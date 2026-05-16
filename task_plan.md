@@ -71,14 +71,14 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-handoff-preset`
+Branch: `feature/v0.4-status-tail-json`
 
 Scope:
 
-- implement the v0.4 handoff preset for bounded context transfer;
-- keep the handoff flow exactly two turns unless a future multi-step flow is explicitly designed;
-- write only local transcript and optional summary files;
-- avoid GitHub posting, scheduling, daemon loops, or automatic task execution;
+- implement the first v0.4 status contract expansion slice;
+- add bounded `last_capture_lines` to `claude-tmux status --json` and `codex-tmux status --json`;
+- keep default text `status` output unchanged;
+- keep the field diagnostic-only and bounded, with missing sessions returning an empty array;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -111,6 +111,9 @@ Verification evidence:
 - PR #40 merged as `2592628`; main CI run `25969424457` passed.
 - Handoff preset local validation passed on `feature/v0.4-handoff-preset`: workflow YAML check with `yq`, script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake `handoff` smoke covering two-turn transcript shape, summary file output, `validate-transcript`, `jq` assertions for agent-a/agent-b turns, and rejection of `handoff --turns 3`.
 - Claude tmux-agent teammate reviewed the handoff preset diff and found no blockers (`VERDICT: PASS`). After removing an unused local variable, Claude re-reviewed and again found no blockers (`VERDICT: PASS`). Non-blocking notes: `--turns` is not listed in handoff usage because non-two-turn handoff is intentionally rejected; CI now checks handoff summary body content as well as the header.
+- PR #41 merged as `5c39146`; main CI run `25969626764` passed.
+- Status tail JSON local validation passed on `feature/v0.4-status-tail-json`: workflow YAML check with `yq`, script syntax for both wrappers, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and local `jq` smoke proving missing sessions return `last_capture_lines == []`, bounded two-line tails work for Claude/Codex, and invalid/zero `*_STATUS_TAIL_LINES` values fall back to a bounded array.
+- Claude tmux-agent teammate reviewed the status tail JSON diff, found two blockers in the first implementation, then re-reviewed after the fix and reported no blockers with `VERDICT: READY TO MERGE`. Final docs-only re-reviews also reported `BLOCKERS: None`, `NON-BLOCKING: None`, and `VERDICT: READY TO MERGE`; the README now states the diagnostic tail is bounded by the wrapper's 80-line status capture window.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope

@@ -10,6 +10,7 @@ SUBMIT_DELAY="${CLAUDE_TMUX_SUBMIT_DELAY:-0.2}"
 TMUX_CONF="${CLAUDE_TMUX_CONF:-${TMPDIR:-/tmp}/claude-tmux.tmux.conf}"
 TMUX_MOUSE="${CLAUDE_TMUX_MOUSE:-on}"
 TMUX_CLIPBOARD="${CLAUDE_TMUX_CLIPBOARD:-auto}"
+STATUS_TAIL_LINES="${CLAUDE_TMUX_STATUS_TAIL_LINES:-20}"
 
 resolve_tmux_bin() {
   if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
@@ -83,6 +84,7 @@ Environment:
   CLAUDE_TMUX_CONF=/tmp/claude-tmux.tmux.conf
   CLAUDE_TMUX_MOUSE=on
   CLAUDE_TMUX_CLIPBOARD=auto
+  CLAUDE_TMUX_STATUS_TAIL_LINES=20
 EOF
 }
 
@@ -671,6 +673,19 @@ status_pane_text() {
   "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
 }
 
+status_tail_json() {
+  local current="$1"
+  local max_lines="$STATUS_TAIL_LINES"
+  if [[ "$max_lines" != <-> ]] || (( max_lines <= 0 )); then
+    max_lines=20
+  fi
+  print -r -- "$current" | "$JQ" -R -s --argjson max_lines "$max_lines" '
+    split("\n")
+    | map(select(length > 0))
+    | .[-$max_lines:]
+  '
+}
+
 self_test_session() {
   require_tmux
   local name="self-test-$$"
@@ -706,10 +721,11 @@ status_session() {
   local exit_detected=false
   local local_or_remote=""
   local diagnostic=""
+  local current=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     exists=true
     running=true
-    local current lowered
+    local lowered
     current="$(status_pane_text "$session")"
     lowered="${current:l}"
     if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
@@ -733,10 +749,11 @@ status_session() {
       --arg prefix "$PREFIX" \
       --arg local_or_remote "$local_or_remote" \
       --arg diagnostic "$diagnostic" \
+      --argjson last_capture_lines "$(status_tail_json "$current")" \
       --argjson exists "$exists" \
       --argjson running "$running" \
       --argjson exit_detected "$exit_detected" \
-      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end)}'
+      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines}'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
     if [[ -n "$diagnostic" ]]; then

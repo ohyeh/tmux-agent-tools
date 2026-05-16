@@ -140,8 +140,9 @@ Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, a
 | `exit_detected` | boolean | stable | Pane contains `local command exited with code` or `remote command exited with code`; this does not imply failure. |
 | `local_or_remote` | string or null | diagnostic | Best-effort mode inferred from pane text; `null` when the session is missing. |
 | `diagnostic` | string or null | diagnostic | Optional readiness warning text; callers should not depend on exact wording. |
+| `last_capture_lines` | array of strings | diagnostic | Bounded pane tail for human diagnosis in JSON callers; empty when the session is missing. Defaults to 20 lines. |
 
-`diagnostic` is currently only populated by `claude-tmux` for best-effort first-run or permission prompts; `codex-tmux` returns `null`.
+`diagnostic` is currently only populated by `claude-tmux` for best-effort first-run or permission prompts; `codex-tmux` returns `null`. Tune the JSON tail with `CLAUDE_TMUX_STATUS_TAIL_LINES` or `CODEX_TMUX_STATUS_TAIL_LINES`; invalid values fall back to 20. The tail is diagnostic and bounded by the wrapper's 80-line status capture window.
 
 Reliability checks:
 
