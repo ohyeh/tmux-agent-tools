@@ -59,14 +59,17 @@ jobs:
           zsh -n skills/tmux-agent-tools/scripts/claude-tmux
           zsh -n skills/tmux-agent-tools/scripts/codex-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
+          zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
           ruby -c Formula/tmux-agent-tools.rb
           brew style Formula/tmux-agent-tools.rb
           skills/tmux-agent-tools/scripts/codex-tmux self-test
           skills/tmux-agent-tools/scripts/claude-tmux self-test
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -se 'length == 0'
           prompt_file="$(mktemp)"
           transcript_file="$(mktemp)"
           printf '%s\n' 'Run a release workflow smoke test.' > "$prompt_file"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 2 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a")' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b")' "$transcript_file"
 

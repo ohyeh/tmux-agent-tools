@@ -72,12 +72,14 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-release-notes-refresh`
+Branch: `feature/v0.4-release-validation-sessions`
 
 Scope:
 
-- refresh v0.4.0 release notes and task-plan state after the P2 ergonomics merges;
-- keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
+- harden the v0.4.0 Release workflow validation so it covers the full stable command surface;
+- include `tmux-agent-sessions` syntax and empty-inventory JSON checks in the release candidate validation;
+- validate the release workflow fake dialogue transcript before release-note extraction or publish;
+- keep this workflow-validation-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -130,7 +132,9 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the first profile env diff and found a blocker: empty `@f` command substitution could create `env "" wrapper ...` for env-less real participants. The fix filters empty entries and passes session env through wrapper-managed `tmux new-session -e` arguments; local revalidation covered env-less and env-set real-wrapper paths.
 - Claude tmux-agent teammate re-reviewed after the fix and found no blockers with `VERDICT: SHIP`; the only non-blocking CI no-env assertion note was addressed and rechecked locally.
 - PR #47 merged as `7ad17a5`; main CI run `25971163853` passed.
-- Pending for this branch: release-note refresh validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- PR #48 merged as `3ac6bc2`; main CI run `25971276044` passed.
+- Release workflow validation hardening local equivalent passed on `feature/v0.4-release-validation-sessions`: workflow YAML check with `yq`, `git diff --check`, script syntax for wrappers/dialogue/session helper, Formula syntax/style, wrapper self-tests, empty session inventory JSON assertion, fake release dialogue smoke, `validate-transcript`, `jq` turn assertions, and v0.4.0 release-note extraction.
+- Pending for this branch: Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
