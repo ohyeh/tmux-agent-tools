@@ -3,6 +3,7 @@ set -euo pipefail
 
 SELF="${0:A}"
 CODEX="${CODEX:-$(command -v codex 2>/dev/null || true)}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
 STABLE_SECONDS="${CODEX_TMUX_STABLE_SECONDS:-3}"
 SUBMIT_DELAY="${CODEX_TMUX_SUBMIT_DELAY:-0.2}"
@@ -98,6 +99,13 @@ require_bins() {
 require_tmux() {
   if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
     echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
+    exit 1
+  fi
+}
+
+require_jq() {
+  if [[ -z "$JQ" || ! -x "$JQ" ]]; then
+    echo "jq not found. Install it with Homebrew or set JQ=/path/to/jq." >&2
     exit 1
   fi
 }
@@ -596,6 +604,11 @@ self_test_session() {
   echo "self-test: ok"
 }
 
+status_pane_text() {
+  local session="$1"
+  "$TMUX" capture-pane -t "$session" -p -S -80 2>/dev/null || true
+}
+
 status_session() {
   require_tmux
   local output_json=0
@@ -613,13 +626,40 @@ status_session() {
   fi
 
   local session="$(session_for_name "$name")"
+  local exists=false
   local running=false
+  local exit_detected=false
+  local local_or_remote=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    exists=true
     running=true
+    local current lowered
+    current="$(status_pane_text "$session")"
+    lowered="${current:l}"
+    if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+      exit_detected=true
+      running=false
+    fi
+    if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
+      local_or_remote="remote"
+    else
+      local_or_remote="local"
+    fi
   fi
 
   if (( output_json )); then
-    printf '{"name":"%s","session":"%s","prefix":"%s","running":%s}\n' "$name" "$session" "$PREFIX" "$running"
+    require_jq
+    "$JQ" -cn \
+      --arg tool "codex" \
+      --arg name "$name" \
+      --arg session "$session" \
+      --arg prefix "$PREFIX" \
+      --arg local_or_remote "$local_or_remote" \
+      --arg diagnostic "" \
+      --argjson exists "$exists" \
+      --argjson running "$running" \
+      --argjson exit_detected "$exit_detected" \
+      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end)}'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
   else

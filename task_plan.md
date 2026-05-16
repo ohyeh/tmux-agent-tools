@@ -57,26 +57,27 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 19. Merge v0.3 session hygiene helper through PR #18. Done.
 20. Merge transcript validator through PR #19. Done.
 21. Merge failure classification through PR #20. Done.
+22. Merge safer transcript sharing through PR #21. Done.
 
 ## Active Work
 
-Branch: `feature/safer-transcript-sharing`
+Branch: `feature/stable-status-json`
 
 Scope:
 
-- add sharing-only `--max-lines` and `--max-bytes` rendering limits;
-- add repeated `--redact-pattern <regex>` support;
-- include visible truncation and redaction notes in generated Markdown;
-- keep pair-review local summary behavior unchanged unless using `summarize` or `github-comment`;
-- ensure `github-comment` dry-run body matches the body used for explicit posting;
+- align `claude-tmux status --json` and `codex-tmux status --json` field names;
+- build wrapper status JSON with `jq` instead of string interpolation;
+- expose `exists`, `running`, and `exit_detected` so held-open exited panes are not reported as running;
+- document stable fields versus best-effort diagnostic fields;
+- add CI checks for missing, running, and exit-detected status JSON shapes;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate recommends a sharing-layer implementation with visible notes and no change to raw JSONL transcript generation.
-- Local checks pass: shell syntax, skill validation, Formula syntax/style, wrapper self-tests, transcript validation, `--max-lines`, `--max-bytes`, repeated `--redact-pattern`, pair-review isolation, and fake `gh` post body validation.
-- Claude tmux-agent final review reports no blockers.
+- Claude tmux-agent teammate recommends a small status JSON slice focused on field alignment, structured JSON construction, missing/running behavior, and docs.
+- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, and missing/running/exit-detected status JSON shapes.
+- Claude tmux-agent final review reports no blockers; it recommends documenting that `codex-tmux` currently returns `diagnostic: null`.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope

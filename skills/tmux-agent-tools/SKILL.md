@@ -76,6 +76,8 @@ codex-tmux stop worker
 
 Use `wait-text --literal` or `wait-literal` when the expected text contains regex metacharacters such as `[`, `]`, `(`, `)`, `.`, `*`, or `?`. Use regex `wait-text` only when regex matching is intentional.
 
+`status --json` is the stable automation contract for both wrappers. Expect the shared fields `tool`, `name`, `session`, `prefix`, `exists`, `running`, `exit_detected`, `local_or_remote`, and `diagnostic`. Treat `local_or_remote` and `diagnostic` as best-effort diagnostics; the other fields are stable. `running` is false when the pane shows the wrapper's local or remote exit-code marker even if the tmux session still exists for capture.
+
 5. For bounded two-agent dialogue, write a prompt file and transcript path:
 
 ```bash
