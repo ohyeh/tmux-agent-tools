@@ -82,11 +82,11 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-cleanup-preview-coverage` next
+Branch: `feature/v0.5-cleanup-preview-coverage`
 
 Scope:
 
-- start the next v0.5 operator-ergonomics slice: stronger cleanup preview coverage;
+- finish the v0.5 operator-ergonomics cleanup preview coverage slice;
 - add focused coverage for scriptable `tmux-agent-sessions cleanup --preview --json` decisions without changing cleanup behavior;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
@@ -178,7 +178,9 @@ Verification evidence:
 - Summary output formats local validation passed on `feature/v0.5-summary-output-formats`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, fake pair-review summary smoke proving default Markdown equals explicit `--output-format markdown`, JSON output validates with `jq`, redacted structured `turns[].tail_lines` do not leak the unredacted fake marker text, JSON `--summary-file` writes the selected format, `github-comment --output-format` is rejected, and unknown output formats are rejected.
 - Claude tmux-agent teammate reviewed the summary output formats diff, found no blockers, and re-reviewed the final diff after a metadata naming cleanup with `VERDICT: SHIP`.
 - PR #64 merged as `d298f25`; feature branch CI run `25973829558` and main CI run `25973857604` passed.
-- Pending for next branch: cleanup preview coverage design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Cleanup preview coverage local validation passed on `feature/v0.5-cleanup-preview-coverage`: `zsh -n` for `tmux-agent-sessions`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and local tmux smoke proving `cleanup --preview --json` covers all owned sessions, `--tool claude`, `--tool dialogue`, and `--name ci-hygiene`, excludes unrelated sessions, leaves previewed sessions alive, and rejects `cleanup --execute --json`.
+- Claude tmux-agent teammate reviewed the cleanup preview coverage diff and found no blockers with `VERDICT: SHIP`.
+- Pending for current branch: commit, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
