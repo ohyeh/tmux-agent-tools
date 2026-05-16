@@ -106,6 +106,11 @@ brew style ohyeh/tmux-agent-tools/tmux-agent-tools
 
 Releases go through a focused release PR, the manual `Release` GitHub Actions workflow, and a follow-up Formula bump PR. See [docs/release-process.md](docs/release-process.md).
 
+## Roadmaps
+
+- [v0.4.0 roadmap](docs/v0.4.0-roadmap.md)
+- [v0.5.0 roadmap](docs/v0.5.0-roadmap.md)
+
 ## Usage
 
 ```bash

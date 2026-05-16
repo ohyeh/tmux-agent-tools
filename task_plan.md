@@ -33,6 +33,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - `B` reliability primitives are now in `main`.
 - `v0.3.0` improved session hygiene and transcript usability without adding more autonomy.
 - `v0.4.0` should improve automation readiness: accurate session state, richer status contracts, bounded handoff, and local summary pipelines.
+- `v0.5.0` should improve observability and multi-session composability: bounded session watch, richer exit detail, transcript contract versioning, and local blocked-trigger artifacts.
 - `D` personal workflow shortcuts should stay outside public core unless generalized.
 - Keep orchestration public and generic: transcript capture, pairing, and bounded turns are core; OpenClaw/Mac-mini shortcuts are not.
 
@@ -72,15 +73,17 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 32. Merge `v0.4.0` release-process validation docs through PR #51 (`71b37a3`). Done.
 33. Merge `v0.4.0` release-ready state through PR #52 (`9cf1684`). Done.
 34. Merge `v0.4.0` status-contract roadmap sync through PR #53 (`17ee594`). Done.
+35. Merge `v0.4.0` roadmap current-state refresh through PR #54 (`dc37dc2`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.4-roadmap-current-state`
+Branch: `feature/v0.5-roadmap`
 
 Scope:
 
-- record the PR #53 merge and main CI evidence before any `v0.4.0` publish;
-- update the v0.4 roadmap so the initial session-state slice reads as completed history rather than current-start guidance;
+- record the PR #54 merge and main CI evidence before any `v0.4.0` publish;
+- add a `v0.5.0` roadmap focused on bounded observability and multi-session composability;
+- define the first measurable v0.5 slice as bounded `tmux-agent-sessions list --watch --json --count N`;
 - keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -148,7 +151,10 @@ Verification evidence:
 - PR #52 merged as `9cf1684`; main CI run `25971846873` passed.
 - Roadmap status-contract sync validation passed on `feature/v0.4-roadmap-status-contract-sync`: `git diff --check`, workflow YAML name check with `yq`, script syntax checks, stale-status searches with `rg`, and Claude tmux-agent teammate re-review with `VERDICT: SHIP`.
 - PR #53 merged as `17ee594`; main CI run `25971998894` passed.
-- Pending for this branch: current-state roadmap validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Current-state roadmap validation passed on `feature/v0.4-roadmap-current-state`: `git diff --check`, workflow YAML name check with `yq`, script syntax checks, stale roadmap searches with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
+- PR #54 merged as `dc37dc2`; main CI run `25972109136` passed.
+- Claude tmux-agent teammate brainstormed the next version and recommended `v0.5.0` focus on observability and multi-session composability, with bounded `tmux-agent-sessions list --watch --json --count N` as the first measurable slice.
+- Pending for this branch: v0.5 roadmap validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
