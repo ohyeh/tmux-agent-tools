@@ -8,11 +8,13 @@ mkdir -p "$target_dir"
 ln -sf "$script_dir/claude-tmux" "$target_dir/claude-tmux"
 ln -sf "$script_dir/codex-tmux" "$target_dir/codex-tmux"
 ln -sf "$script_dir/tmux-agent-dialogue" "$target_dir/tmux-agent-dialogue"
+ln -sf "$script_dir/tmux-agent-sessions" "$target_dir/tmux-agent-sessions"
 
 echo "Installed:"
 echo "  $target_dir/claude-tmux -> $script_dir/claude-tmux"
 echo "  $target_dir/codex-tmux -> $script_dir/codex-tmux"
 echo "  $target_dir/tmux-agent-dialogue -> $script_dir/tmux-agent-dialogue"
+echo "  $target_dir/tmux-agent-sessions -> $script_dir/tmux-agent-sessions"
 echo
 echo "Make sure this is on PATH:"
 echo "  $target_dir"

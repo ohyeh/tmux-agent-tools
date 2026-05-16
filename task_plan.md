@@ -2,7 +2,7 @@
 
 ## Goal
 
-Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.2.0` orchestration features on focused feature branches with tmux-agent teammate review.
+Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.3.0` session hygiene and transcript usability on focused feature branches with Claude tmux-agent teammate review.
 
 ## Success Criteria
 
@@ -21,7 +21,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - Release tag: `v0.2.0`
 - Release tag URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.2.0`
 - Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, and explicit GitHub comment helper support.
-- Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`
+- Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`, `tmux-agent-dialogue`
 - Verified install surfaces: `skills.sh`, stable Homebrew, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
 - Branch protection: `main` requires PR flow; force push and branch deletion are disabled.
@@ -30,7 +30,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 - Release discipline comes before new features.
 - `B` reliability primitives are now in `main`.
-- `A` orchestration is the next product direction for `v0.2.0`.
+- `v0.3.0` should improve session hygiene and transcript usability rather than add more autonomy.
 - `D` personal workflow shortcuts should stay outside public core unless generalized.
 - Keep orchestration public and generic: transcript capture, pairing, and bounded turns are core; OpenClaw/Mac-mini shortcuts are not.
 
@@ -57,19 +57,23 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.3-roadmap`
+Branch: `feature/v0.3-session-hygiene`
 
 Scope:
 
-- plan `v0.3.0` around session hygiene and transcript usability;
-- keep the roadmap public/generic and avoid personal workflow shortcuts;
-- use teammate review to prioritize P0/P1/P2 scope;
+- add `tmux-agent-sessions` as a cross-tool session inventory and cleanup helper;
+- keep `tmux-agent-sessions` as a Homebrew `--HEAD` command until the next tagged release;
+- keep default inventory and cleanup preview read-only;
+- require `cleanup --execute` plus `--all`, `--tool`, or `--name` for stop behavior;
+- limit execution to sessions owned by `claude-tmux`, `codex-tmux`, or `tmux-agent-dialogue`;
+- include JSON inventory output for automation;
+- use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- tmux-agent teammate recommends `v0.3.0` focus on session hygiene, transcript schema validation, and safer transcript sharing.
-- Pending for this branch: docs review and PR CI.
+- Claude tmux-agent teammate recommends a separate `tmux-agent-sessions` command instead of adding cross-wrapper behavior to `claude-tmux` or `codex-tmux`.
+- Pending for this branch: shell syntax, CI-equivalent hygiene smoke, Formula style/test, skill validation, PR CI.
 
 ## v0.2.0 Candidate Scope
 

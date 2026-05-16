@@ -1,0 +1,238 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:t}"
+SCRIPT_DIR="${0:A:h}"
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
+    print -r -- "$TMUX"
+    return
+  fi
+  command -v tmux 2>/dev/null || true
+}
+
+TMUX_BIN="$(resolve_tmux_bin)"
+unset TMUX
+TMUX="$TMUX_BIN"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+CLAUDE_PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
+CODEX_PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
+DIALOGUE_PREFIX="tmux-agent-dialogue"
+FILTER_TOOL=""
+FILTER_NAME=""
+
+usage() {
+  cat <<'EOF'
+tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
+
+Usage:
+  tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>]
+  tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|dialogue>] [--name <name>]
+  tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|dialogue> | --name <name>)
+
+Behavior:
+  - list is read-only;
+  - cleanup --preview is read-only;
+  - cleanup --execute requires --all or a filter before stopping sessions;
+  - cleanup --execute only stops matching sessions owned by claude-tmux, codex-tmux, or tmux-agent-dialogue;
+  - sessions outside known tmux-agent-tools prefixes are never stopped.
+EOF
+}
+
+die() {
+  echo "$SELF: $*" >&2
+  exit 1
+}
+
+require_tmux() {
+  [[ -x "$TMUX" ]] || die "tmux not found"
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
+}
+
+wrapper_for_tool() {
+  local tool="$1"
+  case "$tool" in
+    claude) print -r -- "$SCRIPT_DIR/claude-tmux" ;;
+    codex) print -r -- "$SCRIPT_DIR/codex-tmux" ;;
+    *) die "unsupported wrapper tool: $tool" ;;
+  esac
+}
+
+emit_session_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  require_jq
+  "$JQ" -cn \
+    --arg tool "$tool" \
+    --arg name "$name" \
+    --arg session "$session" \
+    --arg state "running" \
+    '{tool:$tool,name:$name,session:$session,state:$state,running:true}'
+}
+
+parse_filter_arg() {
+  case "$1" in
+    claude|codex|dialogue)
+      print -r -- "$1"
+      ;;
+    *)
+      die "--tool must be one of: claude, codex, dialogue"
+      ;;
+  esac
+}
+
+matches_filters() {
+  local tool="$1"
+  local name="$2"
+  [[ -z "$FILTER_TOOL" || "$tool" == "$FILTER_TOOL" ]] || return 1
+  [[ -z "$FILTER_NAME" || "$name" == "$FILTER_NAME" ]] || return 1
+  return 0
+}
+
+list_owned_sessions() {
+  require_tmux
+  "$TMUX" ls 2>/dev/null | while IFS= read -r line; do
+    local session="${line%%:*}"
+    local tool=""
+    local name=""
+    case "$session" in
+      "$CLAUDE_PREFIX"-*)
+        tool="claude"
+        name="${session#$CLAUDE_PREFIX-}"
+        ;;
+      "$CODEX_PREFIX"-*)
+        tool="codex"
+        name="${session#$CODEX_PREFIX-}"
+        ;;
+      "$DIALOGUE_PREFIX"-*)
+        tool="dialogue"
+        name="${session#$DIALOGUE_PREFIX-}"
+        ;;
+    esac
+    if [[ -n "$tool" ]] && matches_filters "$tool" "$name"; then
+      print -r -- "$tool	$name	$session"
+    fi
+  done
+}
+
+list_sessions() {
+  local output_json=0
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --json)
+        output_json=1
+        ;;
+      --tool)
+        shift
+        FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --name)
+        shift
+        FILTER_NAME="${1:-}"
+        [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>]"
+        ;;
+    esac
+    shift
+  done
+
+  local tool name session
+  list_owned_sessions | while IFS=$'\t' read -r tool name session; do
+    if (( output_json )); then
+      emit_session_json "$tool" "$name" "$session"
+    else
+      print -r -- "$tool	$name	$session	running"
+    fi
+  done
+}
+
+cleanup_sessions() {
+  local mode=""
+  local output_json=0
+  local all=0
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --preview)
+        mode="preview"
+        ;;
+      --execute)
+        mode="execute"
+        ;;
+      --json)
+        output_json=1
+        ;;
+      --all)
+        all=1
+        ;;
+      --tool)
+        shift
+        FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --name)
+        shift
+        FILTER_NAME="${1:-}"
+        [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|dialogue>] [--name <name>] | cleanup --execute (--all | --tool <claude|codex|dialogue> | --name <name>)"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$mode" ]] || die "cleanup requires --preview or --execute"
+  [[ "$mode" != "execute" || "$output_json" -eq 0 ]] || die "--json is only supported with cleanup --preview"
+  if [[ "$mode" == "execute" && "$all" -eq 0 && -z "$FILTER_TOOL" && -z "$FILTER_NAME" ]]; then
+    die "cleanup --execute requires --all, --tool, or --name"
+  fi
+
+  local tool name session
+  list_owned_sessions | while IFS=$'\t' read -r tool name session; do
+    if [[ "$mode" == "preview" ]]; then
+      if (( output_json )); then
+        emit_session_json "$tool" "$name" "$session"
+      else
+        print -r -- "would stop: $tool	$name	$session"
+      fi
+      continue
+    fi
+
+    case "$tool" in
+      claude|codex)
+        "$(wrapper_for_tool "$tool")" stop "$name"
+        ;;
+      dialogue)
+        "$TMUX" kill-session -t "$session"
+        print -r -- "Stopped $session"
+        ;;
+    esac
+  done
+}
+
+command="${1:-help}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  list)
+    list_sessions "$@"
+    ;;
+  cleanup)
+    cleanup_sessions "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
