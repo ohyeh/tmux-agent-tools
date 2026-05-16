@@ -76,17 +76,17 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 35. Merge `v0.4.0` roadmap current-state refresh through PR #54 (`dc37dc2`). Done.
 36. Merge `v0.5.0` roadmap through PR #55 (`71e8ec4`). Done.
 37. Merge bounded session watch through PR #56 (`3a28a5a`). Done.
+38. Merge status exit-code contract through PR #57 (`854b51e`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.5-status-exit-code`
+Branch: `feature/v0.5-exit-code-state`
 
 Scope:
 
-- record the PR #56 merge and main CI evidence before any `v0.4.0` publish;
-- extend Claude and Codex wrapper `status --json` with `exit_code` as integer or null;
-- preserve existing `running`, `exit_detected`, `blocked_reason`, `diagnostic`, and inventory state semantics;
-- keep `tmux-agent-sessions list --json` and cleanup preview JSON schema aligned with wrapper status rows;
+- record the PR #57 merge and main CI evidence before any `v0.4.0` publish;
+- update `docs/v0.5.0-roadmap.md` so bounded watch and exit-code contract no longer appear in progress;
+- keep this branch docs-only;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -164,7 +164,9 @@ Verification evidence:
 - PR #56 merged as `3a28a5a`; main CI run `25972534503` passed.
 - Status exit-code local validation passed on `feature/v0.5-status-exit-code`: `git diff --check`, workflow YAML name checks with `yq`, script syntax checks, skill metadata validation, Formula syntax/style, wrapper self-tests, missing status `exit_code == null`, fake local/remote exit markers with `exit_code == 7` and `exit_code == 2`, inventory JSON preservation, cleanup preview JSON preservation, and dialogue rows with `exit_code == null`.
 - Claude tmux-agent teammate reviewed the status exit-code diff and found no blockers with `VERDICT: SHIP`. Non-blocking notes: multiple captured exit markers use last-wins parsing, and the bounded pane capture window remains the source of evidence.
-- Pending for this branch: PR CI, merge, and main CI.
+- PR #57 merged as `854b51e`; main CI run `25972810785` passed.
+- Docs-only state validation passed on `feature/v0.5-exit-code-state`: `git diff --check`, workflow YAML name checks with `yq`, roadmap/task-plan anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
+- Pending for this branch: docs-only PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
