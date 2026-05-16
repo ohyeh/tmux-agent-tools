@@ -71,13 +71,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-release-dry-run-state`
+Branch: `feature/v0.4-pair-review-swap`
 
 Scope:
 
-- record the reviewed `v0.4.0` release-prep merge and Release workflow dry-run evidence;
-- do not create release tags or GitHub releases from local shell;
-- do not bump the stable Homebrew Formula before the `v0.4.0` tag exists;
+- implement the v0.4 P2 `pair-review --swap` ergonomic slice;
+- reverse pair-review speaker order without changing participant definitions;
+- keep the feature local-only with no GitHub posting, merging, scheduling, or release side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -122,6 +122,9 @@ Verification evidence:
 - PR #44 merged as `5070e2a`; main CI run `25970349954` passed.
 - Release workflow dry-run for `v0.4.0` passed in run `25970374512` (`https://github.com/ohyeh/tmux-agent-tools/actions/runs/25970374512`): `validate` succeeded, release notes were built from `CHANGELOG.md`, `publish` was skipped, and `refs/tags/v0.4.0` / the GitHub Release were absent before dispatch.
 - Claude tmux-agent teammate reviewed this dry-run state update and found no blockers with `VERDICT: READY`.
+- PR #45 merged as `c411413`; main CI run `25970460874` passed.
+- Pair-review swap local validation passed on `feature/v0.4-pair-review-swap`: workflow YAML check with `yq`, script syntax for wrappers/dialogue/session helper, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake pair-review smoke using slurped `jq` assertions to prove default A-to-B order, `--swap` B-to-A order, `critic --swap` rejection, and leading `--swap pair-review` rejection.
+- Claude tmux-agent teammate reviewed the pair-review swap diff, initially found two blockers in CI/assertion clarity and leading `--swap` handling, then re-reviewed after fixes; final verdict was `BLOCKERS: None`, `NON-BLOCKING: None`, and `VERDICT: SHIP`.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope

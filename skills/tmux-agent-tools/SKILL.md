@@ -108,7 +108,7 @@ For a local review preset that only writes a transcript and terminal summary:
 tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
 ```
 
-`pair-review` does not post comments, merge PRs, or publish externally. Use `--summary-file <path>` for a local Markdown summary.
+`pair-review` does not post comments, merge PRs, or publish externally. Use `--swap` when agent B should speak first and agent A should respond. Use `--summary-file <path>` for a local Markdown summary.
 
 Use `critic` when the user wants a bounded critique/response loop without any external action:
 

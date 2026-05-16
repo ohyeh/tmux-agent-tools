@@ -232,7 +232,7 @@ Pair-review preset:
 tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
 ```
 
-`pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. It does not post GitHub comments, merge PRs, or publish externally by default.
+`pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. Add `--swap` to reverse the speaker order so agent B speaks first and agent A responds, without changing the participant definitions. It does not post GitHub comments, merge PRs, or publish externally by default.
 
 Critic preset:
 
