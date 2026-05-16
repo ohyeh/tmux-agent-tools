@@ -20,9 +20,12 @@ Usage:
   codex-tmux send <name> <text>
   codex-tmux wait <name> [timeout_seconds]
   codex-tmux wait-text <name> <regex> [timeout_seconds]
+  codex-tmux wait-literal <name> <text> [timeout_seconds]
   codex-tmux capture <name> [lines]
   codex-tmux list
   codex-tmux status <name>
+  codex-tmux doctor
+  codex-tmux self-test
   codex-tmux stop <name>
   codex-tmux help
 
@@ -34,7 +37,10 @@ Examples:
   codex-tmux send pr5 '請先讀 PR description'
   codex-tmux wait pr5 180
   codex-tmux wait-text pr5 'Done|Need approval' 180
+  codex-tmux wait-literal pr5 '[CODEX-01]' 180
   codex-tmux capture pr5 80
+  codex-tmux doctor
+  codex-tmux self-test
   codex-tmux list
   codex-tmux stop pr5
 
@@ -46,6 +52,7 @@ Behavior:
   - Codex is launched with --yolo.
   - wait returns when the visible pane is stable for a few seconds.
   - wait-text returns when the visible pane matches a zsh extended regex.
+  - wait-literal returns when the visible pane contains exact text.
   - capture reads the tmux pane without stealing browser or terminal focus.
 
 Environment:
@@ -134,6 +141,11 @@ random_suffix() {
   LC_ALL=C /usr/bin/od -An -N3 -tx1 /dev/urandom | /usr/bin/tr -d ' \n'
 }
 
+literal_pattern() {
+  local value="$1"
+  print -r -- "$value"
+}
+
 shell_quote() {
   printf "%q" "$1"
 }
@@ -190,6 +202,7 @@ start_session() {
   echo "send: $SELF send $name <text>"
   echo "wait: $SELF wait $name 180"
   echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "wait-literal: $SELF wait-literal $name '<text>' 180"
   echo "capture: $SELF capture $name 120"
   if [[ -n "$initial_text" ]]; then
     sleep 3
@@ -260,6 +273,7 @@ start_ssh_session() {
   echo "send: $SELF send $name <text>"
   echo "wait: $SELF wait $name 180"
   echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "wait-literal: $SELF wait-literal $name '<text>' 180"
   echo "capture: $SELF capture $name 120"
   if [[ -n "$initial_text" ]]; then
     sleep 5
@@ -421,6 +435,70 @@ wait_text_session() {
   return 1
 }
 
+wait_literal_session() {
+  require_tmux
+  local name="${1:-}"
+  local needle="${2:-}"
+  local timeout_seconds="${3:-180}"
+
+  if [[ -z "$name" || -z "$needle" ]]; then
+    echo "Usage: codex-tmux wait-literal <name> <text> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+  local needle_pattern="$(literal_pattern "$needle")"
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -t "$session" -p -S -200)"
+    if printf '%s' "$current" | /usr/bin/grep -F -q -- "$needle_pattern"; then
+      echo "matched literal: $needle"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "timeout waiting for literal text '$needle': $session" >&2
+  return 1
+}
+
+doctor_session() {
+  require_tmux
+  echo "tmux: $TMUX"
+  if [[ -n "$CODEX" && -x "$CODEX" ]]; then
+    echo "codex: $CODEX"
+  else
+    echo "codex: not found; start requires CODEX=/path/to/codex or codex on PATH"
+  fi
+  echo "prefix: $PREFIX"
+  echo "stable_seconds: $STABLE_SECONDS"
+  echo "tmux_conf: $TMUX_CONF"
+  echo "mouse: $TMUX_MOUSE"
+}
+
+self_test_session() {
+  require_tmux
+  local name="self-test-$$"
+  local session="$(session_for_name "$name")"
+  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  "$TMUX" new-session -d -s "$session" "printf '%s\n' 'TMUX_AGENT_TOOLS_SELF_TEST_OK'; sleep 5"
+  wait_literal_session "$name" "TMUX_AGENT_TOOLS_SELF_TEST_OK" 5
+  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  echo "self-test: ok"
+}
+
 status_session() {
   require_tmux
   local name="${1:-}"
@@ -493,11 +571,20 @@ case "$command" in
   wait-text)
     wait_text_session "$@"
     ;;
+  wait-literal)
+    wait_literal_session "$@"
+    ;;
   capture)
     capture_session "$@"
     ;;
   status)
     status_session "$@"
+    ;;
+  doctor)
+    doctor_session
+    ;;
+  self-test)
+    self_test_session
     ;;
   list)
     list_sessions

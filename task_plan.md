@@ -38,7 +38,7 @@ Ship the verified tmux-agent-tools MVP as `v0.1.0`, then prepare the next reliab
 4. Update README install instructions. Done.
 5. Verify stable Homebrew install. Done.
 6. Verify skills.sh discovery. Done.
-7. Create/push reliability branch. Pending.
+7. Create/push reliability branch. Done.
 
 ## Next Branch Scope
 
@@ -46,9 +46,9 @@ Branch: `feature/reliability-primitives`
 
 Candidate work:
 
-- `wait-literal` or `wait-text --literal`
-- `doctor`
-- `self-test`
+- `wait-literal` or `wait-text --literal` - done
+- `doctor` - done
+- `self-test` - done
 - session metadata/structured status
 - better Claude first-run confirmation handling
 - local hold-on-exit diagnostics
