@@ -198,6 +198,19 @@ jobs:
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
           rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$pair_summary_file"
+          handoff_transcript_file="$(mktemp)"
+          handoff_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue handoff --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$handoff_transcript_file" --summary-file "$handoff_summary_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$handoff_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$handoff_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$handoff_transcript_file"
+          rg -n "tmux-agent-tools handoff|agent-a|agent-b" "$handoff_summary_file"
+          rg -n "fake-a: turn 1 received|fake-b: turn 2 received" "$handoff_summary_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue handoff --turns 3 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/handoff-three-turns.jsonl --timeout 1 >/tmp/handoff-three-turns.out 2>&1; then
+            echo "handoff must reject non-two-turn flows" >&2
+            exit 1
+          fi
+          rg -n "handoff runs exactly two turns" /tmp/handoff-three-turns.out
           critic_transcript_file="$(mktemp)"
           critic_summary_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue critic --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$critic_transcript_file" --summary-file "$critic_summary_file" --timeout 10

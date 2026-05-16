@@ -71,14 +71,14 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-summary-file-pipeline`
+Branch: `feature/v0.4-handoff-preset`
 
 Scope:
 
-- implement the v0.4 summary file pipeline for `tmux-agent-dialogue github-comment`;
-- allow `github-comment --summary-file <path>` to reuse a pre-rendered local summary body;
-- keep `--post-github-comment` explicit and opt-in;
-- verify transcript mode still rejects invalid transcript input before rendering;
+- implement the v0.4 handoff preset for bounded context transfer;
+- keep the handoff flow exactly two turns unless a future multi-step flow is explicitly designed;
+- write only local transcript and optional summary files;
+- avoid GitHub posting, scheduling, daemon loops, or automatic task execution;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -108,6 +108,9 @@ Verification evidence:
 - PR #39 merged as `52c0fe9`; main CI run `25966994197` passed.
 - Summary-file pipeline local validation passed on `feature/v0.4-summary-file-pipeline`: workflow YAML check with `yq`, script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake `pair-review` smoke covering `summarize --summary-file`, `github-comment --transcript`, `github-comment --summary-file`, `--max-lines`, invalid transcript rejection, both-input rejection, and missing-input rejection.
 - Claude tmux-agent teammate reviewed the summary-file pipeline diff after two Claude API 500 attempts and found no blockers (`VERDICT: PASS`). After exactly-one validation was tightened for missing input too, Claude re-reviewed and again found no blockers (`VERDICT: PASS`). Non-blocking notes: empty summary-file and `--max-bytes` summary-file tests could be added later.
+- PR #40 merged as `2592628`; main CI run `25969424457` passed.
+- Handoff preset local validation passed on `feature/v0.4-handoff-preset`: workflow YAML check with `yq`, script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake `handoff` smoke covering two-turn transcript shape, summary file output, `validate-transcript`, `jq` assertions for agent-a/agent-b turns, and rejection of `handoff --turns 3`.
+- Claude tmux-agent teammate reviewed the handoff preset diff and found no blockers (`VERDICT: PASS`). After removing an unused local variable, Claude re-reviewed and again found no blockers (`VERDICT: PASS`). Non-blocking notes: `--turns` is not listed in handoff usage because non-two-turn handoff is intentionally rejected; CI now checks handoff summary body content as well as the header.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
