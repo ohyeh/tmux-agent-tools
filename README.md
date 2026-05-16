@@ -5,7 +5,7 @@ Small tmux wrappers for running Claude Code and Codex CLI as controllable named 
 This repository is both:
 
 - a `skills.sh` compatible skill package;
-- a Homebrew formula source for installing `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` on macOS or Linuxbrew.
+- a Homebrew formula source for installing `claude-tmux`, `codex-tmux`, `tmux-agent-dialogue`, and unreleased `--HEAD` tools on macOS or Linuxbrew.
 
 ## Inspired By
 
@@ -21,6 +21,7 @@ This project is inspired by two tmux skills in the `skills.sh` ecosystem:
 - `claude-tmux`: starts Claude Code in tmux with `--dangerously-skip-permissions`.
 - `codex-tmux`: starts Codex CLI in tmux with `--yolo`.
 - `tmux-agent-dialogue`: runs a bounded two-party tmux dialogue and writes a JSONL transcript.
+- `tmux-agent-sessions`: lists and safely cleans up tmux-agent-tools owned sessions.
 
 The `claude-tmux` and `codex-tmux` wrapper tools support:
 
@@ -39,6 +40,10 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `self-test`
 - `stop`
 - `help`
+
+`tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` sessions. `tmux-agent-sessions cleanup --preview` is also read-only; `cleanup --execute` is required before it stops tool-owned sessions, and execution must include `--all`, `--tool`, or `--name`. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
+
+Until the next tagged release, install `tmux-agent-sessions` with `brew install tmux-agent-tools --HEAD` or run the repo-local script.
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 

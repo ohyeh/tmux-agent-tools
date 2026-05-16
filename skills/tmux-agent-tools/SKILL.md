@@ -11,6 +11,8 @@ Use `claude-tmux` and `codex-tmux` as the canonical interface for long-running C
 
 Use `tmux-agent-dialogue` when the task needs a bounded two-party dialogue with a JSONL transcript. Use `fake` participants for credential-free smoke tests. Run real `codex` and `claude` participants only for explicit manual smoke tests or when the user asks for a real-agent dialogue.
 
+Use `tmux-agent-sessions list` for a read-only inventory across Claude, Codex, and dialogue sessions. Use `tmux-agent-sessions cleanup --preview` before any bulk cleanup, and only use `cleanup --execute --all` or filtered execution when the user has authorized stopping tool-owned sessions.
+
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 
 The wrapper scripts are bundled with this skill at:
@@ -18,6 +20,7 @@ The wrapper scripts are bundled with this skill at:
 - `scripts/claude-tmux`
 - `scripts/codex-tmux`
 - `scripts/tmux-agent-dialogue`
+- `scripts/tmux-agent-sessions`
 
 If the commands are not installed on `PATH`, resolve them from the skill directory and run the script path directly.
 
