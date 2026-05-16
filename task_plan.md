@@ -82,12 +82,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.5-cleanup-preview-coverage`
+Branch: create `feature/v0.5-profile-timeout-overrides` next
 
 Scope:
 
-- finish the v0.5 operator-ergonomics cleanup preview coverage slice;
-- add focused coverage for scriptable `tmux-agent-sessions cleanup --preview --json` decisions without changing cleanup behavior;
+- start the next v0.5 operator-ergonomics slice: participant profile per-agent timeout overrides;
+- keep profile timeout overrides bounded and explicit without changing default timeout behavior;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -180,7 +180,8 @@ Verification evidence:
 - PR #64 merged as `d298f25`; feature branch CI run `25973829558` and main CI run `25973857604` passed.
 - Cleanup preview coverage local validation passed on `feature/v0.5-cleanup-preview-coverage`: `zsh -n` for `tmux-agent-sessions`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and local tmux smoke proving `cleanup --preview --json` covers all owned sessions, `--tool claude`, `--tool dialogue`, and `--name ci-hygiene`, excludes unrelated sessions, leaves previewed sessions alive, and rejects `cleanup --execute --json`.
 - Claude tmux-agent teammate reviewed the cleanup preview coverage diff and found no blockers with `VERDICT: SHIP`.
-- Pending for current branch: commit, PR CI, merge, and main CI.
+- PR #66 merged as `1b482fc`; feature branch CI run `25974048560` and main CI run `25974086394` passed.
+- Pending for next branch: profile timeout override design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
