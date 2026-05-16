@@ -21,7 +21,7 @@ After the release PR merges, run the `Release` workflow from GitHub Actions:
 - `dry_run`: set to `false` only when the dry run is clean and the release should be published;
 - `prerelease`: set according to the release type.
 
-The workflow validates shell syntax, the Homebrew Formula, wrapper self-tests, a fake two-turn dialogue smoke, and the matching `CHANGELOG.md` section before it writes anything. Real releases create an annotated tag and GitHub Release with notes extracted from `CHANGELOG.md`.
+The workflow validates shell syntax for all installed scripts, the Homebrew Formula, wrapper self-tests, an empty `tmux-agent-sessions list --json` inventory, a fake two-turn dialogue smoke, transcript validation, and the matching `CHANGELOG.md` section before it writes anything. Real releases create an annotated tag and GitHub Release with notes extracted from `CHANGELOG.md`.
 
 The dry-run validation job uses read-only repository permissions. The write permission is scoped to the publish job, which only runs when `dry_run` is explicitly set to `false`.
 
