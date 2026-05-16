@@ -23,7 +23,7 @@ usage() {
 tmux-agent-dialogue - run a bounded two-agent tmux dialogue
 
 Usage:
-  tmux-agent-dialogue --turns <n> --workdir <dir> --agent-a <codex|claude|fake> --agent-b <codex|claude|fake> --prompt-file <path> --transcript <path|-> [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>]
+  tmux-agent-dialogue --turns <n> --workdir <dir> (--agent-a <codex|claude|fake>|--agent-a-profile <name>) (--agent-b <codex|claude|fake>|--agent-b-profile <name>) --prompt-file <path> --transcript <path|-> [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>]
   tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--timeout <seconds>] [--summary-file <path>]
   tmux-agent-dialogue validate-transcript --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]

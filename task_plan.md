@@ -78,8 +78,8 @@ Verification evidence:
 
 - Claude tmux-agent teammate agrees this is the smallest useful P2 profile slice and calls out profile-not-found, parse errors, fake SSH, workdir validation, and CLI override tests.
 - Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, profile-driven fake dialogue, CLI workdir override, missing profile failure, unknown profile key failure, non-string profile value failure, and fake SSH rejection.
-- Claude tmux-agent final review reports no blockers.
-- Pending for this branch: PR CI.
+- Claude tmux-agent final review reports no blockers; it recommended tightening the usage line to show profile alternatives, which is done.
+- PR #23 CI passed and the participant profiles slice is merged.
 
 ## v0.2.0 Candidate Scope
 
