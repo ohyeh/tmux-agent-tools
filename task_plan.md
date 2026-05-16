@@ -78,16 +78,17 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 37. Merge bounded session watch through PR #56 (`3a28a5a`). Done.
 38. Merge status exit-code contract through PR #57 (`854b51e`). Done.
 39. Merge v0.5 exit-code state sync through PR #58 (`46df23e`). Done.
+40. Merge transcript schema-version validation through PR #60 (`61af464`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.5-transcript-schema-version`
+Branch: create `feature/v0.5-blocked-trigger-artifacts` next
 
 Scope:
 
-- start the next v0.5 roadmap slice: transcript contract versioning;
-- add explicit schema-version validation without rewriting existing transcripts;
-- keep default transcript validation behavior compatible with schema version `1`;
+- start the next v0.5 roadmap slice: local blocked trigger artifacts;
+- add an explicit local-file trigger output for blocked participant states;
+- never auto-accept permission, approval, SSH, or login prompts;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -170,7 +171,8 @@ Verification evidence:
 - PR #58 merged as `46df23e`; main CI run `25972934251` passed.
 - Transcript schema-version local validation passed on `feature/v0.5-transcript-schema-version`: `git diff --check`, workflow YAML name checks with `yq`, script syntax check, skill metadata validation, Formula syntax/style, wrapper self-tests, fake transcript default validation as schema version `1`, explicit `--schema-version 1` validation, unsupported `--schema-version 2` rejection before transcript reading, empty schema-version rejection, and `summarize --schema-version` rejection.
 - Claude tmux-agent teammate reviewed the transcript schema-version diff, found one CI stability blocker, then re-reviewed after fixes and found no blockers with `VERDICT: SHIP`.
-- Pending for this branch: PR CI, merge, and main CI.
+- PR #60 merged as `61af464`; main CI run `25973206839` passed.
+- Pending for next branch: local blocked-trigger artifact design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
