@@ -197,7 +197,10 @@ Verification evidence:
 - v0.5 release-prep local validation passed on `feature/v0.5-release-prep`: `git diff --check`, workflow YAML name checks with `yq`, script syntax checks, Formula Ruby syntax check, wrapper self-tests, empty session inventory check with `jq`, release-notes extraction for `v0.5.0`, absent tag/release checks, fake release dialogue smoke, transcript validation, turn checks with `jq`, and release-prep anchor checks with `rg`.
 - `brew style --formula Formula/tmux-agent-tools.rb` was attempted from this non-tap working copy and rejected by Homebrew because formulae must be inside a tap; the Release workflow keeps the authoritative `brew style` gate.
 - Claude tmux-agent teammate reviewed the v0.5 release-prep diff, including the new release-readiness doc, and found no blockers with `VERDICT: SHIP`.
-- Pending for this branch: PR CI, merge, and Release workflow dry-run after merge.
+- PR #76 merged as `ed2c1a7`; feature branch CI run `25975327454` and main CI run `25975354971` passed.
+- Release workflow dry-run for `v0.5.0` passed in run `25975385734`: `validate` succeeded, `publish` was skipped, and both the `v0.5.0` tag and GitHub Release are still absent.
+- Claude tmux-agent teammate reviewed the v0.5 dry-run state sync diff and found no blockers with `VERDICT: SHIP`.
+- Pending for this branch: dry-run state sync PR, then explicit operator go/no-go before any non-dry-run Release workflow.
 
 ## v0.2.0 Candidate Scope
 
