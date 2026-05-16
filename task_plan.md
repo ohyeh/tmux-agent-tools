@@ -81,7 +81,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-transcript-schema-version` next
+Branch: `feature/v0.5-transcript-schema-version`
 
 Scope:
 
@@ -168,7 +168,9 @@ Verification evidence:
 - PR #57 merged as `854b51e`; main CI run `25972810785` passed.
 - Docs-only state validation passed on `feature/v0.5-exit-code-state`: `git diff --check`, workflow YAML name checks with `yq`, roadmap/task-plan anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
 - PR #58 merged as `46df23e`; main CI run `25972934251` passed.
-- Pending for next branch: transcript schema-version design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Transcript schema-version local validation passed on `feature/v0.5-transcript-schema-version`: `git diff --check`, workflow YAML name checks with `yq`, script syntax check, skill metadata validation, Formula syntax/style, wrapper self-tests, fake transcript default validation as schema version `1`, explicit `--schema-version 1` validation, unsupported `--schema-version 2` rejection before transcript reading, empty schema-version rejection, and `summarize --schema-version` rejection.
+- Claude tmux-agent teammate reviewed the transcript schema-version diff, found one CI stability blocker, then re-reviewed after fixes and found no blockers with `VERDICT: SHIP`.
+- Pending for this branch: PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 

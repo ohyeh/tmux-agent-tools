@@ -208,9 +208,10 @@ Validate a transcript before sharing or rendering it:
 
 ```bash
 tmux-agent-dialogue validate-transcript --transcript transcript.jsonl
+tmux-agent-dialogue validate-transcript --schema-version 1 --transcript transcript.jsonl
 ```
 
-The validator is local-only. It checks one JSON object per line, required `turn` and `failure` fields, known `failure_type` values when present, and emits line-level diagnostics for invalid JSONL or missing fields. `summarize` and `github-comment` reject invalid transcripts before rendering.
+The validator is local-only. The default validator behavior is schema version `1`; `--schema-version 1` pins the same contract explicitly, and unsupported schema versions fail without rewriting the transcript. It checks one JSON object per line, required `turn` and `failure` fields, known `failure_type` values when present, and emits line-level diagnostics for invalid JSONL or missing fields. `summarize` and `github-comment` reject invalid transcripts before rendering.
 
 Remote participant:
 
