@@ -19,14 +19,14 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
     runs-on: macos-latest
     timeout-minutes: 10
 
@@ -47,6 +47,10 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "release workflow must run from main; got ${GITHUB_REF}" >&2
+            exit 1
+          fi
           ruby -e 'abort("version must look like vX.Y.Z") unless ENV.fetch("VERSION").match?(/\Av\d+\.\d+\.\d+\z/)'
           if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
             echo "tag already exists: ${VERSION}" >&2
@@ -82,8 +86,45 @@ jobs:
           '
           rg -n "." release-notes.md
 
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "dry run: would create annotated tag and GitHub release for ${VERSION}"
+          echo "dry run: after the real release, open a follow-up Formula bump PR with the released archive SHA-256"
+
+  publish:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    needs: validate
+    if: ${{ !inputs.dry_run }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          ruby -e '
+            version = ENV.fetch("VERSION")
+            changelog = File.read("CHANGELOG.md")
+            pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## v|\z)/m
+            match = changelog.match(pattern)
+            abort("CHANGELOG.md is missing a #{version} section") unless match
+            body = match[:body].strip
+            abort("CHANGELOG.md #{version} section is empty") if body.empty?
+            File.write("release-notes.md", body + "\n")
+          '
+
       - name: Create tag and GitHub release
-        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
@@ -99,9 +140,21 @@ jobs:
           fi
           gh release create "$VERSION" --title "$VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"
 
-      - name: Dry-run summary
-        if: ${{ inputs.dry_run }}
+      - name: Summarize Homebrew formula bump
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          echo "dry run: would create annotated tag and GitHub release for ${VERSION}"
+          archive_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${VERSION}.tar.gz"
+          archive_path="$(mktemp)"
+          curl -fsSL "$archive_url" -o "$archive_path"
+          sha256="$(ruby -rdigest -e 'puts Digest::SHA256.file(ARGV.fetch(0)).hexdigest' "$archive_path")"
+          {
+            echo "## Homebrew formula bump"
+            echo
+            echo "Open a follow-up PR that updates:"
+            echo
+            echo '```ruby'
+            echo "url \"${archive_url}\""
+            echo "sha256 \"${sha256}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
