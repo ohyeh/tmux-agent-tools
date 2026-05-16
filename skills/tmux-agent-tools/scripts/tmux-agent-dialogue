@@ -22,8 +22,8 @@ usage() {
 tmux-agent-dialogue - run a bounded two-agent tmux dialogue
 
 Usage:
-  tmux-agent-dialogue --turns <n> --workdir <dir> --agent-a <codex|claude|fake> --agent-b <codex|claude|fake> --prompt-file <path> --transcript <path|-> [--timeout <seconds>]
-  tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--turns <n>] [--timeout <seconds>]
+  tmux-agent-dialogue --turns <n> --workdir <dir> --agent-a <codex|claude|fake> --agent-b <codex|claude|fake> --prompt-file <path> --transcript <path|-> [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>]
+  tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--timeout <seconds>]
 
 Example:
   tmux-agent-dialogue \
@@ -39,6 +39,7 @@ Behavior:
   - waits for a unique marker after each turn;
   - writes one JSONL object per turn;
   - pair-review is a thin two-turn preset and prints a local summary only;
+  - real participants can run locally or through the wrapper start-ssh mode;
   - cleans up sessions it created;
   - has no GitHub, network, or external publishing side effects.
 EOF
@@ -131,15 +132,41 @@ wrapper_for_agent() {
   esac
 }
 
+participant_ssh_target() {
+  local label="$1"
+  case "$label" in
+    a) print -r -- "$AGENT_A_SSH" ;;
+    b) print -r -- "$AGENT_B_SSH" ;;
+    *) die "unsupported participant label: $label" ;;
+  esac
+}
+
+participant_workdir() {
+  local label="$1"
+  case "$label" in
+    a) print -r -- "${AGENT_A_WORKDIR:-$WORKDIR}" ;;
+    b) print -r -- "${AGENT_B_WORKDIR:-$WORKDIR}" ;;
+    *) die "unsupported participant label: $label" ;;
+  esac
+}
+
 start_real_agent() {
   local label="$1"
   local agent="$2"
   local session
   local wrapper
+  local ssh_target
+  local agent_workdir
   session="$(session_name "$label")"
   wrapper="$(wrapper_for_agent "$agent")"
+  ssh_target="$(participant_ssh_target "$label")"
+  agent_workdir="$(participant_workdir "$label")"
   "$wrapper" stop "$session" >/dev/null 2>&1 || true
-  "$wrapper" start --exact "$session" "$WORKDIR" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+  if [[ -n "$ssh_target" ]]; then
+    "$wrapper" start-ssh --exact "$session" "$ssh_target" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+  else
+    "$wrapper" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+  fi
   OWNED_WRAPPERS+=("$agent:$session")
   "$wrapper" wait "$session" "$TIMEOUT" >/dev/null
 }
@@ -312,6 +339,10 @@ TURN_COUNT=0
 WORKDIR=""
 AGENT_A=""
 AGENT_B=""
+AGENT_A_SSH=""
+AGENT_B_SSH=""
+AGENT_A_WORKDIR=""
+AGENT_B_WORKDIR=""
 PROMPT_FILE=""
 TRANSCRIPT=""
 TIMEOUT=180
@@ -334,6 +365,10 @@ while (( $# > 0 )); do
     --workdir) WORKDIR="${2:-}"; shift 2 ;;
     --agent-a) AGENT_A="${2:-}"; shift 2 ;;
     --agent-b) AGENT_B="${2:-}"; shift 2 ;;
+    --agent-a-ssh) AGENT_A_SSH="${2:-}"; shift 2 ;;
+    --agent-b-ssh) AGENT_B_SSH="${2:-}"; shift 2 ;;
+    --agent-a-workdir) AGENT_A_WORKDIR="${2:-}"; shift 2 ;;
+    --agent-b-workdir) AGENT_B_WORKDIR="${2:-}"; shift 2 ;;
     --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
     --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
@@ -349,10 +384,24 @@ done
 [[ -n "$TRANSCRIPT" ]] || die "--transcript is required"
 [[ "$AGENT_A" == "codex" || "$AGENT_A" == "claude" || "$AGENT_A" == "fake" ]] || die "--agent-a must be codex, claude, or fake"
 [[ "$AGENT_B" == "codex" || "$AGENT_B" == "claude" || "$AGENT_B" == "fake" ]] || die "--agent-b must be codex, claude, or fake"
+[[ -z "$AGENT_A_SSH" || "$AGENT_A" != "fake" ]] || die "--agent-a-ssh cannot be used with --agent-a fake"
+[[ -z "$AGENT_B_SSH" || "$AGENT_B" != "fake" ]] || die "--agent-b-ssh cannot be used with --agent-b fake"
+[[ -z "$AGENT_A_SSH" || -n "$AGENT_A_WORKDIR" ]] || die "--agent-a-workdir is required when --agent-a-ssh is set"
+[[ -z "$AGENT_B_SSH" || -n "$AGENT_B_WORKDIR" ]] || die "--agent-b-workdir is required when --agent-b-ssh is set"
+[[ -z "$AGENT_A_SSH" || "$AGENT_A_WORKDIR" == /* ]] || die "--agent-a-workdir must be an absolute remote path when --agent-a-ssh is set"
+[[ -z "$AGENT_B_SSH" || "$AGENT_B_WORKDIR" == /* ]] || die "--agent-b-workdir must be an absolute remote path when --agent-b-ssh is set"
 
 require_tmux
 WORKDIR="${WORKDIR:A}"
 PROMPT_FILE="${PROMPT_FILE:A}"
+if [[ -z "$AGENT_A_SSH" && -n "$AGENT_A_WORKDIR" ]]; then
+  [[ -d "$AGENT_A_WORKDIR" ]] || die "--agent-a-workdir must be an existing directory for local participants"
+  AGENT_A_WORKDIR="${AGENT_A_WORKDIR:A}"
+fi
+if [[ -z "$AGENT_B_SSH" && -n "$AGENT_B_WORKDIR" ]]; then
+  [[ -d "$AGENT_B_WORKDIR" ]] || die "--agent-b-workdir must be an existing directory for local participants"
+  AGENT_B_WORKDIR="${AGENT_B_WORKDIR:A}"
+fi
 if [[ "$TRANSCRIPT" != "-" ]]; then
   TRANSCRIPT="${TRANSCRIPT:A}"
   mkdir -p "${TRANSCRIPT:h}"
