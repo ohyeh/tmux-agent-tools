@@ -82,7 +82,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-release-prep` next
+Branch: `feature/v0.5-release-prep`
 
 Scope:
 
@@ -193,7 +193,11 @@ Verification evidence:
 - v0.5 current-state refresh local validation passed on `feature/v0.5-current-state-refresh`: `git diff --check`, workflow YAML name check with `yq`, and roadmap/changelog/task-plan anchor checks with `rg` proving the unreleased `v0.5.0` changelog, all-planned-slices-landed status, no-tag/release/Formula-bump state, and next release-readiness dry-run path are documented.
 - Claude tmux-agent teammate reviewed the v0.5 current-state refresh diff and found no blockers with `VERDICT: SHIP`; the only duplicate release-notes wording observation was cleaned up before PR.
 - PR #74 merged as `d9c96da`; feature branch CI run `25975033756` and main CI run `25975062529` passed.
-- Pending for next branch: `v0.5.0` release-prep docs, local validation, Claude tmux-agent teammate review, PR CI, merge, and Release workflow dry-run after merge.
+- v0.5 release-prep branch created as `feature/v0.5-release-prep`.
+- v0.5 release-prep local validation passed on `feature/v0.5-release-prep`: `git diff --check`, workflow YAML name checks with `yq`, script syntax checks, Formula Ruby syntax check, wrapper self-tests, empty session inventory check with `jq`, release-notes extraction for `v0.5.0`, absent tag/release checks, fake release dialogue smoke, transcript validation, turn checks with `jq`, and release-prep anchor checks with `rg`.
+- `brew style --formula Formula/tmux-agent-tools.rb` was attempted from this non-tap working copy and rejected by Homebrew because formulae must be inside a tap; the Release workflow keeps the authoritative `brew style` gate.
+- Claude tmux-agent teammate reviewed the v0.5 release-prep diff, including the new release-readiness doc, and found no blockers with `VERDICT: SHIP`.
+- Pending for this branch: PR CI, merge, and Release workflow dry-run after merge.
 
 ## v0.2.0 Candidate Scope
 
