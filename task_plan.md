@@ -63,7 +63,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/critic-preset`
+Branch: `feature/critic-preset-cleanup`
 
 Scope:
 
@@ -79,7 +79,7 @@ Verification evidence:
 
 - Claude tmux-agent teammate recommends `critic` as the smallest useful P2 preset before `debate` or `handoff`.
 - Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, fake `critic` transcript/summary, and odd-turn rejection.
-- Claude tmux-agent final review reports no blockers.
+- Claude tmux-agent final review found two blockers: ambiguous `SKILL.md` github-comment placement and incomplete critic CI turn coverage. Both are fixed on this branch.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
