@@ -43,7 +43,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 
 `tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` sessions. `tmux-agent-sessions cleanup --preview` is also read-only; `cleanup --execute` is required before it stops tool-owned sessions, and execution must include `--all`, `--tool`, or `--name`. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
 
-Until the next tagged release, install `tmux-agent-sessions` with `brew install tmux-agent-tools --HEAD` or run the repo-local script.
+`tmux-agent-sessions` is included in the stable Homebrew install starting with `v0.3.0`.
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 

@@ -25,6 +25,20 @@ The workflow validates shell syntax, the Homebrew Formula, wrapper self-tests, a
 
 The dry-run validation job uses read-only repository permissions. The write permission is scoped to the publish job, which only runs when `dry_run` is explicitly set to `false`.
 
+## Go / No-Go Checklist
+
+Before running the Release workflow with `dry_run: false`, confirm:
+
+- the release PR is merged into `main`;
+- the latest `main` CI run is green;
+- the Release workflow dry-run for the same version is green;
+- `git ls-remote --tags origin refs/tags/<version>` returns no tag;
+- `gh release view <version>` returns no release;
+- manual real-agent release evidence is recorded when the release includes real Claude/Codex behavior;
+- the operator understands that `dry_run: false` creates a public annotated tag and GitHub Release.
+
+Do not treat bot review comments as release blockers unless they identify a correctness, safety, CI, documentation-contract, or packaging issue. Low-value style suggestions should be ignored instead of delaying the release.
+
 ## Formula Bump PR
 
 After the workflow creates the tag and GitHub Release, use the workflow run summary to open a follow-up Formula PR. The summary includes the released archive URL and SHA-256.

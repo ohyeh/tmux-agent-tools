@@ -1,8 +1,8 @@
 class TmuxAgentTools < Formula
   desc "Tmux wrappers for controllable Claude Code and Codex CLI sessions"
   homepage "https://github.com/ohyeh/tmux-agent-tools"
-  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "a9c5aab558ee306727215feb7a5146aa50132360a00e7a9a6c4d7c5627962a55"
+  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "7447ce4f8f88a8da2f2c8b0a610c68754886f642c63cc82f6a5749b7b8041318"
   head "https://github.com/ohyeh/tmux-agent-tools.git", branch: "main"
 
   depends_on "jq"
@@ -15,7 +15,7 @@ class TmuxAgentTools < Formula
     bin.install "skills/tmux-agent-tools/scripts/claude-tmux"
     bin.install "skills/tmux-agent-tools/scripts/codex-tmux"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dialogue"
-    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-sessions" if build.head?
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-sessions"
     pkgshare.install "skills"
   end
 
@@ -24,10 +24,8 @@ class TmuxAgentTools < Formula
     assert_match "codex-tmux - run Codex CLI in tmux", shell_output("#{bin}/codex-tmux help")
     assert_match "tmux-agent-dialogue - run a bounded two-agent tmux dialogue",
                  shell_output("#{bin}/tmux-agent-dialogue help")
-    if build.head?
-      assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",
-                   shell_output("#{bin}/tmux-agent-sessions help")
-    end
+    assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",
+                 shell_output("#{bin}/tmux-agent-sessions help")
 
     transcript = testpath/"transcript.jsonl"
     transcript.write <<~JSONL

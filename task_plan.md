@@ -6,9 +6,9 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Success Criteria
 
-- `v0.2.0` tag exists on the verified orchestration commit.
-- Homebrew formula supports stable `v0.2.0` install without `--HEAD`.
-- `brew install tmux-agent-tools` installs `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` from the tap.
+- `v0.3.0` tag exists on the verified session hygiene and transcript usability commit.
+- Homebrew formula supports stable `v0.3.0` install without `--HEAD`.
+- `brew install tmux-agent-tools` installs `claude-tmux`, `codex-tmux`, `tmux-agent-dialogue`, and `tmux-agent-sessions` from the tap.
 - `npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools` can discover the skill.
 - True Codex/Claude tmux communication remains verified.
 - Next release branch exists and has a concrete scope.
@@ -18,10 +18,10 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 ## Current State
 
 - Repo: `ohyeh/tmux-agent-tools`
-- Release tag: `v0.2.0`
-- Release tag URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.2.0`
+- Release tag: `v0.3.0`
+- Release tag URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.3.0`
 - Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, and explicit GitHub comment helper support.
-- Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`, `tmux-agent-dialogue`
+- Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`, `tmux-agent-dialogue`, `tmux-agent-sessions`
 - Verified install surfaces: `skills.sh`, stable Homebrew, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
 - Branch protection: `main` requires PR flow; force push and branch deletion are disabled.
@@ -65,16 +65,18 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 27. Merge roadmap refresh through PR #29, soft-wrap capture normalization through PR #30, clipboard mode override through PR #31, and human copy-mode UX hardening through PR #32. Done.
 28. Merge task-plan release state through PR #33 and v0.3 real-agent release evidence through PR #34. Done.
 29. Merge `v0.3.0` release notes through PR #35 (`6516e7c`). Done.
+30. Merge `v0.3.0` Release workflow dry-run state through PR #36 (`97a629f`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.3.0-release-dry-run-state`
+Branch: `feature/v0.3-formula-bump`
 
 Scope:
 
-- record the release-prep PR as complete;
-- run and record the `Release` workflow dry-run for `v0.3.0`;
-- keep Formula stable URL/SHA unchanged until the non-dry-run Release workflow creates the `v0.3.0` tag and archive SHA;
+- add an explicit release go/no-go checklist before future non-dry-run releases;
+- bump the Homebrew Formula stable URL/SHA to the published `v0.3.0` archive;
+- include `tmux-agent-sessions` in the stable Homebrew install and Formula test;
+- keep bot review handling evidence-based instead of accepting low-value comments by default;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -88,7 +90,13 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the release-prep diff and found no blockers.
 - Release workflow dry-run for `v0.3.0` passed in run `25963410344`: `validate` succeeded, `publish` was skipped, and `refs/tags/v0.3.0` is still absent.
 - Claude tmux-agent teammate reviewed this dry-run state update and found no blockers.
-- Pending for this branch: PR CI; non-dry-run release requires explicit approval because it creates the public tag and GitHub Release.
+- PR #36 merged as `97a629f`; main CI run `25963504552` passed.
+- Release workflow non-dry-run for `v0.3.0` passed in run `25963549877`: `validate` and `publish` succeeded.
+- GitHub Release exists: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.3.0`.
+- Release archive SHA-256 for `https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.3.0.tar.gz` is `7447ce4f8f88a8da2f2c8b0a610c68754886f642c63cc82f6a5749b7b8041318`.
+- Local Formula validation passed against a tap clone of this branch: `brew reinstall --build-from-source ohyeh/tmux-agent-tools/tmux-agent-tools`, `brew test`, and `brew info` all reported `0.3.0`; the installed commands include `claude-tmux`, `codex-tmux`, `tmux-agent-dialogue`, and `tmux-agent-sessions`.
+- Claude tmux-agent teammate reviewed the Formula bump diff, independently recomputed the `v0.3.0` archive SHA-256, and found no blockers. The human tmux copy/mouse UX concern is a valid follow-up, but does not block this release Formula bump.
+- Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 
