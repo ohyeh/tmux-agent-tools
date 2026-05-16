@@ -82,11 +82,11 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-profile-timeout-overrides` next
+Branch: `feature/v0.5-profile-timeout-overrides`
 
 Scope:
 
-- start the next v0.5 operator-ergonomics slice: participant profile per-agent timeout overrides;
+- implement the next v0.5 operator-ergonomics slice: participant profile per-agent timeout overrides;
 - keep profile timeout overrides bounded and explicit without changing default timeout behavior;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
@@ -181,7 +181,9 @@ Verification evidence:
 - Cleanup preview coverage local validation passed on `feature/v0.5-cleanup-preview-coverage`: `zsh -n` for `tmux-agent-sessions`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and local tmux smoke proving `cleanup --preview --json` covers all owned sessions, `--tool claude`, `--tool dialogue`, and `--name ci-hygiene`, excludes unrelated sessions, leaves previewed sessions alive, and rejects `cleanup --execute --json`.
 - Claude tmux-agent teammate reviewed the cleanup preview coverage diff and found no blockers with `VERDICT: SHIP`.
 - PR #66 merged as `1b482fc`; feature branch CI run `25974048560` and main CI run `25974086394` passed.
-- Pending for next branch: profile timeout override design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Profile timeout override local validation passed on `feature/v0.5-profile-timeout-overrides`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and fake profile timeout smoke proving `timeout:"1"` triggers a per-profile `marker_timeout` transcript while non-integer and zero timeout profile values are rejected.
+- Claude tmux-agent teammate reviewed the profile timeout override diff, initially raised a zsh regex robustness blocker, then re-reviewed after the regex fix and found no blockers with `VERDICT: SHIP`.
+- Pending on `feature/v0.5-profile-timeout-overrides`: PR CI, merge, main CI, and post-merge state sync.
 
 ## v0.2.0 Candidate Scope
 
