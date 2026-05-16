@@ -23,6 +23,7 @@ tmux-agent-dialogue - run a bounded two-agent tmux dialogue
 
 Usage:
   tmux-agent-dialogue --turns <n> --workdir <dir> --agent-a <codex|claude|fake> --agent-b <codex|claude|fake> --prompt-file <path> --transcript <path|-> [--timeout <seconds>]
+  tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--turns <n>] [--timeout <seconds>]
 
 Example:
   tmux-agent-dialogue \
@@ -37,6 +38,7 @@ Behavior:
   - alternates turns between agent A and agent B;
   - waits for a unique marker after each turn;
   - writes one JSONL object per turn;
+  - pair-review is a thin two-turn preset and prints a local summary only;
   - cleans up sessions it created;
   - has no GitHub, network, or external publishing side effects.
 EOF
@@ -247,6 +249,20 @@ record_marker_timeout() {
   append_failure_jsonl "$turn" "$speaker" "$agent" "$marker" "$tail_text"
 }
 
+print_pair_review_summary() {
+  [[ "$TRANSCRIPT" != "-" ]] || return 0
+
+  "$JQ" -r '
+    def tail_lines:
+      split("\n")
+      | map(select(length > 0))
+      | .[-8:]
+      | join("\n");
+    "pair-review complete: transcript=\($transcript)",
+    (.[] | select(.event == "turn") | "\n[\(.speaker) / \(.agent) / turn \(.turn)]\n\(.text | tail_lines)")
+  ' --arg transcript "$TRANSCRIPT" -s "$TRANSCRIPT" >&2
+}
+
 cleanup() {
   local item
   if (( ${#OWNED_WRAPPERS[@]} )); then
@@ -299,9 +315,18 @@ AGENT_B=""
 PROMPT_FILE=""
 TRANSCRIPT=""
 TIMEOUT=180
+MODE="dialogue"
 RUN_ID="${$}-$(date -u '+%Y%m%d%H%M%S')"
 OWNED_SESSIONS=()
 OWNED_WRAPPERS=()
+
+if [[ "${1:-}" == "pair-review" ]]; then
+  MODE="pair-review"
+  TURN_COUNT=2
+  AGENT_A="codex"
+  AGENT_B="claude"
+  shift
+fi
 
 while (( $# > 0 )); do
   case "$1" in
@@ -387,3 +412,6 @@ $previous")"
 done
 
 echo "dialogue complete: turns=$TURN_COUNT transcript=$TRANSCRIPT" >&2
+if [[ "$MODE" == "pair-review" ]]; then
+  print_pair_review_summary
+fi

@@ -151,6 +151,14 @@ Credential-free smoke:
 tmux-agent-dialogue --turns 2 --workdir . --agent-a fake --agent-b fake --prompt-file prompt.md --transcript transcript.jsonl
 ```
 
+Pair-review preset:
+
+```bash
+tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
+```
+
+`pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. It does not post GitHub comments, merge PRs, or publish externally.
+
 ## Requirements
 
 - `zsh`

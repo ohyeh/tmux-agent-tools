@@ -47,25 +47,18 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/real-dialogue-marker-sync`
+Branch: `feature/pair-review-preset`
 
 Scope:
 
-- add `send-wait-literal` so marker orchestration waits for a new post-send occurrence instead of stale pane text;
-- add paste-submit settling for multiline prompts, with `CLAUDE_TMUX_SUBMIT_DELAY` and `CODEX_TMUX_SUBMIT_DELAY` overrides;
-- harden the real-agent split-marker contract with a required standalone final marker line;
-- preserve timeout evidence through a `failure` JSONL event and captured pane tail;
-- keep docs explicit that fake participants are CI-covered and real Codex/Claude dialogue remains manual release evidence, not default CI.
+- add the P1 `pair-review` preset as a thin wrapper over `tmux-agent-dialogue`;
+- default `pair-review` to a two-turn Codex-to-Claude exchange while allowing explicit agent overrides for credential-free tests;
+- write the normal JSONL transcript and print a concise local terminal summary;
+- keep the preset local-only: no GitHub comments, no merge, no publishing.
 
 Verification evidence:
 
-- `zsh -n` passes for all wrapper scripts and `tmux-agent-dialogue`.
-- Wrapper self-tests pass for both `codex-tmux` and `claude-tmux`, including `send-wait-literal`.
-- Fake dialogue smoke passes for 4 turns and each transcript turn includes the processed fake participant output.
-- Live real Codex-to-Claude 2-turn smoke passed on 2026-05-16 after paste-submit settling: both turns matched new post-send markers and wrote two `turn` JSONL events.
-- Skill validation passes for `skills/tmux-agent-tools`.
-- `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
-- Pending for this branch: PR CI.
+- Pending for this branch: `zsh -n`, fake `pair-review` smoke, skill validation, formula validation, PR CI.
 
 ## v0.2.0 Candidate Scope
 
