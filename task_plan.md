@@ -59,27 +59,28 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 21. Merge failure classification through PR #20. Done.
 22. Merge safer transcript sharing through PR #21. Done.
 23. Merge stable status JSON through PR #22. Done.
+24. Merge participant profiles through PR #23 and profile docs cleanup through PR #24. Done.
 
 ## Active Work
 
-Branch: `feature/participant-profiles`
+Branch: `feature/critic-preset`
 
 Scope:
 
-- add `tmux-agent-dialogue --agent-a-profile` and `--agent-b-profile`;
-- read generic participant defaults from `TMUX_AGENT_TOOLS_PARTICIPANTS`, `--participants-config`, or `~/.config/tmux-agent-tools/participants.json`;
-- support only `agent`, `ssh`, and `workdir` profile fields;
-- keep command-line flags higher precedence than profile values;
-- reuse existing participant validation for fake SSH rejection, remote absolute workdirs, and local directory existence;
+- add `tmux-agent-dialogue critic` as a thin preset over the existing bounded dialogue runner;
+- default `critic` to four turns with Codex/Claude defaults that remain overrideable;
+- require custom `critic --turns` values to be positive even numbers;
+- keep output local-only: transcript plus optional local summary file, no hidden GitHub posting, merging, scheduling, or unbounded loops;
+- add CI coverage for successful fake critic transcript/summary and odd-turn rejection;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate agrees this is the smallest useful P2 profile slice and calls out profile-not-found, parse errors, fake SSH, workdir validation, and CLI override tests.
-- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, profile-driven fake dialogue, CLI workdir override, missing profile failure, unknown profile key failure, non-string profile value failure, and fake SSH rejection.
-- Claude tmux-agent final review reports no blockers; it recommended tightening the usage line to show profile alternatives, which is done.
-- PR #23 CI passed and the participant profiles slice is merged.
+- Claude tmux-agent teammate recommends `critic` as the smallest useful P2 preset before `debate` or `handoff`.
+- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, fake `critic` transcript/summary, and odd-turn rejection.
+- Claude tmux-agent final review reports no blockers.
+- Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 

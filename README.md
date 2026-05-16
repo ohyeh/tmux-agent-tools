@@ -227,6 +227,14 @@ tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript
 
 `pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. It does not post GitHub comments, merge PRs, or publish externally by default.
 
+Critic preset:
+
+```bash
+tmux-agent-dialogue critic --workdir . --prompt-file review.md --transcript critic.jsonl
+```
+
+`critic` is a thin four-turn preset over the same bounded dialogue runner. Agent A critiques on odd turns, agent B responds on even turns, and `--turns` may be overridden only with a positive even number. Like `pair-review`, it only writes local transcript/summary output and has no hidden GitHub posting, merging, scheduling, or unbounded loop behavior.
+
 Write the local summary to a file:
 
 ```bash
