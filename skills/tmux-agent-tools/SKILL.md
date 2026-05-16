@@ -9,6 +9,8 @@ description: Use when Codex needs to run, supervise, or coordinate Claude Code o
 
 Use `claude-tmux` and `codex-tmux` as the canonical interface for long-running Claude Code or Codex CLI sessions in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, and cleanup commands.
 
+Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
+
 The wrapper scripts are bundled with this skill at:
 
 - `scripts/claude-tmux`

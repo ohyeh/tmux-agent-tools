@@ -42,7 +42,7 @@ Ship the verified tmux-agent-tools MVP as `v0.1.0`, then prepare the next reliab
 
 ## Next Branch Scope
 
-Branch: `feature/reliability-primitives`
+Branch: `feature/local-exit-diagnostics`
 
 Candidate work:
 
@@ -51,4 +51,4 @@ Candidate work:
 - `self-test` - done
 - session metadata/structured status - done
 - better Claude first-run confirmation handling
-- local hold-on-exit diagnostics
+- local hold-on-exit diagnostics - done
