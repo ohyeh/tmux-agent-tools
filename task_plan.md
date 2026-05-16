@@ -20,7 +20,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - Release tag: `v0.1.0`
 - Release URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.1.0`
 - Current main includes CI smoke checks and Node 24 checkout action updates.
-- Verified commands: `start`, `start-ssh`, `send`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`
+- Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`
 - Verified install surfaces: `skills.sh`, stable Homebrew, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
 - Branch protection: `main` requires PR flow; force push and branch deletion are disabled.
@@ -47,29 +47,32 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/dialogue-runner-hardening`
+Branch: `feature/real-dialogue-marker-sync`
 
 Scope:
 
-- make CI runtime tool installation idempotent;
-- mark the first dialogue runner MVP as merged;
-- correct docs so fake participants are the verified path and real Codex/Claude dialogue remains the next hardening gap before release.
+- add `send-wait-literal` so marker orchestration waits for a new post-send occurrence instead of stale pane text;
+- add paste-submit settling for multiline prompts, with `CLAUDE_TMUX_SUBMIT_DELAY` and `CODEX_TMUX_SUBMIT_DELAY` overrides;
+- harden the real-agent split-marker contract with a required standalone final marker line;
+- preserve timeout evidence through a `failure` JSONL event and captured pane tail;
+- keep docs explicit that fake participants are CI-covered and real Codex/Claude dialogue remains manual release evidence, not default CI.
 
 Verification evidence:
 
-- `zsh -n` passes for all scripts, including `tmux-agent-dialogue`.
+- `zsh -n` passes for all wrapper scripts and `tmux-agent-dialogue`.
+- Wrapper self-tests pass for both `codex-tmux` and `claude-tmux`, including `send-wait-literal`.
+- Fake dialogue smoke passes for 4 turns and each transcript turn includes the processed fake participant output.
+- Live real Codex-to-Claude 2-turn smoke passed on 2026-05-16 after paste-submit settling: both turns matched new post-send markers and wrote two `turn` JSONL events.
 - Skill validation passes for `skills/tmux-agent-tools`.
 - `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
-- Branch-local `doctor` and `self-test` pass for both wrappers.
-- `tmux-agent-dialogue --agent-a fake --agent-b fake --turns 2` writes valid JSONL and cleans up owned tmux sessions.
-- Real Codex/Claude smoke was attempted but not counted as passing: sessions started and cleaned up, but Codex did not return the turn marker. Keep real-agent dialogue as the next hardening gap before release.
-- Main CI passed after PR #7 merge.
+- Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 
 P0:
 
 - `wait-text --literal` alias for exact marker waits;
+- `send-wait-literal` to wait for a new literal after a prompt send;
 - Claude first-run/permission confirmation diagnostics in `status`;
 - `dialogue` runner for bounded Codex/Claude ping-pong using existing wrappers - first local MVP merged;
 - transcript file output with timestamps, speaker, marker, and captured text - first local MVP merged;

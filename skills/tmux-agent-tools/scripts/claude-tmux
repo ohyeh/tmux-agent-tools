@@ -5,6 +5,7 @@ SELF="${0:A}"
 CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || true)}"
 PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
 STABLE_SECONDS="${CLAUDE_TMUX_STABLE_SECONDS:-3}"
+SUBMIT_DELAY="${CLAUDE_TMUX_SUBMIT_DELAY:-0.2}"
 TMUX_CONF="${CLAUDE_TMUX_CONF:-${TMPDIR:-/tmp}/claude-tmux.tmux.conf}"
 TMUX_MOUSE="${CLAUDE_TMUX_MOUSE:-on}"
 
@@ -29,6 +30,7 @@ Usage:
   claude-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
   claude-tmux attach <name>
   claude-tmux send <name> <text>
+  claude-tmux send-wait-literal <name> <text> <literal> [timeout_seconds]
   claude-tmux wait <name> [timeout_seconds]
   claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]
   claude-tmux wait-literal <name> <text> [timeout_seconds]
@@ -46,6 +48,7 @@ Examples:
   claude-tmux start --exact pr5 ~/github/core-parking-service 'hi'
   claude-tmux attach pr5
   claude-tmux send pr5 '請先讀 PR description'
+  claude-tmux send-wait-literal pr5 'Reply with the requested marker.' '[CLAUDE-01]' 180
   claude-tmux wait pr5 180
   claude-tmux wait-text pr5 'Done|Need approval' 180
   claude-tmux wait-text --literal pr5 '[CLAUDE-01]' 180
@@ -66,6 +69,7 @@ Behavior:
   - wait-text returns when the visible pane matches a zsh extended regex.
   - wait-text --literal returns when the visible pane contains exact text.
   - wait-literal returns when the visible pane contains exact text.
+  - send-wait-literal sends text, then waits for a new occurrence of exact text.
   - capture reads the tmux pane without stealing browser or terminal focus.
 
 Environment:
@@ -73,6 +77,7 @@ Environment:
   CLAUDE=$(command -v claude)
   CLAUDE_TMUX_PREFIX=claude-cli
   CLAUDE_TMUX_STABLE_SECONDS=3
+  CLAUDE_TMUX_SUBMIT_DELAY=0.2
   CLAUDE_TMUX_CONF=/tmp/claude-tmux.tmux.conf
   CLAUDE_TMUX_MOUSE=on
 EOF
@@ -158,6 +163,21 @@ shell_quote() {
   printf "%q" "$1"
 }
 
+paste_and_submit() {
+  local session="$1"
+  local buffer_name="$2"
+  local prompt_text="$3"
+
+  printf "%s" "$prompt_text" | "$TMUX" load-buffer -b "$buffer_name" -
+  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+  sleep "$SUBMIT_DELAY"
+  "$TMUX" send-keys -t "$session" Enter
+  if [[ "$prompt_text" == *$'\n'* ]]; then
+    sleep "$SUBMIT_DELAY"
+    "$TMUX" send-keys -t "$session" Enter
+  fi
+}
+
 start_session() {
   require_bins
   write_tmux_conf
@@ -215,9 +235,7 @@ start_session() {
   if [[ -n "$initial_text" ]]; then
     sleep 3
     local buffer_name="$session-init"
-    printf "%s" "$initial_text" | "$TMUX" load-buffer -b "$buffer_name" -
-    "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
-    "$TMUX" send-keys -t "$session" Enter
+    paste_and_submit "$session" "$buffer_name" "$initial_text"
     echo "sent: $initial_text"
   else
     echo "sent: <none>"
@@ -286,9 +304,7 @@ start_ssh_session() {
   if [[ -n "$initial_text" ]]; then
     sleep 5
     local buffer_name="$session-init"
-    printf "%s" "$initial_text" | "$TMUX" load-buffer -b "$buffer_name" -
-    "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
-    "$TMUX" send-keys -t "$session" Enter
+    paste_and_submit "$session" "$buffer_name" "$initial_text"
     echo "sent: $initial_text"
   else
     echo "sent: <none>"
@@ -335,10 +351,70 @@ send_session() {
 
   local prompt_text="$*"
   local buffer_name="$session-send"
-  printf "%s" "$prompt_text" | "$TMUX" load-buffer -b "$buffer_name" -
-  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
-  "$TMUX" send-keys -t "$session" Enter
+  paste_and_submit "$session" "$buffer_name" "$prompt_text"
   echo "Sent to $session: $prompt_text"
+}
+
+count_literal_occurrences() {
+  local haystack="$1"
+  local needle="$2"
+  local count=0
+  local rest="$haystack"
+
+  while [[ "$rest" == *"$needle"* ]]; do
+    rest="${rest#*"$needle"}"
+    count=$((count + 1))
+  done
+
+  echo "$count"
+}
+
+send_wait_literal_session() {
+  require_tmux
+  local name="${1:-}"
+  local prompt_text="${2:-}"
+  local needle="${3:-}"
+  local timeout_seconds="${4:-180}"
+
+  if [[ -z "$name" || -z "$prompt_text" || -z "$needle" ]]; then
+    echo "Usage: claude-tmux send-wait-literal <name> <text> <literal> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local before="$("$TMUX" capture-pane -t "$session" -p -S -300)"
+  local before_count
+  before_count="$(count_literal_occurrences "$before" "$needle")"
+
+  local buffer_name="$session-send-wait"
+  paste_and_submit "$session" "$buffer_name" "$prompt_text"
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+  local current_count=0
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -t "$session" -p -S -300)"
+    current_count="$(count_literal_occurrences "$current" "$needle")"
+    if (( current_count > before_count )); then
+      echo "matched new literal: $needle"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "timeout waiting for new literal text '$needle': $session" >&2
+  return 1
 }
 
 capture_session() {
@@ -502,6 +578,7 @@ doctor_session() {
   fi
   echo "prefix: $PREFIX"
   echo "stable_seconds: $STABLE_SECONDS"
+  echo "submit_delay: $SUBMIT_DELAY"
   echo "tmux_conf: $TMUX_CONF"
   echo "mouse: $TMUX_MOUSE"
 }
@@ -530,9 +607,10 @@ self_test_session() {
   local name="self-test-$$"
   local session="$(session_for_name "$name")"
   "$TMUX" kill-session -t "$session" 2>/dev/null || true
-  "$TMUX" new-session -d -s "$session" "printf '%s\n' 'TMUX_AGENT_TOOLS_SELF_TEST_OK' '[TMUX_AGENT_TOOLS_SELF_TEST_OK]'; sleep 5"
+  "$TMUX" new-session -d -s "$session" "zsh -lc 'printf \"%s\n\" \"TMUX_AGENT_TOOLS_SELF_TEST_OK\" \"[TMUX_AGENT_TOOLS_SELF_TEST_OK]\"; if IFS= read -r line; then printf \"%s\n\" \"echo:\$line\" \"[TMUX_AGENT_TOOLS_SEND_WAIT_OK]\"; fi; sleep 5'"
   wait_literal_session "$name" "TMUX_AGENT_TOOLS_SELF_TEST_OK" 5
   wait_text_session --literal "$name" "[TMUX_AGENT_TOOLS_SELF_TEST_OK]" 5
+  send_wait_literal_session "$name" $'trigger send-wait\nsecond line' "[TMUX_AGENT_TOOLS_SEND_WAIT_OK]" 5
   "$TMUX" kill-session -t "$session" 2>/dev/null || true
   echo "self-test: ok"
 }
@@ -625,6 +703,9 @@ case "$command" in
     ;;
   send)
     send_session "$@"
+    ;;
+  send-wait-literal)
+    send_wait_literal_session "$@"
     ;;
   wait)
     wait_session "$@"

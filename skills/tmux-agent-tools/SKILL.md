@@ -46,6 +46,7 @@ codex-tmux start --exact worker ~/github/project 'Read the repo and report the f
 
 ```bash
 codex-tmux send worker 'Now implement the smallest fix and run the targeted test.'
+codex-tmux send-wait-literal worker 'End with the split marker described here.' '[CODEX-01]' 180
 ```
 
 3. Wait for visible pane stability before reading output:
@@ -57,6 +58,8 @@ codex-tmux wait-text --literal worker '[CODEX-01]' 180
 codex-tmux wait-literal worker '[CODEX-01]' 180
 codex-tmux capture worker 120
 ```
+
+Use `send-wait-literal` for marker-driven orchestration when stale pane content may already contain an older marker. Keep the literal out of the sent prompt or split it in the prompt instructions so the prompt echo itself cannot satisfy the wait. If multiline prompts remain in a CLI input box instead of submitting, increase `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY`.
 
 4. Inspect status or clean up:
 
@@ -81,6 +84,8 @@ For a manual real-agent smoke after explicit authorization:
 ```bash
 tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
 ```
+
+Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. If a marker wait times out, inspect the emitted `failure` JSONL event and captured pane tail before treating the run as a protocol failure.
 
 ## Session Naming
 

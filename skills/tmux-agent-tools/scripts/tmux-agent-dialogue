@@ -71,6 +71,30 @@ append_jsonl() {
   fi
 }
 
+append_failure_jsonl() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local text="$5"
+  local line
+  line="$("$JQ" -cn \
+    --arg event "failure" \
+    --argjson turn "$turn" \
+    --arg speaker "$speaker" \
+    --arg agent "$agent" \
+    --arg marker "$marker" \
+    --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg text "$text" \
+    '{event:$event,turn:$turn,speaker:$speaker,agent:$agent,marker:$marker,timestamp:$timestamp,text:$text}')"
+
+  if [[ "$TRANSCRIPT" == "-" ]]; then
+    print -r -- "$line"
+  else
+    print -r -- "$line" >> "$TRANSCRIPT"
+  fi
+}
+
 require_tmux() {
   command -v "$TMUX" >/dev/null 2>&1 || die "tmux not found"
   [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
@@ -113,7 +137,7 @@ start_real_agent() {
   session="$(session_name "$label")"
   wrapper="$(wrapper_for_agent "$agent")"
   "$wrapper" stop "$session" >/dev/null 2>&1 || true
-  "$wrapper" start --exact "$session" "$WORKDIR" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt."
+  "$wrapper" start --exact "$session" "$WORKDIR" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
   OWNED_WRAPPERS+=("$agent:$session")
   "$wrapper" wait "$session" "$TIMEOUT" >/dev/null
 }
@@ -130,17 +154,33 @@ send_to_agent() {
   fi
 }
 
+send_and_wait_for_marker() {
+  local label="$1"
+  local agent="$2"
+  local message="$3"
+  local marker="$4"
+
+  if [[ "$agent" == "fake" ]]; then
+    send_to_agent "$label" "$agent" "$message"
+    wait_for_marker "$label" "$agent" "$marker" "fake-${label}: ${message%% MARKER:*}"
+    return
+  fi
+
+  "$(wrapper_for_agent "$agent")" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$TIMEOUT"
+}
+
 wait_for_marker() {
   local label="$1"
   local agent="$2"
   local marker="$3"
+  local processed="${4:-}"
 
   if [[ "$agent" == "fake" ]]; then
     local deadline=$((SECONDS + TIMEOUT))
     local current=""
     while (( SECONDS < deadline )); do
       current="$("$TMUX" capture-pane -t "$(session_name "$label")" -p -S -200)"
-      if [[ "$current" == *"$marker"* ]]; then
+      if [[ "$current" == *"$processed"* && "$current" == *"$marker"* ]]; then
         return 0
       fi
       sleep 1
@@ -160,6 +200,51 @@ capture_agent() {
   else
     "$(wrapper_for_agent "$agent")" capture "$(session_name "$label")" 1000
   fi
+}
+
+capture_agent_tail() {
+  local label="$1"
+  local agent="$2"
+  local lines="${3:-80}"
+
+  capture_agent "$label" "$agent" | tail -n "$lines"
+}
+
+summarize_previous() {
+  local captured="$1"
+  local max_lines=24
+  local -a lines
+  local start=1
+  local i
+  local line
+
+  lines=("${(@f)captured}")
+  if (( ${#lines[@]} > max_lines )); then
+    start=$(( ${#lines[@]} - max_lines + 1 ))
+  fi
+
+  for (( i = start; i <= ${#lines[@]}; i++ )); do
+    line="${lines[$i]}"
+    [[ "$line" == \[TMUX_AGENT_DIALOGUE_*_DONE\] ]] && continue
+    print -r -- "$line"
+  done
+}
+
+record_marker_timeout() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local label="$5"
+  local tail_text
+
+  tail_text="$(capture_agent_tail "$label" "$agent" 80 2>/dev/null || true)"
+  echo "$SELF: timeout waiting for $label turn $turn marker: $marker" >&2
+  if [[ -n "$tail_text" ]]; then
+    echo "$SELF: captured tail for $speaker follows:" >&2
+    print -r -- "$tail_text" >&2
+  fi
+  append_failure_jsonl "$turn" "$speaker" "$agent" "$marker" "$tail_text"
 }
 
 cleanup() {
@@ -197,8 +282,13 @@ Initial/user prompt and previous response:
 $previous
 
 Respond concisely for this turn. End your response with the marker formed by joining these two parts with no spaces:
-$marker_a
-$marker_b
+PART_A: $marker_a
+PART_B: $marker_b
+
+Required final line shape:
+PART_A + PART_B
+
+The final line must contain only the joined marker, with no quotes, no Markdown fence, no spaces, and no extra commentary.
 EOF
 }
 
@@ -280,18 +370,20 @@ Previous response:
 $previous")"
 
   if [[ "$agent" == "fake" ]]; then
-    send_to_agent "$label" "$agent" "turn ${turn} received MARKER:${marker}"
+    if ! send_and_wait_for_marker "$label" "$agent" "turn ${turn} received MARKER:${marker}" "$marker"; then
+      record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+      exit 1
+    fi
   else
-    send_to_agent "$label" "$agent" "$prompt"
-  fi
-
-  if ! wait_for_marker "$label" "$agent" "$marker"; then
-    die "timeout waiting for $label turn $turn marker: $marker"
+    if ! send_and_wait_for_marker "$label" "$agent" "$prompt" "$marker"; then
+      record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+      exit 1
+    fi
   fi
 
   captured="$(capture_agent "$label" "$agent")"
   append_jsonl "$turn" "$speaker" "$agent" "$marker" "$captured"
-  previous="$captured"
+  previous="$(summarize_previous "$captured")"
 done
 
 echo "dialogue complete: turns=$TURN_COUNT transcript=$TRANSCRIPT" >&2
