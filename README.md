@@ -5,7 +5,7 @@ Small tmux wrappers for running Claude Code and Codex CLI as controllable named 
 This repository is both:
 
 - a `skills.sh` compatible skill package;
-- a Homebrew formula source for installing `claude-tmux` and `codex-tmux` commands on macOS or Linuxbrew.
+- a Homebrew formula source for installing `claude-tmux`, `codex-tmux`, and unreleased `--HEAD` tools on macOS or Linuxbrew.
 
 ## Inspired By
 
@@ -20,8 +20,9 @@ This project is inspired by two tmux skills in the `skills.sh` ecosystem:
 
 - `claude-tmux`: starts Claude Code in tmux with `--dangerously-skip-permissions`.
 - `codex-tmux`: starts Codex CLI in tmux with `--yolo`.
+- `tmux-agent-dialogue`: runs a bounded two-party tmux dialogue and writes a JSONL transcript.
 
-Both tools support:
+The `claude-tmux` and `codex-tmux` wrapper tools support:
 
 - `start`
 - `start-ssh`
@@ -39,6 +40,8 @@ Both tools support:
 - `help`
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
+
+`tmux-agent-dialogue` is local-only in the first implementation. It can run real `codex`/`claude` participants through the wrappers or credential-free `fake` participants for smoke tests. Until the next tagged release, install it with `brew install tmux-agent-tools --HEAD` or run the repo-local script.
 
 ## Install Skill With skills.sh
 
@@ -124,6 +127,24 @@ Remote run with local tmux:
 
 ```bash
 claude-tmux start-ssh --exact review openclaw-macmini ~/github/project 'Review the diff.'
+```
+
+Bounded dialogue with JSONL transcript:
+
+```bash
+tmux-agent-dialogue \
+  --turns 4 \
+  --workdir . \
+  --agent-a codex \
+  --agent-b claude \
+  --prompt-file prompt.md \
+  --transcript transcript.jsonl
+```
+
+Credential-free smoke:
+
+```bash
+tmux-agent-dialogue --turns 2 --workdir . --agent-a fake --agent-b fake --prompt-file prompt.md --transcript transcript.jsonl
 ```
 
 ## Requirements

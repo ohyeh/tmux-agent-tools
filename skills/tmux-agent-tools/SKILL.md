@@ -9,12 +9,15 @@ description: Use when Codex needs to run, supervise, or coordinate Claude Code o
 
 Use `claude-tmux` and `codex-tmux` as the canonical interface for long-running Claude Code or Codex CLI sessions in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, and cleanup commands.
 
+Use `tmux-agent-dialogue` when the task needs a bounded two-party dialogue with a JSONL transcript. Use `fake` participants for credential-free smoke tests; use real `codex` and `claude` participants only when the user has authorized real agent execution.
+
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 
 The wrapper scripts are bundled with this skill at:
 
 - `scripts/claude-tmux`
 - `scripts/codex-tmux`
+- `scripts/tmux-agent-dialogue`
 
 If the commands are not installed on `PATH`, resolve them from the skill directory and run the script path directly.
 
@@ -66,6 +69,18 @@ codex-tmux stop worker
 ```
 
 Use `wait-text --literal` or `wait-literal` when the expected text contains regex metacharacters such as `[`, `]`, `(`, `)`, `.`, `*`, or `?`. Use regex `wait-text` only when regex matching is intentional.
+
+5. For bounded two-agent dialogue, write a prompt file and transcript path:
+
+```bash
+tmux-agent-dialogue --turns 4 --workdir . --agent-a codex --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
+```
+
+For CI or local smoke tests without real agent credentials:
+
+```bash
+tmux-agent-dialogue --turns 2 --workdir . --agent-a fake --agent-b fake --prompt-file prompt.md --transcript transcript.jsonl
+```
 
 ## Session Naming
 

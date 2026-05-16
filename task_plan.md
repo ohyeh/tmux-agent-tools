@@ -43,29 +43,26 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 6. Verify skills.sh discovery. Done.
 7. Merge reliability primitives through PR. Done.
 8. Merge structured status, local exit diagnostics, and CI smoke checks through PRs. Done.
+9. Merge `feature/v0.2-roadmap` through PR #6. Done.
 
 ## Active Work
 
-Branch: `feature/v0.2-roadmap`
+Branch: `feature/dialogue-runner`
 
 Scope:
 
-- document `v0.2.0` direction;
-- define the first orchestration feature branch;
-- add marker-wait ergonomics needed before orchestration;
-- add Claude readiness diagnostics without auto-accepting first-run prompts.
+- add `tmux-agent-dialogue` as the first orchestration command;
+- keep stable Homebrew installs pinned to `v0.1.0` behavior while exposing the new command only on `--HEAD`;
+- add credential-free fake tmux participant smoke coverage;
+- document local-only runner behavior and JSONL transcript shape.
 
 Verification evidence:
 
-- `zsh -n` passes for both wrapper scripts.
+- `zsh -n` passes for all scripts, including `tmux-agent-dialogue`.
 - Skill validation passes for `skills/tmux-agent-tools`.
-- `ruby -c Formula/tmux-agent-tools.rb` passes.
+- `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
 - Branch-local `doctor` and `self-test` pass for both wrappers.
-- `wait-text --literal` and `wait-literal` both match special-character markers for Codex and Claude wrapper sessions.
-
-Next implementation branch:
-
-- `feature/dialogue-runner`
+- `tmux-agent-dialogue --agent-a fake --agent-b fake --turns 2` writes valid JSONL and cleans up owned tmux sessions.
 
 ## v0.2.0 Candidate Scope
 
@@ -73,10 +70,10 @@ P0:
 
 - `wait-text --literal` alias for exact marker waits;
 - Claude first-run/permission confirmation diagnostics in `status`;
-- `dialogue` runner for bounded Codex/Claude ping-pong using existing wrappers;
-- transcript file output with timestamps, speaker, marker, and captured text;
-- cleanup guarantees for both sessions on success/failure;
-- local-only operation by default.
+- `dialogue` runner for bounded Codex/Claude ping-pong using existing wrappers - first local MVP implemented;
+- transcript file output with timestamps, speaker, marker, and captured text - first local MVP implemented;
+- cleanup guarantees for both sessions on success/failure - first local MVP implemented;
+- local-only operation by default - first local MVP implemented.
 
 P1:
 
