@@ -64,19 +64,18 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/critic-doc-followup`
+Branch: `feature/transcript-summary-label`
 
 Scope:
 
-- clarify that `github-comment` can prepare a dry-run PR comment body from any existing `dialogue`, `pair-review`, or `critic` transcript;
-- keep this as documentation-only cleanup after PR #26;
+- make generic `summarize` and `github-comment` output use a `transcript` label instead of the `pair-review` preset label;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- PR #26 main CI passed after verifying critic turns 1-4 in CI.
-- This branch tightens the `github-comment` wording as transcript-generic.
+- PR #27 main CI passed after clarifying transcript-generic `github-comment` wording.
+- Local smoke verifies `github-comment` dry-run output for `dialogue`, `pair-review`, and `critic` transcripts.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
