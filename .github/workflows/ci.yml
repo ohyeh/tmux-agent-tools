@@ -215,6 +215,9 @@ jobs:
           summary_stdout="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" > "$summary_stdout"
           rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$summary_stdout"
+          summary_file_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --summary-file "$summary_file_body"
+          cmp "$summary_stdout" "$summary_file_body"
           limited_summary="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --max-lines 8 > "$limited_summary"
           rg -n "truncated at 8 lines" "$limited_summary"
@@ -224,9 +227,25 @@ jobs:
           comment_body="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$comment_body"
           rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$comment_body"
+          summary_file_comment_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$summary_file_comment_body"
+          cmp "$comment_body" "$summary_file_comment_body"
+          summary_file_limited_comment="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --max-lines 8 > "$summary_file_limited_comment"
+          rg -n "truncated at 8 lines" "$summary_file_limited_comment"
           redacted_comment_body="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --redact-pattern 'TMUX_AGENT_DIALOGUE_[^]]+' > "$redacted_comment_body"
           rg -n "\\[REDACTED\\]|redact patterns were applied" "$redacted_comment_body"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools >/tmp/github-comment-both-inputs.out 2>&1; then
+            echo "github-comment must reject both transcript and summary-file inputs" >&2
+            exit 1
+          fi
+          rg -n "exactly one of --transcript or --summary-file" /tmp/github-comment-both-inputs.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --github-pr 1 --github-repo ohyeh/tmux-agent-tools >/tmp/github-comment-missing-input.out 2>&1; then
+            echo "github-comment must reject missing transcript/summary-file input" >&2
+            exit 1
+          fi
+          rg -n "exactly one of --transcript or --summary-file" /tmp/github-comment-missing-input.out
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --post-github-comment; then
             echo "GitHub comment posting must require --github-pr" >&2
             exit 1

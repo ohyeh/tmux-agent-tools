@@ -28,7 +28,7 @@ Usage:
   tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>]
   tmux-agent-dialogue validate-transcript --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
-  tmux-agent-dialogue github-comment --transcript <path> --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
+  tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
 
 Example:
   tmux-agent-dialogue \
@@ -570,6 +570,23 @@ build_shareable_pair_review_summary() {
   print -r -- "$body"
 }
 
+build_shareable_summary_file_body() {
+  local body
+  body="$(< "$SUMMARY_FILE")"
+  body="$(limit_markdown_lines "$body" "$MAX_LINES")"
+  body="$(limit_markdown_bytes "$body" "$MAX_BYTES")"
+  body="$(apply_markdown_redactions "$body")"
+  print -r -- "$body"
+}
+
+build_github_comment_body() {
+  if [[ "$MODE" == "github-comment" && -n "$SUMMARY_FILE" ]]; then
+    build_shareable_summary_file_body
+  else
+    build_shareable_pair_review_summary
+  fi
+}
+
 print_pair_review_summary() {
   build_pair_review_summary >&2
 }
@@ -588,7 +605,7 @@ post_pair_review_comment() {
 
   local body_file
   body_file="$(mktemp)"
-  build_shareable_pair_review_summary > "$body_file"
+  build_github_comment_body > "$body_file"
 
   "$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file"
   echo "posted GitHub PR comment: $GITHUB_PR" >&2
@@ -611,16 +628,24 @@ run_summary_mode() {
 
 run_github_comment_mode() {
   require_jq
-  [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || die "--transcript must be an existing file"
   [[ -n "$GITHUB_PR" ]] || die "--github-pr is required"
   [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required"
-  TRANSCRIPT="${TRANSCRIPT:A}"
-  validate_transcript_file "$TRANSCRIPT"
+  if [[ -z "$TRANSCRIPT" && -z "$SUMMARY_FILE" ]] || [[ -n "$TRANSCRIPT" && -n "$SUMMARY_FILE" ]]; then
+    die "github-comment requires exactly one of --transcript or --summary-file"
+  fi
+  if [[ -n "$SUMMARY_FILE" ]]; then
+    [[ -f "$SUMMARY_FILE" ]] || die "--summary-file must be an existing file"
+    SUMMARY_FILE="${SUMMARY_FILE:A}"
+  else
+    [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || die "--transcript must be an existing file"
+    TRANSCRIPT="${TRANSCRIPT:A}"
+    validate_transcript_file "$TRANSCRIPT"
+  fi
 
   if (( POST_GITHUB_COMMENT )); then
     post_pair_review_comment
   else
-    build_shareable_pair_review_summary
+    build_github_comment_body
     echo "dry-run: add --post-github-comment to post to GitHub" >&2
   fi
 }

@@ -251,13 +251,14 @@ Post the summary to a GitHub PR only when explicitly requested:
 tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo --post-github-comment
 ```
 
-Without `--post-github-comment`, `github-comment` prints the comment body as a dry run. Posting requires GitHub CLI authentication and never runs unless the flag is present.
+Without `--post-github-comment`, `github-comment` prints the comment body as a dry run. Posting requires GitHub CLI authentication and never runs unless the flag is present. Use `github-comment --summary-file <path>` to reuse a pre-rendered local summary body instead of re-rendering from a transcript; `github-comment` requires exactly one of `--transcript` or `--summary-file`.
 
 Before sharing a rendered summary, limit or redact the Markdown body:
 
 ```bash
 tmux-agent-dialogue summarize --transcript review.jsonl --max-lines 80 --redact-pattern 'token_[A-Za-z0-9]+'
 tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo --max-bytes 60000 --redact-pattern 'secret-[^ ]+'
+tmux-agent-dialogue github-comment --summary-file review-summary.md --github-pr 123 --github-repo owner/repo --max-lines 80
 ```
 
 `--redact-pattern` can be repeated. Redaction and truncation notes are included in the generated Markdown, and the dry-run `github-comment` body is the same body used for `--post-github-comment`.
