@@ -2,7 +2,7 @@
 
 ## Goal
 
-Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.5.0` observability and multi-session composability on focused feature branches with Claude tmux-agent teammate review.
+Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate beyond `v0.5.0` observability into `v0.6.0` composability on focused feature branches with Claude tmux-agent teammate review.
 
 ## Success Criteria
 
@@ -13,6 +13,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - `npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools` can discover the skill.
 - True Codex/Claude tmux communication remains verified.
 - Next release branch exists and has a concrete scope.
+- Next unreleased roadmap exists and has a concrete first slice.
 - Every mainline change goes through PR merge; no direct push to `main`.
 - Future release tags and GitHub releases are created by a reviewed GitHub Actions workflow, not by local manual tag/release commands.
 
@@ -34,6 +35,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - `v0.3.0` improved session hygiene and transcript usability without adding more autonomy.
 - `v0.4.0` should improve automation readiness: accurate session state, richer status contracts, bounded handoff, and local summary pipelines.
 - `v0.5.0` should improve observability and multi-session composability: bounded session watch, richer exit detail, transcript contract versioning, and local blocked-trigger artifacts.
+- `v0.6.0` should improve composability closure: stronger local output contracts, shell quality gates, and bounded presets without release side effects or credentials.
 - `D` personal workflow shortcuts should stay outside public core unless generalized.
 - Keep orchestration public and generic: transcript capture, pairing, and bounded turns are core; OpenClaw/Mac-mini shortcuts are not.
 
@@ -82,12 +84,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: none; waiting for explicit `v0.5.0` non-dry-run release go/no-go
+Branch: `feature/v0.6-roadmap`
 
 Scope:
 
-- prepare `v0.5.0` release-readiness docs and local validation evidence;
-- keep this as release-prep and dry-run preparation only; do not publish tags, GitHub releases, or Formula bumps in this branch;
+- create the `v0.6.0` roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
+- keep this as roadmap planning only; do not publish tags, GitHub releases, or Formula bumps in this branch;
 - keep this slice free of release publish, tag, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -202,6 +204,9 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the v0.5 dry-run state sync diff and found no blockers with `VERDICT: SHIP`.
 - PR #77 merged as `a2ebfe0`; feature branch CI run `25975453243` and main CI run `25975479364` passed.
 - Pending next: explicit operator go/no-go before any non-dry-run Release workflow for `v0.5.0`; do not publish the tag, GitHub Release, or Formula bump without that approval.
+- Claude tmux-agent teammate brainstormed v0.6 candidates and recommended composability closure: shellcheck CI, skill env reference parity, JSON summary schema metadata, structured GitHub comment results, bounded debate preset, and scriptable session inventory ergonomics.
+- v0.6 roadmap validation passed on `feature/v0.6-roadmap`: `git diff --check`, workflow YAML name checks with `yq`, roadmap/task-plan/README anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
+- Pending for this branch: PR CI and merge.
 
 ## v0.2.0 Candidate Scope
 
