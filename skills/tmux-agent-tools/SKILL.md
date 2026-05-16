@@ -9,7 +9,7 @@ description: Use when Codex needs to run, supervise, or coordinate Claude Code o
 
 Use `claude-tmux` and `codex-tmux` as the canonical interface for long-running Claude Code or Codex CLI sessions in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, and cleanup commands.
 
-Use `tmux-agent-dialogue` when the task needs a bounded two-party dialogue with a JSONL transcript. Use `fake` participants for credential-free smoke tests. Run real `codex` and `claude` participants only for explicit manual smoke tests or when the user asks for a real-agent dialogue. Run `tmux-agent-dialogue validate-transcript --transcript <path>` before summarizing, sharing, or posting a transcript.
+Use `tmux-agent-dialogue` when the task needs a bounded two-party dialogue with a JSONL transcript. Use `fake` participants for credential-free smoke tests. Run real `codex` and `claude` participants only for explicit manual smoke tests or when the user asks for a real-agent dialogue. Run `tmux-agent-dialogue validate-transcript --transcript <path>` before summarizing, sharing, or posting a transcript. Treat `failure_type` as conservative diagnostic metadata, not proof of root cause.
 
 Use `tmux-agent-sessions list` for a read-only inventory across Claude, Codex, and dialogue sessions. Use `tmux-agent-sessions cleanup --preview` before any bulk cleanup, and only use `cleanup --execute --all` or filtered execution when the user has authorized stopping tool-owned sessions.
 

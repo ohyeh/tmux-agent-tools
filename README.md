@@ -152,7 +152,7 @@ tmux-agent-dialogue \
   --transcript transcript.jsonl
 ```
 
-Real participants use the same command shape with `--agent-a codex --agent-b claude`. Real turns use a split-marker contract so the prompt echo cannot satisfy the wait; the required final response line must contain only the joined marker. On timeout, the runner writes a `failure` JSONL event and prints the captured pane tail for diagnosis. Keep real-agent smoke as manual release evidence, not a default CI check.
+Real participants use the same command shape with `--agent-a codex --agent-b claude`. Real turns use a split-marker contract so the prompt echo cannot satisfy the wait; the required final response line must contain only the joined marker. On timeout, the runner writes a `failure` JSONL event with a conservative `failure_type` such as `marker_timeout` or `session_missing`, and prints the captured pane tail for diagnosis. Keep real-agent smoke as manual release evidence, not a default CI check.
 
 Validate a transcript before sharing or rendering it:
 
@@ -160,7 +160,7 @@ Validate a transcript before sharing or rendering it:
 tmux-agent-dialogue validate-transcript --transcript transcript.jsonl
 ```
 
-The validator is local-only. It checks one JSON object per line, required `turn` and `failure` fields, and emits line-level diagnostics for invalid JSONL or missing fields. `summarize` and `github-comment` reject invalid transcripts before rendering.
+The validator is local-only. It checks one JSON object per line, required `turn` and `failure` fields, known `failure_type` values when present, and emits line-level diagnostics for invalid JSONL or missing fields. `summarize` and `github-comment` reject invalid transcripts before rendering.
 
 Remote participant:
 
