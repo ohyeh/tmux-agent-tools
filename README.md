@@ -28,6 +28,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `start-ssh`
 - `attach`
 - `send`
+- `send-wait-literal`
 - `wait`
 - `wait-text`
 - `wait-literal`
@@ -101,6 +102,7 @@ brew style ohyeh/tmux-agent-tools/tmux-agent-tools
 ```bash
 codex-tmux start --exact worker ~/github/project 'Read the repo and report status.'
 codex-tmux send worker 'Run the targeted tests.'
+codex-tmux send-wait-literal worker 'Reply with the marker described in this prompt.' '[CODEX-01]' 180
 codex-tmux wait worker 180
 codex-tmux wait-text worker 'Done|Need approval' 180
 codex-tmux wait-text --literal worker '[CODEX-01]' 180
@@ -110,7 +112,7 @@ codex-tmux status --json worker
 codex-tmux stop worker
 ```
 
-Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`.
+Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`. Use `send-wait-literal` when a prompt should only count a marker that appears after the send operation; the dialogue runner uses this to avoid stale marker matches. The wrappers pause briefly between paste and submit for multiline prompts; tune this with `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY` when a local CLI needs more time.
 
 Reliability checks:
 
@@ -141,7 +143,7 @@ tmux-agent-dialogue \
   --transcript transcript.jsonl
 ```
 
-Real participants use the same command shape with `--agent-a codex --agent-b claude`, but keep that path as manual release evidence until it is hardened.
+Real participants use the same command shape with `--agent-a codex --agent-b claude`. Real turns use a split-marker contract so the prompt echo cannot satisfy the wait; the required final response line must contain only the joined marker. On timeout, the runner writes a `failure` JSONL event and prints the captured pane tail for diagnosis. Keep real-agent smoke as manual release evidence, not a default CI check.
 
 Credential-free smoke:
 
