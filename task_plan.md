@@ -71,13 +71,14 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-sessions-state`
+Branch: `feature/v0.4-summary-file-pipeline`
 
 Scope:
 
-- implement the first v0.4 candidate slice for `tmux-agent-sessions` state accuracy;
-- preserve read-only inventory and cleanup preview behavior;
-- document the session inventory state contract;
+- implement the v0.4 summary file pipeline for `tmux-agent-dialogue github-comment`;
+- allow `github-comment --summary-file <path>` to reuse a pre-rendered local summary body;
+- keep `--post-github-comment` explicit and opt-in;
+- verify transcript mode still rejects invalid transcript input before rendering;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -104,7 +105,10 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the v0.4 roadmap diff and found no blockers.
 - `tmux-agent-sessions` state accuracy local validation passed on `feature/v0.4-sessions-state`: script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, running inventory JSON shape, cleanup preview text shape, exited-but-capturable inventory JSON shape, cleanup preview JSON shape, and cleanup scoping.
 - Claude tmux-agent teammate reviewed the session state diff, initially found two blockers, then re-reviewed after fixes and found no blockers. Remaining note: `missing` is only wrapper-reported passthrough/race state, now documented in README.
-- Pending for this branch: commit, PR CI.
+- PR #39 merged as `52c0fe9`; main CI run `25966994197` passed.
+- Summary-file pipeline local validation passed on `feature/v0.4-summary-file-pipeline`: workflow YAML check with `yq`, script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake `pair-review` smoke covering `summarize --summary-file`, `github-comment --transcript`, `github-comment --summary-file`, `--max-lines`, invalid transcript rejection, both-input rejection, and missing-input rejection.
+- Claude tmux-agent teammate reviewed the summary-file pipeline diff after two Claude API 500 attempts and found no blockers (`VERDICT: PASS`). After exactly-one validation was tightened for missing input too, Claude re-reviewed and again found no blockers (`VERDICT: PASS`). Non-blocking notes: empty summary-file and `--max-bytes` summary-file tests could be added later.
+- Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 
