@@ -62,24 +62,23 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 24. Merge participant profiles through PR #23 and profile docs cleanup through PR #24. Done.
 25. Merge critic preset through PR #25 and critic coverage cleanup through PR #26. Done.
 26. Merge transcript-generic comment docs through PR #27 and generic transcript summary labels through PR #28. Done.
+27. Merge roadmap refresh through PR #29, soft-wrap capture normalization through PR #30, clipboard mode override through PR #31, and human copy-mode UX hardening through PR #32. Done.
 
 ## Active Work
 
-Branch: `feature/clipboard-ux-mode`
+Branch: `feature/v03-task-plan-release-evidence`
 
 Scope:
 
-- keep normal keyboard/mouse copy-mode usable by selecting a platform clipboard command when available, falling back to tmux internal selection otherwise, binding keyboard and mouse-drag copy paths, and exposing an explicit `*_TMUX_CLIPBOARD=internal` override;
-- document clipboard behavior as release-hardening for human terminal use;
+- refresh the active task state after PR #32 so the next branch does not repeat completed copy-mode work;
+- prepare the next v0.3 release-evidence branch scope without adding new autonomy;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- PR #30 normalized tmux soft-wrap capture and main CI passed.
-- Config smoke verifies `CLAUDE_TMUX_CLIPBOARD=internal` produces keyboard and mouse `copy-selection-and-cancel`, a quoted custom `CODEX_TMUX_CLIPBOARD` command is escaped into `copy-pipe-and-cancel`, and mouse remains enabled.
-- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, and stable `brew test`.
-- Pending for this branch: Claude teammate review, PR CI.
+- PR #32 merged as `1fa2980` and main CI run `25963006121` passed.
+- Pending for this branch: documentation-only validation, Claude teammate review, PR CI.
 
 ## v0.2.0 Candidate Scope
 
