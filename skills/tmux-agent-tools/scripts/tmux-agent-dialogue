@@ -184,8 +184,8 @@ apply_profile() {
   "$JQ" -e --arg profile "$profile" '
     .[$profile]
     | to_entries
-    | all(.key == "agent" or .key == "ssh" or .key == "workdir" or .key == "env")
-  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile may only contain agent, ssh, workdir, and env"
+    | all(.key == "agent" or .key == "ssh" or .key == "workdir" or .key == "timeout" or .key == "env")
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile may only contain agent, ssh, workdir, timeout, and env"
   "$JQ" -e --arg profile "$profile" '
     .[$profile]
     | to_entries
@@ -197,16 +197,21 @@ apply_profile() {
     | all((.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type == "string") and ((.value | contains("\n")) | not))
   ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile env must be an object of newline-free string values keyed by shell environment names"
 
-  local profile_agent profile_ssh profile_workdir
+  local profile_agent profile_ssh profile_workdir profile_timeout
   profile_agent="$(profile_value "$profile" agent)"
   profile_ssh="$(profile_value "$profile" ssh)"
   profile_workdir="$(profile_value "$profile" workdir)"
+  profile_timeout="$(profile_value "$profile" timeout)"
+  if [[ -n "$profile_timeout" ]]; then
+    [[ "$profile_timeout" =~ ^[0-9]+$ && "$profile_timeout" -gt 0 ]] || die "participant profile $profile timeout must be a positive integer string"
+  fi
 
   case "$label" in
     a)
       [[ "$agent_set" -eq 1 || -z "$profile_agent" ]] || AGENT_A="$profile_agent"
       [[ "$ssh_set" -eq 1 || -z "$profile_ssh" ]] || AGENT_A_SSH="$profile_ssh"
       [[ "$workdir_set" -eq 1 || -z "$profile_workdir" ]] || AGENT_A_WORKDIR="$profile_workdir"
+      [[ "$TIMEOUT_SET" -eq 1 || -z "$profile_timeout" ]] || AGENT_A_TIMEOUT="$profile_timeout"
       AGENT_A_ENV=("${(@f)$(profile_env_entries "$profile")}")
       AGENT_A_ENV=("${(@)AGENT_A_ENV:#}")
       ;;
@@ -214,6 +219,7 @@ apply_profile() {
       [[ "$agent_set" -eq 1 || -z "$profile_agent" ]] || AGENT_B="$profile_agent"
       [[ "$ssh_set" -eq 1 || -z "$profile_ssh" ]] || AGENT_B_SSH="$profile_ssh"
       [[ "$workdir_set" -eq 1 || -z "$profile_workdir" ]] || AGENT_B_WORKDIR="$profile_workdir"
+      [[ "$TIMEOUT_SET" -eq 1 || -z "$profile_timeout" ]] || AGENT_B_TIMEOUT="$profile_timeout"
       AGENT_B_ENV=("${(@f)$(profile_env_entries "$profile")}")
       AGENT_B_ENV=("${(@)AGENT_B_ENV:#}")
       ;;
@@ -367,6 +373,15 @@ participant_env_entries() {
   esac
 }
 
+participant_timeout() {
+  local label="$1"
+  case "$label" in
+    a) print -r -- "${AGENT_A_TIMEOUT:-$TIMEOUT}" ;;
+    b) print -r -- "${AGENT_B_TIMEOUT:-$TIMEOUT}" ;;
+    *) die "unsupported participant label: $label" ;;
+  esac
+}
+
 start_real_agent() {
   local label="$1"
   local agent="$2"
@@ -388,7 +403,7 @@ start_real_agent() {
     env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "$wrapper" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
   fi
   OWNED_WRAPPERS+=("$agent:$session")
-  "$wrapper" wait "$session" "$TIMEOUT" >/dev/null
+  "$wrapper" wait "$session" "$(participant_timeout "$label")" >/dev/null
 }
 
 send_to_agent() {
@@ -415,7 +430,7 @@ send_and_wait_for_marker() {
     return
   fi
 
-  "$(wrapper_for_agent "$agent")" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$TIMEOUT"
+  "$(wrapper_for_agent "$agent")" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$(participant_timeout "$label")"
 }
 
 wait_for_marker() {
@@ -425,7 +440,7 @@ wait_for_marker() {
   local processed="${4:-}"
 
   if [[ "$agent" == "fake" ]]; then
-    local deadline=$((SECONDS + TIMEOUT))
+    local deadline=$((SECONDS + $(participant_timeout "$label")))
     local current=""
     while (( SECONDS < deadline )); do
       current="$("$TMUX" capture-pane -J -t "$(session_name "$label")" -p -S -200 2>/dev/null)" || return 1
@@ -437,7 +452,7 @@ wait_for_marker() {
     return 1
   fi
 
-  "$(wrapper_for_agent "$agent")" wait-literal "$(session_name "$label")" "$marker" "$TIMEOUT"
+  "$(wrapper_for_agent "$agent")" wait-literal "$(session_name "$label")" "$marker" "$(participant_timeout "$label")"
 }
 
 capture_agent() {
@@ -900,6 +915,7 @@ AGENT_B_WORKDIR=""
 PROMPT_FILE=""
 TRANSCRIPT=""
 TIMEOUT=180
+TIMEOUT_SET=0
 PARTICIPANTS_CONFIG="${TMUX_AGENT_TOOLS_PARTICIPANTS:-${XDG_CONFIG_HOME:-$HOME/.config}/tmux-agent-tools/participants.json}"
 AGENT_A_PROFILE=""
 AGENT_B_PROFILE=""
@@ -911,6 +927,8 @@ AGENT_A_WORKDIR_SET=0
 AGENT_B_WORKDIR_SET=0
 AGENT_A_ENV=()
 AGENT_B_ENV=()
+AGENT_A_TIMEOUT=""
+AGENT_B_TIMEOUT=""
 MODE="dialogue"
 SUMMARY_FILE=""
 SUMMARY_LABEL="transcript"
@@ -981,7 +999,7 @@ while (( $# > 0 )); do
     --agent-b-workdir) AGENT_B_WORKDIR="${2:-}"; AGENT_B_WORKDIR_SET=1; shift 2 ;;
     --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
     --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
-    --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+    --timeout) TIMEOUT="${2:-}"; TIMEOUT_SET=1; shift 2 ;;
     --summary-file) SUMMARY_FILE="${2:-}"; shift 2 ;;
     --output-format) OUTPUT_FORMAT="${2:-}"; OUTPUT_FORMAT_SET=1; shift 2 ;;
     --on-blocked-trigger) ON_BLOCKED_TRIGGER="${2:-}"; shift 2 ;;
@@ -1035,7 +1053,7 @@ fi
 [[ "$TURN_COUNT" =~ '^[0-9]+$' && "$TURN_COUNT" -gt 0 ]] || die "--turns must be a positive integer"
 [[ "$MODE" != "critic" || $(( TURN_COUNT % 2 )) -eq 0 ]] || die "critic --turns must be a positive even integer"
 [[ "$MODE" != "handoff" || "$TURN_COUNT" -eq 2 ]] || die "handoff runs exactly two turns"
-[[ "$TIMEOUT" =~ '^[0-9]+$' && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer"
+[[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer"
 [[ -n "$WORKDIR" && -d "$WORKDIR" ]] || die "--workdir must be an existing directory"
 [[ -n "$PROMPT_FILE" && -f "$PROMPT_FILE" ]] || die "--prompt-file must be an existing file"
 [[ -n "$TRANSCRIPT" ]] || die "--transcript is required"
