@@ -92,6 +92,20 @@ jobs:
           skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 2 --interval 0 | jq -s 'length == 2 and all(type == "array" and length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and (map(select(.tool == "claude" or .tool == "codex")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local")) and (map(select(.tool == "dialogue")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == null)))'
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n "claude-cli-ci-hygiene|codex-cli-ci-hygiene|tmux-agent-dialogue-ci-hygiene-a"
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n $'would stop: (claude|codex|dialogue)\\tci-hygiene(-a)?\\t(claude-cli|codex-cli|tmux-agent-dialogue)-ci-hygiene(-a)?\\trunning'
+          cleanup_preview_all="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json > "$cleanup_preview_all"
+          jq -s -e 'length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and ([.[].session] | all(. != "unrelated-ci-hygiene")) and (all(.state == "running" and .exists == true and .running == true))' "$cleanup_preview_all"
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --tool claude | jq -s -e 'length == 1 and .[0].tool == "claude" and .[0].name == "ci-hygiene" and .[0].session == "claude-cli-ci-hygiene"'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --tool dialogue | jq -s -e 'length == 1 and .[0].tool == "dialogue" and .[0].name == "ci-hygiene-a" and .[0].session == "tmux-agent-dialogue-ci-hygiene-a"'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --name ci-hygiene | jq -s -e 'length == 2 and ([.[].tool] | sort == ["claude","codex"]) and all(.name == "ci-hygiene")'
+          tmux has-session -t claude-cli-ci-hygiene
+          tmux has-session -t codex-cli-ci-hygiene
+          tmux has-session -t tmux-agent-dialogue-ci-hygiene-a
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --json --name ci-hygiene >/tmp/cleanup-execute-json.out 2>&1; then
+            echo "cleanup --execute must reject --json" >&2
+            exit 1
+          fi
+          rg -n -- "--json is only supported with cleanup --preview" /tmp/cleanup-execute-json.out
           tmux has-session -t unrelated-ci-hygiene
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --name ci-hygiene
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --tool dialogue --name ci-hygiene-a
