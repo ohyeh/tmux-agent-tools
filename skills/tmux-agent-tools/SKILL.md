@@ -118,7 +118,7 @@ tmux-agent-dialogue critic --workdir . --prompt-file review.md --transcript crit
 
 `critic` defaults to four turns. Agent A speaks on odd turns, agent B speaks on even turns, and custom `--turns` values must be positive even numbers. It is only a preset over the same local transcript flow; it does not post comments, merge PRs, schedule work, or continue unbounded.
 
-To prepare a GitHub PR comment body from an existing transcript without posting:
+For any existing `dialogue`, `pair-review`, or `critic` transcript, prepare a GitHub PR comment body without posting:
 
 ```bash
 tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo

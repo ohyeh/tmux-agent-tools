@@ -60,26 +60,23 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 22. Merge safer transcript sharing through PR #21. Done.
 23. Merge stable status JSON through PR #22. Done.
 24. Merge participant profiles through PR #23 and profile docs cleanup through PR #24. Done.
+25. Merge critic preset through PR #25 and critic coverage cleanup through PR #26. Done.
 
 ## Active Work
 
-Branch: `feature/critic-preset-cleanup`
+Branch: `feature/critic-doc-followup`
 
 Scope:
 
-- add `tmux-agent-dialogue critic` as a thin preset over the existing bounded dialogue runner;
-- default `critic` to four turns with Codex/Claude defaults that remain overrideable;
-- require custom `critic --turns` values to be positive even numbers;
-- keep output local-only: transcript plus optional local summary file, no hidden GitHub posting, merging, scheduling, or unbounded loops;
-- add CI coverage for successful fake critic transcript/summary and odd-turn rejection;
+- clarify that `github-comment` can prepare a dry-run PR comment body from any existing `dialogue`, `pair-review`, or `critic` transcript;
+- keep this as documentation-only cleanup after PR #26;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate recommends `critic` as the smallest useful P2 preset before `debate` or `handoff`.
-- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, fake `critic` transcript/summary, and odd-turn rejection.
-- Claude tmux-agent final review found two blockers: ambiguous `SKILL.md` github-comment placement and incomplete critic CI turn coverage. Both are fixed on this branch.
+- PR #26 main CI passed after verifying critic turns 1-4 in CI.
+- This branch tightens the `github-comment` wording as transcript-generic.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
