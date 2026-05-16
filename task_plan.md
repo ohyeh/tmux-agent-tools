@@ -82,7 +82,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.5-release-prep`
+Branch: none; waiting for explicit `v0.5.0` non-dry-run release go/no-go
 
 Scope:
 
@@ -200,7 +200,8 @@ Verification evidence:
 - PR #76 merged as `ed2c1a7`; feature branch CI run `25975327454` and main CI run `25975354971` passed.
 - Release workflow dry-run for `v0.5.0` passed in run `25975385734`: `validate` succeeded, `publish` was skipped, and both the `v0.5.0` tag and GitHub Release are still absent.
 - Claude tmux-agent teammate reviewed the v0.5 dry-run state sync diff and found no blockers with `VERDICT: SHIP`.
-- Pending for this branch: dry-run state sync PR, then explicit operator go/no-go before any non-dry-run Release workflow.
+- PR #77 merged as `a2ebfe0`; feature branch CI run `25975453243` and main CI run `25975479364` passed.
+- Pending next: explicit operator go/no-go before any non-dry-run Release workflow for `v0.5.0`; do not publish the tag, GitHub Release, or Formula bump without that approval.
 
 ## v0.2.0 Candidate Scope
 
