@@ -400,7 +400,7 @@ send_wait_literal_session() {
     exit 1
   fi
 
-  local before="$("$TMUX" capture-pane -t "$session" -p -S -300)"
+  local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
   local before_count
   before_count="$(count_literal_occurrences "$before" "$needle")"
 
@@ -412,7 +412,7 @@ send_wait_literal_session() {
   local current_count=0
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -t "$session" -p -S -300)"
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
     current_count="$(count_literal_occurrences "$current" "$needle")"
     if (( current_count > before_count )); then
       echo "matched new literal: $needle"
@@ -446,7 +446,7 @@ capture_session() {
     exit 1
   fi
 
-  "$TMUX" capture-pane -t "$session" -p -S "-$lines"
+  "$TMUX" capture-pane -J -t "$session" -p -S "-$lines"
 }
 
 wait_session() {
@@ -471,7 +471,7 @@ wait_session() {
   local current=""
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -t "$session" -p -S -100)"
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -100)"
     if [[ "$current" == "$last" ]]; then
       stable_count=$((stable_count + 1))
       if (( stable_count >= STABLE_SECONDS )); then
@@ -526,7 +526,7 @@ wait_text_session() {
   local current=""
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -t "$session" -p -S -200)"
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
     if [[ "$current" =~ $pattern ]]; then
       echo "matched: $pattern"
       return 0
@@ -564,7 +564,7 @@ wait_literal_session() {
   local current=""
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -t "$session" -p -S -200)"
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
     if [[ "$current" == *"$needle"* ]]; then
       echo "matched literal: $needle"
       return 0
@@ -594,7 +594,7 @@ doctor_session() {
 readiness_diagnostic() {
   local session="$1"
   local current lowered
-  current="$("$TMUX" capture-pane -t "$session" -p -S -80 2>/dev/null || true)"
+  current="$("$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true)"
   lowered="${current:l}"
 
   if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
@@ -612,7 +612,7 @@ readiness_diagnostic() {
 
 status_pane_text() {
   local session="$1"
-  "$TMUX" capture-pane -t "$session" -p -S -80 2>/dev/null || true
+  "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
 }
 
 self_test_session() {

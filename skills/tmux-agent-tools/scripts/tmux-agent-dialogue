@@ -342,7 +342,7 @@ wait_for_marker() {
     local deadline=$((SECONDS + TIMEOUT))
     local current=""
     while (( SECONDS < deadline )); do
-      current="$("$TMUX" capture-pane -t "$(session_name "$label")" -p -S -200 2>/dev/null)" || return 1
+      current="$("$TMUX" capture-pane -J -t "$(session_name "$label")" -p -S -200 2>/dev/null)" || return 1
       if [[ "$current" == *"$processed"* && "$current" == *"$marker"* ]]; then
         return 0
       fi
@@ -359,7 +359,7 @@ capture_agent() {
   local agent="$2"
 
   if [[ "$agent" == "fake" ]]; then
-    "$TMUX" capture-pane -t "$(session_name "$label")" -p -S -1000
+    "$TMUX" capture-pane -J -t "$(session_name "$label")" -p -S -1000
   else
     "$(wrapper_for_agent "$agent")" capture "$(session_name "$label")" 1000
   fi

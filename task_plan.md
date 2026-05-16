@@ -65,20 +65,20 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v03-roadmap-refresh`
+Branch: `feature/capture-join-wrap`
 
 Scope:
 
-- refresh `task_plan.md` and `docs/v0.3.0-roadmap.md` so completed v0.3 slices are marked as merged instead of in-progress;
-- keep the Formula test compatible with both stable `v0.2.0` (`pair-review` label) and HEAD (`transcript` label);
-- identify the next remaining v0.3 work from current repo state;
+- normalize wrapper and dialogue pane capture with tmux soft-wrap joining so transcript text is not polluted by pane width;
+- document the capture behavior as release-hardening for long model output and markers;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- PR #28 main CI passed after generic `summarize` and `github-comment` output switched to the `transcript` label.
-- Current branch keeps Formula `test do` compatible with both stable `v0.2.0` and unreleased HEAD summary labels.
+- PR #29 main CI passed after roadmap and Formula compatibility refresh.
+- Local tmux smoke confirms default `capture-pane -p` hard-wraps long lines and `capture-pane -p -J` preserves the logical line.
+- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, stable `brew test`, HEAD transcript summary smoke, and wrapper capture long-line regression.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
