@@ -79,7 +79,7 @@ emit_session_json() {
     --arg session "$session" \
     --arg prefix "$prefix" \
     --arg state "running" \
-    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,state:$state,running:true,exit_detected:false,local_or_remote:null,diagnostic:null}'
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,state:$state,running:true,exit_detected:false,local_or_remote:null,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}'
 }
 
 add_state_field() {
@@ -124,7 +124,7 @@ fallback_status_json() {
     --arg local_or_remote "$local_or_remote" \
     --argjson running "$running" \
     --argjson exit_detected "$exit_detected" \
-    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,running:$running,exit_detected:$exit_detected,local_or_remote:$local_or_remote,diagnostic:null}' \
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,running:$running,exit_detected:$exit_detected,local_or_remote:$local_or_remote,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}' \
     | add_state_field
 }
 
