@@ -72,14 +72,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-release-validation-sessions`
+Branch: `feature/v0.4-hardened-dry-run-record`
 
 Scope:
 
-- harden the v0.4.0 Release workflow validation so it covers the full stable command surface;
-- include `tmux-agent-sessions` syntax and empty-inventory JSON checks in the release candidate validation;
-- validate the release workflow fake dialogue transcript before release-note extraction or publish;
-- keep this workflow-validation-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
+- record the hardened `v0.4.0` Release workflow dry-run evidence after PR #49;
+- confirm the run used current `main`, validated the release candidate, skipped publish, and left `v0.4.0` tag/release absent;
+- keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -134,7 +133,10 @@ Verification evidence:
 - PR #47 merged as `7ad17a5`; main CI run `25971163853` passed.
 - PR #48 merged as `3ac6bc2`; main CI run `25971276044` passed.
 - Release workflow validation hardening local equivalent passed on `feature/v0.4-release-validation-sessions`: workflow YAML check with `yq`, `git diff --check`, script syntax for wrappers/dialogue/session helper, Formula syntax/style, wrapper self-tests, empty session inventory JSON assertion, fake release dialogue smoke, `validate-transcript`, `jq` turn assertions, and v0.4.0 release-note extraction.
-- Pending for this branch: Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Claude tmux-agent teammate reviewed the first release-validation diff and found a blocker: `jq -s 'length == 0'` did not fail on false. The fix changed the release workflow check to `jq -se 'length == 0'`; local revalidation proved the false case exits non-zero, and Claude re-reviewed with `VERDICT: SHIP`.
+- PR #49 merged as `35ab0bd`; main CI run `25971447690` passed.
+- Hardened Release workflow dry-run for `v0.4.0` passed in run `25971497742` (`https://github.com/ohyeh/tmux-agent-tools/actions/runs/25971497742`) on `35ab0bd`: the `validate` job succeeded, its `Build release notes` and `Dry-run summary` steps succeeded, the `publish` job was skipped, and `refs/tags/v0.4.0` / the GitHub Release remain absent.
+- Pending for this branch: dry-run evidence docs validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
