@@ -71,15 +71,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 31. Merge `v0.3.0` stable Formula bump through PR #37 (`6acb503`). Done.
 32. Merge `v0.4.0` release-process validation docs through PR #51 (`71b37a3`). Done.
 33. Merge `v0.4.0` release-ready state through PR #52 (`9cf1684`). Done.
+34. Merge `v0.4.0` status-contract roadmap sync through PR #53 (`17ee594`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.4-roadmap-status-contract-sync`
+Branch: `feature/v0.4-roadmap-current-state`
 
 Scope:
 
-- record the PR #52 merge and main CI evidence before any `v0.4.0` publish;
-- sync the v0.4 roadmap with the implemented shared status contract so it no longer describes Codex readiness diagnostics as pending or README-stale;
+- record the PR #53 merge and main CI evidence before any `v0.4.0` publish;
+- update the v0.4 roadmap so the initial session-state slice reads as completed history rather than current-start guidance;
 - keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -145,7 +146,9 @@ Verification evidence:
 - Current `v0.4.0` release state: release notes exist, the hardened Release workflow dry-run is green, release-process docs match the workflow gates, and the Formula bump remains deferred until after the reviewed Release workflow creates the tag.
 - Release-ready state validation passed on `feature/v0.4-release-ready-state`: `git diff --check`, workflow YAML name check with `yq`, roadmap/task-plan anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
 - PR #52 merged as `9cf1684`; main CI run `25971846873` passed.
-- Pending for this branch: roadmap status-contract sync validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Roadmap status-contract sync validation passed on `feature/v0.4-roadmap-status-contract-sync`: `git diff --check`, workflow YAML name check with `yq`, script syntax checks, stale-status searches with `rg`, and Claude tmux-agent teammate re-review with `VERDICT: SHIP`.
+- PR #53 merged as `17ee594`; main CI run `25971998894` passed.
+- Pending for this branch: current-state roadmap validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
