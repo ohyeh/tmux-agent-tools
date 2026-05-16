@@ -129,6 +129,15 @@ available_profiles() {
   "$JQ" -er 'keys | join(", ")' "$PARTICIPANTS_CONFIG" 2>/dev/null || print -r -- "unavailable"
 }
 
+profile_env_entries() {
+  local profile="$1"
+  "$JQ" -er --arg profile "$profile" '
+    .[$profile].env // {}
+    | to_entries[]
+    | "\(.key)=\(.value)"
+  ' "$PARTICIPANTS_CONFIG" 2>/dev/null || true
+}
+
 apply_profile() {
   local label="$1"
   local profile="$2"
@@ -144,13 +153,18 @@ apply_profile() {
   "$JQ" -e --arg profile "$profile" '
     .[$profile]
     | to_entries
-    | all(.key == "agent" or .key == "ssh" or .key == "workdir")
-  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile may only contain agent, ssh, and workdir"
+    | all(.key == "agent" or .key == "ssh" or .key == "workdir" or .key == "env")
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile may only contain agent, ssh, workdir, and env"
   "$JQ" -e --arg profile "$profile" '
     .[$profile]
     | to_entries
-    | all(.value | type == "string")
-  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile values must be strings"
+    | all(if .key == "env" then (.value | type == "object") else (.value | type == "string") end)
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile values must be strings, except env must be an object"
+  "$JQ" -e --arg profile "$profile" '
+    .[$profile].env // {}
+    | to_entries
+    | all((.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type == "string") and ((.value | contains("\n")) | not))
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile env must be an object of newline-free string values keyed by shell environment names"
 
   local profile_agent profile_ssh profile_workdir
   profile_agent="$(profile_value "$profile" agent)"
@@ -162,11 +176,15 @@ apply_profile() {
       [[ "$agent_set" -eq 1 || -z "$profile_agent" ]] || AGENT_A="$profile_agent"
       [[ "$ssh_set" -eq 1 || -z "$profile_ssh" ]] || AGENT_A_SSH="$profile_ssh"
       [[ "$workdir_set" -eq 1 || -z "$profile_workdir" ]] || AGENT_A_WORKDIR="$profile_workdir"
+      AGENT_A_ENV=("${(@f)$(profile_env_entries "$profile")}")
+      AGENT_A_ENV=("${(@)AGENT_A_ENV:#}")
       ;;
     b)
       [[ "$agent_set" -eq 1 || -z "$profile_agent" ]] || AGENT_B="$profile_agent"
       [[ "$ssh_set" -eq 1 || -z "$profile_ssh" ]] || AGENT_B_SSH="$profile_ssh"
       [[ "$workdir_set" -eq 1 || -z "$profile_workdir" ]] || AGENT_B_WORKDIR="$profile_workdir"
+      AGENT_B_ENV=("${(@f)$(profile_env_entries "$profile")}")
+      AGENT_B_ENV=("${(@)AGENT_B_ENV:#}")
       ;;
     *)
       die "unsupported participant profile label: $label"
@@ -252,8 +270,14 @@ start_fake_agent() {
   local label="$1"
   local session
   local command
+  local env_prefix="env"
+  local entry
   session="$(session_name "$label")"
-  command="DIALOGUE_LABEL=$(shell_quote "$label") zsh -lc 'stty -echo 2>/dev/null || true; while IFS= read -r line; do if [[ \"\$line\" == __TMUX_AGENT_DIALOGUE_STOP__* ]]; then break; fi; marker=\"\${line##* MARKER:}\"; body=\"\${line%% MARKER:*}\"; print -r -- \"fake-\${DIALOGUE_LABEL}: \${body}\"; print -r -- \"\$marker\"; done'"
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    env_prefix="${env_prefix} $(shell_quote "$entry")"
+  done < <(participant_env_entries "$label")
+  command="${env_prefix} DIALOGUE_LABEL=$(shell_quote "$label") zsh -lc 'stty -echo 2>/dev/null || true; while IFS= read -r line; do if [[ \"\$line\" == __TMUX_AGENT_DIALOGUE_STOP__* ]]; then break; fi; marker=\"\${line##* MARKER:}\"; body=\"\${line%% MARKER:*}\"; print -r -- \"fake-\${DIALOGUE_LABEL}: \${body}\"; print -r -- \"\$marker\"; done'"
   "$TMUX" kill-session -t "$session" 2>/dev/null || true
   "$TMUX" new-session -d -s "$session" "$command"
   OWNED_SESSIONS+=("$session")
@@ -286,6 +310,26 @@ participant_workdir() {
   esac
 }
 
+participant_env_entries() {
+  local label="$1"
+  local entry
+  case "$label" in
+    a)
+      for entry in "${AGENT_A_ENV[@]}"; do
+        print -r -- "$entry"
+      done
+      ;;
+    b)
+      for entry in "${AGENT_B_ENV[@]}"; do
+        print -r -- "$entry"
+      done
+      ;;
+    *)
+      die "unsupported participant label: $label"
+      ;;
+  esac
+}
+
 start_real_agent() {
   local label="$1"
   local agent="$2"
@@ -293,15 +337,18 @@ start_real_agent() {
   local wrapper
   local ssh_target
   local agent_workdir
+  local -a env_entries
   session="$(session_name "$label")"
   wrapper="$(wrapper_for_agent "$agent")"
   ssh_target="$(participant_ssh_target "$label")"
   agent_workdir="$(participant_workdir "$label")"
+  env_entries=("${(@f)$(participant_env_entries "$label")}")
+  env_entries=("${(@)env_entries:#}")
   "$wrapper" stop "$session" >/dev/null 2>&1 || true
   if [[ -n "$ssh_target" ]]; then
-    "$wrapper" start-ssh --exact "$session" "$ssh_target" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "$wrapper" start-ssh --exact "$session" "$ssh_target" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
   else
-    "$wrapper" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "$wrapper" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
   fi
   OWNED_WRAPPERS+=("$agent:$session")
   "$wrapper" wait "$session" "$TIMEOUT" >/dev/null
@@ -724,6 +771,8 @@ AGENT_A_SSH_SET=0
 AGENT_B_SSH_SET=0
 AGENT_A_WORKDIR_SET=0
 AGENT_B_WORKDIR_SET=0
+AGENT_A_ENV=()
+AGENT_B_ENV=()
 MODE="dialogue"
 SUMMARY_FILE=""
 SUMMARY_LABEL="transcript"

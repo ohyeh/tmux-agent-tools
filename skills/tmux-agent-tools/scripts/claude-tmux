@@ -282,11 +282,18 @@ start_session() {
   fi
 
   local session="$(session_for_name "$name")"
+  local -a session_env_args
+  local session_env_entry
+  session_env_args=()
+  while IFS= read -r session_env_entry; do
+    [[ -n "$session_env_entry" ]] || continue
+    session_env_args+=("-e" "$session_env_entry")
+  done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
 
-  "$TMUX" -f "$TMUX_CONF" new-session -d -s "$session" -c "$directory" \
+  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   echo "agent: $name"
@@ -347,6 +354,13 @@ start_ssh_session() {
   fi
 
   local session="$(session_for_name "$name")"
+  local -a session_env_args
+  local session_env_entry
+  session_env_args=()
+  while IFS= read -r session_env_entry; do
+    [[ -n "$session_env_entry" ]] || continue
+    session_env_args+=("-e" "$session_env_entry")
+  done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
@@ -354,7 +368,7 @@ start_ssh_session() {
   local remote_command
   remote_command="export TERM=xterm-256color COLORTERM=truecolor; cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'claude-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && claude --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] remote command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
-  "$TMUX" -f "$TMUX_CONF" new-session -d -s "$session" \
+  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")"
 
   echo "agent: $name"

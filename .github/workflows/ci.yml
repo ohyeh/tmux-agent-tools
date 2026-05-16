@@ -127,7 +127,7 @@ jobs:
           jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$transcript_file"
           participants_config="$(mktemp)"
-          jq -n --arg workdir "$PWD" '{local_fake:{agent:"fake",workdir:$workdir}, needs_override:{agent:"fake",workdir:"/definitely/missing/tmux-agent-tools-profile"}, bad_fake:{agent:"fake",ssh:"example",workdir:"/tmp"}, bad_extra:{agent:"fake",extra:"nope"}, bad_type:{agent:true}}' > "$participants_config"
+          jq -n --arg workdir "$PWD" '{local_fake:{agent:"fake",workdir:$workdir}, local_codex:{agent:"codex",workdir:$workdir}, env_codex:{agent:"codex",workdir:$workdir,env:{TMUX_AGENT_TOOLS_PROFILE_ENV:"profile-ok"}}, needs_override:{agent:"fake",workdir:"/definitely/missing/tmux-agent-tools-profile"}, bad_fake:{agent:"fake",ssh:"example",workdir:"/tmp"}, bad_extra:{agent:"fake",extra:"nope"}, bad_type:{agent:true}, bad_env_key:{agent:"fake",env:{"BAD-NAME":"nope"}}, bad_env_type:{agent:"fake",env:{TMUX_AGENT_TOOLS_PROFILE_ENV:true}}, bad_env_newline:{agent:"fake",env:{TMUX_AGENT_TOOLS_PROFILE_ENV:"bad\nvalue"}}}' > "$participants_config"
           profile_transcript_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 2 --workdir . --agent-a-profile local_fake --agent-b-profile local_fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$profile_transcript_file" --timeout 10
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$profile_transcript_file"
@@ -135,6 +135,25 @@ jobs:
           override_transcript_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 2 --workdir . --agent-a-profile needs_override --agent-a-workdir . --agent-b-profile local_fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$override_transcript_file" --timeout 10
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$override_transcript_file"
+          env_fake_cli_dir="$(mktemp -d)"
+          printf '%s\n' \
+            '#!/usr/bin/env zsh' \
+            'part_a=""' \
+            'while IFS= read -r line; do' \
+            '  case "$line" in' \
+            '    "PART_A: "*) part_a="${line#PART_A: }" ;;' \
+            '    "PART_B: "*) print -r -- "profile-env:${TMUX_AGENT_TOOLS_PROFILE_ENV-unset}"; print -r -- "${part_a}${line#PART_B: }" ;;' \
+            '  esac' \
+            'done' > "$env_fake_cli_dir/codex"
+          chmod +x "$env_fake_cli_dir/codex"
+          no_env_profile_transcript_file="$(mktemp)"
+          CODEX="$env_fake_cli_dir/codex" skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile local_codex --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$no_env_profile_transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$no_env_profile_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .agent == "codex" and (.text | contains("profile-env:unset")))' "$no_env_profile_transcript_file"
+          env_profile_transcript_file="$(mktemp)"
+          CODEX="$env_fake_cli_dir/codex" skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile env_codex --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$env_profile_transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$env_profile_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .agent == "codex" and (.text | contains("profile-env:profile-ok")))' "$env_profile_transcript_file"
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile missing --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/missing-profile.jsonl --timeout 1 >/tmp/missing-profile.out 2>&1; then
             echo "missing profiles must fail" >&2
             exit 1
@@ -144,12 +163,27 @@ jobs:
             echo "participant profiles with unknown keys must fail" >&2
             exit 1
           fi
-          rg -n "may only contain agent, ssh, and workdir" /tmp/bad-extra-profile.out
+          rg -n "may only contain agent, ssh, workdir, and env" /tmp/bad-extra-profile.out
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_type --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-type-profile.jsonl --timeout 1 >/tmp/bad-type-profile.out 2>&1; then
             echo "participant profiles with non-string values must fail" >&2
             exit 1
           fi
-          rg -n "values must be strings" /tmp/bad-type-profile.out
+          rg -n "values must be strings, except env must be an object" /tmp/bad-type-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_env_key --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-env-key-profile.jsonl --timeout 1 >/tmp/bad-env-key-profile.out 2>&1; then
+            echo "participant profile env keys must be shell environment names" >&2
+            exit 1
+          fi
+          rg -n "env must be an object of newline-free string values keyed by shell environment names" /tmp/bad-env-key-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_env_type --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-env-type-profile.jsonl --timeout 1 >/tmp/bad-env-type-profile.out 2>&1; then
+            echo "participant profile env values must be strings" >&2
+            exit 1
+          fi
+          rg -n "env must be an object of newline-free string values keyed by shell environment names" /tmp/bad-env-type-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_env_newline --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-env-newline-profile.jsonl --timeout 1 >/tmp/bad-env-newline-profile.out 2>&1; then
+            echo "participant profile env values must be newline-free" >&2
+            exit 1
+          fi
+          rg -n "env must be an object of newline-free string values keyed by shell environment names" /tmp/bad-env-newline-profile.out
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_fake --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-fake-profile.jsonl --timeout 1 >/tmp/bad-fake-profile.out 2>&1; then
             echo "fake profile SSH must fail" >&2
             exit 1
