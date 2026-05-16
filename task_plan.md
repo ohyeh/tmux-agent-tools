@@ -47,18 +47,28 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/pair-review-preset`
+Branch: `feature/remote-dialogue-participants`
 
 Scope:
 
-- add the P1 `pair-review` preset as a thin wrapper over `tmux-agent-dialogue`;
-- default `pair-review` to a two-turn Codex-to-Claude exchange while allowing explicit agent overrides for credential-free tests;
-- write the normal JSONL transcript and print a concise local terminal summary;
-- keep the preset local-only: no GitHub comments, no merge, no publishing.
+- add participant-scoped remote support to `tmux-agent-dialogue` through existing wrapper `start-ssh`;
+- support `--agent-a-ssh`, `--agent-b-ssh`, `--agent-a-workdir`, and `--agent-b-workdir`;
+- keep tmux local while running the selected real participant through SSH in its remote directory;
+- require absolute remote workdirs for SSH participants;
+- keep fake participants local-only and reject fake+SSH combinations in CI;
+- keep GitHub posting and publishing out of scope.
 
 Verification evidence:
 
-- Pending for this branch: `zsh -n`, fake `pair-review` smoke, skill validation, formula validation, PR CI.
+- `zsh -n` passes for all wrapper scripts and `tmux-agent-dialogue`.
+- Skill validation passes for `skills/tmux-agent-tools`.
+- `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
+- Wrapper self-tests pass for both `codex-tmux` and `claude-tmux`.
+- Fake dialogue smoke passes for 4 turns and each transcript turn includes processed fake participant output.
+- `pair-review` fake smoke passes and prints a local summary.
+- Credential-free negative checks reject fake+SSH, missing remote workdir, and non-absolute remote workdir.
+- Manual remote smoke passed on 2026-05-16: `--agent-a codex --agent-a-ssh openclaw-macmini --agent-a-workdir /Users/paul.yeh --agent-b fake --turns 1` matched the remote Codex marker and wrote one `turn` JSONL event.
+- Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 
@@ -81,7 +91,7 @@ P1:
 
 P2:
 
-- remote participant support through `start-ssh`;
+- remote participant support through `start-ssh` - in progress;
 - GitHub PR comment helper that posts transcript summaries only when explicitly requested;
 - credential-free CI integration tests with fake participants;
 - real-agent/token tests only as manual release evidence or explicit opt-in workflows.

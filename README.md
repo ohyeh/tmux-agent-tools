@@ -145,6 +145,23 @@ tmux-agent-dialogue \
 
 Real participants use the same command shape with `--agent-a codex --agent-b claude`. Real turns use a split-marker contract so the prompt echo cannot satisfy the wait; the required final response line must contain only the joined marker. On timeout, the runner writes a `failure` JSONL event and prints the captured pane tail for diagnosis. Keep real-agent smoke as manual release evidence, not a default CI check.
 
+Remote participant:
+
+```bash
+tmux-agent-dialogue \
+  --turns 2 \
+  --workdir . \
+  --agent-a codex \
+  --agent-a-ssh openclaw-macmini \
+  --agent-a-workdir /Users/paul.yeh/github/project \
+  --agent-b claude \
+  --prompt-file prompt.md \
+  --transcript transcript.jsonl
+```
+
+Remote mode uses the existing wrapper `start-ssh` path: tmux stays local, while the selected real participant runs through SSH in the remote directory. `fake` participants cannot use SSH mode.
+Use an absolute remote workdir such as `/Users/paul.yeh/github/project`; shell-expansion paths like `~/project` are rejected so the local wrapper does not quote them into a non-expanded remote path.
+
 Credential-free smoke:
 
 ```bash

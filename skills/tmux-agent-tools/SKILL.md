@@ -87,6 +87,14 @@ tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-b claude --pro
 
 Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. If a marker wait times out, inspect the emitted `failure` JSONL event and captured pane tail before treating the run as a protocol failure.
 
+Use participant SSH options when one real agent should run remotely while tmux stays local:
+
+```bash
+tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-a-ssh openclaw-macmini --agent-a-workdir /Users/paul.yeh/github/project --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
+```
+
+Only real `codex` or `claude` participants can use `--agent-a-ssh` or `--agent-b-ssh`; `fake` is local-only. Remote workdirs must be absolute paths on the target host.
+
 For a local review preset that only writes a transcript and terminal summary:
 
 ```bash
