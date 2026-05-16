@@ -186,7 +186,7 @@ jobs:
           rg -n "critic --turns must be a positive even integer" /tmp/critic-odd-turns.out
           summary_stdout="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" > "$summary_stdout"
-          rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$summary_stdout"
+          rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$summary_stdout"
           limited_summary="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --max-lines 8 > "$limited_summary"
           rg -n "truncated at 8 lines" "$limited_summary"
@@ -195,7 +195,7 @@ jobs:
           rg -n "truncated at 200 bytes" "$bytes_summary"
           comment_body="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$comment_body"
-          rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$comment_body"
+          rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$comment_body"
           redacted_comment_body="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --redact-pattern 'TMUX_AGENT_DIALOGUE_[^]]+' > "$redacted_comment_body"
           rg -n "\\[REDACTED\\]|redact patterns were applied" "$redacted_comment_body"
