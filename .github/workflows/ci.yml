@@ -74,10 +74,28 @@ jobs:
           transcript_file="$(mktemp)"
           printf '%s\n' 'Discuss the smoke test.' > "$prompt_file"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 4 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$transcript_file"
+          invalid_transcript_file="$(mktemp)"
+          printf '%s\n' '{"event":"turn"}' > "$invalid_transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$invalid_transcript_file" >/tmp/invalid-transcript.out 2>&1; then
+            echo "invalid transcripts must fail validation" >&2
+            exit 1
+          fi
+          rg -n "turn must be|speaker must be|agent must be|marker must be|timestamp must be|text must be" /tmp/invalid-transcript.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$invalid_transcript_file" >/tmp/invalid-summary.out 2>&1; then
+            echo "summarize must reject invalid transcripts" >&2
+            exit 1
+          fi
+          rg -n "turn must be|speaker must be" /tmp/invalid-summary.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$invalid_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools >/tmp/invalid-comment.out 2>&1; then
+            echo "github-comment must reject invalid transcripts" >&2
+            exit 1
+          fi
+          rg -n "turn must be|speaker must be" /tmp/invalid-comment.out
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a fake --agent-a-ssh example --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/invalid-remote-fake.jsonl --timeout 1; then
             echo "fake participants must not accept SSH mode" >&2
             exit 1
@@ -93,6 +111,7 @@ jobs:
           pair_transcript_file="$(mktemp)"
           pair_summary_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --summary-file "$pair_summary_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
           rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$pair_summary_file"

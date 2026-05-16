@@ -54,26 +54,27 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 16. Merge `jq` runtime dependency and Formula summarize smoke through PR #14. Done.
 17. Merge manual dry-run-first release workflow through PR #15. Done.
 18. Merge release handoff docs and Formula bump summary workflow through PR #16. Done.
+19. Merge v0.3 session hygiene helper through PR #18. Done.
 
 ## Active Work
 
-Branch: `feature/v0.3-session-hygiene`
+Branch: `feature/transcript-validator`
 
 Scope:
 
-- add `tmux-agent-sessions` as a cross-tool session inventory and cleanup helper;
-- keep `tmux-agent-sessions` as a Homebrew `--HEAD` command until the next tagged release;
-- keep default inventory and cleanup preview read-only;
-- require `cleanup --execute` plus `--all`, `--tool`, or `--name` for stop behavior;
-- limit execution to sessions owned by `claude-tmux`, `codex-tmux`, or `tmux-agent-dialogue`;
-- include JSON inventory output for automation;
+- add `tmux-agent-dialogue validate-transcript --transcript <path>`;
+- validate dialogue JSONL line by line with clear diagnostics;
+- require fields for `turn` and `failure` events without introducing a schema-version system yet;
+- make `summarize` and `github-comment` reject invalid transcripts before rendering;
+- wire fake dialogue and pair-review transcript validation into CI;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate recommends a separate `tmux-agent-sessions` command instead of adding cross-wrapper behavior to `claude-tmux` or `codex-tmux`.
-- Pending for this branch: shell syntax, CI-equivalent hygiene smoke, Formula style/test, skill validation, PR CI.
+- Claude tmux-agent teammate recommends the minimal validator command shape, local-only validation, line-level diagnostics, and no strict turn sequencing in this slice.
+- Local checks pass: shell syntax, skill validation, Formula syntax/style, wrapper self-tests, validator positive/negative smoke, fake dialogue validation, pair-review validation, and summary/comment invalid transcript rejection.
+- Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 

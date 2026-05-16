@@ -20,7 +20,7 @@ This project is inspired by two tmux skills in the `skills.sh` ecosystem:
 
 - `claude-tmux`: starts Claude Code in tmux with `--dangerously-skip-permissions`.
 - `codex-tmux`: starts Codex CLI in tmux with `--yolo`.
-- `tmux-agent-dialogue`: runs a bounded two-party tmux dialogue and writes a JSONL transcript.
+- `tmux-agent-dialogue`: runs a bounded two-party tmux dialogue, writes a JSONL transcript, and validates transcript artifacts.
 - `tmux-agent-sessions`: lists and safely cleans up tmux-agent-tools owned sessions.
 
 The `claude-tmux` and `codex-tmux` wrapper tools support:
@@ -153,6 +153,14 @@ tmux-agent-dialogue \
 ```
 
 Real participants use the same command shape with `--agent-a codex --agent-b claude`. Real turns use a split-marker contract so the prompt echo cannot satisfy the wait; the required final response line must contain only the joined marker. On timeout, the runner writes a `failure` JSONL event and prints the captured pane tail for diagnosis. Keep real-agent smoke as manual release evidence, not a default CI check.
+
+Validate a transcript before sharing or rendering it:
+
+```bash
+tmux-agent-dialogue validate-transcript --transcript transcript.jsonl
+```
+
+The validator is local-only. It checks one JSON object per line, required `turn` and `failure` fields, and emits line-level diagnostics for invalid JSONL or missing fields. `summarize` and `github-comment` reject invalid transcripts before rendering.
 
 Remote participant:
 
