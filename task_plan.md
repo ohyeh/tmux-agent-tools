@@ -209,7 +209,11 @@ Verification evidence:
 - v0.6 roadmap validation passed on `feature/v0.6-roadmap`: `git diff --check`, workflow YAML name checks with `yq`, roadmap/task-plan/README anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
 - PR #79 merged as `a4320a9`; feature branch CI run `25975810492` and main CI run `25975839000` passed.
 - Claude tmux-agent teammate reviewed the v0.6 roadmap state sync diff and found no blockers with `VERDICT: SHIP`.
-- Pending for next branch: shellcheck CI quality gate implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
+- Shellcheck CI gate local validation passed on `feature/v0.6-shellcheck-ci`: `git diff --check`, workflow YAML checks with `yq`, `zsh -n` for all installed scripts including `install-bin`, `scripts/ci-shellcheck`, `shellcheck scripts/ci-shellcheck`, Formula Ruby syntax, wrapper self-tests, empty session inventory check with `jq`, and roadmap/task-plan anchor checks with `rg`.
+- ShellCheck cannot parse zsh (`SC1071`), so the gate lints supported-shell helpers and keeps an explicit `SC1071` compatibility sentinel for installed zsh scripts while preserving `zsh -n`.
+- Claude tmux-agent teammate reviewed the shellcheck CI diff and found one blocker: `scripts/ci-shellcheck` must be executable because CI invokes it directly. The file was staged with mode `100755`.
+- Claude tmux-agent teammate re-reviewed after the executable-bit fix and found no blockers with `VERDICT: SHIP`.
+- Pending for this branch: PR CI and merge.
 
 ## v0.2.0 Candidate Scope
 
