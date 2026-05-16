@@ -82,12 +82,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.5-current-state-refresh`
+Branch: create `feature/v0.5-release-prep` next
 
 Scope:
 
-- reconcile the v0.5 roadmap/current state now that the planned P0/P1/P2 slices are implemented;
-- add unreleased `v0.5.0` changelog notes and identify the next release-readiness branch without publishing tags or releases;
+- prepare `v0.5.0` release-readiness docs and local validation evidence;
+- keep this as release-prep and dry-run preparation only; do not publish tags, GitHub releases, or Formula bumps in this branch;
 - keep this slice free of release publish, tag, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -192,7 +192,8 @@ Verification evidence:
 - PR #72 merged as `2421161`; feature branch CI run `25974802216` and main CI run `25974835304` passed.
 - v0.5 current-state refresh local validation passed on `feature/v0.5-current-state-refresh`: `git diff --check`, workflow YAML name check with `yq`, and roadmap/changelog/task-plan anchor checks with `rg` proving the unreleased `v0.5.0` changelog, all-planned-slices-landed status, no-tag/release/Formula-bump state, and next release-readiness dry-run path are documented.
 - Claude tmux-agent teammate reviewed the v0.5 current-state refresh diff and found no blockers with `VERDICT: SHIP`; the only duplicate release-notes wording observation was cleaned up before PR.
-- Pending on `feature/v0.5-current-state-refresh`: PR CI, merge, main CI, and post-merge state sync.
+- PR #74 merged as `d9c96da`; feature branch CI run `25975033756` and main CI run `25975062529` passed.
+- Pending for next branch: `v0.5.0` release-prep docs, local validation, Claude tmux-agent teammate review, PR CI, merge, and Release workflow dry-run after merge.
 
 ## v0.2.0 Candidate Scope
 
