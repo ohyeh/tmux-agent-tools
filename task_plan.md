@@ -55,25 +55,26 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 17. Merge manual dry-run-first release workflow through PR #15. Done.
 18. Merge release handoff docs and Formula bump summary workflow through PR #16. Done.
 19. Merge v0.3 session hygiene helper through PR #18. Done.
+20. Merge transcript validator through PR #19. Done.
 
 ## Active Work
 
-Branch: `feature/transcript-validator`
+Branch: `feature/failure-classification`
 
 Scope:
 
-- add `tmux-agent-dialogue validate-transcript --transcript <path>`;
-- validate dialogue JSONL line by line with clear diagnostics;
-- require fields for `turn` and `failure` events without introducing a schema-version system yet;
-- make `summarize` and `github-comment` reject invalid transcripts before rendering;
-- wire fake dialogue and pair-review transcript validation into CI;
+- include `failure_type` in `failure` JSONL events;
+- classify credential-free fake failure paths as `marker_timeout` and `session_missing`;
+- keep text-pattern classifications conservative and evidence-based for `cli_exited`, `ssh_prompt`, and `permission_prompt`;
+- keep transcript validation backward-compatible while checking known `failure_type` values when present;
+- cover failure classification in CI without real Codex/Claude tokens;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate recommends the minimal validator command shape, local-only validation, line-level diagnostics, and no strict turn sequencing in this slice.
-- Local checks pass: shell syntax, skill validation, Formula syntax/style, wrapper self-tests, validator positive/negative smoke, fake dialogue validation, pair-review validation, and summary/comment invalid transcript rejection.
+- Claude tmux-agent teammate recommends a conservative first slice focused on `marker_timeout` and `session_missing`, with text-pattern classifications treated as best-effort.
+- Local checks pass for `marker_timeout` and `session_missing` fake failure transcripts, including `validate-transcript`.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
