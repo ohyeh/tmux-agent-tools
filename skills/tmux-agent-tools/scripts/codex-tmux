@@ -110,6 +110,18 @@ require_jq() {
   fi
 }
 
+clipboard_command() {
+  if command -v pbcopy >/dev/null 2>&1; then
+    echo "pbcopy"
+  elif command -v wl-copy >/dev/null 2>&1; then
+    echo "wl-copy"
+  elif command -v xclip >/dev/null 2>&1; then
+    echo "xclip -selection clipboard"
+  elif command -v xsel >/dev/null 2>&1; then
+    echo "xsel --clipboard --input"
+  fi
+}
+
 write_tmux_conf() {
   cat > "$TMUX_CONF" <<'EOF'
 set -g default-terminal "tmux-256color"
@@ -148,9 +160,16 @@ set -g mode-style "bg=#2563eb,fg=#ffffff"
 set -g clock-mode-colour "#2563eb"
 set -g display-panes-colour "#64748b"
 set -g display-panes-active-colour "#22c55e"
-bind-key -T copy-mode-vi y send -X copy-pipe-and-cancel "pbcopy"
-bind-key -T copy-mode-vi Enter send -X copy-pipe-and-cancel "pbcopy"
 EOF
+  local copy_command
+  copy_command="$(clipboard_command)"
+  if [[ -n "$copy_command" ]]; then
+    printf 'bind-key -T copy-mode-vi y send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi Enter send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
+  else
+    printf 'bind-key -T copy-mode-vi y send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi Enter send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
+  fi
   printf 'set -g mouse "%s"\n' "$TMUX_MOUSE" >> "$TMUX_CONF"
 }
 

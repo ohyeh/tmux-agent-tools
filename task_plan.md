@@ -70,6 +70,7 @@ Branch: `feature/capture-join-wrap`
 Scope:
 
 - normalize wrapper and dialogue pane capture with tmux soft-wrap joining so transcript text is not polluted by pane width;
+- keep normal keyboard/mouse copy-mode usable by selecting a platform clipboard command when available and falling back to tmux internal selection otherwise;
 - document the capture behavior as release-hardening for long model output and markers;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -79,6 +80,7 @@ Verification evidence:
 - PR #29 main CI passed after roadmap and Formula compatibility refresh.
 - Local tmux smoke confirms default `capture-pane -p` hard-wraps long lines and `capture-pane -p -J` preserves the logical line.
 - Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, stable `brew test`, HEAD transcript summary smoke, and wrapper capture long-line regression.
+- Config smoke verifies copy-mode bindings use `pbcopy` on macOS and fall back to `copy-selection-and-cancel` when clipboard helpers are absent.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
