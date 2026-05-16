@@ -406,6 +406,16 @@ jobs:
             echo "GitHub comment posting must require --github-pr" >&2
             exit 1
           fi
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing abc >/tmp/github-comment-bad-edit.out 2>&1; then
+            echo "GitHub comment edit id must be numeric" >&2
+            exit 1
+          fi
+          rg -n -- "--edit-existing must be a GitHub comment id" /tmp/github-comment-bad-edit.out
+          edit_dry_run_body="$(mktemp)"
+          edit_dry_run_stderr="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 > "$edit_dry_run_body" 2> "$edit_dry_run_stderr"
+          cmp "$comment_body" "$edit_dry_run_body"
+          rg -n "dry-run: add --post-github-comment to update GitHub comment 123" "$edit_dry_run_stderr"
           fake_bin="$(mktemp -d)"
           fake_args="$(mktemp)"
           {
@@ -424,3 +434,22 @@ jobs:
           chmod +x "$fake_bin/gh"
           GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --post-github-comment
           rg -n "pr|comment|1|--repo|ohyeh/tmux-agent-tools|--body-file" "$fake_args"
+          fake_edit_args="$(mktemp)"
+          fake_edit_body="$(mktemp)"
+          {
+            printf '%s\n' '#!/usr/bin/env zsh'
+            # shellcheck disable=SC2016
+            printf '%s\n' '# shellcheck disable=SC2016'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "$@" > "$GH_FAKE_ARGS"'
+            # shellcheck disable=SC2016
+            printf '%s\n' '[[ "$1" == "api" && "$2" == "--method" && "$3" == "PATCH" && "$4" == "repos/ohyeh/tmux-agent-tools/issues/comments/123" && "$5" == "--input" ]] || exit 2'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'jq -e ".body | contains(\"tmux-agent-tools transcript\")" "$6" >/dev/null || exit 3'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'cp "$6" "$GH_FAKE_BODY"'
+          } > "$fake_bin/gh"
+          chmod +x "$fake_bin/gh"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment
+          rg -n "api|PATCH|repos/ohyeh/tmux-agent-tools/issues/comments/123|--input" "$fake_edit_args"
+          jq -e '.body | contains("tmux-agent-tools transcript")' "$fake_edit_body"

@@ -82,11 +82,11 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-github-comment-edit-existing` next
+Branch: `feature/v0.5-github-comment-edit-existing`
 
 Scope:
 
-- start the next v0.5 operator-ergonomics slice: `github-comment --edit-existing` for updating a known marker comment instead of appending;
+- implement the next v0.5 operator-ergonomics slice: `github-comment --edit-existing` for updating a known marker comment instead of appending;
 - keep GitHub write behavior explicit and opt-in, with no hidden posting or editing unless the command is invoked directly;
 - keep this slice free of release publish, tag, scheduling, cleanup, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
@@ -184,7 +184,9 @@ Verification evidence:
 - Profile timeout override local validation passed on `feature/v0.5-profile-timeout-overrides`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and fake profile timeout smoke proving `timeout:"1"` triggers a per-profile `marker_timeout` transcript while non-integer and zero timeout profile values are rejected.
 - Claude tmux-agent teammate reviewed the profile timeout override diff, initially raised a zsh regex robustness blocker, then re-reviewed after the regex fix and found no blockers with `VERDICT: SHIP`.
 - PR #68 merged as `002dfaa`; feature branch CI run `25974347910` and main CI run `25974375950` passed.
-- Pending for next branch: `github-comment --edit-existing` design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- GitHub comment edit-existing local validation passed on `feature/v0.5-github-comment-edit-existing`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and fake GitHub smoke proving dry-run edit mode does not call `gh`, non-numeric `--edit-existing` is rejected, and `--post-github-comment --edit-existing 123` calls `gh api --method PATCH repos/ohyeh/tmux-agent-tools/issues/comments/123 --input <json>` with the rendered Markdown body.
+- Claude tmux-agent teammate reviewed the GitHub comment edit-existing diff and found no blockers with `VERDICT: SHIP`.
+- Pending on `feature/v0.5-github-comment-edit-existing`: PR CI, merge, main CI, and post-merge state sync.
 
 ## v0.2.0 Candidate Scope
 
