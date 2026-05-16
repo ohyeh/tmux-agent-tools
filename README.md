@@ -29,9 +29,12 @@ Both tools support:
 - `send`
 - `wait`
 - `wait-text`
+- `wait-literal`
 - `capture`
 - `list`
 - `status`
+- `doctor`
+- `self-test`
 - `stop`
 - `help`
 
@@ -95,8 +98,18 @@ codex-tmux start --exact worker ~/github/project 'Read the repo and report statu
 codex-tmux send worker 'Run the targeted tests.'
 codex-tmux wait worker 180
 codex-tmux wait-text worker 'Done|Need approval' 180
+codex-tmux wait-literal worker '[CODEX-01]' 180
 codex-tmux capture worker 120
 codex-tmux stop worker
+```
+
+Reliability checks:
+
+```bash
+codex-tmux doctor
+codex-tmux self-test
+claude-tmux doctor
+claude-tmux self-test
 ```
 
 Remote run with local tmux:
