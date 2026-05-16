@@ -71,13 +71,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-roadmap`
+Branch: `feature/v0.4-sessions-state`
 
 Scope:
 
-- close out the completed v0.3 roadmap state;
-- create the `v0.4.0` roadmap around automation readiness;
-- seed the first v0.4 candidate slice for `tmux-agent-sessions` state accuracy;
+- implement the first v0.4 candidate slice for `tmux-agent-sessions` state accuracy;
+- preserve read-only inventory and cleanup preview behavior;
+- document the session inventory state contract;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -102,7 +102,9 @@ Verification evidence:
 - Claude tmux-agent teammate brainstormed v0.4 candidates and recommended automation readiness: status/session truth, handoff preset, and summary-file pipeline.
 - Roadmap docs validation passed: script syntax, skill metadata validation, Formula syntax/style, and text searches for v0.4 scope anchors.
 - Claude tmux-agent teammate reviewed the v0.4 roadmap diff and found no blockers.
-- Pending for this branch: PR CI.
+- `tmux-agent-sessions` state accuracy local validation passed on `feature/v0.4-sessions-state`: script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, running inventory JSON shape, cleanup preview text shape, exited-but-capturable inventory JSON shape, cleanup preview JSON shape, and cleanup scoping.
+- Claude tmux-agent teammate reviewed the session state diff, initially found two blockers, then re-reviewed after fixes and found no blockers. Remaining note: `missing` is only wrapper-reported passthrough/race state, now documented in README.
+- Pending for this branch: commit, PR CI.
 
 ## v0.2.0 Candidate Scope
 
