@@ -74,17 +74,18 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 33. Merge `v0.4.0` release-ready state through PR #52 (`9cf1684`). Done.
 34. Merge `v0.4.0` status-contract roadmap sync through PR #53 (`17ee594`). Done.
 35. Merge `v0.4.0` roadmap current-state refresh through PR #54 (`dc37dc2`). Done.
+36. Merge `v0.5.0` roadmap through PR #55 (`71e8ec4`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.5-roadmap`
+Branch: `feature/v0.5-bounded-session-watch`
 
 Scope:
 
-- record the PR #54 merge and main CI evidence before any `v0.4.0` publish;
-- add a `v0.5.0` roadmap focused on bounded observability and multi-session composability;
-- define the first measurable v0.5 slice as bounded `tmux-agent-sessions list --watch --json --count N`;
-- keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
+- record the PR #55 merge and main CI evidence before any `v0.4.0` publish;
+- implement bounded `tmux-agent-sessions list --watch --json --count N [--interval S]`;
+- keep watch mode read-only, finite, credential-free, and explicit about no scheduler/daemon behavior;
+- keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -154,7 +155,9 @@ Verification evidence:
 - Current-state roadmap validation passed on `feature/v0.4-roadmap-current-state`: `git diff --check`, workflow YAML name check with `yq`, script syntax checks, stale roadmap searches with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
 - PR #54 merged as `dc37dc2`; main CI run `25972109136` passed.
 - Claude tmux-agent teammate brainstormed the next version and recommended `v0.5.0` focus on observability and multi-session composability, with bounded `tmux-agent-sessions list --watch --json --count N` as the first measurable slice.
-- Pending for this branch: v0.5 roadmap validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- v0.5 roadmap validation passed on `feature/v0.5-roadmap`: `git diff --check`, workflow YAML name check with `yq`, script syntax checks, roadmap anchor searches with `rg`, and Claude tmux-agent teammate final review with `VERDICT: SHIP`.
+- PR #55 merged as `71e8ec4`; main CI run `25972340758` passed.
+- Pending for this branch: bounded watch implementation validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
