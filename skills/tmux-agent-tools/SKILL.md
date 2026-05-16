@@ -56,6 +56,7 @@ codex-tmux capture worker 120
 
 ```bash
 codex-tmux status worker
+codex-tmux status --json worker
 codex-tmux doctor
 codex-tmux self-test
 codex-tmux stop worker

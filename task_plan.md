@@ -49,6 +49,6 @@ Candidate work:
 - `wait-literal` or `wait-text --literal` - done
 - `doctor` - done
 - `self-test` - done
-- session metadata/structured status
+- session metadata/structured status - done
 - better Claude first-run confirmation handling
 - local hold-on-exit diagnostics
