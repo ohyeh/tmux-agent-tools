@@ -28,11 +28,13 @@ tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
 
 Usage:
   tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>]
+  tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>]
   tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|dialogue>] [--name <name>]
   tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|dialogue> | --name <name>)
 
 Behavior:
   - list is read-only;
+  - list --watch is bounded by --count and emits one JSON array snapshot per poll;
   - cleanup --preview is read-only;
   - cleanup --execute requires --all or a filter before stopping sessions;
   - cleanup --execute only stops matching sessions owned by claude-tmux, codex-tmux, or tmux-agent-dialogue;
@@ -181,6 +183,14 @@ parse_filter_arg() {
   esac
 }
 
+parse_nonnegative_integer_arg() {
+  local flag="$1"
+  local value="$2"
+  local integer_re='^[0-9]+$'
+  [[ "$value" =~ $integer_re ]] || die "$flag requires a non-negative integer"
+  print -r -- "$value"
+}
+
 matches_filters() {
   local tool="$1"
   local name="$2"
@@ -217,10 +227,24 @@ list_owned_sessions() {
 
 list_sessions() {
   local output_json=0
+  local watch=0
+  local watch_count=""
+  local watch_interval=1
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --json)
         output_json=1
+        ;;
+      --watch)
+        watch=1
+        ;;
+      --count)
+        shift
+        watch_count="$(parse_nonnegative_integer_arg --count "${1:-}")"
+        ;;
+      --interval)
+        shift
+        watch_interval="$(parse_nonnegative_integer_arg --interval "${1:-}")"
         ;;
       --tool)
         shift
@@ -232,11 +256,28 @@ list_sessions() {
         [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
         ;;
       *)
-        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>]"
+        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>] | list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>]"
         ;;
     esac
     shift
   done
+
+  if (( watch )); then
+    (( output_json )) || die "list --watch requires --json"
+    [[ -n "$watch_count" ]] || die "list --watch requires --count"
+    require_jq
+    local i=0
+    while (( i < watch_count )); do
+      list_owned_sessions | while IFS=$'\t' read -r tool name session; do
+        emit_inventory_json "$tool" "$name" "$session"
+      done | "$JQ" -cs '.'
+      i=$((i + 1))
+      if (( i < watch_count )); then
+        sleep "$watch_interval"
+      fi
+    done
+    return
+  fi
 
   local tool name session
   list_owned_sessions | while IFS=$'\t' read -r tool name session; do
