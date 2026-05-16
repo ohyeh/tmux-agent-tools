@@ -273,9 +273,10 @@ Post the summary to a GitHub PR only when explicitly requested:
 
 ```bash
 tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo --post-github-comment
+tmux-agent-dialogue github-comment --summary-file review-summary.md --github-repo owner/repo --edit-existing 123456789 --post-github-comment
 ```
 
-Without `--post-github-comment`, `github-comment` prints the comment body as a dry run. Posting requires GitHub CLI authentication and never runs unless the flag is present. Use `github-comment --summary-file <path>` to reuse a pre-rendered local summary body instead of re-rendering from a transcript; `github-comment` requires exactly one of `--transcript` or `--summary-file`.
+Without `--post-github-comment`, `github-comment` prints the comment body as a dry run. Posting or editing requires GitHub CLI authentication and never runs unless the flag is present. Use `github-comment --summary-file <path>` to reuse a pre-rendered local summary body instead of re-rendering from a transcript; `github-comment` requires exactly one of `--transcript` or `--summary-file`. By default, posting appends with `gh pr comment` and requires `--github-pr`; pass `--edit-existing <comment-id>` to update a known issue comment through `gh api` instead of appending.
 
 Before sharing a rendered summary, limit or redact the Markdown body:
 

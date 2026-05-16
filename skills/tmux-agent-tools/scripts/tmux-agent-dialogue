@@ -29,7 +29,7 @@ Usage:
   tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
-  tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
+  tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-repo <owner/repo> [--github-pr <number-or-url>|--edit-existing <comment-id>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
 
 Example:
   tmux-agent-dialogue \
@@ -801,7 +801,6 @@ write_pair_review_summary_file() {
 
 post_pair_review_comment() {
   (( POST_GITHUB_COMMENT )) || return 0
-  [[ -n "$GITHUB_PR" ]] || die "--github-pr is required with --post-github-comment"
   [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required with --post-github-comment"
   [[ -n "$GH" && -x "$GH" ]] || die "gh not found; install GitHub CLI or set GH=/path/to/gh"
 
@@ -809,8 +808,17 @@ post_pair_review_comment() {
   body_file="$(mktemp)"
   build_github_comment_body > "$body_file"
 
-  "$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file"
-  echo "posted GitHub PR comment: $GITHUB_PR" >&2
+  if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+    local api_body_file
+    api_body_file="$(mktemp)"
+    "$JQ" -n --rawfile body "$body_file" '{body: $body}' > "$api_body_file"
+    "$GH" api --method PATCH "repos/$GITHUB_REPO/issues/comments/$GITHUB_EDIT_EXISTING" --input "$api_body_file"
+    echo "updated GitHub PR comment: $GITHUB_EDIT_EXISTING" >&2
+  else
+    [[ -n "$GITHUB_PR" ]] || die "--github-pr is required with --post-github-comment"
+    "$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file"
+    echo "posted GitHub PR comment: $GITHUB_PR" >&2
+  fi
 }
 
 run_summary_mode() {
@@ -830,8 +838,10 @@ run_summary_mode() {
 
 run_github_comment_mode() {
   require_jq
-  [[ -n "$GITHUB_PR" ]] || die "--github-pr is required"
   [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required"
+  if [[ -z "$GITHUB_EDIT_EXISTING" ]]; then
+    [[ -n "$GITHUB_PR" ]] || die "--github-pr is required"
+  fi
   if [[ -z "$TRANSCRIPT" && -z "$SUMMARY_FILE" ]] || [[ -n "$TRANSCRIPT" && -n "$SUMMARY_FILE" ]]; then
     die "github-comment requires exactly one of --transcript or --summary-file"
   fi
@@ -848,7 +858,11 @@ run_github_comment_mode() {
     post_pair_review_comment
   else
     build_github_comment_body
-    echo "dry-run: add --post-github-comment to post to GitHub" >&2
+    if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+      echo "dry-run: add --post-github-comment to update GitHub comment $GITHUB_EDIT_EXISTING" >&2
+    else
+      echo "dry-run: add --post-github-comment to post to GitHub" >&2
+    fi
   fi
 }
 
@@ -939,6 +953,7 @@ POST_GITHUB_COMMENT=0
 PAIR_REVIEW_SWAP=0
 GITHUB_PR=""
 GITHUB_REPO=""
+GITHUB_EDIT_EXISTING=""
 MAX_LINES=""
 MAX_BYTES=""
 TRANSCRIPT_SCHEMA_VERSION=""
@@ -1011,6 +1026,7 @@ while (( $# > 0 )); do
     --post-github-comment) POST_GITHUB_COMMENT=1; shift ;;
     --github-pr) GITHUB_PR="${2:-}"; shift 2 ;;
     --github-repo) GITHUB_REPO="${2:-}"; shift 2 ;;
+    --edit-existing) GITHUB_EDIT_EXISTING="${2:-}"; shift 2 ;;
     -h|--help|help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -1023,6 +1039,8 @@ fi
 [[ "$OUTPUT_FORMAT_SET" -eq 0 || "$MODE" == "summarize" ]] || die "--output-format is only supported with summarize"
 [[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 || "$MODE" == "validate-transcript" ]] || die "--schema-version is only supported with validate-transcript"
 [[ "$PAIR_REVIEW_SWAP" -eq 0 || "$MODE" == "pair-review" ]] || die "--swap is only supported with pair-review"
+[[ -z "$GITHUB_EDIT_EXISTING" || "$MODE" == "github-comment" ]] || die "--edit-existing is only supported with github-comment"
+[[ -z "$GITHUB_EDIT_EXISTING" || "$GITHUB_EDIT_EXISTING" =~ ^[0-9]+$ ]] || die "--edit-existing must be a GitHub comment id"
 if [[ -n "$AGENT_A_PROFILE" || -n "$AGENT_B_PROFILE" ]]; then
   [[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" ]] || die "--agent-a-profile and --agent-b-profile are only supported with dialogue, pair-review, critic, or handoff"
 fi
@@ -1074,6 +1092,7 @@ apply_profile b "$AGENT_B_PROFILE" "$AGENT_B_SET" "$AGENT_B_SSH_SET" "$AGENT_B_W
 [[ "$POST_GITHUB_COMMENT" -eq 0 ]] || die "--post-github-comment is only supported with github-comment"
 [[ -z "$GITHUB_PR" ]] || die "--github-pr is only supported with github-comment"
 [[ -z "$GITHUB_REPO" ]] || die "--github-repo is only supported with github-comment"
+[[ -z "$GITHUB_EDIT_EXISTING" ]] || die "--edit-existing is only supported with github-comment"
 [[ -z "$SUMMARY_FILE" || "$TRANSCRIPT" != "-" ]] || die "--summary-file requires --transcript to be a file path"
 [[ -z "$ON_BLOCKED_TRIGGER" || "$ON_BLOCKED_TRIGGER" != "-" ]] || die "--on-blocked-trigger must be a file path"
 
