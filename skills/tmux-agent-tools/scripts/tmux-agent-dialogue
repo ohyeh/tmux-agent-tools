@@ -1,0 +1,297 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:t}"
+SCRIPT_DIR="${0:A:h}"
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
+    print -r -- "$TMUX"
+    return
+  fi
+  command -v tmux 2>/dev/null || true
+}
+
+TMUX_BIN="$(resolve_tmux_bin)"
+unset TMUX
+TMUX="$TMUX_BIN"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-dialogue - run a bounded two-agent tmux dialogue
+
+Usage:
+  tmux-agent-dialogue --turns <n> --workdir <dir> --agent-a <codex|claude|fake> --agent-b <codex|claude|fake> --prompt-file <path> --transcript <path|-> [--timeout <seconds>]
+
+Example:
+  tmux-agent-dialogue \
+    --turns 4 \
+    --workdir . \
+    --agent-a fake \
+    --agent-b fake \
+    --prompt-file prompt.md \
+    --transcript transcript.jsonl
+
+Behavior:
+  - alternates turns between agent A and agent B;
+  - waits for a unique marker after each turn;
+  - writes one JSONL object per turn;
+  - cleans up sessions it created;
+  - has no GitHub, network, or external publishing side effects.
+EOF
+}
+
+die() {
+  echo "$SELF: $*" >&2
+  exit 1
+}
+
+append_jsonl() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local text="$5"
+  local line
+  line="$("$JQ" -cn \
+    --arg event "turn" \
+    --argjson turn "$turn" \
+    --arg speaker "$speaker" \
+    --arg agent "$agent" \
+    --arg marker "$marker" \
+    --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg text "$text" \
+    '{event:$event,turn:$turn,speaker:$speaker,agent:$agent,marker:$marker,timestamp:$timestamp,text:$text}')"
+
+  if [[ "$TRANSCRIPT" == "-" ]]; then
+    print -r -- "$line"
+  else
+    print -r -- "$line" >> "$TRANSCRIPT"
+  fi
+}
+
+require_tmux() {
+  command -v "$TMUX" >/dev/null 2>&1 || die "tmux not found"
+  [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
+}
+
+session_name() {
+  local label="$1"
+  print -r -- "tmux-agent-dialogue-${RUN_ID}-${label}"
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+start_fake_agent() {
+  local label="$1"
+  local session
+  local command
+  session="$(session_name "$label")"
+  command="DIALOGUE_LABEL=$(shell_quote "$label") zsh -lc 'stty -echo 2>/dev/null || true; while IFS= read -r line; do if [[ \"\$line\" == __TMUX_AGENT_DIALOGUE_STOP__* ]]; then break; fi; marker=\"\${line##* MARKER:}\"; body=\"\${line%% MARKER:*}\"; print -r -- \"fake-\${DIALOGUE_LABEL}: \${body}\"; print -r -- \"\$marker\"; done'"
+  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  "$TMUX" new-session -d -s "$session" "$command"
+  OWNED_SESSIONS+=("$session")
+}
+
+wrapper_for_agent() {
+  local agent="$1"
+  case "$agent" in
+    codex) print -r -- "$SCRIPT_DIR/codex-tmux" ;;
+    claude) print -r -- "$SCRIPT_DIR/claude-tmux" ;;
+    *) die "unsupported real agent: $agent" ;;
+  esac
+}
+
+start_real_agent() {
+  local label="$1"
+  local agent="$2"
+  local session
+  local wrapper
+  session="$(session_name "$label")"
+  wrapper="$(wrapper_for_agent "$agent")"
+  "$wrapper" stop "$session" >/dev/null 2>&1 || true
+  "$wrapper" start --exact "$session" "$WORKDIR" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt."
+  OWNED_WRAPPERS+=("$agent:$session")
+  "$wrapper" wait "$session" "$TIMEOUT" >/dev/null
+}
+
+send_to_agent() {
+  local label="$1"
+  local agent="$2"
+  local message="$3"
+
+  if [[ "$agent" == "fake" ]]; then
+    "$TMUX" send-keys -t "$(session_name "$label")" -- "$message" C-m
+  else
+    "$(wrapper_for_agent "$agent")" send "$(session_name "$label")" "$message"
+  fi
+}
+
+wait_for_marker() {
+  local label="$1"
+  local agent="$2"
+  local marker="$3"
+
+  if [[ "$agent" == "fake" ]]; then
+    local deadline=$((SECONDS + TIMEOUT))
+    local current=""
+    while (( SECONDS < deadline )); do
+      current="$("$TMUX" capture-pane -t "$(session_name "$label")" -p -S -200)"
+      if [[ "$current" == *"$marker"* ]]; then
+        return 0
+      fi
+      sleep 1
+    done
+    return 1
+  fi
+
+  "$(wrapper_for_agent "$agent")" wait-literal "$(session_name "$label")" "$marker" "$TIMEOUT"
+}
+
+capture_agent() {
+  local label="$1"
+  local agent="$2"
+
+  if [[ "$agent" == "fake" ]]; then
+    "$TMUX" capture-pane -t "$(session_name "$label")" -p -S -1000
+  else
+    "$(wrapper_for_agent "$agent")" capture "$(session_name "$label")" 1000
+  fi
+}
+
+cleanup() {
+  local item
+  if (( ${#OWNED_WRAPPERS[@]} )); then
+    for item in "${OWNED_WRAPPERS[@]}"; do
+      local agent="${item%%:*}"
+      local session="${item#*:}"
+      "$(wrapper_for_agent "$agent")" stop "$session" >/dev/null 2>&1 || true
+    done
+  fi
+
+  if (( ${#OWNED_SESSIONS[@]} )); then
+    for item in "${OWNED_SESSIONS[@]}"; do
+      "$TMUX" send-keys -t "$item" -- "__TMUX_AGENT_DIALOGUE_STOP__" C-m 2>/dev/null || true
+      "$TMUX" kill-session -t "$item" 2>/dev/null || true
+    done
+  fi
+}
+
+make_turn_prompt() {
+  local turn="$1"
+  local label="$2"
+  local marker="$3"
+  local previous="$4"
+  local half=$(( ${#marker} / 2 ))
+  local marker_a="${marker[1,half]}"
+  local marker_b="${marker[half+1,-1]}"
+
+  cat <<EOF
+Turn: $turn
+Speaker: $label
+
+Initial/user prompt and previous response:
+$previous
+
+Respond concisely for this turn. End your response with the marker formed by joining these two parts with no spaces:
+$marker_a
+$marker_b
+EOF
+}
+
+TURN_COUNT=0
+WORKDIR=""
+AGENT_A=""
+AGENT_B=""
+PROMPT_FILE=""
+TRANSCRIPT=""
+TIMEOUT=180
+RUN_ID="${$}-$(date -u '+%Y%m%d%H%M%S')"
+OWNED_SESSIONS=()
+OWNED_WRAPPERS=()
+
+while (( $# > 0 )); do
+  case "$1" in
+    --turns) TURN_COUNT="${2:-}"; shift 2 ;;
+    --workdir) WORKDIR="${2:-}"; shift 2 ;;
+    --agent-a) AGENT_A="${2:-}"; shift 2 ;;
+    --agent-b) AGENT_B="${2:-}"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
+    --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ "$TURN_COUNT" =~ '^[0-9]+$' && "$TURN_COUNT" -gt 0 ]] || die "--turns must be a positive integer"
+[[ "$TIMEOUT" =~ '^[0-9]+$' && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer"
+[[ -n "$WORKDIR" && -d "$WORKDIR" ]] || die "--workdir must be an existing directory"
+[[ -n "$PROMPT_FILE" && -f "$PROMPT_FILE" ]] || die "--prompt-file must be an existing file"
+[[ -n "$TRANSCRIPT" ]] || die "--transcript is required"
+[[ "$AGENT_A" == "codex" || "$AGENT_A" == "claude" || "$AGENT_A" == "fake" ]] || die "--agent-a must be codex, claude, or fake"
+[[ "$AGENT_B" == "codex" || "$AGENT_B" == "claude" || "$AGENT_B" == "fake" ]] || die "--agent-b must be codex, claude, or fake"
+
+require_tmux
+WORKDIR="${WORKDIR:A}"
+PROMPT_FILE="${PROMPT_FILE:A}"
+if [[ "$TRANSCRIPT" != "-" ]]; then
+  TRANSCRIPT="${TRANSCRIPT:A}"
+  mkdir -p "${TRANSCRIPT:h}"
+  : > "$TRANSCRIPT"
+fi
+
+trap cleanup EXIT
+
+if [[ "$AGENT_A" == "fake" ]]; then
+  start_fake_agent "a"
+else
+  start_real_agent "a" "$AGENT_A"
+fi
+
+if [[ "$AGENT_B" == "fake" ]]; then
+  start_fake_agent "b"
+else
+  start_real_agent "b" "$AGENT_B"
+fi
+
+initial_prompt="$(<"$PROMPT_FILE")"
+previous="No previous response yet."
+
+for (( turn = 1; turn <= TURN_COUNT; turn++ )); do
+  if (( turn % 2 == 1 )); then
+    label="a"
+    agent="$AGENT_A"
+    speaker="agent-a"
+  else
+    label="b"
+    agent="$AGENT_B"
+    speaker="agent-b"
+  fi
+
+  marker="[TMUX_AGENT_DIALOGUE_${RUN_ID}_${label}_${turn}_DONE]"
+  prompt="$(make_turn_prompt "$turn" "$label" "$marker" "Initial prompt:
+$initial_prompt
+
+Previous response:
+$previous")"
+
+  if [[ "$agent" == "fake" ]]; then
+    send_to_agent "$label" "$agent" "turn ${turn} received MARKER:${marker}"
+  else
+    send_to_agent "$label" "$agent" "$prompt"
+  fi
+
+  if ! wait_for_marker "$label" "$agent" "$marker"; then
+    die "timeout waiting for $label turn $turn marker: $marker"
+  fi
+
+  captured="$(capture_agent "$label" "$agent")"
+  append_jsonl "$turn" "$speaker" "$agent" "$marker" "$captured"
+  previous="$captured"
+done
+
+echo "dialogue complete: turns=$TURN_COUNT transcript=$TRANSCRIPT" >&2

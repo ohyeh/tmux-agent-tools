@@ -2,12 +2,23 @@
 set -euo pipefail
 
 SELF="${0:A}"
-TMUX="${TMUX:-$(command -v tmux 2>/dev/null || true)}"
 CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || true)}"
 PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
 STABLE_SECONDS="${CLAUDE_TMUX_STABLE_SECONDS:-3}"
 TMUX_CONF="${CLAUDE_TMUX_CONF:-${TMPDIR:-/tmp}/claude-tmux.tmux.conf}"
 TMUX_MOUSE="${CLAUDE_TMUX_MOUSE:-on}"
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
+    print -r -- "$TMUX"
+    return
+  fi
+  command -v tmux 2>/dev/null || true
+}
+
+TMUX_BIN="$(resolve_tmux_bin)"
+unset TMUX
+TMUX="$TMUX_BIN"
 
 usage() {
   cat <<'EOF'
