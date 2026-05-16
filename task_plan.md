@@ -58,26 +58,27 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 20. Merge transcript validator through PR #19. Done.
 21. Merge failure classification through PR #20. Done.
 22. Merge safer transcript sharing through PR #21. Done.
+23. Merge stable status JSON through PR #22. Done.
 
 ## Active Work
 
-Branch: `feature/stable-status-json`
+Branch: `feature/participant-profiles`
 
 Scope:
 
-- align `claude-tmux status --json` and `codex-tmux status --json` field names;
-- build wrapper status JSON with `jq` instead of string interpolation;
-- expose `exists`, `running`, and `exit_detected` so held-open exited panes are not reported as running;
-- document stable fields versus best-effort diagnostic fields;
-- add CI checks for missing, running, and exit-detected status JSON shapes;
+- add `tmux-agent-dialogue --agent-a-profile` and `--agent-b-profile`;
+- read generic participant defaults from `TMUX_AGENT_TOOLS_PARTICIPANTS`, `--participants-config`, or `~/.config/tmux-agent-tools/participants.json`;
+- support only `agent`, `ssh`, and `workdir` profile fields;
+- keep command-line flags higher precedence than profile values;
+- reuse existing participant validation for fake SSH rejection, remote absolute workdirs, and local directory existence;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate recommends a small status JSON slice focused on field alignment, structured JSON construction, missing/running behavior, and docs.
-- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, and missing/running/exit-detected status JSON shapes.
-- Claude tmux-agent final review reports no blockers; it recommends documenting that `codex-tmux` currently returns `diagnostic: null`.
+- Claude tmux-agent teammate agrees this is the smallest useful P2 profile slice and calls out profile-not-found, parse errors, fake SSH, workdir validation, and CLI override tests.
+- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, profile-driven fake dialogue, CLI workdir override, missing profile failure, unknown profile key failure, non-string profile value failure, and fake SSH rejection.
+- Claude tmux-agent final review reports no blockers.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope

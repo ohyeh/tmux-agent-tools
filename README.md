@@ -170,6 +170,24 @@ tmux-agent-dialogue \
 
 Real participants use the same command shape with `--agent-a codex --agent-b claude`. Real turns use a split-marker contract so the prompt echo cannot satisfy the wait; the required final response line must contain only the joined marker. On timeout, the runner writes a `failure` JSONL event with a conservative `failure_type` such as `marker_timeout` or `session_missing`, and prints the captured pane tail for diagnosis. Keep real-agent smoke as manual release evidence, not a default CI check.
 
+Participant profiles can reduce repeated agent, SSH, and workdir flags without adding project-specific shortcuts. By default, `tmux-agent-dialogue` reads `~/.config/tmux-agent-tools/participants.json`; set `TMUX_AGENT_TOOLS_PARTICIPANTS` or pass `--participants-config <path>` to use another file.
+
+```json
+{
+  "local-reviewer": {
+    "agent": "claude",
+    "workdir": "/Users/example/github/project"
+  },
+  "remote-worker": {
+    "agent": "codex",
+    "ssh": "example-host",
+    "workdir": "/Users/example/github/project"
+  }
+}
+```
+
+Use profiles with `--agent-a-profile <name>` or `--agent-b-profile <name>`. Command-line flags such as `--agent-a`, `--agent-a-ssh`, and `--agent-a-workdir` override profile values. Profiles may only contain `agent`, `ssh`, and `workdir`; `fake` participants cannot use SSH, and remote workdirs must be absolute paths.
+
 Validate a transcript before sharing or rendering it:
 
 ```bash

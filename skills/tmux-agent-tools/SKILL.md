@@ -92,6 +92,8 @@ tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-b claude --pro
 
 Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. If a marker wait times out, inspect the emitted `failure` JSONL event and captured pane tail before treating the run as a protocol failure.
 
+Use participant profiles only for generic, reusable defaults. Profiles live at `~/.config/tmux-agent-tools/participants.json` by default, or at `TMUX_AGENT_TOOLS_PARTICIPANTS` / `--participants-config <path>`. Each top-level profile may contain only `agent`, `ssh`, and `workdir`; command-line flags override profile values. Do not encode personal project shortcuts in public docs or examples.
+
 Use participant SSH options when one real agent should run remotely while tmux stays local:
 
 ```bash
