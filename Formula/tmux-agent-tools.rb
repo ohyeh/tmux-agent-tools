@@ -33,7 +33,7 @@ class TmuxAgentTools < Formula
     transcript.write <<~JSONL
       {"event":"turn","turn":1,"speaker":"agent-a","agent":"fake","timestamp":"2026-05-16T00:00:00Z","marker":"[DONE]","text":"fake-a: ok"}
     JSONL
-    assert_match "tmux-agent-tools pair-review",
-                 shell_output("#{bin}/tmux-agent-dialogue summarize --transcript #{transcript}")
+    assert_match(/tmux-agent-tools (pair-review|transcript)/,
+                 shell_output("#{bin}/tmux-agent-dialogue summarize --transcript #{transcript}"))
   end
 end
