@@ -108,7 +108,7 @@ For a local review preset that only writes a transcript and terminal summary:
 tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
 ```
 
-`pair-review` does not post comments, merge PRs, or publish externally. Use `--summary-file <path>` for a local Markdown summary. To prepare a GitHub PR comment body without posting:
+`pair-review` does not post comments, merge PRs, or publish externally. Use `--summary-file <path>` for a local Markdown summary.
 
 Use `critic` when the user wants a bounded critique/response loop without any external action:
 
@@ -117,6 +117,8 @@ tmux-agent-dialogue critic --workdir . --prompt-file review.md --transcript crit
 ```
 
 `critic` defaults to four turns. Agent A speaks on odd turns, agent B speaks on even turns, and custom `--turns` values must be positive even numbers. It is only a preset over the same local transcript flow; it does not post comments, merge PRs, schedule work, or continue unbounded.
+
+To prepare a GitHub PR comment body from an existing transcript without posting:
 
 ```bash
 tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo
