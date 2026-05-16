@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.5.0 - Unreleased
+
+`v0.5.0` is the observability and multi-session composability release.
+
+### Added
+
+- `tmux-agent-sessions list --watch --json --count N --interval S` for bounded inventory polling without creating a daemon.
+- Wrapper `status --json` now includes nullable `exit_code` detail parsed from wrapper exit markers.
+- `tmux-agent-dialogue validate-transcript --schema-version 1` for explicit transcript contract validation.
+- `tmux-agent-dialogue --on-blocked-trigger <path>` for local blocked-session trigger artifacts.
+- `tmux-agent-dialogue summarize --output-format json` for structured summary output while keeping Markdown as the default.
+- Participant profile `timeout` values for per-agent bounded dialogue waits.
+- `github-comment --edit-existing <comment-id>` for explicitly updating a known GitHub issue comment instead of appending.
+
+### Changed
+
+- Cleanup preview JSON coverage now asserts scriptable cleanup decisions for owned sessions, tool filters, name filters, unrelated sessions, and execute-mode rejection.
+- Summary-file comment coverage now includes empty summary files and `--max-bytes` truncation behavior.
+- GitHub comment helpers remain dry-run by default; posting or editing still requires explicit `--post-github-comment`.
+
+### Notes
+
+- Default CI remains credential-free and uses fake participants.
+- Real Codex/Claude runs remain manual release evidence, not default pull-request checks.
+- Homebrew Formula stable URL and SHA-256 should be bumped in a follow-up PR after the `Release` workflow creates the `v0.5.0` tag and summary.
+
 ## v0.4.0 - 2026-05-16
 
 `v0.4.0` is the automation-readiness release.

@@ -82,12 +82,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-current-state-refresh` next
+Branch: `feature/v0.5-current-state-refresh`
 
 Scope:
 
 - reconcile the v0.5 roadmap/current state now that the planned P0/P1/P2 slices are implemented;
-- decide the next bounded branch from evidence, likely release-readiness docs or the next roadmap, without publishing tags or releases;
+- add unreleased `v0.5.0` changelog notes and identify the next release-readiness branch without publishing tags or releases;
 - keep this slice free of release publish, tag, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -190,7 +190,9 @@ Verification evidence:
 - Summary-file edge coverage local validation passed on `feature/v0.5-summary-file-edge-coverage`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and fake summary-file smoke proving `github-comment --summary-file <rendered-summary> --max-bytes 200` emits the `--max-bytes` truncation note while an empty `--summary-file` dry-run succeeds with an empty body and no GitHub write.
 - Claude tmux-agent teammate reviewed the summary-file edge coverage diff and found no blockers with `VERDICT: SHIP`.
 - PR #72 merged as `2421161`; feature branch CI run `25974802216` and main CI run `25974835304` passed.
-- Pending for next branch: v0.5 current-state refresh design, docs alignment, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- v0.5 current-state refresh local validation passed on `feature/v0.5-current-state-refresh`: `git diff --check`, workflow YAML name check with `yq`, and roadmap/changelog/task-plan anchor checks with `rg` proving the unreleased `v0.5.0` changelog, all-planned-slices-landed status, no-tag/release/Formula-bump state, and next release-readiness dry-run path are documented.
+- Claude tmux-agent teammate reviewed the v0.5 current-state refresh diff and found no blockers with `VERDICT: SHIP`; the only duplicate release-notes wording observation was cleaned up before PR.
+- Pending on `feature/v0.5-current-state-refresh`: PR CI, merge, main CI, and post-merge state sync.
 
 ## v0.2.0 Candidate Scope
 
