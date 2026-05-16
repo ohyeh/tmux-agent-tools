@@ -23,6 +23,7 @@ jobs:
           brew list tmux >/dev/null 2>&1 || brew install tmux
           brew list jq >/dev/null 2>&1 || brew install jq
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
+          brew list shellcheck >/dev/null 2>&1 || brew install shellcheck
 
       - name: Validate shell scripts
         run: |
@@ -30,6 +31,8 @@ jobs:
           zsh -n skills/tmux-agent-tools/scripts/codex-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
+          zsh -n skills/tmux-agent-tools/scripts/install-bin
+          scripts/ci-shellcheck
 
       - name: Validate skill metadata
         run: |
