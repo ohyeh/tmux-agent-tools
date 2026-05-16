@@ -17,9 +17,9 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 ## Current State
 
 - Repo: `ohyeh/tmux-agent-tools`
-- Release tag: `v0.1.0`
-- Release URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.1.0`
-- Current main includes CI smoke checks and Node 24 checkout action updates.
+- Release tag: `v0.2.0`
+- Release tag URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.2.0`
+- Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, and explicit GitHub comment helper support.
 - Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`
 - Verified install surfaces: `skills.sh`, stable Homebrew, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
@@ -44,33 +44,34 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 7. Merge reliability primitives through PR. Done.
 8. Merge structured status, local exit diagnostics, and CI smoke checks through PRs. Done.
 9. Merge `feature/v0.2-roadmap` through PR #6. Done.
+10. Merge bounded dialogue runner through PR #8. Done.
+11. Merge real dialogue marker hardening through PR #9. Done.
+12. Merge pair-review preset through PR #10. Done.
+13. Merge remote participant support through PR #11. Done.
+14. Merge explicit GitHub comment helper through PR #12. Done.
 
 ## Active Work
 
-Branch: `feature/github-comment-helper`
+Branch: `feature/v0.2-release-prep`
 
 Scope:
 
-- add a separate explicit opt-in GitHub PR comment helper for pair-review transcripts;
-- keep local terminal summary as the default behavior;
-- support `--summary-file` for local Markdown summary output;
-- support `github-comment --transcript ...` as a dry-run comment body renderer;
-- require `github-comment --post-github-comment --github-pr <number-or-url> --github-repo <owner/repo>` before calling `gh pr comment`;
-- keep CI credential-free by testing summary output and post-flag validation without posting.
+- publish `v0.2.0` as the stable Homebrew release target;
+- update Formula stable `url` and `sha256` to the `v0.2.0` archive;
+- install `tmux-agent-dialogue` in stable Homebrew, not only `--HEAD`;
+- update README and roadmap wording so they no longer describe merged features as active work;
+- add a concise changelog entry for `v0.2.0`;
+- keep all mainline changes going through PR.
 
 Verification evidence:
 
+- `v0.2.0` tag exists on commit `4e2fd0f`.
+- remote tag object `0506f731eee6978d7188293ed9bd1e47e4a5cf17` peels to commit `4e2fd0f`.
+- `v0.2.0` archive SHA-256 is `a9c5aab558ee306727215feb7a5146aa50132360a00e7a9a6c4d7c5627962a55`.
 - `zsh -n` passes for all wrapper scripts and `tmux-agent-dialogue`.
-- Skill validation passes for `skills/tmux-agent-tools`.
-- `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
-- Wrapper self-tests pass for both `codex-tmux` and `claude-tmux`.
-- Fake dialogue smoke passes and each transcript turn includes processed fake participant output.
-- `pair-review` fake smoke passes, writes a local summary file, and prints a local summary.
-- `summarize --transcript` renders a comment-safe Markdown body without tmux/GitHub.
-- `github-comment --transcript --github-pr --github-repo` renders a dry-run body without posting.
-- `github-comment --post-github-comment` fails before posting when required PR/repo inputs are missing.
-- Fake `gh` command-shape check proves post mode calls `gh pr comment <pr> --repo <repo> --body-file <file>`.
-- Pending for this branch: PR CI.
+- `ruby -c Formula/tmux-agent-tools.rb`, `brew style Formula/tmux-agent-tools.rb`, and tap-name `brew audit --strict --online` pass.
+- Local tap branch install proves stable `0.2.0` installs `/opt/homebrew/bin/tmux-agent-dialogue`.
+- Remaining check for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
 
@@ -93,8 +94,8 @@ P1:
 
 P2:
 
-- remote participant support through `start-ssh` - in progress;
-- GitHub PR comment helper that posts transcript summaries only when explicitly requested - in progress;
+- remote participant support through `start-ssh` - merged;
+- GitHub PR comment helper that posts transcript summaries only when explicitly requested - merged;
 - credential-free CI integration tests with fake participants;
 - real-agent/token tests only as manual release evidence or explicit opt-in workflows.
 

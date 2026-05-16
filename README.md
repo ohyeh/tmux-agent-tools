@@ -5,7 +5,7 @@ Small tmux wrappers for running Claude Code and Codex CLI as controllable named 
 This repository is both:
 
 - a `skills.sh` compatible skill package;
-- a Homebrew formula source for installing `claude-tmux`, `codex-tmux`, and unreleased `--HEAD` tools on macOS or Linuxbrew.
+- a Homebrew formula source for installing `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` on macOS or Linuxbrew.
 
 ## Inspired By
 
@@ -42,7 +42,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 
-`tmux-agent-dialogue` is local-only in the first implementation. Its credential-free `fake` participants are covered by CI; real `codex`/`claude` participants are accepted by the command but should be treated as pre-release hardening work until a manual real-agent smoke is recorded. Until the next tagged release, install it with `brew install tmux-agent-tools --HEAD` or run the repo-local script.
+`tmux-agent-dialogue` is included in the stable Homebrew install starting with `v0.2.0`. Its credential-free `fake` participants are covered by CI; real `codex`/`claude` participants are accepted by the command and should still use manual smoke evidence rather than default CI.
 
 ## Install Skill With skills.sh
 
