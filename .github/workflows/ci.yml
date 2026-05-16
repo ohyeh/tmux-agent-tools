@@ -81,6 +81,14 @@ jobs:
           skills/tmux-agent-tools/scripts/codex-tmux status --json ci-status-exited | jq -e '.tool == "codex" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "remote"'
           tmux kill-session -t claude-cli-ci-status-exited
           tmux kill-session -t codex-cli-ci-status-exited
+          long_marker="WRAPSTART_$(printf '%120s' '' | tr ' ' x)_WRAPEND"
+          tmux new-session -d -x 40 -y 10 -s claude-cli-ci-wrap "printf '%s\n' '$long_marker'; sleep 300"
+          tmux new-session -d -x 40 -y 10 -s codex-cli-ci-wrap "printf '%s\n' '$long_marker'; sleep 300"
+          sleep 0.2
+          skills/tmux-agent-tools/scripts/claude-tmux capture ci-wrap 5 | rg -n "$long_marker"
+          skills/tmux-agent-tools/scripts/codex-tmux capture ci-wrap 5 | rg -n "$long_marker"
+          tmux kill-session -t claude-cli-ci-wrap
+          tmux kill-session -t codex-cli-ci-wrap
           prompt_file="$(mktemp)"
           transcript_file="$(mktemp)"
           printf '%s\n' 'Discuss the smoke test.' > "$prompt_file"
