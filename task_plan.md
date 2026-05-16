@@ -71,14 +71,17 @@ Branch: `feature/v03-task-plan-release-evidence`
 Scope:
 
 - refresh the active task state after PR #32 so the next branch does not repeat completed copy-mode work;
-- prepare the next v0.3 release-evidence branch scope without adding new autonomy;
+- record manual real Codex/Claude wrapper smoke and bounded dialogue smoke as v0.3 release evidence;
+- keep default CI credential-free and avoid committing real-agent transcript contents;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
 - PR #32 merged as `1fa2980` and main CI run `25963006121` passed.
-- Pending for this branch: documentation-only validation, Claude teammate review, PR CI.
+- Real wrapper smoke passed with `V03CODEXSMOKEOK`, `V03CLAUDESMOKEOK`, and `REAL_WRAPPER_SMOKE_OK`.
+- Real bounded dialogue smoke passed with `REAL_DIALOGUE_SMOKE_OK`; `jq` verified codex turn 1 and claude turn 2.
+- Pending for this branch: documentation validation, Claude teammate review, PR CI.
 
 ## v0.2.0 Candidate Scope
 
