@@ -19,7 +19,7 @@ Usage:
   claude-tmux attach <name>
   claude-tmux send <name> <text>
   claude-tmux wait <name> [timeout_seconds]
-  claude-tmux wait-text <name> <regex> [timeout_seconds]
+  claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]
   claude-tmux wait-literal <name> <text> [timeout_seconds]
   claude-tmux capture <name> [lines]
   claude-tmux list
@@ -37,7 +37,8 @@ Examples:
   claude-tmux send pr5 '請先讀 PR description'
   claude-tmux wait pr5 180
   claude-tmux wait-text pr5 'Done|Need approval' 180
-  claude-tmux wait-literal pr5 '[CODEX-01]' 180
+  claude-tmux wait-text --literal pr5 '[CLAUDE-01]' 180
+  claude-tmux wait-literal pr5 '[CLAUDE-01]' 180
   claude-tmux capture pr5 80
   claude-tmux doctor
   claude-tmux self-test
@@ -52,6 +53,7 @@ Behavior:
   - Claude is launched with --dangerously-skip-permissions.
   - wait returns when the visible pane is stable for a few seconds.
   - wait-text returns when the visible pane matches a zsh extended regex.
+  - wait-text --literal returns when the visible pane contains exact text.
   - wait-literal returns when the visible pane contains exact text.
   - capture reads the tmux pane without stealing browser or terminal focus.
 
@@ -139,11 +141,6 @@ session_for_name() {
 
 random_suffix() {
   LC_ALL=C /usr/bin/od -An -N3 -tx1 /dev/urandom | /usr/bin/tr -d ' \n'
-}
-
-literal_pattern() {
-  local value="$1"
-  print -r -- "$value"
 }
 
 shell_quote() {
@@ -399,12 +396,23 @@ wait_session() {
 
 wait_text_session() {
   require_tmux
+  local literal=0
+  if [[ "${1:-}" == "--literal" ]]; then
+    literal=1
+    shift
+  fi
+
+  if (( literal )); then
+    wait_literal_session "$@"
+    return
+  fi
+
   local name="${1:-}"
   local pattern="${2:-}"
   local timeout_seconds="${3:-180}"
 
   if [[ -z "$name" || -z "$pattern" ]]; then
-    echo "Usage: claude-tmux wait-text <name> <regex> [timeout_seconds]" >&2
+    echo "Usage: claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]" >&2
     exit 2
   fi
 
@@ -459,11 +467,10 @@ wait_literal_session() {
 
   local deadline=$((SECONDS + timeout_seconds))
   local current=""
-  local needle_pattern="$(literal_pattern "$needle")"
 
   while (( SECONDS < deadline )); do
     current="$("$TMUX" capture-pane -t "$session" -p -S -200)"
-    if printf '%s' "$current" | /usr/bin/grep -F -q -- "$needle_pattern"; then
+    if [[ "$current" == *"$needle"* ]]; then
       echo "matched literal: $needle"
       return 0
     fi
@@ -488,13 +495,33 @@ doctor_session() {
   echo "mouse: $TMUX_MOUSE"
 }
 
+readiness_diagnostic() {
+  local session="$1"
+  local current lowered
+  current="$("$TMUX" capture-pane -t "$session" -p -S -80 2>/dev/null || true)"
+  lowered="${current:l}"
+
+  if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+    return 0
+  fi
+
+  if [[ "$lowered" == *"do you want to proceed"* \
+    || "$lowered" == *"press enter"* \
+    || "$lowered" == *"accept"* \
+    || "$lowered" == *"permission"* \
+    || "$lowered" == *"trust"* ]]; then
+    echo "session may be waiting for Claude first-run or permission confirmation; attach or capture the pane before sending prompts"
+  fi
+}
+
 self_test_session() {
   require_tmux
   local name="self-test-$$"
   local session="$(session_for_name "$name")"
   "$TMUX" kill-session -t "$session" 2>/dev/null || true
-  "$TMUX" new-session -d -s "$session" "printf '%s\n' 'TMUX_AGENT_TOOLS_SELF_TEST_OK'; sleep 5"
+  "$TMUX" new-session -d -s "$session" "printf '%s\n' 'TMUX_AGENT_TOOLS_SELF_TEST_OK' '[TMUX_AGENT_TOOLS_SELF_TEST_OK]'; sleep 5"
   wait_literal_session "$name" "TMUX_AGENT_TOOLS_SELF_TEST_OK" 5
+  wait_text_session --literal "$name" "[TMUX_AGENT_TOOLS_SELF_TEST_OK]" 5
   "$TMUX" kill-session -t "$session" 2>/dev/null || true
   echo "self-test: ok"
 }
@@ -517,14 +544,23 @@ status_session() {
 
   local session="$(session_for_name "$name")"
   local running=false
+  local diagnostic=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     running=true
+    diagnostic="$(readiness_diagnostic "$session")"
   fi
 
   if (( output_json )); then
-    printf '{"name":"%s","session":"%s","prefix":"%s","running":%s}\n' "$name" "$session" "$PREFIX" "$running"
+    if [[ -n "$diagnostic" ]]; then
+      printf '{"name":"%s","session":"%s","prefix":"%s","running":%s,"diagnostic":"%s"}\n' "$name" "$session" "$PREFIX" "$running" "$diagnostic"
+    else
+      printf '{"name":"%s","session":"%s","prefix":"%s","running":%s,"diagnostic":null}\n' "$name" "$session" "$PREFIX" "$running"
+    fi
   elif [[ "$running" == true ]]; then
     echo "running: $session"
+    if [[ -n "$diagnostic" ]]; then
+      echo "diagnostic: $diagnostic"
+    fi
   else
     echo "stopped: $session"
   fi

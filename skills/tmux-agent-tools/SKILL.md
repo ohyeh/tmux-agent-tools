@@ -50,6 +50,7 @@ codex-tmux send worker 'Now implement the smallest fix and run the targeted test
 ```bash
 codex-tmux wait worker 180
 codex-tmux wait-text worker 'Done|Need approval' 180
+codex-tmux wait-text --literal worker '[CODEX-01]' 180
 codex-tmux wait-literal worker '[CODEX-01]' 180
 codex-tmux capture worker 120
 ```
@@ -64,7 +65,7 @@ codex-tmux self-test
 codex-tmux stop worker
 ```
 
-Use `wait-literal` when the expected text contains regex metacharacters such as `[`, `]`, `(`, `)`, `.`, `*`, or `?`. Use `wait-text` only when regex matching is intentional.
+Use `wait-text --literal` or `wait-literal` when the expected text contains regex metacharacters such as `[`, `]`, `(`, `)`, `.`, `*`, or `?`. Use regex `wait-text` only when regex matching is intentional.
 
 ## Session Naming
 
@@ -91,6 +92,7 @@ Requirements:
 - These wrappers launch agent CLIs with permissive flags: Claude uses `--dangerously-skip-permissions`; Codex uses `--yolo`.
 - Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations unless the user explicitly authorized that work.
 - Prefer `capture` and `status` before assuming a worker is done.
+- `claude-tmux status <name>` reports a diagnostic when the pane appears to be waiting for a Claude first-run or permission confirmation. It does not auto-accept that prompt.
 - Prefer `doctor` and `self-test` before debugging agent behavior; they verify wrapper dependencies and tmux capture/wait behavior without starting a real agent.
 
 ## Environment Overrides

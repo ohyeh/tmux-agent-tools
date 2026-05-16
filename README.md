@@ -100,11 +100,14 @@ codex-tmux start --exact worker ~/github/project 'Read the repo and report statu
 codex-tmux send worker 'Run the targeted tests.'
 codex-tmux wait worker 180
 codex-tmux wait-text worker 'Done|Need approval' 180
+codex-tmux wait-text --literal worker '[CODEX-01]' 180
 codex-tmux wait-literal worker '[CODEX-01]' 180
 codex-tmux capture worker 120
 codex-tmux status --json worker
 codex-tmux stop worker
 ```
+
+Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`.
 
 Reliability checks:
 
@@ -114,6 +117,8 @@ codex-tmux self-test
 claude-tmux doctor
 claude-tmux self-test
 ```
+
+`claude-tmux status <name>` reports a diagnostic when the pane appears to be waiting for a Claude first-run or permission confirmation. It does not auto-accept that prompt; attach or capture the pane and make the decision explicitly.
 
 Remote run with local tmux:
 
