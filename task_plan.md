@@ -20,7 +20,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - Repo: `ohyeh/tmux-agent-tools`
 - Release tag: `v0.3.0`
 - Release tag URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.3.0`
-- Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, and explicit GitHub comment helper support.
+- Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, explicit GitHub comment helper support, wrapper-backed session state, bounded status tails, blocked-reason diagnostics, handoff, and summary-file comment input.
 - Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`, `tmux-agent-dialogue`, `tmux-agent-sessions`
 - Verified install surfaces: `skills.sh`, stable Homebrew, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
@@ -71,15 +71,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-status-blocked-reason`
+Branch: `feature/v0.4-release-prep`
 
 Scope:
 
-- implement the next v0.4 status contract expansion slice;
-- add diagnostic `confirmation_detected` and `blocked_reason` to `claude-tmux status --json` and `codex-tmux status --json`;
-- keep prompt detection bounded and best-effort, without exact diagnostic string contracts;
-- keep default text `status` output unchanged;
-- keep all prompt handling explicit: no auto-accepting prompts or hidden interaction;
+- prepare `v0.4.0` release notes and current-state docs after the automation-readiness slices landed;
+- do not create release tags or GitHub releases from local shell;
+- do not bump the stable Homebrew Formula before the `v0.4.0` tag exists;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -118,6 +116,9 @@ Verification evidence:
 - PR #42 merged as `febcd46`; main CI run `25969865523` passed.
 - Status blocked-reason local validation passed on `feature/v0.4-status-blocked-reason`: workflow YAML check with `yq`, script syntax for both wrappers and `tmux-agent-sessions`, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and local `jq` smoke proving missing sessions return `confirmation_detected == false` and `blocked_reason == null`, Claude permission prompts map to `permission_prompt`, Codex approval prompts map to `approval_prompt`, SSH prompts map to `ssh_prompt`, exit markers map to `cli_exited`, wrapper exit footers do not false-positive as `permission_prompt`, ordinary `accept` text does not false-positive as `approval_prompt`, and `tmux-agent-sessions list --json` preserves wrapper blocked-state fields.
 - Claude tmux-agent teammate reviewed the status blocked-reason diff, found no blockers, then re-reviewed after prompt-pattern and CI hardening; final verdict was `BLOCKERS: None`, `NON-BLOCKING: None`, and `VERDICT: SHIP`.
+- PR #43 merged as `8a77554`; main CI run `25970224776` passed.
+- v0.4.0 release-prep local validation passed on `feature/v0.4-release-prep`: release workflow YAML check with `yq`, script syntax for all wrappers/dialogue/session helper, Formula syntax/style, wrapper self-tests, `git diff --check`, release-note extraction for `v0.4.0`, and the release workflow fake two-turn dialogue smoke with `jq` assertions.
+- Claude tmux-agent teammate reviewed the v0.4.0 release-prep diff and found no blockers with `VERDICT: READY TO PR`; Formula bump remains correctly deferred until after the tag exists.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
