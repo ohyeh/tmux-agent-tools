@@ -3,6 +3,7 @@ set -euo pipefail
 
 SELF="${0:A}"
 CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || true)}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
 STABLE_SECONDS="${CLAUDE_TMUX_STABLE_SECONDS:-3}"
 SUBMIT_DELAY="${CLAUDE_TMUX_SUBMIT_DELAY:-0.2}"
@@ -98,6 +99,13 @@ require_bins() {
 require_tmux() {
   if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
     echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
+    exit 1
+  fi
+}
+
+require_jq() {
+  if [[ -z "$JQ" || ! -x "$JQ" ]]; then
+    echo "jq not found. Install it with Homebrew or set JQ=/path/to/jq." >&2
     exit 1
   fi
 }
@@ -602,6 +610,11 @@ readiness_diagnostic() {
   fi
 }
 
+status_pane_text() {
+  local session="$1"
+  "$TMUX" capture-pane -t "$session" -p -S -80 2>/dev/null || true
+}
+
 self_test_session() {
   require_tmux
   local name="self-test-$$"
@@ -632,19 +645,42 @@ status_session() {
   fi
 
   local session="$(session_for_name "$name")"
+  local exists=false
   local running=false
+  local exit_detected=false
+  local local_or_remote=""
   local diagnostic=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    exists=true
     running=true
+    local current lowered
+    current="$(status_pane_text "$session")"
+    lowered="${current:l}"
+    if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+      exit_detected=true
+      running=false
+    fi
+    if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
+      local_or_remote="remote"
+    else
+      local_or_remote="local"
+    fi
     diagnostic="$(readiness_diagnostic "$session")"
   fi
 
   if (( output_json )); then
-    if [[ -n "$diagnostic" ]]; then
-      printf '{"name":"%s","session":"%s","prefix":"%s","running":%s,"diagnostic":"%s"}\n' "$name" "$session" "$PREFIX" "$running" "$diagnostic"
-    else
-      printf '{"name":"%s","session":"%s","prefix":"%s","running":%s,"diagnostic":null}\n' "$name" "$session" "$PREFIX" "$running"
-    fi
+    require_jq
+    "$JQ" -cn \
+      --arg tool "claude" \
+      --arg name "$name" \
+      --arg session "$session" \
+      --arg prefix "$PREFIX" \
+      --arg local_or_remote "$local_or_remote" \
+      --arg diagnostic "$diagnostic" \
+      --argjson exists "$exists" \
+      --argjson running "$running" \
+      --argjson exit_detected "$exit_detected" \
+      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end)}'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
     if [[ -n "$diagnostic" ]]; then

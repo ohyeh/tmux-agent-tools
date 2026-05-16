@@ -123,6 +123,22 @@ codex-tmux stop worker
 
 Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`. Use `send-wait-literal` when a prompt should only count a marker that appears after the send operation; the dialogue runner uses this to avoid stale marker matches. The wrappers pause briefly between paste and submit for multiline prompts; tune this with `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY` when a local CLI needs more time.
 
+`status --json` is a stable machine-readable contract for both wrappers. It is built with `jq` and uses the same fields for Claude and Codex:
+
+| Field | Type | Stability | Meaning |
+| --- | --- | --- | --- |
+| `tool` | string | stable | `claude` or `codex`. |
+| `name` | string | stable | Requested short agent name. |
+| `session` | string | stable | Full tmux session name. |
+| `prefix` | string | stable | Session prefix used by the wrapper. |
+| `exists` | boolean | stable | Whether the tmux session exists. |
+| `running` | boolean | stable | `true` only when the session exists and no wrapper exit-code marker is visible. |
+| `exit_detected` | boolean | stable | Pane contains `local command exited with code` or `remote command exited with code`; this does not imply failure. |
+| `local_or_remote` | string or null | diagnostic | Best-effort mode inferred from pane text; `null` when the session is missing. |
+| `diagnostic` | string or null | diagnostic | Optional readiness warning text; callers should not depend on exact wording. |
+
+`diagnostic` is currently only populated by `claude-tmux` for best-effort first-run or permission prompts; `codex-tmux` returns `null`.
+
 Reliability checks:
 
 ```bash
