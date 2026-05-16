@@ -53,31 +53,23 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 15. Merge `v0.2.0` stable Formula prep through PR #13. Done.
 16. Merge `jq` runtime dependency and Formula summarize smoke through PR #14. Done.
 17. Merge manual dry-run-first release workflow through PR #15. Done.
+18. Merge release handoff docs and Formula bump summary workflow through PR #16. Done.
 
 ## Active Work
 
-Branch: `feature/release-process-handoff`
+Branch: `feature/v0.3-roadmap`
 
 Scope:
 
-- document the release PR -> Release workflow -> Formula bump PR sequence;
-- link the release process from the README;
-- split the Release workflow so dry-run validation has read-only repository permissions and only the publish job can write;
-- require the Release workflow to run from `main`;
-- add Release workflow step-summary output with the released archive URL and SHA-256 for the follow-up Formula PR;
+- plan `v0.3.0` around session hygiene and transcript usability;
+- keep the roadmap public/generic and avoid personal workflow shortcuts;
+- use teammate review to prioritize P0/P1/P2 scope;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- `v0.2.0` stable Formula prep merged in PR #13.
-- PR #14 adds `jq` to the Formula and exercises `tmux-agent-dialogue summarize` in Formula test.
-- Release workflow is dry-run by default and requires explicit `dry_run: false` to create a tag/release.
-- `actionlint .github/workflows/release.yml` passes.
-- `yq` confirms top-level permissions are read-only and publish job permissions are write-scoped.
-- Local main-ref guard smoke accepts `refs/heads/main` and rejects a feature branch ref.
-- Local release handoff smoke computes the `v0.2.0` archive SHA and renders the Formula bump summary.
-- Formula syntax/style, skill validation, and wrapper self-tests pass.
-- Remaining check for this branch: PR CI.
+- tmux-agent teammate recommends `v0.3.0` focus on session hygiene, transcript schema validation, and safer transcript sharing.
+- Pending for this branch: docs review and PR CI.
 
 ## v0.2.0 Candidate Scope
 
