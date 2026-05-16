@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 - Unreleased
+## v0.5.0 - 2026-05-17
 
 `v0.5.0` is the observability and multi-session composability release.
 
