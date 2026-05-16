@@ -100,6 +100,7 @@ codex-tmux wait worker 180
 codex-tmux wait-text worker 'Done|Need approval' 180
 codex-tmux wait-literal worker '[CODEX-01]' 180
 codex-tmux capture worker 120
+codex-tmux status --json worker
 codex-tmux stop worker
 ```
 

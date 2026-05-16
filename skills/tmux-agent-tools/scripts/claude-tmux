@@ -23,7 +23,7 @@ Usage:
   claude-tmux wait-literal <name> <text> [timeout_seconds]
   claude-tmux capture <name> [lines]
   claude-tmux list
-  claude-tmux status <name>
+  claude-tmux status [--json] <name>
   claude-tmux doctor
   claude-tmux self-test
   claude-tmux stop <name>
@@ -501,15 +501,29 @@ self_test_session() {
 
 status_session() {
   require_tmux
+  local output_json=0
+
+  if [[ "${1:-}" == "--json" ]]; then
+    output_json=1
+    shift
+  fi
+
   local name="${1:-}"
 
   if [[ -z "$name" ]]; then
-    echo "Usage: claude-tmux status <name>" >&2
+    echo "Usage: claude-tmux status [--json] <name>" >&2
     exit 2
   fi
 
   local session="$(session_for_name "$name")"
+  local running=false
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    running=true
+  fi
+
+  if (( output_json )); then
+    printf '{"name":"%s","session":"%s","prefix":"%s","running":%s}\n' "$name" "$session" "$PREFIX" "$running"
+  elif [[ "$running" == true ]]; then
     echo "running: $session"
   else
     echo "stopped: $session"
