@@ -239,10 +239,18 @@ tmux-agent-dialogue critic --workdir . --prompt-file review.md --transcript crit
 
 `critic` is a thin four-turn preset over the same bounded dialogue runner. Agent A critiques on odd turns, agent B responds on even turns, and `--turns` may be overridden only with a positive even number. Like `pair-review`, it only writes local transcript/summary output and has no hidden GitHub posting, merging, scheduling, or unbounded loop behavior.
 
+Handoff preset:
+
+```bash
+tmux-agent-dialogue handoff --workdir . --prompt-file task.md --transcript handoff.jsonl
+```
+
+`handoff` is a thin two-turn preset for bounded context transfer. Agent A produces the handoff on turn 1, agent B responds on turn 2 with readiness, risks, or next-action notes. It rejects non-two-turn flows and only writes local transcript/summary output.
+
 Write the local summary to a file:
 
 ```bash
-tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl --summary-file review-summary.md
+tmux-agent-dialogue handoff --workdir . --prompt-file task.md --transcript handoff.jsonl --summary-file handoff-summary.md
 ```
 
 Post the summary to a GitHub PR only when explicitly requested:
