@@ -244,6 +244,8 @@ tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript
 
 `pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. Add `--swap` to reverse the speaker order so agent B speaks first and agent A responds, without changing the participant definitions. It does not post GitHub comments, merge PRs, or publish externally by default.
 
+Add `--on-blocked-trigger blocked.json` to a bounded dialogue run, `pair-review`, `critic`, or `handoff` to write a local JSON trigger only when a participant appears blocked by a permission prompt, SSH prompt, or CLI exit. Non-blocked runs do not create the file. The artifact includes `event`, `turn`, `participant`, `agent`, `marker`, `blocked_reason`, and `timestamp`; this flag never accepts prompts or posts externally.
+
 Critic preset:
 
 ```bash

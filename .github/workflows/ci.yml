@@ -228,6 +228,16 @@ jobs:
           fi
           jq -e 'select(.event == "failure" and .failure_type == "session_missing")' "$missing_session_transcript_file"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$missing_session_transcript_file"
+          blocked_transcript_file="$(mktemp)"
+          blocked_trigger_file="$(mktemp)"
+          rm -f "$blocked_trigger_file"
+          if TMUX_AGENT_DIALOGUE_TEST_BLOCKED_FAKE_TURN=1 skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$blocked_transcript_file" --on-blocked-trigger "$blocked_trigger_file" --timeout 1; then
+            echo "blocked fake turn should fail" >&2
+            exit 1
+          fi
+          jq -e 'select(.event == "failure" and .failure_type == "permission_prompt")' "$blocked_transcript_file"
+          jq -e '.event == "blocked" and .participant == "agent-a" and .agent == "fake" and .blocked_reason == "permission_prompt" and (.timestamp | type == "string" and length > 0)' "$blocked_trigger_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$blocked_transcript_file"
           invalid_transcript_file="$(mktemp)"
           printf '%s\n' '{"event":"turn"}' > "$invalid_transcript_file"
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$invalid_transcript_file" >/tmp/invalid-transcript.out 2>&1; then
@@ -260,7 +270,10 @@ jobs:
           fi
           pair_transcript_file="$(mktemp)"
           pair_summary_file="$(mktemp)"
-          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --summary-file "$pair_summary_file" --timeout 10
+          pair_trigger_file="$(mktemp)"
+          rm -f "$pair_trigger_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --summary-file "$pair_summary_file" --on-blocked-trigger "$pair_trigger_file" --timeout 10
+          test ! -e "$pair_trigger_file"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
