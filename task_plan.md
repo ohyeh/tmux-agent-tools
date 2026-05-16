@@ -84,12 +84,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.6-roadmap`
+Branch: create `feature/v0.6-shellcheck-ci` next
 
 Scope:
 
-- create the `v0.6.0` roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
-- keep this as roadmap planning only; do not publish tags, GitHub releases, or Formula bumps in this branch;
+- implement the first `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
+- start with shellcheck CI quality gating;
+- keep this free of release publish, tag, GitHub Release, Formula bump, credentials, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - keep this slice free of release publish, tag, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -206,7 +207,9 @@ Verification evidence:
 - Pending next: explicit operator go/no-go before any non-dry-run Release workflow for `v0.5.0`; do not publish the tag, GitHub Release, or Formula bump without that approval.
 - Claude tmux-agent teammate brainstormed v0.6 candidates and recommended composability closure: shellcheck CI, skill env reference parity, JSON summary schema metadata, structured GitHub comment results, bounded debate preset, and scriptable session inventory ergonomics.
 - v0.6 roadmap validation passed on `feature/v0.6-roadmap`: `git diff --check`, workflow YAML name checks with `yq`, roadmap/task-plan/README anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
-- Pending for this branch: PR CI and merge.
+- PR #79 merged as `a4320a9`; feature branch CI run `25975810492` and main CI run `25975839000` passed.
+- Claude tmux-agent teammate reviewed the v0.6 roadmap state sync diff and found no blockers with `VERDICT: SHIP`.
+- Pending for next branch: shellcheck CI quality gate implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
