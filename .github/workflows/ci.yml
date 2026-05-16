@@ -132,9 +132,18 @@ jobs:
           summary_stdout="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" > "$summary_stdout"
           rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$summary_stdout"
+          limited_summary="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --max-lines 8 > "$limited_summary"
+          rg -n "truncated at 8 lines" "$limited_summary"
+          bytes_summary="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --max-bytes 200 > "$bytes_summary"
+          rg -n "truncated at 200 bytes" "$bytes_summary"
           comment_body="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$comment_body"
           rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$comment_body"
+          redacted_comment_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --redact-pattern 'TMUX_AGENT_DIALOGUE_[^]]+' > "$redacted_comment_body"
+          rg -n "\\[REDACTED\\]|redact patterns were applied" "$redacted_comment_body"
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --post-github-comment; then
             echo "GitHub comment posting must require --github-pr" >&2
             exit 1
@@ -149,5 +158,5 @@ jobs:
             printf '%s\n' '[[ -s "$body_file" ]] || exit 3'
           } > "$fake_bin/gh"
           chmod +x "$fake_bin/gh"
-          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --post-github-comment
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --post-github-comment
           rg -n "pr|comment|1|--repo|ohyeh/tmux-agent-tools|--body-file" "$fake_args"

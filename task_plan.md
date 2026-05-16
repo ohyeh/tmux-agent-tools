@@ -56,25 +56,27 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 18. Merge release handoff docs and Formula bump summary workflow through PR #16. Done.
 19. Merge v0.3 session hygiene helper through PR #18. Done.
 20. Merge transcript validator through PR #19. Done.
+21. Merge failure classification through PR #20. Done.
 
 ## Active Work
 
-Branch: `feature/failure-classification`
+Branch: `feature/safer-transcript-sharing`
 
 Scope:
 
-- include `failure_type` in `failure` JSONL events;
-- classify credential-free fake failure paths as `marker_timeout` and `session_missing`;
-- keep text-pattern classifications conservative and evidence-based for `cli_exited`, `ssh_prompt`, and `permission_prompt`;
-- keep transcript validation backward-compatible while checking known `failure_type` values when present;
-- cover failure classification in CI without real Codex/Claude tokens;
+- add sharing-only `--max-lines` and `--max-bytes` rendering limits;
+- add repeated `--redact-pattern <regex>` support;
+- include visible truncation and redaction notes in generated Markdown;
+- keep pair-review local summary behavior unchanged unless using `summarize` or `github-comment`;
+- ensure `github-comment` dry-run body matches the body used for explicit posting;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- Claude tmux-agent teammate recommends a conservative first slice focused on `marker_timeout` and `session_missing`, with text-pattern classifications treated as best-effort.
-- Local checks pass for `marker_timeout` and `session_missing` fake failure transcripts, including `validate-transcript`.
+- Claude tmux-agent teammate recommends a sharing-layer implementation with visible notes and no change to raw JSONL transcript generation.
+- Local checks pass: shell syntax, skill validation, Formula syntax/style, wrapper self-tests, transcript validation, `--max-lines`, `--max-bytes`, repeated `--redact-pattern`, pair-review isolation, and fake `gh` post body validation.
+- Claude tmux-agent final review reports no blockers.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope

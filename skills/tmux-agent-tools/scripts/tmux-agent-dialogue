@@ -26,8 +26,8 @@ Usage:
   tmux-agent-dialogue --turns <n> --workdir <dir> --agent-a <codex|claude|fake> --agent-b <codex|claude|fake> --prompt-file <path> --transcript <path|-> [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>]
   tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--timeout <seconds>] [--summary-file <path>]
   tmux-agent-dialogue validate-transcript --transcript <path>
-  tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>]
-  tmux-agent-dialogue github-comment --transcript <path> --github-pr <number-or-url> --github-repo <owner/repo> [--post-github-comment]
+  tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
+  tmux-agent-dialogue github-comment --transcript <path> --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
 
 Example:
   tmux-agent-dialogue \
@@ -396,7 +396,7 @@ record_marker_timeout() {
   append_failure_jsonl "$turn" "$speaker" "$agent" "$marker" "$failure_type" "$tail_text"
 }
 
-build_pair_review_summary() {
+build_pair_review_summary_raw() {
   [[ "$TRANSCRIPT" != "-" ]] || die "pair-review summary requires --transcript to be a file path"
   validate_transcript_file "$TRANSCRIPT"
 
@@ -413,6 +413,104 @@ build_pair_review_summary() {
     "",
     (.[] | select(.event == "turn") | "### \(.speaker) / \(.agent) / turn \(.turn)\n\n```\n\(.text | tail_lines)\n```")
   ' --arg transcript "$TRANSCRIPT" -s "$TRANSCRIPT"
+}
+
+close_open_markdown_fence() {
+  local body="$1"
+  local fence_count
+  fence_count="$(print -r -- "$body" | "$JQ" -Rs '([match("(?m)^```"; "g")] | length)')"
+  if (( fence_count % 2 == 1 )); then
+    print -r -- "$body"
+    print -r -- '```'
+  else
+    print -r -- "$body"
+  fi
+}
+
+limit_markdown_lines() {
+  local body="$1"
+  local max_lines="$2"
+  [[ -n "$max_lines" ]] || { print -r -- "$body"; return; }
+
+  local -a lines
+  lines=("${(@f)body}")
+  if (( ${#lines[@]} <= max_lines )); then
+    print -r -- "$body"
+    return
+  fi
+
+  local limited=""
+  local i
+  for (( i = 1; i <= max_lines; i++ )); do
+    if [[ -z "$limited" ]]; then
+      limited="${lines[$i]}"
+    else
+      limited="${limited}"$'\n'"${lines[$i]}"
+    fi
+  done
+  limited="$(close_open_markdown_fence "$limited")"
+  print -r -- "$limited"
+  print -r -- ""
+  print -r -- "> **Note:** transcript summary truncated at ${max_lines} lines by --max-lines."
+}
+
+limit_markdown_bytes() {
+  local body="$1"
+  local max_bytes="$2"
+  [[ -n "$max_bytes" ]] || { print -r -- "$body"; return; }
+
+  local body_bytes
+  body_bytes="$(LC_ALL=C printf '%s' "$body" | wc -c | tr -d ' ')"
+  if (( body_bytes <= max_bytes )); then
+    print -r -- "$body"
+    return
+  fi
+
+  local -a lines
+  local line next candidate candidate_bytes
+  local limited=""
+  lines=("${(@f)body}")
+  for line in "${lines[@]}"; do
+    if [[ -z "$limited" ]]; then
+      candidate="$line"
+    else
+      candidate="${limited}"$'\n'"${line}"
+    fi
+    candidate_bytes="$(LC_ALL=C printf '%s' "$candidate" | wc -c | tr -d ' ')"
+    (( candidate_bytes <= max_bytes )) || break
+    limited="$candidate"
+  done
+
+  limited="$(close_open_markdown_fence "$limited")"
+  print -r -- "$limited"
+  print -r -- ""
+  print -r -- "> **Note:** transcript summary truncated at ${max_bytes} bytes by --max-bytes."
+}
+
+apply_markdown_redactions() {
+  local body="$1"
+  local pattern
+  (( ${#REDACT_PATTERNS[@]} )) || { print -r -- "$body"; return; }
+
+  for pattern in "${REDACT_PATTERNS[@]}"; do
+    body="$(print -r -- "$body" | "$JQ" -Rrs --arg pattern "$pattern" 'gsub($pattern; "[REDACTED]")')"
+  done
+  print -r -- "$body"
+  print -r -- ""
+  print -r -- "> **Note:** one or more redact patterns were applied."
+}
+
+build_pair_review_summary() {
+  build_pair_review_summary_raw
+}
+
+build_shareable_pair_review_summary() {
+  local body
+  body="$(build_pair_review_summary_raw)"
+  body="$(limit_markdown_lines "$body" "$MAX_LINES")"
+  body="$(limit_markdown_bytes "$body" "$MAX_BYTES")"
+  body="$(apply_markdown_redactions "$body")"
+  print -r -- "$body"
 }
 
 print_pair_review_summary() {
@@ -433,7 +531,7 @@ post_pair_review_comment() {
 
   local body_file
   body_file="$(mktemp)"
-  build_pair_review_summary > "$body_file"
+  build_shareable_pair_review_summary > "$body_file"
 
   "$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file"
   echo "posted GitHub PR comment: $GITHUB_PR" >&2
@@ -447,10 +545,10 @@ run_summary_mode() {
   if [[ -n "$SUMMARY_FILE" ]]; then
     SUMMARY_FILE="${SUMMARY_FILE:A}"
     mkdir -p "${SUMMARY_FILE:h}"
-    build_pair_review_summary > "$SUMMARY_FILE"
+    build_shareable_pair_review_summary > "$SUMMARY_FILE"
     echo "summary file: $SUMMARY_FILE" >&2
   else
-    build_pair_review_summary
+    build_shareable_pair_review_summary
   fi
 }
 
@@ -465,7 +563,7 @@ run_github_comment_mode() {
   if (( POST_GITHUB_COMMENT )); then
     post_pair_review_comment
   else
-    build_pair_review_summary
+    build_shareable_pair_review_summary
     echo "dry-run: add --post-github-comment to post to GitHub" >&2
   fi
 }
@@ -531,6 +629,9 @@ SUMMARY_FILE=""
 POST_GITHUB_COMMENT=0
 GITHUB_PR=""
 GITHUB_REPO=""
+MAX_LINES=""
+MAX_BYTES=""
+REDACT_PATTERNS=()
 RUN_ID="${$}-$(date -u '+%Y%m%d%H%M%S')"
 OWNED_SESSIONS=()
 OWNED_WRAPPERS=()
@@ -566,6 +667,9 @@ while (( $# > 0 )); do
     --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
     --summary-file) SUMMARY_FILE="${2:-}"; shift 2 ;;
+    --max-lines) MAX_LINES="${2:-}"; shift 2 ;;
+    --max-bytes) MAX_BYTES="${2:-}"; shift 2 ;;
+    --redact-pattern) REDACT_PATTERNS+=("${2:-}"); shift 2 ;;
     --post-github-comment) POST_GITHUB_COMMENT=1; shift ;;
     --github-pr) GITHUB_PR="${2:-}"; shift 2 ;;
     --github-repo) GITHUB_REPO="${2:-}"; shift 2 ;;
@@ -573,6 +677,12 @@ while (( $# > 0 )); do
     *) die "unknown argument: $1" ;;
   esac
 done
+
+if [[ -n "$MAX_LINES" || -n "$MAX_BYTES" || ${#REDACT_PATTERNS[@]} -gt 0 ]]; then
+  [[ "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--max-lines, --max-bytes, and --redact-pattern are only supported with summarize or github-comment"
+fi
+[[ -z "$MAX_LINES" || ( "$MAX_LINES" =~ '^[0-9]+$' && "$MAX_LINES" -gt 0 ) ]] || die "--max-lines must be a positive integer"
+[[ -z "$MAX_BYTES" || ( "$MAX_BYTES" =~ '^[0-9]+$' && "$MAX_BYTES" -gt 0 ) ]] || die "--max-bytes must be a positive integer"
 
 if [[ "$MODE" == "summarize" ]]; then
   run_summary_mode

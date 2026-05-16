@@ -111,6 +111,7 @@ tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --g
 ```
 
 Only add `--post-github-comment` when the user explicitly asks to publish the summary to GitHub.
+Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize` or `github-comment` when transcript content may be too large or sensitive to share raw. The generated Markdown includes visible truncation and redaction notes.
 
 ## Session Naming
 
