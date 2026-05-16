@@ -155,7 +155,7 @@ claude-tmux doctor
 claude-tmux self-test
 ```
 
-`claude-tmux status <name>` reports a diagnostic when the pane appears to be waiting for a Claude first-run or permission confirmation. It does not auto-accept that prompt; attach or capture the pane and make the decision explicitly.
+`claude-tmux status <name>` and `codex-tmux status <name>` report diagnostics when the pane appears to be waiting for known first-run, permission, approval, SSH, or login prompts. They do not auto-accept prompts; attach or capture the pane and make the decision explicitly.
 
 Remote run with local tmux:
 
