@@ -55,13 +55,13 @@ macOS or Linuxbrew:
 
 ```bash
 brew tap ohyeh/tmux-agent-tools https://github.com/ohyeh/tmux-agent-tools.git
-brew install tmux-agent-tools --HEAD
+brew install tmux-agent-tools
 ```
 
-After a tagged release and stable `url`/`sha256` are added to the formula, install without `--HEAD`:
+Install the latest unreleased commit:
 
 ```bash
-brew install tmux-agent-tools
+brew install tmux-agent-tools --HEAD
 ```
 
 ## Install Commands Without Homebrew
