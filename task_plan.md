@@ -54,28 +54,31 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 16. Merge `jq` runtime dependency and Formula summarize smoke through PR #14. Done.
 17. Merge manual dry-run-first release workflow through PR #15. Done.
 18. Merge release handoff docs and Formula bump summary workflow through PR #16. Done.
-19. Merge v0.3 session hygiene helper through PR #18. Done.
-20. Merge transcript validator through PR #19. Done.
-21. Merge failure classification through PR #20. Done.
-22. Merge safer transcript sharing through PR #21. Done.
+19. Merge v0.3 session hygiene helper through PR #18 (`32135e0`). Done.
+20. Merge transcript validator through PR #19 (`8c3607a`). Done.
+21. Merge failure classification through PR #20 (`8ca4aeb`). Done.
+22. Merge safer transcript sharing through PR #21 (`132289f`). Done.
 23. Merge stable status JSON through PR #22. Done.
 24. Merge participant profiles through PR #23 and profile docs cleanup through PR #24. Done.
 25. Merge critic preset through PR #25 and critic coverage cleanup through PR #26. Done.
+26. Merge transcript-generic comment docs through PR #27 and generic transcript summary labels through PR #28. Done.
 
 ## Active Work
 
-Branch: `feature/transcript-summary-label`
+Branch: `feature/v03-roadmap-refresh`
 
 Scope:
 
-- make generic `summarize` and `github-comment` output use a `transcript` label instead of the `pair-review` preset label;
+- refresh `task_plan.md` and `docs/v0.3.0-roadmap.md` so completed v0.3 slices are marked as merged instead of in-progress;
+- keep the Formula test compatible with both stable `v0.2.0` (`pair-review` label) and HEAD (`transcript` label);
+- identify the next remaining v0.3 work from current repo state;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- PR #27 main CI passed after clarifying transcript-generic `github-comment` wording.
-- Local smoke verifies `github-comment` dry-run output for `dialogue`, `pair-review`, and `critic` transcripts.
+- PR #28 main CI passed after generic `summarize` and `github-comment` output switched to the `transcript` label.
+- Current branch keeps Formula `test do` compatible with both stable `v0.2.0` and unreleased HEAD summary labels.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
