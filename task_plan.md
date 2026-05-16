@@ -52,4 +52,4 @@ Candidate work:
 - session metadata/structured status - done
 - better Claude first-run confirmation handling
 - local hold-on-exit diagnostics - done
-- CI smoke checks for PRs - in progress
+- CI smoke checks for PRs - done
