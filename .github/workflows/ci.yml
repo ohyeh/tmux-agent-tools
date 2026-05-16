@@ -206,6 +206,19 @@ jobs:
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
           rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$pair_summary_file"
+          pair_swap_transcript_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --swap --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_swap_transcript_file" --timeout 10
+          jq -s -e 'map(select(.event == "turn")) as $turns | ($turns | length) == 2 and $turns[0].turn == 1 and $turns[0].speaker == "agent-b" and ($turns[0].text | contains("fake-b: turn 1 received")) and $turns[1].turn == 2 and $turns[1].speaker == "agent-a" and ($turns[1].text | contains("fake-a: turn 2 received"))' "$pair_swap_transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue critic --swap --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/critic-swap.jsonl >/tmp/critic-swap.out 2>&1; then
+            echo "swap must only be accepted by pair-review" >&2
+            exit 1
+          fi
+          rg -n -- "--swap is only supported with pair-review" /tmp/critic-swap.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --swap pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/pair-swap-before-subcommand.jsonl >/tmp/pair-swap-before-subcommand.out 2>&1; then
+            echo "swap must be placed after the pair-review subcommand" >&2
+            exit 1
+          fi
+          rg -n -- "--swap is only supported after the pair-review subcommand" /tmp/pair-swap-before-subcommand.out
           handoff_transcript_file="$(mktemp)"
           handoff_summary_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue handoff --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$handoff_transcript_file" --summary-file "$handoff_summary_file" --timeout 10
