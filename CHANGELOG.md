@@ -11,12 +11,15 @@
 - `status --json` now includes diagnostic prompt fields: `confirmation_detected` and nullable `blocked_reason`.
 - `tmux-agent-dialogue handoff` for bounded two-turn context transfer with local transcript and optional summary output.
 - `github-comment --summary-file` for reusing a pre-rendered local Markdown summary body.
+- `tmux-agent-dialogue pair-review --swap` for reversing proposal/review speaker order without changing participant definitions.
+- Participant profile `env` support for generic per-session environment variables passed into local tmux sessions.
 
 ### Changed
 
 - Session inventory and cleanup previews use wrapper-backed running/exited state instead of assuming every owned tmux session is running.
 - Status diagnostics remain bounded, best-effort, and non-authoritative; prompt detection never auto-accepts or interacts with prompts.
 - Handoff and summary-file flows stay local by default, with GitHub posting still requiring explicit `--post-github-comment`.
+- Participant profile env is validated before session start, remains profile-scoped, and is documented with SSH caveats rather than treated as a secret transport.
 
 ### Notes
 

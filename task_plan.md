@@ -6,8 +6,9 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Success Criteria
 
-- `v0.3.0` tag exists on the verified session hygiene and transcript usability commit.
-- Homebrew formula supports stable `v0.3.0` install without `--HEAD`.
+- `v0.3.0` tag exists on the verified session hygiene and transcript usability commit, and remains the current stable Homebrew release until the next tag is published.
+- `v0.4.0` release notes and dry-run evidence stay current with all merged automation-readiness and operator-ergonomics slices.
+- Homebrew formula supports stable `v0.3.0` install without `--HEAD`, with the `v0.4.0` Formula bump deferred until after the reviewed Release workflow creates the tag.
 - `brew install tmux-agent-tools` installs `claude-tmux`, `codex-tmux`, `tmux-agent-dialogue`, and `tmux-agent-sessions` from the tap.
 - `npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools` can discover the skill.
 - True Codex/Claude tmux communication remains verified.
@@ -71,14 +72,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-profile-env`
+Branch: `feature/v0.4-release-notes-refresh`
 
 Scope:
 
-- implement the v0.4 P2 participant profile `env` ergonomic slice;
-- keep profile env generic and per-session, without personal shortcuts or secret examples;
-- validate env keys and values before starting tmux sessions;
-- keep the feature local-only with no GitHub posting, merging, scheduling, or release side effects;
+- refresh v0.4.0 release notes and task-plan state after the P2 ergonomics merges;
+- keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -130,7 +129,8 @@ Verification evidence:
 - Profile env local validation passed on `feature/v0.4-profile-env`: workflow YAML check with `yq`, script syntax for wrappers/dialogue/session helper, Formula syntax/style, skill metadata validation, wrapper self-tests, `git diff --check`, fake profile smoke, fake `codex` executable through the real wrapper path proving no-env profiles do not crash and profile env reaches the local tmux session process, and bad profile rejection for unknown keys, non-string profile values, invalid env keys, non-string env values, and newline env values.
 - Claude tmux-agent teammate reviewed the first profile env diff and found a blocker: empty `@f` command substitution could create `env "" wrapper ...` for env-less real participants. The fix filters empty entries and passes session env through wrapper-managed `tmux new-session -e` arguments; local revalidation covered env-less and env-set real-wrapper paths.
 - Claude tmux-agent teammate re-reviewed after the fix and found no blockers with `VERDICT: SHIP`; the only non-blocking CI no-env assertion note was addressed and rechecked locally.
-- Pending for this branch: PR CI, merge, and main CI.
+- PR #47 merged as `7ad17a5`; main CI run `25971163853` passed.
+- Pending for this branch: release-note refresh validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
