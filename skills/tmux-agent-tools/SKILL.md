@@ -23,6 +23,12 @@ If the commands are not installed on `PATH`, resolve them from the skill directo
 - Use `start` for a local working directory.
 - Use `start-ssh` when the tmux session should stay local but the agent CLI should run through SSH on another machine.
 
+## When Not To Use
+
+- Do not use tmux for one-off non-interactive shell commands; run those directly.
+- Do not start a new tmux agent when a simple file read, search, test, or build command is enough.
+- Do not use these wrappers for externally visible, destructive, or privacy-sensitive work unless the user has already authorized that work.
+
 ## Core Workflow
 
 1. Start a session with a short stable name:
@@ -41,6 +47,7 @@ codex-tmux send worker 'Now implement the smallest fix and run the targeted test
 
 ```bash
 codex-tmux wait worker 180
+codex-tmux wait-text worker 'Done|Need approval' 180
 codex-tmux capture worker 120
 ```
 

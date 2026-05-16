@@ -7,6 +7,15 @@ This repository is both:
 - a `skills.sh` compatible skill package;
 - a Homebrew formula source for installing `claude-tmux` and `codex-tmux` commands on macOS or Linuxbrew.
 
+## Inspired By
+
+This project is inspired by two tmux skills in the `skills.sh` ecosystem:
+
+- [mitsuhiko/agent-stuff/tmux](https://www.skills.sh/mitsuhiko/agent-stuff/tmux), especially the pattern of pairing a compact `SKILL.md` with shell helpers under `scripts/`.
+- [steipete/clawdis/tmux](https://www.skills.sh/steipete/clawdis/tmux), especially the practical guidance around using tmux for long-running interactive agent sessions instead of one-off shell commands.
+
+`tmux-agent-tools` keeps that skill-first layout, but adds installable wrapper commands for Claude Code and Codex CLI.
+
 ## Tools
 
 - `claude-tmux`: starts Claude Code in tmux with `--dangerously-skip-permissions`.
@@ -19,6 +28,7 @@ Both tools support:
 - `attach`
 - `send`
 - `wait`
+- `wait-text`
 - `capture`
 - `list`
 - `status`
@@ -84,6 +94,7 @@ brew style ohyeh/tmux-agent-tools/tmux-agent-tools
 codex-tmux start --exact worker ~/github/project 'Read the repo and report status.'
 codex-tmux send worker 'Run the targeted tests.'
 codex-tmux wait worker 180
+codex-tmux wait-text worker 'Done|Need approval' 180
 codex-tmux capture worker 120
 codex-tmux stop worker
 ```

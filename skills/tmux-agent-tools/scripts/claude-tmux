@@ -19,6 +19,7 @@ Usage:
   claude-tmux attach <name>
   claude-tmux send <name> <text>
   claude-tmux wait <name> [timeout_seconds]
+  claude-tmux wait-text <name> <regex> [timeout_seconds]
   claude-tmux capture <name> [lines]
   claude-tmux list
   claude-tmux status <name>
@@ -32,6 +33,7 @@ Examples:
   claude-tmux attach pr5
   claude-tmux send pr5 '請先讀 PR description'
   claude-tmux wait pr5 180
+  claude-tmux wait-text pr5 'Done|Need approval' 180
   claude-tmux capture pr5 80
   claude-tmux list
   claude-tmux stop pr5
@@ -43,6 +45,7 @@ Behavior:
   - start-ssh keeps tmux local, then runs Claude through ssh in the remote directory.
   - Claude is launched with --dangerously-skip-permissions.
   - wait returns when the visible pane is stable for a few seconds.
+  - wait-text returns when the visible pane matches a zsh extended regex.
   - capture reads the tmux pane without stealing browser or terminal focus.
 
 Environment:
@@ -184,6 +187,10 @@ start_session() {
   echo "agent: $name"
   echo "Started $session"
   echo "cwd:  $directory"
+  echo "send: $SELF send $name <text>"
+  echo "wait: $SELF wait $name 180"
+  echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "capture: $SELF capture $name 120"
   if [[ -n "$initial_text" ]]; then
     sleep 3
     local buffer_name="$session-init"
@@ -250,6 +257,10 @@ start_ssh_session() {
   echo "Started $session"
   echo "ssh:  $ssh_target"
   echo "cwd:  $remote_directory"
+  echo "send: $SELF send $name <text>"
+  echo "wait: $SELF wait $name 180"
+  echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "capture: $SELF capture $name 120"
   if [[ -n "$initial_text" ]]; then
     sleep 5
     local buffer_name="$session-init"
@@ -267,7 +278,7 @@ start_ssh_session() {
 }
 
 attach_session() {
-  require_bins
+  require_tmux
   local name="${1:-}"
 
   if [[ -z "$name" ]]; then
@@ -285,7 +296,7 @@ attach_session() {
 }
 
 send_session() {
-  require_bins
+  require_tmux
   local name="${1:-}"
   shift || true
 
@@ -309,7 +320,7 @@ send_session() {
 }
 
 capture_session() {
-  require_bins
+  require_tmux
   local name="${1:-}"
   local lines="${2:-80}"
 
@@ -333,7 +344,7 @@ capture_session() {
 }
 
 wait_session() {
-  require_bins
+  require_tmux
   local name="${1:-}"
   local timeout_seconds="${2:-180}"
 
@@ -372,8 +383,46 @@ wait_session() {
   return 1
 }
 
+wait_text_session() {
+  require_tmux
+  local name="${1:-}"
+  local pattern="${2:-}"
+  local timeout_seconds="${3:-180}"
+
+  if [[ -z "$name" || -z "$pattern" ]]; then
+    echo "Usage: claude-tmux wait-text <name> <regex> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -t "$session" -p -S -200)"
+    if [[ "$current" =~ $pattern ]]; then
+      echo "matched: $pattern"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "timeout waiting for text '$pattern': $session" >&2
+  return 1
+}
+
 status_session() {
-  require_bins
+  require_tmux
   local name="${1:-}"
 
   if [[ -z "$name" ]]; then
@@ -390,7 +439,7 @@ status_session() {
 }
 
 list_sessions() {
-  require_bins
+  require_tmux
   "$TMUX" ls 2>/dev/null | while IFS= read -r line; do
     case "$line" in
       "$PREFIX"-*)
@@ -403,7 +452,7 @@ list_sessions() {
 }
 
 stop_session() {
-  require_bins
+  require_tmux
   local name="${1:-}"
 
   if [[ -z "$name" ]]; then
@@ -440,6 +489,9 @@ case "$command" in
     ;;
   wait)
     wait_session "$@"
+    ;;
+  wait-text)
+    wait_text_session "$@"
     ;;
   capture)
     capture_session "$@"
