@@ -125,7 +125,7 @@ Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-t
 
 Captured pane text joins tmux soft-wrapped screen lines before matching or writing transcripts. This keeps long model output, markers, and summaries from changing shape just because the tmux pane is narrow.
 
-Interactive sessions keep mouse support on by default. Copy-mode `y` and `Enter` use the first available system clipboard command (`pbcopy`, `wl-copy`, `xclip`, or `xsel`); when none exists, they fall back to tmux's internal selection so keyboard copy does not fail just because a platform clipboard helper is missing. Set `CLAUDE_TMUX_CLIPBOARD=internal` or `CODEX_TMUX_CLIPBOARD=internal` to force tmux internal selection, or set either variable to a custom copy command when a terminal needs a specific clipboard bridge.
+Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, and mouse drag release use the first available system clipboard command (`pbcopy`, `wl-copy`, `xclip`, or `xsel`); when none exists, they fall back to tmux's internal selection so keyboard copy does not fail just because a platform clipboard helper is missing. Set `CLAUDE_TMUX_CLIPBOARD=internal` or `CODEX_TMUX_CLIPBOARD=internal` to force tmux internal selection, or set either variable to a custom copy command when a terminal needs a specific clipboard bridge.
 
 `status --json` is a stable machine-readable contract for both wrappers. It is built with `jq` and uses the same fields for Claude and Codex:
 

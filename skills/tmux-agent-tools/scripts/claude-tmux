@@ -132,6 +132,29 @@ clipboard_command() {
   fi
 }
 
+tmux_conf_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf "%s" "$value"
+}
+
+clipboard_description() {
+  local command
+  command="$(clipboard_command)"
+  if [[ -n "$command" ]]; then
+    if [[ "$TMUX_CLIPBOARD" == "auto" ]]; then
+      echo "auto ($command)"
+    else
+      echo "$command"
+    fi
+  elif [[ "$TMUX_CLIPBOARD" == "auto" ]]; then
+    echo "auto (internal fallback)"
+  else
+    echo "internal"
+  fi
+}
+
 write_tmux_conf() {
   cat > "$TMUX_CONF" <<'EOF'
 set -g default-terminal "tmux-256color"
@@ -174,11 +197,14 @@ EOF
   local copy_command
   copy_command="$(clipboard_command)"
   if [[ -n "$copy_command" ]]; then
+    copy_command="$(tmux_conf_quote "$copy_command")"
     printf 'bind-key -T copy-mode-vi y send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
     printf 'bind-key -T copy-mode-vi Enter send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
   else
     printf 'bind-key -T copy-mode-vi y send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
     printf 'bind-key -T copy-mode-vi Enter send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
   fi
   printf 'set -g mouse "%s"\n' "$TMUX_MOUSE" >> "$TMUX_CONF"
 }
@@ -618,7 +644,7 @@ doctor_session() {
   echo "submit_delay: $SUBMIT_DELAY"
   echo "tmux_conf: $TMUX_CONF"
   echo "mouse: $TMUX_MOUSE"
-  echo "clipboard: $TMUX_CLIPBOARD"
+  echo "clipboard: $(clipboard_description)"
 }
 
 readiness_diagnostic() {
