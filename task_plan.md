@@ -2,7 +2,7 @@
 
 ## Goal
 
-Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.3.0` session hygiene and transcript usability on focused feature branches with Claude tmux-agent teammate review.
+Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.4.0` automation readiness on focused feature branches with Claude tmux-agent teammate review.
 
 ## Success Criteria
 
@@ -30,7 +30,8 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 - Release discipline comes before new features.
 - `B` reliability primitives are now in `main`.
-- `v0.3.0` should improve session hygiene and transcript usability rather than add more autonomy.
+- `v0.3.0` improved session hygiene and transcript usability without adding more autonomy.
+- `v0.4.0` should improve automation readiness: accurate session state, richer status contracts, bounded handoff, and local summary pipelines.
 - `D` personal workflow shortcuts should stay outside public core unless generalized.
 - Keep orchestration public and generic: transcript capture, pairing, and bounded turns are core; OpenClaw/Mac-mini shortcuts are not.
 
@@ -66,17 +67,17 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 28. Merge task-plan release state through PR #33 and v0.3 real-agent release evidence through PR #34. Done.
 29. Merge `v0.3.0` release notes through PR #35 (`6516e7c`). Done.
 30. Merge `v0.3.0` Release workflow dry-run state through PR #36 (`97a629f`). Done.
+31. Merge `v0.3.0` stable Formula bump through PR #37 (`6acb503`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.3-formula-bump`
+Branch: `feature/v0.4-roadmap`
 
 Scope:
 
-- add an explicit release go/no-go checklist before future non-dry-run releases;
-- bump the Homebrew Formula stable URL/SHA to the published `v0.3.0` archive;
-- include `tmux-agent-sessions` in the stable Homebrew install and Formula test;
-- keep bot review handling evidence-based instead of accepting low-value comments by default;
+- close out the completed v0.3 roadmap state;
+- create the `v0.4.0` roadmap around automation readiness;
+- seed the first v0.4 candidate slice for `tmux-agent-sessions` state accuracy;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -96,6 +97,11 @@ Verification evidence:
 - Release archive SHA-256 for `https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.3.0.tar.gz` is `7447ce4f8f88a8da2f2c8b0a610c68754886f642c63cc82f6a5749b7b8041318`.
 - Local Formula validation passed against a tap clone of this branch: `brew reinstall --build-from-source ohyeh/tmux-agent-tools/tmux-agent-tools`, `brew test`, and `brew info` all reported `0.3.0`; the installed commands include `claude-tmux`, `codex-tmux`, `tmux-agent-dialogue`, and `tmux-agent-sessions`.
 - Claude tmux-agent teammate reviewed the Formula bump diff, independently recomputed the `v0.3.0` archive SHA-256, and found no blockers. The human tmux copy/mouse UX concern is a valid follow-up, but does not block this release Formula bump.
+- PR #37 merged as `6acb503`; main CI run `25963770634` passed.
+- Stable Homebrew reinstall/test from the GitHub tap reported `0.3.0` and installed `tmux-agent-sessions`.
+- Claude tmux-agent teammate brainstormed v0.4 candidates and recommended automation readiness: status/session truth, handoff preset, and summary-file pipeline.
+- Roadmap docs validation passed: script syntax, skill metadata validation, Formula syntax/style, and text searches for v0.4 scope anchors.
+- Claude tmux-agent teammate reviewed the v0.4 roadmap diff and found no blockers.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
