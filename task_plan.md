@@ -71,11 +71,11 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-release-prep`
+Branch: `feature/v0.4-release-dry-run-state`
 
 Scope:
 
-- prepare `v0.4.0` release notes and current-state docs after the automation-readiness slices landed;
+- record the reviewed `v0.4.0` release-prep merge and Release workflow dry-run evidence;
 - do not create release tags or GitHub releases from local shell;
 - do not bump the stable Homebrew Formula before the `v0.4.0` tag exists;
 - use Claude tmux-agent teammate review only;
@@ -119,6 +119,9 @@ Verification evidence:
 - PR #43 merged as `8a77554`; main CI run `25970224776` passed.
 - v0.4.0 release-prep local validation passed on `feature/v0.4-release-prep`: release workflow YAML check with `yq`, script syntax for all wrappers/dialogue/session helper, Formula syntax/style, wrapper self-tests, `git diff --check`, release-note extraction for `v0.4.0`, and the release workflow fake two-turn dialogue smoke with `jq` assertions.
 - Claude tmux-agent teammate reviewed the v0.4.0 release-prep diff and found no blockers with `VERDICT: READY TO PR`; Formula bump remains correctly deferred until after the tag exists.
+- PR #44 merged as `5070e2a`; main CI run `25970349954` passed.
+- Release workflow dry-run for `v0.4.0` passed in run `25970374512` (`https://github.com/ohyeh/tmux-agent-tools/actions/runs/25970374512`): `validate` succeeded, release notes were built from `CHANGELOG.md`, `publish` was skipped, and `refs/tags/v0.4.0` / the GitHub Release were absent before dispatch.
+- Claude tmux-agent teammate reviewed this dry-run state update and found no blockers with `VERDICT: READY`.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
