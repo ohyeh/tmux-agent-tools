@@ -2,7 +2,7 @@
 
 ## Goal
 
-Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.4.0` automation readiness on focused feature branches with Claude tmux-agent teammate review.
+Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate toward `v0.5.0` observability and multi-session composability on focused feature branches with Claude tmux-agent teammate review.
 
 ## Success Criteria
 
@@ -21,7 +21,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - Repo: `ohyeh/tmux-agent-tools`
 - Release tag: `v0.3.0`
 - Release tag URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.3.0`
-- Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, explicit GitHub comment helper support, wrapper-backed session state, bounded status tails, blocked-reason diagnostics, handoff, and summary-file comment input.
+- Current main includes CI smoke checks, Node 24 checkout action updates, bounded dialogue orchestration, pair-review, remote participants, explicit GitHub comment helper support, wrapper-backed session state, bounded status tails, blocked-reason diagnostics, handoff, summary-file comment input, and bounded session watch.
 - Verified commands: `start`, `start-ssh`, `send`, `send-wait-literal`, `wait`, `wait-text`, `wait-literal`, `capture`, `list`, `status`, `doctor`, `self-test`, `stop`, `tmux-agent-dialogue`, `tmux-agent-sessions`
 - Verified install surfaces: `skills.sh`, stable Homebrew, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
@@ -75,16 +75,18 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 34. Merge `v0.4.0` status-contract roadmap sync through PR #53 (`17ee594`). Done.
 35. Merge `v0.4.0` roadmap current-state refresh through PR #54 (`dc37dc2`). Done.
 36. Merge `v0.5.0` roadmap through PR #55 (`71e8ec4`). Done.
+37. Merge bounded session watch through PR #56 (`3a28a5a`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.5-bounded-session-watch`
+Branch: `feature/v0.5-status-exit-code`
 
 Scope:
 
-- record the PR #55 merge and main CI evidence before any `v0.4.0` publish;
-- implement bounded `tmux-agent-sessions list --watch --json --count N [--interval S]`;
-- keep watch mode read-only, finite, credential-free, and explicit about no scheduler/daemon behavior;
+- record the PR #56 merge and main CI evidence before any `v0.4.0` publish;
+- extend Claude and Codex wrapper `status --json` with `exit_code` as integer or null;
+- preserve existing `running`, `exit_detected`, `blocked_reason`, `diagnostic`, and inventory state semantics;
+- keep `tmux-agent-sessions list --json` and cleanup preview JSON schema aligned with wrapper status rows;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -157,7 +159,12 @@ Verification evidence:
 - Claude tmux-agent teammate brainstormed the next version and recommended `v0.5.0` focus on observability and multi-session composability, with bounded `tmux-agent-sessions list --watch --json --count N` as the first measurable slice.
 - v0.5 roadmap validation passed on `feature/v0.5-roadmap`: `git diff --check`, workflow YAML name check with `yq`, script syntax checks, roadmap anchor searches with `rg`, and Claude tmux-agent teammate final review with `VERDICT: SHIP`.
 - PR #55 merged as `71e8ec4`; main CI run `25972340758` passed.
-- Pending for this branch: bounded watch implementation validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Bounded session watch local validation passed on `feature/v0.5-bounded-session-watch`: script syntax, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake session JSON watch smoke covering `--count 0`, invalid `--count`, and two emitted snapshots.
+- Claude tmux-agent teammate reviewed the bounded session watch diff, found a zsh regex blocker in the first implementation, then re-reviewed after fixes and found no blockers with `VERDICT: SHIP`.
+- PR #56 merged as `3a28a5a`; main CI run `25972534503` passed.
+- Status exit-code local validation passed on `feature/v0.5-status-exit-code`: `git diff --check`, workflow YAML name checks with `yq`, script syntax checks, skill metadata validation, Formula syntax/style, wrapper self-tests, missing status `exit_code == null`, fake local/remote exit markers with `exit_code == 7` and `exit_code == 2`, inventory JSON preservation, cleanup preview JSON preservation, and dialogue rows with `exit_code == null`.
+- Claude tmux-agent teammate reviewed the status exit-code diff and found no blockers with `VERDICT: SHIP`. Non-blocking notes: multiple captured exit markers use last-wins parsing, and the bounded pane capture window remains the source of evidence.
+- Pending for this branch: PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 

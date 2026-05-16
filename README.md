@@ -143,6 +143,7 @@ Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, a
 | `exists` | boolean | stable | Whether the tmux session exists. |
 | `running` | boolean | stable | `true` only when the session exists and no wrapper exit-code marker is visible. |
 | `exit_detected` | boolean | stable | Pane contains `local command exited with code` or `remote command exited with code`; this does not imply failure. |
+| `exit_code` | integer or null | stable | Numeric code parsed only from the wrapper exit-code marker; `null` when missing, running, or no marker is visible. |
 | `local_or_remote` | string or null | diagnostic | Best-effort mode inferred from pane text; `null` when the session is missing. |
 | `diagnostic` | string or null | diagnostic | Optional readiness warning text; callers should not depend on exact wording. |
 | `last_capture_lines` | array of strings | diagnostic | Bounded pane tail for human diagnosis in JSON callers; empty when the session is missing. Defaults to 20 lines. |

@@ -81,7 +81,7 @@ emit_session_json() {
     --arg session "$session" \
     --arg prefix "$prefix" \
     --arg state "running" \
-    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,state:$state,running:true,exit_detected:false,local_or_remote:null,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}'
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,state:$state,running:true,exit_detected:false,exit_code:null,local_or_remote:null,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}'
 }
 
 add_state_field() {
@@ -97,6 +97,19 @@ add_state_field() {
   }'
 }
 
+exit_code_for_text() {
+  local current="$1"
+  local line
+  local code=""
+  local exit_re='(local|remote) command exited with code ([0-9]+)'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $exit_re ]]; then
+      code="${match[2]}"
+    fi
+  done <<< "$current"
+  print -r -- "$code"
+}
+
 fallback_status_json() {
   local tool="$1"
   local name="$2"
@@ -108,10 +121,12 @@ fallback_status_json() {
 
   local running=true
   local exit_detected=false
+  local exit_code=""
   local local_or_remote="local"
   if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
     running=false
     exit_detected=true
+    exit_code="$(exit_code_for_text "$current")"
   fi
   if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
     local_or_remote="remote"
@@ -124,9 +139,10 @@ fallback_status_json() {
     --arg session "$session" \
     --arg prefix "$prefix" \
     --arg local_or_remote "$local_or_remote" \
+    --arg exit_code "$exit_code" \
     --argjson running "$running" \
     --argjson exit_detected "$exit_detected" \
-    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,running:$running,exit_detected:$exit_detected,local_or_remote:$local_or_remote,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}' \
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:$local_or_remote,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}' \
     | add_state_field
 }
 
