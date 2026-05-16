@@ -5,6 +5,7 @@ class TmuxAgentTools < Formula
   sha256 "a9c5aab558ee306727215feb7a5146aa50132360a00e7a9a6c4d7c5627962a55"
   head "https://github.com/ohyeh/tmux-agent-tools.git", branch: "main"
 
+  depends_on "jq"
   depends_on "tmux"
   on_linux do
     depends_on "zsh"
@@ -22,5 +23,12 @@ class TmuxAgentTools < Formula
     assert_match "codex-tmux - run Codex CLI in tmux", shell_output("#{bin}/codex-tmux help")
     assert_match "tmux-agent-dialogue - run a bounded two-agent tmux dialogue",
                  shell_output("#{bin}/tmux-agent-dialogue help")
+
+    transcript = testpath/"transcript.jsonl"
+    transcript.write <<~JSONL
+      {"event":"turn","turn":1,"speaker":"agent-a","agent":"fake","timestamp":"2026-05-16T00:00:00Z","marker":"[DONE]","text":"fake-a: ok"}
+    JSONL
+    assert_match "tmux-agent-tools pair-review",
+                 shell_output("#{bin}/tmux-agent-dialogue summarize --transcript #{transcript}")
   end
 end

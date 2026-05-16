@@ -6,9 +6,9 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Success Criteria
 
-- `v0.1.0` tag exists on the verified MVP commit.
-- Homebrew formula supports stable install without `--HEAD`.
-- `brew install tmux-agent-tools` succeeds from the tap.
+- `v0.2.0` tag exists on the verified orchestration commit.
+- Homebrew formula supports stable `v0.2.0` install without `--HEAD`.
+- `brew install tmux-agent-tools` installs `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` from the tap.
 - `npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools` can discover the skill.
 - True Codex/Claude tmux communication remains verified.
 - Next v0.2.0 branch exists and has a concrete scope.
@@ -59,6 +59,8 @@ Scope:
 - publish `v0.2.0` as the stable Homebrew release target;
 - update Formula stable `url` and `sha256` to the `v0.2.0` archive;
 - install `tmux-agent-dialogue` in stable Homebrew, not only `--HEAD`;
+- declare stable runtime dependencies required by `tmux-agent-dialogue`;
+- test a jq-backed `tmux-agent-dialogue summarize` path in the Formula;
 - update README and roadmap wording so they no longer describe merged features as active work;
 - add a concise changelog entry for `v0.2.0`;
 - keep all mainline changes going through PR.
@@ -70,6 +72,7 @@ Verification evidence:
 - `v0.2.0` archive SHA-256 is `a9c5aab558ee306727215feb7a5146aa50132360a00e7a9a6c4d7c5627962a55`.
 - `zsh -n` passes for all wrapper scripts and `tmux-agent-dialogue`.
 - `ruby -c Formula/tmux-agent-tools.rb`, `brew style Formula/tmux-agent-tools.rb`, and tap-name `brew audit --strict --online` pass.
+- `brew test ohyeh/tmux-agent-tools/tmux-agent-tools` passes with a `tmux-agent-dialogue summarize` transcript smoke.
 - Local tap branch install proves stable `0.2.0` installs `/opt/homebrew/bin/tmux-agent-dialogue`.
 - Remaining check for this branch: PR CI.
 
