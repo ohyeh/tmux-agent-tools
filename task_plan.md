@@ -42,7 +42,7 @@ Ship the verified tmux-agent-tools MVP as `v0.1.0`, then prepare the next reliab
 
 ## Next Branch Scope
 
-Branch: `feature/local-exit-diagnostics`
+Branch: `feature/ci-smoke-checks`
 
 Candidate work:
 
@@ -52,3 +52,4 @@ Candidate work:
 - session metadata/structured status - done
 - better Claude first-run confirmation handling
 - local hold-on-exit diagnostics - done
+- CI smoke checks for PRs - done
