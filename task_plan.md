@@ -84,12 +84,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.6-shellcheck-ci` next
+Branch: create `feature/v0.6-skill-env-reference-parity` next
 
 Scope:
 
-- implement the first `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
-- start with shellcheck CI quality gating;
+- implement the next `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
+- align `SKILL.md` environment references with the public README/wrapper contract;
 - keep this free of release publish, tag, GitHub Release, Formula bump, credentials, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - keep this slice free of release publish, tag, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
@@ -213,7 +213,9 @@ Verification evidence:
 - ShellCheck cannot parse zsh (`SC1071`), so the gate lints supported-shell helpers and keeps an explicit `SC1071` compatibility sentinel for installed zsh scripts while preserving `zsh -n`.
 - Claude tmux-agent teammate reviewed the shellcheck CI diff and found one blocker: `scripts/ci-shellcheck` must be executable because CI invokes it directly. The file was staged with mode `100755`.
 - Claude tmux-agent teammate re-reviewed after the executable-bit fix and found no blockers with `VERDICT: SHIP`.
-- Pending for this branch: PR CI and merge.
+- PR #81 merged as `64d7142`; feature branch CI run `25976129168` and main CI run `25976153865` passed.
+- Claude tmux-agent teammate reviewed the shellcheck state sync diff and found no blockers with `VERDICT: SHIP`.
+- Pending for next branch: skill env reference parity implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
