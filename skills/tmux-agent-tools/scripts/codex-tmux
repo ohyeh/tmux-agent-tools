@@ -9,6 +9,7 @@ STABLE_SECONDS="${CODEX_TMUX_STABLE_SECONDS:-3}"
 SUBMIT_DELAY="${CODEX_TMUX_SUBMIT_DELAY:-0.2}"
 TMUX_CONF="${CODEX_TMUX_CONF:-${TMPDIR:-/tmp}/codex-tmux.tmux.conf}"
 TMUX_MOUSE="${CODEX_TMUX_MOUSE:-on}"
+TMUX_CLIPBOARD="${CODEX_TMUX_CLIPBOARD:-auto}"
 
 resolve_tmux_bin() {
   if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
@@ -81,6 +82,7 @@ Environment:
   CODEX_TMUX_SUBMIT_DELAY=0.2
   CODEX_TMUX_CONF=/tmp/codex-tmux.tmux.conf
   CODEX_TMUX_MOUSE=on
+  CODEX_TMUX_CLIPBOARD=auto
 EOF
 }
 
@@ -111,6 +113,14 @@ require_jq() {
 }
 
 clipboard_command() {
+  if [[ "$TMUX_CLIPBOARD" == "internal" ]]; then
+    return 0
+  fi
+  if [[ "$TMUX_CLIPBOARD" != "auto" ]]; then
+    echo "$TMUX_CLIPBOARD"
+    return 0
+  fi
+
   if command -v pbcopy >/dev/null 2>&1; then
     echo "pbcopy"
   elif command -v wl-copy >/dev/null 2>&1; then
@@ -608,6 +618,7 @@ doctor_session() {
   echo "submit_delay: $SUBMIT_DELAY"
   echo "tmux_conf: $TMUX_CONF"
   echo "mouse: $TMUX_MOUSE"
+  echo "clipboard: $TMUX_CLIPBOARD"
 }
 
 self_test_session() {
