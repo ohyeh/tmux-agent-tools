@@ -64,24 +64,31 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 26. Merge transcript-generic comment docs through PR #27 and generic transcript summary labels through PR #28. Done.
 27. Merge roadmap refresh through PR #29, soft-wrap capture normalization through PR #30, clipboard mode override through PR #31, and human copy-mode UX hardening through PR #32. Done.
 28. Merge task-plan release state through PR #33 and v0.3 real-agent release evidence through PR #34. Done.
+29. Merge `v0.3.0` release notes through PR #35 (`6516e7c`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.3.0-release-prep`
+Branch: `feature/v0.3.0-release-dry-run-state`
 
 Scope:
 
-- prepare the `v0.3.0` release PR with CHANGELOG notes;
-- keep Formula stable URL/SHA unchanged until the Release workflow creates the `v0.3.0` tag and archive SHA;
+- record the release-prep PR as complete;
+- run and record the `Release` workflow dry-run for `v0.3.0`;
+- keep Formula stable URL/SHA unchanged until the non-dry-run Release workflow creates the `v0.3.0` tag and archive SHA;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
 - PR #34 merged as `483b028` and main CI run `25963205465` passed.
+- PR #35 merged as `6516e7c`; feature branch CI run `25963350635` and main CI run `25963375020` passed.
 - Real wrapper smoke passed with `V03CODEXSMOKEOK`, `V03CLAUDESMOKEOK`, and `REAL_WRAPPER_SMOKE_OK`.
 - Real bounded dialogue smoke passed with `REAL_DIALOGUE_SMOKE_OK`; `jq` verified codex turn 1 and claude turn 2.
-- Pending for this branch: release notes validation, Claude teammate review, PR CI.
+- Local release workflow equivalent validation passed for `v0.3.0`: tag absence check, script syntax, skill validation, Formula syntax/style, wrapper self-tests, fake dialogue smoke, `jq` transcript checks, release notes extraction, and `git diff --check`.
+- Claude tmux-agent teammate reviewed the release-prep diff and found no blockers.
+- Release workflow dry-run for `v0.3.0` passed in run `25963410344`: `validate` succeeded, `publish` was skipped, and `refs/tags/v0.3.0` is still absent.
+- Claude tmux-agent teammate reviewed this dry-run state update and found no blockers.
+- Pending for this branch: PR CI; non-dry-run release requires explicit approval because it creates the public tag and GitHub Release.
 
 ## v0.2.0 Candidate Scope
 
