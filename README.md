@@ -38,6 +38,8 @@ Both tools support:
 - `stop`
 - `help`
 
+Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
+
 ## Install Skill With skills.sh
 
 ```bash
