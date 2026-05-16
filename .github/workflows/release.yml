@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver tag to create, for example v0.2.1"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+      dry_run:
+        description: "Validate inputs and release notes without creating a tag or release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install runtime tools
+        run: |
+          brew list tmux >/dev/null 2>&1 || brew install tmux
+          brew list jq >/dev/null 2>&1 || brew install jq
+          brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
+
+      - name: Validate release candidate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          ruby -e 'abort("version must look like vX.Y.Z") unless ENV.fetch("VERSION").match?(/\Av\d+\.\d+\.\d+\z/)'
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "tag already exists: ${VERSION}" >&2
+            exit 1
+          fi
+          zsh -n skills/tmux-agent-tools/scripts/claude-tmux
+          zsh -n skills/tmux-agent-tools/scripts/codex-tmux
+          zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
+          ruby -c Formula/tmux-agent-tools.rb
+          brew style Formula/tmux-agent-tools.rb
+          skills/tmux-agent-tools/scripts/codex-tmux self-test
+          skills/tmux-agent-tools/scripts/claude-tmux self-test
+          prompt_file="$(mktemp)"
+          transcript_file="$(mktemp)"
+          printf '%s\n' 'Run a release workflow smoke test.' > "$prompt_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 2 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$transcript_file" --timeout 10
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a")' "$transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b")' "$transcript_file"
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          ruby -e '
+            version = ENV.fetch("VERSION")
+            changelog = File.read("CHANGELOG.md")
+            pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## v|\z)/m
+            match = changelog.match(pattern)
+            abort("CHANGELOG.md is missing a #{version} section") unless match
+            body = match[:body].strip
+            abort("CHANGELOG.md #{version} section is empty") if body.empty?
+            File.write("release-notes.md", body + "\n")
+          '
+          rg -n "." release-notes.md
+
+      - name: Create tag and GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+          prerelease_flag=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          gh release create "$VERSION" --title "$VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "dry run: would create annotated tag and GitHub release for ${VERSION}"
