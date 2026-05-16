@@ -47,14 +47,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/dialogue-runner`
+Branch: `feature/dialogue-runner-hardening`
 
 Scope:
 
-- add `tmux-agent-dialogue` as the first orchestration command;
-- keep stable Homebrew installs pinned to `v0.1.0` behavior while exposing the new command only on `--HEAD`;
-- add credential-free fake tmux participant smoke coverage;
-- document local-only runner behavior and JSONL transcript shape.
+- make CI runtime tool installation idempotent;
+- mark the first dialogue runner MVP as merged;
+- correct docs so fake participants are the verified path and real Codex/Claude dialogue remains the next hardening gap before release.
 
 Verification evidence:
 
@@ -63,6 +62,8 @@ Verification evidence:
 - `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
 - Branch-local `doctor` and `self-test` pass for both wrappers.
 - `tmux-agent-dialogue --agent-a fake --agent-b fake --turns 2` writes valid JSONL and cleans up owned tmux sessions.
+- Real Codex/Claude smoke was attempted but not counted as passing: sessions started and cleaned up, but Codex did not return the turn marker. Keep real-agent dialogue as the next hardening gap before release.
+- Main CI passed after PR #7 merge.
 
 ## v0.2.0 Candidate Scope
 
@@ -70,16 +71,17 @@ P0:
 
 - `wait-text --literal` alias for exact marker waits;
 - Claude first-run/permission confirmation diagnostics in `status`;
-- `dialogue` runner for bounded Codex/Claude ping-pong using existing wrappers - first local MVP implemented;
-- transcript file output with timestamps, speaker, marker, and captured text - first local MVP implemented;
-- cleanup guarantees for both sessions on success/failure - first local MVP implemented;
-- local-only operation by default - first local MVP implemented.
+- `dialogue` runner for bounded Codex/Claude ping-pong using existing wrappers - first local MVP merged;
+- transcript file output with timestamps, speaker, marker, and captured text - first local MVP merged;
+- cleanup guarantees for both sessions on success/failure - first local MVP merged;
+- local-only operation by default - first local MVP merged.
 
 P1:
 
 - `pair-review` preset: one agent proposes, the other reviews, final transcript saved;
 - `--turns`, `--timeout`, `--workdir`, `--agent-a`, `--agent-b`, `--prompt-file`;
 - machine-readable JSONL transcript.
+- harden real Codex/Claude marker protocol so manual 2-turn smoke closes without intervention.
 
 P2:
 

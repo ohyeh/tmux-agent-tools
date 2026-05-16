@@ -41,7 +41,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 
-`tmux-agent-dialogue` is local-only in the first implementation. It can run real `codex`/`claude` participants through the wrappers or credential-free `fake` participants for smoke tests. Until the next tagged release, install it with `brew install tmux-agent-tools --HEAD` or run the repo-local script.
+`tmux-agent-dialogue` is local-only in the first implementation. Its credential-free `fake` participants are covered by CI; real `codex`/`claude` participants are accepted by the command but should be treated as pre-release hardening work until a manual real-agent smoke is recorded. Until the next tagged release, install it with `brew install tmux-agent-tools --HEAD` or run the repo-local script.
 
 ## Install Skill With skills.sh
 
@@ -135,11 +135,13 @@ Bounded dialogue with JSONL transcript:
 tmux-agent-dialogue \
   --turns 4 \
   --workdir . \
-  --agent-a codex \
-  --agent-b claude \
+  --agent-a fake \
+  --agent-b fake \
   --prompt-file prompt.md \
   --transcript transcript.jsonl
 ```
+
+Real participants use the same command shape with `--agent-a codex --agent-b claude`, but keep that path as manual release evidence until it is hardened.
 
 Credential-free smoke:
 
