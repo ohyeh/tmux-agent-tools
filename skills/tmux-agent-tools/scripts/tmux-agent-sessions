@@ -67,12 +67,107 @@ emit_session_json() {
   local name="$2"
   local session="$3"
   require_jq
+  local prefix=""
+  case "$tool" in
+    claude) prefix="$CLAUDE_PREFIX" ;;
+    codex) prefix="$CODEX_PREFIX" ;;
+    dialogue) prefix="$DIALOGUE_PREFIX" ;;
+  esac
   "$JQ" -cn \
     --arg tool "$tool" \
     --arg name "$name" \
     --arg session "$session" \
+    --arg prefix "$prefix" \
     --arg state "running" \
-    '{tool:$tool,name:$name,session:$session,state:$state,running:true}'
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,state:$state,running:true,exit_detected:false,local_or_remote:null,diagnostic:null}'
+}
+
+add_state_field() {
+  require_jq
+  "$JQ" -c '. + {
+    state: (
+      if (.exists | not) then "missing"
+      elif .exit_detected then "exited"
+      elif .running then "running"
+      else "stopped"
+      end
+    )
+  }'
+}
+
+fallback_status_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local prefix="$4"
+  local current lowered
+  current="$("$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true)"
+  lowered="${current:l}"
+
+  local running=true
+  local exit_detected=false
+  local local_or_remote="local"
+  if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+    running=false
+    exit_detected=true
+  fi
+  if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
+    local_or_remote="remote"
+  fi
+
+  require_jq
+  "$JQ" -cn \
+    --arg tool "$tool" \
+    --arg name "$name" \
+    --arg session "$session" \
+    --arg prefix "$prefix" \
+    --arg local_or_remote "$local_or_remote" \
+    --argjson running "$running" \
+    --argjson exit_detected "$exit_detected" \
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,running:$running,exit_detected:$exit_detected,local_or_remote:$local_or_remote,diagnostic:null}' \
+    | add_state_field
+}
+
+emit_wrapper_session_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local wrapper output prefix
+  wrapper="$(wrapper_for_tool "$tool")"
+  case "$tool" in
+    claude) prefix="$CLAUDE_PREFIX" ;;
+    codex) prefix="$CODEX_PREFIX" ;;
+  esac
+  if output="$("$wrapper" status --json "$name" 2>/dev/null)"; then
+    print -r -- "$output" | add_state_field
+    return
+  fi
+  fallback_status_json "$tool" "$name" "$session" "$prefix"
+}
+
+emit_inventory_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  case "$tool" in
+    claude|codex)
+      emit_wrapper_session_json "$tool" "$name" "$session"
+      ;;
+    dialogue)
+      emit_session_json "$tool" "$name" "$session"
+      ;;
+  esac
+}
+
+emit_inventory_text() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local json state
+  require_jq
+  json="$(emit_inventory_json "$tool" "$name" "$session")"
+  state="$(print -r -- "$json" | "$JQ" -r '.state')"
+  print -r -- "$tool	$name	$session	$state"
 }
 
 parse_filter_arg() {
@@ -146,9 +241,9 @@ list_sessions() {
   local tool name session
   list_owned_sessions | while IFS=$'\t' read -r tool name session; do
     if (( output_json )); then
-      emit_session_json "$tool" "$name" "$session"
+      emit_inventory_json "$tool" "$name" "$session"
     else
-      print -r -- "$tool	$name	$session	running"
+      emit_inventory_text "$tool" "$name" "$session"
     fi
   done
 }
@@ -197,9 +292,9 @@ cleanup_sessions() {
   list_owned_sessions | while IFS=$'\t' read -r tool name session; do
     if [[ "$mode" == "preview" ]]; then
       if (( output_json )); then
-        emit_session_json "$tool" "$name" "$session"
+        emit_inventory_json "$tool" "$name" "$session"
       else
-        print -r -- "would stop: $tool	$name	$session"
+        print -r -- "would stop: $(emit_inventory_text "$tool" "$name" "$session")"
       fi
       continue
     fi

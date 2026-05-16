@@ -41,7 +41,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `stop`
 - `help`
 
-`tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` sessions. `tmux-agent-sessions cleanup --preview` is also read-only; `cleanup --execute` is required before it stops tool-owned sessions, and execution must include `--all`, `--tool`, or `--name`. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
+`tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` sessions. Claude and Codex inventory rows reuse the wrapper `status --json` contract and add `state` (`running`, `exited`, `stopped`, or wrapper-reported `missing`), so a pane that remains capturable after an exit-code marker is not reported as still running. Dialogue rows are tmux inventory rows and use conservative `running` state while the session exists. `tmux-agent-sessions cleanup --preview` is also read-only and includes the same state in JSON mode; `cleanup --execute` is required before it stops tool-owned sessions, and execution must include `--all`, `--tool`, or `--name`. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
 
 `tmux-agent-sessions` is included in the stable Homebrew install starting with `v0.3.0`.
 

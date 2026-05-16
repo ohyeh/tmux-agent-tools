@@ -80,8 +80,9 @@ jobs:
           tmux new-session -d -s unrelated-ci-hygiene 'sleep 300'
           skills/tmux-agent-tools/scripts/claude-tmux status --json ci-hygiene | jq -e '.tool == "claude" and .name == "ci-hygiene" and .session == "claude-cli-ci-hygiene" and .prefix == "claude-cli" and .exists == true and .running == true and .exit_detected == false and .local_or_remote == "local"'
           skills/tmux-agent-tools/scripts/codex-tmux status --json ci-hygiene | jq -e '.tool == "codex" and .name == "ci-hygiene" and .session == "codex-cli-ci-hygiene" and .prefix == "codex-cli" and .exists == true and .running == true and .exit_detected == false and .local_or_remote == "local"'
-          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"])'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and (map(select(.tool == "claude" or .tool == "codex")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .local_or_remote == "local")) and (map(select(.tool == "dialogue")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .local_or_remote == null))'
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n "claude-cli-ci-hygiene|codex-cli-ci-hygiene|tmux-agent-dialogue-ci-hygiene-a"
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n $'would stop: (claude|codex|dialogue)\\tci-hygiene(-a)?\\t(claude-cli|codex-cli|tmux-agent-dialogue)-ci-hygiene(-a)?\\trunning'
           tmux has-session -t unrelated-ci-hygiene
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --name ci-hygiene
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --tool dialogue --name ci-hygiene-a
@@ -96,6 +97,8 @@ jobs:
           sleep 0.2
           skills/tmux-agent-tools/scripts/claude-tmux status --json ci-status-exited | jq -e '.tool == "claude" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "local"'
           skills/tmux-agent-tools/scripts/codex-tmux status --json ci-status-exited | jq -e '.tool == "codex" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "remote"'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --name ci-status-exited | jq -s 'length == 2 and any(.tool == "claude" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "local") and any(.tool == "codex" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "remote")'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --name ci-status-exited | jq -s 'length == 2 and any(.tool == "claude" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "local") and any(.tool == "codex" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .local_or_remote == "remote")'
           tmux kill-session -t claude-cli-ci-status-exited
           tmux kill-session -t codex-cli-ci-status-exited
           long_marker="WRAPSTART_$(printf '%120s' '' | tr ' ' x)_WRAPEND"
