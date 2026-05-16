@@ -65,23 +65,21 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/capture-join-wrap`
+Branch: `feature/clipboard-ux-mode`
 
 Scope:
 
-- normalize wrapper and dialogue pane capture with tmux soft-wrap joining so transcript text is not polluted by pane width;
-- keep normal keyboard/mouse copy-mode usable by selecting a platform clipboard command when available and falling back to tmux internal selection otherwise;
-- document the capture behavior as release-hardening for long model output and markers;
+- keep normal keyboard/mouse copy-mode usable by selecting a platform clipboard command when available, falling back to tmux internal selection otherwise, and exposing an explicit `*_TMUX_CLIPBOARD=internal` override;
+- document clipboard behavior as release-hardening for human terminal use;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- PR #29 main CI passed after roadmap and Formula compatibility refresh.
-- Local tmux smoke confirms default `capture-pane -p` hard-wraps long lines and `capture-pane -p -J` preserves the logical line.
-- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, stable `brew test`, HEAD transcript summary smoke, and wrapper capture long-line regression.
-- Config smoke verifies copy-mode bindings use `pbcopy` on macOS and fall back to `copy-selection-and-cancel` when clipboard helpers are absent.
-- Pending for this branch: PR CI.
+- PR #30 normalized tmux soft-wrap capture and main CI passed.
+- Config smoke verifies `CLAUDE_TMUX_CLIPBOARD=internal` produces `copy-selection-and-cancel`, a custom `CODEX_TMUX_CLIPBOARD` command produces `copy-pipe-and-cancel`, and mouse remains enabled.
+- Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, and stable `brew test`.
+- Pending for this branch: Claude teammate review, PR CI.
 
 ## v0.2.0 Candidate Scope
 
