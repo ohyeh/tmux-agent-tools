@@ -70,15 +70,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 30. Merge `v0.3.0` Release workflow dry-run state through PR #36 (`97a629f`). Done.
 31. Merge `v0.3.0` stable Formula bump through PR #37 (`6acb503`). Done.
 32. Merge `v0.4.0` release-process validation docs through PR #51 (`71b37a3`). Done.
+33. Merge `v0.4.0` release-ready state through PR #52 (`9cf1684`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.4-release-ready-state`
+Branch: `feature/v0.4-roadmap-status-contract-sync`
 
 Scope:
 
-- record the PR #51 merge and main CI evidence before any `v0.4.0` publish;
-- mark `v0.4.0` as release-ready from repo evidence, with real publish still requiring explicit operator approval;
+- record the PR #52 merge and main CI evidence before any `v0.4.0` publish;
+- sync the v0.4 roadmap with the implemented shared status contract so it no longer describes Codex readiness diagnostics as pending or README-stale;
 - keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -142,7 +143,9 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the release-process docs diff and found no blockers with `VERDICT: SHIP`.
 - PR #51 merged as `71b37a3`; main CI run `25971728433` passed.
 - Current `v0.4.0` release state: release notes exist, the hardened Release workflow dry-run is green, release-process docs match the workflow gates, and the Formula bump remains deferred until after the reviewed Release workflow creates the tag.
-- Pending for this branch: release-ready state validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Release-ready state validation passed on `feature/v0.4-release-ready-state`: `git diff --check`, workflow YAML name check with `yq`, roadmap/task-plan anchor checks with `rg`, and Claude tmux-agent teammate review with `VERDICT: SHIP`.
+- PR #52 merged as `9cf1684`; main CI run `25971846873` passed.
+- Pending for this branch: roadmap status-contract sync validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
