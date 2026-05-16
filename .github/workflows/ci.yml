@@ -60,3 +60,7 @@ jobs:
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$transcript_file"
+          pair_transcript_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --timeout 10
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
