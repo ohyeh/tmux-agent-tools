@@ -28,7 +28,7 @@ Usage:
   tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
-  tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
+  tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
   tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
 
 Example:
@@ -657,6 +657,106 @@ build_shareable_pair_review_summary() {
   print -r -- "$body"
 }
 
+build_shareable_pair_review_summary_json() {
+  local raw_body="$1"
+  local final_body="$2"
+  local raw_line_count
+  local raw_byte_count
+  local line_limited_body="$raw_body"
+  local line_limited_byte_count
+  local max_lines_json="null"
+  local max_bytes_json="null"
+  local truncated_by_lines="false"
+  local truncated_by_bytes="false"
+  local redaction_patterns_json
+
+  raw_line_count="$(print -r -- "$raw_body" | "$JQ" -Rsc 'if length == 0 then 0 else split("\n") | length end')"
+  raw_byte_count="$(LC_ALL=C printf '%s' "$raw_body" | wc -c | tr -d ' ')"
+  redaction_patterns_json="$(printf '%s\n' "${REDACT_PATTERNS[@]}" | "$JQ" -Rsc 'if length == 0 then [] else split("\n")[:-1] end')"
+  if [[ -n "$MAX_LINES" ]]; then
+    max_lines_json="$MAX_LINES"
+    if (( raw_line_count > MAX_LINES )); then
+      truncated_by_lines="true"
+    fi
+    line_limited_body="$(limit_markdown_lines "$raw_body" "$MAX_LINES")"
+  fi
+  line_limited_byte_count="$(LC_ALL=C printf '%s' "$line_limited_body" | wc -c | tr -d ' ')"
+  if [[ -n "$MAX_BYTES" ]]; then
+    max_bytes_json="$MAX_BYTES"
+    if (( line_limited_byte_count > MAX_BYTES )); then
+      truncated_by_bytes="true"
+    fi
+  fi
+
+  "$JQ" -s \
+    --arg label "$SUMMARY_LABEL" \
+    --arg transcript "$TRANSCRIPT" \
+    --arg rendered_markdown "$final_body" \
+    --argjson max_lines "$max_lines_json" \
+    --argjson max_bytes "$max_bytes_json" \
+    --argjson raw_line_count "$raw_line_count" \
+    --argjson raw_byte_count "$raw_byte_count" \
+    --argjson redaction_patterns "$redaction_patterns_json" \
+    --argjson truncated_by_lines "$truncated_by_lines" \
+    --argjson truncated_by_bytes "$truncated_by_bytes" \
+    '
+      def tail_lines:
+        split("\n")
+        | map(select(length > 0))
+        | .[-8:];
+      def redact:
+        reduce $redaction_patterns[] as $pattern (. ; gsub($pattern; "[REDACTED]"));
+      {
+        format: "json",
+        label: $label,
+        transcript: $transcript,
+        turns: [ .[] | select(.event == "turn") | {
+          turn,
+          speaker,
+          agent,
+          marker,
+          timestamp,
+          tail_lines: (.text | tail_lines | map(redact))
+        } ],
+        failures: [ .[] | select(.event == "failure") | {
+          turn,
+          speaker,
+          agent,
+          marker,
+          failure_type,
+          timestamp
+        } ],
+        metadata: {
+          output_format: "json",
+          raw_line_count: $raw_line_count,
+          raw_byte_count: $raw_byte_count,
+          max_lines: $max_lines,
+          max_bytes: $max_bytes,
+          truncated_by_lines: $truncated_by_lines,
+          truncated_by_bytes: $truncated_by_bytes,
+          redaction_pattern_count: ($redaction_patterns | length),
+          redacted: (($redaction_patterns | length) > 0)
+        },
+        rendered_markdown: $rendered_markdown
+      }
+    ' "$TRANSCRIPT"
+}
+
+build_shareable_summary_output() {
+  local raw_body
+  local final_body
+  raw_body="$(build_pair_review_summary_raw)"
+  final_body="$(limit_markdown_lines "$raw_body" "$MAX_LINES")"
+  final_body="$(limit_markdown_bytes "$final_body" "$MAX_BYTES")"
+  final_body="$(apply_markdown_redactions "$final_body")"
+
+  if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    build_shareable_pair_review_summary_json "$raw_body" "$final_body"
+  else
+    print -r -- "$final_body"
+  fi
+}
+
 build_shareable_summary_file_body() {
   local body
   body="$(< "$SUMMARY_FILE")"
@@ -706,10 +806,10 @@ run_summary_mode() {
   if [[ -n "$SUMMARY_FILE" ]]; then
     SUMMARY_FILE="${SUMMARY_FILE:A}"
     mkdir -p "${SUMMARY_FILE:h}"
-    build_shareable_pair_review_summary > "$SUMMARY_FILE"
+    build_shareable_summary_output > "$SUMMARY_FILE"
     echo "summary file: $SUMMARY_FILE" >&2
   else
-    build_shareable_pair_review_summary
+    build_shareable_summary_output
   fi
 }
 
@@ -815,6 +915,8 @@ MODE="dialogue"
 SUMMARY_FILE=""
 SUMMARY_LABEL="transcript"
 ON_BLOCKED_TRIGGER=""
+OUTPUT_FORMAT="markdown"
+OUTPUT_FORMAT_SET=0
 POST_GITHUB_COMMENT=0
 PAIR_REVIEW_SWAP=0
 GITHUB_PR=""
@@ -881,6 +983,7 @@ while (( $# > 0 )); do
     --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
     --summary-file) SUMMARY_FILE="${2:-}"; shift 2 ;;
+    --output-format) OUTPUT_FORMAT="${2:-}"; OUTPUT_FORMAT_SET=1; shift 2 ;;
     --on-blocked-trigger) ON_BLOCKED_TRIGGER="${2:-}"; shift 2 ;;
     --max-lines) MAX_LINES="${2:-}"; shift 2 ;;
     --max-bytes) MAX_BYTES="${2:-}"; shift 2 ;;
@@ -898,6 +1001,8 @@ done
 if [[ -n "$MAX_LINES" || -n "$MAX_BYTES" || ${#REDACT_PATTERNS[@]} -gt 0 ]]; then
   [[ "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--max-lines, --max-bytes, and --redact-pattern are only supported with summarize or github-comment"
 fi
+[[ "$OUTPUT_FORMAT" == "markdown" || "$OUTPUT_FORMAT" == "json" ]] || die "--output-format must be markdown or json"
+[[ "$OUTPUT_FORMAT_SET" -eq 0 || "$MODE" == "summarize" ]] || die "--output-format is only supported with summarize"
 [[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 || "$MODE" == "validate-transcript" ]] || die "--schema-version is only supported with validate-transcript"
 [[ "$PAIR_REVIEW_SWAP" -eq 0 || "$MODE" == "pair-review" ]] || die "--swap is only supported with pair-review"
 if [[ -n "$AGENT_A_PROFILE" || -n "$AGENT_B_PROFILE" ]]; then
