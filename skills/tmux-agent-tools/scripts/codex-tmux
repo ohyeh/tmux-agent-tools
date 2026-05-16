@@ -696,6 +696,19 @@ blocked_reason_for_text() {
   fi
 }
 
+exit_code_for_text() {
+  local current="$1"
+  local line
+  local code=""
+  local exit_re='(local|remote) command exited with code ([0-9]+)'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $exit_re ]]; then
+      code="${match[2]}"
+    fi
+  done <<< "$current"
+  print -r -- "$code"
+}
+
 diagnostic_for_blocked_reason() {
   local reason="$1"
   case "$reason" in
@@ -741,6 +754,7 @@ status_session() {
   local local_or_remote=""
   local diagnostic=""
   local blocked_reason=""
+  local exit_code=""
   local confirmation_detected=false
   local current=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
@@ -752,6 +766,7 @@ status_session() {
     if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
       exit_detected=true
       running=false
+      exit_code="$(exit_code_for_text "$current")"
     fi
     if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
       local_or_remote="remote"
@@ -777,12 +792,13 @@ status_session() {
       --arg local_or_remote "$local_or_remote" \
       --arg diagnostic "$diagnostic" \
       --arg blocked_reason "$blocked_reason" \
+      --arg exit_code "$exit_code" \
       --argjson last_capture_lines "$(status_tail_json "$current")" \
       --argjson exists "$exists" \
       --argjson running "$running" \
       --argjson exit_detected "$exit_detected" \
       --argjson confirmation_detected "$confirmation_detected" \
-      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end)}'
+      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end)}'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
   else
