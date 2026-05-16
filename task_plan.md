@@ -11,8 +11,9 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - `brew install tmux-agent-tools` installs `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` from the tap.
 - `npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools` can discover the skill.
 - True Codex/Claude tmux communication remains verified.
-- Next v0.2.0 branch exists and has a concrete scope.
+- Next release branch exists and has a concrete scope.
 - Every mainline change goes through PR merge; no direct push to `main`.
+- Future release tags and GitHub releases are created by a reviewed GitHub Actions workflow, not by local manual tag/release commands.
 
 ## Current State
 
@@ -49,31 +50,27 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 12. Merge pair-review preset through PR #10. Done.
 13. Merge remote participant support through PR #11. Done.
 14. Merge explicit GitHub comment helper through PR #12. Done.
+15. Merge `v0.2.0` stable Formula prep through PR #13. Done.
+16. Merge `jq` runtime dependency and Formula summarize smoke through PR #14. Done.
 
 ## Active Work
 
-Branch: `feature/v0.2-release-prep`
+Branch: `feature/release-workflow`
 
 Scope:
 
-- publish `v0.2.0` as the stable Homebrew release target;
-- update Formula stable `url` and `sha256` to the `v0.2.0` archive;
-- install `tmux-agent-dialogue` in stable Homebrew, not only `--HEAD`;
-- declare stable runtime dependencies required by `tmux-agent-dialogue`;
-- test a jq-backed `tmux-agent-dialogue summarize` path in the Formula;
-- update README and roadmap wording so they no longer describe merged features as active work;
-- add a concise changelog entry for `v0.2.0`;
+- add a `workflow_dispatch` release workflow for future releases that validates main, extracts notes from `CHANGELOG.md`, and creates the tag/release only after the workflow file lands on main;
 - keep all mainline changes going through PR.
 
 Verification evidence:
 
-- `v0.2.0` tag exists on commit `4e2fd0f`.
-- remote tag object `0506f731eee6978d7188293ed9bd1e47e4a5cf17` peels to commit `4e2fd0f`.
-- `v0.2.0` archive SHA-256 is `a9c5aab558ee306727215feb7a5146aa50132360a00e7a9a6c4d7c5627962a55`.
-- `zsh -n` passes for all wrapper scripts and `tmux-agent-dialogue`.
-- `ruby -c Formula/tmux-agent-tools.rb`, `brew style Formula/tmux-agent-tools.rb`, and tap-name `brew audit --strict --online` pass.
-- `brew test ohyeh/tmux-agent-tools/tmux-agent-tools` passes with a `tmux-agent-dialogue summarize` transcript smoke.
-- Local tap branch install proves stable `0.2.0` installs `/opt/homebrew/bin/tmux-agent-dialogue`.
+- `v0.2.0` stable Formula prep merged in PR #13.
+- PR #14 adds `jq` to the Formula and exercises `tmux-agent-dialogue summarize` in Formula test.
+- Release workflow is dry-run by default and requires explicit `dry_run: false` to create a tag/release.
+- `yq` parses the workflow dispatch inputs, permissions, and release job steps.
+- Local release notes extraction smoke passes for `v0.2.0`.
+- The release workflow validation command block passes locally: script syntax, Formula syntax/style, and wrapper self-tests.
+- `actionlint .github/workflows/release.yml` passes.
 - Remaining check for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
