@@ -16,7 +16,9 @@ Ship the verified tmux-agent-tools MVP as `v0.1.0`, then prepare the next reliab
 ## Current State
 
 - Repo: `ohyeh/tmux-agent-tools`
-- Current verified MVP commit: `64af8c0 Add wait-text and skill usage guidance`
+- Release tag: `v0.1.0`
+- Release URL: `https://github.com/ohyeh/tmux-agent-tools/releases/tag/v0.1.0`
+- Current release formula commit: `77b5f78 Add stable v0.1.0 release formula`
 - Verified commands: `start`, `start-ssh`, `send`, `wait`, `wait-text`, `capture`, `list`, `status`, `stop`
 - Verified install surfaces: `skills.sh`, Homebrew `--HEAD`, VM `install-bin`
 - Verified runtime: real Codex/Claude start-send-wait-capture-stop and 10-run ping-pong
@@ -34,8 +36,8 @@ Ship the verified tmux-agent-tools MVP as `v0.1.0`, then prepare the next reliab
 2. Compute GitHub source archive SHA-256. Done.
 3. Update Formula for stable `url` + `sha256`. Done.
 4. Update README install instructions. Done.
-5. Verify stable Homebrew install. Pending.
-6. Verify skills.sh discovery. Pending.
+5. Verify stable Homebrew install. Done.
+6. Verify skills.sh discovery. Done.
 7. Create/push reliability branch. Pending.
 
 ## Next Branch Scope
