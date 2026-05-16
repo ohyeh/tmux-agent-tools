@@ -667,6 +667,30 @@ status_pane_text() {
   "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
 }
 
+blocked_reason_for_text() {
+  local lowered="$1"
+  if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+    print -r -- "cli_exited"
+  elif [[ "$lowered" == *"password:"* || "$lowered" == *"permission denied"* || "$lowered" == *"are you sure you want to continue connecting"* ]]; then
+    print -r -- "ssh_prompt"
+  elif [[ "$lowered" == *"do you want to proceed"* || "$lowered" == *"press enter to continue"* || "$lowered" == *"permission confirmation"* || "$lowered" == *"permission prompt"* || "$lowered" == *"permission required"* || "$lowered" == *"trust this"* || "$lowered" == *"trust the files"* ]]; then
+    print -r -- "permission_prompt"
+  elif [[ "$lowered" == *"approval"* || "$lowered" == *"approve"* || "$lowered" == *"[y/n]"* ]]; then
+    print -r -- "approval_prompt"
+  elif [[ "$lowered" == *"please log in"* || "$lowered" == *"log in to"* || "$lowered" == *"sign in to"* || "$lowered" == *"not logged in"* ]]; then
+    print -r -- "login_prompt"
+  fi
+}
+
+diagnostic_for_blocked_reason() {
+  local reason="$1"
+  case "$reason" in
+    permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+      echo "session may be waiting for interactive confirmation; attach or capture the pane before sending prompts"
+      ;;
+  esac
+}
+
 status_tail_json() {
   local current="$1"
   local max_lines="$STATUS_TAIL_LINES"
@@ -701,6 +725,9 @@ status_session() {
   local running=false
   local exit_detected=false
   local local_or_remote=""
+  local diagnostic=""
+  local blocked_reason=""
+  local confirmation_detected=false
   local current=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     exists=true
@@ -717,6 +744,13 @@ status_session() {
     else
       local_or_remote="local"
     fi
+    blocked_reason="$(blocked_reason_for_text "$lowered")"
+    diagnostic="$(diagnostic_for_blocked_reason "$blocked_reason")"
+    case "$blocked_reason" in
+      permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+        confirmation_detected=true
+        ;;
+    esac
   fi
 
   if (( output_json )); then
@@ -727,12 +761,14 @@ status_session() {
       --arg session "$session" \
       --arg prefix "$PREFIX" \
       --arg local_or_remote "$local_or_remote" \
-      --arg diagnostic "" \
+      --arg diagnostic "$diagnostic" \
+      --arg blocked_reason "$blocked_reason" \
       --argjson last_capture_lines "$(status_tail_json "$current")" \
       --argjson exists "$exists" \
       --argjson running "$running" \
       --argjson exit_detected "$exit_detected" \
-      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines}'
+      --argjson confirmation_detected "$confirmation_detected" \
+      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end)}'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
   else

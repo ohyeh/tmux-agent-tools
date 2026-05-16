@@ -71,14 +71,15 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-status-tail-json`
+Branch: `feature/v0.4-status-blocked-reason`
 
 Scope:
 
-- implement the first v0.4 status contract expansion slice;
-- add bounded `last_capture_lines` to `claude-tmux status --json` and `codex-tmux status --json`;
+- implement the next v0.4 status contract expansion slice;
+- add diagnostic `confirmation_detected` and `blocked_reason` to `claude-tmux status --json` and `codex-tmux status --json`;
+- keep prompt detection bounded and best-effort, without exact diagnostic string contracts;
 - keep default text `status` output unchanged;
-- keep the field diagnostic-only and bounded, with missing sessions returning an empty array;
+- keep all prompt handling explicit: no auto-accepting prompts or hidden interaction;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -114,6 +115,9 @@ Verification evidence:
 - PR #41 merged as `5c39146`; main CI run `25969626764` passed.
 - Status tail JSON local validation passed on `feature/v0.4-status-tail-json`: workflow YAML check with `yq`, script syntax for both wrappers, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and local `jq` smoke proving missing sessions return `last_capture_lines == []`, bounded two-line tails work for Claude/Codex, and invalid/zero `*_STATUS_TAIL_LINES` values fall back to a bounded array.
 - Claude tmux-agent teammate reviewed the status tail JSON diff, found two blockers in the first implementation, then re-reviewed after the fix and reported no blockers with `VERDICT: READY TO MERGE`. Final docs-only re-reviews also reported `BLOCKERS: None`, `NON-BLOCKING: None`, and `VERDICT: READY TO MERGE`; the README now states the diagnostic tail is bounded by the wrapper's 80-line status capture window.
+- PR #42 merged as `febcd46`; main CI run `25969865523` passed.
+- Status blocked-reason local validation passed on `feature/v0.4-status-blocked-reason`: workflow YAML check with `yq`, script syntax for both wrappers and `tmux-agent-sessions`, skill metadata validation, Formula syntax/style, wrapper self-tests, `git diff --check`, and local `jq` smoke proving missing sessions return `confirmation_detected == false` and `blocked_reason == null`, Claude permission prompts map to `permission_prompt`, Codex approval prompts map to `approval_prompt`, SSH prompts map to `ssh_prompt`, exit markers map to `cli_exited`, wrapper exit footers do not false-positive as `permission_prompt`, ordinary `accept` text does not false-positive as `approval_prompt`, and `tmux-agent-sessions list --json` preserves wrapper blocked-state fields.
+- Claude tmux-agent teammate reviewed the status blocked-reason diff, found no blockers, then re-reviewed after prompt-pattern and CI hardening; final verdict was `BLOCKERS: None`, `NON-BLOCKING: None`, and `VERDICT: SHIP`.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
