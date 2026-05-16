@@ -47,16 +47,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/remote-dialogue-participants`
+Branch: `feature/github-comment-helper`
 
 Scope:
 
-- add participant-scoped remote support to `tmux-agent-dialogue` through existing wrapper `start-ssh`;
-- support `--agent-a-ssh`, `--agent-b-ssh`, `--agent-a-workdir`, and `--agent-b-workdir`;
-- keep tmux local while running the selected real participant through SSH in its remote directory;
-- require absolute remote workdirs for SSH participants;
-- keep fake participants local-only and reject fake+SSH combinations in CI;
-- keep GitHub posting and publishing out of scope.
+- add a separate explicit opt-in GitHub PR comment helper for pair-review transcripts;
+- keep local terminal summary as the default behavior;
+- support `--summary-file` for local Markdown summary output;
+- support `github-comment --transcript ...` as a dry-run comment body renderer;
+- require `github-comment --post-github-comment --github-pr <number-or-url> --github-repo <owner/repo>` before calling `gh pr comment`;
+- keep CI credential-free by testing summary output and post-flag validation without posting.
 
 Verification evidence:
 
@@ -64,10 +64,12 @@ Verification evidence:
 - Skill validation passes for `skills/tmux-agent-tools`.
 - `ruby -c Formula/tmux-agent-tools.rb` and `brew style Formula/tmux-agent-tools.rb` pass.
 - Wrapper self-tests pass for both `codex-tmux` and `claude-tmux`.
-- Fake dialogue smoke passes for 4 turns and each transcript turn includes processed fake participant output.
-- `pair-review` fake smoke passes and prints a local summary.
-- Credential-free negative checks reject fake+SSH, missing remote workdir, and non-absolute remote workdir.
-- Manual remote smoke passed on 2026-05-16: `--agent-a codex --agent-a-ssh openclaw-macmini --agent-a-workdir /Users/paul.yeh --agent-b fake --turns 1` matched the remote Codex marker and wrote one `turn` JSONL event.
+- Fake dialogue smoke passes and each transcript turn includes processed fake participant output.
+- `pair-review` fake smoke passes, writes a local summary file, and prints a local summary.
+- `summarize --transcript` renders a comment-safe Markdown body without tmux/GitHub.
+- `github-comment --transcript --github-pr --github-repo` renders a dry-run body without posting.
+- `github-comment --post-github-comment` fails before posting when required PR/repo inputs are missing.
+- Fake `gh` command-shape check proves post mode calls `gh pr comment <pr> --repo <repo> --body-file <file>`.
 - Pending for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
@@ -92,7 +94,7 @@ P1:
 P2:
 
 - remote participant support through `start-ssh` - in progress;
-- GitHub PR comment helper that posts transcript summaries only when explicitly requested;
+- GitHub PR comment helper that posts transcript summaries only when explicitly requested - in progress;
 - credential-free CI integration tests with fake participants;
 - real-agent/token tests only as manual release evidence or explicit opt-in workflows.
 
