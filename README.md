@@ -174,7 +174,21 @@ Pair-review preset:
 tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
 ```
 
-`pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. It does not post GitHub comments, merge PRs, or publish externally.
+`pair-review` defaults to a two-turn Codex-to-Claude exchange, writes the same JSONL transcript, and prints a local terminal summary. It does not post GitHub comments, merge PRs, or publish externally by default.
+
+Write the local summary to a file:
+
+```bash
+tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl --summary-file review-summary.md
+```
+
+Post the summary to a GitHub PR only when explicitly requested:
+
+```bash
+tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo --post-github-comment
+```
+
+Without `--post-github-comment`, `github-comment` prints the comment body as a dry run. Posting requires GitHub CLI authentication and never runs unless the flag is present.
 
 ## Requirements
 

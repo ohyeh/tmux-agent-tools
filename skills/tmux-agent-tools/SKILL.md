@@ -101,7 +101,13 @@ For a local review preset that only writes a transcript and terminal summary:
 tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
 ```
 
-`pair-review` does not post comments, merge PRs, or publish externally.
+`pair-review` does not post comments, merge PRs, or publish externally. Use `--summary-file <path>` for a local Markdown summary. To prepare a GitHub PR comment body without posting:
+
+```bash
+tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo
+```
+
+Only add `--post-github-comment` when the user explicitly asks to publish the summary to GitHub.
 
 ## Session Naming
 

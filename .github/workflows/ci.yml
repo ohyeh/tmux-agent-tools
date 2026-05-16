@@ -22,6 +22,7 @@ jobs:
         run: |
           brew list tmux >/dev/null 2>&1 || brew install tmux
           brew list jq >/dev/null 2>&1 || brew install jq
+          brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
 
       - name: Validate shell scripts
         run: |
@@ -73,6 +74,30 @@ jobs:
             exit 1
           fi
           pair_transcript_file="$(mktemp)"
-          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --timeout 10
+          pair_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --summary-file "$pair_summary_file" --timeout 10
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
+          rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$pair_summary_file"
+          summary_stdout="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" > "$summary_stdout"
+          rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$summary_stdout"
+          comment_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$comment_body"
+          rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$comment_body"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --post-github-comment; then
+            echo "GitHub comment posting must require --github-pr" >&2
+            exit 1
+          fi
+          fake_bin="$(mktemp -d)"
+          fake_args="$(mktemp)"
+          {
+            printf '%s\n' '#!/usr/bin/env zsh'
+            printf '%s\n' 'printf "%s\n" "$@" > "$GH_FAKE_ARGS"'
+            printf '%s\n' '[[ "$1" == "pr" && "$2" == "comment" ]] || exit 2'
+            printf '%s\n' 'body_file="${@: -1}"'
+            printf '%s\n' '[[ -s "$body_file" ]] || exit 3'
+          } > "$fake_bin/gh"
+          chmod +x "$fake_bin/gh"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --post-github-comment
+          rg -n "pr|comment|1|--repo|ohyeh/tmux-agent-tools|--body-file" "$fake_args"
