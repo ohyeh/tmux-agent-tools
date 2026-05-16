@@ -64,12 +64,14 @@ jobs:
           claude_clipboard_conf="$(mktemp)"
           codex_clipboard_conf="$(mktemp)"
           CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CONF="$claude_clipboard_conf" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/claude-tmux start --exact ci-clipboard . >/tmp/claude-clipboard.out
-          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CONF="$codex_clipboard_conf" CODEX_TMUX_CLIPBOARD="cat >/tmp/tmux-agent-tools-ci-copy" skills/tmux-agent-tools/scripts/codex-tmux start --exact ci-clipboard . >/tmp/codex-clipboard.out
+          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CONF="$codex_clipboard_conf" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/codex-tmux start --exact ci-clipboard . >/tmp/codex-clipboard.out
           rg -n 'set -g mouse "on"' "$claude_clipboard_conf"
           rg -n 'copy-selection-and-cancel' "$claude_clipboard_conf"
-          rg -n 'copy-pipe-and-cancel "cat >/tmp/tmux-agent-tools-ci-copy"' "$codex_clipboard_conf"
+          rg -n 'MouseDragEnd1Pane send -X copy-selection-and-cancel' "$claude_clipboard_conf"
+          rg -n 'copy-pipe-and-cancel "sh -c \\"cat >/tmp/tmux-agent-tools-ci-copy\\""' "$codex_clipboard_conf"
+          rg -n 'MouseDragEnd1Pane send -X copy-pipe-and-cancel "sh -c \\"cat >/tmp/tmux-agent-tools-ci-copy\\""' "$codex_clipboard_conf"
           CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/claude-tmux doctor | rg -n 'clipboard: internal'
-          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CLIPBOARD="cat >/tmp/tmux-agent-tools-ci-copy" skills/tmux-agent-tools/scripts/codex-tmux doctor | rg -n 'clipboard: cat >/tmp/tmux-agent-tools-ci-copy'
+          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/codex-tmux doctor | rg -n 'clipboard: sh -c "cat >/tmp/tmux-agent-tools-ci-copy"'
           skills/tmux-agent-tools/scripts/claude-tmux stop ci-clipboard
           skills/tmux-agent-tools/scripts/codex-tmux stop ci-clipboard
           tmux new-session -d -s claude-cli-ci-hygiene 'sleep 300'

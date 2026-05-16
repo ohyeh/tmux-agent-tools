@@ -69,7 +69,7 @@ Branch: `feature/clipboard-ux-mode`
 
 Scope:
 
-- keep normal keyboard/mouse copy-mode usable by selecting a platform clipboard command when available, falling back to tmux internal selection otherwise, and exposing an explicit `*_TMUX_CLIPBOARD=internal` override;
+- keep normal keyboard/mouse copy-mode usable by selecting a platform clipboard command when available, falling back to tmux internal selection otherwise, binding keyboard and mouse-drag copy paths, and exposing an explicit `*_TMUX_CLIPBOARD=internal` override;
 - document clipboard behavior as release-hardening for human terminal use;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -77,7 +77,7 @@ Scope:
 Verification evidence:
 
 - PR #30 normalized tmux soft-wrap capture and main CI passed.
-- Config smoke verifies `CLAUDE_TMUX_CLIPBOARD=internal` produces `copy-selection-and-cancel`, a custom `CODEX_TMUX_CLIPBOARD` command produces `copy-pipe-and-cancel`, and mouse remains enabled.
+- Config smoke verifies `CLAUDE_TMUX_CLIPBOARD=internal` produces keyboard and mouse `copy-selection-and-cancel`, a quoted custom `CODEX_TMUX_CLIPBOARD` command is escaped into `copy-pipe-and-cancel`, and mouse remains enabled.
 - Local checks pass: `actionlint`, workflow YAML parse, shell syntax, skill validation, Formula syntax/style, wrapper self-tests, and stable `brew test`.
 - Pending for this branch: Claude teammate review, PR CI.
 
