@@ -71,12 +71,13 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: `feature/v0.4-pair-review-swap`
+Branch: `feature/v0.4-profile-env`
 
 Scope:
 
-- implement the v0.4 P2 `pair-review --swap` ergonomic slice;
-- reverse pair-review speaker order without changing participant definitions;
+- implement the v0.4 P2 participant profile `env` ergonomic slice;
+- keep profile env generic and per-session, without personal shortcuts or secret examples;
+- validate env keys and values before starting tmux sessions;
 - keep the feature local-only with no GitHub posting, merging, scheduling, or release side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -125,7 +126,11 @@ Verification evidence:
 - PR #45 merged as `c411413`; main CI run `25970460874` passed.
 - Pair-review swap local validation passed on `feature/v0.4-pair-review-swap`: workflow YAML check with `yq`, script syntax for wrappers/dialogue/session helper, Formula syntax/style, wrapper self-tests, `git diff --check`, and fake pair-review smoke using slurped `jq` assertions to prove default A-to-B order, `--swap` B-to-A order, `critic --swap` rejection, and leading `--swap pair-review` rejection.
 - Claude tmux-agent teammate reviewed the pair-review swap diff, initially found two blockers in CI/assertion clarity and leading `--swap` handling, then re-reviewed after fixes; final verdict was `BLOCKERS: None`, `NON-BLOCKING: None`, and `VERDICT: SHIP`.
-- Pending for this branch: PR CI.
+- PR #46 merged as `9c17d2f`; main CI run `25970732453` passed.
+- Profile env local validation passed on `feature/v0.4-profile-env`: workflow YAML check with `yq`, script syntax for wrappers/dialogue/session helper, Formula syntax/style, skill metadata validation, wrapper self-tests, `git diff --check`, fake profile smoke, fake `codex` executable through the real wrapper path proving no-env profiles do not crash and profile env reaches the local tmux session process, and bad profile rejection for unknown keys, non-string profile values, invalid env keys, non-string env values, and newline env values.
+- Claude tmux-agent teammate reviewed the first profile env diff and found a blocker: empty `@f` command substitution could create `env "" wrapper ...` for env-less real participants. The fix filters empty entries and passes session env through wrapper-managed `tmux new-session -e` arguments; local revalidation covered env-less and env-set real-wrapper paths.
+- Claude tmux-agent teammate re-reviewed after the fix and found no blockers with `VERDICT: SHIP`; the only non-blocking CI no-env assertion note was addressed and rechecked locally.
+- Pending for this branch: PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 

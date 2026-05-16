@@ -183,7 +183,10 @@ Participant profiles can reduce repeated agent, SSH, and workdir flags without a
 {
   "local-reviewer": {
     "agent": "claude",
-    "workdir": "/Users/example/github/project"
+    "workdir": "/Users/example/github/project",
+    "env": {
+      "TMUX_AGENT_MODE": "review"
+    }
   },
   "remote-worker": {
     "agent": "codex",
@@ -193,7 +196,7 @@ Participant profiles can reduce repeated agent, SSH, and workdir flags without a
 }
 ```
 
-Use profiles with `--agent-a-profile <name>` or `--agent-b-profile <name>`. Command-line flags such as `--agent-a`, `--agent-a-ssh`, and `--agent-a-workdir` override profile values. Profiles may only contain `agent`, `ssh`, and `workdir`; `fake` participants cannot use SSH, and remote workdirs must be absolute paths.
+Use profiles with `--agent-a-profile <name>` or `--agent-b-profile <name>`. Command-line flags such as `--agent-a`, `--agent-a-ssh`, and `--agent-a-workdir` override profile values. Profiles may only contain `agent`, `ssh`, `workdir`, and `env`; `env` must be an object of newline-free string values keyed by shell environment names. Profile env is passed to the local wrapper/session process. For SSH participants, remote environment behavior depends on SSH and remote shell configuration; do not rely on profile env as a secret transport. `fake` participants cannot use SSH, and remote workdirs must be absolute paths.
 
 Validate a transcript before sharing or rendering it:
 
