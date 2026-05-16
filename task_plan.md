@@ -52,14 +52,19 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 14. Merge explicit GitHub comment helper through PR #12. Done.
 15. Merge `v0.2.0` stable Formula prep through PR #13. Done.
 16. Merge `jq` runtime dependency and Formula summarize smoke through PR #14. Done.
+17. Merge manual dry-run-first release workflow through PR #15. Done.
 
 ## Active Work
 
-Branch: `feature/release-workflow`
+Branch: `feature/release-process-handoff`
 
 Scope:
 
-- add a `workflow_dispatch` release workflow for future releases that validates main, extracts notes from `CHANGELOG.md`, and creates the tag/release only after the workflow file lands on main;
+- document the release PR -> Release workflow -> Formula bump PR sequence;
+- link the release process from the README;
+- split the Release workflow so dry-run validation has read-only repository permissions and only the publish job can write;
+- require the Release workflow to run from `main`;
+- add Release workflow step-summary output with the released archive URL and SHA-256 for the follow-up Formula PR;
 - keep all mainline changes going through PR.
 
 Verification evidence:
@@ -67,10 +72,11 @@ Verification evidence:
 - `v0.2.0` stable Formula prep merged in PR #13.
 - PR #14 adds `jq` to the Formula and exercises `tmux-agent-dialogue summarize` in Formula test.
 - Release workflow is dry-run by default and requires explicit `dry_run: false` to create a tag/release.
-- `yq` parses the workflow dispatch inputs, permissions, and release job steps.
-- Local release notes extraction smoke passes for `v0.2.0`.
-- The release workflow validation command block passes locally: script syntax, Formula syntax/style, and wrapper self-tests.
 - `actionlint .github/workflows/release.yml` passes.
+- `yq` confirms top-level permissions are read-only and publish job permissions are write-scoped.
+- Local main-ref guard smoke accepts `refs/heads/main` and rejects a feature branch ref.
+- Local release handoff smoke computes the `v0.2.0` archive SHA and renders the Formula bump summary.
+- Formula syntax/style, skill validation, and wrapper self-tests pass.
 - Remaining check for this branch: PR CI.
 
 ## v0.2.0 Candidate Scope
