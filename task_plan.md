@@ -82,12 +82,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-summary-output-formats` next
+Branch: `feature/v0.5-summary-output-formats`
 
 Scope:
 
-- start the next v0.5 roadmap slice: summary output formats;
-- add structured summary output for scripts without changing the default Markdown summary contract;
+- finish the v0.5 summary output formats slice;
+- add structured `summarize --output-format json` output for scripts without changing the default Markdown summary contract;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -175,7 +175,9 @@ Verification evidence:
 - `brew style --formula Formula/tmux-agent-tools.rb` was attempted from this non-tap working copy and rejected by Homebrew because formulae must be inside a tap; Formula syntax still passed and the Formula file is unchanged by this slice.
 - Claude tmux-agent teammate reviewed the blocked-trigger diff, initially raised two evidence questions, then re-reviewed after local proof and found no blockers with `VERDICT: SHIP`.
 - PR #62 merged as `30ba8a6`; feature branch CI run `25973517992` and main CI run `25973541155` passed.
-- Pending for next branch: summary output format design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Summary output formats local validation passed on `feature/v0.5-summary-output-formats`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, fake pair-review summary smoke proving default Markdown equals explicit `--output-format markdown`, JSON output validates with `jq`, redacted structured `turns[].tail_lines` do not leak the unredacted fake marker text, JSON `--summary-file` writes the selected format, `github-comment --output-format` is rejected, and unknown output formats are rejected.
+- Claude tmux-agent teammate reviewed the summary output formats diff, found no blockers, and re-reviewed the final diff after a metadata naming cleanup with `VERDICT: SHIP`.
+- Pending for current branch: commit, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
