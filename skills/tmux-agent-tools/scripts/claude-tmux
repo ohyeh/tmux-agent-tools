@@ -1,0 +1,463 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:A}"
+TMUX="${TMUX:-$(command -v tmux 2>/dev/null || true)}"
+CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || true)}"
+PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
+STABLE_SECONDS="${CLAUDE_TMUX_STABLE_SECONDS:-3}"
+TMUX_CONF="${CLAUDE_TMUX_CONF:-${TMPDIR:-/tmp}/claude-tmux.tmux.conf}"
+TMUX_MOUSE="${CLAUDE_TMUX_MOUSE:-on}"
+
+usage() {
+  cat <<'EOF'
+claude-tmux - run Claude Code in tmux and drive it programmatically.
+
+Usage:
+  claude-tmux start [--attach] [--exact] <name> <directory> [initial text]
+  claude-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
+  claude-tmux attach <name>
+  claude-tmux send <name> <text>
+  claude-tmux wait <name> [timeout_seconds]
+  claude-tmux capture <name> [lines]
+  claude-tmux list
+  claude-tmux status <name>
+  claude-tmux stop <name>
+  claude-tmux help
+
+Examples:
+  claude-tmux start --attach pr5 ~/github/core-parking-service
+  claude-tmux start-ssh --attach pr5 openclaw-macmini ~/github/core-parking-service
+  claude-tmux start --exact pr5 ~/github/core-parking-service 'hi'
+  claude-tmux attach pr5
+  claude-tmux send pr5 '請先讀 PR description'
+  claude-tmux wait pr5 180
+  claude-tmux capture pr5 80
+  claude-tmux list
+  claude-tmux stop pr5
+
+Behavior:
+  - Session name is claude-cli-<name> by default.
+  - start appends a random 6-character suffix to <name>, unless --exact is used.
+  - start always recreates that named tmux session.
+  - start-ssh keeps tmux local, then runs Claude through ssh in the remote directory.
+  - Claude is launched with --dangerously-skip-permissions.
+  - wait returns when the visible pane is stable for a few seconds.
+  - capture reads the tmux pane without stealing browser or terminal focus.
+
+Environment:
+  TMUX=$(command -v tmux)
+  CLAUDE=$(command -v claude)
+  CLAUDE_TMUX_PREFIX=claude-cli
+  CLAUDE_TMUX_STABLE_SECONDS=3
+  CLAUDE_TMUX_CONF=/tmp/claude-tmux.tmux.conf
+  CLAUDE_TMUX_MOUSE=on
+EOF
+}
+
+require_bins() {
+  if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
+    echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
+    exit 1
+  fi
+
+  if [[ -z "$CLAUDE" || ! -x "$CLAUDE" ]]; then
+    echo "claude not found. Install Claude Code or set CLAUDE=/path/to/claude." >&2
+    exit 1
+  fi
+}
+
+require_tmux() {
+  if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
+    echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
+    exit 1
+  fi
+}
+
+write_tmux_conf() {
+  cat > "$TMUX_CONF" <<'EOF'
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",xterm-256color:RGB"
+set -as terminal-features ",tmux-256color:RGB"
+set -ga terminal-overrides ",xterm-256color:Tc"
+set -ga terminal-overrides ",tmux-256color:Tc"
+set -g allow-passthrough on
+set -s extended-keys on
+set -as terminal-features ",xterm*:extkeys"
+set -as terminal-features ",tmux*:extkeys"
+set -as terminal-features ",xterm*:clipboard"
+set -as terminal-features ",tmux*:clipboard"
+set -g focus-events on
+set -sg escape-time 10
+set -g xterm-keys on
+set -g set-clipboard on
+set -g mode-keys vi
+set -g status-keys vi
+set-environment -g COLORTERM truecolor
+set -g history-limit 50000
+set -g status on
+set -g status-position bottom
+set -g status-interval 2
+set -g status-style "bg=#111827,fg=#cbd5e1"
+set -g status-left-length 64
+set -g status-right-length 96
+set -g status-left "#[bg=#2563eb,fg=#ffffff,bold] Claude #[bg=#111827,fg=#93c5fd] #S "
+set -g status-right "#[fg=#64748b]#(pwd | sed 's#^$HOME#~#') #[fg=#22c55e]%H:%M "
+set -g window-status-format "#[fg=#94a3b8] #I:#W "
+set -g window-status-current-format "#[bg=#1f2937,fg=#ffffff,bold] #I:#W "
+set -g pane-border-style "fg=#334155"
+set -g pane-active-border-style "fg=#2563eb"
+set -g message-style "bg=#1f2937,fg=#ffffff"
+set -g mode-style "bg=#2563eb,fg=#ffffff"
+set -g clock-mode-colour "#2563eb"
+set -g display-panes-colour "#64748b"
+set -g display-panes-active-colour "#22c55e"
+bind-key -T copy-mode-vi y send -X copy-pipe-and-cancel "pbcopy"
+bind-key -T copy-mode-vi Enter send -X copy-pipe-and-cancel "pbcopy"
+EOF
+  printf 'set -g mouse "%s"\n' "$TMUX_MOUSE" >> "$TMUX_CONF"
+}
+
+session_for_name() {
+  local name="$1"
+  if [[ ! "$name" =~ '^[A-Za-z0-9_.-]+$' ]]; then
+    echo "Invalid session name: $name" >&2
+    exit 2
+  fi
+  echo "$PREFIX-$name"
+}
+
+random_suffix() {
+  LC_ALL=C /usr/bin/od -An -N3 -tx1 /dev/urandom | /usr/bin/tr -d ' \n'
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+start_session() {
+  require_bins
+  write_tmux_conf
+  local should_attach=0
+  local exact_name=0
+
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
+    case "$1" in
+      --attach)
+        should_attach=1
+        ;;
+      --exact)
+        exact_name=1
+        ;;
+    esac
+    shift
+  done
+
+  local requested_name="${1:-}"
+  local directory="${2:-}"
+  shift 2 || true
+  local initial_text="${*:-}"
+
+  if [[ -z "$requested_name" || -z "$directory" ]]; then
+    echo "Usage: claude-tmux start [--attach] [--exact] <name> <directory> [initial text]" >&2
+    exit 2
+  fi
+
+  if [[ ! -d "$directory" ]]; then
+    echo "Directory not found: $directory" >&2
+    exit 1
+  fi
+
+  local name="$requested_name"
+  if (( ! exact_name )); then
+    name="$requested_name-$(random_suffix)"
+  fi
+
+  local session="$(session_for_name "$name")"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+  fi
+
+  "$TMUX" -f "$TMUX_CONF" new-session -d -s "$session" -c "$directory" \
+    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; exec $CLAUDE --dangerously-skip-permissions"
+
+  echo "agent: $name"
+  echo "Started $session"
+  echo "cwd:  $directory"
+  if [[ -n "$initial_text" ]]; then
+    sleep 3
+    local buffer_name="$session-init"
+    printf "%s" "$initial_text" | "$TMUX" load-buffer -b "$buffer_name" -
+    "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+    "$TMUX" send-keys -t "$session" Enter
+    echo "sent: $initial_text"
+  else
+    echo "sent: <none>"
+  fi
+
+  if (( should_attach )); then
+    "$TMUX" attach -t "$session"
+  fi
+}
+
+start_ssh_session() {
+  require_tmux
+  write_tmux_conf
+  local should_attach=0
+  local exact_name=0
+
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
+    case "$1" in
+      --attach)
+        should_attach=1
+        ;;
+      --exact)
+        exact_name=1
+        ;;
+    esac
+    shift
+  done
+
+  local requested_name="${1:-}"
+  local ssh_target="${2:-}"
+  local remote_directory="${3:-}"
+
+  if [[ -z "$requested_name" || -z "$ssh_target" || -z "$remote_directory" ]]; then
+    echo "Usage: claude-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]" >&2
+    exit 2
+  fi
+
+  shift 3
+  local initial_text="${*:-}"
+
+  local name="$requested_name"
+  if (( ! exact_name )); then
+    name="$requested_name-$(random_suffix)"
+  fi
+
+  local session="$(session_for_name "$name")"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+  fi
+
+  local remote_command
+  remote_command="export TERM=xterm-256color COLORTERM=truecolor; cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'claude-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && claude --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] remote command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  "$TMUX" -f "$TMUX_CONF" new-session -d -s "$session" \
+    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")"
+
+  echo "agent: $name"
+  echo "Started $session"
+  echo "ssh:  $ssh_target"
+  echo "cwd:  $remote_directory"
+  if [[ -n "$initial_text" ]]; then
+    sleep 5
+    local buffer_name="$session-init"
+    printf "%s" "$initial_text" | "$TMUX" load-buffer -b "$buffer_name" -
+    "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+    "$TMUX" send-keys -t "$session" Enter
+    echo "sent: $initial_text"
+  else
+    echo "sent: <none>"
+  fi
+
+  if (( should_attach )); then
+    "$TMUX" attach -t "$session"
+  fi
+}
+
+attach_session() {
+  require_bins
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: claude-tmux attach <name>" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  "$TMUX" attach -t "$session"
+}
+
+send_session() {
+  require_bins
+  local name="${1:-}"
+  shift || true
+
+  if [[ -z "$name" || "$#" -eq 0 ]]; then
+    echo "Usage: claude-tmux send <name> <text>" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local prompt_text="$*"
+  local buffer_name="$session-send"
+  printf "%s" "$prompt_text" | "$TMUX" load-buffer -b "$buffer_name" -
+  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+  "$TMUX" send-keys -t "$session" Enter
+  echo "Sent to $session: $prompt_text"
+}
+
+capture_session() {
+  require_bins
+  local name="${1:-}"
+  local lines="${2:-80}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: claude-tmux capture <name> [lines]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$lines" =~ '^[0-9]+$' || "$lines" -lt 1 ]]; then
+    echo "Invalid lines: $lines" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  "$TMUX" capture-pane -t "$session" -p -S "-$lines"
+}
+
+wait_session() {
+  require_bins
+  local name="${1:-}"
+  local timeout_seconds="${2:-180}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: claude-tmux wait <name> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local last=""
+  local stable_count=0
+  local current=""
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -t "$session" -p -S -100)"
+    if [[ "$current" == "$last" ]]; then
+      stable_count=$((stable_count + 1))
+      if (( stable_count >= STABLE_SECONDS )); then
+        echo "stable"
+        return 0
+      fi
+    else
+      stable_count=0
+      last="$current"
+    fi
+    sleep 1
+  done
+
+  echo "timeout waiting for stable output: $session" >&2
+  return 1
+}
+
+status_session() {
+  require_bins
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: claude-tmux status <name>" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "running: $session"
+  else
+    echo "stopped: $session"
+  fi
+}
+
+list_sessions() {
+  require_bins
+  "$TMUX" ls 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      "$PREFIX"-*)
+        local session="${line%%:*}"
+        local name="${session#$PREFIX-}"
+        echo "$name -> $session"
+        ;;
+    esac
+  done
+}
+
+stop_session() {
+  require_bins
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: claude-tmux stop <name>" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+    echo "Stopped $session"
+  else
+    echo "Already stopped: $session"
+  fi
+}
+
+command="${1:-help}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  start)
+    start_session "$@"
+    ;;
+  start-ssh)
+    start_ssh_session "$@"
+    ;;
+  attach)
+    attach_session "$@"
+    ;;
+  send)
+    send_session "$@"
+    ;;
+  wait)
+    wait_session "$@"
+    ;;
+  capture)
+    capture_session "$@"
+    ;;
+  status)
+    status_session "$@"
+    ;;
+  list)
+    list_sessions
+    ;;
+  stop)
+    stop_session "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tmux Agent Tools"
+  short_description: "Drive Claude Code and Codex CLI sessions through tmux wrappers."
+  default_prompt: "Use tmux-agent-tools to start, control, wait for, capture, and clean up Claude Code or Codex CLI sessions in tmux."

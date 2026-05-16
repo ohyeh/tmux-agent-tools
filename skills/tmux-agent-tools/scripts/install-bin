@@ -1,0 +1,16 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+target_dir="${1:-$HOME/.local/bin}"
+script_dir="${0:A:h}"
+
+mkdir -p "$target_dir"
+ln -sf "$script_dir/claude-tmux" "$target_dir/claude-tmux"
+ln -sf "$script_dir/codex-tmux" "$target_dir/codex-tmux"
+
+echo "Installed:"
+echo "  $target_dir/claude-tmux -> $script_dir/claude-tmux"
+echo "  $target_dir/codex-tmux -> $script_dir/codex-tmux"
+echo
+echo "Make sure this is on PATH:"
+echo "  $target_dir"

@@ -1,0 +1,88 @@
+---
+name: tmux-agent-tools
+description: Use when Codex needs to run, supervise, or coordinate Claude Code or Codex CLI through local tmux sessions using the claude-tmux and codex-tmux wrappers. Triggers include starting named agent sessions, sending prompts to an existing tmux agent, waiting for terminal stability, capturing pane output, listing agent sessions, stopping sessions, or using start-ssh to keep tmux local while running the CLI on a remote host.
+---
+
+# Tmux Agent Tools
+
+## Overview
+
+Use `claude-tmux` and `codex-tmux` as the canonical interface for long-running Claude Code or Codex CLI sessions in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, and cleanup commands.
+
+The wrapper scripts are bundled with this skill at:
+
+- `scripts/claude-tmux`
+- `scripts/codex-tmux`
+
+If the commands are not installed on `PATH`, resolve them from the skill directory and run the script path directly.
+
+## Command Choice
+
+- Use `claude-tmux` when the requested worker should run Claude Code.
+- Use `codex-tmux` when the requested worker should run Codex CLI.
+- Use `start` for a local working directory.
+- Use `start-ssh` when the tmux session should stay local but the agent CLI should run through SSH on another machine.
+
+## Core Workflow
+
+1. Start a session with a short stable name:
+
+```bash
+codex-tmux start --exact worker ~/github/project 'Read the repo and report the failing test.'
+```
+
+2. Send follow-up work without attaching:
+
+```bash
+codex-tmux send worker 'Now implement the smallest fix and run the targeted test.'
+```
+
+3. Wait for visible pane stability before reading output:
+
+```bash
+codex-tmux wait worker 180
+codex-tmux capture worker 120
+```
+
+4. Inspect status or clean up:
+
+```bash
+codex-tmux status worker
+codex-tmux stop worker
+```
+
+## Session Naming
+
+- Without `--exact`, `start` appends a random suffix to avoid collisions.
+- With `--exact`, the session uses the requested name exactly under the tool prefix.
+- `send`, `capture`, `wait`, `status`, `attach`, and `stop` take the agent name, not the full tmux session name.
+
+## Remote Sessions
+
+Use `start-ssh` when the target repo is on another host:
+
+```bash
+claude-tmux start-ssh --exact review openclaw-macmini ~/github/project 'Review the diff and return findings only.'
+```
+
+Requirements:
+
+- local machine has `tmux`;
+- remote shell can resolve `claude` or `codex` on `PATH`;
+- SSH target is already configured.
+
+## Safety
+
+- These wrappers launch agent CLIs with permissive flags: Claude uses `--dangerously-skip-permissions`; Codex uses `--yolo`.
+- Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations unless the user explicitly authorized that work.
+- Prefer `capture` and `status` before assuming a worker is done.
+
+## Environment Overrides
+
+- `TMUX=/path/to/tmux`
+- `CLAUDE=/path/to/claude`
+- `CODEX=/path/to/codex`
+- `CLAUDE_TMUX_PREFIX` / `CODEX_TMUX_PREFIX`
+- `CLAUDE_TMUX_STABLE_SECONDS` / `CODEX_TMUX_STABLE_SECONDS`
+- `CLAUDE_TMUX_CONF` / `CODEX_TMUX_CONF`
+- `CLAUDE_TMUX_MOUSE` / `CODEX_TMUX_MOUSE`
