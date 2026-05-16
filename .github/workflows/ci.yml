@@ -131,6 +131,22 @@ jobs:
           printf '%s\n' 'Discuss the smoke test.' > "$prompt_file"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 4 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$transcript_file" --timeout 10
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$transcript_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --schema-version 1 --transcript "$transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --schema-version 2 >/tmp/unsupported-schema-version.out 2>&1; then
+            echo "unsupported transcript schema versions must fail" >&2
+            exit 1
+          fi
+          rg -n "unsupported transcript schema version: 2" /tmp/unsupported-schema-version.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --schema-version "" --transcript "$transcript_file" >/tmp/empty-schema-version.out 2>&1; then
+            echo "empty transcript schema versions must fail" >&2
+            exit 1
+          fi
+          rg -n -- "--schema-version must be 1" /tmp/empty-schema-version.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --schema-version 1 --transcript "$transcript_file" >/tmp/schema-version-summary.out 2>&1; then
+            echo "--schema-version must be scoped to validate-transcript" >&2
+            exit 1
+          fi
+          rg -n -- "--schema-version is only supported with validate-transcript" /tmp/schema-version-summary.out
           jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$transcript_file"
           jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$transcript_file"

@@ -27,7 +27,7 @@ Usage:
   tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--swap] [--timeout <seconds>] [--summary-file <path>]
   tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>]
   tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>]
-  tmux-agent-dialogue validate-transcript --transcript <path>
+  tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
   tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
 
@@ -255,6 +255,12 @@ validate_transcript_file() {
   fi
 
   (( failures == 0 )) || return 1
+}
+
+validate_transcript_schema_version() {
+  local schema_version="$1"
+  [[ -n "$schema_version" ]] || die "--schema-version must be 1"
+  [[ "$schema_version" == "1" ]] || die "unsupported transcript schema version: $schema_version"
 }
 
 session_name() {
@@ -782,6 +788,8 @@ GITHUB_PR=""
 GITHUB_REPO=""
 MAX_LINES=""
 MAX_BYTES=""
+TRANSCRIPT_SCHEMA_VERSION=""
+TRANSCRIPT_SCHEMA_VERSION_SET=0
 REDACT_PATTERNS=()
 RUN_ID="${$}-$(date -u '+%Y%m%d%H%M%S')"
 OWNED_SESSIONS=()
@@ -842,6 +850,7 @@ while (( $# > 0 )); do
     --summary-file) SUMMARY_FILE="${2:-}"; shift 2 ;;
     --max-lines) MAX_LINES="${2:-}"; shift 2 ;;
     --max-bytes) MAX_BYTES="${2:-}"; shift 2 ;;
+    --schema-version) TRANSCRIPT_SCHEMA_VERSION="${2:-}"; TRANSCRIPT_SCHEMA_VERSION_SET=1; shift 2 ;;
     --redact-pattern) REDACT_PATTERNS+=("${2:-}"); shift 2 ;;
     --swap) PAIR_REVIEW_SWAP=1; shift ;;
     --post-github-comment) POST_GITHUB_COMMENT=1; shift ;;
@@ -855,6 +864,7 @@ done
 if [[ -n "$MAX_LINES" || -n "$MAX_BYTES" || ${#REDACT_PATTERNS[@]} -gt 0 ]]; then
   [[ "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--max-lines, --max-bytes, and --redact-pattern are only supported with summarize or github-comment"
 fi
+[[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 || "$MODE" == "validate-transcript" ]] || die "--schema-version is only supported with validate-transcript"
 [[ "$PAIR_REVIEW_SWAP" -eq 0 || "$MODE" == "pair-review" ]] || die "--swap is only supported with pair-review"
 if [[ -n "$AGENT_A_PROFILE" || -n "$AGENT_B_PROFILE" ]]; then
   [[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" ]] || die "--agent-a-profile and --agent-b-profile are only supported with dialogue, pair-review, critic, or handoff"
@@ -869,9 +879,13 @@ if [[ "$MODE" == "summarize" ]]; then
 fi
 if [[ "$MODE" == "validate-transcript" ]]; then
   require_jq
+  if [[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 ]]; then
+    TRANSCRIPT_SCHEMA_VERSION="1"
+  fi
+  validate_transcript_schema_version "$TRANSCRIPT_SCHEMA_VERSION"
   [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || die "--transcript must be an existing file"
   validate_transcript_file "${TRANSCRIPT:A}"
-  echo "transcript valid: ${TRANSCRIPT:A}" >&2
+  echo "transcript valid: ${TRANSCRIPT:A} schema_version=$TRANSCRIPT_SCHEMA_VERSION" >&2
   exit 0
 fi
 if [[ "$MODE" == "github-comment" ]]; then
