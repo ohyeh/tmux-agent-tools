@@ -69,15 +69,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 29. Merge `v0.3.0` release notes through PR #35 (`6516e7c`). Done.
 30. Merge `v0.3.0` Release workflow dry-run state through PR #36 (`97a629f`). Done.
 31. Merge `v0.3.0` stable Formula bump through PR #37 (`6acb503`). Done.
+32. Merge `v0.4.0` release-process validation docs through PR #51 (`71b37a3`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.4-release-process-docs-refresh`
+Branch: `feature/v0.4-release-ready-state`
 
 Scope:
 
-- refresh release-process docs so they match the hardened Release workflow validation gates;
-- record the PR #50 merge and main CI evidence before any `v0.4.0` publish;
+- record the PR #51 merge and main CI evidence before any `v0.4.0` publish;
+- mark `v0.4.0` as release-ready from repo evidence, with real publish still requiring explicit operator approval;
 - keep this docs/state-only with no release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -137,7 +138,11 @@ Verification evidence:
 - PR #49 merged as `35ab0bd`; main CI run `25971447690` passed.
 - Hardened Release workflow dry-run for `v0.4.0` passed in run `25971497742` (`https://github.com/ohyeh/tmux-agent-tools/actions/runs/25971497742`) on `35ab0bd`: the `validate` job succeeded, its `Build release notes` and `Dry-run summary` steps succeeded, the `publish` job was skipped, and `refs/tags/v0.4.0` / the GitHub Release remain absent.
 - PR #50 merged as `8c5b34e`; main CI run `25971623256` passed.
-- Pending for this branch: release-process docs validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Release-process docs validation passed on `feature/v0.4-release-process-docs-refresh`: `git diff --check`, workflow YAML name check with `yq`, workflow anchor checks with `rg`, and docs/task-plan anchor checks with `rg`.
+- Claude tmux-agent teammate reviewed the release-process docs diff and found no blockers with `VERDICT: SHIP`.
+- PR #51 merged as `71b37a3`; main CI run `25971728433` passed.
+- Current `v0.4.0` release state: release notes exist, the hardened Release workflow dry-run is green, release-process docs match the workflow gates, and the Formula bump remains deferred until after the reviewed Release workflow creates the tag.
+- Pending for this branch: release-ready state validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
