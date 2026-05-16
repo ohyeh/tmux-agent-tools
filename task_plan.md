@@ -82,11 +82,11 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-summary-file-edge-coverage` next
+Branch: `feature/v0.5-summary-file-edge-coverage`
 
 Scope:
 
-- start the next v0.5 operator-ergonomics slice: coverage for empty `--summary-file` and `--max-bytes` summary-file behavior;
+- implement the next v0.5 operator-ergonomics slice: coverage for empty `--summary-file` and `--max-bytes` summary-file behavior;
 - keep this as coverage/contract hardening without adding new GitHub write behavior;
 - keep this slice free of release publish, tag, scheduling, cleanup, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
@@ -187,7 +187,9 @@ Verification evidence:
 - GitHub comment edit-existing local validation passed on `feature/v0.5-github-comment-edit-existing`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and fake GitHub smoke proving dry-run edit mode does not call `gh`, non-numeric `--edit-existing` is rejected, and `--post-github-comment --edit-existing 123` calls `gh api --method PATCH repos/ohyeh/tmux-agent-tools/issues/comments/123 --input <json>` with the rendered Markdown body.
 - Claude tmux-agent teammate reviewed the GitHub comment edit-existing diff and found no blockers with `VERDICT: SHIP`.
 - PR #70 merged as `1febcd0`; feature branch CI run `25974584663` and main CI run `25974612263` passed.
-- Pending for next branch: empty `--summary-file` and `--max-bytes` summary-file coverage design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Summary-file edge coverage local validation passed on `feature/v0.5-summary-file-edge-coverage`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, and fake summary-file smoke proving `github-comment --summary-file <rendered-summary> --max-bytes 200` emits the `--max-bytes` truncation note while an empty `--summary-file` dry-run succeeds with an empty body and no GitHub write.
+- Claude tmux-agent teammate reviewed the summary-file edge coverage diff and found no blockers with `VERDICT: SHIP`.
+- Pending on `feature/v0.5-summary-file-edge-coverage`: PR CI, merge, main CI, and post-merge state sync.
 
 ## v0.2.0 Candidate Scope
 
