@@ -23,10 +23,10 @@ usage() {
 tmux-agent-dialogue - run a bounded two-agent tmux dialogue
 
 Usage:
-  tmux-agent-dialogue --turns <n> --workdir <dir> (--agent-a <codex|claude|fake>|--agent-a-profile <name>) (--agent-b <codex|claude|fake>|--agent-b-profile <name>) --prompt-file <path> --transcript <path|-> [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>]
-  tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--swap] [--timeout <seconds>] [--summary-file <path>]
-  tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>]
-  tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>]
+  tmux-agent-dialogue --turns <n> --workdir <dir> (--agent-a <codex|claude|fake>|--agent-a-profile <name>) (--agent-b <codex|claude|fake>|--agent-b-profile <name>) --prompt-file <path> --transcript <path|-> [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--swap] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
   tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-pr <number-or-url> --github-repo <owner/repo> [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
@@ -47,6 +47,7 @@ Behavior:
   - validates transcript JSONL before summary or GitHub comment rendering;
   - pair-review, critic, and handoff are thin presets and print local summaries;
   - pair-review --swap reverses speaker order without changing participant definitions;
+  - --on-blocked-trigger writes a local JSON artifact only when a participant appears blocked;
   - github-comment prints a dry-run body unless --post-github-comment is explicit;
   - real participants can run locally or through the wrapper start-ssh mode;
   - optional participant profiles live at ~/.config/tmux-agent-tools/participants.json or TMUX_AGENT_TOOLS_PARTICIPANTS;
@@ -108,6 +109,36 @@ append_failure_jsonl() {
   else
     print -r -- "$line" >> "$TRANSCRIPT"
   fi
+}
+
+write_blocked_trigger() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local blocked_reason="$5"
+  local trigger_path="$6"
+
+  [[ -n "$trigger_path" ]] || return 0
+  case "$blocked_reason" in
+    cli_exited|ssh_prompt|permission_prompt)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  mkdir -p "${trigger_path:h}"
+  "$JQ" -cn \
+    --arg event "blocked" \
+    --argjson turn "$turn" \
+    --arg participant "$speaker" \
+    --arg agent "$agent" \
+    --arg marker "$marker" \
+    --arg blocked_reason "$blocked_reason" \
+    --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{event:$event,turn:$turn,participant:$participant,agent:$agent,marker:$marker,blocked_reason:$blocked_reason,timestamp:$timestamp}' \
+    > "$trigger_path"
 }
 
 require_tmux() {
@@ -506,6 +537,7 @@ record_marker_timeout() {
     print -r -- "$tail_text" >&2
   fi
   append_failure_jsonl "$turn" "$speaker" "$agent" "$marker" "$failure_type" "$tail_text"
+  write_blocked_trigger "$turn" "$speaker" "$agent" "$marker" "$failure_type" "$ON_BLOCKED_TRIGGER"
 }
 
 build_pair_review_summary_raw() {
@@ -782,6 +814,7 @@ AGENT_B_ENV=()
 MODE="dialogue"
 SUMMARY_FILE=""
 SUMMARY_LABEL="transcript"
+ON_BLOCKED_TRIGGER=""
 POST_GITHUB_COMMENT=0
 PAIR_REVIEW_SWAP=0
 GITHUB_PR=""
@@ -848,6 +881,7 @@ while (( $# > 0 )); do
     --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
     --summary-file) SUMMARY_FILE="${2:-}"; shift 2 ;;
+    --on-blocked-trigger) ON_BLOCKED_TRIGGER="${2:-}"; shift 2 ;;
     --max-lines) MAX_LINES="${2:-}"; shift 2 ;;
     --max-bytes) MAX_BYTES="${2:-}"; shift 2 ;;
     --schema-version) TRANSCRIPT_SCHEMA_VERSION="${2:-}"; TRANSCRIPT_SCHEMA_VERSION_SET=1; shift 2 ;;
@@ -913,10 +947,12 @@ apply_profile b "$AGENT_B_PROFILE" "$AGENT_B_SET" "$AGENT_B_SSH_SET" "$AGENT_B_W
 [[ -z "$AGENT_A_SSH" || "$AGENT_A_WORKDIR" == /* ]] || die "--agent-a-workdir must be an absolute remote path when --agent-a-ssh is set"
 [[ -z "$AGENT_B_SSH" || "$AGENT_B_WORKDIR" == /* ]] || die "--agent-b-workdir must be an absolute remote path when --agent-b-ssh is set"
 [[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" || -z "$SUMMARY_FILE" ]] || die "--summary-file is only supported with pair-review, critic, or handoff"
+[[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" || -z "$ON_BLOCKED_TRIGGER" ]] || die "--on-blocked-trigger is only supported with dialogue, pair-review, critic, or handoff"
 [[ "$POST_GITHUB_COMMENT" -eq 0 ]] || die "--post-github-comment is only supported with github-comment"
 [[ -z "$GITHUB_PR" ]] || die "--github-pr is only supported with github-comment"
 [[ -z "$GITHUB_REPO" ]] || die "--github-repo is only supported with github-comment"
 [[ -z "$SUMMARY_FILE" || "$TRANSCRIPT" != "-" ]] || die "--summary-file requires --transcript to be a file path"
+[[ -z "$ON_BLOCKED_TRIGGER" || "$ON_BLOCKED_TRIGGER" != "-" ]] || die "--on-blocked-trigger must be a file path"
 
 require_tmux
 WORKDIR="${WORKDIR:A}"
@@ -937,6 +973,10 @@ fi
 if [[ -n "$SUMMARY_FILE" ]]; then
   SUMMARY_FILE="${SUMMARY_FILE:A}"
   mkdir -p "${SUMMARY_FILE:h}"
+fi
+if [[ -n "$ON_BLOCKED_TRIGGER" ]]; then
+  ON_BLOCKED_TRIGGER="${ON_BLOCKED_TRIGGER:A}"
+  mkdir -p "${ON_BLOCKED_TRIGGER:h}"
 fi
 
 trap cleanup EXIT
@@ -983,7 +1023,13 @@ Previous response:
 $previous")"
 
   if [[ "$agent" == "fake" ]]; then
-    if [[ "${TMUX_AGENT_DIALOGUE_TEST_TIMEOUT_FAKE_TURN:-}" == "$turn" ]]; then
+    if [[ "${TMUX_AGENT_DIALOGUE_TEST_BLOCKED_FAKE_TURN:-}" == "$turn" ]]; then
+      send_to_agent "$label" "$agent" "Do you want to allow this action?" || true
+      if ! wait_for_marker "$label" "$agent" "$marker" "fake-${label}: Do you want to allow this action?"; then
+        record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+        exit 1
+      fi
+    elif [[ "${TMUX_AGENT_DIALOGUE_TEST_TIMEOUT_FAKE_TURN:-}" == "$turn" ]]; then
       if ! wait_for_marker "$label" "$agent" "$marker" "fake-${label}: turn ${turn} received"; then
         record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
         exit 1

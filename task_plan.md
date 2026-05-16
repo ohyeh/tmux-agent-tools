@@ -82,12 +82,12 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.5-blocked-trigger-artifacts` next
+Branch: `feature/v0.5-blocked-trigger-artifacts`
 
 Scope:
 
-- start the next v0.5 roadmap slice: local blocked trigger artifacts;
-- add an explicit local-file trigger output for blocked participant states;
+- finish the v0.5 local blocked trigger artifact slice;
+- add an explicit `--on-blocked-trigger` local-file output for blocked participant states;
 - never auto-accept permission, approval, SSH, or login prompts;
 - keep this slice free of release publish, tag, GitHub posting, scheduling, or runtime side effects;
 - use Claude tmux-agent teammate review only;
@@ -172,7 +172,10 @@ Verification evidence:
 - Transcript schema-version local validation passed on `feature/v0.5-transcript-schema-version`: `git diff --check`, workflow YAML name checks with `yq`, script syntax check, skill metadata validation, Formula syntax/style, wrapper self-tests, fake transcript default validation as schema version `1`, explicit `--schema-version 1` validation, unsupported `--schema-version 2` rejection before transcript reading, empty schema-version rejection, and `summarize --schema-version` rejection.
 - Claude tmux-agent teammate reviewed the transcript schema-version diff, found one CI stability blocker, then re-reviewed after fixes and found no blockers with `VERDICT: SHIP`.
 - PR #60 merged as `61af464`; main CI run `25973206839` passed.
-- Pending for next branch: local blocked-trigger artifact design, implementation, validation, Claude tmux-agent teammate review, PR CI, merge, and main CI.
+- Local blocked-trigger artifact validation passed on `feature/v0.5-blocked-trigger-artifacts`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name check with `yq`, `git diff --check`, skill metadata smoke, Formula Ruby syntax check, wrapper self-tests, blocked fake smoke proving `failure_type == "permission_prompt"` and trigger JSON `blocked_reason == "permission_prompt"`, non-blocked pair-review proving no trigger file is created, and transcript validation for both flows.
+- `brew style --formula Formula/tmux-agent-tools.rb` was attempted from this non-tap working copy and rejected by Homebrew because formulae must be inside a tap; Formula syntax still passed and the Formula file is unchanged by this slice.
+- Claude tmux-agent teammate reviewed the blocked-trigger diff, initially raised two evidence questions, then re-reviewed after local proof and found no blockers with `VERDICT: SHIP`.
+- Pending for current branch: commit, PR CI, merge, and main CI.
 
 ## v0.2.0 Candidate Scope
 
