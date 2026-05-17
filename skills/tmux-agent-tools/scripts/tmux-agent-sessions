@@ -21,14 +21,16 @@ CODEX_PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
 DIALOGUE_PREFIX="tmux-agent-dialogue"
 FILTER_TOOL=""
 FILTER_NAME=""
+FILTER_STATE=""
+SORT_FIELD=""
 
 usage() {
   cat <<'EOF'
 tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
 
 Usage:
-  tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>]
-  tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>]
+  tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--sort <tool|name|session|state>]
   tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|dialogue>] [--name <name>]
   tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|dialogue> | --name <name>)
 
@@ -199,6 +201,28 @@ parse_filter_arg() {
   esac
 }
 
+parse_state_arg() {
+  case "$1" in
+    running|exited|stopped|missing)
+      print -r -- "$1"
+      ;;
+    *)
+      die "--state must be one of: running, exited, stopped, missing"
+      ;;
+  esac
+}
+
+parse_sort_arg() {
+  case "$1" in
+    tool|name|session|state)
+      print -r -- "$1"
+      ;;
+    *)
+      die "--sort must be one of: tool, name, session, state"
+      ;;
+  esac
+}
+
 parse_nonnegative_integer_arg() {
   local flag="$1"
   local value="$2"
@@ -213,6 +237,27 @@ matches_filters() {
   [[ -z "$FILTER_TOOL" || "$tool" == "$FILTER_TOOL" ]] || return 1
   [[ -z "$FILTER_NAME" || "$name" == "$FILTER_NAME" ]] || return 1
   return 0
+}
+
+filter_sort_inventory_json() {
+  require_jq
+  "$JQ" -cs \
+    --arg state "$FILTER_STATE" \
+    --arg sort_field "$SORT_FIELD" \
+    'map(select($state == "" or .state == $state))
+     | if $sort_field == "" then .
+       elif $sort_field == "tool" then sort_by(.tool, .name, .session)
+       elif $sort_field == "name" then sort_by(.name, .tool, .session)
+       elif $sort_field == "session" then sort_by(.session, .tool, .name)
+       elif $sort_field == "state" then sort_by(.state, .tool, .name, .session)
+       else .
+       end'
+}
+
+inventory_json_array() {
+  list_owned_sessions | while IFS=$'\t' read -r tool name session; do
+    emit_inventory_json "$tool" "$name" "$session"
+  done | filter_sort_inventory_json
 }
 
 list_owned_sessions() {
@@ -271,8 +316,16 @@ list_sessions() {
         FILTER_NAME="${1:-}"
         [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
         ;;
+      --state)
+        shift
+        FILTER_STATE="$(parse_state_arg "${1:-}")"
+        ;;
+      --sort)
+        shift
+        SORT_FIELD="$(parse_sort_arg "${1:-}")"
+        ;;
       *)
-        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>] | list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>]"
+        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--sort <tool|name|session|state>] | list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--sort <tool|name|session|state>]"
         ;;
     esac
     shift
@@ -284,9 +337,7 @@ list_sessions() {
     require_jq
     local i=0
     while (( i < watch_count )); do
-      list_owned_sessions | while IFS=$'\t' read -r tool name session; do
-        emit_inventory_json "$tool" "$name" "$session"
-      done | "$JQ" -cs '.'
+      inventory_json_array
       i=$((i + 1))
       if (( i < watch_count )); then
         sleep "$watch_interval"
@@ -295,14 +346,11 @@ list_sessions() {
     return
   fi
 
-  local tool name session
-  list_owned_sessions | while IFS=$'\t' read -r tool name session; do
-    if (( output_json )); then
-      emit_inventory_json "$tool" "$name" "$session"
-    else
-      emit_inventory_text "$tool" "$name" "$session"
-    fi
-  done
+  if (( output_json )); then
+    inventory_json_array | "$JQ" -c '.[]'
+  else
+    inventory_json_array | "$JQ" -r '.[] | [.tool, .name, .session, .state] | @tsv'
+  fi
 }
 
 cleanup_sessions() {

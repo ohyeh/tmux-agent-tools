@@ -88,7 +88,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.6-session-inventory-ergonomics` next
+Branch: `feature/v0.6-session-inventory-ergonomics`
 
 Scope:
 
@@ -230,7 +230,8 @@ Verification evidence:
 - Bounded debate preset local validation passed on `feature/v0.6-debate-preset`: `git diff --check`, `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `scripts/ci-shellcheck`, Formula Ruby syntax check, wrapper self-tests, dialogue help smoke, roadmap/README/SKILL/CI/script anchor checks with `rg`, fake four-turn `debate` smoke proving alternating agent-a/agent-b transcript rows with `jq`, `validate-transcript`, `debate` summary label output, and odd `--turns` rejection.
 - Claude tmux-agent teammate reviewed the bounded debate preset diff and found no blockers with `VERDICT: SHIP`.
 - PR #89 merged as `69799d2`; feature branch CI run `25977319588` and main CI run `25977351225` passed.
-- Pending for next branch: session inventory ergonomics implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
+- Session inventory ergonomics local validation passed on `feature/v0.6-session-inventory-ergonomics`: `git diff --check`, workflow YAML name checks with `yq`, `zsh -n` for `tmux-agent-sessions`, `scripts/ci-shellcheck`, Formula Ruby syntax check, wrapper self-tests, README/SKILL/CI/script anchor checks with `rg`, and local tmux smoke proving `list --sort name`, `list --sort session`, `list --state running --sort tool`, empty `--state exited`, watch snapshots with `--state running --sort name`, text output shape, and invalid `--sort` / `--state` rejection.
+- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
