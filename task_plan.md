@@ -84,15 +84,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 41. Merge skill environment reference parity through PR #83 (`ca4730e`). Done.
 42. Merge JSON summary schema metadata through PR #85 (`17bb966`). Done.
 43. Merge structured GitHub comment result through PR #87 (`761758b`). Done.
+44. Merge bounded debate preset through PR #89 (`69799d2`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.6-debate-preset`
+Branch: create `feature/v0.6-session-inventory-ergonomics` next
 
 Scope:
 
 - implement the next `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
-- add a bounded `debate` preset for structured back-and-forth critique;
+- add scriptable session inventory ergonomics for sorted and filtered local inventory consumption;
 - keep this free of release publish, tag, GitHub Release, Formula bump, credentials, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -227,7 +228,9 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the structured GitHub comment result diff and found no blockers with `VERDICT: SHIP`.
 - PR #87 merged as `761758b`; feature branch CI run `25976924280` and main CI run `25976956631` passed.
 - Bounded debate preset local validation passed on `feature/v0.6-debate-preset`: `git diff --check`, `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `scripts/ci-shellcheck`, Formula Ruby syntax check, wrapper self-tests, dialogue help smoke, roadmap/README/SKILL/CI/script anchor checks with `rg`, fake four-turn `debate` smoke proving alternating agent-a/agent-b transcript rows with `jq`, `validate-transcript`, `debate` summary label output, and odd `--turns` rejection.
-- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
+- Claude tmux-agent teammate reviewed the bounded debate preset diff and found no blockers with `VERDICT: SHIP`.
+- PR #89 merged as `69799d2`; feature branch CI run `25977319588` and main CI run `25977351225` passed.
+- Pending for next branch: session inventory ergonomics implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
