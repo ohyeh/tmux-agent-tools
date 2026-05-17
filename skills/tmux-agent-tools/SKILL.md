@@ -92,12 +92,12 @@ tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-b claude --pro
 
 Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. If a marker wait times out, inspect the emitted `failure` JSONL event and captured pane tail before treating the run as a protocol failure.
 
-Use participant profiles only for generic, reusable defaults. Profiles live at `~/.config/tmux-agent-tools/participants.json` by default, or at `TMUX_AGENT_TOOLS_PARTICIPANTS` / `--participants-config <path>`. Each top-level profile may contain only `agent`, `ssh`, `workdir`, and `env`; command-line flags override `agent`, `ssh`, and `workdir` values. `env` must be an object of newline-free string values keyed by shell environment names and is passed to the local wrapper/session process. For SSH participants, remote environment behavior depends on SSH and remote shell configuration, so do not rely on profile env as a secret transport. Do not encode personal project shortcuts in public docs or examples.
+Use participant profiles only for generic, reusable defaults. Profiles live at `~/.config/tmux-agent-tools/participants.json` by default, or at `TMUX_AGENT_TOOLS_PARTICIPANTS` / `--participants-config <path>`. Each top-level profile may contain only `agent`, `ssh`, `workdir`, `timeout`, and `env`; command-line flags override profile values. `timeout` must be a positive integer string in seconds and applies only to that participant when the run does not pass `--timeout`. `env` must be an object of newline-free string values keyed by shell environment names and is passed to the local wrapper/session process. For SSH participants, remote environment behavior depends on SSH and remote shell configuration, so do not rely on profile env as a secret transport. Do not encode personal project shortcuts in public docs or examples.
 
 Use participant SSH options when one real agent should run remotely while tmux stays local:
 
 ```bash
-tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-a-ssh openclaw-macmini --agent-a-workdir /Users/paul.yeh/github/project --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
+tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-a-ssh example-host --agent-a-workdir /Users/example/github/project --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
 ```
 
 Only real `codex` or `claude` participants can use `--agent-a-ssh` or `--agent-b-ssh`; `fake` is local-only. Remote workdirs must be absolute paths on the target host.
@@ -138,7 +138,7 @@ Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize`
 Use `start-ssh` when the target repo is on another host:
 
 ```bash
-claude-tmux start-ssh --exact review openclaw-macmini ~/github/project 'Review the diff and return findings only.'
+claude-tmux start-ssh --exact review example-host ~/github/project 'Review the diff and return findings only.'
 ```
 
 Requirements:
@@ -162,6 +162,9 @@ Requirements:
 - `CODEX=/path/to/codex`
 - `CLAUDE_TMUX_PREFIX` / `CODEX_TMUX_PREFIX`
 - `CLAUDE_TMUX_STABLE_SECONDS` / `CODEX_TMUX_STABLE_SECONDS`
+- `CLAUDE_TMUX_SUBMIT_DELAY` / `CODEX_TMUX_SUBMIT_DELAY`
 - `CLAUDE_TMUX_CONF` / `CODEX_TMUX_CONF`
 - `CLAUDE_TMUX_MOUSE` / `CODEX_TMUX_MOUSE`
 - `CLAUDE_TMUX_CLIPBOARD` / `CODEX_TMUX_CLIPBOARD` (`auto`, `internal`, or a copy command)
+- `CLAUDE_TMUX_STATUS_TAIL_LINES` / `CODEX_TMUX_STATUS_TAIL_LINES`
+- `TMUX_AGENT_TOOLS_PARTICIPANTS`
