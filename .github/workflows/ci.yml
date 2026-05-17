@@ -92,6 +92,21 @@ jobs:
           skills/tmux-agent-tools/scripts/claude-tmux status --json ci-hygiene | jq -e '.tool == "claude" and .name == "ci-hygiene" and .session == "claude-cli-ci-hygiene" and .prefix == "claude-cli" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local" and (.last_capture_lines | type == "array" and length <= 20) and .confirmation_detected == false and .blocked_reason == null'
           skills/tmux-agent-tools/scripts/codex-tmux status --json ci-hygiene | jq -e '.tool == "codex" and .name == "ci-hygiene" and .session == "codex-cli-ci-hygiene" and .prefix == "codex-cli" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local" and (.last_capture_lines | type == "array" and length <= 20) and .confirmation_detected == false and .blocked_reason == null'
           skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and (map(select(.tool == "claude" or .tool == "codex")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local")) and (map(select(.tool == "dialogue")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == null))'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --sort name | jq -s -e '[.[].name] == ["ci-hygiene","ci-hygiene","ci-hygiene-a"]'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --sort session | jq -s -e '[.[].session] == ["claude-cli-ci-hygiene","codex-cli-ci-hygiene","tmux-agent-dialogue-ci-hygiene-a"]'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --state running --sort tool | jq -s -e 'length == 3 and [.[].tool] == ["claude","codex","dialogue"] and all(.state == "running")'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --state exited | jq -s -e 'length == 0'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 1 --interval 0 --state running --sort name | jq -s -e 'length == 1 and (.[0] | length == 3 and [.[].name] == ["ci-hygiene","ci-hygiene","ci-hygiene-a"])'
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --sort nope >/tmp/session-sort-bad.out 2>&1; then
+            echo "list --sort must reject unknown fields" >&2
+            exit 1
+          fi
+          rg -n -- "--sort must be one of: tool, name, session, state" /tmp/session-sort-bad.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --state unknown >/tmp/session-state-bad.out 2>&1; then
+            echo "list --state must reject unknown states" >&2
+            exit 1
+          fi
+          rg -n -- "--state must be one of: running, exited, stopped, missing" /tmp/session-state-bad.out
           skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 2 --interval 0 | jq -s 'length == 2 and all(type == "array" and length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and (map(select(.tool == "claude" or .tool == "codex")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local")) and (map(select(.tool == "dialogue")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == null)))'
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n "claude-cli-ci-hygiene|codex-cli-ci-hygiene|tmux-agent-dialogue-ci-hygiene-a"
           skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n $'would stop: (claude|codex|dialogue)\\tci-hygiene(-a)?\\t(claude-cli|codex-cli|tmux-agent-dialogue)-ci-hygiene(-a)?\\trunning'
