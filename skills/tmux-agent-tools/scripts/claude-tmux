@@ -66,7 +66,6 @@ Examples:
 
 Behavior:
   - Session name is claude-cli-<name> by default.
-  - start appends a random 6-character suffix to <name>, unless --exact is used.
   - start and resume append a random 6-character suffix to <name>, unless --exact is used.
   - start and resume always recreate that named tmux session.
   - start-ssh keeps tmux local, then runs Claude through ssh in the remote directory.
