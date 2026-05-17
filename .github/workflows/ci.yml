@@ -373,11 +373,14 @@ jobs:
           json_summary_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format json --summary-file "$json_summary_file"
           jq -e '.schema_version == "1" and .format == "json" and (.turns | length) == 2 and (.rendered_markdown | contains("tmux-agent-tools transcript"))' "$json_summary_file"
-          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --output-format json >/tmp/github-comment-output-format.out 2>&1; then
-            echo "github-comment must reject --output-format" >&2
-            exit 1
-          fi
-          rg -n -- "--output-format is only supported with summarize" /tmp/github-comment-output-format.out
+          github_comment_json="$(mktemp)"
+          github_comment_json_stderr="$(mktemp)"
+          GH=/tmp/gh-must-not-run skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --output-format json > "$github_comment_json" 2> "$github_comment_json_stderr"
+          jq -e '.schema_version == "1" and .mode == "github-comment" and .status == "dry_run" and .action == "post" and .post_github_comment == false and .github_repo == "ohyeh/tmux-agent-tools" and .github_pr == "1" and .edit_existing == null and (.body | contains("tmux-agent-tools transcript")) and .gh_output == null' "$github_comment_json"
+          [[ ! -s "$github_comment_json_stderr" ]] || { echo "github-comment JSON dry-run should not print prose stderr" >&2; exit 1; }
+          github_comment_edit_json="$(mktemp)"
+          GH=/tmp/gh-must-not-run skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --output-format json > "$github_comment_edit_json"
+          jq -e '.status == "dry_run" and .action == "edit" and .edit_existing == "123" and .github_pr == null and (.body | contains("tmux-agent-tools transcript"))' "$github_comment_edit_json"
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format xml >/tmp/bad-output-format.out 2>&1; then
             echo "summarize must reject unknown output formats" >&2
             exit 1
@@ -442,10 +445,15 @@ jobs:
             printf '%s\n' 'body_file="${@: -1}"'
             # shellcheck disable=SC2016
             printf '%s\n' '[[ -s "$body_file" ]] || exit 3'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-456"'
           } > "$fake_bin/gh"
           chmod +x "$fake_bin/gh"
           GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --post-github-comment
           rg -n "pr|comment|1|--repo|ohyeh/tmux-agent-tools|--body-file" "$fake_args"
+          posted_json="$(mktemp)"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --post-github-comment --output-format json > "$posted_json"
+          jq -e '.status == "posted" and .action == "post" and .post_github_comment == true and .comment_url == "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-456" and (.gh_output | contains("issuecomment-456"))' "$posted_json"
           fake_edit_args="$(mktemp)"
           fake_edit_body="$(mktemp)"
           {
@@ -460,8 +468,13 @@ jobs:
             printf '%s\n' 'jq -e ".body | contains(\"tmux-agent-tools transcript\")" "$6" >/dev/null || exit 3'
             # shellcheck disable=SC2016
             printf '%s\n' 'cp "$6" "$GH_FAKE_BODY"'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "{\"id\":123,\"html_url\":\"https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-123\"}"'
           } > "$fake_bin/gh"
           chmod +x "$fake_bin/gh"
           GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment
           rg -n "api|PATCH|repos/ohyeh/tmux-agent-tools/issues/comments/123|--input" "$fake_edit_args"
           jq -e '.body | contains("tmux-agent-tools transcript")' "$fake_edit_body"
+          edited_json="$(mktemp)"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment --output-format json > "$edited_json"
+          jq -e '.status == "edited" and .action == "edit" and .post_github_comment == true and .comment_id == "123" and .comment_url == "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-123" and (.gh_output | fromjson | .id == 123)' "$edited_json"
