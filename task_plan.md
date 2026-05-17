@@ -87,7 +87,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.6-debate-preset` next
+Branch: `feature/v0.6-debate-preset`
 
 Scope:
 
@@ -226,7 +226,8 @@ Verification evidence:
 - Structured GitHub comment result local validation passed on `feature/v0.6-github-comment-json-result`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `git diff --check`, `scripts/ci-shellcheck`, roadmap/README/CI/script anchor checks with `rg`, and fake pair-review GitHub comment smoke proving JSON dry-run post/edit do not call `gh`, JSON post/edit call fake `gh` only with explicit `--post-github-comment`, and JSON results report `dry_run`, `posted`, `edited`, `comment_url`, and `comment_id` as available.
 - Claude tmux-agent teammate reviewed the structured GitHub comment result diff and found no blockers with `VERDICT: SHIP`.
 - PR #87 merged as `761758b`; feature branch CI run `25976924280` and main CI run `25976956631` passed.
-- Pending for next branch: bounded debate preset implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
+- Bounded debate preset local validation passed on `feature/v0.6-debate-preset`: `git diff --check`, `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `scripts/ci-shellcheck`, Formula Ruby syntax check, wrapper self-tests, dialogue help smoke, roadmap/README/SKILL/CI/script anchor checks with `rg`, fake four-turn `debate` smoke proving alternating agent-a/agent-b transcript rows with `jq`, `validate-transcript`, `debate` summary label output, and odd `--turns` rejection.
+- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 

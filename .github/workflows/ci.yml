@@ -352,6 +352,20 @@ jobs:
             exit 1
           fi
           rg -n "critic --turns must be a positive even integer" /tmp/critic-odd-turns.out
+          debate_transcript_file="$(mktemp)"
+          debate_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue debate --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$debate_transcript_file" --summary-file "$debate_summary_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$debate_transcript_file"
+          rg -n "tmux-agent-tools debate|agent-a|agent-b" "$debate_summary_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue debate --turns 3 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/debate-odd-turns.jsonl --timeout 1 >/tmp/debate-odd-turns.out 2>&1; then
+            echo "debate must reject odd turn counts" >&2
+            exit 1
+          fi
+          rg -n "debate --turns must be a positive even integer" /tmp/debate-odd-turns.out
           summary_stdout="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" > "$summary_stdout"
           rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$summary_stdout"
