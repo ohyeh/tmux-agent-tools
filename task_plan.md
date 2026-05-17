@@ -81,17 +81,17 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 38. Merge status exit-code contract through PR #57 (`854b51e`). Done.
 39. Merge v0.5 exit-code state sync through PR #58 (`46df23e`). Done.
 40. Merge transcript schema-version validation through PR #60 (`61af464`). Done.
+41. Merge skill environment reference parity through PR #83 (`ca4730e`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.6-skill-env-reference-parity`
+Branch: create `feature/v0.6-json-summary-schema` next
 
 Scope:
 
 - implement the next `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
-- align `SKILL.md` environment references with the public README/wrapper contract;
+- add top-level schema metadata to `summarize --output-format json`;
 - keep this free of release publish, tag, GitHub Release, Formula bump, credentials, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
-- keep this slice free of release publish, tag, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
 
@@ -217,7 +217,8 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the shellcheck state sync diff and found no blockers with `VERDICT: SHIP`.
 - Skill env reference parity local validation passed on `feature/v0.6-skill-env-reference-parity`: `git diff --check`, workflow YAML name checks with `yq`, skill metadata smoke, README/SKILL public env parity checks with `rg`, and private hostname/path guard with `rg`.
 - Claude tmux-agent teammate reviewed the skill env reference parity diff and found no blockers with `VERDICT: SHIP`.
-- Pending for this branch: PR CI and merge.
+- PR #83 merged as `ca4730e`; feature branch CI run `25976405131` and main CI run `25976433533` passed.
+- Pending for next branch: JSON summary schema metadata implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
