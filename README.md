@@ -26,6 +26,7 @@ This project is inspired by two tmux skills in the `skills.sh` ecosystem:
 The `claude-tmux` and `codex-tmux` wrapper tools support:
 
 - `start`
+- `resume`
 - `start-ssh`
 - `attach`
 - `send`
@@ -46,6 +47,22 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 `tmux-agent-sessions` is included in the stable Homebrew install starting with `v0.3.0`.
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
+
+Resume an existing Claude Code conversation inside a managed tmux session:
+
+```bash
+claude-tmux resume --exact resume /Users/paul.yeh/github/tmux-agent-tools ee5aca88-a1af-48d3-af21-54f60d618f22
+```
+
+This launches Claude as `claude --dangerously-skip-permissions --resume <session-id>` while preserving the usual `claude-tmux status`, `capture`, `send`, `attach`, and `stop` controls.
+
+Resume an existing Codex conversation inside a managed tmux session:
+
+```bash
+codex-tmux resume --exact resume /Users/paul.yeh/github/tmux-agent-tools 019e356f-f95d-7570-9784-ea7b58e404a5
+```
+
+This launches Codex as `codex --yolo resume <session-id>` while preserving the usual `codex-tmux status`, `capture`, `send`, `attach`, and `stop` controls.
 
 `tmux-agent-dialogue` is included in the stable Homebrew install starting with `v0.2.0`. Its credential-free `fake` participants are covered by CI; real `codex`/`claude` participants are accepted by the command and should still use manual smoke evidence rather than default CI.
 

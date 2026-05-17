@@ -30,6 +30,7 @@ claude-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   claude-tmux start [--attach] [--exact] <name> <directory> [initial text]
+  claude-tmux resume [--attach] [--exact] <name> <directory> <session-id>
   claude-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
   claude-tmux attach <name>
   claude-tmux send <name> <text>
@@ -47,6 +48,7 @@ Usage:
 
 Examples:
   claude-tmux start --attach pr5 ~/github/core-parking-service
+  claude-tmux resume --exact pr5 ~/github/core-parking-service ee5aca88-a1af-48d3-af21-54f60d618f22
   claude-tmux start-ssh --attach pr5 openclaw-macmini ~/github/core-parking-service
   claude-tmux start --exact pr5 ~/github/core-parking-service 'hi'
   claude-tmux attach pr5
@@ -64,8 +66,8 @@ Examples:
 
 Behavior:
   - Session name is claude-cli-<name> by default.
-  - start appends a random 6-character suffix to <name>, unless --exact is used.
-  - start always recreates that named tmux session.
+  - start and resume append a random 6-character suffix to <name>, unless --exact is used.
+  - start and resume always recreate that named tmux session.
   - start-ssh keeps tmux local, then runs Claude through ssh in the remote directory.
   - Claude is launched with --dangerously-skip-permissions.
   - wait returns when the visible pane is stable for a few seconds.
@@ -312,6 +314,78 @@ start_session() {
   else
     echo "sent: <none>"
   fi
+
+  if (( should_attach )); then
+    "$TMUX" attach -t "$session"
+  fi
+}
+
+resume_session() {
+  require_bins
+  write_tmux_conf
+  local should_attach=0
+  local exact_name=0
+
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
+    case "$1" in
+      --attach)
+        should_attach=1
+        ;;
+      --exact)
+        exact_name=1
+        ;;
+    esac
+    shift
+  done
+
+  local requested_name="${1:-}"
+  local directory="${2:-}"
+  local claude_session_id="${3:-}"
+
+  if [[ -z "$requested_name" || -z "$directory" || -z "$claude_session_id" ]]; then
+    echo "Usage: claude-tmux resume [--attach] [--exact] <name> <directory> <session-id>" >&2
+    exit 2
+  fi
+
+  if [[ ! -d "$directory" ]]; then
+    echo "Directory not found: $directory" >&2
+    exit 1
+  fi
+
+  if [[ ! "$claude_session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    echo "Invalid Claude session id: $claude_session_id" >&2
+    exit 2
+  fi
+
+  local name="$requested_name"
+  if (( ! exact_name )); then
+    name="$requested_name-$(random_suffix)"
+  fi
+
+  local session="$(session_for_name "$name")"
+  local -a session_env_args
+  local session_env_entry
+  session_env_args=()
+  while IFS= read -r session_env_entry; do
+    [[ -n "$session_env_entry" ]] || continue
+    session_env_args+=("-e" "$session_env_entry")
+  done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+  fi
+
+  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'claude session id: $claude_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions --resume $(shell_quote "$claude_session_id"); code=\$?; printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  echo "agent: $name"
+  echo "Started $session"
+  echo "cwd:  $directory"
+  echo "claude session id: $claude_session_id"
+  echo "send: $SELF send $name <text>"
+  echo "wait: $SELF wait $name 180"
+  echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "wait-literal: $SELF wait-literal $name '<text>' 180"
+  echo "capture: $SELF capture $name 120"
 
   if (( should_attach )); then
     "$TMUX" attach -t "$session"
@@ -848,6 +922,9 @@ fi
 case "$command" in
   start)
     start_session "$@"
+    ;;
+  resume)
+    resume_session "$@"
     ;;
   start-ssh)
     start_ssh_session "$@"

@@ -29,6 +29,8 @@ If the commands are not installed on `PATH`, resolve them from the skill directo
 - Use `claude-tmux` when the requested worker should run Claude Code.
 - Use `codex-tmux` when the requested worker should run Codex CLI.
 - Use `start` for a local working directory.
+- Use `claude-tmux resume` when an existing Claude Code session ID should continue inside a managed tmux session.
+- Use `codex-tmux resume` when an existing Codex session ID should continue inside a managed tmux session.
 - Use `start-ssh` when the tmux session should stay local but the agent CLI should run through SSH on another machine.
 
 ## When Not To Use
@@ -43,6 +45,18 @@ If the commands are not installed on `PATH`, resolve them from the skill directo
 
 ```bash
 codex-tmux start --exact worker ~/github/project 'Read the repo and report the failing test.'
+```
+
+Resume an existing Claude Code session inside tmux:
+
+```bash
+claude-tmux resume --exact worker ~/github/project ee5aca88-a1af-48d3-af21-54f60d618f22
+```
+
+Resume an existing Codex session inside tmux:
+
+```bash
+codex-tmux resume --exact worker ~/github/project 019e356f-f95d-7570-9784-ea7b58e404a5
 ```
 
 2. Send follow-up work without attaching:
