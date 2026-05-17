@@ -85,15 +85,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 42. Merge JSON summary schema metadata through PR #85 (`17bb966`). Done.
 43. Merge structured GitHub comment result through PR #87 (`761758b`). Done.
 44. Merge bounded debate preset through PR #89 (`69799d2`). Done.
+45. Merge session inventory ergonomics through PR #91 (`a557711`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.6-session-inventory-ergonomics`
+Branch: create `feature/v0.6-current-state-refresh` next
 
 Scope:
 
-- implement the next `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
-- add scriptable session inventory ergonomics for sorted and filtered local inventory consumption;
+- refresh the `v0.6.0` current state and release-readiness docs while keeping the `v0.5.0` and `v0.6.0` non-dry-run release gates behind explicit operator go/no-go;
+- record all merged `v0.6.0` local-contract slices and prepare the next release-readiness branch scope without publishing anything;
 - keep this free of release publish, tag, GitHub Release, Formula bump, credentials, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -231,7 +232,9 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the bounded debate preset diff and found no blockers with `VERDICT: SHIP`.
 - PR #89 merged as `69799d2`; feature branch CI run `25977319588` and main CI run `25977351225` passed.
 - Session inventory ergonomics local validation passed on `feature/v0.6-session-inventory-ergonomics`: `git diff --check`, workflow YAML name checks with `yq`, `zsh -n` for `tmux-agent-sessions`, `scripts/ci-shellcheck`, Formula Ruby syntax check, wrapper self-tests, README/SKILL/CI/script anchor checks with `rg`, and local tmux smoke proving `list --sort name`, `list --sort session`, `list --state running --sort tool`, empty `--state exited`, watch snapshots with `--state running --sort name`, text output shape, and invalid `--sort` / `--state` rejection.
-- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
+- Claude tmux-agent teammate reviewed the session inventory ergonomics diff and found no blockers with `VERDICT: SHIP`.
+- PR #91 merged as `a557711`; feature branch CI run `25977612632` and main CI run `25977637928` passed.
+- Pending for next branch: v0.6 current-state refresh, release-readiness prep scope, local validation, Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
