@@ -82,15 +82,16 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 39. Merge v0.5 exit-code state sync through PR #58 (`46df23e`). Done.
 40. Merge transcript schema-version validation through PR #60 (`61af464`). Done.
 41. Merge skill environment reference parity through PR #83 (`ca4730e`). Done.
+42. Merge JSON summary schema metadata through PR #85 (`17bb966`). Done.
 
 ## Active Work
 
-Branch: `feature/v0.6-json-summary-schema`
+Branch: create `feature/v0.6-github-comment-json-result` next
 
 Scope:
 
 - implement the next `v0.6.0` slice from the roadmap while keeping the `v0.5.0` non-dry-run release gated on explicit operator go/no-go;
-- add top-level schema metadata to `summarize --output-format json`;
+- add a structured JSON result mode for `github-comment`;
 - keep this free of release publish, tag, GitHub Release, Formula bump, credentials, scheduling, cleanup, GitHub posting, or unrelated runtime side effects;
 - use Claude tmux-agent teammate review only;
 - keep all mainline changes going through PR.
@@ -219,7 +220,9 @@ Verification evidence:
 - Claude tmux-agent teammate reviewed the skill env reference parity diff and found no blockers with `VERDICT: SHIP`.
 - PR #83 merged as `ca4730e`; feature branch CI run `25976405131` and main CI run `25976433533` passed.
 - JSON summary schema metadata local validation passed on `feature/v0.6-json-summary-schema`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `git diff --check`, dialogue help smoke, roadmap/README/CI/script anchor checks with `rg`, and fake pair-review summary smoke proving default Markdown still renders while JSON stdout and JSON `--summary-file` include top-level `schema_version == "1"` with existing fields preserved.
-- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
+- Claude tmux-agent teammate reviewed the JSON summary schema metadata diff and found no blockers with `VERDICT: SHIP`.
+- PR #85 merged as `17bb966`; feature branch CI run `25976644042` and main CI run `25976674074` passed.
+- Pending for next branch: structured GitHub comment result implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
