@@ -85,7 +85,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.6-json-summary-schema` next
+Branch: `feature/v0.6-json-summary-schema`
 
 Scope:
 
@@ -218,7 +218,8 @@ Verification evidence:
 - Skill env reference parity local validation passed on `feature/v0.6-skill-env-reference-parity`: `git diff --check`, workflow YAML name checks with `yq`, skill metadata smoke, README/SKILL public env parity checks with `rg`, and private hostname/path guard with `rg`.
 - Claude tmux-agent teammate reviewed the skill env reference parity diff and found no blockers with `VERDICT: SHIP`.
 - PR #83 merged as `ca4730e`; feature branch CI run `25976405131` and main CI run `25976433533` passed.
-- Pending for next branch: JSON summary schema metadata implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
+- JSON summary schema metadata local validation passed on `feature/v0.6-json-summary-schema`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `git diff --check`, dialogue help smoke, roadmap/README/CI/script anchor checks with `rg`, and fake pair-review summary smoke proving default Markdown still renders while JSON stdout and JSON `--summary-file` include top-level `schema_version == "1"` with existing fields preserved.
+- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 
