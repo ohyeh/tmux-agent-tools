@@ -369,10 +369,10 @@ jobs:
           rg -n "truncated at 200 bytes" "$bytes_summary"
           json_summary="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format json --max-lines 12 --redact-pattern 'fake-[ab]' > "$json_summary"
-          jq -e '.format == "json" and .label == "transcript" and (.turns | length) == 2 and (.failures | length) == 0 and .metadata.output_format == "json" and .metadata.truncated_by_lines == true and .metadata.redacted == true and .metadata.redaction_pattern_count == 1 and ([.turns[].tail_lines[]] | any(contains("[REDACTED]"))) and ([.turns[].tail_lines[]] | all(contains("fake-") | not)) and (.rendered_markdown | contains("[REDACTED]") and contains("truncated at 12 lines"))' "$json_summary"
+          jq -e '.schema_version == "1" and .format == "json" and .label == "transcript" and (.turns | length) == 2 and (.failures | length) == 0 and .metadata.output_format == "json" and .metadata.truncated_by_lines == true and .metadata.redacted == true and .metadata.redaction_pattern_count == 1 and ([.turns[].tail_lines[]] | any(contains("[REDACTED]"))) and ([.turns[].tail_lines[]] | all(contains("fake-") | not)) and (.rendered_markdown | contains("[REDACTED]") and contains("truncated at 12 lines"))' "$json_summary"
           json_summary_file="$(mktemp)"
           skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format json --summary-file "$json_summary_file"
-          jq -e '.format == "json" and (.turns | length) == 2 and (.rendered_markdown | contains("tmux-agent-tools transcript"))' "$json_summary_file"
+          jq -e '.schema_version == "1" and .format == "json" and (.turns | length) == 2 and (.rendered_markdown | contains("tmux-agent-tools transcript"))' "$json_summary_file"
           if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --output-format json >/tmp/github-comment-output-format.out 2>&1; then
             echo "github-comment must reject --output-format" >&2
             exit 1

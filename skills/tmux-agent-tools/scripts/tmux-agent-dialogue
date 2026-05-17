@@ -722,6 +722,7 @@ build_shareable_pair_review_summary_json() {
       def redact:
         reduce $redaction_patterns[] as $pattern (. ; gsub($pattern; "[REDACTED]"));
       {
+        schema_version: "1",
         format: "json",
         label: $label,
         transcript: $transcript,
