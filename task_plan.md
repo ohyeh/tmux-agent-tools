@@ -86,7 +86,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.6-github-comment-json-result` next
+Branch: `feature/v0.6-github-comment-json-result`
 
 Scope:
 
@@ -222,7 +222,8 @@ Verification evidence:
 - JSON summary schema metadata local validation passed on `feature/v0.6-json-summary-schema`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `git diff --check`, dialogue help smoke, roadmap/README/CI/script anchor checks with `rg`, and fake pair-review summary smoke proving default Markdown still renders while JSON stdout and JSON `--summary-file` include top-level `schema_version == "1"` with existing fields preserved.
 - Claude tmux-agent teammate reviewed the JSON summary schema metadata diff and found no blockers with `VERDICT: SHIP`.
 - PR #85 merged as `17bb966`; feature branch CI run `25976644042` and main CI run `25976674074` passed.
-- Pending for next branch: structured GitHub comment result implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
+- Structured GitHub comment result local validation passed on `feature/v0.6-github-comment-json-result`: `zsh -n` for `tmux-agent-dialogue`, workflow YAML name checks with `yq`, `git diff --check`, `scripts/ci-shellcheck`, roadmap/README/CI/script anchor checks with `rg`, and fake pair-review GitHub comment smoke proving JSON dry-run post/edit do not call `gh`, JSON post/edit call fake `gh` only with explicit `--post-github-comment`, and JSON results report `dry_run`, `posted`, `edited`, `comment_url`, and `comment_id` as available.
+- Pending for this branch: Claude tmux-agent teammate review, PR CI, and merge.
 
 ## v0.2.0 Candidate Scope
 

@@ -29,7 +29,7 @@ Usage:
   tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
-  tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-repo <owner/repo> [--github-pr <number-or-url>|--edit-existing <comment-id>] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
+  tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-repo <owner/repo> [--github-pr <number-or-url>|--edit-existing <comment-id>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
 
 Example:
   tmux-agent-dialogue \
@@ -790,6 +790,58 @@ build_github_comment_body() {
   fi
 }
 
+print_github_comment_result_json() {
+  local result_status="$1"
+  local action="$2"
+  local body_file="$3"
+  local gh_output="${4:-}"
+  local body_byte_count
+  local comment_url=""
+  local comment_id=""
+  body_byte_count="$(LC_ALL=C wc -c < "$body_file" | tr -d ' ')"
+
+  if [[ -n "$gh_output" ]]; then
+    comment_url="$(print -r -- "$gh_output" | "$JQ" -Rrs 'capture("(?<url>https?://[^[:space:]\"]+)")?.url // ""')"
+    comment_id="$(print -r -- "$gh_output" | "$JQ" -Rrs 'try (fromjson.id | tostring) catch ""')"
+  fi
+  if [[ -z "$comment_id" && -n "$GITHUB_EDIT_EXISTING" ]]; then
+    comment_id="$GITHUB_EDIT_EXISTING"
+  fi
+
+  "$JQ" -n \
+    --arg schema_version "1" \
+    --arg status "$result_status" \
+    --arg action "$action" \
+    --arg github_repo "$GITHUB_REPO" \
+    --arg github_pr "$GITHUB_PR" \
+    --arg edit_existing "$GITHUB_EDIT_EXISTING" \
+    --arg output_format "json" \
+    --argjson post_github_comment "$POST_GITHUB_COMMENT" \
+    --argjson body_byte_count "$body_byte_count" \
+    --rawfile body "$body_file" \
+    --arg gh_output "$gh_output" \
+    --arg comment_url "$comment_url" \
+    --arg comment_id "$comment_id" \
+    '
+      {
+        schema_version: $schema_version,
+        mode: "github-comment",
+        status: $status,
+        action: $action,
+        output_format: $output_format,
+        post_github_comment: ($post_github_comment == 1),
+        github_repo: $github_repo,
+        github_pr: (if $github_pr == "" then null else $github_pr end),
+        edit_existing: (if $edit_existing == "" then null else $edit_existing end),
+        body_byte_count: $body_byte_count,
+        body: $body,
+        gh_output: (if $gh_output == "" then null else $gh_output end)
+      }
+      + (if $comment_url == "" then {} else {comment_url: $comment_url} end)
+      + (if $comment_id == "" then {} else {comment_id: $comment_id} end)
+    '
+}
+
 print_pair_review_summary() {
   build_pair_review_summary >&2
 }
@@ -798,28 +850,6 @@ write_pair_review_summary_file() {
   [[ -n "$SUMMARY_FILE" ]] || return 0
   build_pair_review_summary > "$SUMMARY_FILE"
   echo "summary file: $SUMMARY_FILE" >&2
-}
-
-post_pair_review_comment() {
-  (( POST_GITHUB_COMMENT )) || return 0
-  [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required with --post-github-comment"
-  [[ -n "$GH" && -x "$GH" ]] || die "gh not found; install GitHub CLI or set GH=/path/to/gh"
-
-  local body_file
-  body_file="$(mktemp)"
-  build_github_comment_body > "$body_file"
-
-  if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
-    local api_body_file
-    api_body_file="$(mktemp)"
-    "$JQ" -n --rawfile body "$body_file" '{body: $body}' > "$api_body_file"
-    "$GH" api --method PATCH "repos/$GITHUB_REPO/issues/comments/$GITHUB_EDIT_EXISTING" --input "$api_body_file"
-    echo "updated GitHub PR comment: $GITHUB_EDIT_EXISTING" >&2
-  else
-    [[ -n "$GITHUB_PR" ]] || die "--github-pr is required with --post-github-comment"
-    "$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file"
-    echo "posted GitHub PR comment: $GITHUB_PR" >&2
-  fi
 }
 
 run_summary_mode() {
@@ -855,14 +885,52 @@ run_github_comment_mode() {
     validate_transcript_file "$TRANSCRIPT"
   fi
 
-  if (( POST_GITHUB_COMMENT )); then
-    post_pair_review_comment
+  local body_file
+  local action
+  local gh_output=""
+  body_file="$(mktemp)"
+  build_github_comment_body > "$body_file"
+  if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+    action="edit"
   else
-    build_github_comment_body
+    action="post"
+  fi
+
+  if (( POST_GITHUB_COMMENT )); then
+    [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required with --post-github-comment"
+    [[ -n "$GH" && -x "$GH" ]] || die "gh not found; install GitHub CLI or set GH=/path/to/gh"
+
     if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
-      echo "dry-run: add --post-github-comment to update GitHub comment $GITHUB_EDIT_EXISTING" >&2
+      local api_body_file
+      api_body_file="$(mktemp)"
+      "$JQ" -n --rawfile body "$body_file" '{body: $body}' > "$api_body_file"
+      gh_output="$("$GH" api --method PATCH "repos/$GITHUB_REPO/issues/comments/$GITHUB_EDIT_EXISTING" --input "$api_body_file")"
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        print_github_comment_result_json "edited" "$action" "$body_file" "$gh_output"
+      else
+        [[ -z "$gh_output" ]] || print -r -- "$gh_output"
+        echo "updated GitHub PR comment: $GITHUB_EDIT_EXISTING" >&2
+      fi
     else
-      echo "dry-run: add --post-github-comment to post to GitHub" >&2
+      [[ -n "$GITHUB_PR" ]] || die "--github-pr is required with --post-github-comment"
+      gh_output="$("$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file")"
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        print_github_comment_result_json "posted" "$action" "$body_file" "$gh_output"
+      else
+        [[ -z "$gh_output" ]] || print -r -- "$gh_output"
+        echo "posted GitHub PR comment: $GITHUB_PR" >&2
+      fi
+    fi
+  else
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+      print_github_comment_result_json "dry_run" "$action" "$body_file"
+    else
+      cat "$body_file"
+      if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+        echo "dry-run: add --post-github-comment to update GitHub comment $GITHUB_EDIT_EXISTING" >&2
+      else
+        echo "dry-run: add --post-github-comment to post to GitHub" >&2
+      fi
     fi
   fi
 }
@@ -1037,7 +1105,7 @@ if [[ -n "$MAX_LINES" || -n "$MAX_BYTES" || ${#REDACT_PATTERNS[@]} -gt 0 ]]; the
   [[ "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--max-lines, --max-bytes, and --redact-pattern are only supported with summarize or github-comment"
 fi
 [[ "$OUTPUT_FORMAT" == "markdown" || "$OUTPUT_FORMAT" == "json" ]] || die "--output-format must be markdown or json"
-[[ "$OUTPUT_FORMAT_SET" -eq 0 || "$MODE" == "summarize" ]] || die "--output-format is only supported with summarize"
+[[ "$OUTPUT_FORMAT_SET" -eq 0 || "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--output-format is only supported with summarize or github-comment"
 [[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 || "$MODE" == "validate-transcript" ]] || die "--schema-version is only supported with validate-transcript"
 [[ "$PAIR_REVIEW_SWAP" -eq 0 || "$MODE" == "pair-review" ]] || die "--swap is only supported with pair-review"
 [[ -z "$GITHUB_EDIT_EXISTING" || "$MODE" == "github-comment" ]] || die "--edit-existing is only supported with github-comment"

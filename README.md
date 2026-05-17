@@ -284,11 +284,12 @@ Before sharing a rendered summary, limit or redact the Markdown body:
 ```bash
 tmux-agent-dialogue summarize --transcript review.jsonl --max-lines 80 --redact-pattern 'token_[A-Za-z0-9]+'
 tmux-agent-dialogue summarize --transcript review.jsonl --output-format json
+tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo --output-format json
 tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo --max-bytes 60000 --redact-pattern 'secret-[^ ]+'
 tmux-agent-dialogue github-comment --summary-file review-summary.md --github-pr 123 --github-repo owner/repo --max-lines 80
 ```
 
-`--redact-pattern` can be repeated. Redaction and truncation notes are included in the generated Markdown, and the dry-run `github-comment` body is the same body used for `--post-github-comment`. `summarize --output-format json` keeps Markdown as the default format while adding top-level `schema_version: "1"` plus structured `turns`, `failures`, `metadata`, and `rendered_markdown` fields for scripts; `--summary-file` writes the selected format. `github-comment` remains Markdown-only.
+`--redact-pattern` can be repeated. Redaction and truncation notes are included in the generated Markdown, and the dry-run `github-comment` body is the same body used for `--post-github-comment`. `summarize --output-format json` keeps Markdown as the default format while adding top-level `schema_version: "1"` plus structured `turns`, `failures`, `metadata`, and `rendered_markdown` fields for scripts; `--summary-file` writes the selected format. `github-comment --output-format json` returns a structured local result with `status` (`dry_run`, `posted`, or `edited`), `action`, repository fields, rendered body metadata, and `comment_url` or `comment_id` only when available from `gh`; GitHub writes still require explicit `--post-github-comment`.
 
 ## Requirements
 
