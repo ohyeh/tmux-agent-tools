@@ -26,6 +26,7 @@ Usage:
   tmux-agent-dialogue --turns <n> --workdir <dir> (--agent-a <codex|claude|fake>|--agent-a-profile <name>) (--agent-b <codex|claude|fake>|--agent-b-profile <name>) --prompt-file <path> --transcript <path|-> [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--swap] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue debate --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <codex|claude|fake>] [--agent-b <codex|claude|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
   tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
   tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
@@ -45,7 +46,7 @@ Behavior:
   - waits for a unique marker after each turn;
   - writes one JSONL object per turn;
   - validates transcript JSONL before summary or GitHub comment rendering;
-  - pair-review, critic, and handoff are thin presets and print local summaries;
+  - pair-review, critic, debate, and handoff are thin presets and print local summaries;
   - pair-review --swap reverses speaker order without changing participant definitions;
   - --on-blocked-trigger writes a local JSON artifact only when a participant appears blocked;
   - github-comment prints a dry-run body unless --post-github-comment is explicit;
@@ -967,6 +968,10 @@ make_turn_prompt() {
     instruction="Produce a concise context handoff: current objective, important constraints, evidence already gathered, open risks, and the next concrete action."
   elif [[ "$MODE" == "handoff" && "$turn" -eq 2 ]]; then
     instruction="Respond to the handoff with readiness, risks, missing context, and the next-action summary. Do not continue executing the task."
+  elif [[ "$MODE" == "debate" && $(( turn % 2 )) -eq 1 ]]; then
+    instruction="Argue the strongest case for your position, respond to the previous points, and name concrete evidence or risks. Do not declare a winner or continue unbounded."
+  elif [[ "$MODE" == "debate" ]]; then
+    instruction="Argue the strongest opposing or refining case, respond to the previous points, and name concrete evidence or risks. Do not declare a winner or continue unbounded."
   fi
 
   cat <<EOF
@@ -1050,6 +1055,13 @@ elif [[ "${1:-}" == "critic" ]]; then
   AGENT_A="codex"
   AGENT_B="claude"
   shift
+elif [[ "${1:-}" == "debate" ]]; then
+  MODE="debate"
+  SUMMARY_LABEL="debate"
+  TURN_COUNT=4
+  AGENT_A="codex"
+  AGENT_B="claude"
+  shift
 elif [[ "${1:-}" == "handoff" ]]; then
   MODE="handoff"
   SUMMARY_LABEL="handoff"
@@ -1111,7 +1123,7 @@ fi
 [[ -z "$GITHUB_EDIT_EXISTING" || "$MODE" == "github-comment" ]] || die "--edit-existing is only supported with github-comment"
 [[ -z "$GITHUB_EDIT_EXISTING" || "$GITHUB_EDIT_EXISTING" =~ ^[0-9]+$ ]] || die "--edit-existing must be a GitHub comment id"
 if [[ -n "$AGENT_A_PROFILE" || -n "$AGENT_B_PROFILE" ]]; then
-  [[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" ]] || die "--agent-a-profile and --agent-b-profile are only supported with dialogue, pair-review, critic, or handoff"
+  [[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" ]] || die "--agent-a-profile and --agent-b-profile are only supported with dialogue, pair-review, critic, debate, or handoff"
 fi
 [[ -z "$MAX_LINES" || ( "$MAX_LINES" =~ '^[0-9]+$' && "$MAX_LINES" -gt 0 ) ]] || die "--max-lines must be a positive integer"
 [[ -z "$MAX_BYTES" || ( "$MAX_BYTES" =~ '^[0-9]+$' && "$MAX_BYTES" -gt 0 ) ]] || die "--max-bytes must be a positive integer"
@@ -1139,6 +1151,7 @@ fi
 
 [[ "$TURN_COUNT" =~ '^[0-9]+$' && "$TURN_COUNT" -gt 0 ]] || die "--turns must be a positive integer"
 [[ "$MODE" != "critic" || $(( TURN_COUNT % 2 )) -eq 0 ]] || die "critic --turns must be a positive even integer"
+[[ "$MODE" != "debate" || $(( TURN_COUNT % 2 )) -eq 0 ]] || die "debate --turns must be a positive even integer"
 [[ "$MODE" != "handoff" || "$TURN_COUNT" -eq 2 ]] || die "handoff runs exactly two turns"
 [[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer"
 [[ -n "$WORKDIR" && -d "$WORKDIR" ]] || die "--workdir must be an existing directory"
@@ -1156,8 +1169,8 @@ apply_profile b "$AGENT_B_PROFILE" "$AGENT_B_SET" "$AGENT_B_SSH_SET" "$AGENT_B_W
 [[ -z "$AGENT_B_SSH" || -n "$AGENT_B_WORKDIR" ]] || die "--agent-b-workdir is required when --agent-b-ssh is set"
 [[ -z "$AGENT_A_SSH" || "$AGENT_A_WORKDIR" == /* ]] || die "--agent-a-workdir must be an absolute remote path when --agent-a-ssh is set"
 [[ -z "$AGENT_B_SSH" || "$AGENT_B_WORKDIR" == /* ]] || die "--agent-b-workdir must be an absolute remote path when --agent-b-ssh is set"
-[[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" || -z "$SUMMARY_FILE" ]] || die "--summary-file is only supported with pair-review, critic, or handoff"
-[[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" || -z "$ON_BLOCKED_TRIGGER" ]] || die "--on-blocked-trigger is only supported with dialogue, pair-review, critic, or handoff"
+[[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" || -z "$SUMMARY_FILE" ]] || die "--summary-file is only supported with pair-review, critic, debate, or handoff"
+[[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" || -z "$ON_BLOCKED_TRIGGER" ]] || die "--on-blocked-trigger is only supported with dialogue, pair-review, critic, debate, or handoff"
 [[ "$POST_GITHUB_COMMENT" -eq 0 ]] || die "--post-github-comment is only supported with github-comment"
 [[ -z "$GITHUB_PR" ]] || die "--github-pr is only supported with github-comment"
 [[ -z "$GITHUB_REPO" ]] || die "--github-repo is only supported with github-comment"
@@ -1269,7 +1282,7 @@ $previous")"
 done
 
 echo "dialogue complete: turns=$TURN_COUNT transcript=$TRANSCRIPT" >&2
-if [[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "handoff" ]]; then
+if [[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" ]]; then
   print_pair_review_summary
   write_pair_review_summary_file
 fi
