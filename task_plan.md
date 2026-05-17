@@ -84,7 +84,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 
 ## Active Work
 
-Branch: create `feature/v0.6-skill-env-reference-parity` next
+Branch: `feature/v0.6-skill-env-reference-parity`
 
 Scope:
 
@@ -215,7 +215,9 @@ Verification evidence:
 - Claude tmux-agent teammate re-reviewed after the executable-bit fix and found no blockers with `VERDICT: SHIP`.
 - PR #81 merged as `64d7142`; feature branch CI run `25976129168` and main CI run `25976153865` passed.
 - Claude tmux-agent teammate reviewed the shellcheck state sync diff and found no blockers with `VERDICT: SHIP`.
-- Pending for next branch: skill env reference parity implementation, local validation, Claude tmux-agent teammate review, PR CI, and merge.
+- Skill env reference parity local validation passed on `feature/v0.6-skill-env-reference-parity`: `git diff --check`, workflow YAML name checks with `yq`, skill metadata smoke, README/SKILL public env parity checks with `rg`, and private hostname/path guard with `rg`.
+- Claude tmux-agent teammate reviewed the skill env reference parity diff and found no blockers with `VERDICT: SHIP`.
+- Pending for this branch: PR CI and merge.
 
 ## v0.2.0 Candidate Scope
 
