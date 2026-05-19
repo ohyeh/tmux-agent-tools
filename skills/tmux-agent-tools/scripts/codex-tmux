@@ -97,7 +97,15 @@ require_bins() {
   fi
 
   if [[ -z "$CODEX" || ! -x "$CODEX" ]]; then
-    echo "codex not found. Install Codex CLI or set CODEX=/path/to/codex." >&2
+    local codex_lookup
+    codex_lookup="$(command -v codex 2>/dev/null || true)"
+    echo "codex not found at ${CODEX:-<empty>}." >&2
+    if [[ -n "$codex_lookup" ]]; then
+      echo "Current PATH resolves codex to: $codex_lookup" >&2
+      echo "Unset CODEX or set CODEX=$codex_lookup to use that install." >&2
+    else
+      echo "Current PATH does not resolve codex. Install Codex CLI or set CODEX=/path/to/codex." >&2
+    fi
     exit 1
   fi
 }
