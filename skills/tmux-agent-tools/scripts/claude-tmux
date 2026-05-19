@@ -97,7 +97,15 @@ require_bins() {
   fi
 
   if [[ -z "$CLAUDE" || ! -x "$CLAUDE" ]]; then
-    echo "claude not found. Install Claude Code or set CLAUDE=/path/to/claude." >&2
+    local claude_lookup
+    claude_lookup="$(command -v claude 2>/dev/null || true)"
+    echo "claude not found at ${CLAUDE:-<empty>}." >&2
+    if [[ -n "$claude_lookup" ]]; then
+      echo "Current PATH resolves claude to: $claude_lookup" >&2
+      echo "Unset CLAUDE or set CLAUDE=$claude_lookup to use that install." >&2
+    else
+      echo "Current PATH does not resolve claude. Install Claude Code or set CLAUDE=/path/to/claude." >&2
+    fi
     exit 1
   fi
 }
