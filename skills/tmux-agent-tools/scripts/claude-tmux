@@ -554,6 +554,145 @@ sentinel_inline_block() {
   printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
 }
 
+# --- Safety fuses: --max-runtime / --max-idle (issue #105) ----------------
+# Consumes `--max-runtime <seconds>` and `--max-idle <seconds>` from "$@",
+# exposing MAX_FUSE_PARSE_REMAINING with the rest of the argv. Caller must
+# pre-declare scalar locals `max_runtime` and `max_idle` (empty = unset).
+parse_max_fuse_flags() {
+  MAX_FUSE_PARSE_REMAINING=()
+  while [[ "${1:-}" == "--max-runtime" || "${1:-}" == "--max-idle" ]]; do
+    case "$1" in
+      --max-runtime)
+        if (( $# < 2 )); then
+          echo "--max-runtime requires a value (seconds)" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--max-runtime must be a positive integer (seconds): $2" >&2
+          exit 2
+        fi
+        max_runtime="$2"
+        shift 2
+        ;;
+      --max-idle)
+        if (( $# < 2 )); then
+          echo "--max-idle requires a value (seconds)" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--max-idle must be a positive integer (seconds): $2" >&2
+          exit 2
+        fi
+        max_idle="$2"
+        shift 2
+        ;;
+    esac
+  done
+  MAX_FUSE_PARSE_REMAINING=("$@")
+}
+
+# Background watcher loop, runs in a detached subshell launched via nohup.
+# Polls the tmux session every second; if --max-runtime or --max-idle is
+# tripped, writes 124 + reason to the sentinel/reason sidecar, runs the
+# on-exit hook with ON_EXIT_REASON, and tears down the tmux session.
+#
+# Invariants:
+#   - Both fuses may coexist; whichever fires first wins.
+#   - Watcher exits silently when the tmux session disappears (normal stop
+#     handled teardown).
+#   - Pane idle = sha256 of `capture-pane -p` unchanged. Hash kept in the
+#     watcher's own memory to avoid racing `status --json`'s hash file.
+max_fuse_watcher_loop() {
+  local agent_name="$1" tmux_session="$2" sentinel="$3" on_exit_cmd="$4"
+  local max_runtime="$5" max_idle="$6" tmux_bin="$7"
+  zmodload zsh/datetime 2>/dev/null || true
+  local started_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  local last_hash=""
+  local last_change_epoch="$started_epoch"
+  local reason=""
+  local now_epoch pane_text new_hash
+  while :; do
+    sleep 1
+    if ! "$tmux_bin" has-session -t "$tmux_session" 2>/dev/null; then
+      return 0
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if [[ -n "$max_runtime" ]] && (( now_epoch - started_epoch >= max_runtime )); then
+      reason="max_runtime"
+      break
+    fi
+    if [[ -n "$max_idle" ]]; then
+      pane_text="$("$tmux_bin" capture-pane -p -t "$tmux_session" 2>/dev/null || true)"
+      if command -v sha256sum >/dev/null 2>&1; then
+        new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
+      else
+        new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+      fi
+      if [[ "$new_hash" != "$last_hash" ]]; then
+        last_hash="$new_hash"
+        last_change_epoch="$now_epoch"
+      elif (( now_epoch - last_change_epoch >= max_idle )); then
+        reason="max_idle"
+        break
+      fi
+    fi
+  done
+
+  if [[ -z "$reason" ]]; then
+    return 0
+  fi
+
+  # Trip: write sentinel + reason BEFORE killing the session so the pane
+  # epilogue's own sentinel write loses the race (mv -f is last writer,
+  # and we want 124 to win).
+  if [[ -n "$sentinel" ]]; then
+    ( printf '%s\n' "124" > "$sentinel.tmp" && mv -f "$sentinel.tmp" "$sentinel" ) 2>/dev/null || true
+    ( printf '%s\n' "$reason" > "$sentinel.reason.tmp" && mv -f "$sentinel.reason.tmp" "$sentinel.reason" ) 2>/dev/null || true
+  fi
+  if [[ -n "$on_exit_cmd" && -n "$sentinel" ]]; then
+    (
+      export ON_EXIT_CODE=124 ON_EXIT_NAME="$agent_name" ON_EXIT_REASON="$reason"
+      eval "$on_exit_cmd"
+    ) >> "$sentinel.hook.log" 2>&1 || true
+  fi
+  "$tmux_bin" kill-session -t "$tmux_session" 2>/dev/null || true
+  rm -f "$(agent_root_dir)/$agent_name/fuse.pid" 2>/dev/null || true
+  return 0
+}
+
+# Spawn the watcher as a detached background process. Records PID under
+# $TMUX_AGENT_DIR/<name>/fuse.pid so `stop` can kill it before tearing
+# down tmux.
+spawn_max_fuse_watcher() {
+  local agent_name="$1" tmux_session="$2" sentinel="$3" on_exit_cmd="$4"
+  local max_runtime="$5" max_idle="$6"
+  [[ -z "$max_runtime" && -z "$max_idle" ]] && return 0
+  local subdir
+  subdir="$(ensure_agent_dir "$agent_name")"
+  local pid_file="$subdir/fuse.pid"
+  nohup "$SELF" __fuse_watcher \
+    "$agent_name" "$tmux_session" "$sentinel" "$on_exit_cmd" \
+    "$max_runtime" "$max_idle" "$TMUX" \
+    >/dev/null 2>&1 </dev/null &
+  local watcher_pid=$!
+  disown 2>/dev/null || true
+  printf '%s\n' "$watcher_pid" > "$pid_file" 2>/dev/null || true
+}
+
+# Kill the watcher PID recorded by spawn_max_fuse_watcher, if any.
+kill_max_fuse_watcher() {
+  local agent_name="$1"
+  local pid_file
+  pid_file="$(agent_root_dir)/$agent_name/fuse.pid"
+  [[ -f "$pid_file" ]] || return 0
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file" 2>/dev/null || true
+}
+
 run_on_start_hook() {
   # Fires the --on-start hook (issue #101a) after `tmux new-session` returns.
   # Best-effort timing: pane is created but the CLI may not yet have rendered
@@ -1030,6 +1169,11 @@ start_session() {
   parse_sentinel_flags "$@"
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
+  local max_runtime=""
+  local max_idle=""
+  parse_max_fuse_flags "$@"
+  set -- "${MAX_FUSE_PARSE_REMAINING[@]}"
+
   local transcript_path=""
   local transcript_truncate=""
   while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" ]]; do
@@ -1063,7 +1207,7 @@ start_session() {
   local initial_text="${*:-}"
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: claude-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
+    echo "Usage: claude-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
@@ -1129,6 +1273,7 @@ start_session() {
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions; code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
+  spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
 
   if [[ -n "$transcript_path" ]]; then
@@ -1188,6 +1333,11 @@ resume_session() {
   local sentinel_keep=0
   parse_sentinel_flags "$@"
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
+
+  local max_runtime=""
+  local max_idle=""
+  parse_max_fuse_flags "$@"
+  set -- "${MAX_FUSE_PARSE_REMAINING[@]}"
 
   local transcript_path=""
   local transcript_truncate=""
@@ -1286,6 +1436,7 @@ resume_session() {
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'claude session id: $claude_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions --resume $(shell_quote "$claude_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
+  spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
 
   if [[ -n "$transcript_path" ]]; then
@@ -2297,6 +2448,10 @@ stop_session() {
     exit 2
   fi
 
+  # Kill the safety-fuse watcher (issue #105) BEFORE tearing down tmux so
+  # the watcher cannot race a sentinel write against a clean stop.
+  kill_max_fuse_watcher "$name"
+
   local session
   session="$(session_for_name "$name")"
   local stopped=0
@@ -2334,6 +2489,12 @@ if [[ "$#" -gt 0 ]]; then
 fi
 
 case "$command" in
+  __fuse_watcher)
+    # Internal: detached safety-fuse watcher (issue #105). Args:
+    # <agent_name> <tmux_session> <sentinel> <on_exit_cmd> <max_runtime> <max_idle> <tmux_bin>
+    max_fuse_watcher_loop "$@"
+    exit 0
+    ;;
   start)
     start_session "$@"
     ;;
