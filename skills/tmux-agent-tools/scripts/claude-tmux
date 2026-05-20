@@ -797,6 +797,26 @@ transcript_truncate_text() {
   fi
 }
 
+transcript_emit_wait_event() {
+  # Emit a single wait_* event into the transcript when one is configured
+  # (issue #141). Caller passes the wrapper-specific wait kind and the
+  # outcome reason. needle/timeout are best-effort metadata.
+  local name="$1" event_name="$2" outcome="$3" needle="${4:-}" timeout="${5:-}"
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  [[ -n "$transcript_path" ]] || return 0
+  local line
+  line="$("$JQ" -c -n \
+    --arg event "$event_name" --arg name "$name" --arg outcome "$outcome" \
+    --arg needle "$needle" --arg timeout "$timeout" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, event: $event, name: $name, outcome: $outcome,
+      needle: (if $needle == "" then null else $needle end),
+      timeout_seconds: (if $timeout == "" then null else ($timeout | tonumber) end),
+      at: $at}')"
+  transcript_append "$transcript_path" "$line"
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 
 record_started_at() {
@@ -1404,12 +1424,14 @@ send_wait_literal_session() {
     current_count="$(count_literal_occurrences "$current" "$needle")"
     if (( current_count > before_count )); then
       marker_seen_add "$name" "$needle"
+      transcript_emit_wait_event "$name" send_wait_literal matched "$needle" "$timeout_seconds"
       echo "matched new literal: $needle"
       return 0
     fi
     sleep 1
   done
 
+  transcript_emit_wait_event "$name" send_wait_literal timeout "$needle" "$timeout_seconds"
   echo "timeout waiting for new literal text '$needle': $session" >&2
   return 1
 }
@@ -1709,6 +1731,7 @@ wait_session() {
     if [[ "$current" == "$last" ]]; then
       stable_count=$((stable_count + 1))
       if (( stable_count >= STABLE_SECONDS )); then
+        transcript_emit_wait_event "$name" wait stable "" "$timeout_seconds"
         echo "stable"
         return 0
       fi
@@ -1719,6 +1742,7 @@ wait_session() {
     sleep 1
   done
 
+  transcript_emit_wait_event "$name" wait timeout "" "$timeout_seconds"
   echo "timeout waiting for stable output: $session" >&2
   return 1
 }
@@ -1762,12 +1786,14 @@ wait_text_session() {
   while (( SECONDS < deadline )); do
     current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
     if [[ "$current" =~ $pattern ]]; then
+      transcript_emit_wait_event "$name" wait_text matched "$pattern" "$timeout_seconds"
       echo "matched: $pattern"
       return 0
     fi
     sleep 1
   done
 
+  transcript_emit_wait_event "$name" wait_text timeout "$pattern" "$timeout_seconds"
   echo "timeout waiting for text '$pattern': $session" >&2
   return 1
 }
@@ -1801,12 +1827,14 @@ wait_literal_session() {
     current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
     if [[ "$current" == *"$needle"* ]]; then
       marker_seen_add "$name" "$needle"
+      transcript_emit_wait_event "$name" wait_literal matched "$needle" "$timeout_seconds"
       echo "matched literal: $needle"
       return 0
     fi
     sleep 1
   done
 
+  transcript_emit_wait_event "$name" wait_literal timeout "$needle" "$timeout_seconds"
   echo "timeout waiting for literal text '$needle': $session" >&2
   return 1
 }
@@ -1944,8 +1972,10 @@ wait_and_capture_session() {
   local reason
   if (( matched )); then
     reason="matched"
+    transcript_emit_wait_event "$name" wait_and_capture matched "$marker" "$timeout_seconds"
   else
     reason="timeout"
+    transcript_emit_wait_event "$name" wait_and_capture timeout "$marker" "$timeout_seconds"
   fi
 
   if (( output_json )); then
