@@ -1,0 +1,67 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #120 v1 slice: --ci flag.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-ci-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_ci_marker() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix --ci writes ci-mode marker"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --ci "$prefix" "$WORK" >/dev/null
+  /bin/sleep 1
+  local marker="$TMUX_AGENT_DIR/$prefix/ci-mode"
+  assert "$prefix ci-mode marker exists" "$(test -f "$marker" && echo yes)" "yes"
+  assert "$prefix ci-mode marker contents" "$(cat "$marker" 2>/dev/null | tr -d '\n')" "1"
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_no_ci_no_marker() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix no --ci → no marker"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-noci" "$WORK" >/dev/null
+  /bin/sleep 1
+  local marker="$TMUX_AGENT_DIR/$prefix-noci/ci-mode"
+  if [[ -e "$marker" ]]; then
+    echo "  FAIL $prefix marker should not exist" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix no marker without --ci"
+    PASS=$((PASS + 1))
+  fi
+  "$wrapper" stop "$prefix-noci" >/dev/null 2>&1 || true
+}
+
+run_ci_marker        "$CODEX_TMUX"  "CODEX"  "ci-codex"
+run_ci_marker        "$CLAUDE_TMUX" "CLAUDE" "ci-claude"
+run_no_ci_no_marker  "$CODEX_TMUX"  "CODEX"  "nc-codex"
+run_no_ci_no_marker  "$CLAUDE_TMUX" "CLAUDE" "nc-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

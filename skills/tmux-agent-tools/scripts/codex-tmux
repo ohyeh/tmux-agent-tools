@@ -1414,9 +1414,10 @@ start_session() {
   local transcript_truncate=""
   local result_schema_path=""
   local usage_path=""
+  local ci_mode=0
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" ]]; do
     case "$1" in
       --transcript|--record)
         if (( $# < 2 )); then
@@ -1477,6 +1478,10 @@ start_session() {
         fi
         usage_path="$2"
         shift 2
+        ;;
+      --ci)
+        ci_mode=1
+        shift
         ;;
     esac
   done
@@ -1541,6 +1546,9 @@ start_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  if (( ci_mode )); then
+    ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
+  fi
   if [[ -n "$usage_path" ]]; then
     usage_record_path "$name" "$usage_path"
   fi
@@ -1636,9 +1644,10 @@ resume_session() {
   local transcript_truncate=""
   local result_schema_path=""
   local usage_path=""
+  local ci_mode=0
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" ]]; do
     case "$1" in
       --transcript|--record)
         if (( $# < 2 )); then
@@ -1700,6 +1709,10 @@ resume_session() {
         usage_path="$2"
         shift 2
         ;;
+      --ci)
+        ci_mode=1
+        shift
+        ;;
     esac
   done
 
@@ -1748,6 +1761,9 @@ resume_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  if (( ci_mode )); then
+    ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
+  fi
   if [[ -n "$usage_path" ]]; then
     usage_record_path "$name" "$usage_path"
   fi
