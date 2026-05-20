@@ -1,0 +1,70 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #106 help <subcommand> discoverability.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+PASS=0
+FAIL=0
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    needle:   $needle" >&2
+    echo "    haystack (first 200): ${haystack:0:200}" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_exit() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected exit=$expected got exit=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Subcommands that MUST get focused help — change-detecting list
+TOPICS=(start resume start-ssh send send-wait-literal wait wait-text \
+        wait-literal wait-and-capture capture result status list \
+        attach stop doctor self-test help)
+
+run_wrapper() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix help dispatch ($wrapper)"
+  # `help` with no arg → falls through to full usage
+  local out
+  out="$("$wrapper" help 2>&1)"
+  assert_contains "$prefix help (no arg) → usage" "$out" "Usage:"
+
+  for topic in "${TOPICS[@]}"; do
+    out="$("$wrapper" help "$topic" 2>&1)"
+    # Focused help must mention the topic name as part of the cheatsheet
+    assert_contains "$prefix help $topic mentions topic" "$out" "$topic"
+  done
+
+  # Unknown topic → exit 2 + helpful list
+  local code=0
+  out="$("$wrapper" help bogus-not-a-topic 2>&1)" || code=$?
+  assert_exit "$prefix help bogus exit=2" "2" "$code"
+  assert_contains "$prefix help bogus lists topics" "$out" "Available topics"
+}
+
+run_wrapper "$CODEX_TMUX"  "codex"
+run_wrapper "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
