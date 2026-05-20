@@ -1,3 +1,8 @@
 .DS_Store
 *.swp
 *.tmp
+
+# Agent worktrees (issue #126 dispatch)
+.claude/worktrees/
+# macOS SMB transient files
+**/.smbdelete*
