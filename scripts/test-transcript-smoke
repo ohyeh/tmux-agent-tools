@@ -172,6 +172,45 @@ run_truncate_invalid() {
   assert "$prefix-tinv2 exit=2 on zero" "$code" "2"
 }
 
+run_wait_events() {
+  # #141: wait/wait-text/wait-literal/send-wait-literal/wait-and-capture
+  # must each emit a transcript event with outcome=matched|timeout and
+  # the needle/timeout metadata when a transcript is configured.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-wait-events ($wrapper)"
+  local transcript="$WORK/$prefix-wait.jsonl"
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix-we" "$WORK" >/dev/null
+  /bin/sleep 2
+
+  # wait-literal that succeeds (fake-quiet emits "ready")
+  "$wrapper" wait-literal "$prefix-we" "ready" 5 >/dev/null
+
+  # wait-text regex that succeeds
+  "$wrapper" wait-text "$prefix-we" "rea.*" 5 >/dev/null
+
+  # wait-literal that times out
+  "$wrapper" wait-literal "$prefix-we" "MISS-MARKER" 2 >/dev/null 2>&1 || true
+
+  /bin/sleep 1
+  local n
+  n="$(jq -c 'select(.event=="wait_literal" and .outcome=="matched") | .needle' "$transcript" | head -1)"
+  assert "$prefix wait_literal matched event recorded" "$n" '"ready"'
+
+  n="$(jq -c 'select(.event=="wait_text" and .outcome=="matched") | .needle' "$transcript" | head -1)"
+  assert "$prefix wait_text matched event recorded" "$n" '"rea.*"'
+
+  n="$(jq -c 'select(.event=="wait_literal" and .outcome=="timeout") | .needle' "$transcript" | head -1)"
+  assert "$prefix wait_literal timeout event recorded" "$n" '"MISS-MARKER"'
+
+  # Every event must carry schema_version: 1 + at timestamp
+  local missing_sv
+  missing_sv="$(jq -c 'select(.event | startswith("wait")) | select(.schema_version != 1) | .event' "$transcript" | head -1)"
+  assert "$prefix every wait event has schema_version=1" "$missing_sv" ""
+
+  "$wrapper" stop "$prefix-we" >/dev/null 2>&1 || true
+}
+
 run_transcript        "$CODEX_TMUX"  "CODEX"  "tr-codex"  "codex"
 run_transcript        "$CLAUDE_TMUX" "CLAUDE" "tr-claude" "claude"
 run_stale_reject      "$CODEX_TMUX"  "CODEX"  "codex"
@@ -182,6 +221,8 @@ run_truncate          "$CODEX_TMUX"  "CODEX"  "trc-codex"
 run_truncate          "$CLAUDE_TMUX" "CLAUDE" "trc-claude"
 run_truncate_invalid  "$CODEX_TMUX"  "tic-codex"
 run_truncate_invalid  "$CLAUDE_TMUX" "tic-claude"
+run_wait_events       "$CODEX_TMUX"  "CODEX"  "we-codex"
+run_wait_events       "$CLAUDE_TMUX" "CLAUDE" "we-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
 run_missing_value_reject "$CLAUDE_TMUX" "claude"
 
