@@ -1146,6 +1146,45 @@ result_validate_lightweight() {
   [[ "$valid" == "true" ]] && return 0 || return 2
 }
 
+tag_record() {
+  # Persist --tag key=value pairs (#124) under $TMUX_AGENT_DIR/<name>/tags.json.
+  # Args: $1 name, $2 raw "k=v" string. Validates k matches [A-Za-z0-9_.-]+.
+  # Multiple values for the same key are kept (last write wins per repeat).
+  local name="$1" kv="$2"
+  if [[ "$kv" != *=* ]]; then
+    echo "--tag must be key=value: $kv" >&2
+    return 2
+  fi
+  local k="${kv%%=*}" v="${kv#*=}"
+  if ! [[ "$k" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "--tag key must match [A-Za-z0-9_.-]+: $k" >&2
+    return 2
+  fi
+  require_jq
+  local subdir tags_file existing
+  subdir="$(ensure_agent_dir "$name")"
+  tags_file="$subdir/tags.json"
+  existing='{}'
+  if [[ -f "$tags_file" ]]; then
+    existing="$(cat "$tags_file")"
+  fi
+  local merged
+  merged="$("$JQ" -c -n --arg k "$k" --arg v "$v" --argjson cur "$existing" \
+    '$cur + {($k): $v}')"
+  ( printf '%s\n' "$merged" > "$tags_file" ) 2>/dev/null || true
+}
+
+tag_list_json() {
+  # Emit the persisted tags as a JSON object, or {} if absent.
+  local name="$1"
+  local tags_file="$(agent_root_dir)/$name/tags.json"
+  if [[ -f "$tags_file" ]]; then
+    cat "$tags_file"
+  else
+    printf '{}'
+  fi
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 
 record_started_at() {
@@ -1289,7 +1328,9 @@ start_session() {
   local transcript_path=""
   local transcript_truncate=""
   local result_schema_path=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" ]]; do
+  local -a pending_tags
+  pending_tags=()
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
     case "$1" in
       --transcript)
         if (( $# < 2 )); then
@@ -1325,6 +1366,18 @@ start_session() {
           exit 1
         fi
         result_schema_path="$2"
+        shift 2
+        ;;
+      --tag)
+        if (( $# < 2 )); then
+          echo "--tag requires a value (key=value)" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--tag must be key=value: $2" >&2
+          exit 2
+        fi
+        pending_tags+=("$2")
         shift 2
         ;;
     esac
@@ -1389,6 +1442,9 @@ start_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  for tag in "${pending_tags[@]}"; do
+    tag_record "$name" "$tag" || true
+  done
   if [[ -n "$transcript_path" ]]; then
     transcript_record_path "$name" "$transcript_path"
     if [[ -n "$transcript_truncate" ]]; then
@@ -1476,7 +1532,9 @@ resume_session() {
   local transcript_path=""
   local transcript_truncate=""
   local result_schema_path=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" ]]; do
+  local -a pending_tags
+  pending_tags=()
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
     case "$1" in
       --transcript)
         if (( $# < 2 )); then
@@ -1512,6 +1570,18 @@ resume_session() {
           exit 1
         fi
         result_schema_path="$2"
+        shift 2
+        ;;
+      --tag)
+        if (( $# < 2 )); then
+          echo "--tag requires a value (key=value)" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--tag must be key=value: $2" >&2
+          exit 2
+        fi
+        pending_tags+=("$2")
         shift 2
         ;;
     esac
@@ -1574,6 +1644,9 @@ resume_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  for tag in "${pending_tags[@]}"; do
+    tag_record "$name" "$tag" || true
+  done
   if [[ -n "$transcript_path" ]]; then
     transcript_record_path "$name" "$transcript_path"
     if [[ -n "$transcript_truncate" ]]; then
@@ -2828,6 +2901,13 @@ case "$command" in
     ;;
   result)
     result_session "$@"
+    ;;
+  tags)
+    if [[ -z "${1:-}" ]]; then
+      echo "Usage: $SELF tags <name>" >&2
+      exit 2
+    fi
+    tag_list_json "$1"
     ;;
   status)
     status_session "$@"

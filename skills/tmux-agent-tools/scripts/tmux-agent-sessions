@@ -23,6 +23,35 @@ FILTER_TOOL=""
 FILTER_NAME=""
 FILTER_STATE=""
 SORT_FIELD=""
+typeset -a FILTER_TAGS
+FILTER_TAGS=()
+TMUX_AGENT_DIR="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}"
+
+tags_for_session() {
+  # Returns the tags.json content for an agent, or {} when missing.
+  local name="$1"
+  local tags_file="$TMUX_AGENT_DIR/$name/tags.json"
+  if [[ -f "$tags_file" ]]; then
+    cat "$tags_file"
+  else
+    printf '{}'
+  fi
+}
+
+matches_tag_filters() {
+  # All --tag k=v filters must match (AND). Returns 0 on match.
+  local name="$1"
+  (( ${#FILTER_TAGS[@]} == 0 )) && return 0
+  local tags
+  tags="$(tags_for_session "$name")"
+  local kv k v actual
+  for kv in "${FILTER_TAGS[@]}"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    actual="$(printf '%s' "$tags" | "$JQ" -r --arg k "$k" '.[$k] // "__missing__"')"
+    [[ "$actual" == "$v" ]] || return 1
+  done
+  return 0
+}
 
 usage() {
   cat <<'EOF'
@@ -238,6 +267,7 @@ matches_filters() {
   local name="$2"
   [[ -z "$FILTER_TOOL" || "$tool" == "$FILTER_TOOL" ]] || return 1
   [[ -z "$FILTER_NAME" || "$name" == "$FILTER_NAME" ]] || return 1
+  matches_tag_filters "$name" || return 1
   return 0
 }
 
@@ -313,6 +343,11 @@ list_sessions() {
         shift
         FILTER_TOOL="$(parse_filter_arg "${1:-}")"
         ;;
+      --tag)
+        shift
+        [[ "${1:-}" == *=* ]] || die "--tag must be key=value: ${1:-}"
+        FILTER_TAGS+=("$1")
+        ;;
       --name)
         shift
         FILTER_NAME="${1:-}"
@@ -371,6 +406,11 @@ watch_events() {
       --tool)
         shift
         FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --tag)
+        shift
+        [[ "${1:-}" == *=* ]] || die "--tag must be key=value: ${1:-}"
+        FILTER_TAGS+=("$1")
         ;;
       --name)
         shift
@@ -494,6 +534,11 @@ cleanup_sessions() {
       --tool)
         shift
         FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --tag)
+        shift
+        [[ "${1:-}" == *=* ]] || die "--tag must be key=value: ${1:-}"
+        FILTER_TAGS+=("$1")
         ;;
       --name)
         shift
