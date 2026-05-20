@@ -164,6 +164,26 @@ codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
 
 All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
 
+### `status --json` liveness fields
+
+In addition to the existing stable fields, `status --json` now reports
+five liveness-oriented fields so callers can answer "is the agent
+actually doing something":
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `started_at` | ISO-8601 UTC \| null | When the wrapper created the tmux session. |
+| `last_change_at` | ISO-8601 UTC \| null | When `status` last observed the pane content change. Computed via a per-session pane hash so the value reflects "as of the last status call" — there is no daemon. |
+| `idle_seconds` | integer \| null | `now - last_change_at`. Null when the session is gone. |
+| `bytes_in_pane` | integer \| null | Approximate byte size of the visible pane buffer. |
+| `marker_seen` | string[] | Distinct literal markers the wrapper has observed via `wait-literal` / `send-wait-literal`. First-seen order; FIFO-capped at 100. Regex `wait-text` does NOT add to this set — only literal markers. |
+
+All five are ADDITIVE; existing fields (`exists`, `running`,
+`exit_detected`, etc.) keep their shape and meaning. Calling
+`status --json` periodically is how `last_change_at` and
+`idle_seconds` stay current; without periodic polling the value
+reports "as of the last call".
+
 ### Single-agent JSONL transcript
 
 `start` and `resume` accept `--transcript <abs-path>`. Subsequent

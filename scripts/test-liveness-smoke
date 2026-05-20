@@ -1,0 +1,175 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #98 status --json liveness fields.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-liveness-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-live.sh" <<'EOF'
+#!/bin/sh
+echo "ready-marker"
+sleep 60
+EOF
+chmod +x "$WORK/fake-live.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_gt() {
+  local label="$1" actual="$2" threshold="$3"
+  if [[ "$actual" -gt "$threshold" ]]; then
+    echo "  ok   $label ($actual > $threshold)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label ($actual <= $threshold)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_liveness() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix ($wrapper)"
+
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  local payload started_at last_change_at bytes idle marker_count
+  payload="$("$wrapper" status --json "$prefix")"
+  started_at="$(printf '%s' "$payload" | jq -r .started_at)"
+  last_change_at="$(printf '%s' "$payload" | jq -r .last_change_at)"
+  bytes="$(printf '%s' "$payload" | jq -r .bytes_in_pane)"
+  idle="$(printf '%s' "$payload" | jq -r .idle_seconds)"
+  marker_count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+
+  # started_at and last_change_at should be ISO-8601 UTC
+  if [[ "$started_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    echo "  ok   $prefix started_at ISO-8601 UTC"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix started_at not ISO-8601 UTC: $started_at" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  if [[ "$last_change_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    echo "  ok   $prefix last_change_at ISO-8601 UTC"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix last_change_at not ISO-8601 UTC: $last_change_at" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  assert_gt "$prefix bytes_in_pane non-zero" "$bytes" "0"
+  assert "$prefix marker_seen empty at start" "$marker_count" "0"
+
+  # Trigger a marker via wait-literal
+  "$wrapper" wait-literal "$prefix" "ready-marker" 5 >/dev/null
+  payload="$("$wrapper" status --json "$prefix")"
+  marker_count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  local marker_value
+  marker_value="$(printf '%s' "$payload" | jq -r '.marker_seen[0]')"
+  assert "$prefix marker_seen length=1 after wait-literal" "$marker_count" "1"
+  assert "$prefix marker_seen[0] is needle" "$marker_value" "ready-marker"
+
+  # Sleep so idle_seconds grows
+  sleep 3
+  payload="$("$wrapper" status --json "$prefix")"
+  idle="$(printf '%s' "$payload" | jq -r .idle_seconds)"
+  assert_gt "$prefix idle_seconds grows past 1" "$idle" "1"
+
+  # Repeating wait-literal on same needle should not duplicate
+  "$wrapper" wait-literal "$prefix" "ready-marker" 5 >/dev/null
+  payload="$("$wrapper" status --json "$prefix")"
+  marker_count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  assert "$prefix marker_seen dedup" "$marker_count" "1"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_invariants() {
+  # Locks design-doc invariants partner R8 caught as un-smoked:
+  #   1. marker_seen file is FIFO-capped at 100 entries.
+  #   2. wait-text (regex) does NOT add to marker_seen — only literal
+  #      markers count.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-invariants ($wrapper)"
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  # Pre-seed the marker_seen file with 101 distinct entries so the next
+  # `marker_seen_add` triggers the FIFO eviction path.
+  local marker_file="$TMUX_AGENT_DIR/$prefix/marker_seen"
+  seq 1 101 | awk '{printf "m-%d\n", $1}' > "$marker_file"
+
+  # Force one more marker via wait-literal — fake-live emits "ready-marker"
+  # at start, so wait-literal returns quickly and triggers marker_seen_add.
+  "$wrapper" wait-literal "$prefix" "ready-marker" 5 >/dev/null
+
+  local payload count first
+  payload="$("$wrapper" status --json "$prefix")"
+  count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  assert "$prefix marker_seen FIFO capped at 100" "$count" "100"
+  first="$(printf '%s' "$payload" | jq -r '.marker_seen[0]')"
+  assert "$prefix marker_seen oldest evicted (first should be m-3, not m-1)" "$first" "m-3"
+
+  # Now verify wait-text (regex) does NOT add to marker_seen.
+  # Pattern matches the literal "ready-marker" in the pane via regex,
+  # so the wait succeeds — but the result should NOT enter marker_seen.
+  "$wrapper" wait-text "$prefix" 'ready-mark.*' 5 >/dev/null
+  payload="$("$wrapper" status --json "$prefix")"
+  local count_after
+  count_after="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  assert "$prefix wait-text does not add marker" "$count_after" "$count"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_missing_session_defaults() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing ($wrapper, no session → null liveness fields)"
+  local payload exists started_at last bytes idle marker_count
+  payload="$("$wrapper" status --json "$prefix-missing-$$")"
+  exists="$(printf '%s' "$payload" | jq -r .exists)"
+  started_at="$(printf '%s' "$payload" | jq -r .started_at)"
+  last="$(printf '%s' "$payload" | jq -r .last_change_at)"
+  bytes="$(printf '%s' "$payload" | jq -r .bytes_in_pane)"
+  idle="$(printf '%s' "$payload" | jq -r .idle_seconds)"
+  marker_count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  assert "$prefix-missing exists=false" "$exists" "false"
+  assert "$prefix-missing started_at=null" "$started_at" "null"
+  assert "$prefix-missing last_change_at=null" "$last" "null"
+  assert "$prefix-missing bytes_in_pane=null" "$bytes" "null"
+  assert "$prefix-missing idle_seconds=null" "$idle" "null"
+  assert "$prefix-missing marker_seen empty" "$marker_count" "0"
+}
+
+run_liveness "$CODEX_TMUX"  "CODEX"  "live-codex"
+run_liveness "$CLAUDE_TMUX" "CLAUDE" "live-claude"
+run_invariants "$CODEX_TMUX"  "CODEX"  "inv-codex"
+run_invariants "$CLAUDE_TMUX" "CLAUDE" "inv-claude"
+run_missing_session_defaults "$CODEX_TMUX"  "codex"
+run_missing_session_defaults "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
