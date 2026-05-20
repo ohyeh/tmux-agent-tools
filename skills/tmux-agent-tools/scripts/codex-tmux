@@ -253,6 +253,103 @@ paste_and_submit() {
   fi
 }
 
+# --- Sentinel / on-exit hook helpers (shared by start/resume; issue #132) ---
+# Each helper either uses globals declared in the caller (sentinel,
+# on_exit_cmd, sentinel_keep, session_env_args) or returns its output via
+# stdout. Centralising them removes the duplication called out in the
+# PR #130 review.
+
+parse_sentinel_flags() {
+  # Consumes --sentinel / --on-exit / --sentinel-keep from "$@" until the
+  # next non-flag positional is seen, then publishes the remainder via the
+  # SENTINEL_PARSE_REMAINING global. Caller does:
+  #   parse_sentinel_flags "$@"; set -- "${SENTINEL_PARSE_REMAINING[@]}"
+  #
+  # `--sentinel` and `--on-exit` MUST take a value. If the value is missing
+  # the function exits explicitly rather than letting `shift 2` fail under
+  # `set -e` with a cryptic "shift count must be <= $#".
+  SENTINEL_PARSE_REMAINING=()
+  while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--sentinel-keep" ]]; do
+    case "$1" in
+      --sentinel)
+        if (( $# < 2 )); then
+          echo "--sentinel requires a value (absolute path)" >&2
+          exit 2
+        fi
+        sentinel="$2"
+        shift 2
+        ;;
+      --on-exit)
+        if (( $# < 2 )); then
+          echo "--on-exit requires a value (shell command)" >&2
+          exit 2
+        fi
+        on_exit_cmd="$2"
+        shift 2
+        ;;
+      --sentinel-keep)
+        # Placeholder: future stop_session work will use this flag to keep
+        # the sentinel file across an explicit stop. Nothing reads it yet;
+        # tracked alongside the #95 design doc cleanup semantics.
+        sentinel_keep=1
+        shift
+        ;;
+    esac
+  done
+  SENTINEL_PARSE_REMAINING=("$@")
+}
+
+validate_sentinel_flags() {
+  # Validates sentinel (absolute path; not pre-existing) and warns if
+  # --on-exit is set without --sentinel. May exit non-zero on hard errors.
+  local tool="$1"
+  if [[ -n "$sentinel" && "${sentinel:0:1}" != "/" ]]; then
+    echo "--sentinel must be an absolute path: $sentinel" >&2
+    exit 2
+  fi
+  if [[ -n "$sentinel" && -e "$sentinel" ]]; then
+    echo "Sentinel path already exists: $sentinel" >&2
+    echo "Remove it or pass a fresh --sentinel path to avoid stale-completion false positives." >&2
+    exit 1
+  fi
+  if [[ -n "$on_exit_cmd" && -z "$sentinel" ]]; then
+    echo "[$tool] warning: --on-exit ignored without --sentinel" >&2
+    on_exit_cmd=""
+  fi
+}
+
+apply_sentinel_env_args() {
+  # Appends -e TMUX_AGENT_TOOLS_SENTINEL=... and -e TMUX_AGENT_TOOLS_ON_EXIT=...
+  # to the caller's session_env_args array when set.
+  if [[ -n "$sentinel" ]]; then
+    session_env_args+=("-e" "TMUX_AGENT_TOOLS_SENTINEL=$sentinel")
+  fi
+  if [[ -n "$on_exit_cmd" ]]; then
+    session_env_args+=("-e" "TMUX_AGENT_TOOLS_ON_EXIT=$on_exit_cmd")
+  fi
+}
+
+sentinel_inline_block() {
+  # Emits the shell snippet that goes between `code=$?` and the exit-message
+  # printfs inside the tmux new-session command. The snippet:
+  #   1. atomically writes the exit code to $TMUX_AGENT_TOOLS_SENTINEL
+  #   2. runs the --on-exit hook with ON_EXIT_CODE / ON_EXIT_NAME exported,
+  #      only when BOTH the sentinel path and the hook command are set.
+  #
+  # Escape gymnastics (DO NOT touch without re-running scripts/test-sentinel-smoke):
+  #   - Outer printf is SINGLE-QUOTED so the wrapper shell does NOT expand
+  #     $TMUX_AGENT_TOOLS_SENTINEL / $code etc. — those are for the pane shell.
+  #   - '\''...'\'' = end-quote + literal `'` + start-quote, used to embed the
+  #     inner `printf '%s\n'`.
+  #   - %%s\\n = printf format that emits literal `%s\n` (two chars: percent-s
+  #     and backslash-n). NOT a real newline; the tmux pane shell re-processes
+  #     the `\n` when running the inner printf.
+  #   - The last `%s` is the only real format spec, filled with the
+  #     shell_quoted agent name so dangerous names cannot break out.
+  local agent_name="$1"
+  printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
+}
+
 start_session() {
   require_bins
   write_tmux_conf
@@ -274,22 +371,8 @@ start_session() {
   local sentinel=""
   local on_exit_cmd=""
   local sentinel_keep=0
-  while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--sentinel-keep" ]]; do
-    case "$1" in
-      --sentinel)
-        sentinel="${2:-}"
-        shift 2
-        ;;
-      --on-exit)
-        on_exit_cmd="${2:-}"
-        shift 2
-        ;;
-      --sentinel-keep)
-        sentinel_keep=1
-        shift
-        ;;
-    esac
-  done
+  parse_sentinel_flags "$@"
+  set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
   local requested_name="${1:-}"
   local directory="${2:-}"
@@ -301,19 +384,7 @@ start_session() {
     exit 2
   fi
 
-  if [[ -n "$sentinel" && "${sentinel:0:1}" != "/" ]]; then
-    echo "--sentinel must be an absolute path: $sentinel" >&2
-    exit 2
-  fi
-  if [[ -n "$sentinel" && -e "$sentinel" ]]; then
-    echo "Sentinel path already exists: $sentinel" >&2
-    echo "Remove it or pass a fresh --sentinel path to avoid stale-completion false positives." >&2
-    exit 1
-  fi
-  if [[ -n "$on_exit_cmd" && -z "$sentinel" ]]; then
-    echo "[codex-tmux] warning: --on-exit ignored without --sentinel" >&2
-    on_exit_cmd=""
-  fi
+  validate_sentinel_flags codex-tmux
 
   if [[ ! -d "$directory" ]]; then
     echo "Directory not found: $directory" >&2
@@ -333,18 +404,13 @@ start_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
-  if [[ -n "$sentinel" ]]; then
-    session_env_args+=("-e" "TMUX_AGENT_TOOLS_SENTINEL=$sentinel")
-  fi
-  if [[ -n "$on_exit_cmd" ]]; then
-    session_env_args+=("-e" "TMUX_AGENT_TOOLS_ON_EXIT=$on_exit_cmd")
-  fi
+  apply_sentinel_env_args
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CODEX") --yolo; code=\$?; if [ -n \"\$TMUX_AGENT_TOOLS_SENTINEL\" ]; then printf '%s\n' \"\$code\" > \"\$TMUX_AGENT_TOOLS_SENTINEL.tmp\" && mv -f \"\$TMUX_AGENT_TOOLS_SENTINEL.tmp\" \"\$TMUX_AGENT_TOOLS_SENTINEL\"; fi; if [ -n \"\$TMUX_AGENT_TOOLS_ON_EXIT\" ] && [ -n \"\$TMUX_AGENT_TOOLS_SENTINEL\" ]; then ( export ON_EXIT_CODE=\"\$code\" ON_EXIT_NAME=$(shell_quote "$name"); eval \"\$TMUX_AGENT_TOOLS_ON_EXIT\" ) >> \"\$TMUX_AGENT_TOOLS_SENTINEL.hook.log\" 2>&1 || true; fi; printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CODEX") --yolo; code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   echo "agent: $name"
   echo "Started $session"
@@ -389,22 +455,8 @@ resume_session() {
   local sentinel=""
   local on_exit_cmd=""
   local sentinel_keep=0
-  while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--sentinel-keep" ]]; do
-    case "$1" in
-      --sentinel)
-        sentinel="${2:-}"
-        shift 2
-        ;;
-      --on-exit)
-        on_exit_cmd="${2:-}"
-        shift 2
-        ;;
-      --sentinel-keep)
-        sentinel_keep=1
-        shift
-        ;;
-    esac
-  done
+  parse_sentinel_flags "$@"
+  set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
   local requested_name="${1:-}"
   local directory="${2:-}"
@@ -425,19 +477,7 @@ resume_session() {
     exit 2
   fi
 
-  if [[ -n "$sentinel" && "${sentinel:0:1}" != "/" ]]; then
-    echo "--sentinel must be an absolute path: $sentinel" >&2
-    exit 2
-  fi
-  if [[ -n "$sentinel" && -e "$sentinel" ]]; then
-    echo "Sentinel path already exists: $sentinel" >&2
-    echo "Remove it or pass a fresh --sentinel path to avoid stale-completion false positives." >&2
-    exit 1
-  fi
-  if [[ -n "$on_exit_cmd" && -z "$sentinel" ]]; then
-    echo "[codex-tmux] warning: --on-exit ignored without --sentinel" >&2
-    on_exit_cmd=""
-  fi
+  validate_sentinel_flags codex-tmux
 
   local name="$requested_name"
   if (( ! exact_name )); then
@@ -452,18 +492,13 @@ resume_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
-  if [[ -n "$sentinel" ]]; then
-    session_env_args+=("-e" "TMUX_AGENT_TOOLS_SENTINEL=$sentinel")
-  fi
-  if [[ -n "$on_exit_cmd" ]]; then
-    session_env_args+=("-e" "TMUX_AGENT_TOOLS_ON_EXIT=$on_exit_cmd")
-  fi
+  apply_sentinel_env_args
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'codex session id: $codex_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CODEX") --yolo resume $(shell_quote "$codex_session_id"); code=\$?; if [ -n \"\$TMUX_AGENT_TOOLS_SENTINEL\" ]; then printf '%s\n' \"\$code\" > \"\$TMUX_AGENT_TOOLS_SENTINEL.tmp\" && mv -f \"\$TMUX_AGENT_TOOLS_SENTINEL.tmp\" \"\$TMUX_AGENT_TOOLS_SENTINEL\"; fi; if [ -n \"\$TMUX_AGENT_TOOLS_ON_EXIT\" ] && [ -n \"\$TMUX_AGENT_TOOLS_SENTINEL\" ]; then ( export ON_EXIT_CODE=\"\$code\" ON_EXIT_NAME=$(shell_quote "$name"); eval \"\$TMUX_AGENT_TOOLS_ON_EXIT\" ) >> \"\$TMUX_AGENT_TOOLS_SENTINEL.hook.log\" 2>&1 || true; fi; printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'codex session id: $codex_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CODEX") --yolo resume $(shell_quote "$codex_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   echo "agent: $name"
   echo "Started $session"

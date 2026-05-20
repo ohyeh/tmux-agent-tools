@@ -102,6 +102,17 @@ run_relative_reject() {
   assert "$prefix-rel rejected" "$rc" "2"
 }
 
+run_missing_value_reject() {
+  # Regression test for #133 review: --sentinel as the last argv used to
+  # crash the wrapper with "shift count must be <= $#" under zsh + set -e.
+  # Must now exit 2 with a clear "requires a value" diagnostic.
+  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4"
+  echo "case: $prefix-missing-value ($wrapper, --sentinel without value should be rejected)"
+  local rc=0
+  env "$cli_env=$fake" "$wrapper" start --exact --sentinel 2>/dev/null || rc=$?
+  assert "$prefix-missing-value rejected" "$rc" "2"
+}
+
 run_composite_hook() {
   # Regression test for the partner-reported bug in PR #130 review:
   # composite shell commands as --on-exit must work without the wrapper
@@ -133,6 +144,8 @@ run_happy_path "$CODEX_TMUX"  "CODEX"  "codex-smoke"  "$WORK/fake-exit-7.sh" "7"
 run_happy_path "$CLAUDE_TMUX" "CLAUDE" "claude-smoke" "$WORK/fake-exit-3.sh" "3"
 run_stale_reject    "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
 run_relative_reject "$CLAUDE_TMUX" "CLAUDE" "claude" "$WORK/fake-exit-3.sh"
+run_missing_value_reject "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
+run_missing_value_reject "$CLAUDE_TMUX" "CLAUDE" "claude" "$WORK/fake-exit-3.sh"
 run_composite_hook  "$CODEX_TMUX"  "CODEX"  "codex-composite"  "$WORK/fake-exit-7.sh" "7"
 run_composite_hook  "$CLAUDE_TMUX" "CLAUDE" "claude-composite" "$WORK/fake-exit-3.sh" "3"
 
