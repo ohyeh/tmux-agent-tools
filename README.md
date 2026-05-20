@@ -164,6 +164,49 @@ codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
 
 All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
 
+### Result-file convention (`result` subcommand)
+
+`start` and `resume` export two env vars into the pane shell so the agent CLI can write its structured result without inventing a path:
+
+```
+TMUX_AGENT_NAME=<short-name>
+TMUX_AGENT_RESULT=$TMUX_AGENT_DIR/<short-name>/result.json
+```
+
+`TMUX_AGENT_DIR` defaults to `$XDG_STATE_HOME/tmux-agent-tools` (or `~/.local/state/tmux-agent-tools` when XDG is unset). The wrapper creates the per-agent subdirectory at start and clears any stale `result.json` to prevent false positives.
+
+Recommended prompt snippet (also tracked in SKILL.md):
+
+> When this skill exits, the agent MUST write its final structured
+> result via **atomic rename** so a `result --wait` reader never sees a
+> partial file:
+>
+> ```sh
+> cat > "$TMUX_AGENT_RESULT.tmp" <<'JSON'
+> {"status": "ok", "summary": "...", "errors": [], "artifacts": []}
+> JSON
+> mv -f "$TMUX_AGENT_RESULT.tmp" "$TMUX_AGENT_RESULT"
+> ```
+>
+> Do NOT write directly to `$TMUX_AGENT_RESULT`. The wrapper's
+> `result --wait` polls at 1Hz and could otherwise observe partial
+> content during the agent's final write.
+
+Read the result with the new `result` subcommand:
+
+```bash
+codex-tmux result worker                # cat result.json
+codex-tmux result --field .status worker
+codex-tmux result --wait 180 worker     # block up to 180s for the file
+codex-tmux result --json worker         # metadata-wrapped output
+```
+
+| Flag | Behavior |
+| --- | --- |
+| `--field <jq>` | Extract a single value via `jq -r`. Exits non-zero if the path is missing. |
+| `--wait <seconds>` | Poll until the file appears or timeout. fswatch / inotifywait support is a follow-up; current implementation polls once per second. |
+| `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, valid, body}`. `valid` is `true` when the file parsed as JSON (body is the parsed object) and `false` when it did not (body is the raw bytes as a string, so the caller can still inspect). When the file is missing, `--json` exits 0 with `{present: false, valid: false, body: null}` — callers branch on `.present` rather than the exit code. Text mode (no `--json`) keeps the conventional exit 1 + stderr message for missing files. |
+
 ### Event-driven completion (sentinel + on-exit hook)
 
 `claude-tmux` and `codex-tmux` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.

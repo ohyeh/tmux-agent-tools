@@ -1,0 +1,126 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #97 result-file convention and `result` subcommand.
+#
+# Verifies that the wrapper:
+#   - exports TMUX_AGENT_NAME and TMUX_AGENT_RESULT into the pane shell
+#   - the conventional <TMUX_AGENT_DIR>/<name>/ directory is created
+#   - `result <name>` plain/--field/--wait/--json work as documented
+#   - missing-file paths exit non-zero in text mode but emit a structured
+#     `present: false` payload in --json mode.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-result-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+# Fake CLI that immediately writes a structured result to TMUX_AGENT_RESULT
+# then sleeps so the pane survives long enough to inspect.
+cat > "$WORK/fake-writer.sh" <<'EOF'
+#!/bin/sh
+printf '%s' '{"status":"ok","summary":"hello from fake","errors":[],"artifacts":[]}' > "$TMUX_AGENT_RESULT"
+sleep 30
+EOF
+chmod +x "$WORK/fake-writer.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_result_variants() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix ($wrapper)"
+
+  env "$cli_env=$WORK/fake-writer.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  # Give the fake CLI a moment to write the result file.
+  sleep 3
+
+  local status_value summary_value json_present json_schema_v json_missing
+  status_value="$("$wrapper" result --field .status "$prefix" 2>&1 || true)"
+  assert "$prefix --field .status" "$status_value" "ok"
+
+  summary_value="$("$wrapper" result --field .summary "$prefix" 2>&1 || true)"
+  assert "$prefix --field .summary" "$summary_value" "hello from fake"
+
+  json_present="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .present || true)"
+  assert "$prefix --json present=true" "$json_present" "true"
+
+  json_schema_v="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .schema_version || true)"
+  assert "$prefix --json schema_version=1" "$json_schema_v" "1"
+
+  local valid_flag
+  valid_flag="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
+  assert "$prefix --json valid=true on parseable JSON" "$valid_flag" "true"
+
+  # --wait when file already present is essentially a no-op (must run
+  # BEFORE the invalid-JSON test since it overwrites result.json).
+  local wait_value
+  wait_value="$("$wrapper" result --wait 2 --field .status "$prefix" 2>&1 || true)"
+  assert "$prefix --wait existing file" "$wait_value" "ok"
+
+  # invalid JSON case: overwrite result.json with non-JSON bytes. Runs
+  # LAST in this block because it permanently corrupts the file.
+  printf 'this is not valid json' > "$TMUX_AGENT_DIR/$prefix/result.json"
+  local inv_valid inv_body
+  inv_valid="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
+  inv_body="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .body || true)"
+  assert "$prefix --json valid=false on invalid JSON" "$inv_valid" "false"
+  assert "$prefix --json body=raw-string on invalid JSON" "$inv_body" "this is not valid json"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+
+  # Missing file behavior: directory removed so the file is gone
+  rm -rf "$TMUX_AGENT_DIR/$prefix"
+
+  local rc=0
+  "$wrapper" result "$prefix" 2>/dev/null || rc=$?
+  assert "$prefix missing file exit=1 (text mode)" "$rc" "1"
+
+  json_missing="$("$wrapper" result --json "$prefix" 2>/dev/null | jq -r .present || true)"
+  assert "$prefix missing file --json present=false" "$json_missing" "false"
+
+  # gemini-code-assist on PR #136: --json missing-file must exit 0 (the
+  # structured payload IS the success). text mode keeps exit=1.
+  rc=0
+  "$wrapper" result --json "$prefix" >/dev/null 2>&1 || rc=$?
+  assert "$prefix missing file --json exit=0" "$rc" "0"
+}
+
+run_missing_value_reject() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing-value ($wrapper)"
+  local rc=0
+  "$wrapper" result --field 2>/dev/null || rc=$?
+  assert "$prefix-missing-value rejected" "$rc" "2"
+  rc=0
+  "$wrapper" result --wait 2>/dev/null || rc=$?
+  assert "$prefix-wait-missing rejected" "$rc" "2"
+}
+
+run_result_variants "$CODEX_TMUX"  "CODEX"  "result-codex"
+run_result_variants "$CLAUDE_TMUX" "CLAUDE" "result-claude"
+run_missing_value_reject "$CODEX_TMUX"  "codex"
+run_missing_value_reject "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
