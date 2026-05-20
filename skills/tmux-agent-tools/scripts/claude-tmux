@@ -1168,10 +1168,12 @@ wait_and_capture_session() {
           match_style: $style, since_marker: $since,
           wait_seconds: 0, timeout: $timeout,
           stripped_ansi: false, reason: "session_gone", lines: []}'
-      (( no_timeout_error )) && return 0
-      return 1
+    else
+      echo "Session does not exist: $session" >&2
     fi
-    echo "Session does not exist: $session" >&2
+    # session_gone is a HARD failure (the agent is no longer reachable);
+    # --no-timeout-error decouples only the soft-timeout case from exit
+    # code, NOT session-gone. gemini-code-assist on PR #137.
     return 1
   fi
 

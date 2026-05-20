@@ -111,8 +111,14 @@ run_cases() {
 
   # session_gone reason
   "$wrapper" stop "$prefix" >/dev/null 2>&1
-  json_payload="$("$wrapper" wait-and-capture --literal --marker MARKER-99 --timeout 1 --json --no-timeout-error "$prefix" 2>&1)"
+  json_payload="$("$wrapper" wait-and-capture --literal --marker MARKER-99 --timeout 1 --json --no-timeout-error "$prefix" 2>&1 || true)"
   assert "$prefix --json reason=session_gone" "$(printf '%s' "$json_payload" | jq -r .reason)" "session_gone"
+
+  # session_gone is a HARD failure: --no-timeout-error must NOT suppress
+  # the exit code (gemini-code-assist on PR #137 R6).
+  rc=0
+  "$wrapper" wait-and-capture --literal --marker MARKER-99 --timeout 1 --json --no-timeout-error "$prefix" >/dev/null 2>&1 || rc=$?
+  assert "$prefix session_gone exit=1 despite --no-timeout-error" "$rc" "1"
 }
 
 run_ere_class_default_literal() {
