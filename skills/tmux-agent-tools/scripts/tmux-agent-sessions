@@ -31,12 +31,14 @@ tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
 Usage:
   tmux-agent-sessions list [--json] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--sort <tool|name|session|state>]
   tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]
   tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|dialogue>] [--name <name>]
   tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|dialogue> | --name <name>)
 
 Behavior:
   - list is read-only;
   - list --watch is bounded by --count and emits one JSON array snapshot per poll;
+  - watch polls inventory and emits one JSONL event per state transition (session_added, session_state_changed, session_removed); bounded by --count (0 = unlimited);
   - cleanup --preview is read-only;
   - cleanup --execute requires --all or a filter before stopping sessions;
   - cleanup --execute only stops matching sessions owned by claude-tmux, codex-tmux, or tmux-agent-dialogue;
@@ -353,6 +355,124 @@ list_sessions() {
   fi
 }
 
+watch_events() {
+  local watch_count=0
+  local watch_interval=2
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --count)
+        shift
+        watch_count="$(parse_nonnegative_integer_arg --count "${1:-}")"
+        ;;
+      --interval)
+        shift
+        watch_interval="$(parse_nonnegative_integer_arg --interval "${1:-}")"
+        ;;
+      --tool)
+        shift
+        FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --name)
+        shift
+        FILTER_NAME="${1:-}"
+        [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
+        ;;
+      --state)
+        shift
+        FILTER_STATE="$(parse_state_arg "${1:-}")"
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]"
+        ;;
+    esac
+    shift
+  done
+
+  require_jq
+
+  # Previous and current snapshots keyed by tool|name|session -> state.
+  # Pre-declare scalars outside the loop so `local` re-declaration does not
+  # echo existing values on subsequent iterations (zsh `local foo` reprints).
+  typeset -A prev_state curr_state
+  local first=1
+  local i=0
+  local snapshot="" now="" key="" tool="" sname="" session="" state="" rest="" cur="" old=""
+  while (( watch_count == 0 || i < watch_count )); do
+    snapshot="$(inventory_json_array)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    # Rebuild current map from snapshot lines: tool\tname\tsession\tstate.
+    curr_state=()
+    while IFS=$'\t' read -r tool sname session state; do
+      [[ -z "$tool" ]] && continue
+      key="$tool|$sname|$session"
+      curr_state[$key]="$state"
+    done < <(print -r -- "$snapshot" | "$JQ" -r '.[] | [.tool, .name, .session, .state] | @tsv')
+
+    if (( ! first )); then
+      # Added or state_changed.
+      for key in "${(@k)curr_state}"; do
+        cur="${curr_state[$key]}"
+        old="${prev_state[$key]-}"
+        tool="${key%%|*}"
+        rest="${key#*|}"
+        sname="${rest%|*}"
+        session="${rest##*|}"
+        if [[ -z "$old" ]]; then
+          "$JQ" -cn \
+            --argjson schema_version 1 \
+            --arg event "session_added" \
+            --arg tool "$tool" \
+            --arg name "$sname" \
+            --arg session "$session" \
+            --arg state "$cur" \
+            --arg at "$now" \
+            '{schema_version:$schema_version,event:$event,tool:$tool,name:$name,session:$session,state:$state,at:$at}'
+        elif [[ "$old" != "$cur" ]]; then
+          "$JQ" -cn \
+            --argjson schema_version 1 \
+            --arg event "session_state_changed" \
+            --arg tool "$tool" \
+            --arg name "$sname" \
+            --arg session "$session" \
+            --arg from "$old" \
+            --arg to "$cur" \
+            --arg at "$now" \
+            '{schema_version:$schema_version,event:$event,tool:$tool,name:$name,session:$session,from:$from,to:$to,at:$at}'
+        fi
+      done
+      # Removed.
+      for key in "${(@k)prev_state}"; do
+        if [[ -z "${curr_state[$key]-}" ]]; then
+          tool="${key%%|*}"
+          rest="${key#*|}"
+          sname="${rest%|*}"
+          session="${rest##*|}"
+          "$JQ" -cn \
+            --argjson schema_version 1 \
+            --arg event "session_removed" \
+            --arg tool "$tool" \
+            --arg name "$sname" \
+            --arg session "$session" \
+            --arg at "$now" \
+            '{schema_version:$schema_version,event:$event,tool:$tool,name:$name,session:$session,at:$at}'
+        fi
+      done
+    fi
+
+    prev_state=()
+    for key in "${(@k)curr_state}"; do
+      prev_state[$key]="${curr_state[$key]}"
+    done
+    first=0
+
+    i=$((i + 1))
+    if (( watch_count == 0 || i < watch_count )); then
+      sleep "$watch_interval"
+    fi
+  done
+}
+
 cleanup_sessions() {
   local mode=""
   local output_json=0
@@ -427,6 +547,9 @@ case "$command" in
     ;;
   cleanup)
     cleanup_sessions "$@"
+    ;;
+  watch)
+    watch_events "$@"
     ;;
   -h|--help|help)
     usage
