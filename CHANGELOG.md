@@ -5,6 +5,8 @@
 
 ### Added
 
+
+- `usage.jsonl` skeleton + `status --usage` aggregator (issue #103 v1 slice). `start`/`resume` now write a `{event: "usage_init", at, schema_version: 1}` line under `$TMUX_AGENT_DIR/<name>/usage.jsonl` (or `--usage <abs>` for a custom location). `status --usage <name>` reads the file, folds `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `turns` and emits a structured payload (`schema_version: 1`). v1 has no real CLI-tee mechanism (tracked in design doc) — every aggregate field is 0/null with an explanatory note. `scripts/test-usage-smoke`: 16 sub-assertions covering default path, custom `--usage` path, aggregator output, and relative-path rejection.
 - `--record <abs.jsonl>` is now a documented alias for `--transcript` on `start`/`resume` (issue #127 v1 slice). `tmux-agent-replay fixture-validate <jsonl>` sanity-checks a transcript: all lines parse, all entries carry `schema_version:1`, all timestamps match ISO-8601 UTC, and at least one `start` event is present. Exit 0 on valid, exit 2 on validation failure. Output is structured JSON `{schema_version:1, ok, fixture, generated_at, checks[{name,status,detail}]}`. Replay TMUX_AGENT_FIXTURE replay-from-fixture mode remains deferred (depends on a fake-CLI driver — see `docs/design-remaining-backlog.md`). `scripts/test-fixture-validate-smoke`: 10 sub-assertions.
 ## v0.8.0 - 2026-05-21
 
