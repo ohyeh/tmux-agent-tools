@@ -164,6 +164,30 @@ codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
 
 All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
 
+### `wait-and-capture` combined subcommand
+
+The two-step `wait-literal X && capture --strip-ansi --since-marker X`
+pattern is so common that the wrappers ship a single `wait-and-capture`
+subcommand for it:
+
+```bash
+codex-tmux wait-and-capture --literal --marker '[DONE]' --strip-ansi --json worker
+```
+
+| Flag | Behavior |
+| --- | --- |
+| `--marker <text>` (required) | Marker to wait for. |
+| `--literal` / `--regex` | Match style. Default is `--regex`. |
+| `--timeout <s>` | Wait timeout. Default 180s. |
+| `--tail <n>` | Lines of scrollback to capture (default 80). |
+| `--strip-ansi` | Forwarded to the capture phase, removes CSI/SGR escapes. |
+| `--since-marker <text>` | Slice the body to lines AFTER the marker. Defaults to `--marker` value so the golden path needs no extra flag. |
+| `--json` | Wrap output as `{schema_version, matched, marker, match_style, since_marker, wait_seconds, timeout, stripped_ansi, reason, lines}`. `reason` is one of `matched`, `timeout`, `session_gone`. |
+| `--no-timeout-error` | Decouple soft-timeout from `--json` (partner R3 critique on the original design). With this flag, timeout exits 0 instead of 1. Composable with or without `--json`. |
+
+Without `--no-timeout-error`, timeout exits 1 — keeps `if wait-and-capture ...`
+shell-friendly without forcing every caller to write a special case.
+
 ### Result-file convention (`result` subcommand)
 
 `start` and `resume` export two env vars into the pane shell so the agent CLI can write its structured result without inventing a path:

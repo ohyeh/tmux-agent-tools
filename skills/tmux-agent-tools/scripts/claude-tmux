@@ -38,6 +38,7 @@ Usage:
   claude-tmux wait <name> [timeout_seconds]
   claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]
   claude-tmux wait-literal <name> <text> [timeout_seconds]
+  claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] <name>
   claude-tmux capture <name> [lines]
   claude-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>
   claude-tmux list
@@ -1084,6 +1085,156 @@ wait_literal_session() {
   return 1
 }
 
+wait_and_capture_session() {
+  # Combined wait + capture — the golden-path shortcut described in
+  # issue #99. Replaces the two-step `wait-literal` / `capture` pair.
+  # `--no-timeout-error` decouples soft-timeout opt-in from `--json`
+  # (partner R3 critique on the original design).
+  require_tmux
+  local marker=""
+  local match_style="regex"
+  local timeout_seconds=180
+  local tail_lines=80
+  local strip_ansi=0
+  local since_marker=""
+  local output_json=0
+  local no_timeout_error=0
+  local since_set=0
+
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --marker)
+        if (( $# < 2 )); then echo "--marker requires a value" >&2; exit 2; fi
+        marker="$2"; shift 2 ;;
+      --literal) match_style="literal"; shift ;;
+      --regex) match_style="regex"; shift ;;
+      --timeout)
+        if (( $# < 2 )); then echo "--timeout requires a value (seconds)" >&2; exit 2; fi
+        timeout_seconds="$2"; shift 2 ;;
+      --tail)
+        if (( $# < 2 )); then echo "--tail requires a value (lines)" >&2; exit 2; fi
+        tail_lines="$2"; shift 2 ;;
+      --strip-ansi) strip_ansi=1; shift ;;
+      --since-marker)
+        if (( $# < 2 )); then echo "--since-marker requires a value (literal text)" >&2; exit 2; fi
+        since_marker="$2"; since_set=1; shift 2 ;;
+      --json) output_json=1; shift ;;
+      --no-timeout-error) no_timeout_error=1; shift ;;
+      --) shift; break ;;
+      *) echo "Unknown wait-and-capture flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local name="${1:-}"
+  if [[ -z "$name" || -z "$marker" ]]; then
+    echo "Usage: claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] <name>" >&2
+    exit 2
+  fi
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid --timeout: $timeout_seconds" >&2
+    exit 2
+  fi
+  if [[ ! "$tail_lines" =~ '^[0-9]+$' || "$tail_lines" -lt 1 ]]; then
+    echo "Invalid --tail: $tail_lines" >&2
+    exit 2
+  fi
+  if (( output_json )); then
+    require_jq
+  fi
+
+  (( since_set )) || since_marker="$marker"
+
+  local session
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    if (( output_json )); then
+      "$JQ" -n \
+        --arg marker "$marker" --arg style "$match_style" \
+        --arg since "$since_marker" \
+        --argjson timeout "$timeout_seconds" \
+        '{schema_version: 1, matched: false, marker: $marker,
+          match_style: $style, since_marker: $since,
+          wait_seconds: 0, timeout: $timeout,
+          stripped_ansi: false, reason: "session_gone", lines: []}'
+      (( no_timeout_error )) && return 0
+      return 1
+    fi
+    echo "Session does not exist: $session" >&2
+    return 1
+  fi
+
+  local started=$SECONDS
+  local matched=0
+  local deadline=$((started + timeout_seconds))
+  local current=""
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    if [[ "$match_style" == "literal" ]]; then
+      if [[ "$current" == *"$marker"* ]]; then
+        matched=1
+        break
+      fi
+    else
+      if [[ "$current" =~ $marker ]]; then
+        matched=1
+        break
+      fi
+    fi
+    sleep 1
+  done
+  local elapsed=$((SECONDS - started))
+
+  local raw
+  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$tail_lines")"
+
+  if (( strip_ansi )); then
+    raw="$(printf '%s' "$raw" | sed $'s/\x1b\\[[0-9;?]*[A-Za-z]//g')"
+  fi
+
+  if (( matched )) && [[ -n "$since_marker" ]]; then
+    local last_idx
+    last_idx="$(printf '%s\n' "$raw" | { grep -nF "$since_marker" || true; } | tail -1 | cut -d: -f1)"
+    if [[ -n "$last_idx" ]]; then
+      raw="$(printf '%s\n' "$raw" | tail -n +"$((last_idx + 1))")"
+    else
+      raw=""
+    fi
+  fi
+
+  local reason
+  if (( matched )); then
+    reason="matched"
+  else
+    reason="timeout"
+  fi
+
+  if (( output_json )); then
+    "$JQ" -n \
+      --arg marker "$marker" --arg style "$match_style" \
+      --argjson matched "$matched" \
+      --argjson elapsed "$elapsed" \
+      --argjson timeout "$timeout_seconds" \
+      --argjson stripped "$strip_ansi" \
+      --arg since "$since_marker" \
+      --arg reason "$reason" \
+      --arg body "$raw" \
+      '{schema_version: 1,
+        matched: ($matched == 1), marker: $marker, match_style: $style,
+        wait_seconds: $elapsed, timeout: $timeout,
+        stripped_ansi: ($stripped == 1),
+        since_marker: $since,
+        reason: $reason,
+        lines: ($body | split("\n"))}'
+  else
+    printf '%s\n' "$raw"
+  fi
+
+  if (( ! matched && ! no_timeout_error )); then
+    return 1
+  fi
+  return 0
+}
+
 doctor_session() {
   require_tmux
   echo "tmux: $TMUX"
@@ -1309,6 +1460,9 @@ case "$command" in
     ;;
   wait-literal)
     wait_literal_session "$@"
+    ;;
+  wait-and-capture)
+    wait_and_capture_session "$@"
     ;;
   capture)
     capture_session "$@"
