@@ -1306,6 +1306,93 @@ restore_session() {
   return 0
 }
 
+audit_log_chain_key() {
+  # Derive a per-host HMAC chain key. Linux: /etc/machine-id. macOS:
+  # IOPlatformUUID. Fallback: hash of $HOME (per-user). All values are
+  # operator-derivable so the log is verifiable on the same host.
+  if [[ -f /etc/machine-id ]]; then
+    cat /etc/machine-id
+  elif command -v ioreg >/dev/null 2>&1; then
+    ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+      | awk -F\" '/IOPlatformUUID/{print $4; exit}' || echo "$HOME"
+  else
+    echo "$HOME"
+  fi
+}
+
+audit_log_append() {
+  # Append a single JSONL event to TMUX_AGENT_TOOLS_AUDIT_LOG (#119).
+  # Chains via SHA-256 of (prev_hash || line). No-op when env unset.
+  # Synchronous; never blocks long since it's append-only file IO.
+  local event_json="$1"
+  local audit_target="${TMUX_AGENT_TOOLS_AUDIT_LOG:-}"
+  [[ -z "$audit_target" ]] && return 0
+  require_jq
+  local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  if [[ -f "$audit_target" ]]; then
+    prev_hash="$(tail -1 "$audit_target" 2>/dev/null | "$JQ" -r .chain_hash 2>/dev/null || echo "$prev_hash")"
+    [[ -z "$prev_hash" || "$prev_hash" == "null" ]] && prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  fi
+  local chain_key
+  chain_key="$(audit_log_chain_key)"
+  local with_meta
+  with_meta="$("$JQ" -c -n --argjson e "$event_json" --arg pv "$prev_hash" \
+    --arg at "$(transcript_iso_now)" \
+    '$e + {prev_chain_hash: $pv, at: $at, schema_version: 1}')"
+  local sha_cmd
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha_cmd="sha256sum"
+  else
+    sha_cmd="shasum -a 256"
+  fi
+  local new_hash
+  new_hash="$(printf '%s%s%s' "$chain_key" "$prev_hash" "$with_meta" | eval "$sha_cmd" | awk '{print $1}')"
+  local final_line
+  final_line="$("$JQ" -c -n --argjson e "$with_meta" --arg h "$new_hash" \
+    '$e + {chain_hash: $h}')"
+  ( printf '%s\n' "$final_line" >> "$audit_target" ) 2>/dev/null || true
+}
+
+audit_log_verify() {
+  # Walk the audit log, re-derive each chain_hash, report mismatches.
+  local audit_target="${1:-}"
+  if [[ -z "$audit_target" || ! -f "$audit_target" ]]; then
+    echo "Usage: $SELF audit-verify <audit.jsonl>" >&2
+    return 2
+  fi
+  require_jq
+  local chain_key sha_cmd
+  chain_key="$(audit_log_chain_key)"
+  if command -v sha256sum >/dev/null 2>&1; then sha_cmd="sha256sum"; else sha_cmd="shasum -a 256"; fi
+  local expected_prev="0000000000000000000000000000000000000000000000000000000000000000"
+  local lineno=0 bad=0
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    local pv hv stripped recomputed
+    pv="$(printf '%s' "$line" | "$JQ" -r .prev_chain_hash)"
+    hv="$(printf '%s' "$line" | "$JQ" -r .chain_hash)"
+    stripped="$(printf '%s' "$line" | "$JQ" -c 'del(.chain_hash)')"
+    recomputed="$(printf '%s%s%s' "$chain_key" "$expected_prev" "$stripped" | eval "$sha_cmd" | awk '{print $1}')"
+    if [[ "$pv" != "$expected_prev" ]]; then
+      echo "line $lineno: prev_chain_hash mismatch (expected $expected_prev, got $pv)" >&2
+      bad=$((bad + 1))
+    elif [[ "$recomputed" != "$hv" ]]; then
+      echo "line $lineno: chain_hash mismatch (expected $recomputed, got $hv)" >&2
+      bad=$((bad + 1))
+    fi
+    expected_prev="$hv"
+  done < "$audit_target"
+  if (( bad == 0 )); then
+    "$JQ" -n --arg path "$audit_target" --argjson lines "$lineno" \
+      '{schema_version: 1, audit_log: $path, lines: $lines, ok: true}'
+    return 0
+  else
+    "$JQ" -n --arg path "$audit_target" --argjson lines "$lineno" --argjson bad "$bad" \
+      '{schema_version: 1, audit_log: $path, lines: $lines, bad_lines: $bad, ok: false}'
+    return 2
+  fi
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 
 record_started_at() {
@@ -1581,6 +1668,8 @@ start_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  audit_log_append "$("$JQ" -c -n --arg event start --arg tool claude --arg name "$name" \
+    --arg session "$session" --arg cwd "$directory" '{event:$event, tool:$tool, name:$name, session:$session, cwd:$cwd}')"
   if (( ci_mode )); then
     ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
   fi
@@ -1808,6 +1897,8 @@ resume_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  audit_log_append "$("$JQ" -c -n --arg event start --arg tool claude --arg name "$name" \
+    --arg session "$session" --arg cwd "$directory" '{event:$event, tool:$tool, name:$name, session:$session, cwd:$cwd}')"
   if (( ci_mode )); then
     ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
   fi
@@ -2051,6 +2142,8 @@ _send_wait_literal_locked() {
 
   local buffer_name="$session-send-wait"
   paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  audit_log_append "$("$JQ" -c -n --arg event send --arg tool claude --arg name "$name" --arg text_len "${#prompt_text}" \
+    '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber)}')"
 
   local deadline=$((SECONDS + timeout_seconds))
   local current=""
@@ -3082,6 +3175,9 @@ case "$command" in
     ;;
   result)
     result_session "$@"
+    ;;
+  audit-verify)
+    audit_log_verify "${1:-}"
     ;;
   tenant)
     # Print the effective prefix (with --tenant suffix if any) so callers

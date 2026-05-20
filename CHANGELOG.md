@@ -5,6 +5,8 @@
 
 ### Added
 
+
+- `TMUX_AGENT_TOOLS_AUDIT_LOG=<abs.jsonl>` opt-in audit log (issue #119). Each subcommand appends a JSONL event chained via SHA-256 to the previous (`prev_chain_hash` + `chain_hash` + `schema_version: 1`). Chain key derived from `/etc/machine-id` (Linux) / `IOPlatformUUID` (macOS) / `$HOME` (fallback) — no operator-managed key. `audit-verify <log>` walks the chain and reports tamper. No daemon, fully synchronous on each call path — respects "no hidden autonomy". `scripts/test-audit-smoke`: 16 sub-assertions covering append, chain shape, verify-ok, tamper-detection, env-unset no-op.
 - `TMUX_AGENT_TOOLS_TENANT=<name>` env var appends a tenant suffix to the session prefix (issue #118). Operators on the same host get isolated session names + state dirs by exporting different tenant names — no shared state, no daemon, fully operator-explicit. New `tenant` subcommand on both wrappers prints the effective prefix. Respects the "no hidden autonomy" roadmap non-goal: tenant scoping is env-var only with no policy machinery. `scripts/test-tenant-smoke`: 6 sub-assertions.
 ## v0.9.0 - 2026-05-21
 
