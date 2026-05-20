@@ -695,11 +695,43 @@ send_wait_literal_session() {
 
 capture_session() {
   require_tmux
+  local strip_ansi=0
+  local since_marker=""
+  local output_json=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --strip-ansi)
+        strip_ansi=1
+        shift
+        ;;
+      --since-marker)
+        if (( $# < 2 )); then
+          echo "--since-marker requires a value (literal text)" >&2
+          exit 2
+        fi
+        since_marker="$2"
+        shift 2
+        ;;
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "Unknown capture flag: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
   local name="${1:-}"
   local lines="${2:-80}"
 
   if [[ -z "$name" ]]; then
-    echo "Usage: claude-tmux capture <name> [lines]" >&2
+    echo "Usage: claude-tmux capture [--strip-ansi] [--since-marker <text>] [--json] <name> [lines]" >&2
     exit 2
   fi
 
@@ -708,13 +740,54 @@ capture_session() {
     exit 2
   fi
 
+  if (( output_json )); then
+    require_jq
+  fi
+
   local session="$(session_for_name "$name")"
   if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
 
-  "$TMUX" capture-pane -J -t "$session" -p -S "-$lines"
+  local raw
+  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$lines")"
+
+  if (( strip_ansi )); then
+    # Strip CSI/SGR escape sequences. Known coverage gap (see
+    # docs/design-issue-96-capture-variants.md): OSC/DCS/APC/PM/SOS
+    # terminators are NOT stripped. Documented for callers.
+    raw="$(printf '%s' "$raw" | sed $'s/\x1b\\[[0-9;?]*[A-Za-z]//g')"
+  fi
+
+  local marker_found=0
+  if [[ -n "$since_marker" ]]; then
+    # Slice to lines AFTER the LAST occurrence of the literal marker.
+    local last_idx
+    # grep -nF exits 1 when no match; tolerate that under `set -e + pipefail`.
+    last_idx="$(printf '%s\n' "$raw" | { grep -nF "$since_marker" || true; } | tail -1 | cut -d: -f1)"
+    if [[ -n "$last_idx" ]]; then
+      marker_found=1
+      raw="$(printf '%s\n' "$raw" | tail -n +"$((last_idx + 1))")"
+    else
+      raw=""
+    fi
+  fi
+
+  if (( output_json )); then
+    "$JQ" -n \
+      --arg name "$name" \
+      --arg session "$session" \
+      --argjson lines_requested "$lines" \
+      --argjson marker_found "$marker_found" \
+      --argjson stripped_ansi "$strip_ansi" \
+      --arg body "$raw" \
+      '{name: $name, session: $session, lines_requested: $lines_requested,
+        marker_found: ($marker_found == 1), stripped_ansi: ($stripped_ansi == 1),
+        lines: ($body | split("\n"))}'
+  else
+    printf '%s\n' "$raw"
+  fi
 }
 
 wait_session() {

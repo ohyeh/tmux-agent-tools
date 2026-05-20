@@ -148,6 +148,22 @@ Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-t
 
 Captured pane text joins tmux soft-wrapped screen lines before matching or writing transcripts. This keeps long model output, markers, and summaries from changing shape just because the tmux pane is narrow.
 
+### Token-efficient capture variants
+
+`capture` supports three optional post-processing flags that let the wrapper trim output BEFORE returning it, so the caller does not pay token cost for boilerplate or pre-marker scrollback:
+
+```bash
+codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
+```
+
+| Flag | Behavior |
+| --- | --- |
+| `--strip-ansi` | Remove ANSI CSI/SGR escape sequences from the captured text. Known gap: OSC, DCS, APC, PM, SOS terminators are NOT stripped (see `docs/design-issue-96-capture-variants.md`). |
+| `--since-marker <text>` | Keep only the lines AFTER the LAST occurrence of the literal `<text>`. If the marker is missing, the body is empty (text mode) or `marker_found: false` (JSON mode). |
+| `--json` | Wrap output as `{name, session, lines_requested, marker_found, stripped_ansi, lines}`. Composable with the other flags. |
+
+All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
+
 ### Event-driven completion (sentinel + on-exit hook)
 
 `claude-tmux` and `codex-tmux` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.

@@ -1,0 +1,130 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #96 token-efficient capture variants.
+#
+# Exercises --strip-ansi / --since-marker / --json against synthetic
+# panes that emit known content. No real Claude / Codex required.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+for wrapper in "$CODEX_TMUX" "$CLAUDE_TMUX"; do
+  if [[ ! -x "$wrapper" ]]; then
+    echo "wrapper not executable: $wrapper" >&2
+    exit 1
+  fi
+done
+
+WORK="$(mktemp -d -t tmux-agent-capture-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Synthetic CLI: emits a colored line + a literal marker + two follow-up
+# lines, then sleeps so the pane remains capturable.
+cat > "$WORK/fake-content.sh" <<'EOF'
+#!/bin/sh
+printf '\033[31mRED-LINE\033[0m\nMARKER-CAP\nafter1\nafter2\n'
+sleep 30
+EOF
+chmod +x "$WORK/fake-content.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label (contains '$needle')"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (missing '$needle')" >&2
+    echo "    haystack head: $(printf '%s' "$haystack" | head -2)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "  ok   $label (does not contain '$needle')"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (unexpected '$needle')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_capture_variants() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix ($wrapper)"
+  env "$cli_env=$WORK/fake-content.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  local raw_output strip_output since_output json_output
+
+  raw_output="$("$wrapper" capture "$prefix" 20 2>&1)"
+  assert_contains "$prefix raw includes marker" "$raw_output" "MARKER-CAP"
+  assert_contains "$prefix raw includes after2" "$raw_output" "after2"
+
+  strip_output="$("$wrapper" capture --strip-ansi "$prefix" 20 2>&1)"
+  # The literal escape introducer (\x1b[31m) must be absent after stripping.
+  # Use printf so the comparison is exact even if tmux renders colors.
+  assert_not_contains "$prefix --strip-ansi removes ESC[31m" "$strip_output" "$(printf '\033[31m')"
+  assert_contains "$prefix --strip-ansi keeps body" "$strip_output" "RED-LINE"
+
+  since_output="$("$wrapper" capture --since-marker MARKER-CAP "$prefix" 20 2>&1)"
+  assert_contains "$prefix --since-marker keeps after1" "$since_output" "after1"
+  assert_not_contains "$prefix --since-marker drops MARKER-CAP" "$since_output" "MARKER-CAP"
+  assert_not_contains "$prefix --since-marker drops RED-LINE" "$since_output" "RED-LINE"
+
+  json_output="$("$wrapper" capture --strip-ansi --since-marker MARKER-CAP --json "$prefix" 20 2>&1)"
+  local marker_found stripped name_in_json
+  marker_found="$(printf '%s' "$json_output" | jq -r .marker_found 2>/dev/null || echo "PARSE_FAIL")"
+  stripped="$(printf '%s' "$json_output" | jq -r .stripped_ansi 2>/dev/null || echo "PARSE_FAIL")"
+  name_in_json="$(printf '%s' "$json_output" | jq -r .name 2>/dev/null || echo "PARSE_FAIL")"
+  assert "$prefix --json marker_found" "$marker_found" "true"
+  assert "$prefix --json stripped_ansi" "$stripped" "true"
+  assert "$prefix --json name field" "$name_in_json" "$prefix"
+
+  # Marker not found
+  local miss_output miss_found
+  miss_output="$("$wrapper" capture --since-marker NOPE-NOT-THERE --json "$prefix" 20 2>&1)"
+  miss_found="$(printf '%s' "$miss_output" | jq -r .marker_found 2>/dev/null || echo "PARSE_FAIL")"
+  assert "$prefix --json marker_found=false when missing" "$miss_found" "false"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_missing_value_reject() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing-value ($wrapper, --since-marker without value)"
+  local rc=0
+  "$wrapper" capture --since-marker 2>/dev/null || rc=$?
+  assert "$prefix-missing-value rejected" "$rc" "2"
+}
+
+run_capture_variants "$CODEX_TMUX"  "CODEX"  "capture-codex"
+run_capture_variants "$CLAUDE_TMUX" "CLAUDE" "capture-claude"
+run_missing_value_reject "$CODEX_TMUX"  "codex"
+run_missing_value_reject "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
