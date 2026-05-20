@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.8.0 - 2026-05-21
+
+`v0.8.0` ships safety + DX surfaces: max-runtime/idle fuses (#105), health-check ping (#128), result-schema validation (#125), session tagging (#124), webhook notify (#121). Also documents the L5/L6 policy-block roadmap amendment proposals (#112–#119 design batch).
+
+
 
 ### Added
 
