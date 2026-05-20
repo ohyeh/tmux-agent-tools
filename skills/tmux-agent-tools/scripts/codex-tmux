@@ -1250,6 +1250,62 @@ usage_aggregate_json() {
      note: (if any(.event == "turn_usage") then [] else ["no turn_usage events yet — CLI stream tee mechanism deferred per #103 v1"] end)}' "$usage_target"
 }
 
+checkpoint_session() {
+  # Package agent state + a pane snapshot into a tarball (#111 v1).
+  # Args: $1 name, $2 output tarball path (absolute).
+  local name="${1:-}" out="${2:-}"
+  if [[ -z "$name" || -z "$out" ]]; then
+    echo "Usage: $SELF checkpoint <name> <output.tar.gz>" >&2
+    return 2
+  fi
+  if [[ "${out:0:1}" != "/" ]]; then
+    echo "checkpoint output must be an absolute path: $out" >&2
+    return 2
+  fi
+  local subdir="$(agent_root_dir)/$name"
+  if [[ ! -d "$subdir" ]]; then
+    echo "No agent state for: $name" >&2
+    return 1
+  fi
+  # Capture pane scrollback if the session still exists.
+  local session
+  session="$(session_for_name "$name")"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" capture-pane -J -t "$session" -p -S -2000 > "$subdir/pane-snapshot.txt" 2>/dev/null || true
+  fi
+  # Pack the per-agent state dir into the tarball.
+  tar -czf "$out" -C "$(agent_root_dir)" "$name" 2>/dev/null || {
+    echo "checkpoint: tar failed" >&2
+    return 1
+  }
+  echo "checkpoint written: $out"
+  return 0
+}
+
+restore_session() {
+  # Read-only restore: extract a checkpoint tarball into a scratch dir
+  # and print its contents (#111 v1). Does NOT spawn a new tmux session.
+  local input="${1:-}"
+  if [[ -z "$input" ]]; then
+    echo "Usage: $SELF restore <input.tar.gz>" >&2
+    return 2
+  fi
+  if [[ ! -f "$input" ]]; then
+    echo "Not a file: $input" >&2
+    return 1
+  fi
+  local extract_dir
+  extract_dir="$(mktemp -d -t tmux-agent-restore.XXXXXX)"
+  tar -xzf "$input" -C "$extract_dir" 2>/dev/null || {
+    echo "restore: tar extract failed" >&2
+    return 1
+  }
+  echo "restored to: $extract_dir"
+  echo "contents:"
+  ls -la "$extract_dir"/*
+  return 0
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 # Persist a few small bits of cross-subcommand state under
 # $TMUX_AGENT_DIR/<name>/ so that `status --json` can answer
@@ -3043,6 +3099,12 @@ case "$command" in
       exit 2
     fi
     tag_list_json "$1"
+    ;;
+  checkpoint)
+    checkpoint_session "$@"
+    ;;
+  restore)
+    restore_session "$@"
     ;;
   status)
     status_session "$@"
