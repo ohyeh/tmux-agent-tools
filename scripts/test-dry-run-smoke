@@ -110,6 +110,50 @@ run_no_side_effects() {
   fi
 }
 
+run_wrong_env_var_does_not_cross_fallback() {
+  # Regression for gemini HIGH-priority finding: claude-tmux must NOT
+  # fall back to $CODEX when $CLAUDE is unset, and vice versa.
+  local wrapper="$1" wrong_env="$2" prefix="$3"
+  echo "case: $prefix-wrong-env ($wrapper, wrong env var should not satisfy CLI check)"
+  local out code=0
+  # Pass only the *other* tool's env var; the dry-run's correct env is unset.
+  # Also unset PATH-resolved fallbacks by pointing the wrong env at a path
+  # that exists but is wrong-tool — wrapper should still resolve via the
+  # right env var only.
+  out="$(env -u CODEX -u CLAUDE "$wrong_env=$WORK/fake.sh" "$wrapper" \
+    start --exact --dry-run "$prefix-wrong" "$WORK" 2>&1)" || code=$?
+  # The right env is unset; wrapper should fall back to `command -v <tool>`
+  # which may or may not resolve depending on shell PATH. We only assert
+  # that the wrong env's path was NOT what got reported.
+  local reported
+  reported="$(printf '%s' "$out" | jq -r '.checks[] | select(.name=="agent_cli_binary") | .detail' 2>/dev/null || true)"
+  if [[ "$reported" == *"$WORK/fake.sh"* ]]; then
+    echo "  FAIL $prefix-wrong-env: cross-fallback leaked $reported" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix-wrong-env: no cross-fallback (reported=$reported)"
+    PASS=$((PASS + 1))
+  fi
+}
+
+run_transcript_no_side_effect() {
+  # Regression for gemini MEDIUM-priority finding: transcript writability
+  # must not CREATE the file (was using `: > $path`).
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-transcript-no-side-effect ($wrapper)"
+  local tpath="$WORK/$prefix-side-effect.jsonl"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --transcript "$tpath" "$prefix-tse" "$WORK" >/dev/null 2>&1
+  if [[ -e "$tpath" ]]; then
+    echo "  FAIL $prefix transcript dry-run created $tpath" >&2
+    FAIL=$((FAIL + 1))
+    rm -f "$tpath"
+  else
+    echo "  ok   $prefix transcript path not touched by dry-run"
+    PASS=$((PASS + 1))
+  fi
+}
+
 for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
   IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
   run_ok_case "$wrapper" "$env_var" "$prefix"
@@ -117,8 +161,12 @@ for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
   run_preexisting_sentinel "$wrapper" "$env_var" "$prefix"
   run_on_exit_without_sentinel "$wrapper" "$env_var" "$prefix"
   run_relative_transcript "$wrapper" "$env_var" "$prefix"
+  run_transcript_no_side_effect "$wrapper" "$env_var" "$prefix"
   run_no_side_effects "$wrapper" "$env_var" "$prefix"
 done
+
+run_wrong_env_var_does_not_cross_fallback "$CODEX_TMUX"  "CLAUDE" "xcd"
+run_wrong_env_var_does_not_cross_fallback "$CLAUDE_TMUX" "CODEX"  "xcl"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

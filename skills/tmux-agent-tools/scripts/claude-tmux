@@ -426,12 +426,17 @@ run_dry_run_checks() {
     ok=0
   fi
 
-  # agent CLI binary
-  local cli_path="${CODEX:-${CLAUDE:-}}"
+  # agent CLI binary — pick the correct env var based on tool
+  local cli_path
+  case "$tool" in
+    codex-tmux)  cli_path="${CODEX:-codex}" ;;
+    claude-tmux) cli_path="${CLAUDE:-claude}" ;;
+    *)           cli_path="" ;;
+  esac
   if [[ -n "$cli_path" ]] && ( [[ -x "$cli_path" ]] || command -v "$cli_path" >/dev/null 2>&1 ); then
     add_check "agent_cli_binary" "pass" "$cli_path"
   else
-    add_check "agent_cli_binary" "fail" "agent CLI not resolvable: $cli_path"
+    add_check "agent_cli_binary" "fail" "agent CLI not resolvable: $cli_path (tool=$tool)"
     ok=0
   fi
 
@@ -482,7 +487,7 @@ run_dry_run_checks() {
     add_check "on_exit_pairing" "skip" "no --on-exit"
   fi
 
-  # transcript
+  # transcript — check parent dir is writable WITHOUT creating the file
   if [[ -n "$transcript_path" ]]; then
     if [[ "${transcript_path:0:1}" != "/" ]]; then
       add_check "transcript_path" "fail" "--transcript must be absolute: $transcript_path"
@@ -491,11 +496,11 @@ run_dry_run_checks() {
       add_check "transcript_path" "fail" "pre-existing: $transcript_path"
       ok=0
     else
-      if ( : > "$transcript_path" ) 2>/dev/null; then
-        rm -f "$transcript_path"
+      local transcript_parent="${transcript_path:h}"
+      if [[ -d "$transcript_parent" && -w "$transcript_parent" ]]; then
         add_check "transcript_path" "pass" "$transcript_path"
       else
-        add_check "transcript_path" "fail" "not writable: $transcript_path"
+        add_check "transcript_path" "fail" "parent not writable: $transcript_parent"
         ok=0
       fi
     fi
@@ -659,11 +664,8 @@ apply_result_env_args() {
 }
 
 start_session() {
-  require_bins
-  write_tmux_conf
   local should_attach=0
   local exact_name=0
-
   local dry_run=0
   while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" || "${1:-}" == "--dry-run" ]]; do
     case "$1" in
@@ -712,6 +714,9 @@ start_session() {
       "$sentinel" "$on_exit_cmd" "$transcript_path"
     exit $?
   fi
+
+  require_bins
+  write_tmux_conf
 
   if [[ ! -d "$directory" ]]; then
     echo "Directory not found: $directory" >&2
