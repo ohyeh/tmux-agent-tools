@@ -585,6 +585,132 @@ run_on_start_hook() {
   ) &
 }
 
+# --- Dry-run pre-flight checks (issue #110) -------------------------------
+# Verify the named start would succeed without launching tmux or the CLI.
+# Emits a JSON summary on stdout. Exit 0 if all checks pass, 2 if any
+# critical check fails. Warnings (e.g. transcript probe fallback) do not
+# fail the run.
+run_dry_run_checks() {
+  require_jq
+  local tool="$1" req_name="$2" directory="$3" exact_name="$4"
+  local sentinel="$5" on_exit_cmd="$6" transcript_path="$7"
+  local checks_json="[]"
+
+  add_check() {
+    local check_name="$1" check_status="$2" detail="$3"
+    checks_json="$("$JQ" -c -n --argjson cs "$checks_json" \
+      --arg name "$check_name" --arg status "$check_status" --arg detail "$detail" \
+      '$cs + [{name: $name, status: $status, detail: $detail}]')"
+  }
+
+  local ok=1
+  # workdir
+  if [[ -d "$directory" ]]; then
+    add_check "workdir_exists" "pass" "$directory"
+  else
+    add_check "workdir_exists" "fail" "directory not found: $directory"
+    ok=0
+  fi
+
+  # tmux binary
+  if [[ -x "$TMUX" ]] || command -v "$TMUX" >/dev/null 2>&1; then
+    add_check "tmux_binary" "pass" "$TMUX"
+  else
+    add_check "tmux_binary" "fail" "tmux not found at $TMUX"
+    ok=0
+  fi
+
+  # agent CLI binary — pick the correct env var based on tool
+  local cli_path
+  case "$tool" in
+    codex-tmux)  cli_path="${CODEX:-codex}" ;;
+    claude-tmux) cli_path="${CLAUDE:-claude}" ;;
+    *)           cli_path="" ;;
+  esac
+  if [[ -n "$cli_path" ]] && ( [[ -x "$cli_path" ]] || command -v "$cli_path" >/dev/null 2>&1 ); then
+    add_check "agent_cli_binary" "pass" "$cli_path"
+  else
+    add_check "agent_cli_binary" "fail" "agent CLI not resolvable: $cli_path (tool=$tool)"
+    ok=0
+  fi
+
+  # session name conflict (only with --exact; non-exact appends a suffix)
+  local session_name
+  if (( exact_name )); then
+    session_name="$(session_for_name "$req_name")"
+    if "$TMUX" has-session -t "$session_name" 2>/dev/null; then
+      add_check "session_not_in_use" "fail" "session already exists: $session_name (would be killed by start)"
+      ok=0
+    else
+      add_check "session_not_in_use" "pass" "$session_name"
+    fi
+  else
+    add_check "session_not_in_use" "skip" "non-exact name appends random suffix"
+  fi
+
+  # sentinel
+  if [[ -n "$sentinel" ]]; then
+    if [[ "${sentinel:0:1}" != "/" ]]; then
+      add_check "sentinel_path" "fail" "--sentinel must be absolute: $sentinel"
+      ok=0
+    elif [[ -e "$sentinel" ]]; then
+      add_check "sentinel_path" "fail" "pre-existing: $sentinel (would block start)"
+      ok=0
+    else
+      local sentinel_parent="${sentinel:h}"
+      if [[ -d "$sentinel_parent" && -w "$sentinel_parent" ]]; then
+        add_check "sentinel_path" "pass" "$sentinel"
+      else
+        add_check "sentinel_path" "fail" "parent not writable: $sentinel_parent"
+        ok=0
+      fi
+    fi
+  else
+    add_check "sentinel_path" "skip" "no --sentinel"
+  fi
+
+  # on-exit hook requires sentinel
+  if [[ -n "$on_exit_cmd" ]]; then
+    if [[ -z "$sentinel" ]]; then
+      add_check "on_exit_pairing" "fail" "--on-exit requires --sentinel"
+      ok=0
+    else
+      add_check "on_exit_pairing" "pass" "hook = $on_exit_cmd"
+    fi
+  else
+    add_check "on_exit_pairing" "skip" "no --on-exit"
+  fi
+
+  # transcript — check parent dir is writable WITHOUT creating the file
+  if [[ -n "$transcript_path" ]]; then
+    if [[ "${transcript_path:0:1}" != "/" ]]; then
+      add_check "transcript_path" "fail" "--transcript must be absolute: $transcript_path"
+      ok=0
+    elif [[ -e "$transcript_path" ]]; then
+      add_check "transcript_path" "fail" "pre-existing: $transcript_path"
+      ok=0
+    else
+      local transcript_parent="${transcript_path:h}"
+      if [[ -d "$transcript_parent" && -w "$transcript_parent" ]]; then
+        add_check "transcript_path" "pass" "$transcript_path"
+      else
+        add_check "transcript_path" "fail" "parent not writable: $transcript_parent"
+        ok=0
+      fi
+    fi
+  else
+    add_check "transcript_path" "skip" "no --transcript"
+  fi
+
+  local ok_bool
+  if (( ok )); then ok_bool=true; else ok_bool=false; fi
+  "$JQ" -n --argjson checks "$checks_json" --argjson ok "$ok_bool" \
+    --arg tool "$tool" --arg name "$req_name" --arg directory "$directory" \
+    '{schema_version: 1, tool: $tool, name: $name, directory: $directory,
+      ok: $ok, checks: $checks}'
+  if (( ok )); then return 0; else return 2; fi
+}
+
 # --- Result-file convention helpers (issue #97) ---------------------------
 # Layout under $TMUX_AGENT_DIR (default $XDG_STATE_HOME/tmux-agent-tools):
 #   <dir>/<agent-name>/result.json
@@ -737,13 +863,17 @@ start_session() {
   local should_attach=0
   local exact_name=0
 
-  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
+  local dry_run=0
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" || "${1:-}" == "--dry-run" ]]; do
     case "$1" in
       --attach)
         should_attach=1
         ;;
       --exact)
         exact_name=1
+        ;;
+      --dry-run)
+        dry_run=1
         ;;
     esac
     shift
@@ -772,8 +902,14 @@ start_session() {
   local initial_text="${*:-}"
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: claude-tmux start [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> [initial text]" >&2
+    echo "Usage: claude-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> [initial text]" >&2
     exit 2
+  fi
+
+  if (( dry_run )); then
+    run_dry_run_checks claude-tmux "$requested_name" "$directory" "$exact_name" \
+      "$sentinel" "$on_exit_cmd" "$transcript_path"
+    exit $?
   fi
 
   if [[ ! -d "$directory" ]]; then
