@@ -1,0 +1,61 @@
+#!/usr/bin/env zsh
+# Smoke for issue #123 v1 dashboard JSON snapshot.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DASH="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-dashboard"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-dash-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: empty snapshot shape"
+out="$("$DASH" 2>&1)"
+assert "schema_version=1" "$(printf '%s' "$out" | jq -r .schema_version)" "1"
+assert "totals.total numeric" "$(printf '%s' "$out" | jq -r '.totals.total | type')" "number"
+assert "sessions array" "$(printf '%s' "$out" | jq -r '.sessions | type')" "array"
+
+echo "case: snapshot includes started session"
+CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact dash-test "$WORK" >/dev/null
+/bin/sleep 1
+out="$("$DASH" 2>&1)"
+total="$(printf '%s' "$out" | jq -r '.totals.total')"
+if (( total >= 1 )); then
+  echo "  ok   total >= 1 after start (got $total)"; PASS=$((PASS + 1))
+else
+  echo "  FAIL total expected >=1, got $total" >&2; FAIL=$((FAIL + 1))
+fi
+"$CODEX_TMUX" stop dash-test >/dev/null 2>&1 || true
+
+echo "case: --watch --count 1 exits"
+out="$("$DASH" --watch --count 1 --interval 1 2>&1)"
+lines="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+if (( lines >= 1 )); then
+  echo "  ok   --count 1 emitted ($lines lines)"; PASS=$((PASS + 1))
+else
+  echo "  FAIL --count 1 emitted nothing" >&2; FAIL=$((FAIL + 1))
+fi
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

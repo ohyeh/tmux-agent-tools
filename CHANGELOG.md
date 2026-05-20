@@ -9,6 +9,8 @@
 
 
 
+
+- `tmux-agent-dashboard [--watch] [--interval s] [--count n]` JSON snapshot tool (issue #123 v1 slice). Single JSON object per snapshot with totals + per-session payloads. `--watch` polls bounded by `--count`. Interactive ncurses TUI deferred per design batch. `scripts/test-dashboard-smoke`: 5 sub-assertions.
 - `tmux-agent-cron` catalog tool (issue #122 v1 slice). Subcommands: `add`, `list`, `remove`, `show`, `history`. Schedules persist to `~/.tmux-agent/cron/schedules.jsonl`. Platform integration (launchd / systemd-timer / crontab) is deferred to v2 per design batch — operator reads the catalog from their own scheduler. `scripts/test-cron-smoke`: 12 sub-assertions.
 - `checkpoint <name> <abs.tar.gz>` and `restore <input.tar.gz>` subcommands on both wrappers (issue #111 v1 slice). `checkpoint` snapshots the per-agent state dir + a 2000-line pane scrollback into a gzip-compressed tarball. `restore` is read-only: extracts to a scratch dir and prints contents. Spawning a fresh session from the checkpoint is deferred to v2 per design batch. `scripts/test-checkpoint-smoke`: 12 sub-assertions.
 - `--ci` flag on `start` / `resume` (issue #120 v1 slice). Persists a per-agent marker at `$TMUX_AGENT_DIR/<name>/ci-mode` so future subcommands can branch on it. `docs/ci-mode-exit-codes.md` documents the stable exit code contract: 0/ok, 1/generic, 2/usage-error, 3/permission-wall, 4/secret-missing (placeholder), 5/schema-fail (placeholder), 124/timeout. Deferred to v2: JSON-by-default flip, `doctor --ci`, GH Actions example. `scripts/test-ci-mode-smoke`: 6 sub-assertions.
