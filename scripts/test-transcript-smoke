@@ -1,0 +1,116 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #100 single-agent JSONL transcript.
+#
+# Verifies that --transcript on start (and resume in spirit, via the same
+# helpers) wires up subsequent send / capture / stop to append wrapper
+# events to a single JSONL file.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-transcript-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-quiet.sh" <<'EOF'
+#!/bin/sh
+echo "ready"
+sleep 30
+EOF
+chmod +x "$WORK/fake-quiet.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_transcript() {
+  local wrapper="$1" cli_env="$2" prefix="$3" expected_tool="$4"
+  echo "case: $prefix ($wrapper)"
+  local transcript="$WORK/$prefix.jsonl"
+  rm -f "$transcript"
+
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix" "$WORK" >/dev/null
+  sleep 2
+  "$wrapper" send "$prefix" "hello agent" >/dev/null
+  sleep 1
+  "$wrapper" capture "$prefix" 10 >/dev/null
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+
+  # Transcript should have 4 lines: start, send, capture, stop.
+  local line_count
+  line_count="$(wc -l < "$transcript" | tr -d ' ')"
+  assert "$prefix transcript has 4 events" "$line_count" "4"
+
+  # Every line: valid JSON with schema_version=1.
+  local invalid_count
+  invalid_count="$(awk 'NR' "$transcript" | while read -r line; do
+    printf '%s' "$line" | jq -e '.schema_version == 1' >/dev/null 2>&1 || echo "BAD"
+  done | wc -l | tr -d ' ')"
+  assert "$prefix every line schema_version=1" "$invalid_count" "0"
+
+  # Each expected event present.
+  for evt in start send capture stop; do
+    local found
+    found="$(grep -c "\"event\":\"$evt\"" "$transcript" || true)"
+    assert "$prefix transcript has $evt event" "$found" "1"
+  done
+
+  # start event tool field
+  local tool_in_start
+  tool_in_start="$(head -1 "$transcript" | jq -r .tool)"
+  assert "$prefix start event tool=$expected_tool" "$tool_in_start" "$expected_tool"
+
+  # send event preserves text
+  local send_text
+  send_text="$(grep '"event":"send"' "$transcript" | jq -r .text)"
+  assert "$prefix send event preserves text" "$send_text" "hello agent"
+}
+
+run_stale_reject() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-stale ($wrapper, pre-existing transcript should be rejected)"
+  local transcript="$WORK/$prefix-stale.jsonl"
+  printf 'stale\n' > "$transcript"
+  local rc=0
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix-stale" "$WORK" >/dev/null 2>&1 || rc=$?
+  assert "$prefix-stale rejected" "$rc" "1"
+  rm -f "$transcript"
+}
+
+run_missing_value_reject() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing-value ($wrapper)"
+  local rc=0
+  "$wrapper" start --exact --transcript 2>/dev/null || rc=$?
+  assert "$prefix-missing-value rejected" "$rc" "2"
+}
+
+run_transcript        "$CODEX_TMUX"  "CODEX"  "tr-codex"  "codex"
+run_transcript        "$CLAUDE_TMUX" "CLAUDE" "tr-claude" "claude"
+run_stale_reject      "$CODEX_TMUX"  "CODEX"  "codex"
+run_stale_reject      "$CLAUDE_TMUX" "CLAUDE" "claude"
+run_missing_value_reject "$CODEX_TMUX"  "codex"
+run_missing_value_reject "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

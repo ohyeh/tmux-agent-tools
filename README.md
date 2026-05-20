@@ -164,6 +164,35 @@ codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
 
 All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
 
+### Single-agent JSONL transcript
+
+`start` and `resume` accept `--transcript <abs-path>`. Subsequent
+`send`, `capture`, and `stop` invocations append a JSONL event to that
+file so single-agent sessions get the same audit-trail shape as
+`tmux-agent-dialogue`:
+
+```bash
+codex-tmux start --exact --transcript /tmp/worker.jsonl worker ~/proj
+codex-tmux send worker 'do step 1'
+codex-tmux capture worker 20
+codex-tmux stop worker
+cat /tmp/worker.jsonl
+# {"schema_version":1,"event":"start","tool":"codex","name":"worker", ...}
+# {"schema_version":1,"event":"send","name":"worker","text":"do step 1","at": ...}
+# {"schema_version":1,"event":"capture","name":"worker","lines_requested":20, ...}
+# {"schema_version":1,"event":"stop","name":"worker","stopped":true, ...}
+```
+
+All events carry `schema_version: 1`, an `event` discriminator, the
+agent `name`, and an ISO-8601 UTC `at` timestamp. The transcript path
+is remembered for the session in `$TMUX_AGENT_DIR/<name>/transcript-path`
+so subsequent subcommands find it automatically. A pre-existing
+transcript file aborts start to avoid mixed runs.
+
+Wait-family events (`wait`, `wait-text`, `wait-literal`,
+`send-wait-literal`, `wait-and-capture`) are NOT yet recorded — tracked
+as a #100 followup so this PR stays scoped to the most-used surface.
+
 ### `wait-and-capture` combined subcommand
 
 The two-step `wait-literal X && capture --strip-ansi --since-marker X`
