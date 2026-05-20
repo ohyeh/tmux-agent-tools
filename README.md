@@ -205,7 +205,7 @@ codex-tmux result --json worker         # metadata-wrapped output
 | --- | --- |
 | `--field <jq>` | Extract a single value via `jq -r`. Exits non-zero if the path is missing. |
 | `--wait <seconds>` | Poll until the file appears or timeout. fswatch / inotifywait support is a follow-up; current implementation polls once per second. |
-| `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, valid, body}`. `valid` is `true` when the file parsed as JSON (body is the parsed object) and `false` when it did not (body is the raw bytes as a string, so the caller can still inspect). `present: false` is returned (text mode exits 1) when the file is missing. |
+| `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, valid, body}`. `valid` is `true` when the file parsed as JSON (body is the parsed object) and `false` when it did not (body is the raw bytes as a string, so the caller can still inspect). When the file is missing, `--json` exits 0 with `{present: false, valid: false, body: null}` — callers branch on `.present` rather than the exit code. Text mode (no `--json`) keeps the conventional exit 1 + stderr message for missing files. |
 
 ### Event-driven completion (sentinel + on-exit hook)
 

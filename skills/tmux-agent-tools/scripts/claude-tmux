@@ -891,9 +891,13 @@ result_session() {
 
   if [[ ! -f "$result_path" ]]; then
     if (( output_json )); then
+      # gemini-code-assist on PR #136: `--json` is a structured-output
+      # mode; if JSON was emitted, the subcommand succeeded. The
+      # "result-not-yet" condition lives in `.present`. Callers branch
+      # on the payload, not the exit code.
       "$JQ" -n --arg path "$result_path" \
-        '{schema_version: 1, path: $path, present: false, body: null}'
-      exit 1
+        '{schema_version: 1, path: $path, present: false, valid: false, body: null}'
+      return 0
     fi
     echo "Result file not found: $result_path" >&2
     exit 1
@@ -903,9 +907,18 @@ result_session() {
   body="$(cat "$result_path")"
   bytes=$(wc -c < "$result_path" | tr -d ' ')
   if [[ "$(uname)" == "Darwin" ]]; then
-    mtime=$(stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$result_path")
+    # BSD stat: -f %m emits epoch seconds. Format via `date -u -r EPOCH`
+    # so the value is genuinely UTC.
+    local epoch
+    epoch=$(stat -f %m "$result_path")
+    mtime=$(date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ)
   else
-    mtime=$(stat -c %y "$result_path" | awk '{print $1"T"$2"Z"}')
+    # GNU stat: -c %Y emits epoch seconds. `stat -c %y` was wrong because
+    # it formatted in the local timezone but the wrapper appended a `Z`
+    # suffix as if it were UTC (gemini-code-assist on PR #136).
+    local epoch
+    epoch=$(stat -c %Y "$result_path")
+    mtime=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)
   fi
 
   if (( output_json )); then
