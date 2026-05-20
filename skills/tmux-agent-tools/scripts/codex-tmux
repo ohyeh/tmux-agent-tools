@@ -1190,6 +1190,66 @@ tag_list_json() {
   fi
 }
 
+usage_record_path() {
+  # Persist the per-agent usage stream path (#103 v1 skeleton).
+  local name="$1" target="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( printf '%s\n' "$target" > "$subdir/usage-path" ) 2>/dev/null || true
+}
+
+usage_path_for() {
+  # Returns the configured usage path, or the default fallback.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/usage-path"
+  if [[ -f "$marker" ]]; then
+    cat "$marker"
+  else
+    printf '%s' "$(agent_root_dir)/$name/usage.jsonl"
+  fi
+}
+
+usage_init_event() {
+  # Write a single usage_init line so consumers can detect the stream
+  # exists even before any real usage data lands (v1 skeleton).
+  local name="$1"
+  local usage_target
+  usage_target="$(usage_path_for "$name")"
+  require_jq
+  local line
+  line="$("$JQ" -c -n --arg event usage_init --arg name "$name" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, event: $event, name: $name, at: $at}')"
+  ( printf '%s\n' "$line" >> "$usage_target" ) 2>/dev/null || true
+}
+
+usage_aggregate_json() {
+  # Read usage.jsonl, fold the well-known token / cost fields. Missing
+  # fields are returned as null with a note documenting the gap. v1
+  # never reads real CLI usage data — that's deferred per design.
+  local name="$1"
+  local usage_target
+  usage_target="$(usage_path_for "$name")"
+  require_jq
+  if [[ ! -f "$usage_target" ]]; then
+    "$JQ" -n --arg name "$name" \
+      '{schema_version: 1, name: $name, input_tokens: null,
+        output_tokens: null, cache_read_tokens: null, cache_write_tokens: null,
+        cost_usd: null, turns: 0,
+        note: ["usage.jsonl not present — capture mechanism deferred per #103 v1"]}'
+    return 0
+  fi
+  "$JQ" -cs --arg name "$name" '
+    {schema_version: 1, name: $name,
+     input_tokens:        ((map(.input_tokens // 0)        | add) // null),
+     output_tokens:       ((map(.output_tokens // 0)       | add) // null),
+     cache_read_tokens:   ((map(.cache_read_tokens // 0)   | add) // null),
+     cache_write_tokens:  ((map(.cache_write_tokens // 0)  | add) // null),
+     cost_usd:            (map(.cost_usd // 0) | (if length > 0 and any(. > 0) then add else null end)),
+     turns: (map(select(.event == "turn_usage")) | length),
+     note: (if any(.event == "turn_usage") then [] else ["no turn_usage events yet — CLI stream tee mechanism deferred per #103 v1"] end)}' "$usage_target"
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 # Persist a few small bits of cross-subcommand state under
 # $TMUX_AGENT_DIR/<name>/ so that `status --json` can answer
@@ -1353,9 +1413,10 @@ start_session() {
   local transcript_path=""
   local transcript_truncate=""
   local result_schema_path=""
+  local usage_path=""
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" ]]; do
     case "$1" in
       --transcript|--record)
         if (( $# < 2 )); then
@@ -1403,6 +1464,18 @@ start_session() {
           exit 2
         fi
         pending_tags+=("$2")
+        shift 2
+        ;;
+      --usage)
+        if (( $# < 2 )); then
+          echo "--usage requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--usage must be an absolute path: $2" >&2
+          exit 2
+        fi
+        usage_path="$2"
         shift 2
         ;;
     esac
@@ -1468,6 +1541,10 @@ start_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  if [[ -n "$usage_path" ]]; then
+    usage_record_path "$name" "$usage_path"
+  fi
+  usage_init_event "$name"
   for tag in "${pending_tags[@]}"; do
     tag_record "$name" "$tag" || true
   done
@@ -1558,9 +1635,10 @@ resume_session() {
   local transcript_path=""
   local transcript_truncate=""
   local result_schema_path=""
+  local usage_path=""
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" ]]; do
     case "$1" in
       --transcript|--record)
         if (( $# < 2 )); then
@@ -1608,6 +1686,18 @@ resume_session() {
           exit 2
         fi
         pending_tags+=("$2")
+        shift 2
+        ;;
+      --usage)
+        if (( $# < 2 )); then
+          echo "--usage requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--usage must be an absolute path: $2" >&2
+          exit 2
+        fi
+        usage_path="$2"
         shift 2
         ;;
     esac
@@ -1658,6 +1748,10 @@ resume_session() {
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
+  if [[ -n "$usage_path" ]]; then
+    usage_record_path "$name" "$usage_path"
+  fi
+  usage_init_event "$name"
   for tag in "${pending_tags[@]}"; do
     tag_record "$name" "$tag" || true
   done
@@ -2602,6 +2696,16 @@ status_session() {
   if [[ "${1:-}" == "--json" ]]; then
     output_json=1
     shift
+  fi
+  if [[ "${1:-}" == "--usage" ]]; then
+    shift
+    local name_for_usage="${1:-}"
+    if [[ -z "$name_for_usage" ]]; then
+      echo "Usage: status --usage <name>" >&2
+      exit 2
+    fi
+    usage_aggregate_json "$name_for_usage"
+    return $?
   fi
 
   local name="${1:-}"
