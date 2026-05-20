@@ -1,5 +1,37 @@
 # tmux-agent-tools Task Plan
 
+## Overnight 2026-05-20 (in progress)
+
+Partner session: `codex-cli-partner` (codex-tmux). Goal: chip away at RFC #109 backlog while operator sleeps.
+
+In-flight slice — Issue #95 (P0/L1 Event-driven completion signaling):
+
+Status: PR-ready except for `start-ssh` and operator review.
+
+| Surface | State |
+|---|---|
+| Design doc `docs/design-issue-95-event-driven-completion.md` | DONE |
+| Implementation notes `docs/implementation-notes.md` | DONE (D1–D10) |
+| codex-tmux local `start` | DONE, 4 smoke cases pass |
+| codex-tmux local `resume` | DONE, `zsh -n` only (needs real Codex UUID smoke) |
+| claude-tmux local `start` | DONE, smoke pass |
+| claude-tmux local `resume` | DONE, `zsh -n` only |
+| `--sentinel-keep`, stale reject, relative reject, on-exit-without-sentinel warn | DONE |
+| README "Event-driven completion" section | DONE |
+| CHANGELOG `## Unreleased` | DONE |
+| `scripts/test-sentinel-smoke` (4 cases / 8 sub-assertions) | DONE, all pass |
+| codex-tmux `start-ssh` | DESIGN AGREED in design doc; code pending |
+| claude-tmux `start-ssh` | DESIGN AGREED; code pending |
+| Formula bump | OUT OF SCOPE (gated on operator release workflow) |
+| `git commit` / PR | OUT OF SCOPE for overnight (no direct push to main) |
+
+Next concrete actions for the awake operator:
+1. Review `docs/implementation-notes.md` D1–D10 (decisions) before merging.
+2. Real Codex/Claude `resume` smoke test using a captured session UUID.
+3. Implement `start-ssh` sentinel per the "SSH semantics" table in the design doc; mirror smoke into `scripts/test-sentinel-smoke` with a `ssh localhost` test path.
+4. Decide whether `scripts/test-sentinel-smoke` should be wired into CI.
+5. Open a feature branch PR — do NOT push directly to `main` per branch-protection convention.
+
 ## Goal
 
 Develop tmux-agent-tools through the public PR workflow: keep `main` protected, ship verified releases, and iterate beyond `v0.5.0` observability into `v0.6.0` composability on focused feature branches with Claude tmux-agent teammate review.
