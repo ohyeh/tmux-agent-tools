@@ -1538,9 +1538,13 @@ start_session() {
   local result_schema_path=""
   local usage_path=""
   local ci_mode=0
+  local on_exit_allow=""
+  local workdir_fresh=0
+  local -a pending_secrets
+  pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
       --transcript|--record)
         if (( $# < 2 )); then
@@ -1606,6 +1610,30 @@ start_session() {
         ci_mode=1
         shift
         ;;
+      --on-exit-allow)
+        if (( $# < 2 )); then
+          echo "--on-exit-allow requires a regex value" >&2
+          exit 2
+        fi
+        on_exit_allow="$2"
+        shift 2
+        ;;
+      --secret)
+        if (( $# < 2 )); then
+          echo "--secret requires KEY=PATH value" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--secret must be KEY=PATH: $2" >&2
+          exit 2
+        fi
+        pending_secrets+=("$2")
+        shift 2
+        ;;
+      --workdir-fresh)
+        workdir_fresh=1
+        shift
+        ;;
     esac
   done
 
@@ -1630,6 +1658,13 @@ start_session() {
     exit 1
   fi
 
+  if [[ -n "$on_exit_allow" && -n "$on_exit_cmd" ]]; then
+    if ! [[ "$on_exit_cmd" =~ $on_exit_allow ]]; then
+      echo "--on-exit hook does not match --on-exit-allow regex: $on_exit_cmd" >&2
+      echo "  allow regex: $on_exit_allow" >&2
+      exit 3
+    fi
+  fi
   validate_sentinel_flags claude-tmux
   if [[ -n "$transcript_path" && "${transcript_path:0:1}" != "/" ]]; then
     echo "--transcript must be an absolute path: $transcript_path" >&2
@@ -1656,6 +1691,20 @@ start_session() {
   if (( ! exact_name )); then
     name="$requested_name-$(random_suffix)"
   fi
+  if (( workdir_fresh )); then
+    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
+      exit 1
+    fi
+    local fresh_workdir="${TMPDIR:-/tmp}/tmux-agent-worktree-${name//[^A-Za-z0-9._-]/_}-$$"
+    if ! ( cd "$directory" && git worktree add "$fresh_workdir" >/dev/null 2>&1 ); then
+      echo "git worktree add failed" >&2
+      exit 1
+    fi
+    directory="$fresh_workdir"
+    ensure_agent_dir "$name" >/dev/null
+    ( printf '%s\n' "$fresh_workdir" > "$(agent_root_dir)/$name/fresh-worktree" ) 2>/dev/null || true
+  fi
 
   local session="$(session_for_name "$name")"
   local -a session_env_args
@@ -1665,6 +1714,16 @@ start_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  for sec in "${pending_secrets[@]}"; do
+    sec_key="${sec%%=*}"
+    sec_path="${sec#*=}"
+    if [[ ! -f "$sec_path" ]]; then
+      echo "--secret file not found: $sec_path" >&2
+      exit 4
+    fi
+    sec_value="$(cat "$sec_path")"
+    session_env_args+=("-e" "${sec_key}=${sec_value}")
+  done
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
@@ -1769,9 +1828,13 @@ resume_session() {
   local result_schema_path=""
   local usage_path=""
   local ci_mode=0
+  local on_exit_allow=""
+  local workdir_fresh=0
+  local -a pending_secrets
+  pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
       --transcript|--record)
         if (( $# < 2 )); then
@@ -1837,6 +1900,30 @@ resume_session() {
         ci_mode=1
         shift
         ;;
+      --on-exit-allow)
+        if (( $# < 2 )); then
+          echo "--on-exit-allow requires a regex value" >&2
+          exit 2
+        fi
+        on_exit_allow="$2"
+        shift 2
+        ;;
+      --secret)
+        if (( $# < 2 )); then
+          echo "--secret requires KEY=PATH value" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--secret must be KEY=PATH: $2" >&2
+          exit 2
+        fi
+        pending_secrets+=("$2")
+        shift 2
+        ;;
+      --workdir-fresh)
+        workdir_fresh=1
+        shift
+        ;;
     esac
   done
 
@@ -1859,6 +1946,13 @@ resume_session() {
     exit 2
   fi
 
+  if [[ -n "$on_exit_allow" && -n "$on_exit_cmd" ]]; then
+    if ! [[ "$on_exit_cmd" =~ $on_exit_allow ]]; then
+      echo "--on-exit hook does not match --on-exit-allow regex: $on_exit_cmd" >&2
+      echo "  allow regex: $on_exit_allow" >&2
+      exit 3
+    fi
+  fi
   validate_sentinel_flags claude-tmux
   if [[ -n "$transcript_path" && "${transcript_path:0:1}" != "/" ]]; then
     echo "--transcript must be an absolute path: $transcript_path" >&2
@@ -1885,6 +1979,20 @@ resume_session() {
   if (( ! exact_name )); then
     name="$requested_name-$(random_suffix)"
   fi
+  if (( workdir_fresh )); then
+    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
+      exit 1
+    fi
+    local fresh_workdir="${TMPDIR:-/tmp}/tmux-agent-worktree-${name//[^A-Za-z0-9._-]/_}-$$"
+    if ! ( cd "$directory" && git worktree add "$fresh_workdir" >/dev/null 2>&1 ); then
+      echo "git worktree add failed" >&2
+      exit 1
+    fi
+    directory="$fresh_workdir"
+    ensure_agent_dir "$name" >/dev/null
+    ( printf '%s\n' "$fresh_workdir" > "$(agent_root_dir)/$name/fresh-worktree" ) 2>/dev/null || true
+  fi
 
   local session="$(session_for_name "$name")"
   local -a session_env_args
@@ -1894,6 +2002,16 @@ resume_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  for sec in "${pending_secrets[@]}"; do
+    sec_key="${sec%%=*}"
+    sec_path="${sec#*=}"
+    if [[ ! -f "$sec_path" ]]; then
+      echo "--secret file not found: $sec_path" >&2
+      exit 4
+    fi
+    sec_value="$(cat "$sec_path")"
+    session_env_args+=("-e" "${sec_key}=${sec_value}")
+  done
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
@@ -1990,6 +2108,20 @@ start_ssh_session() {
   local name="$requested_name"
   if (( ! exact_name )); then
     name="$requested_name-$(random_suffix)"
+  fi
+  if (( workdir_fresh )); then
+    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
+      exit 1
+    fi
+    local fresh_workdir="${TMPDIR:-/tmp}/tmux-agent-worktree-${name//[^A-Za-z0-9._-]/_}-$$"
+    if ! ( cd "$directory" && git worktree add "$fresh_workdir" >/dev/null 2>&1 ); then
+      echo "git worktree add failed" >&2
+      exit 1
+    fi
+    directory="$fresh_workdir"
+    ensure_agent_dir "$name" >/dev/null
+    ( printf '%s\n' "$fresh_workdir" > "$(agent_root_dir)/$name/fresh-worktree" ) 2>/dev/null || true
   fi
 
   local session="$(session_for_name "$name")"
