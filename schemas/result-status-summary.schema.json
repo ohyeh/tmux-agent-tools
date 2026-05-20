@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "tmux-agent-tools result-status-summary",
+  "description": "Lightweight result.json contract used by tmux-agent-tools. v1 validator (see #125) only checks: type (object), required keys, additionalProperties: false.",
+  "type": "object",
+  "required": ["schema_version", "status", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "integer"},
+    "status": {"type": "string"},
+    "summary": {"type": "string"},
+    "artifacts": {"type": "array"},
+    "errors": {"type": "array"}
+  }
+}

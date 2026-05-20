@@ -1040,6 +1040,117 @@ transcript_emit_wait_event() {
   transcript_append "$transcript_path" "$line"
 }
 
+result_schema_record() {
+  # Persist per-agent --result-schema path (#125) under
+  # $TMUX_AGENT_DIR/<name>/result-schema-path. Best-effort write.
+  local name="$1" target="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( printf '%s\n' "$target" > "$subdir/result-schema-path" ) 2>/dev/null || true
+}
+
+result_schema_path_for() {
+  # Returns the configured schema path or empty if none.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/result-schema-path"
+  [[ -f "$marker" ]] && cat "$marker" || true
+}
+
+result_validate_lightweight() {
+  # Lightweight v1 validator (#125): checks top-level type + required +
+  # additionalProperties:false. Emits a single JSON line.
+  # Args: $1 result_path, $2 schema_path
+  local result_path="$1" schema_path="$2"
+  require_jq
+
+  if [[ ! -f "$schema_path" ]]; then
+    "$JQ" -n --arg p "$schema_path" \
+      '{schema_version: 1, present: false, valid: false,
+        errors: [{path: ".", message: ("schema file not found: " + $p)}], body: null}'
+    return 1
+  fi
+  local schema
+  schema="$(cat "$schema_path")"
+
+  if [[ ! -f "$result_path" ]]; then
+    "$JQ" -n '{schema_version: 1, present: false, valid: false, errors: [], body: null}'
+    return 0
+  fi
+
+  # Parse result. If parse fails, report parse_error.
+  local body
+  body="$("$JQ" '.' "$result_path" 2>/dev/null)" || {
+    "$JQ" -n --arg raw "$(cat "$result_path")" \
+      '{schema_version: 1, present: true, valid: false,
+        errors: [{path: ".", message: "parse_error: result is not valid JSON"}],
+        body: $raw}'
+    return 2
+  }
+
+  # Run v1 validator in one jq invocation.
+  "$JQ" -n --argjson schema "$schema" --argjson body "$body" '
+    def v1_validate($schema; $body):
+      # type check
+      ( $schema.type as $t
+        | if $t == "object" and ($body | type) != "object"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "array" and ($body | type) != "array"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "string" and ($body | type) != "string"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "integer" and ($body | type) != "number"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "number" and ($body | type) != "number"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "boolean" and ($body | type) != "boolean"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          else [] end
+      ) as $type_errors
+      | # required keys (object only)
+        ( if ($schema.type // "object") == "object" and ($body | type) == "object"
+          then ($schema.required // [])
+               | map(select(. as $k | ($body | has($k)) | not))
+               | map({path: ".", message: ("missing required key: " + .)})
+          else [] end
+        ) as $required_errors
+      | # additionalProperties:false (object only)
+        ( if $schema.additionalProperties == false
+             and ($body | type) == "object"
+          then ($body | keys) - (($schema.properties // {}) | keys)
+               | map({path: ., message: "additional property not allowed"})
+          else [] end
+        ) as $extra_errors
+      | $type_errors + $required_errors + $extra_errors;
+    ($body | tojson) as $body_json
+    | v1_validate($schema; $body) as $errs
+    | {schema_version: 1, present: true, valid: ($errs | length == 0),
+       errors: $errs, body: $body}'
+
+  # Exit code: 0 if valid, 2 if invalid.
+  local valid
+  valid="$("$JQ" -n --argjson schema "$schema" --argjson body "$body" '
+    def v1_validate($schema; $body):
+      ( $schema.type as $t
+        | if $t == "object" and ($body | type) != "object" then [1]
+          elif $t == "array" and ($body | type) != "array" then [1]
+          else [] end
+      ) as $type_errors
+      | ( if ($schema.type // "object") == "object" and ($body | type) == "object"
+          then ($schema.required // [])
+               | map(select(. as $k | ($body | has($k)) | not))
+          else [] end
+        ) as $required_errors
+      | ( if $schema.additionalProperties == false
+             and ($body | type) == "object"
+          then ($body | keys) - (($schema.properties // {}) | keys)
+          else [] end
+        ) as $extra_errors
+      | ($type_errors + $required_errors + $extra_errors | length == 0);
+    v1_validate($schema; $body)
+  ')"
+  [[ "$valid" == "true" ]] && return 0 || return 2
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 # Persist a few small bits of cross-subcommand state under
 # $TMUX_AGENT_DIR/<name>/ so that `status --json` can answer
@@ -1202,7 +1313,8 @@ start_session() {
 
   local transcript_path=""
   local transcript_truncate=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" ]]; do
+  local result_schema_path=""
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" ]]; do
     case "$1" in
       --transcript)
         if (( $# < 2 )); then
@@ -1222,6 +1334,22 @@ start_session() {
           exit 2
         fi
         transcript_truncate="$2"
+        shift 2
+        ;;
+      --result-schema)
+        if (( $# < 2 )); then
+          echo "--result-schema requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--result-schema must be an absolute path: $2" >&2
+          exit 2
+        fi
+        if [[ ! -f "$2" ]]; then
+          echo "--result-schema file not found: $2" >&2
+          exit 1
+        fi
+        result_schema_path="$2"
         shift 2
         ;;
     esac
@@ -1292,6 +1420,11 @@ start_session() {
     if [[ -n "$transcript_truncate" ]]; then
       transcript_truncate_record "$name" "$transcript_truncate"
     fi
+  fi
+  if [[ -n "$result_schema_path" ]]; then
+    result_schema_record "$name" "$result_schema_path"
+  fi
+  if true; then
   fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
@@ -1368,7 +1501,8 @@ resume_session() {
 
   local transcript_path=""
   local transcript_truncate=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" ]]; do
+  local result_schema_path=""
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" ]]; do
     case "$1" in
       --transcript)
         if (( $# < 2 )); then
@@ -1388,6 +1522,22 @@ resume_session() {
           exit 2
         fi
         transcript_truncate="$2"
+        shift 2
+        ;;
+      --result-schema)
+        if (( $# < 2 )); then
+          echo "--result-schema requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--result-schema must be an absolute path: $2" >&2
+          exit 2
+        fi
+        if [[ ! -f "$2" ]]; then
+          echo "--result-schema file not found: $2" >&2
+          exit 1
+        fi
+        result_schema_path="$2"
         shift 2
         ;;
     esac
@@ -1443,6 +1593,11 @@ resume_session() {
     if [[ -n "$transcript_truncate" ]]; then
       transcript_truncate_record "$name" "$transcript_truncate"
     fi
+  fi
+  if [[ -n "$result_schema_path" ]]; then
+    result_schema_record "$name" "$result_schema_path"
+  fi
+  if true; then
   fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
@@ -1831,6 +1986,7 @@ result_session() {
   local field=""
   local wait_seconds=0
   local output_json=0
+  local validate_mode=0
   while [[ "${1:-}" == --* ]]; do
     case "$1" in
       --field)
@@ -1855,6 +2011,10 @@ result_session() {
         ;;
       --json)
         output_json=1
+        shift
+        ;;
+      --validate)
+        validate_mode=1
         shift
         ;;
       --)
@@ -1882,6 +2042,22 @@ result_session() {
 
   local result_path
   result_path="$(agent_root_dir)/$name/result.json"
+
+  if (( validate_mode )); then
+    require_jq
+    local schema_path
+    schema_path="$(result_schema_path_for "$name")"
+    if [[ -z "$schema_path" ]]; then
+      # No schema configured: emit a skipped-validation marker.
+      "$JQ" -n --arg path "$result_path" \
+        '{schema_version: 1, present: ($path | test("/")), valid: true,
+          errors: [{path: ".", message: "no --result-schema configured for this agent"}],
+          body: null}'
+      return 0
+    fi
+    result_validate_lightweight "$result_path" "$schema_path"
+    return $?
+  fi
 
   if (( wait_seconds > 0 )); then
     # Polling implementation. fswatch / inotifywait can replace this in a
