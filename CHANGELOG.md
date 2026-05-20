@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Safety fuses on `claude-tmux start` / `codex-tmux start` / `resume` (issue #105). Two new optional flags: `--max-runtime <seconds>` force-stops the agent after N seconds since start, `--max-idle <seconds>` force-stops the agent after N consecutive idle seconds (pane content hash unchanged). Both flags can coexist; whichever fires first wins. On trip, a detached background watcher writes `124` to the `--sentinel` file plus a new `<sentinel>.reason` sidecar containing `max_runtime` or `max_idle`, runs the `--on-exit` hook with `ON_EXIT_CODE=124` / `ON_EXIT_NAME=<name>` / `ON_EXIT_REASON=<reason>`, and kills the tmux session. The watcher PID is recorded under `$TMUX_AGENT_DIR/<name>/fuse.pid` so explicit `stop` tears it down first (no zombie process). `--max-cost` deferred (depends on token telemetry from #103, not yet landed). `scripts/test-max-fuse-smoke`: 20 sub-assertions across both wrappers covering runtime trip + reason + hook, idle trip + reason, idle counter reset on pane activity, stop kills watcher and clears `fuse.pid`, both flags coexisting with runtime winning, and bad-value rejection.
+
 ## v0.7.0 - 2026-05-21
 
 `v0.7.0` ships the runtime-safety + replay slice: advisory lock around concurrent send (#102), cross-session inventory watch events (#104), and the read-only `tmux-agent-replay` tool (#126 — `diff` + `redact`, with `run` deferred per acceptance).
