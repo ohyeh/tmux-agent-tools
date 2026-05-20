@@ -207,11 +207,86 @@ cmd_redact() {
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# fixture-validate (issue #127 v1 slice)
+# ---------------------------------------------------------------------------
+cmd_fixture_validate() {
+  require_jq
+  # NB: `local path=` would clobber $PATH in zsh (tied pair) — see
+  # memory/feedback_zsh_tied_pair_locals.md. Use fixture_path instead.
+  local fixture_path="${1:-}"
+  if [[ -z "$fixture_path" ]]; then
+    echo "Usage: tmux-agent-replay fixture-validate <transcript.jsonl>" >&2
+    return 2
+  fi
+  if [[ ! -f "$fixture_path" ]]; then
+    echo "Not a file: $fixture_path" >&2
+    return 1
+  fi
+
+  local errors=0
+  local checks_json="[]"
+  add_check() {
+    # `local status=` is illegal in zsh (read-only). See
+    # memory/feedback_zsh_status_readonly.md.
+    local name="$1" check_status="$2" detail="$3"
+    checks_json="$("$JQ" -c -n --argjson cs "$checks_json" \
+      --arg name "$name" --arg status "$check_status" --arg detail "$detail" \
+      '$cs + [{name: $name, status: $status, detail: $detail}]')"
+  }
+
+  local total parsed
+  total="$(wc -l < "$fixture_path" | awk '{print $1}')"
+  parsed="$("$JQ" -c -s 'length' "$fixture_path" 2>/dev/null || echo 0)"
+  if [[ "$parsed" == "$total" ]]; then
+    add_check "all_lines_parse" "pass" "$total lines"
+  else
+    add_check "all_lines_parse" "fail" "$parsed of $total parsed as JSON"
+    errors=$((errors + 1))
+  fi
+
+  local non_v1
+  non_v1="$("$JQ" -c -s '[.[] | select(.schema_version != 1)] | length' "$fixture_path" 2>/dev/null || echo "?")"
+  if [[ "$non_v1" == "0" ]]; then
+    add_check "schema_version_1" "pass" "all $total entries"
+  else
+    add_check "schema_version_1" "fail" "$non_v1 entries missing schema_version=1"
+    errors=$((errors + 1))
+  fi
+
+  local bad_ts
+  bad_ts="$("$JQ" -c -s '[.[] | select(.at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") | not)] | length' "$fixture_path" 2>/dev/null || echo "?")"
+  if [[ "$bad_ts" == "0" ]]; then
+    add_check "timestamps_iso8601" "pass" "all entries"
+  else
+    add_check "timestamps_iso8601" "fail" "$bad_ts entries with non-ISO 'at' field"
+    errors=$((errors + 1))
+  fi
+
+  local has_start
+  has_start="$("$JQ" -c -s '[.[] | select(.event == "start")] | length' "$fixture_path" 2>/dev/null || echo 0)"
+  if [[ "$has_start" -ge 1 ]]; then
+    add_check "has_start_event" "pass" "$has_start start event(s)"
+  else
+    add_check "has_start_event" "fail" "no start event found"
+    errors=$((errors + 1))
+  fi
+
+  local ok_bool
+  if (( errors == 0 )); then ok_bool=true; else ok_bool=false; fi
+  "$JQ" -n --argjson checks "$checks_json" --argjson ok "$ok_bool" \
+    --arg path "$fixture_path" --arg at "$(iso_now)" \
+    '{schema_version: 1, generated_at: $at, fixture: $path, ok: $ok, checks: $checks}'
+
+  if (( errors == 0 )); then return 0; else return 2; fi
+}
+
 sub="${1:-}"
 shift 2>/dev/null || true
 case "$sub" in
-  diff)       cmd_diff   "$@" ;;
-  redact)     cmd_redact "$@" ;;
+  diff)               cmd_diff             "$@" ;;
+  redact)             cmd_redact           "$@" ;;
+  fixture-validate)   cmd_fixture_validate "$@" ;;
   help|-h|--help|"") usage ;;
   *)          echo "Unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
 esac

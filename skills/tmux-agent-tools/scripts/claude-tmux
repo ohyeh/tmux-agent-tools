@@ -1330,9 +1330,9 @@ start_session() {
   local result_schema_path=""
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
     case "$1" in
-      --transcript)
+      --transcript|--record)
         if (( $# < 2 )); then
           echo "--transcript requires a value (absolute path)" >&2
           exit 2
@@ -1534,9 +1534,9 @@ resume_session() {
   local result_schema_path=""
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" ]]; do
     case "$1" in
-      --transcript)
+      --transcript|--record)
         if (( $# < 2 )); then
           echo "--transcript requires a value (absolute path)" >&2
           exit 2

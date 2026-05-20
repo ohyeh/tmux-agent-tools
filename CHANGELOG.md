@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+
+### Added
+
+- `--record <abs.jsonl>` is now a documented alias for `--transcript` on `start`/`resume` (issue #127 v1 slice). `tmux-agent-replay fixture-validate <jsonl>` sanity-checks a transcript: all lines parse, all entries carry `schema_version:1`, all timestamps match ISO-8601 UTC, and at least one `start` event is present. Exit 0 on valid, exit 2 on validation failure. Output is structured JSON `{schema_version:1, ok, fixture, generated_at, checks[{name,status,detail}]}`. Replay TMUX_AGENT_FIXTURE replay-from-fixture mode remains deferred (depends on a fake-CLI driver — see `docs/design-remaining-backlog.md`). `scripts/test-fixture-validate-smoke`: 10 sub-assertions.
 ## v0.8.0 - 2026-05-21
 
 `v0.8.0` ships safety + DX surfaces: max-runtime/idle fuses (#105), health-check ping (#128), result-schema validation (#125), session tagging (#124), webhook notify (#121). Also documents the L5/L6 policy-block roadmap amendment proposals (#112–#119 design batch).

@@ -1,0 +1,91 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #127 v1 slice: --record alias + fixture-validate.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPLAY="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-replay"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-fixture-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Valid fixture.
+cat > "$WORK/good.jsonl" <<'EOF'
+{"schema_version":1,"event":"start","name":"a","at":"2026-05-21T00:00:00Z"}
+{"schema_version":1,"event":"send","name":"a","text":"hi","at":"2026-05-21T00:00:01Z"}
+{"schema_version":1,"event":"stop","name":"a","at":"2026-05-21T00:00:02Z"}
+EOF
+echo "case: valid fixture passes all checks"
+out="$("$REPLAY" fixture-validate "$WORK/good.jsonl" 2>&1)"
+code=$?
+assert "valid exit=0" "$code" "0"
+assert "valid ok=true" "$(printf '%s' "$out" | jq -r .ok)" "true"
+assert "valid 4 checks" "$(printf '%s' "$out" | jq '.checks | length')" "4"
+
+# Missing start event.
+cat > "$WORK/nostart.jsonl" <<'EOF'
+{"schema_version":1,"event":"send","name":"a","at":"2026-05-21T00:00:01Z"}
+EOF
+echo "case: no start event flagged"
+code=0
+out="$("$REPLAY" fixture-validate "$WORK/nostart.jsonl" 2>&1)" || code=$?
+assert "nostart exit=2" "$code" "2"
+assert "nostart ok=false" "$(printf '%s' "$out" | jq -r .ok)" "false"
+
+# Bad schema_version.
+cat > "$WORK/badsv.jsonl" <<'EOF'
+{"schema_version":2,"event":"start","name":"a","at":"2026-05-21T00:00:00Z"}
+EOF
+echo "case: non-v1 schema flagged"
+code=0
+out="$("$REPLAY" fixture-validate "$WORK/badsv.jsonl" 2>&1)" || code=$?
+assert "badsv ok=false" "$(printf '%s' "$out" | jq -r .ok)" "false"
+
+# Missing file.
+echo "case: missing file"
+code=0
+"$REPLAY" fixture-validate "/no/such/file.jsonl" >/dev/null 2>&1 || code=$?
+assert "missing file exit=1" "$code" "1"
+
+# --record alias works on start.
+echo "case: --record alias of --transcript"
+TRANSCRIPT="$WORK/rec.jsonl"
+CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --record "$TRANSCRIPT" rec-codex "$WORK" >/dev/null
+/bin/sleep 1
+"$CODEX_TMUX" send rec-codex "trigger" >/dev/null
+/bin/sleep 1
+assert "transcript exists after --record" "$(test -s "$TRANSCRIPT" && echo yes)" "yes"
+assert "start event present" "$(jq -c 'select(.event=="start")' "$TRANSCRIPT" | wc -l | tr -d ' ')" "1"
+"$CODEX_TMUX" stop rec-codex >/dev/null 2>&1 || true
+
+TRANSCRIPT2="$WORK/rec-claude.jsonl"
+CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact --record "$TRANSCRIPT2" rec-claude "$WORK" >/dev/null
+/bin/sleep 1
+assert "claude --record creates transcript" "$(test -s "$TRANSCRIPT2" && echo yes)" "yes"
+"$CLAUDE_TMUX" stop rec-claude >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
