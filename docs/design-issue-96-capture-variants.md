@@ -51,6 +51,22 @@ would be a synonym with two failure modes (which wins when both passed?).
 Better to keep the positional and document it. If clarity is a problem
 later, the positional can be deprecated to `--tail` in a separate slice.
 
+## Schema versioning
+
+`schema_version: 1` is the first stable contract for `--json` output.
+Aligned with `#100` transcript and `#103` telemetry conventions in the
+same repo so every L3 JSON surface follows the same rule:
+
+- Additive fields do NOT bump `schema_version` — existing consumers keep
+  working as long as they ignore unknown keys.
+- Renaming or removing a field bumps `schema_version` to `2` and the
+  README contract table lists the prior shape for one release.
+
+This is intentionally inserted in the v0 release surface; adding it
+later forces every consumer to write `if .schema_version == null then 1
+else .schema_version end` fallback forever. Same convention as #100 /
+#103.
+
 ## Implementation sketch
 
 ```bash

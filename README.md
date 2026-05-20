@@ -159,8 +159,8 @@ codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
 | Flag | Behavior |
 | --- | --- |
 | `--strip-ansi` | Remove ANSI CSI/SGR escape sequences from the captured text. Known gap: OSC, DCS, APC, PM, SOS terminators are NOT stripped (see `docs/design-issue-96-capture-variants.md`). |
-| `--since-marker <text>` | Keep only the lines AFTER the LAST occurrence of the literal `<text>`. If the marker is missing, the body is empty (text mode) or `marker_found: false` (JSON mode). |
-| `--json` | Wrap output as `{name, session, lines_requested, marker_found, stripped_ansi, lines}`. Composable with the other flags. |
+| `--since-marker <text>` | Keep only the lines AFTER the LAST occurrence of the literal `<text>`. The marker line itself is NOT retained. Multi-line marker text is not supported — use a single-line literal. If the marker is missing, the body is empty (text mode) or `marker_found: false` (JSON mode). |
+| `--json` | Wrap output as `{schema_version, name, session, lines_requested, marker_found, stripped_ansi, lines}`. `schema_version` is `1` for this contract; additive field changes will not bump it. Composable with the other flags. |
 
 All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
 

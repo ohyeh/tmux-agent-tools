@@ -99,9 +99,12 @@ run_capture_variants() {
   marker_found="$(printf '%s' "$json_output" | jq -r .marker_found 2>/dev/null || echo "PARSE_FAIL")"
   stripped="$(printf '%s' "$json_output" | jq -r .stripped_ansi 2>/dev/null || echo "PARSE_FAIL")"
   name_in_json="$(printf '%s' "$json_output" | jq -r .name 2>/dev/null || echo "PARSE_FAIL")"
+  local schema_ver
+  schema_ver="$(printf '%s' "$json_output" | jq -r .schema_version 2>/dev/null || echo "PARSE_FAIL")"
   assert "$prefix --json marker_found" "$marker_found" "true"
   assert "$prefix --json stripped_ansi" "$stripped" "true"
   assert "$prefix --json name field" "$name_in_json" "$prefix"
+  assert "$prefix --json schema_version=1" "$schema_ver" "1"
 
   # Marker not found
   local miss_output miss_found

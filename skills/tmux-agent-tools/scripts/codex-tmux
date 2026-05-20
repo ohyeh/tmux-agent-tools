@@ -782,7 +782,8 @@ capture_session() {
       --argjson marker_found "$marker_found" \
       --argjson stripped_ansi "$strip_ansi" \
       --arg body "$raw" \
-      '{name: $name, session: $session, lines_requested: $lines_requested,
+      '{schema_version: 1,
+        name: $name, session: $session, lines_requested: $lines_requested,
         marker_found: ($marker_found == 1), stripped_ansi: ($stripped_ansi == 1),
         lines: ($body | split("\n"))}'
   else
