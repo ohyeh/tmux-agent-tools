@@ -10,6 +10,8 @@
 
 
 
+
+- `tmux-agent-history` SQLite + FTS5 index tool (issue #129 v1 slice). Subcommands: `index <transcript>...`, `search <query>`, `show <name>`. Stores per-session metadata at `~/.tmux-agent/history.db`; full transcript body indexed via FTS5 unicode61 tokenizer. Time filters (`--since 7d`), cross-session rollups (`top --by cost`), and `diff` are deferred per design batch. `scripts/test-history-smoke`: 9 sub-assertions.
 - `tmux-agent-dashboard [--watch] [--interval s] [--count n]` JSON snapshot tool (issue #123 v1 slice). Single JSON object per snapshot with totals + per-session payloads. `--watch` polls bounded by `--count`. Interactive ncurses TUI deferred per design batch. `scripts/test-dashboard-smoke`: 5 sub-assertions.
 - `tmux-agent-cron` catalog tool (issue #122 v1 slice). Subcommands: `add`, `list`, `remove`, `show`, `history`. Schedules persist to `~/.tmux-agent/cron/schedules.jsonl`. Platform integration (launchd / systemd-timer / crontab) is deferred to v2 per design batch — operator reads the catalog from their own scheduler. `scripts/test-cron-smoke`: 12 sub-assertions.
 - `checkpoint <name> <abs.tar.gz>` and `restore <input.tar.gz>` subcommands on both wrappers (issue #111 v1 slice). `checkpoint` snapshots the per-agent state dir + a 2000-line pane scrollback into a gzip-compressed tarball. `restore` is read-only: extracts to a scratch dir and prints contents. Spawning a fresh session from the checkpoint is deferred to v2 per design batch. `scripts/test-checkpoint-smoke`: 12 sub-assertions.

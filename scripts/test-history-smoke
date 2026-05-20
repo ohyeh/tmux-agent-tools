@@ -1,0 +1,77 @@
+#!/usr/bin/env zsh
+# Smoke for issue #129 v1 history index + search.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+HIST="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-history"
+
+WORK="$(mktemp -d -t tmux-agent-hist-smoke.XXXXXX)"
+export TMUX_AGENT_HISTORY_DIR="$WORK"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+cat > "$WORK/t1.jsonl" <<'EOF'
+{"schema_version":1,"event":"start","name":"alpha","at":"2026-05-21T00:00:00Z"}
+{"schema_version":1,"event":"send","name":"alpha","text":"license plate query","at":"2026-05-21T00:00:01Z"}
+{"schema_version":1,"event":"stop","name":"alpha","at":"2026-05-21T00:01:00Z"}
+EOF
+cat > "$WORK/t2.jsonl" <<'EOF'
+{"schema_version":1,"event":"start","name":"beta","at":"2026-05-21T01:00:00Z"}
+{"schema_version":1,"event":"send","name":"beta","text":"parking fee bug","at":"2026-05-21T01:00:01Z"}
+EOF
+
+echo "case: index two transcripts"
+"$HIST" index "$WORK/t1.jsonl" "$WORK/t2.jsonl" >/dev/null
+assert "db file created" "$(test -s "$WORK/history.db" && echo yes)" "yes"
+
+echo "case: search hits the right session"
+out="$("$HIST" search license 2>&1)"
+assert "search license length=1" "$(printf '%s' "$out" | jq -r 'length')" "1"
+assert "search license names alpha" "$(printf '%s' "$out" | jq -r '.[0].name')" "alpha"
+
+out="$("$HIST" search parking 2>&1)"
+assert "search parking names beta" "$(printf '%s' "$out" | jq -r '.[0].name')" "beta"
+
+out="$("$HIST" search nonexistent 2>&1)"
+assert "search no match length=0" "$(printf '%s' "$out" | jq -r 'length')" "0"
+
+echo "case: show dumps transcript"
+out="$("$HIST" show alpha 2>&1)"
+if [[ "$out" == *"license plate"* ]]; then
+  echo "  ok   show alpha includes payload"; PASS=$((PASS + 1))
+else
+  echo "  FAIL show alpha missing payload" >&2; FAIL=$((FAIL + 1))
+fi
+
+echo "case: show unknown name"
+code=0
+"$HIST" show unknown >/dev/null 2>&1 || code=$?
+assert "show unknown exit=1" "$code" "1"
+
+echo "case: missing arg"
+code=0
+"$HIST" search >/dev/null 2>&1 || code=$?
+assert "search missing arg exit=2" "$code" "2"
+
+echo "case: skip non-existent fixture"
+"$HIST" index "/no/such/file" 2>&1 | grep -q "Skipping" && {
+  echo "  ok   skip-missing path"; PASS=$((PASS + 1))
+} || {
+  echo "  FAIL no Skipping message" >&2; FAIL=$((FAIL + 1))
+}
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
