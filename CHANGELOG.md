@@ -5,6 +5,8 @@
 
 ### Added
 
+
+- `claude-tmux ping <name> [--timeout 10] [--json]` and the equivalent on `codex-tmux` actively probe the pane (issue #128). Sends a benign newline + Ctrl-U (which clears the input line — safe against turn-stealing) and waits for pane bytes to change. Exits 0 / 1 / 2 for ok / timeout / dead with rtt_ms reported. JSON output carries `schema_version: 1`. `scripts/test-ping-smoke`: 28 sub-assertions across both wrappers (live → ok, quiet → timeout, missing → dead, --timeout honored, rtt is non-negative int).
 - `--max-runtime <seconds>` and `--max-idle <seconds>` safety fuses on `claude-tmux` / `codex-tmux` `start` (issue #105). A detached watcher process polls the pane and force-stops the agent when the threshold trips; sentinel writes `124` and a sidecar `<sentinel>.reason` records `max_runtime` or `max_idle`. `--on-exit` hooks receive `ON_EXIT_REASON` so callers can branch on cause. `stop` kills the watcher PID recorded at `$TMUX_AGENT_DIR/<name>/fuse.pid` to prevent zombies. `scripts/test-max-fuse-smoke`: 20 sub-assertions covering runtime trip, idle trip, idle reset on activity, watcher cleanup, both-flags-runtime-wins, and bad-value rejection. `--max-cost` deferred until #103 token telemetry lands.
 ## v0.7.0 - 2026-05-21
 
