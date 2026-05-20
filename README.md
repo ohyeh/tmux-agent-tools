@@ -148,6 +148,29 @@ Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-t
 
 Captured pane text joins tmux soft-wrapped screen lines before matching or writing transcripts. This keeps long model output, markers, and summaries from changing shape just because the tmux pane is narrow.
 
+### Event-driven completion (sentinel + on-exit hook)
+
+`claude-tmux` and `codex-tmux` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.
+
+```bash
+codex-tmux start --exact --sentinel /tmp/worker.exit --on-exit /usr/local/bin/notify-done worker ~/github/project
+# ... later, an external watcher does:
+while [[ ! -f /tmp/worker.exit ]]; do sleep 1; done
+exit_code=$(cat /tmp/worker.exit)
+```
+
+Flags (place before `<name>` and `<directory>`):
+
+| Flag | Meaning |
+| --- | --- |
+| `--sentinel <abs-path>` | Absolute path; wrapper writes the CLI exit code (decimal + newline) atomically after the CLI returns. Pre-existing file aborts start to prevent stale-completion false positives. |
+| `--on-exit <shell-cmd>` | Hook command run after the sentinel is written. Receives `$1`=exit code, `$2`=agent name. Stdout/stderr go to `<sentinel>.hook.log`. Ignored with a warning if `--sentinel` is omitted. |
+| `--sentinel-keep` | Keep the sentinel file on `stop`. Default removes it during cleanup. |
+
+The sentinel format is intentionally minimal — a single decimal integer plus newline — so shell consumers can rely on `cat`/`[[ ]]` without parsing. Structured telemetry belongs to a separate JSON artifact (see roadmap L3 issues #100/#103); the sentinel will not grow into a JSON payload.
+
+Currently the sentinel is wired into local `start` and `resume` paths for both wrappers. `start-ssh` and the SSH variant are pending a design decision on where remote sentinels should live (remote host by default, with operator-pulled retrieval).
+
 Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, and mouse drag release use the first available system clipboard command (`pbcopy`, `wl-copy`, `xclip`, or `xsel`); when none exists, they fall back to tmux's internal selection so keyboard copy does not fail just because a platform clipboard helper is missing. Set `CLAUDE_TMUX_CLIPBOARD=internal` or `CODEX_TMUX_CLIPBOARD=internal` to force tmux internal selection, or set either variable to a custom copy command when a terminal needs a specific clipboard bridge.
 
 `status --json` is a stable machine-readable contract for both wrappers. It is built with `jq` and uses the same fields for Claude and Codex:

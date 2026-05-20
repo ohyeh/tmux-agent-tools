@@ -1,0 +1,112 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #95 event-driven completion signaling.
+#
+# Exercises the actual claude-tmux / codex-tmux wrappers with fake CLIs so the
+# sentinel + on-exit hook contract can be validated without real Claude or
+# Codex installs and without credentials.
+#
+# Exits non-zero on the first failure. Run from any cwd; the script resolves
+# the in-tree wrapper paths automatically.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+for wrapper in "$CODEX_TMUX" "$CLAUDE_TMUX"; do
+  if [[ ! -x "$wrapper" ]]; then
+    echo "wrapper not executable: $wrapper" >&2
+    exit 1
+  fi
+done
+
+WORK="$(mktemp -d -t tmux-agent-sentinel-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-exit-7.sh" <<'EOF'
+#!/bin/sh
+sleep 1
+exit 7
+EOF
+cat > "$WORK/fake-exit-3.sh" <<'EOF'
+#!/bin/sh
+sleep 1
+exit 3
+EOF
+cat > "$WORK/hook.sh" <<'EOF'
+#!/bin/sh
+printf 'hook: code=%s name=%s\n' "$1" "$2"
+EOF
+chmod +x "$WORK"/fake-exit-*.sh "$WORK/hook.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (got='$actual' expected='$expected')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_happy_path() {
+  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4" expected="$5"
+  echo "case: $prefix ($wrapper, expected exit=$expected)"
+  local sentinel="$WORK/$prefix.exit"
+  rm -f "$sentinel" "$sentinel.hook.log" "$sentinel.tmp"
+  env "$cli_env=$fake" "$wrapper" start --exact \
+    --sentinel "$sentinel" --on-exit "$WORK/hook.sh" \
+    "$prefix" "$WORK" >/dev/null
+  local i got=""
+  for i in 1 2 3 4 5 6 7 8; do
+    [[ -f "$sentinel" ]] && { got="$(cat "$sentinel")"; break; }
+    sleep 1
+  done
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+  assert "$prefix sentinel content" "$got" "$expected"
+  local hook_present="missing"
+  [[ -f "$sentinel.hook.log" ]] && hook_present="present"
+  assert "$prefix hook log present" "$hook_present" "present"
+  if [[ -f "$sentinel.hook.log" ]]; then
+    local hook_line
+    hook_line="$(head -n1 "$sentinel.hook.log")"
+    assert "$prefix hook log exit code" "$hook_line" "hook: code=$expected name=$prefix"
+  fi
+}
+
+run_stale_reject() {
+  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4"
+  echo "case: $prefix-stale ($wrapper, pre-existing sentinel should be rejected)"
+  local sentinel="$WORK/$prefix-stale.exit"
+  echo "stale" > "$sentinel"
+  local rc=0
+  env "$cli_env=$fake" "$wrapper" start --exact \
+    --sentinel "$sentinel" "$prefix-stale" "$WORK" >/dev/null 2>&1 || rc=$?
+  rm -f "$sentinel"
+  assert "$prefix-stale rejected" "$rc" "1"
+}
+
+run_relative_reject() {
+  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4"
+  echo "case: $prefix-relative ($wrapper, relative path should be rejected)"
+  local rc=0
+  env "$cli_env=$fake" "$wrapper" start --exact \
+    --sentinel "relative.exit" "$prefix-rel" "$WORK" >/dev/null 2>&1 || rc=$?
+  assert "$prefix-rel rejected" "$rc" "2"
+}
+
+run_happy_path "$CODEX_TMUX"  "CODEX"  "codex-smoke"  "$WORK/fake-exit-7.sh" "7"
+run_happy_path "$CLAUDE_TMUX" "CLAUDE" "claude-smoke" "$WORK/fake-exit-3.sh" "3"
+run_stale_reject    "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
+run_relative_reject "$CLAUDE_TMUX" "CLAUDE" "claude" "$WORK/fake-exit-3.sh"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
