@@ -106,6 +106,45 @@ run_liveness() {
   "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
 }
 
+run_invariants() {
+  # Locks design-doc invariants partner R8 caught as un-smoked:
+  #   1. marker_seen file is FIFO-capped at 100 entries.
+  #   2. wait-text (regex) does NOT add to marker_seen — only literal
+  #      markers count.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-invariants ($wrapper)"
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  # Pre-seed the marker_seen file with 101 distinct entries so the next
+  # `marker_seen_add` triggers the FIFO eviction path.
+  local marker_file="$TMUX_AGENT_DIR/$prefix/marker_seen"
+  seq 1 101 | awk '{printf "m-%d\n", $1}' > "$marker_file"
+
+  # Force one more marker via wait-literal — fake-live emits "ready-marker"
+  # at start, so wait-literal returns quickly and triggers marker_seen_add.
+  "$wrapper" wait-literal "$prefix" "ready-marker" 5 >/dev/null
+
+  local payload count first
+  payload="$("$wrapper" status --json "$prefix")"
+  count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  assert "$prefix marker_seen FIFO capped at 100" "$count" "100"
+  first="$(printf '%s' "$payload" | jq -r '.marker_seen[0]')"
+  assert "$prefix marker_seen oldest evicted (first should be m-3, not m-1)" "$first" "m-3"
+
+  # Now verify wait-text (regex) does NOT add to marker_seen.
+  # Pattern matches the literal "ready-marker" in the pane via regex,
+  # so the wait succeeds — but the result should NOT enter marker_seen.
+  "$wrapper" wait-text "$prefix" 'ready-mark.*' 5 >/dev/null
+  payload="$("$wrapper" status --json "$prefix")"
+  local count_after
+  count_after="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
+  assert "$prefix wait-text does not add marker" "$count_after" "$count"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
 run_missing_session_defaults() {
   local wrapper="$1" prefix="$2"
   echo "case: $prefix-missing ($wrapper, no session → null liveness fields)"
@@ -127,6 +166,8 @@ run_missing_session_defaults() {
 
 run_liveness "$CODEX_TMUX"  "CODEX"  "live-codex"
 run_liveness "$CLAUDE_TMUX" "CLAUDE" "live-claude"
+run_invariants "$CODEX_TMUX"  "CODEX"  "inv-codex"
+run_invariants "$CLAUDE_TMUX" "CLAUDE" "inv-claude"
 run_missing_session_defaults "$CODEX_TMUX"  "codex"
 run_missing_session_defaults "$CLAUDE_TMUX" "claude"
 
