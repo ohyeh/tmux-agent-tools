@@ -164,7 +164,7 @@ Flags (place before `<name>` and `<directory>`):
 | Flag | Meaning |
 | --- | --- |
 | `--sentinel <abs-path>` | Absolute path; wrapper writes the CLI exit code (decimal + newline) atomically after the CLI returns. Pre-existing file aborts start to prevent stale-completion false positives. |
-| `--on-exit <shell-cmd>` | Hook command run after the sentinel is written. Receives `$1`=exit code, `$2`=agent name. Stdout/stderr go to `<sentinel>.hook.log`. Ignored with a warning if `--sentinel` is omitted. |
+| `--on-exit <shell-cmd>` | Hook command run after the sentinel is written. The hook reads `$ON_EXIT_CODE` (decimal exit code) and `$ON_EXIT_NAME` (agent name) from its environment. The wrapper does NOT append positional args, so composite shell strings such as `'curl -X POST "$URL?code=$ON_EXIT_CODE"'` work correctly. Stdout/stderr go to `<sentinel>.hook.log`. Ignored with a warning if `--sentinel` is omitted. |
 | `--sentinel-keep` | Keep the sentinel file on `stop`. Default removes it during cleanup. |
 
 The sentinel format is intentionally minimal — a single decimal integer plus newline — so shell consumers can rely on `cat`/`[[ ]]` without parsing. Structured telemetry belongs to a separate JSON artifact (see roadmap L3 issues #100/#103); the sentinel will not grow into a JSON payload.

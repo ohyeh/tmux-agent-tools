@@ -38,7 +38,7 @@ exit 3
 EOF
 cat > "$WORK/hook.sh" <<'EOF'
 #!/bin/sh
-printf 'hook: code=%s name=%s\n' "$1" "$2"
+printf 'hook: code=%s name=%s\n' "${ON_EXIT_CODE:-MISSING}" "${ON_EXIT_NAME:-MISSING}"
 EOF
 chmod +x "$WORK"/fake-exit-*.sh "$WORK/hook.sh"
 
@@ -102,10 +102,39 @@ run_relative_reject() {
   assert "$prefix-rel rejected" "$rc" "2"
 }
 
+run_composite_hook() {
+  # Regression test for the partner-reported bug in PR #130 review:
+  # composite shell commands as --on-exit must work without the wrapper
+  # injecting trailing positional args. Env injection (ON_EXIT_CODE /
+  # ON_EXIT_NAME) lets the hook author compose pipelines / && / etc.
+  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4" expected="$5"
+  echo "case: $prefix ($wrapper, composite --on-exit command)"
+  local sentinel="$WORK/$prefix.exit"
+  local hook_out="$WORK/$prefix.hook.captured"
+  rm -f "$sentinel" "$sentinel.hook.log" "$sentinel.tmp" "$hook_out"
+  # Composite: an && chain that uses env vars and writes elsewhere.
+  local composite="printf 'composite: code=%s name=%s' \"\$ON_EXIT_CODE\" \"\$ON_EXIT_NAME\" > $hook_out && printf '\n' >> $hook_out"
+  env "$cli_env=$fake" "$wrapper" start --exact \
+    --sentinel "$sentinel" --on-exit "$composite" \
+    "$prefix" "$WORK" >/dev/null
+  local i got=""
+  for i in 1 2 3 4 5 6 7 8; do
+    [[ -f "$sentinel" ]] && { got="$(cat "$sentinel")"; break; }
+    sleep 1
+  done
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+  local captured=""
+  [[ -f "$hook_out" ]] && captured="$(head -n1 "$hook_out")"
+  assert "$prefix composite sentinel" "$got" "$expected"
+  assert "$prefix composite hook captured" "$captured" "composite: code=$expected name=$prefix"
+}
+
 run_happy_path "$CODEX_TMUX"  "CODEX"  "codex-smoke"  "$WORK/fake-exit-7.sh" "7"
 run_happy_path "$CLAUDE_TMUX" "CLAUDE" "claude-smoke" "$WORK/fake-exit-3.sh" "3"
 run_stale_reject    "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
 run_relative_reject "$CLAUDE_TMUX" "CLAUDE" "claude" "$WORK/fake-exit-3.sh"
+run_composite_hook  "$CODEX_TMUX"  "CODEX"  "codex-composite"  "$WORK/fake-exit-7.sh" "7"
+run_composite_hook  "$CLAUDE_TMUX" "CLAUDE" "claude-composite" "$WORK/fake-exit-3.sh" "3"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

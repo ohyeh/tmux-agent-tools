@@ -40,12 +40,34 @@ the original issue text. Update entries chronologically. Latest at bottom.
 - Alternative considered: timestamp-suffix the sentinel automatically. Rejected
   because then the path is not predictable for external watchers.
 
-### D5 — Hook invocation: `eval` inside a subshell
-- The simplest way to honor an arbitrary `--on-exit "do thing && more"`
-  string without forcing the user to write a script file.
-- Subshell isolates env mutations and prevents the pane shell from inheriting
-  hook side effects.
-- Hook output redirected to `<sentinel>.hook.log` to keep the pane clean.
+### D5 — Hook invocation: `eval` inside a subshell, env-injected (revised post-review)
+
+**Original design (broken):** Subshell + `eval "$HOOK" "$code" "$name"`
+so `$1`=exit_code, `$2`=name. Looked clean for single-binary hooks.
+
+**Partner-caught bug (PR #130 review):** for COMPOSITE hook commands the
+trailing positional args land in the wrong place. The original issue's
+own example `--on-exit 'curl -X POST $WEBHOOK'` eval'd as
+`curl -X POST https://... 7 worker` — the `7` and `worker` became curl
+arguments, not what the docs claimed. The issue's example didn't work.
+
+**Revised design:** subshell with explicit `export` of two named env vars,
+then `eval` the hook with no extra positional args:
+
+```sh
+( export ON_EXIT_CODE="$code" ON_EXIT_NAME="$name"; eval "$HOOK" ) \
+  >> "$SENTINEL.hook.log" 2>&1 || true
+```
+
+Hooks now read `$ON_EXIT_CODE` and `$ON_EXIT_NAME` from the environment.
+Works for both single-binary hooks (env exported to child process) AND
+composite shell strings (variables resolve in eval's context).
+
+**Sub-subtlety discovered during the fix:** `VAR=val eval "cmd"` sets
+`VAR` only for eval-as-builtin and does NOT export to children. Smoke
+caught this — single-script hook saw `MISSING` while composite hook
+worked. Fix is explicit `export` inside the subshell so children inherit
+it; subshell scope guarantees nothing leaks outside.
 
 ### D6 — Sentinel write strategy: tmp + rename
 - POSIX-atomic on same filesystem. Readers see either no file or full
@@ -156,6 +178,42 @@ Test results:
 - `scripts/test-sentinel-smoke`: new reusable smoke runner that exercises
   both wrappers against fake CLIs. 4 cases / 8 sub-assertions, all pass.
   Reviewer can wire it into CI as a non-credential smoke check.
+
+### D11 — Remove the `${SENTINEL:-/tmp/...}.hook.log` fallback (partner)
+
+Original code had a defensive fallback when `TMUX_AGENT_TOOLS_SENTINEL`
+was empty:
+
+```sh
+>> "${TMUX_AGENT_TOOLS_SENTINEL:-/tmp/tmux-agent-tools-hook}.hook.log"
+```
+
+Partner correctly pointed out this path is dead (we already clear
+`on_exit_cmd` if no sentinel was given), but the dead-but-tempting
+fallback would let a future refactor silently route every agent's hook
+output into a single shared `/tmp/tmux-agent-tools-hook.hook.log` file.
+
+Fix: hard-gate the hook block on BOTH variables being set:
+
+```sh
+if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ...
+```
+
+If anyone ever wires `--on-exit` without `--sentinel` again, the hook
+block is provably unreachable rather than silently writing to a shared
+file. Belt-and-suspenders against future-self.
+
+### D12 — Smoke runner now covers the composite hook case
+
+Added two cases in `scripts/test-sentinel-smoke`:
+- `codex-composite`: composite shell command using `$ON_EXIT_CODE` and
+  `$ON_EXIT_NAME` with `&&` chain and redirect.
+- `claude-composite`: same against claude-tmux.
+
+Total 12 sub-assertions across 6 cases, all green. The composite case is
+the regression test for partner's PR #130 finding — if anyone re-introduces
+the positional `eval "$HOOK" "$code" "$name"` form, the composite case will
+fail because the trailing args break the user's `&&` chain.
 
 ### D10 — Self-test stays untouched, smoke is a separate script
 - Partner suggested adding sentinel coverage to `self-test`. Considered:

@@ -76,17 +76,53 @@ Proposed change — insert two steps between `code=$?` and the exit message:
 
 ```
 $(shell_quote "$CLI") ARGS; code=$?
-[[ -n "$_SENTINEL" ]] && { umask 022; printf '%s\n' "$code" > "$_SENTINEL.tmp" && mv -f "$_SENTINEL.tmp" "$_SENTINEL"; }
-[[ -n "$_ON_EXIT" ]] && { ( ON_EXIT_CODE="$code" AGENT_NAME="$name" eval "$_ON_EXIT" "$code" "$name" ) >> "$_SENTINEL.hook.log" 2>&1 || true; }
+if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then
+  printf '%s\n' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" \
+    && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"
+fi
+if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then
+  ( export ON_EXIT_CODE="$code" ON_EXIT_NAME="$name"; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) \
+    >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true
+fi
 printf '\n[<tool>-tmux] local command exited with code %s\n' "$code"
 printf '[<tool>-tmux] press Enter to close this pane\n'
 read _
 exit "$code"
 ```
 
-`_SENTINEL` and `_ON_EXIT` are passed via `session_env_args` (already used
-for env propagation). The hook is best-effort — failures never block pane
-close.
+Env vars are passed via `session_env_args` (already used for env
+propagation). The hook is best-effort — failures never block pane close.
+
+### Hook contract (revised post PR #130 review)
+
+The hook receives values via **environment variables**, not positional
+args. Partner-caught regression: positional args break composite shell
+hooks because the wrapper would append `$code $name` after whatever the
+caller wrote, so `--on-exit 'curl -X POST $URL'` eval'd as
+`curl -X POST $URL 7 worker` — wrong shape.
+
+| Env var | Meaning |
+|---|---|
+| `ON_EXIT_CODE` | decimal exit code of the wrapped CLI |
+| `ON_EXIT_NAME` | requested agent name |
+
+Single-binary hook example:
+
+```sh
+#!/bin/sh
+curl -X POST "$WEBHOOK?code=$ON_EXIT_CODE&name=$ON_EXIT_NAME"
+```
+
+Composite shell hook example (works because no trailing positional args):
+
+```
+--on-exit 'curl -X POST "$URL?code=$ON_EXIT_CODE" && logger "agent $ON_EXIT_NAME done"'
+```
+
+The explicit `export` inside the subshell is required: `VAR=val eval "..."`
+only sets the variable for the eval builtin and does NOT inherit to child
+processes invoked from inside the eval. Subshell scoping prevents the
+exported variables from leaking outside the hook block.
 
 ## status --json additions
 
