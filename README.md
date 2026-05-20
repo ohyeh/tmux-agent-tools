@@ -193,6 +193,12 @@ Wait-family events (`wait`, `wait-text`, `wait-literal`,
 `send-wait-literal`, `wait-and-capture`) are NOT yet recorded — tracked
 as a #100 followup so this PR stays scoped to the most-used surface.
 
+**Large prompt warning**: `send` events embed the full prompt text as a
+JSON string. A 100 KB prompt produces a 100 KB-ish JSONL line. If you
+expect very large prompts, either redact via the dialogue
+`--max-bytes` / `--redact-pattern` pipeline before sharing the transcript,
+or watch the followup that adds opt-in truncation to `send` events.
+
 ### `wait-and-capture` combined subcommand
 
 The two-step `wait-literal X && capture --strip-ansi --since-marker X`

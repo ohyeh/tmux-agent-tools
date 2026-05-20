@@ -104,10 +104,29 @@ run_missing_value_reject() {
   assert "$prefix-missing-value rejected" "$rc" "2"
 }
 
+run_unwritable_reject() {
+  # Partner R7 critique: best-effort `|| true` writes hide a real
+  # operator misconfiguration (unwritable transcript path → empty audit
+  # trail with no warning). The wrapper now write-probes at start and
+  # exits 1 if the path cannot be created/truncated.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-unwritable ($wrapper, unwritable transcript should be rejected at start)"
+  local dir="$WORK/$prefix-noperm"
+  mkdir -p "$dir"
+  chmod 555 "$dir"
+  local rc=0
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$dir/transcript.jsonl" "$prefix-unwritable" "$WORK" >/dev/null 2>&1 || rc=$?
+  chmod 755 "$dir"
+  assert "$prefix-unwritable rejected at start" "$rc" "1"
+}
+
 run_transcript        "$CODEX_TMUX"  "CODEX"  "tr-codex"  "codex"
 run_transcript        "$CLAUDE_TMUX" "CLAUDE" "tr-claude" "claude"
 run_stale_reject      "$CODEX_TMUX"  "CODEX"  "codex"
 run_stale_reject      "$CLAUDE_TMUX" "CLAUDE" "claude"
+run_unwritable_reject "$CODEX_TMUX"  "CODEX"  "codex"
+run_unwritable_reject "$CLAUDE_TMUX" "CLAUDE" "claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
 run_missing_value_reject "$CLAUDE_TMUX" "claude"
 

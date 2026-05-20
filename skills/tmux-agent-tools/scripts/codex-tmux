@@ -482,6 +482,15 @@ start_session() {
   fi
   if [[ -n "$transcript_path" ]]; then
     require_jq
+    # Write probe (partner R7 critique): transcript_append is best-effort
+    # for runtime resilience, but a silent silent-failure at start would
+    # produce an empty audit trail with no operator-visible warning. Fail
+    # loudly at start if the path is not writable.
+    if ! ( : > "$transcript_path" ) 2>/dev/null; then
+      echo "--transcript path is not writable: $transcript_path" >&2
+      exit 1
+    fi
+    rm -f "$transcript_path"
   fi
 
   if [[ ! -d "$directory" ]]; then
