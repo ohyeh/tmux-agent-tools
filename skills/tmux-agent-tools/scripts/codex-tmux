@@ -4,7 +4,12 @@ set -euo pipefail
 SELF="${0:A}"
 CODEX="${CODEX:-$(command -v codex 2>/dev/null || true)}"
 JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
-PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
+_BASE_PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
+if [[ -n "${TMUX_AGENT_TOOLS_TENANT:-}" ]]; then
+  PREFIX="${_BASE_PREFIX}-${TMUX_AGENT_TOOLS_TENANT}"
+else
+  PREFIX="$_BASE_PREFIX"
+fi
 STABLE_SECONDS="${CODEX_TMUX_STABLE_SECONDS:-3}"
 SUBMIT_DELAY="${CODEX_TMUX_SUBMIT_DELAY:-0.2}"
 TMUX_CONF="${CODEX_TMUX_CONF:-${TMPDIR:-/tmp}/codex-tmux.tmux.conf}"
@@ -3092,6 +3097,12 @@ case "$command" in
     ;;
   result)
     result_session "$@"
+    ;;
+  tenant)
+    # Print the effective prefix (with --tenant suffix if any) so callers
+    # can inspect multi-tenant scoping (#118).
+    printf '%s\n' "$PREFIX"
+    exit 0
     ;;
   tags)
     if [[ -z "${1:-}" ]]; then
