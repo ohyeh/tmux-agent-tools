@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.10.0 - 2026-05-21
+
+`v0.10.0` closes the entire issue backlog. All 33 GitHub issues from the original list are now closed. This release lands the L5/L6 batch (#112–#119) under the "no hidden autonomy" non-goal: every L5/L6 surface is synchronous, operator-explicit, with no resident daemons or shared cross-session state.
+
+Total smoke coverage: ~440 sub-assertions across 21 smoke runners.
+
+
 
 ### Added
 
