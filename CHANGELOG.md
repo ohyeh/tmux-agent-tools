@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+
+### Added
+
+- `TMUX_AGENT_TOOLS_TENANT=<name>` env var appends a tenant suffix to the session prefix (issue #118). Operators on the same host get isolated session names + state dirs by exporting different tenant names — no shared state, no daemon, fully operator-explicit. New `tenant` subcommand on both wrappers prints the effective prefix. Respects the "no hidden autonomy" roadmap non-goal: tenant scoping is env-var only with no policy machinery. `scripts/test-tenant-smoke`: 6 sub-assertions.
 ## v0.9.0 - 2026-05-21
 
 `v0.9.0` clears the entire L4/L7/L8 backlog with v1 slices. Closes 7 issues (#103, #111, #120, #122, #123, #127, #129) and lands two design docs (#167 L5/L6 policy-block, #170 v1-slice contracts). Only L5/L6 (#112–#119, policy-blocked per "no hidden autonomy") remain open.
