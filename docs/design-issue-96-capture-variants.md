@@ -157,18 +157,11 @@ Synthetic pane: spawn `tmux new-session -d 'printf "\x1b[31mHELLO\x1b[0m\nMARKER
 - ANSI regex is permissive (matches CSI + ESC[?]) — may strip something
   unintended. Acceptable because the alternative is no stripping at all
   and the caller has the `--strip-ansi` switch to opt out.
-- **Coverage gap (per gemini-code-assist review on PR #131):** the regex
-  `\x1b\[[0-9;?]*[A-Za-z]` only handles CSI/SGR sequences. It does NOT
-  handle:
-  - OSC (Operating System Command): `\x1b]...\x07` or `\x1b]...\x1b\\` —
-    used for terminal title sets, hyperlinks, clipboard, etc.
-  - DCS (Device Control String): `\x1bP...\x1b\\`
-  - APC / PM / SOS strings: `\x1b_...\x1b\\`, `\x1b^...\x1b\\`, `\x1bX...\x1b\\`
-  - C1 control codes in single-byte form (less common in modern panes).
-
-  Implementation must either (a) extend the strip pass to cover all of
-  the above terminators, or (b) document the coverage gap in
-  `--strip-ansi`'s `--help` and README so callers do not assume "fully
-  clean" output. Recommended path: (a) for terminators OSC/DCS/APC/PM/SOS
-  in a single sed pass; the regex is well-known. Tracked as part of the
-  #96 implementation acceptance.
+- **Coverage extended in #135 (PR landed after #96):** the strip pass
+  now covers CSI/SGR plus OSC (BEL or ST terminated), DCS, APC, PM,
+  and SOS in a single sed pipeline. Only out-of-scope category is the
+  8-bit C1 control codes (`\x9b` etc.) — modern panes rarely emit those
+  and they require terminal-dependent handling. Smoke
+  (`scripts/test-capture-smoke`) emits one synthetic example of each
+  category and asserts both the introducer is removed and the visible
+  body around it survives.

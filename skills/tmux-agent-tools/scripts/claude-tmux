@@ -1475,10 +1475,26 @@ capture_session() {
   raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$lines")"
 
   if (( strip_ansi )); then
-    # Strip CSI/SGR escape sequences. Known coverage gap (see
-    # docs/design-issue-96-capture-variants.md): OSC/DCS/APC/PM/SOS
-    # terminators are NOT stripped. Documented for callers.
-    raw="$(printf '%s' "$raw" | sed $'s/\x1b\\[[0-9;?]*[A-Za-z]//g')"
+    # Strip ANSI escape sequences (#96 + #135 extension). Covers:
+    #   - CSI / SGR:  ESC [ ... <letter>
+    #   - OSC:        ESC ] ...  (terminated by BEL \x07 or ST ESC \\)
+    #   - DCS:        ESC P ... ESC \\
+    #   - APC:        ESC _ ... ESC \\
+    #   - PM:         ESC ^ ... ESC \\
+    #   - SOS:        ESC X ... ESC \\
+    # Out of scope (per design doc non-goal): 8-bit C1 controls like \x9b.
+    # Note: sed strips per-line, which is fine because tmux capture-pane
+    # joins soft-wrapped lines and terminal OSC/DCS payloads do not span
+    # logical lines in normal CLI output.
+    raw="$(printf '%s' "$raw" | sed -E $'
+      s/\x1b\\[[0-9;?]*[A-Za-z]//g
+      s/\x1b\\][^\x07\x1b]*\x07//g
+      s/\x1b\\][^\x1b]*\x1b\\\\//g
+      s/\x1bP[^\x1b]*\x1b\\\\//g
+      s/\x1b_[^\x1b]*\x1b\\\\//g
+      s/\x1b\\^[^\x1b]*\x1b\\\\//g
+      s/\x1bX[^\x1b]*\x1b\\\\//g
+    ')"
   fi
 
   local marker_found=0

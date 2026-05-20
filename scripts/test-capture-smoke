@@ -26,7 +26,23 @@ trap 'rm -rf "$WORK"' EXIT
 # lines, then sleeps so the pane remains capturable.
 cat > "$WORK/fake-content.sh" <<'EOF'
 #!/bin/sh
-printf '\033[31mRED-LINE\033[0m\nMARKER-CAP\nafter1\nafter2\n'
+# #135 extended strip-ansi: emit one example of every escape category so
+# the smoke can verify all are stripped under --strip-ansi.
+#   CSI/SGR: \033[31m ... \033[0m
+#   OSC (BEL-terminated):  \033]0;TITLE\007
+#   OSC (ST-terminated):   \033]8;;https://example.com\033\\link\033]8;;\033\\
+#   DCS:                   \033PHIDE\033\\
+#   APC:                   \033_APPLE\033\\
+#   PM:                    \033^PRIVATE\033\\
+#   SOS:                   \033XSTART\033\\
+printf '\033[31mRED-LINE\033[0m\n'
+printf '\033]0;OSC-TITLE\007OSC-AFTER\n'
+printf '\033]8;;https://example.com\033\\OSC8-VISIBLE\033]8;;\033\\\n'
+printf '\033PHIDE-DCS\033\\DCS-AFTER\n'
+printf '\033_APC-HIDDEN\033\\APC-AFTER\n'
+printf '\033^PM-HIDDEN\033\\PM-AFTER\n'
+printf '\033XSOS-HIDDEN\033\\SOS-AFTER\n'
+printf 'MARKER-CAP\nafter1\nafter2\n'
 sleep 30
 EOF
 chmod +x "$WORK/fake-content.sh"
@@ -88,6 +104,20 @@ run_capture_variants() {
   # Use printf so the comparison is exact even if tmux renders colors.
   assert_not_contains "$prefix --strip-ansi removes ESC[31m" "$strip_output" "$(printf '\033[31m')"
   assert_contains "$prefix --strip-ansi keeps body" "$strip_output" "RED-LINE"
+
+  # #135 extended strip categories. Each escape introducer must be absent
+  # while the visible payload around it must survive.
+  assert_not_contains "$prefix strip removes OSC introducer" "$strip_output" "$(printf '\033]')"
+  assert_not_contains "$prefix strip removes DCS introducer" "$strip_output" "$(printf '\033P')"
+  assert_not_contains "$prefix strip removes APC introducer" "$strip_output" "$(printf '\033_')"
+  assert_not_contains "$prefix strip removes PM introducer"  "$strip_output" "$(printf '\033^')"
+  assert_not_contains "$prefix strip removes SOS introducer" "$strip_output" "$(printf '\033X')"
+  assert_contains "$prefix strip keeps OSC-AFTER body"  "$strip_output" "OSC-AFTER"
+  assert_contains "$prefix strip keeps OSC8-VISIBLE body" "$strip_output" "OSC8-VISIBLE"
+  assert_contains "$prefix strip keeps DCS-AFTER body"  "$strip_output" "DCS-AFTER"
+  assert_contains "$prefix strip keeps APC-AFTER body"  "$strip_output" "APC-AFTER"
+  assert_contains "$prefix strip keeps PM-AFTER body"   "$strip_output" "PM-AFTER"
+  assert_contains "$prefix strip keeps SOS-AFTER body"  "$strip_output" "SOS-AFTER"
 
   since_output="$("$wrapper" capture --since-marker MARKER-CAP "$prefix" 20 2>&1)"
   assert_contains "$prefix --since-marker keeps after1" "$since_output" "after1"
