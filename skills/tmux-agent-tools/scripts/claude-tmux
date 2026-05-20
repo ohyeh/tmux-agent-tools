@@ -397,6 +397,80 @@ transcript_iso_now() {
   date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+# --- status --json liveness helpers (issue #98) ----------------------------
+
+record_started_at() {
+  local name="$1"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$subdir/started_at"
+}
+
+read_started_at() {
+  local name="$1"
+  local file="$(agent_root_dir)/$name/started_at"
+  [[ -f "$file" ]] && cat "$file" || true
+}
+
+marker_seen_add() {
+  local name="$1" needle="$2"
+  [[ -z "$needle" ]] && return 0
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local file="$subdir/marker_seen"
+  if [[ -f "$file" ]] && grep -Fxq "$needle" "$file" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$needle" >> "$file"
+  if [[ -f "$file" ]] && (( $(wc -l < "$file") > 100 )); then
+    tail -n 100 "$file" > "$file.tmp" && mv -f "$file.tmp" "$file"
+  fi
+}
+
+marker_seen_list_json() {
+  local name="$1"
+  local file="$(agent_root_dir)/$name/marker_seen"
+  if [[ -f "$file" ]]; then
+    "$JQ" -R . "$file" | "$JQ" -s .
+  else
+    printf '[]'
+  fi
+}
+
+update_pane_hash() {
+  local name="$1" pane_text="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local hash_file="$subdir/pane-hash"
+  local new_hash
+  new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+  local now_iso
+  now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local stored_hash="" stored_at=""
+  if [[ -f "$hash_file" ]]; then
+    stored_hash="$(awk '{print $1}' "$hash_file")"
+    stored_at="$(awk '{print $2}' "$hash_file")"
+  fi
+  if [[ "$new_hash" != "$stored_hash" ]]; then
+    printf '%s %s\n' "$new_hash" "$now_iso" > "$hash_file"
+    stored_at="$now_iso"
+  fi
+  printf '%s' "$stored_at"
+}
+
+iso_epoch_diff_seconds() {
+  local iso="$1"
+  [[ -z "$iso" ]] && { printf '%s' 0; return 0; }
+  local now=$(date -u +%s)
+  local then
+  if [[ "$(uname)" == "Darwin" ]]; then
+    then="$(date -u -j -f %Y-%m-%dT%H:%M:%SZ "$iso" +%s 2>/dev/null || echo "$now")"
+  else
+    then="$(date -u -d "$iso" +%s 2>/dev/null || echo "$now")"
+  fi
+  printf '%s' $((now - then))
+}
+
 transcript_append() {
   # NOTE: parameter is `target` (not `path`) — see transcript_record_path
   # for the zsh PATH/path tied-pair gotcha.
@@ -501,6 +575,7 @@ start_session() {
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_sentinel_env_args
   apply_result_env_args "$name"
+  record_started_at "$name"
   if [[ -n "$transcript_path" ]]; then
     transcript_record_path "$name" "$transcript_path"
   fi
@@ -634,6 +709,7 @@ resume_session() {
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_sentinel_env_args
   apply_result_env_args "$name"
+  record_started_at "$name"
   if [[ -n "$transcript_path" ]]; then
     transcript_record_path "$name" "$transcript_path"
   fi
@@ -851,6 +927,7 @@ send_wait_literal_session() {
     current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
     current_count="$(count_literal_occurrences "$current" "$needle")"
     if (( current_count > before_count )); then
+      marker_seen_add "$name" "$needle"
       echo "matched new literal: $needle"
       return 0
     fi
@@ -1231,6 +1308,7 @@ wait_literal_session() {
   while (( SECONDS < deadline )); do
     current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
     if [[ "$current" == *"$needle"* ]]; then
+      marker_seen_add "$name" "$needle"
       echo "matched literal: $needle"
       return 0
     fi
@@ -1515,6 +1593,9 @@ status_session() {
   local exit_code=""
   local confirmation_detected=false
   local current=""
+  # Liveness fields (issue #98). Additive only — existing field shape is preserved.
+  local last_change_at=""
+  local bytes_in_pane=""
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     exists=true
     running=true
@@ -1538,6 +1619,20 @@ status_session() {
         confirmation_detected=true
         ;;
     esac
+    last_change_at="$(update_pane_hash "$name" "$current")"
+    bytes_in_pane=$(printf '%s' "$current" | wc -c | tr -d ' ')
+  fi
+  local started_at
+  started_at="$(read_started_at "$name")"
+  local idle_seconds=""
+  if [[ "$exists" == true && -n "$last_change_at" ]]; then
+    idle_seconds="$(iso_epoch_diff_seconds "$last_change_at")"
+  fi
+  local marker_seen_json
+  if [[ "$exists" == true || -f "$(agent_root_dir)/$name/marker_seen" ]]; then
+    marker_seen_json="$(marker_seen_list_json "$name")"
+  else
+    marker_seen_json='[]'
   fi
 
   if (( output_json )); then
@@ -1551,12 +1646,17 @@ status_session() {
       --arg diagnostic "$diagnostic" \
       --arg blocked_reason "$blocked_reason" \
       --arg exit_code "$exit_code" \
+      --arg started_at "$started_at" \
+      --arg last_change_at "$last_change_at" \
+      --arg idle_seconds "$idle_seconds" \
+      --arg bytes_in_pane "$bytes_in_pane" \
+      --argjson marker_seen "$marker_seen_json" \
       --argjson last_capture_lines "$(status_tail_json "$current")" \
       --argjson exists "$exists" \
       --argjson running "$running" \
       --argjson exit_detected "$exit_detected" \
       --argjson confirmation_detected "$confirmation_detected" \
-      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end)}'
+      '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end),started_at:(if $started_at == "" then null else $started_at end),last_change_at:(if $last_change_at == "" then null else $last_change_at end),idle_seconds:(if $idle_seconds == "" then null else ($idle_seconds | tonumber) end),bytes_in_pane:(if $bytes_in_pane == "" then null else ($bytes_in_pane | tonumber) end),marker_seen:$marker_seen}'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
     if [[ -n "$diagnostic" ]]; then
