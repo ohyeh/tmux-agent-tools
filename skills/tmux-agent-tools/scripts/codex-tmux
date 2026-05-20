@@ -1101,7 +1101,7 @@ wait_and_capture_session() {
   # (partner R3 critique on the original design).
   require_tmux
   local marker=""
-  local match_style="regex"
+  local match_style="literal"
   local timeout_seconds=180
   local tail_lines=80
   local strip_ansi=0
@@ -1109,14 +1109,15 @@ wait_and_capture_session() {
   local output_json=0
   local no_timeout_error=0
   local since_set=0
+  local style_set=0
 
   while [[ "${1:-}" == --* ]]; do
     case "$1" in
       --marker)
         if (( $# < 2 )); then echo "--marker requires a value" >&2; exit 2; fi
         marker="$2"; shift 2 ;;
-      --literal) match_style="literal"; shift ;;
-      --regex) match_style="regex"; shift ;;
+      --literal) match_style="literal"; style_set=1; shift ;;
+      --regex) match_style="regex"; style_set=1; shift ;;
       --timeout)
         if (( $# < 2 )); then echo "--timeout requires a value (seconds)" >&2; exit 2; fi
         timeout_seconds="$2"; shift 2 ;;
@@ -1151,8 +1152,18 @@ wait_and_capture_session() {
     require_jq
   fi
 
-  # Default since-marker = marker so the golden path keeps caller's prompt minimal.
-  (( since_set )) || since_marker="$marker"
+  # Default since-marker = marker, but ONLY when the marker is a literal.
+  # Under --regex, defaulting since-marker to the regex pattern would feed
+  # `grep -F` a string that may not appear in the pane (e.g. `Done|Error`
+  # never matches `grep -F`). Caller must opt-in with explicit
+  # --since-marker for regex match style. Partner R6 critique on PR #137.
+  if (( ! since_set )); then
+    if [[ "$match_style" == "literal" ]]; then
+      since_marker="$marker"
+    else
+      since_marker=""
+    fi
+  fi
 
   local session
   session="$(session_for_name "$name")"

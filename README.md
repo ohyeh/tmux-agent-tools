@@ -177,11 +177,11 @@ codex-tmux wait-and-capture --literal --marker '[DONE]' --strip-ansi --json work
 | Flag | Behavior |
 | --- | --- |
 | `--marker <text>` (required) | Marker to wait for. |
-| `--literal` / `--regex` | Match style. Default is `--regex`. |
+| `--literal` / `--regex` | Match style. Default is `--literal` — markers like `[DONE]` match exactly. Use `--regex` only when you need zsh ERE. |
 | `--timeout <s>` | Wait timeout. Default 180s. |
 | `--tail <n>` | Lines of scrollback to capture (default 80). |
 | `--strip-ansi` | Forwarded to the capture phase, removes CSI/SGR escapes. |
-| `--since-marker <text>` | Slice the body to lines AFTER the marker. Defaults to `--marker` value so the golden path needs no extra flag. |
+| `--since-marker <text>` | Slice the body to lines AFTER the marker. Under `--literal` the default is the marker value. Under `--regex` you MUST pass `--since-marker` explicitly — `grep -F` against the raw regex pattern would not match what the regex matched. |
 | `--json` | Wrap output as `{schema_version, matched, marker, match_style, since_marker, wait_seconds, timeout, stripped_ansi, reason, lines}`. `reason` is one of `matched`, `timeout`, `session_gone`. |
 | `--no-timeout-error` | Decouple soft-timeout from `--json` (partner R3 critique on the original design). With this flag, timeout exits 0 instead of 1. Composable with or without `--json`. |
 

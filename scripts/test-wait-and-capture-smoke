@@ -34,6 +34,21 @@ sleep 30
 EOF
 chmod +x "$WORK/fake-mark.sh"
 
+# Fake CLI that emits text containing letters D/O/N/E BEFORE the literal
+# `[DONE]` marker. Used to verify the default --literal style does not
+# false-positive on the ERE character class `[DONE]` (partner R6 critique
+# on PR #137 — original default of --regex would have matched the first
+# `D` of `Doing` and ended the wait long before `[DONE]` arrived).
+cat > "$WORK/fake-ere-trap.sh" <<'EOF'
+#!/bin/sh
+printf 'Doing some work first\n'
+sleep 2
+printf '[DONE]\n'
+printf 'tail-line\n'
+sleep 30
+EOF
+chmod +x "$WORK/fake-ere-trap.sh"
+
 PASS=0
 FAIL=0
 
@@ -100,6 +115,38 @@ run_cases() {
   assert "$prefix --json reason=session_gone" "$(printf '%s' "$json_payload" | jq -r .reason)" "session_gone"
 }
 
+run_ere_class_default_literal() {
+  # Regression test for partner R6: with the (new) default match style of
+  # --literal, a marker that looks like an ERE character class such as
+  # `[DONE]` matches the literal text and does NOT prematurely match the
+  # letter `D` of `Doing` printed earlier in the pane.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-ere-class ($wrapper, default --literal must not false-positive on [DONE])"
+  env "$cli_env=$WORK/fake-ere-trap.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 1
+
+  local started ended elapsed body
+  started=$(date +%s)
+  body="$("$wrapper" wait-and-capture --marker '[DONE]' --timeout 10 "$prefix" 2>&1)"
+  ended=$(date +%s)
+  elapsed=$((ended - started))
+
+  # The fake sleeps 2s before printing [DONE]; default --literal should
+  # take ~2s. The pre-existing `Doing` text MUST NOT have satisfied the
+  # wait — that would have returned immediately. Require elapsed >= 1.
+  if (( elapsed >= 1 )); then
+    echo "  ok   $prefix-ere-class waited >=1s (saw [DONE] not Doing)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix-ere-class returned in ${elapsed}s — default style may have matched Doing as ERE class" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  assert_contains "$prefix-ere-class body contains tail-line" "$body" "tail-line"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
 run_missing_value_reject() {
   local wrapper="$1" prefix="$2"
   echo "case: $prefix-missing-value ($wrapper)"
@@ -116,6 +163,8 @@ run_missing_value_reject() {
 
 run_cases "$CODEX_TMUX"  "CODEX"  "wc-codex"
 run_cases "$CLAUDE_TMUX" "CLAUDE" "wc-claude"
+run_ere_class_default_literal "$CODEX_TMUX"  "CODEX"  "wc-ere-codex"
+run_ere_class_default_literal "$CLAUDE_TMUX" "CLAUDE" "wc-ere-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
 run_missing_value_reject "$CLAUDE_TMUX" "claude"
 
