@@ -1,0 +1,74 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #121 tmux-agent-notify.
+# Exercises --dry-run for both formats + envelope shape + tag merging.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+NOTIFY="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-notify"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    needle: $needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: generic-json envelope"
+body="$(ON_EXIT_NAME=test ON_EXIT_CODE=0 "$NOTIFY" --webhook http://x --dry-run)"
+assert "schema_version=1" "$(printf '%s' "$body" | jq -r .schema_version)" "1"
+assert "tool=tmux-agent-tools" "$(printf '%s' "$body" | jq -r .tool)" "tmux-agent-tools"
+assert "agent=test" "$(printf '%s' "$body" | jq -r .agent)" "test"
+assert "exit_code=0" "$(printf '%s' "$body" | jq -r .exit_code)" "0"
+assert "tags is object" "$(printf '%s' "$body" | jq -r '.tags | type')" "object"
+
+echo "case: tag merging"
+body="$(ON_EXIT_NAME=test ON_EXIT_CODE=2 "$NOTIFY" --webhook http://x --dry-run --tag a=1 --tag b=2)"
+assert "tag a=1" "$(printf '%s' "$body" | jq -r .tags.a)" "1"
+assert "tag b=2" "$(printf '%s' "$body" | jq -r .tags.b)" "2"
+assert "exit_code=2" "$(printf '%s' "$body" | jq -r .exit_code)" "2"
+
+echo "case: slack format wraps envelope"
+body="$(ON_EXIT_NAME=worker ON_EXIT_CODE=1 "$NOTIFY" --webhook http://x --format slack --dry-run)"
+assert_contains "slack body has text field" "$body" '"text":'
+assert_contains "slack text names agent" "$body" "worker"
+assert_contains "slack text mentions exit code" "$body" "code 1"
+assert_contains "slack body has attachments" "$body" "attachments"
+
+echo "case: missing webhook rejected"
+code=0
+"$NOTIFY" --format generic-json 2>/dev/null || code=$?
+assert "missing webhook exit=2" "$code" "2"
+
+echo "case: unknown format rejected"
+code=0
+"$NOTIFY" --webhook http://x --format bogus --dry-run 2>/dev/null || code=$?
+assert "unknown format exit=2" "$code" "2"
+
+echo "case: no env vars defaults"
+body="$("$NOTIFY" --webhook http://x --dry-run)"
+assert "agent defaults to unknown" "$(printf '%s' "$body" | jq -r .agent)" "unknown"
+assert "exit_code defaults to 0" "$(printf '%s' "$body" | jq -r .exit_code)" "0"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
