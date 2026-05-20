@@ -428,10 +428,12 @@ marker_seen_add() {
 }
 
 marker_seen_list_json() {
+  # Single-jq form (gemini-code-assist on PR #142): `-Rs` slurps the file
+  # as a string, then split on newline and drop empty entries.
   local name="$1"
   local file="$(agent_root_dir)/$name/marker_seen"
   if [[ -f "$file" ]]; then
-    "$JQ" -R . "$file" | "$JQ" -s .
+    "$JQ" -Rs 'split("\n") | map(select(length > 0))' "$file"
   else
     printf '[]'
   fi
@@ -442,8 +444,15 @@ update_pane_hash() {
   local subdir
   subdir="$(ensure_agent_dir "$name")"
   local hash_file="$subdir/pane-hash"
+  # Prefer sha256sum (GNU coreutils — ubiquitous on Linux); fall back to
+  # shasum (Perl-based, default on macOS). gemini-code-assist on PR #142
+  # caught that minimal Linux distros may ship without Perl.
   local new_hash
-  new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+  if command -v sha256sum >/dev/null 2>&1; then
+    new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
+  else
+    new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+  fi
   local now_iso
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local stored_hash="" stored_at=""

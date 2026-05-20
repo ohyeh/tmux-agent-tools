@@ -98,7 +98,6 @@ run_liveness() {
 
   # Repeating wait-literal on same needle should not duplicate
   "$wrapper" wait-literal "$prefix" "ready-marker" 5 >/dev/null
-  marker_count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
   payload="$("$wrapper" status --json "$prefix")"
   marker_count="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
   assert "$prefix marker_seen dedup" "$marker_count" "1"
