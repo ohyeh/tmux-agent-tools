@@ -1,0 +1,150 @@
+#!/usr/bin/env zsh
+# tmux-agent-dag (issue #113 v1 — synchronous DAG walker).
+#
+# v1 ships a synchronous DAG walker: walks tasks in topological order,
+# launches each, BLOCKS until completion, then advances. No daemon, no
+# async dispatch — respects "no hidden autonomy".
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-dag - synchronous task DAG walker (#113 v1).
+
+Usage:
+  tmux-agent-dag run <manifest.json>
+
+Manifest format (JSON, NOT YAML — keep deps small):
+  {
+    "schema_version": 1,
+    "tool": "codex",
+    "tasks": [
+      {"name": "build",  "workdir": "/path", "prompt": "...", "after": []},
+      {"name": "test",   "workdir": "/path", "prompt": "...", "after": ["build"]},
+      {"name": "deploy", "workdir": "/path", "prompt": "...", "after": ["test"]}
+    ]
+  }
+
+The walker runs tasks in topological order. Each task BLOCKS until the
+agent writes result.json. If any task fails (status != "ok"), the
+walker aborts unless `"continue_on_failure": true` is set on the task.
+
+Emits a final JSON summary:
+  {
+    "schema_version": 1,
+    "manifest": "<path>",
+    "results": [{"name": "...", "result": {...}, "ok": true/false}],
+    "ok": true/false,
+    "at": "<ISO-8601 UTC>"
+  }
+EOF
+}
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+if [[ "${1:-}" != "run" ]]; then
+  usage
+  exit 0
+fi
+shift
+
+manifest="${1:-}"
+if [[ -z "$manifest" || ! -f "$manifest" ]]; then
+  echo "Usage: tmux-agent-dag run <manifest.json>" >&2
+  exit 2
+fi
+
+[[ -n "$JQ" ]] || { echo "jq not found" >&2; exit 1; }
+
+tool="$("$JQ" -r '.tool // "codex"' "$manifest")"
+SCRIPT_DIR="${0:A:h}"
+case "$tool" in
+  claude) WRAPPER="$SCRIPT_DIR/claude-tmux" ;;
+  codex)  WRAPPER="$SCRIPT_DIR/codex-tmux" ;;
+  *)      echo "manifest .tool must be claude or codex" >&2; exit 2 ;;
+esac
+
+# Build a simple topological order. v1 trusts the manifest's task order
+# matches the dependency declaration — i.e., authors list tasks in valid
+# topo order. Cycle detection deferred to v2.
+task_names="$("$JQ" -r '.tasks[].name' "$manifest")"
+ts="$(date +%s)"
+
+typeset -A status
+typeset -a results
+results=()
+overall_ok=true
+
+while IFS= read -r task_name; do
+  [[ -z "$task_name" ]] && continue
+  workdir="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | .workdir' "$manifest")"
+  prompt="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | .prompt' "$manifest")"
+  continue_on_failure="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | (.continue_on_failure // false)' "$manifest")"
+  afters="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | (.after // [])[]' "$manifest")"
+  # Verify dependencies passed
+  skip=0
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if [[ "${status[$dep]:-pending}" != "ok" ]]; then
+      echo "dag: skipping '$task_name' — dependency '$dep' not ok" >&2
+      skip=1
+      break
+    fi
+  done <<< "$afters"
+  if (( skip )); then
+    status[$task_name]="skipped"
+    results+=("$("$JQ" -c -n --arg name "$task_name" '{name:$name, ok:false, skipped:true, result:null}')")
+    overall_ok=false
+    continue
+  fi
+  if [[ ! -d "$workdir" ]]; then
+    echo "dag: workdir not found for '$task_name': $workdir" >&2
+    status[$task_name]="missing_workdir"
+    results+=("$("$JQ" -c -n --arg name "$task_name" '{name:$name, ok:false, skipped:false, result:null}')")
+    overall_ok=false
+    continue
+  fi
+  agent_name="dag-${ts}-${task_name}"
+  "$WRAPPER" start --exact "$agent_name" "$workdir" "$prompt" >/dev/null
+  # Block until result.json (60s default; not configurable in v1)
+  result_path="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}/$agent_name/result.json"
+  deadline=$(( $(date +%s) + 60 ))
+  while [[ ! -f "$result_path" ]]; do
+    if (( $(date +%s) >= deadline )); then break; fi
+    /bin/sleep 1
+  done
+  ok=false
+  result_body='{}'
+  if [[ -f "$result_path" ]]; then
+    result_body="$(cat "$result_path")"
+    if [[ "$("$JQ" -r '.status // ""' <<< "$result_body")" == "ok" ]]; then
+      ok=true
+    fi
+  fi
+  status[$task_name]=$([ "$ok" = true ] && echo ok || echo failed)
+  results+=("$("$JQ" -c -n --arg name "$task_name" --argjson ok "$ok" --argjson result "$result_body" \
+    '{name:$name, ok:$ok, skipped:false, result:$result}')")
+  if [[ "$ok" != "true" && "$continue_on_failure" != "true" ]]; then
+    overall_ok=false
+    "$WRAPPER" stop "$agent_name" >/dev/null 2>&1 || true
+    echo "dag: '$task_name' failed; aborting walk (continue_on_failure=false)" >&2
+    break
+  fi
+  "$WRAPPER" stop "$agent_name" >/dev/null 2>&1 || true
+done <<< "$task_names"
+
+# Emit final summary
+results_array="["
+for i in {1..${#results[@]}}; do
+  results_array+="${results[$i]}"
+  (( i < ${#results[@]} )) && results_array+=","
+done
+results_array+="]"
+
+"$JQ" -n --argjson results "$results_array" --argjson ok "$overall_ok" \
+  --arg manifest "$manifest" --arg at "$(iso_now)" \
+  '{schema_version: 1, manifest: $manifest, ok: $ok, results: $results, at: $at}'
+
+[[ "$overall_ok" == "true" ]] && exit 0 || exit 1

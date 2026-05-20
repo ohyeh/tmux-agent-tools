@@ -1,0 +1,134 @@
+#!/usr/bin/env zsh
+# tmux-agent-fanout (issue #112 v1 — synchronous slice).
+#
+# v1 ships SYNCHRONOUS fan-out: caller waits for all children to complete.
+# No daemon, no async dispatch — respects "no hidden autonomy".
+# Each child writes its result.json (#97) and the fanout aggregates.
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-fanout - synchronous fan-out coordinator (#112 v1).
+
+Usage:
+  tmux-agent-fanout --prompt-file <prompt> --workdir <a> --workdir <b> [--workdir <c>]... \
+                    [--tool claude|codex] [--timeout <seconds>] [--name-prefix <p>]
+
+Spawns one agent per --workdir, sends the prompt, waits for each to
+write $TMUX_AGENT_RESULT, then emits a consolidated JSON:
+
+  {
+    "schema_version": 1,
+    "tool": "<claude|codex>",
+    "prompt_file": "<path>",
+    "agents": [
+      {"workdir": "...", "name": "...", "exit_code": 0, "result": {...}, "error": null},
+      ...
+    ],
+    "at": "<ISO-8601 UTC>"
+  }
+
+Synchronous wait: this tool blocks until all agents complete or the
+timeout fires. No daemon process is spawned.
+EOF
+}
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+prompt_file=""
+typeset -a workdirs
+workdirs=()
+tool="codex"
+timeout_s=600
+name_prefix="fan"
+
+while (( $# )); do
+  case "$1" in
+    --prompt-file) prompt_file="${2:-}"; shift 2 || true ;;
+    --workdir)     workdirs+=("${2:-}"); shift 2 || true ;;
+    --tool)        tool="${2:-codex}"; shift 2 || true ;;
+    --timeout)     timeout_s="${2:-600}"; shift 2 || true ;;
+    --name-prefix) name_prefix="${2:-fan}"; shift 2 || true ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "Unknown: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$prompt_file" ]]; then
+  echo "--prompt-file required" >&2; exit 2
+fi
+if (( ${#workdirs[@]} == 0 )); then
+  echo "at least one --workdir required" >&2; exit 2
+fi
+if [[ ! -f "$prompt_file" ]]; then
+  echo "prompt-file not found: $prompt_file" >&2; exit 1
+fi
+
+SCRIPT_DIR="${0:A:h}"
+case "$tool" in
+  claude) WRAPPER="$SCRIPT_DIR/claude-tmux" ;;
+  codex)  WRAPPER="$SCRIPT_DIR/codex-tmux" ;;
+  *) echo "--tool must be claude or codex" >&2; exit 2 ;;
+esac
+
+prompt_text="$(cat "$prompt_file")"
+
+# Spawn each agent.
+typeset -a agent_names
+agent_names=()
+ts="$(date +%s)"
+for i in {1..${#workdirs[@]}}; do
+  workdir="${workdirs[$i]}"
+  name="${name_prefix}-${ts}-${i}"
+  agent_names+=("$name")
+  if [[ ! -d "$workdir" ]]; then
+    echo "skipping (not a dir): $workdir" >&2
+    continue
+  fi
+  "$WRAPPER" start --exact "$name" "$workdir" "$prompt_text" >/dev/null
+done
+
+# Synchronously wait for each agent's result.json. Bounded by timeout.
+deadline=$(( $(date +%s) + timeout_s ))
+typeset -a agent_results
+agent_results=()
+for i in {1..${#workdirs[@]}}; do
+  workdir="${workdirs[$i]}"
+  name="${agent_names[$i]}"
+  result_path="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}/$name/result.json"
+  agent_result='{}'
+  exit_code=0
+  error_msg=""
+  while [[ ! -f "$result_path" ]]; do
+    if (( $(date +%s) >= deadline )); then
+      exit_code=124
+      error_msg="timeout"
+      break
+    fi
+    /bin/sleep 1
+  done
+  if [[ -f "$result_path" ]]; then
+    agent_result="$(cat "$result_path")"
+  fi
+  agent_results+=("$("$JQ" -c -n --arg workdir "$workdir" --arg name "$name" \
+    --argjson exit_code "$exit_code" --argjson result "$agent_result" \
+    --arg error "$error_msg" \
+    '{workdir: $workdir, name: $name, exit_code: $exit_code, result: $result, error: (if $error == "" then null else $error end)}')")
+  "$WRAPPER" stop "$name" >/dev/null 2>&1 || true
+done
+
+# Emit consolidated payload.
+agents_array="["
+for i in {1..${#agent_results[@]}}; do
+  agents_array+="${agent_results[$i]}"
+  (( i < ${#agent_results[@]} )) && agents_array+=","
+done
+agents_array+="]"
+
+"$JQ" -n --argjson agents "$agents_array" --arg tool "$tool" \
+  --arg prompt_file "$prompt_file" --arg at "$(iso_now)" \
+  '{schema_version: 1, tool: $tool, prompt_file: $prompt_file,
+    agents: $agents, at: $at}'
