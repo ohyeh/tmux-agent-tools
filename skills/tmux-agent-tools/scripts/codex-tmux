@@ -730,6 +730,84 @@ ensure_agent_dir() {
   printf '%s' "$dir"
 }
 
+# --- Advisory send lock (issue #102) --------------------------------------
+# Serialize concurrent pane-mutating calls (`send`, `send-wait-literal`) on
+# the same agent so two callers cannot interleave keystrokes into the same
+# tmux pane.
+#
+# Lock file: $TMUX_AGENT_DIR/<name>/send.lock
+# Prefers flock(1) (Linux/coreutils). On macOS without flock, falls back to
+# mkdir-based locking with PID stamping for stale-holder recovery — design
+# in docs/design-issue-102-advisory-lock.md.
+#
+# The fallback recovers from `kill -9`, OOM, or reboot by probing the
+# holder PID with `kill -0`. The trap inside the subshell is intentionally
+# scoped to the subshell so it does NOT clobber the caller's process-wide
+# trap (partner review on the original sketch).
+
+SEND_LOCK_DEFAULT_TIMEOUT=30
+
+send_lock_around() {
+  # Usage: send_lock_around <agent_name> <timeout_seconds> <cmd> [args...]
+  # Returns 75 on timeout (EX_TEMPFAIL) with stderr message, else inner rc.
+  local agent_name="$1"
+  local timeout_seconds="$2"
+  shift 2
+  local subdir
+  subdir="$(ensure_agent_dir "$agent_name")"
+  local lock_file="$subdir/send.lock"
+
+  if command -v flock >/dev/null 2>&1; then
+    : > "$lock_file" 2>/dev/null || true
+    (
+      flock -w "$timeout_seconds" -x 9 || {
+        echo "lock contended on $agent_name after ${timeout_seconds}s" >&2
+        exit 75
+      }
+      "$@"
+    ) 9>"$lock_file"
+    return $?
+  fi
+
+  # mkdir fallback with PID-stamped stale-holder recovery.
+  zmodload zsh/datetime 2>/dev/null || true
+  local lock_dir="$lock_file.d"
+  local now_epoch end
+  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  end=$(( now_epoch + timeout_seconds ))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      # Holder died without releasing — reclaim. rm -rf because the pid
+      # file lives inside the lock dir; rmdir alone would fail.
+      rm -rf "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    if [[ -z "$holder_pid" ]]; then
+      sleep 0.2
+      [[ -f "$lock_dir/pid" ]] || { rm -rf "$lock_dir" 2>/dev/null || true; continue; }
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if (( now_epoch >= end )); then
+      echo "lock contended on $agent_name after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
+      return 75
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # Subshell-scoped trap: do NOT use a process-wide trap here, it would
+  # overwrite the caller's trap. rm -rf because the pid file lives inside
+  # the lock dir; rmdir alone would fail and leak the lock.
+  (
+    trap "rm -rf '$lock_dir' 2>/dev/null || true" EXIT INT TERM
+    "$@"
+  )
+  local rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  return $rc
+}
+
 # --- Single-agent transcript helpers (issue #100) -------------------------
 # A transcript captures wrapper-level events (start / send / wait / capture /
 # stop) as JSONL. Path is configured at `start --transcript <abs>` and
@@ -1363,7 +1441,8 @@ send_session() {
 
   local prompt_text="$*"
   local buffer_name="$session-send"
-  paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    paste_and_submit "$session" "$buffer_name" "$prompt_text" || return $?
 
   local transcript_path
   transcript_path="$(transcript_path_for "$name")"
@@ -1421,6 +1500,13 @@ send_wait_literal_session() {
     echo "Session does not exist: $session" >&2
     exit 1
   fi
+
+  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds"
+}
+
+_send_wait_literal_locked() {
+  local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5"
 
   local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
   local before_count
@@ -2255,6 +2341,12 @@ stop_session() {
     transcript_append "$transcript_path" "$stop_line"
   fi
 }
+
+# Allow test harnesses (issue #102 smoke) to source the wrapper purely for
+# its helpers without executing the dispatcher.
+if [[ -n "${TMUX_AGENT_TOOLS_SOURCE_ONLY:-}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 command="${1:-help}"
 if [[ "$#" -gt 0 ]]; then
