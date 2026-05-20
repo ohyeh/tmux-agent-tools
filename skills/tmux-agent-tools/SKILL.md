@@ -149,6 +149,70 @@ tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --g
 Only add `--post-github-comment` when the user explicitly asks to publish the summary to GitHub.
 Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize` or `github-comment` when transcript content may be too large or sensitive to share raw. The generated Markdown includes visible truncation and redaction notes.
 
+## Token-efficient patterns (#107)
+
+Default capture dumps raw scrollback — most of those tokens are ANSI escapes, banners, and pre-marker noise. Prefer the structured paths:
+
+| Pattern | Why it saves tokens |
+| --- | --- |
+| Agent writes `$TMUX_AGENT_RESULT` (a JSON file), parent reads the file (#97) | Parent never reads pane scrollback. Token cost = result body, not pane history. |
+| `capture --strip-ansi --since-marker '[T02]' --tail 80` (#96) | Strips CSI/SGR + trims pre-marker noise BEFORE returning. |
+| `wait-and-capture --marker '[DONE]' --tail 80 --strip-ansi --json` (#99) | One round-trip for "is it done + here is the relevant tail". |
+| `status --json` + `idle_seconds` / `marker_seen[]` (#98) | Liveness without reading any pane bytes. |
+| `--transcript /tmp/run.jsonl` (#100) | All wrapper events go to disk; replay later without re-capture. |
+
+## Completion signaling matrix (#107)
+
+| Need | Use | Cost | Cross-process |
+| --- | --- | --- | --- |
+| "Is pane idle?" | `status --json` → `idle_seconds` (#98) | 1 capture-pane | yes |
+| "Did marker appear?" | `wait-literal <text>` | poll until found | no (in-process) |
+| "Marker + tail in one call" | `wait-and-capture --marker ... --tail N` (#99) | poll + 1 capture | no |
+| "Notify when CLI exits" | `start --sentinel /path` (#95); watch the file | filesystem-event | yes |
+| "Run code on CLI exit" | `start --sentinel ... --on-exit 'cmd'` (#95) | hook runs in pane shell | yes |
+| "Run code on CLI start" | `start --on-start 'cmd'` (#101a) | detached subshell | yes |
+| "Aggregate inventory state" | `tmux-agent-sessions list --json` | one pass over sessions | yes |
+
+## Result file contract (#107, builds on #97)
+
+Agents should write `$TMUX_AGENT_RESULT` (path is `$TMUX_AGENT_DIR/<name>/result.json`) with this shape:
+
+```jsonc
+{
+  "schema_version": 1,
+  "status": "ok" | "blocked" | "error",
+  "summary": "one-line human-readable summary",
+  "artifacts": [{"kind": "pr|file|url", "ref": "PR-1234"}],
+  "errors": [{"code": "...", "message": "...", "remediation": "..."}]
+}
+```
+
+Parent reads it via `result --json --wait <seconds> <name>` and branches on `.present` (file existed) then `.valid` (parsed as JSON) before consuming `.body`.
+
+## Failure mode cheatsheet (#107)
+
+| Symptom | Likely cause | First action |
+| --- | --- | --- |
+| `wait-text` times out but pane has the text | regex metachar in marker | switch to `wait-literal` or `wait-text --literal` |
+| `wait-literal` returns immediately | stale marker from previous turn | use `send-wait-literal` instead |
+| `status --json` says `running:true` but no progress | CLI sitting on a permission prompt | check `diagnostic` field (`confirmation_detected`); attach + answer |
+| `--on-exit` hook never logged | `--on-exit` set without `--sentinel` | the wrapper warns and ignores; add `--sentinel <path>` |
+| `result.json` missing after agent says "done" | agent never wrote `$TMUX_AGENT_RESULT` | re-prompt with explicit "write $TMUX_AGENT_RESULT before signaling done" |
+| Pane shows exit code marker but session lingers | normal — wrapper keeps the pane open for inspection | `stop <name>` to clean up |
+
+## Concurrency model (#107)
+
+- Single caller per agent name. Two `start --exact same-name` kills the first session.
+- Wrapper state under `$TMUX_AGENT_DIR/<name>/` (`started_at`, `marker_seen`, `transcript-path`, etc.) is NOT lock-protected today. Don't share one agent name across two orchestrators.
+- The `marker_seen` FIFO is capped at 100 entries (#98) — oldest evicted first.
+- Multiple agents under different names are independent; `tmux-agent-sessions list --json` is a safe read across all of them.
+
+## Cost accounting (#107)
+
+- Per-turn usage capture (#103) is design-only today. When it lands, usage goes to `$TMUX_AGENT_DIR/<name>/usage.jsonl` with `schema_version: 1` and is aggregated via `status --usage` / `usage --top N`.
+- `--max-runtime` / `--max-idle` / `--max-cost` fuses (#105) are roadmap, not implemented.
+- For now, account cost via: transcript size as proxy + your provider's billing dashboard.
+
 ## Session Naming
 
 - Without `--exact`, `start` appends a random suffix to avoid collisions.
