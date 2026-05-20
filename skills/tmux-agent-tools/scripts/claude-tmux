@@ -39,6 +39,7 @@ Usage:
   claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]
   claude-tmux wait-literal <name> <text> [timeout_seconds]
   claude-tmux capture <name> [lines]
+  claude-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>
   claude-tmux list
   claude-tmux status [--json] <name>
   claude-tmux doctor
@@ -350,6 +351,34 @@ sentinel_inline_block() {
   printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
 }
 
+# --- Result-file convention helpers (issue #97) ---------------------------
+# Layout under $TMUX_AGENT_DIR (default $XDG_STATE_HOME/tmux-agent-tools):
+#   <dir>/<agent-name>/result.json
+# Wrapper exports TMUX_AGENT_NAME and TMUX_AGENT_RESULT into the pane so the
+# agent CLI can write its structured result without inventing a path.
+
+agent_root_dir() {
+  printf '%s' "${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}"
+}
+
+ensure_agent_dir() {
+  local name="$1"
+  local dir
+  dir="$(agent_root_dir)/$name"
+  mkdir -p "$dir"
+  printf '%s' "$dir"
+}
+
+apply_result_env_args() {
+  local name="$1"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local result_path="$subdir/result.json"
+  rm -f "$result_path"
+  session_env_args+=("-e" "TMUX_AGENT_NAME=$name")
+  session_env_args+=("-e" "TMUX_AGENT_RESULT=$result_path")
+}
+
 start_session() {
   require_bins
   write_tmux_conf
@@ -405,6 +434,7 @@ start_session() {
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_sentinel_env_args
+  apply_result_env_args "$name"
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
@@ -493,6 +523,7 @@ resume_session() {
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_sentinel_env_args
+  apply_result_env_args "$name"
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
@@ -789,6 +820,120 @@ capture_session() {
   else
     printf '%s\n' "$raw"
   fi
+}
+
+result_session() {
+  # Read the structured result an agent wrote to its conventional path
+  # (see #97 design doc). Path resolution:
+  #   $TMUX_AGENT_DIR/<name>/result.json
+  local field=""
+  local wait_seconds=0
+  local output_json=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --field)
+        if (( $# < 2 )); then
+          echo "--field requires a value (jq path)" >&2
+          exit 2
+        fi
+        field="$2"
+        shift 2
+        ;;
+      --wait)
+        if (( $# < 2 )); then
+          echo "--wait requires a value (seconds)" >&2
+          exit 2
+        fi
+        wait_seconds="$2"
+        shift 2
+        if [[ ! "$wait_seconds" =~ '^[0-9]+$' ]]; then
+          echo "--wait must be a non-negative integer" >&2
+          exit 2
+        fi
+        ;;
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "Unknown result flag: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: claude-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>" >&2
+    exit 2
+  fi
+  if (( output_json )); then
+    require_jq
+  fi
+  if [[ -n "$field" ]]; then
+    require_jq
+  fi
+
+  local result_path
+  result_path="$(agent_root_dir)/$name/result.json"
+
+  if (( wait_seconds > 0 )); then
+    local elapsed=0
+    while [[ ! -f "$result_path" && "$elapsed" -lt "$wait_seconds" ]]; do
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+  fi
+
+  if [[ ! -f "$result_path" ]]; then
+    if (( output_json )); then
+      "$JQ" -n --arg path "$result_path" \
+        '{schema_version: 1, path: $path, present: false, body: null}'
+      exit 1
+    fi
+    echo "Result file not found: $result_path" >&2
+    exit 1
+  fi
+
+  local body bytes mtime
+  body="$(cat "$result_path")"
+  bytes=$(wc -c < "$result_path" | tr -d ' ')
+  if [[ "$(uname)" == "Darwin" ]]; then
+    mtime=$(stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$result_path")
+  else
+    mtime=$(stat -c %y "$result_path" | awk '{print $1"T"$2"Z"}')
+  fi
+
+  if (( output_json )); then
+    local body_json
+    if printf '%s' "$body" | "$JQ" -e . >/dev/null 2>&1; then
+      body_json="$body"
+    else
+      body_json='null'
+    fi
+    "$JQ" -n \
+      --arg path "$result_path" \
+      --argjson bytes "$bytes" \
+      --arg mtime "$mtime" \
+      --argjson body "$body_json" \
+      '{schema_version: 1, path: $path, present: true, bytes: $bytes,
+        mtime: $mtime, body: $body}'
+    return 0
+  fi
+
+  if [[ -n "$field" ]]; then
+    if ! printf '%s' "$body" | "$JQ" -e -r "$field"; then
+      echo "Field not found in result.json: $field" >&2
+      exit 1
+    fi
+    return 0
+  fi
+
+  printf '%s\n' "$body"
 }
 
 wait_session() {
@@ -1146,6 +1291,9 @@ case "$command" in
     ;;
   capture)
     capture_session "$@"
+    ;;
+  result)
+    result_session "$@"
     ;;
   status)
     status_session "$@"

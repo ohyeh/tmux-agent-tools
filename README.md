@@ -164,6 +164,36 @@ codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
 
 All flags must come BEFORE the positional `<name> [lines]`. Without any flag the behavior is identical to today.
 
+### Result-file convention (`result` subcommand)
+
+`start` and `resume` export two env vars into the pane shell so the agent CLI can write its structured result without inventing a path:
+
+```
+TMUX_AGENT_NAME=<short-name>
+TMUX_AGENT_RESULT=$TMUX_AGENT_DIR/<short-name>/result.json
+```
+
+`TMUX_AGENT_DIR` defaults to `$XDG_STATE_HOME/tmux-agent-tools` (or `~/.local/state/tmux-agent-tools` when XDG is unset). The wrapper creates the per-agent subdirectory at start and clears any stale `result.json` to prevent false positives.
+
+Recommended prompt snippet (also tracked in SKILL.md):
+
+> When this skill exits, write the final structured result to `$TMUX_AGENT_RESULT` as JSON with at least `status` and `summary`, then print `[DONE]` on a separate line.
+
+Read the result with the new `result` subcommand:
+
+```bash
+codex-tmux result worker                # cat result.json
+codex-tmux result --field .status worker
+codex-tmux result --wait 180 worker     # block up to 180s for the file
+codex-tmux result --json worker         # metadata-wrapped output
+```
+
+| Flag | Behavior |
+| --- | --- |
+| `--field <jq>` | Extract a single value via `jq -r`. Exits non-zero if the path is missing. |
+| `--wait <seconds>` | Poll until the file appears or timeout. fswatch / inotifywait support is a follow-up; current implementation polls once per second. |
+| `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, body}`. `present: false` is returned (text mode exits 1) when the file is missing, so callers can branch on the structured payload. |
+
 ### Event-driven completion (sentinel + on-exit hook)
 
 `claude-tmux` and `codex-tmux` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.
