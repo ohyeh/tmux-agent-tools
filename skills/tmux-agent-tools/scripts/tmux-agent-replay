@@ -1,0 +1,217 @@
+#!/usr/bin/env zsh
+# tmux-agent-replay (issue #126): read-only utilities over single-agent
+# JSONL transcripts produced by `--transcript` (#100, #140, #141).
+#
+# v1 ships two subcommands:
+#   diff   <a.jsonl> <b.jsonl>          — compare two runs (marker sequence,
+#                                          send counts, wait outcomes).
+#   redact <in.jsonl> --output <out>    — strip common secrets via a
+#                                          conservative regex set.
+#
+# `run` (live re-execute) is intentionally out of scope for v1 — LLM
+# nondeterminism makes "same script" runs diverge in ways diff would
+# overstate. Tracked in the issue as a deferred slice.
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-replay - read-only utilities over JSONL transcripts (#126).
+
+Usage:
+  tmux-agent-replay diff   <a.jsonl> <b.jsonl> [--json]
+  tmux-agent-replay redact <in.jsonl> --output <out.jsonl> [--pattern <regex>]...
+  tmux-agent-replay help
+
+Subcommands:
+  diff    Compare two transcripts. Reports send-event count delta,
+          wait-event outcome delta, and the per-line diff of marker
+          needles in event order. `--json` emits a structured payload
+          with schema_version: 1 instead of the human-readable summary.
+  redact  Apply a regex set to every string field in the transcript
+          and write a new JSONL file. The default pattern set covers
+          AWS access keys, GitHub tokens, generic api_key= assignments,
+          and Bearer tokens. Repeat `--pattern <regex>` to add more
+          patterns; replacement is always `[redacted]`.
+
+Notes:
+  - `run` (re-execute a transcript against a fresh session) is a
+    deferred followup — LLM nondeterminism makes naive replay
+    misleading. See issue #126 for the design rationale.
+EOF
+}
+
+require_jq() {
+  if [[ -z "$JQ" || ! -x "$JQ" ]]; then
+    echo "jq not found; install jq (brew install jq)" >&2
+    exit 1
+  fi
+}
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---------------------------------------------------------------------------
+# diff
+# ---------------------------------------------------------------------------
+cmd_diff() {
+  require_jq
+  local json_out=0 a="" b=""
+  while (( $# )); do
+    case "$1" in
+      --json) json_out=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      -*) echo "Unknown diff flag: $1" >&2; return 2 ;;
+      *)
+        if [[ -z "$a" ]]; then a="$1"
+        elif [[ -z "$b" ]]; then b="$1"
+        else echo "Extra positional: $1" >&2; return 2
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$a" || -z "$b" ]]; then
+    echo "Usage: tmux-agent-replay diff <a.jsonl> <b.jsonl> [--json]" >&2
+    return 2
+  fi
+  if [[ ! -f "$a" ]]; then echo "Not a file: $a" >&2; return 1; fi
+  if [[ ! -f "$b" ]]; then echo "Not a file: $b" >&2; return 1; fi
+
+  # Counts per event type, and the ordered marker sequence per file.
+  local a_summary b_summary
+  a_summary="$("$JQ" -cs '
+    {
+      sends:           ( map(select(.event=="send"))      | length ),
+      waits_matched:   ( map(select(.event|startswith("wait")) | select(.outcome=="matched")) | length ),
+      waits_timeout:   ( map(select(.event|startswith("wait")) | select(.outcome=="timeout")) | length ),
+      markers:         ( map(select(.event|startswith("wait")) | select(.outcome=="matched") | .needle) ),
+      result_present:  ( map(select(.event=="stop")) | length > 0 )
+    }
+  ' "$a")"
+  b_summary="$("$JQ" -cs '
+    {
+      sends:           ( map(select(.event=="send"))      | length ),
+      waits_matched:   ( map(select(.event|startswith("wait")) | select(.outcome=="matched")) | length ),
+      waits_timeout:   ( map(select(.event|startswith("wait")) | select(.outcome=="timeout")) | length ),
+      markers:         ( map(select(.event|startswith("wait")) | select(.outcome=="matched") | .needle) ),
+      result_present:  ( map(select(.event=="stop")) | length > 0 )
+    }
+  ' "$b")"
+
+  if (( json_out )); then
+    "$JQ" -n --argjson a "$a_summary" --argjson b "$b_summary" \
+      --arg a_path "$a" --arg b_path "$b" --arg at "$(iso_now)" \
+      '{schema_version: 1, generated_at: $at, a: ($a + {path: $a_path}), b: ($b + {path: $b_path}),
+        delta: {
+          sends: ($b.sends - $a.sends),
+          waits_matched: ($b.waits_matched - $a.waits_matched),
+          waits_timeout: ($b.waits_timeout - $a.waits_timeout)
+        }}'
+    return 0
+  fi
+
+  # Human-readable summary.
+  local a_sends a_matched a_timeout b_sends b_matched b_timeout
+  a_sends="$(printf '%s' "$a_summary"   | "$JQ" -r .sends)"
+  a_matched="$(printf '%s' "$a_summary" | "$JQ" -r .waits_matched)"
+  a_timeout="$(printf '%s' "$a_summary" | "$JQ" -r .waits_timeout)"
+  b_sends="$(printf '%s' "$b_summary"   | "$JQ" -r .sends)"
+  b_matched="$(printf '%s' "$b_summary" | "$JQ" -r .waits_matched)"
+  b_timeout="$(printf '%s' "$b_summary" | "$JQ" -r .waits_timeout)"
+
+  printf '%-20s %-12s %-12s %-10s\n' "metric" "a" "b" "delta"
+  printf '%-20s %-12s %-12s %-10s\n' "sends" "$a_sends" "$b_sends" "$((b_sends - a_sends))"
+  printf '%-20s %-12s %-12s %-10s\n' "waits_matched" "$a_matched" "$b_matched" "$((b_matched - a_matched))"
+  printf '%-20s %-12s %-12s %-10s\n' "waits_timeout" "$a_timeout" "$b_timeout" "$((b_timeout - a_timeout))"
+
+  # Marker sequence delta — show A-only / B-only entries in order.
+  printf '\nmarkers in a:\n'
+  printf '%s\n' "$a_summary" | "$JQ" -r '.markers[]?'
+  printf '\nmarkers in b:\n'
+  printf '%s\n' "$b_summary" | "$JQ" -r '.markers[]?'
+}
+
+# ---------------------------------------------------------------------------
+# redact
+# ---------------------------------------------------------------------------
+DEFAULT_PATTERNS=(
+  'AKIA[0-9A-Z]{16}'                       # AWS access key
+  'ASIA[0-9A-Z]{16}'                       # AWS STS key
+  'gh[pousr]_[A-Za-z0-9]{36,}'             # GitHub tokens
+  '(?i)bearer [A-Za-z0-9._\-]{12,}'        # Bearer auth
+  '(?i)api[_-]?key["'\'']?\s*[:=]\s*["'\'']?[A-Za-z0-9._\-]{8,}'
+  '(?i)password["'\'']?\s*[:=]\s*["'\'']?[A-Za-z0-9._\-]{6,}'
+)
+
+cmd_redact() {
+  require_jq
+  local in_path="" out_path=""
+  local -a patterns
+  patterns=("${DEFAULT_PATTERNS[@]}")
+  while (( $# )); do
+    case "$1" in
+      --output)
+        if (( $# < 2 )); then echo "--output requires a value" >&2; return 2; fi
+        out_path="$2"; shift 2 ;;
+      --pattern)
+        if (( $# < 2 )); then echo "--pattern requires a value" >&2; return 2; fi
+        patterns+=("$2"); shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      -*) echo "Unknown redact flag: $1" >&2; return 2 ;;
+      *)
+        if [[ -z "$in_path" ]]; then in_path="$1"
+        else echo "Extra positional: $1" >&2; return 2
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$in_path" || -z "$out_path" ]]; then
+    echo "Usage: tmux-agent-replay redact <in.jsonl> --output <out.jsonl>" >&2
+    return 2
+  fi
+  if [[ ! -f "$in_path" ]]; then echo "Not a file: $in_path" >&2; return 1; fi
+  if [[ -e "$out_path" ]]; then
+    echo "Output path already exists: $out_path" >&2
+    echo "Remove it or pass a fresh --output path." >&2
+    return 1
+  fi
+
+  # Build a single jq filter that applies every pattern over every string
+  # field. Use gsub with a regex per pattern. Replacement is `[redacted]`.
+  local jq_filter='walk(if type == "string" then '
+  local i=1
+  for pat in "${patterns[@]}"; do
+    # jq gsub needs the pattern as a string; escape backslashes.
+    local escaped="${pat//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    if (( i == 1 )); then
+      jq_filter+="gsub(\"$escaped\"; \"[redacted]\")"
+    else
+      jq_filter+=" | gsub(\"$escaped\"; \"[redacted]\")"
+    fi
+    i=$((i + 1))
+  done
+  jq_filter+=' else . end)'
+
+  # Apply line by line so the JSONL contract is preserved.
+  : > "$out_path"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf '%s' "$line" | "$JQ" -c "$jq_filter" >> "$out_path"
+  done < "$in_path"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+sub="${1:-}"
+shift 2>/dev/null || true
+case "$sub" in
+  diff)       cmd_diff   "$@" ;;
+  redact)     cmd_redact "$@" ;;
+  help|-h|--help|"") usage ;;
+  *)          echo "Unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
+esac
