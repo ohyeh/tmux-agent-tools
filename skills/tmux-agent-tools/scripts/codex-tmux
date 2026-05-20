@@ -29,8 +29,8 @@ usage() {
 codex-tmux - run Codex CLI in tmux and drive it programmatically.
 
 Usage:
-  codex-tmux start [--attach] [--exact] <name> <directory> [initial text]
-  codex-tmux resume [--attach] [--exact] <name> <directory> <session-id>
+  codex-tmux start [--attach] [--exact] [--transcript <path>] <name> <directory> [initial text]
+  codex-tmux resume [--attach] [--exact] [--transcript <path>] <name> <directory> <session-id>
   codex-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
   codex-tmux attach <name>
   codex-tmux send <name> <text>
@@ -371,6 +371,48 @@ ensure_agent_dir() {
   printf '%s' "$dir"
 }
 
+# --- Single-agent transcript helpers (issue #100) -------------------------
+# A transcript captures wrapper-level events (start / send / wait / capture /
+# stop) as JSONL. Path is configured at `start --transcript <abs>` and
+# remembered for subsequent subcommands via a small marker file under
+# $TMUX_AGENT_DIR/<name>/transcript-path.
+
+transcript_path_for() {
+  # Prints the configured transcript path for an agent, or empty if none.
+  # IMPORTANT: zsh aliases the lowercase `path` to PATH; never use
+  # `local path=` in any helper here.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/transcript-path"
+  [[ -f "$marker" ]] && cat "$marker" || true
+}
+
+transcript_record_path() {
+  # Writes the transcript path marker so later subcommands can find it.
+  # NOTE: parameter named `target` not `path` — zsh ties lowercase `path`
+  # to PATH, and `local path=...` would clobber PATH for the rest of the
+  # function, breaking every external command lookup that follows
+  # (mkdir, cat, jq, ...).
+  local name="$1" target="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  printf '%s\n' "$target" > "$subdir/transcript-path"
+}
+
+transcript_iso_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+transcript_append() {
+  # Append one JSONL line. Best-effort: transcript is observability, not
+  # contract. Failures are swallowed so they never break the underlying
+  # tmux operation.
+  # NOTE: parameter is `target` (not `path`) — see transcript_record_path
+  # for the zsh PATH/path tied-pair gotcha.
+  local target="$1" line="$2"
+  [[ -z "$target" ]] && return 0
+  printf '%s\n' "$line" >> "$target" 2>/dev/null || true
+}
+
 apply_result_env_args() {
   # Appends -e TMUX_AGENT_NAME=... and -e TMUX_AGENT_RESULT=... to the
   # caller's session_env_args array. Removes any stale result.json so a
@@ -408,17 +450,48 @@ start_session() {
   parse_sentinel_flags "$@"
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
+  local transcript_path=""
+  while [[ "${1:-}" == "--transcript" ]]; do
+    if (( $# < 2 )); then
+      echo "--transcript requires a value (absolute path)" >&2
+      exit 2
+    fi
+    transcript_path="$2"
+    shift 2
+  done
+
   local requested_name="${1:-}"
   local directory="${2:-}"
   shift 2 || true
   local initial_text="${*:-}"
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: codex-tmux start [--attach] [--exact] [--sentinel <path>] [--on-exit <cmd>] [--sentinel-keep] <name> <directory> [initial text]" >&2
+    echo "Usage: codex-tmux start [--attach] [--exact] [--sentinel <path>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
   validate_sentinel_flags codex-tmux
+  if [[ -n "$transcript_path" && "${transcript_path:0:1}" != "/" ]]; then
+    echo "--transcript must be an absolute path: $transcript_path" >&2
+    exit 2
+  fi
+  if [[ -n "$transcript_path" && -e "$transcript_path" ]]; then
+    echo "Transcript path already exists: $transcript_path" >&2
+    echo "Remove it or pass a fresh --transcript path to avoid mixed runs." >&2
+    exit 1
+  fi
+  if [[ -n "$transcript_path" ]]; then
+    require_jq
+    # Write probe (partner R7 critique): transcript_append is best-effort
+    # for runtime resilience, but a silent silent-failure at start would
+    # produce an empty audit trail with no operator-visible warning. Fail
+    # loudly at start if the path is not writable.
+    if ! ( : > "$transcript_path" ) 2>/dev/null; then
+      echo "--transcript path is not writable: $transcript_path" >&2
+      exit 1
+    fi
+    rm -f "$transcript_path"
+  fi
 
   if [[ ! -d "$directory" ]]; then
     echo "Directory not found: $directory" >&2
@@ -440,12 +513,26 @@ start_session() {
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_sentinel_env_args
   apply_result_env_args "$name"
+  if [[ -n "$transcript_path" ]]; then
+    transcript_record_path "$name" "$transcript_path"
+  fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CODEX") --yolo; code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  if [[ -n "$transcript_path" ]]; then
+    local start_line
+    start_line="$("$JQ" -c -n \
+      --arg event start --arg tool codex --arg name "$name" \
+      --arg session "$session" --arg cwd "$directory" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, tool: $tool, name: $name,
+        session: $session, cwd: $cwd, at: $at}')"
+    transcript_append "$transcript_path" "$start_line"
+  fi
 
   echo "agent: $name"
   echo "Started $session"
@@ -493,12 +580,22 @@ resume_session() {
   parse_sentinel_flags "$@"
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
+  local transcript_path=""
+  while [[ "${1:-}" == "--transcript" ]]; do
+    if (( $# < 2 )); then
+      echo "--transcript requires a value (absolute path)" >&2
+      exit 2
+    fi
+    transcript_path="$2"
+    shift 2
+  done
+
   local requested_name="${1:-}"
   local directory="${2:-}"
   local codex_session_id="${3:-}"
 
   if [[ -z "$requested_name" || -z "$directory" || -z "$codex_session_id" ]]; then
-    echo "Usage: codex-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-exit <cmd>] [--sentinel-keep] <name> <directory> <session-id>" >&2
+    echo "Usage: codex-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> <session-id>" >&2
     exit 2
   fi
 
@@ -513,6 +610,14 @@ resume_session() {
   fi
 
   validate_sentinel_flags codex-tmux
+  if [[ -n "$transcript_path" && "${transcript_path:0:1}" != "/" ]]; then
+    echo "--transcript must be an absolute path: $transcript_path" >&2
+    exit 2
+  fi
+  if [[ -n "$transcript_path" && -e "$transcript_path" ]]; then
+    echo "Transcript path already exists: $transcript_path" >&2
+    exit 1
+  fi
 
   local name="$requested_name"
   if (( ! exact_name )); then
@@ -529,12 +634,27 @@ resume_session() {
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_sentinel_env_args
   apply_result_env_args "$name"
+  if [[ -n "$transcript_path" ]]; then
+    transcript_record_path "$name" "$transcript_path"
+  fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'codex session id: $codex_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CODEX") --yolo resume $(shell_quote "$codex_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  if [[ -n "$transcript_path" ]]; then
+    local start_line
+    start_line="$("$JQ" -c -n \
+      --arg event start --arg tool codex --arg name "$name" \
+      --arg session "$session" --arg cwd "$directory" \
+      --arg resume_id "$codex_session_id" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, tool: $tool, name: $name,
+        session: $session, cwd: $cwd, resume_id: $resume_id, at: $at}')"
+    transcript_append "$transcript_path" "$start_line"
+  fi
 
   echo "agent: $name"
   echo "Started $session"
@@ -664,6 +784,18 @@ send_session() {
   local prompt_text="$*"
   local buffer_name="$session-send"
   paste_and_submit "$session" "$buffer_name" "$prompt_text"
+
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  if [[ -n "$transcript_path" ]]; then
+    local send_line
+    send_line="$("$JQ" -c -n \
+      --arg event send --arg name "$name" --arg text "$prompt_text" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, name: $name, text: $text, at: $at}')"
+    transcript_append "$transcript_path" "$send_line"
+  fi
+
   echo "Sent to $session: $prompt_text"
 }
 
@@ -824,6 +956,26 @@ capture_session() {
         lines: ($body | split("\n"))}'
   else
     printf '%s\n' "$raw"
+  fi
+
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  if [[ -n "$transcript_path" ]]; then
+    local capture_line
+    capture_line="$("$JQ" -c -n \
+      --arg event capture --arg name "$name" \
+      --argjson lines_requested "$lines" \
+      --argjson strip_ansi "$strip_ansi" \
+      --arg since_marker "$since_marker" \
+      --argjson marker_found "$marker_found" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, name: $name,
+        lines_requested: $lines_requested,
+        stripped_ansi: ($strip_ansi == 1),
+        since_marker: $since_marker,
+        marker_found: ($marker_found == 1),
+        at: $at}')"
+    transcript_append "$transcript_path" "$capture_line"
   fi
 }
 
@@ -1439,12 +1591,28 @@ stop_session() {
     exit 2
   fi
 
-  local session="$(session_for_name "$name")"
+  local session
+  session="$(session_for_name "$name")"
+  local stopped=0
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
+    stopped=1
     echo "Stopped $session"
   else
     echo "Already stopped: $session"
+  fi
+
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  if [[ -n "$transcript_path" ]]; then
+    local stop_line
+    stop_line="$("$JQ" -c -n \
+      --arg event stop --arg name "$name" \
+      --argjson stopped "$stopped" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, name: $name,
+        stopped: ($stopped == 1), at: $at}')"
+    transcript_append "$transcript_path" "$stop_line"
   fi
 }
 
