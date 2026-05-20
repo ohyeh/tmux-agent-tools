@@ -909,19 +909,27 @@ result_session() {
   fi
 
   if (( output_json )); then
-    local body_json
+    # body=null ambiguity (partner R5 critique): a `null` literal in
+    # result.json is valid JSON; without a `valid` flag the consumer
+    # cannot tell that case apart from "wrapper failed to parse". Emit
+    # both: valid=true with parsed body, or valid=false with the raw
+    # bytes wrapped as a JSON string so the caller can still inspect.
+    local body_json valid_flag
     if printf '%s' "$body" | "$JQ" -e . >/dev/null 2>&1; then
       body_json="$body"
+      valid_flag=true
     else
-      body_json='null'
+      body_json="$(printf '%s' "$body" | "$JQ" -Rs .)"
+      valid_flag=false
     fi
     "$JQ" -n \
       --arg path "$result_path" \
       --argjson bytes "$bytes" \
       --arg mtime "$mtime" \
+      --argjson valid "$valid_flag" \
       --argjson body "$body_json" \
       '{schema_version: 1, path: $path, present: true, bytes: $bytes,
-        mtime: $mtime, body: $body}'
+        mtime: $mtime, valid: $valid, body: $body}'
     return 0
   fi
 

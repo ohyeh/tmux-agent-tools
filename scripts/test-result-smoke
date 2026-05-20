@@ -67,10 +67,24 @@ run_result_variants() {
   json_schema_v="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .schema_version || true)"
   assert "$prefix --json schema_version=1" "$json_schema_v" "1"
 
-  # --wait when file already present is essentially a no-op
+  local valid_flag
+  valid_flag="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
+  assert "$prefix --json valid=true on parseable JSON" "$valid_flag" "true"
+
+  # --wait when file already present is essentially a no-op (must run
+  # BEFORE the invalid-JSON test since it overwrites result.json).
   local wait_value
   wait_value="$("$wrapper" result --wait 2 --field .status "$prefix" 2>&1 || true)"
   assert "$prefix --wait existing file" "$wait_value" "ok"
+
+  # invalid JSON case: overwrite result.json with non-JSON bytes. Runs
+  # LAST in this block because it permanently corrupts the file.
+  printf 'this is not valid json' > "$TMUX_AGENT_DIR/$prefix/result.json"
+  local inv_valid inv_body
+  inv_valid="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
+  inv_body="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .body || true)"
+  assert "$prefix --json valid=false on invalid JSON" "$inv_valid" "false"
+  assert "$prefix --json body=raw-string on invalid JSON" "$inv_body" "this is not valid json"
 
   "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
 

@@ -177,7 +177,20 @@ TMUX_AGENT_RESULT=$TMUX_AGENT_DIR/<short-name>/result.json
 
 Recommended prompt snippet (also tracked in SKILL.md):
 
-> When this skill exits, write the final structured result to `$TMUX_AGENT_RESULT` as JSON with at least `status` and `summary`, then print `[DONE]` on a separate line.
+> When this skill exits, the agent MUST write its final structured
+> result via **atomic rename** so a `result --wait` reader never sees a
+> partial file:
+>
+> ```sh
+> cat > "$TMUX_AGENT_RESULT.tmp" <<'JSON'
+> {"status": "ok", "summary": "...", "errors": [], "artifacts": []}
+> JSON
+> mv -f "$TMUX_AGENT_RESULT.tmp" "$TMUX_AGENT_RESULT"
+> ```
+>
+> Do NOT write directly to `$TMUX_AGENT_RESULT`. The wrapper's
+> `result --wait` polls at 1Hz and could otherwise observe partial
+> content during the agent's final write.
 
 Read the result with the new `result` subcommand:
 
@@ -192,7 +205,7 @@ codex-tmux result --json worker         # metadata-wrapped output
 | --- | --- |
 | `--field <jq>` | Extract a single value via `jq -r`. Exits non-zero if the path is missing. |
 | `--wait <seconds>` | Poll until the file appears or timeout. fswatch / inotifywait support is a follow-up; current implementation polls once per second. |
-| `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, body}`. `present: false` is returned (text mode exits 1) when the file is missing, so callers can branch on the structured payload. |
+| `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, valid, body}`. `valid` is `true` when the file parsed as JSON (body is the parsed object) and `false` when it did not (body is the raw bytes as a string, so the caller can still inspect). `present: false` is returned (text mode exits 1) when the file is missing. |
 
 ### Event-driven completion (sentinel + on-exit hook)
 
