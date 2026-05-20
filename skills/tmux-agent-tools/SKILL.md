@@ -149,6 +149,23 @@ tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --g
 Only add `--post-github-comment` when the user explicitly asks to publish the summary to GitHub.
 Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize` or `github-comment` when transcript content may be too large or sensitive to share raw. The generated Markdown includes visible truncation and redaction notes.
 
+## Scenario → command cheatsheet (issue #106)
+
+Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focused per-subcommand cheatsheet instead of dumping the full usage.
+
+| Scenario | Command |
+| --- | --- |
+| Know when an agent finished across processes | `start --sentinel /tmp/x.exit` + watch the file |
+| Run code at agent start | `start --on-start 'cmd'` (#101a) |
+| Run code at agent exit | `start --sentinel ... --on-exit 'cmd'` (#95) |
+| Get the last 80 lines of pane | `capture --tail 80` |
+| Strip ANSI for token-efficient capture | `capture --strip-ansi --since-marker '[T02]'` (#96) |
+| Wait for marker AND get tail in one call | `wait-and-capture --marker '[DONE]' --tail 80 --json` (#99) |
+| Read the agent's structured result | `result --field '.status' --wait 30 --json <name>` (#97) |
+| Check if agent is stuck | `status --json <name>` then read `idle_seconds` (#98) |
+| Record every wrapper event to disk | `start --transcript /tmp/run.jsonl` (#100) |
+| Per-subcommand cheatsheet | `claude-tmux help <subcommand>` (#106) |
+
 ## Token-efficient patterns (#107)
 
 Default capture dumps raw scrollback — most of those tokens are ANSI escapes, banners, and pre-marker noise. Prefer the structured paths:

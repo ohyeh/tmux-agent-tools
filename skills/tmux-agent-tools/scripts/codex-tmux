@@ -92,6 +92,200 @@ Environment:
 EOF
 }
 
+help_for_subcommand() {
+  # Per-subcommand cheatsheet for issue #106 discoverability.
+  # Falls through to the full `usage` when no topic matches.
+  local topic="${1:-}"
+  case "$topic" in
+    "")
+      usage
+      return 0
+      ;;
+    start)
+      cat <<'HELP_EOF'
+codex-tmux start [flags] <name> <directory> [initial text]
+
+Launch codex inside a fresh tmux session.
+
+Flags (place BEFORE <name>):
+  --attach                       Attach immediately after creating the session.
+  --exact                        Use <name> verbatim (no random suffix).
+  --sentinel <abs-path>          Write CLI exit code to file when CLI exits (#95).
+  --on-start <shell-cmd>         Run hook after `tmux new-session` returns (#101a).
+  --on-exit  <shell-cmd>         Run hook after CLI exit; needs --sentinel.
+  --sentinel-keep                Keep sentinel file across `stop` cleanup.
+  --transcript <abs-path>        Append JSONL events to this path (#100).
+
+Examples:
+  codex-tmux start --exact worker ~/proj 'Run targeted tests.'
+  codex-tmux start --sentinel /tmp/w.exit --on-exit 'curl -X POST $URL' \
+                  --on-start 'date >> /tmp/start.log' worker ~/proj 'hi'
+
+See also: README "Event-driven completion" and `codex-tmux help resume`.
+HELP_EOF
+      ;;
+    resume)
+      cat <<'HELP_EOF'
+codex-tmux resume [flags] <name> <directory> <session-id>
+
+Resume an existing codex session-id inside tmux. Accepts the same flags as
+`start`: --attach, --exact, --sentinel, --on-start, --on-exit, --sentinel-keep,
+--transcript.
+
+Example:
+  codex-tmux resume --exact rev ~/proj 019e356f-f95d-7570-9784-ea7b58e404a5
+HELP_EOF
+      ;;
+    send)
+      cat <<'HELP_EOF'
+codex-tmux send <name> <text>
+
+Paste <text> into the agent CLI and submit. Multiline OK; the wrapper
+inserts a short delay between paste and submit. Tune via CODEX_TMUX_SUBMIT_DELAY.
+HELP_EOF
+      ;;
+    send-wait-literal)
+      cat <<'HELP_EOF'
+codex-tmux send-wait-literal <name> <text> <literal> [timeout]
+
+Send text then wait for a NEW occurrence of <literal> after the send. Use
+this over `send` + `wait-literal` when stale pane content may already
+contain the marker.
+HELP_EOF
+      ;;
+    wait)
+      cat <<'HELP_EOF'
+codex-tmux wait <name> [timeout_seconds]
+
+Block until pane bytes have been stable for CODEX_TMUX_STABLE_SECONDS. Times
+out with exit 1 if the pane keeps changing.
+HELP_EOF
+      ;;
+    wait-text|wait-literal)
+      cat <<'HELP_EOF'
+codex-tmux wait-text [--literal] <name> <pattern> [timeout_seconds]
+codex-tmux wait-literal       <name> <text>    [timeout_seconds]
+
+Both wait until the visible pane contains the pattern. `wait-text` uses zsh
+extended regex by default; `--literal` and `wait-literal` use exact-text
+match. Prefer literal forms for markers containing regex metacharacters
+(`[`, `]`, `(`, `)`, `.`, `*`, `?`).
+HELP_EOF
+      ;;
+    wait-and-capture)
+      cat <<'HELP_EOF'
+codex-tmux wait-and-capture --marker <text> [flags] <name>
+
+One-shot combination of wait + capture (#99). Default match style is
+literal (regex would false-positive on `[DONE]`-shaped markers).
+
+Flags:
+  --marker <text>              Required marker text.
+  --literal | --regex          Match style. Default --literal (#137 R6).
+  --timeout <s>                Wait timeout.
+  --tail <n>                   Capture last N lines.
+  --strip-ansi                 Strip CSI/SGR escapes.
+  --since-marker <text>        Trim pane output before <text>; defaults to
+                                --marker when match style is literal.
+  --json                       Structured payload with reason:
+                                  matched | timeout | session_gone.
+  --no-timeout-error           SOFT timeout exits 0; session_gone still exits 1.
+HELP_EOF
+      ;;
+    capture)
+      cat <<'HELP_EOF'
+codex-tmux capture [flags] <name> [lines]
+
+Read the tmux pane without stealing focus.
+
+Flags:
+  --strip-ansi                 Remove CSI/SGR escapes (#96).
+  --since-marker <text>        Keep only lines after the LAST <text>.
+  --json                       Wrap as {schema_version, name, session,
+                                  lines_requested, marker_found,
+                                  stripped_ansi, lines}.
+HELP_EOF
+      ;;
+    result)
+      cat <<'HELP_EOF'
+codex-tmux result [flags] <name>
+
+Read the agent's result.json (#97) at $TMUX_AGENT_DIR/<name>/result.json.
+
+Flags:
+  --field <jq>                  Extract single value via `jq -r`. Exit 1 on
+                                missing path.
+  --wait <seconds>              Poll until the file appears or timeout.
+  --json                        Wrap as {schema_version, path, present,
+                                  bytes, mtime, valid, body}. Missing file
+                                  → exit 0 with present:false.
+HELP_EOF
+      ;;
+    status)
+      cat <<'HELP_EOF'
+codex-tmux status [--json] <name>
+
+Show pane state + diagnostics. `--json` emits the stable contract
+including liveness fields (#98): started_at, last_change_at, idle_seconds,
+bytes_in_pane, marker_seen[], plus the shared exists/running/exit_detected/
+local_or_remote/diagnostic fields.
+HELP_EOF
+      ;;
+    list)
+      cat <<'HELP_EOF'
+codex-tmux list
+
+List active codex-tmux-prefixed tmux sessions. Use `tmux-agent-sessions list`
+for the cross-tool inventory with state filters.
+HELP_EOF
+      ;;
+    attach)
+      cat <<'HELP_EOF'
+codex-tmux attach <name>
+
+Attach to the session in the current terminal. Detach with the usual tmux
+prefix + `d` (default Ctrl-b d).
+HELP_EOF
+      ;;
+    stop)
+      cat <<'HELP_EOF'
+codex-tmux stop <name>
+
+Kill the tmux session. Removes the sentinel file by default; pass
+--sentinel-keep at start to retain it.
+HELP_EOF
+      ;;
+    doctor|self-test)
+      cat <<'HELP_EOF'
+codex-tmux doctor          Check binaries + tmux + capture/wait behavior.
+codex-tmux self-test       End-to-end smoke without launching a real CLI.
+
+Both are credential-free and safe to run anywhere.
+HELP_EOF
+      ;;
+    start-ssh)
+      cat <<'HELP_EOF'
+codex-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
+
+Keep tmux local but run codex over ssh on <ssh-target>. The remote shell
+must resolve `codex` on PATH.
+HELP_EOF
+      ;;
+    help)
+      cat <<'HELP_EOF'
+codex-tmux help               Show full usage.
+codex-tmux help <subcommand>  Show focused cheatsheet for one subcommand.
+HELP_EOF
+      ;;
+    *)
+      printf 'No focused help for %q. Available topics:\n' "$topic" >&2
+      printf '  start resume start-ssh attach send send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status\n  list stop doctor self-test help\n' >&2
+      return 2
+      ;;
+  esac
+}
+
+
 require_bins() {
   if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
     echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
@@ -1844,7 +2038,7 @@ case "$command" in
     stop_session "$@"
     ;;
   -h|--help|help)
-    usage
+    help_for_subcommand "${1:-}"
     ;;
   *)
     usage >&2
