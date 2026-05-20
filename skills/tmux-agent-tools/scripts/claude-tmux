@@ -271,7 +271,7 @@ parse_sentinel_flags() {
   # the function exits explicitly rather than letting `shift 2` fail under
   # `set -e` with a cryptic "shift count must be <= $#".
   SENTINEL_PARSE_REMAINING=()
-  while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--sentinel-keep" ]]; do
+  while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--on-start" || "${1:-}" == "--sentinel-keep" ]]; do
     case "$1" in
       --sentinel)
         if (( $# < 2 )); then
@@ -287,6 +287,14 @@ parse_sentinel_flags() {
           exit 2
         fi
         on_exit_cmd="$2"
+        shift 2
+        ;;
+      --on-start)
+        if (( $# < 2 )); then
+          echo "--on-start requires a value (shell command)" >&2
+          exit 2
+        fi
+        on_start_cmd="$2"
         shift 2
         ;;
       --sentinel-keep)
@@ -350,6 +358,37 @@ sentinel_inline_block() {
   #     shell_quoted agent name so dangerous names cannot break out.
   local agent_name="$1"
   printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
+}
+
+run_on_start_hook() {
+  # Fires the --on-start hook (issue #101a) after `tmux new-session` returns.
+  # Best-effort timing: pane is created but the CLI may not yet have rendered
+  # its first prompt. Hook runs in a detached subshell so wrapper return is
+  # not blocked. Non-zero hook exit is logged but never fails the agent.
+  #
+  # Hook log path mirrors the on-exit hook:
+  #   - <sentinel>.hook.log when --sentinel is set
+  #   - $TMUX_AGENT_DIR/<name>/hook.log otherwise
+  local agent_name="$1" agent_session="$2"
+  [[ -n "$on_start_cmd" ]] || return 0
+  local log_path
+  if [[ -n "$sentinel" ]]; then
+    log_path="$sentinel.hook.log"
+  else
+    ensure_agent_dir "$agent_name"
+    log_path="$(agent_root_dir)/$agent_name/hook.log"
+  fi
+  (
+    export TMUX_AGENT_NAME="$agent_name" TMUX_AGENT_SESSION="$agent_session"
+    {
+      printf '[on-start %s] %s\n' "$(transcript_iso_now)" "$agent_name"
+      # Isolate eval in its OWN subshell so `exit N` only kills the inner
+      # shell, allowing the exit-code line below to still be logged.
+      hook_code=0
+      ( eval "$on_start_cmd" ) || hook_code=$?
+      printf '[on-start exit] %s\n' "$hook_code"
+    } >> "$log_path" 2>&1
+  ) &
 }
 
 # --- Result-file convention helpers (issue #97) ---------------------------
@@ -518,6 +557,7 @@ start_session() {
 
   local sentinel=""
   local on_exit_cmd=""
+  local on_start_cmd=""
   local sentinel_keep=0
   parse_sentinel_flags "$@"
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
@@ -538,7 +578,7 @@ start_session() {
   local initial_text="${*:-}"
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: claude-tmux start [--attach] [--exact] [--sentinel <path>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> [initial text]" >&2
+    echo "Usage: claude-tmux start [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
@@ -595,6 +635,8 @@ start_session() {
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions; code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
+  run_on_start_hook "$name" "$session"
+
   if [[ -n "$transcript_path" ]]; then
     local start_line
     start_line="$("$JQ" -c -n \
@@ -648,6 +690,7 @@ resume_session() {
 
   local sentinel=""
   local on_exit_cmd=""
+  local on_start_cmd=""
   local sentinel_keep=0
   parse_sentinel_flags "$@"
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
@@ -667,7 +710,7 @@ resume_session() {
   local claude_session_id="${3:-}"
 
   if [[ -z "$requested_name" || -z "$directory" || -z "$claude_session_id" ]]; then
-    echo "Usage: claude-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> <session-id>" >&2
+    echo "Usage: claude-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> <session-id>" >&2
     exit 2
   fi
 
@@ -728,6 +771,8 @@ resume_session() {
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'claude session id: $claude_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions --resume $(shell_quote "$claude_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  run_on_start_hook "$name" "$session"
 
   if [[ -n "$transcript_path" ]]; then
     local start_line

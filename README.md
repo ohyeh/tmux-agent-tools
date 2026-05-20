@@ -286,7 +286,7 @@ codex-tmux result --json worker         # metadata-wrapped output
 | `--wait <seconds>` | Poll until the file appears or timeout. fswatch / inotifywait support is a follow-up; current implementation polls once per second. |
 | `--json` | Wrap output as `{schema_version, path, present, bytes, mtime, valid, body}`. `valid` is `true` when the file parsed as JSON (body is the parsed object) and `false` when it did not (body is the raw bytes as a string, so the caller can still inspect). When the file is missing, `--json` exits 0 with `{present: false, valid: false, body: null}` — callers branch on `.present` rather than the exit code. Text mode (no `--json`) keeps the conventional exit 1 + stderr message for missing files. |
 
-### Event-driven completion (sentinel + on-exit hook)
+### Event-driven completion (sentinel + lifecycle hooks)
 
 `claude-tmux` and `codex-tmux` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.
 
@@ -303,6 +303,7 @@ Flags (place before `<name>` and `<directory>`):
 | --- | --- |
 | `--sentinel <abs-path>` | Absolute path; wrapper writes the CLI exit code (decimal + newline) atomically after the CLI returns. Pre-existing file aborts start to prevent stale-completion false positives. |
 | `--on-exit <shell-cmd>` | Hook command run after the sentinel is written. The hook reads `$ON_EXIT_CODE` (decimal exit code) and `$ON_EXIT_NAME` (agent name) from its environment. The wrapper does NOT append positional args, so composite shell strings such as `'curl -X POST "$URL?code=$ON_EXIT_CODE"'` work correctly. Stdout/stderr go to `<sentinel>.hook.log`. Ignored with a warning if `--sentinel` is omitted. |
+| `--on-start <shell-cmd>` | Hook command run after `tmux new-session` returns (issue #101a). The hook reads `$TMUX_AGENT_NAME` and `$TMUX_AGENT_SESSION` from its environment and runs detached so wrapper return is not blocked. Stdout/stderr captured to `<sentinel>.hook.log` (when `--sentinel` is set) or `$TMUX_AGENT_DIR/<name>/hook.log`. Non-zero hook exit is logged but never fails the agent. Best-effort timing: the pane is created but the CLI may not yet have rendered its first prompt when the hook fires. |
 | `--sentinel-keep` | Keep the sentinel file on `stop`. Default removes it during cleanup. |
 
 The sentinel format is intentionally minimal — a single decimal integer plus newline — so shell consumers can rely on `cat`/`[[ ]]` without parsing. Structured telemetry belongs to a separate JSON artifact (see roadmap L3 issues #100/#103); the sentinel will not grow into a JSON payload.
