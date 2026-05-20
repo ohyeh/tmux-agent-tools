@@ -121,12 +121,67 @@ run_unwritable_reject() {
   assert "$prefix-unwritable rejected at start" "$rc" "1"
 }
 
+run_truncate() {
+  # #140 opt-in transcript-text-truncate: long send payloads get a hash +
+  # byte-count placeholder; short ones pass through verbatim.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-truncate ($wrapper, --transcript-text-truncate 20)"
+  local transcript="$WORK/$prefix-truncate.jsonl"
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" --transcript-text-truncate 20 \
+    "$prefix-trc" "$WORK" >/dev/null
+  /bin/sleep 1
+  "$wrapper" send "$prefix-trc" "short" >/dev/null
+  "$wrapper" send "$prefix-trc" "this is a long prompt past twenty bytes" >/dev/null
+  /bin/sleep 1
+
+  local short_line long_line
+  short_line="$(jq -c 'select(.event=="send") | {t: .text, h: .text_sha256, b: .text_bytes}' "$transcript" | head -1)"
+  long_line="$(jq -c 'select(.event=="send") | {t: .text, h: .text_sha256, b: .text_bytes}' "$transcript" | tail -1)"
+
+  assert "$prefix-trc short text passthrough" "$(printf '%s' "$short_line" | jq -r .t)" "short"
+  assert "$prefix-trc short sha=null" "$(printf '%s' "$short_line" | jq -r .h)" "null"
+  assert "$prefix-trc short bytes=5" "$(printf '%s' "$short_line" | jq -r .b)" "5"
+
+  assert "$prefix-trc long text replaced" "$(printf '%s' "$long_line" | jq -r .t | head -c 10)" "[truncated"
+  local long_sha
+  long_sha="$(printf '%s' "$long_line" | jq -r .h)"
+  if [[ "$long_sha" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "  ok   $prefix-trc long sha is 64-char hex"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix-trc long sha not 64-char hex: $long_sha" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  assert "$prefix-trc long bytes>20" "$(( $(printf '%s' "$long_line" | jq -r .b) > 20 ))" "1"
+
+  "$wrapper" stop "$prefix-trc" >/dev/null 2>&1 || true
+}
+
+run_truncate_invalid() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-truncate-invalid ($wrapper, non-integer / zero rejected)"
+  local code=0
+  "$wrapper" start --exact --transcript /tmp/$$-tinv.jsonl --transcript-text-truncate notanumber \
+    "$prefix-tinv" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix-tinv exit=2 on non-integer" "$code" "2"
+
+  code=0
+  "$wrapper" start --exact --transcript /tmp/$$-tinv2.jsonl --transcript-text-truncate 0 \
+    "$prefix-tinv2" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix-tinv2 exit=2 on zero" "$code" "2"
+}
+
 run_transcript        "$CODEX_TMUX"  "CODEX"  "tr-codex"  "codex"
 run_transcript        "$CLAUDE_TMUX" "CLAUDE" "tr-claude" "claude"
 run_stale_reject      "$CODEX_TMUX"  "CODEX"  "codex"
 run_stale_reject      "$CLAUDE_TMUX" "CLAUDE" "claude"
 run_unwritable_reject "$CODEX_TMUX"  "CODEX"  "codex"
 run_unwritable_reject "$CLAUDE_TMUX" "CLAUDE" "claude"
+run_truncate          "$CODEX_TMUX"  "CODEX"  "trc-codex"
+run_truncate          "$CLAUDE_TMUX" "CLAUDE" "trc-claude"
+run_truncate_invalid  "$CODEX_TMUX"  "tic-codex"
+run_truncate_invalid  "$CLAUDE_TMUX" "tic-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
 run_missing_value_reject "$CLAUDE_TMUX" "claude"
 

@@ -29,8 +29,8 @@ usage() {
 claude-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
-  claude-tmux start [--attach] [--exact] [--transcript <path>] <name> <directory> [initial text]
-  claude-tmux resume [--attach] [--exact] [--transcript <path>] <name> <directory> <session-id>
+  claude-tmux start [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
+  claude-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   claude-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
   claude-tmux attach <name>
   claude-tmux send <name> <text>
@@ -756,6 +756,47 @@ transcript_iso_now() {
   date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+transcript_truncate_record() {
+  # Persist per-agent text-truncate threshold (#140). Stored as a single
+  # decimal byte-count under $TMUX_AGENT_DIR/<name>/transcript-truncate.
+  local name="$1" bytes="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( printf '%s\n' "$bytes" > "$subdir/transcript-truncate" ) 2>/dev/null || true
+}
+
+transcript_truncate_threshold() {
+  # Returns the persisted threshold, or empty when unset.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/transcript-truncate"
+  [[ -f "$marker" ]] && cat "$marker" || true
+}
+
+transcript_truncate_text() {
+  # Apply the #140 truncate policy to a send-event text payload.
+  # Echoes a JSON object with `text`, `text_sha256`, `text_bytes`. When the
+  # threshold is unset or the text fits, `text` is the verbatim payload
+  # and the hash/bytes fields are null.
+  local name="$1" text="$2"
+  local threshold
+  threshold="$(transcript_truncate_threshold "$name")"
+  local bytes=${#text}
+  if [[ -n "$threshold" ]] && (( threshold > 0 )) && (( bytes > threshold )); then
+    local sha
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha="$(printf '%s' "$text" | sha256sum | awk '{print $1}')"
+    else
+      sha="$(printf '%s' "$text" | shasum -a 256 | awk '{print $1}')"
+    fi
+    "$JQ" -c -n --arg text "[truncated, original $bytes bytes]" \
+      --arg sha "$sha" --argjson bytes "$bytes" \
+      '{text: $text, text_sha256: $sha, text_bytes: $bytes}'
+  else
+    "$JQ" -c -n --arg text "$text" --argjson bytes "$bytes" \
+      '{text: $text, text_sha256: null, text_bytes: $bytes}'
+  fi
+}
+
 # --- status --json liveness helpers (issue #98) ----------------------------
 
 record_started_at() {
@@ -892,13 +933,30 @@ start_session() {
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
   local transcript_path=""
-  while [[ "${1:-}" == "--transcript" ]]; do
-    if (( $# < 2 )); then
-      echo "--transcript requires a value (absolute path)" >&2
-      exit 2
-    fi
-    transcript_path="$2"
-    shift 2
+  local transcript_truncate=""
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" ]]; do
+    case "$1" in
+      --transcript)
+        if (( $# < 2 )); then
+          echo "--transcript requires a value (absolute path)" >&2
+          exit 2
+        fi
+        transcript_path="$2"
+        shift 2
+        ;;
+      --transcript-text-truncate)
+        if (( $# < 2 )); then
+          echo "--transcript-text-truncate requires a positive integer" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--transcript-text-truncate must be a positive integer: $2" >&2
+          exit 2
+        fi
+        transcript_truncate="$2"
+        shift 2
+        ;;
+    esac
   done
 
   local requested_name="${1:-}"
@@ -907,7 +965,7 @@ start_session() {
   local initial_text="${*:-}"
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: claude-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> [initial text]" >&2
+    echo "Usage: claude-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
@@ -962,6 +1020,9 @@ start_session() {
   record_started_at "$name"
   if [[ -n "$transcript_path" ]]; then
     transcript_record_path "$name" "$transcript_path"
+    if [[ -n "$transcript_truncate" ]]; then
+      transcript_truncate_record "$name" "$transcript_truncate"
+    fi
   fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
@@ -1031,13 +1092,30 @@ resume_session() {
   set -- "${SENTINEL_PARSE_REMAINING[@]}"
 
   local transcript_path=""
-  while [[ "${1:-}" == "--transcript" ]]; do
-    if (( $# < 2 )); then
-      echo "--transcript requires a value (absolute path)" >&2
-      exit 2
-    fi
-    transcript_path="$2"
-    shift 2
+  local transcript_truncate=""
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--transcript-text-truncate" ]]; do
+    case "$1" in
+      --transcript)
+        if (( $# < 2 )); then
+          echo "--transcript requires a value (absolute path)" >&2
+          exit 2
+        fi
+        transcript_path="$2"
+        shift 2
+        ;;
+      --transcript-text-truncate)
+        if (( $# < 2 )); then
+          echo "--transcript-text-truncate requires a positive integer" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--transcript-text-truncate must be a positive integer: $2" >&2
+          exit 2
+        fi
+        transcript_truncate="$2"
+        shift 2
+        ;;
+    esac
   done
 
   local requested_name="${1:-}"
@@ -1045,7 +1123,7 @@ resume_session() {
   local claude_session_id="${3:-}"
 
   if [[ -z "$requested_name" || -z "$directory" || -z "$claude_session_id" ]]; then
-    echo "Usage: claude-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] <name> <directory> <session-id>" >&2
+    echo "Usage: claude-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>" >&2
     exit 2
   fi
 
@@ -1099,6 +1177,9 @@ resume_session() {
   record_started_at "$name"
   if [[ -n "$transcript_path" ]]; then
     transcript_record_path "$name" "$transcript_path"
+    if [[ -n "$transcript_truncate" ]]; then
+      transcript_truncate_record "$name" "$transcript_truncate"
+    fi
   fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
@@ -1253,11 +1334,17 @@ send_session() {
   local transcript_path
   transcript_path="$(transcript_path_for "$name")"
   if [[ -n "$transcript_path" ]]; then
-    local send_line
+    # #140: apply optional --transcript-text-truncate to keep long send
+    # payloads out of the transcript while preserving an integrity hash.
+    local text_obj send_line
+    text_obj="$(transcript_truncate_text "$name" "$prompt_text")"
     send_line="$("$JQ" -c -n \
-      --arg event send --arg name "$name" --arg text "$prompt_text" \
+      --argjson text_obj "$text_obj" \
+      --arg event send --arg name "$name" \
       --arg at "$(transcript_iso_now)" \
-      '{schema_version: 1, event: $event, name: $name, text: $text, at: $at}')"
+      '{schema_version: 1, event: $event, name: $name,
+        text: $text_obj.text, text_sha256: $text_obj.text_sha256,
+        text_bytes: $text_obj.text_bytes, at: $at}')"
     transcript_append "$transcript_path" "$send_line"
   fi
 
