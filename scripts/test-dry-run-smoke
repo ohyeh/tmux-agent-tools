@@ -1,0 +1,125 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #110 --dry-run pre-flight checks on `start`.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-dry-run-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+jq_val() { printf '%s' "$1" | jq -r "$2"; }
+
+run_ok_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-ok ($wrapper, all green)"
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run "$prefix-ok" "$WORK" 2>&1)" || code=$?
+  assert "$prefix-ok exit=0" "$code" "0"
+  assert "$prefix-ok ok=true" "$(jq_val "$out" .ok)" "true"
+  assert "$prefix-ok schema_version=1" "$(jq_val "$out" .schema_version)" "1"
+  assert "$prefix-ok workdir_exists=pass" "$(jq_val "$out" '.checks[] | select(.name=="workdir_exists") | .status')" "pass"
+  assert "$prefix-ok agent_cli_binary=pass" "$(jq_val "$out" '.checks[] | select(.name=="agent_cli_binary") | .status')" "pass"
+  assert "$prefix-ok tool field" "$(jq_val "$out" .tool)" "$(basename "$wrapper")"
+}
+
+run_bad_workdir() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-bad-dir ($wrapper, missing workdir)"
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run "$prefix-bad" /no/such/dir 2>&1)" || code=$?
+  assert "$prefix-bad-dir exit=2" "$code" "2"
+  assert "$prefix-bad-dir ok=false" "$(jq_val "$out" .ok)" "false"
+  assert "$prefix-bad-dir workdir_exists=fail" "$(jq_val "$out" '.checks[] | select(.name=="workdir_exists") | .status')" "fail"
+}
+
+run_preexisting_sentinel() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-stale-sentinel ($wrapper, pre-existing sentinel)"
+  touch "$WORK/$prefix-stale"
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --sentinel "$WORK/$prefix-stale" "$prefix-s" "$WORK" 2>&1)" || code=$?
+  assert "$prefix-stale exit=2" "$code" "2"
+  assert "$prefix-stale sentinel_path=fail" "$(jq_val "$out" '.checks[] | select(.name=="sentinel_path") | .status')" "fail"
+}
+
+run_on_exit_without_sentinel() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-orphan-on-exit ($wrapper, --on-exit without --sentinel)"
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --on-exit "echo done" "$prefix-x" "$WORK" 2>&1)" || code=$?
+  assert "$prefix-orphan exit=2" "$code" "2"
+  assert "$prefix-orphan on_exit_pairing=fail" "$(jq_val "$out" '.checks[] | select(.name=="on_exit_pairing") | .status')" "fail"
+}
+
+run_relative_transcript() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-relative-transcript ($wrapper, relative path rejected)"
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --transcript "relative.jsonl" "$prefix-r" "$WORK" 2>&1)" || code=$?
+  assert "$prefix-relative exit=2" "$code" "2"
+  assert "$prefix-relative transcript_path=fail" "$(jq_val "$out" '.checks[] | select(.name=="transcript_path") | .status')" "fail"
+}
+
+run_no_side_effects() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-no-side-effects ($wrapper, dry-run must not create session)"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run "$prefix-side" "$WORK" >/dev/null 2>&1
+  # If start_session actually ran, tmux would have created a real session.
+  # Probe tmux directly because `status` returns 0 even for stopped sessions.
+  local tmux_session
+  if [[ "$wrapper" == *codex-tmux ]]; then
+    tmux_session="codex-cli-$prefix-side"
+  else
+    tmux_session="claude-cli-$prefix-side"
+  fi
+  if tmux has-session -t "$tmux_session" 2>/dev/null; then
+    echo "  FAIL $prefix-no-side-effects: dry-run leaked tmux session $tmux_session" >&2
+    FAIL=$((FAIL + 1))
+    tmux kill-session -t "$tmux_session" 2>/dev/null || true
+  else
+    echo "  ok   $prefix-no-side-effects: no tmux session created"
+    PASS=$((PASS + 1))
+  fi
+}
+
+for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
+  IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
+  run_ok_case "$wrapper" "$env_var" "$prefix"
+  run_bad_workdir "$wrapper" "$env_var" "$prefix"
+  run_preexisting_sentinel "$wrapper" "$env_var" "$prefix"
+  run_on_exit_without_sentinel "$wrapper" "$env_var" "$prefix"
+  run_relative_transcript "$wrapper" "$env_var" "$prefix"
+  run_no_side_effects "$wrapper" "$env_var" "$prefix"
+done
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
