@@ -26,14 +26,20 @@ TARGETS=(
 TIED_NAMES='(path|cdpath|fignore|fpath|manpath|psvar)'
 PATTERN="(^|[[:space:]])(local|typeset)[[:space:]]+([[:alnum:]_]+[[:space:]]+)*${TIED_NAMES}="
 
-local violations=0
-local match
+# `local` is only legal inside zsh functions; use `typeset` at top level
+# (per gemini CRITICAL R-prio finding on PR #149).
+typeset -i violations=0
+typeset match
+# Resolve this script's own absolute path so the skip check is exact,
+# not a substring match (gemini MEDIUM finding on PR #149).
+typeset SELF
+SELF="$(cd "$(dirname "${(%):-%x}")" && pwd)/$(basename "${(%):-%x}")"
 for dir in "${TARGETS[@]}"; do
   [[ -d "$dir" ]] || continue
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
-    # Skip ourselves so this lint script can document the banned pattern.
-    [[ "$match" == *"lint-no-path-tied-locals"* ]] && continue
+    # Skip self by exact absolute-path match on the `path:line:...` prefix.
+    [[ "${match%%:*}" == "$SELF" ]] && continue
     printf '%s\n' "$match"
     violations=$((violations + 1))
   done < <(grep -REn -e "$PATTERN" "$dir" --include='*' 2>/dev/null || true)
