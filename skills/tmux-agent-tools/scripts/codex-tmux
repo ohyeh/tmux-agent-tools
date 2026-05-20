@@ -2742,6 +2742,7 @@ wait_literal_session() {
 }
 
 wait_and_capture_session() {
+  local pause_until_file=""
   # Combined wait + capture — the golden-path shortcut described in
   # issue #99. Replaces the two-step `wait-literal` / `capture` pair.
   # `--no-timeout-error` decouples soft-timeout opt-in from `--json`
@@ -2778,6 +2779,14 @@ wait_and_capture_session() {
       --json) output_json=1; shift ;;
       --no-timeout-error) no_timeout_error=1; shift ;;
       --) shift; break ;;
+      --pause-until-file)
+        if (( $# < 2 )); then
+          echo "--pause-until-file requires a path" >&2
+          exit 2
+        fi
+        pause_until_file="$2"
+        shift 2
+        ;;
       *) echo "Unknown wait-and-capture flag: $1" >&2; exit 2 ;;
     esac
   done
@@ -2874,6 +2883,17 @@ wait_and_capture_session() {
   local reason
   if (( matched )); then
     reason="matched"
+    if [[ -n "$pause_until_file" ]]; then
+      # #114 approval gate: after matching the marker, block until the
+      # operator writes the gate file. No daemon — synchronous poll.
+      while [[ ! -f "$pause_until_file" ]]; do
+        if (( SECONDS >= deadline )); then
+          reason="gate_timeout"
+          break
+        fi
+        /bin/sleep 1
+      done
+    fi
     transcript_emit_wait_event "$name" wait_and_capture matched "$marker" "$timeout_seconds"
   else
     reason="timeout"

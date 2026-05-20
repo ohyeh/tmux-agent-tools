@@ -1,0 +1,64 @@
+#!/usr/bin/env zsh
+# Smoke for L5 batch: #112 fanout, #113 dag, #114 approval gate.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FANOUT="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-fanout"
+DAG="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-dag"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# #112 fanout: dispatch + usage
+echo "case: #112 fanout argv validation"
+code=0
+"$FANOUT" >/dev/null 2>&1 || code=$?
+assert "fanout no --prompt-file exit=2" "$code" "2"
+
+code=0
+"$FANOUT" --prompt-file /no/such --workdir /tmp >/dev/null 2>&1 || code=$?
+assert "fanout missing prompt-file exit=1" "$code" "1"
+
+# Direct usage call
+out="$("$FANOUT" --help 2>&1)"
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2; FAIL=$((FAIL + 1))
+  fi
+}
+assert_contains "fanout usage mentions --workdir" "$out" "--workdir"
+
+# #113 dag: usage + manifest validation
+echo "case: #113 dag usage"
+out="$("$DAG" 2>&1)"
+assert_contains "dag usage mentions manifest" "$out" "manifest"
+
+code=0
+"$DAG" run /no/such.json >/dev/null 2>&1 || code=$?
+assert "dag missing manifest exit=2" "$code" "2"
+
+# #114 approval gate: --pause-until-file flag is recognized in
+# wait-and-capture; just check arg parsing.
+echo "case: #114 --pause-until-file flag recognized"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+code=0
+"$CODEX_TMUX" wait-and-capture --marker X --pause-until-file >/dev/null 2>&1 || code=$?
+assert "missing pause-until-file value exit=2" "$code" "2"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
