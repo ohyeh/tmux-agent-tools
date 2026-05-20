@@ -95,19 +95,80 @@ lock_around() {
     return $rc
   fi
 
-  # mkdir fallback
+  # mkdir fallback: PID-stamped, with stale-holder recovery (PR #131 review)
+  local lock_dir="$lock_file.d"
   local end=$(( EPOCHSECONDS + timeout ))
-  while ! mkdir "$lock_file.d" 2>/dev/null; do
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      # Holder is dead — reclaim. rmdir is atomic; concurrent waiters race
+      # but only one wins the next mkdir.
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    if [[ -z "$holder_pid" ]]; then
+      # Lock dir exists but PID not written yet (half-init). Brief wait, then
+      # treat as stale if still missing.
+      sleep 0.2
+      [[ -f "$lock_dir/pid" ]] || { rmdir "$lock_dir" 2>/dev/null || true; continue; }
+    fi
     [[ $EPOCHSECONDS -ge $end ]] && {
-      echo "lock contended on $agent_name after ${timeout}s" >&2
+      echo "lock contended on $agent_name after ${timeout}s (holder pid=$holder_pid)" >&2
       return 75
     }
     sleep 0.1
   done
-  trap "rmdir $lock_file.d" EXIT INT TERM
-  "$@"
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # Subshell-scope the trap so we do NOT clobber caller's process-wide trap.
+  (
+    trap "rmdir '$lock_dir' 2>/dev/null || true" EXIT INT TERM
+    "$@"
+  )
 }
 ```
+
+### Stale lock recovery (added per PR #131 review)
+
+Partner critique caught a real bug in the original mkdir fallback: on
+`kill -9`, OOM, or machine reboot the `lock_file.d` directory survived,
+the `trap` never fired, and every subsequent call hit the 30-second
+timeout then exited 75. For a L1 mechanism that would brick the wrapper.
+
+The fix above borrows `flock`'s semantic (process-death-implies-released)
+by stamping the holder PID into the lock dir and probing with `kill -0`:
+
+| State of lock dir | Holder PID file | `kill -0 <pid>` | Decision |
+|---|---|---|---|
+| missing | n/a | n/a | acquire normally |
+| exists | matches a live process | success | wait (real contention) |
+| exists | refers to a dead PID | EPERM/ESRCH | reclaim (rmdir + retry) |
+| exists | no `pid` file (half-init) | n/a | brief wait then reclaim |
+
+This shifts the mkdir fallback from "broken under crash" to "best-effort
+stale-cleanup". The fallback's correctness still depends on PID reuse
+not happening within a single `lock-timeout` window — acceptable risk;
+`flock` remains the preferred path.
+
+### Subshell-scoped trap (also partner critique)
+
+Original sketch used `trap "rmdir $lock_file.d" EXIT INT TERM`, which is
+PROCESS-WIDE in zsh. Calling this inside `_send_session_impl` would
+overwrite any trap the caller already set. Fix: run the lock body in a
+subshell so the trap is scoped to the subshell only.
+
+### `doctor` integration
+
+`doctor` should report lock-holder state for owned sessions when running
+the mkdir fallback:
+
+```
+lock holder: codex-cli-w pid=8512 (alive)
+lock holder: codex-cli-x pid=7811 (dead — will reclaim on next op)
+```
+
+Same data also feeds a future `status --json` `lock_holder_pid` field if
+needed.
 
 Each entry point becomes:
 
@@ -137,12 +198,17 @@ send_session() {
 |---|---|
 | Single sender | identical to today |
 | Two parallel `send` calls | second waits, both complete in order |
-| Lock timeout reached | exit 75, stderr fixed message |
+| Lock timeout reached | exit 75, stderr fixed message including holder PID |
 | `--no-lock` | warning printed once, no lock taken |
 | `flock` missing | mkdir fallback used; same outcomes |
+| **Stale lock (added per partner critique)**: `mkdir lock.d && echo 99999 > lock.d/pid` then call `send` | next caller acquires lock within ~1s (reclaim path) |
+| **Crashed holder mid-operation**: `mkdir lock.d && echo $$ > lock.d/pid && sleep & kill -9 $!` | next caller reclaims within probe interval |
+| **Subshell trap scoping**: caller sets its own `trap` then invokes a locked subcommand | caller's trap remains intact after subcommand returns |
 
 Smoke test addition: extend `scripts/test-sentinel-smoke` or sibling
-runner with a "two parallel sends" case that confirms no interleaving.
+runner with the parallel-send AND stale-lock cases above. Without the
+stale-lock case, the regression that motivated the partner critique
+could re-enter the codebase undetected.
 
 ## Risk and trade-offs
 
