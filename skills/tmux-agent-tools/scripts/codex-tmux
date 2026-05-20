@@ -264,18 +264,33 @@ parse_sentinel_flags() {
   # next non-flag positional is seen, then publishes the remainder via the
   # SENTINEL_PARSE_REMAINING global. Caller does:
   #   parse_sentinel_flags "$@"; set -- "${SENTINEL_PARSE_REMAINING[@]}"
+  #
+  # `--sentinel` and `--on-exit` MUST take a value. If the value is missing
+  # the function exits explicitly rather than letting `shift 2` fail under
+  # `set -e` with a cryptic "shift count must be <= $#".
   SENTINEL_PARSE_REMAINING=()
   while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--sentinel-keep" ]]; do
     case "$1" in
       --sentinel)
-        sentinel="${2:-}"
+        if (( $# < 2 )); then
+          echo "--sentinel requires a value (absolute path)" >&2
+          exit 2
+        fi
+        sentinel="$2"
         shift 2
         ;;
       --on-exit)
-        on_exit_cmd="${2:-}"
+        if (( $# < 2 )); then
+          echo "--on-exit requires a value (shell command)" >&2
+          exit 2
+        fi
+        on_exit_cmd="$2"
         shift 2
         ;;
       --sentinel-keep)
+        # Placeholder: future stop_session work will use this flag to keep
+        # the sentinel file across an explicit stop. Nothing reads it yet;
+        # tracked alongside the #95 design doc cleanup semantics.
         sentinel_keep=1
         shift
         ;;
@@ -320,6 +335,17 @@ sentinel_inline_block() {
   #   1. atomically writes the exit code to $TMUX_AGENT_TOOLS_SENTINEL
   #   2. runs the --on-exit hook with ON_EXIT_CODE / ON_EXIT_NAME exported,
   #      only when BOTH the sentinel path and the hook command are set.
+  #
+  # Escape gymnastics (DO NOT touch without re-running scripts/test-sentinel-smoke):
+  #   - Outer printf is SINGLE-QUOTED so the wrapper shell does NOT expand
+  #     $TMUX_AGENT_TOOLS_SENTINEL / $code etc. — those are for the pane shell.
+  #   - '\''...'\'' = end-quote + literal `'` + start-quote, used to embed the
+  #     inner `printf '%s\n'`.
+  #   - %%s\\n = printf format that emits literal `%s\n` (two chars: percent-s
+  #     and backslash-n). NOT a real newline; the tmux pane shell re-processes
+  #     the `\n` when running the inner printf.
+  #   - The last `%s` is the only real format spec, filled with the
+  #     shell_quoted agent name so dangerous names cannot break out.
   local agent_name="$1"
   printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
 }
