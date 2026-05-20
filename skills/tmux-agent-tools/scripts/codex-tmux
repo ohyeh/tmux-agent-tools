@@ -770,7 +770,7 @@ record_started_at() {
   local name="$1"
   local subdir
   subdir="$(ensure_agent_dir "$name")"
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$subdir/started_at"
+  ( date -u +%Y-%m-%dT%H:%M:%SZ > "$subdir/started_at" ) 2>/dev/null || true
 }
 
 read_started_at() {
@@ -791,10 +791,12 @@ marker_seen_add() {
   if [[ -f "$file" ]] && grep -Fxq "$needle" "$file" 2>/dev/null; then
     return 0
   fi
-  printf '%s\n' "$needle" >> "$file"
-  # FIFO cap at 100
+  ( printf '%s\n' "$needle" >> "$file" ) 2>/dev/null || true
+  # FIFO cap at 100. Both ops best-effort: a failed cap is operationally
+  # cheap to retry on next marker, and propagating the failure would make
+  # status --json look broken (issue #144).
   if [[ -f "$file" ]] && (( $(wc -l < "$file") > 100 )); then
-    tail -n 100 "$file" > "$file.tmp" && mv -f "$file.tmp" "$file"
+    ( tail -n 100 "$file" > "$file.tmp" && mv -f "$file.tmp" "$file" ) 2>/dev/null || true
   fi
 }
 
@@ -835,8 +837,13 @@ update_pane_hash() {
     stored_at="$(awk '{print $2}' "$hash_file")"
   fi
   if [[ "$new_hash" != "$stored_hash" ]]; then
-    printf '%s %s\n' "$new_hash" "$now_iso" > "$hash_file"
-    stored_at="$now_iso"
+    # #144: degrade silently — status --json must remain readable even
+    # if the hash file cannot be written.
+    # Subshell isolates the shell's own redirect-open error, which
+    # `2>/dev/null` on the printf line alone does NOT catch in zsh.
+    if ( printf '%s %s\n' "$new_hash" "$now_iso" > "$hash_file" ) 2>/dev/null; then
+      stored_at="$now_iso"
+    fi
   fi
   printf '%s' "$stored_at"
 }
