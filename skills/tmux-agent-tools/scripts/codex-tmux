@@ -875,6 +875,72 @@ ensure_agent_dir() {
   printf '%s' "$dir"
 }
 
+# --- Managed fresh worktree (issue #187) ----------------------------------
+setup_fresh_worktree() {
+  local agent_name="$1" tool="$2" source_repo="$3"
+  local sanitized="${agent_name//[^A-Za-z0-9._-]/_}"
+  local uuid
+  uuid="$(LC_ALL=C /usr/bin/od -An -N4 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+  local branch="tmux-agent/${sanitized}-${uuid}"
+  local root="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/worktrees"
+  mkdir -p "$root"
+  local wt_path="$root/${sanitized}-${uuid}"
+  local base_ref
+  base_ref="$( cd "$source_repo" && git rev-parse --abbrev-ref HEAD 2>/dev/null )"
+  if [[ -z "$base_ref" || "$base_ref" == "HEAD" ]]; then
+    base_ref="$( cd "$source_repo" && git rev-parse --short HEAD 2>/dev/null )"
+  fi
+  if ! ( cd "$source_repo" && git worktree add -b "$branch" "$wt_path" >/dev/null 2>&1 ); then
+    echo "git worktree add failed" >&2
+    return 1
+  fi
+  local policy="${TMUX_AGENT_WORKTREE_POLICY:-no-change-cleanup}"
+  case "$policy" in
+    no-change-cleanup|has-change-keep|always-keep) ;;
+    *) policy="no-change-cleanup" ;;
+  esac
+  local created_at
+  created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local meta_dir="$wt_path/.tmux-agent-worktree"
+  mkdir -p "$meta_dir"
+  local exclude_dir
+  exclude_dir="$( cd "$wt_path" && git rev-parse --git-path info 2>/dev/null )"
+  if [[ -n "$exclude_dir" ]]; then
+    ( cd "$wt_path" && mkdir -p "$exclude_dir" && \
+      printf '%s\n' '/.tmux-agent-worktree/' >> "$exclude_dir/exclude" ) 2>/dev/null || true
+  fi
+  local abs_repo
+  abs_repo="$(cd "$source_repo" && pwd)"
+  "$JQ" -n \
+    --argjson schema_version 1 \
+    --arg source_repo "$abs_repo" \
+    --arg base_ref "$base_ref" \
+    --arg agent_name "$agent_name" \
+    --arg tool "$tool" \
+    --arg created_at "$created_at" \
+    --arg wt_path "$wt_path" \
+    --arg branch "$branch" \
+    --arg cleanup_policy "$policy" \
+    '{schema_version:$schema_version, source_repo:$source_repo, base_ref:$base_ref,
+      agent_name:$agent_name, tool:$tool, created_at:$created_at, path:$wt_path,
+      branch:$branch, cleanup_policy:$cleanup_policy}' > "$meta_dir/meta.json"
+  ensure_agent_dir "$agent_name" >/dev/null
+  local agent_dir
+  agent_dir="$(agent_root_dir)/$agent_name"
+  ( printf '%s\n' "$wt_path" > "$agent_dir/fresh-worktree" ) 2>/dev/null || true
+  "$JQ" -n \
+    --argjson schema_version 1 \
+    --arg wt_path "$wt_path" \
+    --arg branch "$branch" \
+    --arg source_repo "$abs_repo" \
+    --arg cleanup_policy "$policy" \
+    '{schema_version:$schema_version, path:$wt_path, branch:$branch,
+      source_repo:$source_repo, cleanup_policy:$cleanup_policy}' \
+    > "$agent_dir/worktree.json" 2>/dev/null || true
+  echo "fresh worktree: $wt_path" >&2
+  printf '%s' "$wt_path"
+}
+
 # --- Advisory send lock (issue #102) --------------------------------------
 # Serialize concurrent pane-mutating calls (`send`, `send-wait-literal`) on
 # the same agent so two callers cannot interleave keystrokes into the same
@@ -1914,14 +1980,9 @@ start_session() {
       echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
       exit 1
     fi
-    local fresh_workdir="${TMPDIR:-/tmp}/tmux-agent-worktree-${name//[^A-Za-z0-9._-]/_}-$$"
-    if ! ( cd "$directory" && git worktree add "$fresh_workdir" >/dev/null 2>&1 ); then
-      echo "git worktree add failed" >&2
-      exit 1
-    fi
+    local fresh_workdir
+    fresh_workdir="$(setup_fresh_worktree "$name" "codex" "$directory")" || exit 1
     directory="$fresh_workdir"
-    ensure_agent_dir "$name" >/dev/null
-    ( printf '%s\n' "$fresh_workdir" > "$(agent_root_dir)/$name/fresh-worktree" ) 2>/dev/null || true
   fi
 
   local session="$(session_for_name "$name")"
@@ -2190,14 +2251,9 @@ resume_session() {
       echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
       exit 1
     fi
-    local fresh_workdir="${TMPDIR:-/tmp}/tmux-agent-worktree-${name//[^A-Za-z0-9._-]/_}-$$"
-    if ! ( cd "$directory" && git worktree add "$fresh_workdir" >/dev/null 2>&1 ); then
-      echo "git worktree add failed" >&2
-      exit 1
-    fi
+    local fresh_workdir
+    fresh_workdir="$(setup_fresh_worktree "$name" "codex" "$directory")" || exit 1
     directory="$fresh_workdir"
-    ensure_agent_dir "$name" >/dev/null
-    ( printf '%s\n' "$fresh_workdir" > "$(agent_root_dir)/$name/fresh-worktree" ) 2>/dev/null || true
   fi
 
   local session="$(session_for_name "$name")"
@@ -2311,14 +2367,9 @@ start_ssh_session() {
       echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
       exit 1
     fi
-    local fresh_workdir="${TMPDIR:-/tmp}/tmux-agent-worktree-${name//[^A-Za-z0-9._-]/_}-$$"
-    if ! ( cd "$directory" && git worktree add "$fresh_workdir" >/dev/null 2>&1 ); then
-      echo "git worktree add failed" >&2
-      exit 1
-    fi
+    local fresh_workdir
+    fresh_workdir="$(setup_fresh_worktree "$name" "codex" "$directory")" || exit 1
     directory="$fresh_workdir"
-    ensure_agent_dir "$name" >/dev/null
-    ( printf '%s\n' "$fresh_workdir" > "$(agent_root_dir)/$name/fresh-worktree" ) 2>/dev/null || true
   fi
 
   local session="$(session_for_name "$name")"
@@ -3128,6 +3179,17 @@ doctor_session() {
   echo "tmux_conf: $TMUX_CONF"
   echo "mouse: $TMUX_MOUSE"
   echo "clipboard: $(clipboard_description)"
+  if command -v git >/dev/null 2>&1; then
+    echo "git: $(command -v git)"
+    if git worktree --help >/dev/null 2>&1; then
+      echo "git worktree: ok"
+    else
+      echo "git worktree: not available"
+    fi
+  else
+    echo "git: not found"
+    echo "git worktree: not available (git missing)"
+  fi
 }
 
 self_test_session() {
