@@ -181,7 +181,67 @@ cmd_rotate() {
     esac
   done
   log="$(resolve_log "$log")"
-  audit_rotate_if_needed "$log" "$force"
+  if [[ -n "${TMUX_AGENT_AUDIT_NO_LOCK:-}" ]]; then
+    audit_rotate_if_needed "$log" "$force"
+  else
+    audit_lock_around "$log" 30 audit_rotate_if_needed "$log" "$force"
+  fi
+}
+
+# audit_lock_around — serialize rotate + chain-append on the same log file.
+# Lock file: <log>.lock. Uses flock(1) when available; mkdir fallback otherwise.
+# Returns 75 on timeout, otherwise the inner command's rc.
+# Without serialization two concurrent agents can race between size-check,
+# rename, and HEAD-link write — producing duplicate audit.rotation records or
+# a prev_chain_hash read off the wrong file, breaking verify.
+audit_lock_around() {
+  local log_path="$1" timeout_seconds="$2"
+  shift 2
+  local lock_file="$log_path.lock"
+  mkdir -p "$(dirname "$lock_file")" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    : > "$lock_file" 2>/dev/null || true
+    (
+      flock -w "$timeout_seconds" -x 9 || {
+        echo "$SELF: audit lock contended on $log_path after ${timeout_seconds}s" >&2
+        exit 75
+      }
+      "$@"
+    ) 9>"$lock_file"
+    return $?
+  fi
+  # mkdir fallback with PID-stamped stale-holder recovery.
+  # Run "$@" in the current shell (NOT a subshell) so the lock is reliably
+  # held across the critical section — wrapping in `( ... )` with an EXIT
+  # trap proved racy under stress (subshell EXIT trap can interleave with
+  # contending mkdir attempts and break serialization).
+  zmodload zsh/datetime 2>/dev/null || true
+  local lock_dir="$lock_file.d"
+  local now_epoch end
+  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  end=$(( now_epoch + timeout_seconds ))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if (( now_epoch >= end )); then
+      echo "$SELF: audit lock contended on $log_path after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
+      return 75
+    fi
+    sleep 0.05
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lock_dir' 2>/dev/null || true" INT TERM
+  "$@"
+  local rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  trap - INT TERM
+  return $rc
 }
 
 # Shared rotation routine (also invoked by wrappers via this script).

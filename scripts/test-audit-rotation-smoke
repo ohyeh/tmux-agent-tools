@@ -70,6 +70,51 @@ done
 assert "retain caps at 3" "$(test ! -f "$LOG.4" && echo yes)" "yes"
 assert ".1 exists post-loop" "$(test -f "$LOG.1" && echo yes)" "yes"
 
+# Concurrent appends + rotations must not break the chain (HIGH on PR #193).
+# Two appenders racing with a force-rotate triggered each iteration.
+CON_LOG="$WORK/concurrent.jsonl"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" CLAUDE="$WORK/fake.sh" \
+  "$CLAUDE_TMUX" start --exact con-seed "$WORK" >/dev/null
+sleep 1
+TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" "$CLAUDE_TMUX" stop con-seed >/dev/null 2>&1 || true
+
+unset TMUX_AGENT_TOOLS_AUDIT_RETAIN
+appender() {
+  local label="$1"
+  for i in 1 2 3 4 5 6; do
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" CLAUDE="$WORK/fake.sh" \
+      "$CLAUDE_TMUX" start --exact "con-$label-$i" "$WORK" >/dev/null 2>&1 || true
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" \
+      "$CLAUDE_TMUX" stop "con-$label-$i" >/dev/null 2>&1 || true
+  done
+}
+rotator() {
+  for _ in 1 2 3 4 5 6; do
+    TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$CON_LOG" --force >/dev/null 2>&1 || true
+  done
+}
+appender a &
+A=$!
+appender b &
+B=$!
+rotator &
+R=$!
+wait "$A" "$B" "$R"
+
+assert "concurrent: verify active log" \
+  "$("$AUDIT_BIN" verify --log "$CON_LOG" | jq -r .ok)" "true"
+# Every rotated-out file must also verify cleanly.
+con_bad=0
+for f in "$CON_LOG".*; do
+  [[ "$f" == "$CON_LOG.lock" || "$f" == "$CON_LOG.lock.d" ]] && continue
+  [[ -f "$f" ]] || continue
+  if [[ "$("$AUDIT_BIN" verify --log "$f" | jq -r .ok)" != "true" ]]; then
+    con_bad=$((con_bad+1))
+    echo "  concurrent: rotated file failed verify: $f" >&2
+  fi
+done
+assert "concurrent: rotated files clean" "$con_bad" "0"
+
 echo
 echo "summary: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
