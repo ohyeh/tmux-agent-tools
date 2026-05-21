@@ -246,8 +246,30 @@ for i in {1..$total}; do
 
   # Tell the wrapper where to write result.json (real wrapper honors
   # TMUX_AGENT_RESULT; fake wrapper honors the same env var).
+  # Capture wrapper exit code so an exec failure (missing binary, bad arg,
+  # dependency error) is surfaced immediately instead of being swallowed by
+  # `|| true` — which would cause the wait loop to hang for the full
+  # --timeout window waiting for a result.json that will never appear.
+  set +e
   TMUX_AGENT_RESULT="$per_result_path" \
-    "$wrapper" start --exact "$session_name" "$a_wd" "$prompt_text" >/dev/null 2>&1 || true
+    "$wrapper" start --exact "$session_name" "$a_wd" "$prompt_text" >/dev/null 2>&1
+  wrapper_rc=$?
+  set -e
+
+  if (( wrapper_rc != 0 )) && [[ ! -f "$per_result_path" ]]; then
+    # Wrapper exec failed before it could write result.json. Synthesize an
+    # error result.json so the collection loop sees it immediately and the
+    # agent is marked failed instead of timing out.
+    "$JQ" -n \
+      --argjson rc "$wrapper_rc" \
+      --arg name "$a_name" \
+      '{schema_version:1,
+        status:"error",
+        summary:"wrapper exec failed",
+        errors:[("wrapper exited rc=" + ($rc|tostring) + " before writing result.json for agent " + $name)]}' \
+      >"$per_result_path"
+    echo "tmux-agent-fanout: wrapper exec failed (rc=$wrapper_rc) for agent=$a_name" >&2
+  fi
 done
 
 # -------- Wait and collect --------
