@@ -162,25 +162,54 @@ for n in "${names[@]}"; do
   name_seen[$n]=1
 done
 
-# Build adjacency: deps[name]="dep1 dep2 ..." (space-separated)
+# Build adjacency. deps[name] is newline-delimited (safe for names with spaces).
+# rdeps[name] is newline-delimited list of tasks that depend on name (reverse edges)
+# for O(N+E) Kahn relaxation. Duplicate deps within a task are a validation error.
 typeset -A deps
+typeset -A rdeps
 typeset -A indeg
 typeset -A cmd_of
 typeset -A result_path_of
 
 for n in "${names[@]}"; do
   deps[$n]=""
+  rdeps[$n]=""
   indeg[$n]=0
 done
 
-# depends_on (or legacy 'after')
-for n in "${names[@]}"; do
-  local_deps="$("$JQ" -r --arg n "$n" '
-    .tasks[] | select(.name==$n) | (.depends_on // .after // []) | .[]
-  ' "$manifest")"
-  cmd_of[$n]="$("$JQ" -r --arg n "$n" '.tasks[] | select(.name==$n) | (.command // "")' "$manifest")"
-  result_path_of[$n]="$("$JQ" -r --arg n "$n" '.tasks[] | select(.name==$n) | (.result_path // "")' "$manifest")"
-  while IFS= read -r d; do
+# Single jq pass: emit per-task records using ASCII Unit Separator (US, 0x1f)
+# between fields and Record Separator (RS, 0x1e) between tasks. These bytes
+# never appear unescaped inside JSON strings, so they preserve names/commands
+# that contain spaces or newlines verbatim — fixing the previous space-split
+# bug. Record layout: name<US>command<US>result_path<US>dep1<US>dep2<US>...
+# Records joined by <RS>.
+tasks_blob="$("$JQ" -j '
+  .tasks
+  | map([(.name // ""), (.command // ""), (.result_path // ""),
+         ((.depends_on // .after // []))]
+        | [.[0], "", .[1], "", .[2], "",
+           (.[3] | map(. + "") | join(""))] | join(""))
+  | join("")
+' "$manifest")"
+
+# Parse records.
+typeset -a _records
+_records=("${(@ps:\x1e:)tasks_blob}")
+for rec in "${_records[@]}"; do
+  [[ -z "$rec" ]] && continue
+  typeset -a _fields
+  _fields=("${(@ps:\x1f:)rec}")
+  # fields: 1=name 2=command 3=result_path 4..=deps (last may be empty)
+  n="${_fields[1]}"
+  cmd_of[$n]="${_fields[2]}"
+  result_path_of[$n]="${_fields[3]}"
+  # iterate fields 4..end; skip trailing empty
+  typeset -A _dep_seen
+  _dep_seen=()
+  local _i=4
+  while (( _i <= ${#_fields} )); do
+    d="${_fields[$_i]}"
+    _i=$(( _i + 1 ))
     [[ -z "$d" ]] && continue
     if [[ "$d" == "$n" ]]; then
       fail_validation "$manifest" "self-dependency: task '$n' depends on itself" "$summary_out"
@@ -188,12 +217,27 @@ for n in "${names[@]}"; do
     if [[ -z "${name_seen[$d]:-}" ]]; then
       fail_validation "$manifest" "missing dependency: task '$n' depends on unknown '$d'" "$summary_out"
     fi
-    deps[$n]="${deps[$n]} $d"
+    if [[ -n "${_dep_seen[$d]:-}" ]]; then
+      fail_validation "$manifest" "duplicate dependency in task '$n': '$d'" "$summary_out"
+    fi
+    _dep_seen[$d]=1
+    if [[ -z "${deps[$n]}" ]]; then
+      deps[$n]="$d"
+    else
+      deps[$n]="${deps[$n]}"$'\n'"$d"
+    fi
+    if [[ -z "${rdeps[$d]}" ]]; then
+      rdeps[$d]="$n"
+    else
+      rdeps[$d]="${rdeps[$d]}"$'\n'"$n"
+    fi
     indeg[$n]=$(( indeg[$n] + 1 ))
-  done <<< "$local_deps"
+  done
+  unset _dep_seen
 done
 
 # Kahn's algorithm: pick zero-indegree nodes in manifest order (stable).
+# O(N+E) using reverse-edge list for relaxation.
 typeset -a order
 order=()
 typeset -A removed
@@ -214,14 +258,10 @@ while :; do
   [[ -z "$picked" ]] && break
   order+=("$picked")
   removed[$picked]=1
-  # decrement indeg of every node that lists picked as a dep
-  for n in "${names[@]}"; do
-    [[ -n "${removed[$n]:-}" ]] && continue
-    for d in ${=deps[$n]}; do
-      if [[ "$d" == "$picked" ]]; then
-        cur_indeg[$n]=$(( cur_indeg[$n] - 1 ))
-      fi
-    done
+  # decrement indeg of every node that lists picked as a dep (reverse edges).
+  for m in "${(@f)rdeps[$picked]}"; do
+    [[ -z "$m" ]] && continue
+    cur_indeg[$m]=$(( cur_indeg[$m] - 1 ))
   done
 done
 
@@ -241,7 +281,8 @@ if (( ${#order[@]} != ${#names[@]} )); then
     cycle_path+=("$cur")
     on_path[$cur]=${#cycle_path[@]}
     next=""
-    for d in ${=deps[$cur]}; do
+    for d in "${(@f)deps[$cur]}"; do
+      [[ -z "$d" ]] && continue
       if [[ -z "${removed[$d]:-}" ]]; then
         next="$d"
         break
@@ -304,7 +345,9 @@ run_task() {
 # Precompute: does any dep have a non-ok status?
 dep_blocked() {
   local name="$1"
-  for d in ${=deps[$name]}; do
+  local d
+  for d in "${(@f)deps[$name]}"; do
+    [[ -z "$d" ]] && continue
     if [[ "${task_status[$d]:-}" != "ok" ]]; then
       return 0
     fi
