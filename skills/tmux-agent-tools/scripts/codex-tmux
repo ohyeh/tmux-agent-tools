@@ -2906,7 +2906,7 @@ wait_and_capture_session() {
     echo "Invalid --tail: $tail_lines" >&2
     exit 2
   fi
-  if [[ ! "$pause_timeout" =~ '^[0-9]+$' ]]; then
+  if [[ ! "$pause_timeout" =~ ^[0-9]+$ ]]; then
     echo "Invalid --pause-timeout: $pause_timeout" >&2
     exit 2
   fi
