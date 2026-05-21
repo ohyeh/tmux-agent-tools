@@ -90,6 +90,21 @@ codex-tmux stop worker
 
 Use `wait-text --literal` or `wait-literal` when the expected text contains regex metacharacters such as `[`, `]`, `(`, `)`, `.`, `*`, or `?`. Use regex `wait-text` only when regex matching is intentional.
 
+For a human-in-the-loop approval gate, pause `wait-and-capture` until an
+operator writes a decision file (issue #185):
+
+```bash
+marker=/tmp/agent-7/approve.txt
+codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
+  --pause-until-file "$marker" --pause-timeout 1800 worker
+# Operator (another shell): echo approve > "$marker"  → exit 0
+#                           echo reject  > "$marker"  → exit 7
+# --pause-timeout fires     →                            exit 8
+```
+
+While blocked, `$TMUX_AGENT_DIR/<name>/approval-status.json` shows
+`state: "awaiting_approval"`. See `docs/design-issue-185-approval-gate.md`.
+
 `status --json` is the stable automation contract for both wrappers. Expect the shared fields `tool`, `name`, `session`, `prefix`, `exists`, `running`, `exit_detected`, `local_or_remote`, and `diagnostic`. Treat `local_or_remote` and `diagnostic` as best-effort diagnostics; the other fields are stable. `running` is false when the pane shows the wrapper's local or remote exit-code marker even if the tmux session still exists for capture.
 
 5. For bounded two-agent dialogue, write a prompt file and transcript path:
