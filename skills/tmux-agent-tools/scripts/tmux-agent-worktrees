@@ -13,7 +13,9 @@
 set -euo pipefail
 
 JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
-TMUX="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
+# Use TMUX_BIN, not TMUX — TMUX is the tmux client socket env var; shadowing it
+# breaks tmux server targeting (HIGH finding on PR #194).
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
 GIT="${GIT:-$(command -v git 2>/dev/null || true)}"
 
 if [[ -z "$JQ" ]]; then
@@ -58,19 +60,20 @@ is_dirty() {
 session_alive() {
   # Best-effort: check if any tmux session name contains the agent name.
   local agent="$1"
-  [[ -n "$TMUX" ]] || return 1
+  [[ -n "$TMUX_BIN" ]] || return 1
   local sessions
-  sessions="$($TMUX ls -F '#S' 2>/dev/null)" || return 1
+  sessions="$("$TMUX_BIN" ls -F '#S' 2>/dev/null)" || return 1
   [[ "$sessions" == *"$agent"* ]]
 }
 
 augment_meta() {
   # Stdin: meta.json. Stdout: meta + dirty + session.
   local meta_path="$1"
-  local path agent dirty alive
-  path="$("$JQ" -r '.path' "$meta_path")"
+  # NB: `local path=` would clobber $PATH in zsh (tied pair). Use wt_path.
+  local wt_path agent dirty alive
+  wt_path="$("$JQ" -r '.path' "$meta_path")"
   agent="$("$JQ" -r '.agent_name' "$meta_path")"
-  dirty="$(is_dirty "$path")"
+  dirty="$(is_dirty "$wt_path")"
   if session_alive "$agent"; then alive="alive"; else alive="dead"; fi
   "$JQ" --arg dirty "$dirty" --arg session "$alive" \
     '. + {dirty:$dirty, session:$session}' "$meta_path"

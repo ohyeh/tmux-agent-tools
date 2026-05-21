@@ -117,6 +117,33 @@ sleep 1
 assert "wt-c kept because always-keep" \
   "$(test -d "$wt_path_c" && echo yes)" "yes"
 
+# --- Case 7: $PATH survives augment_meta (zsh tied-pair regression) ---------
+echo "case: \$PATH intact after augment_meta (regression for PR #194 CRITICAL)"
+path_check_out="$(
+  PATH_BEFORE="$PATH" zsh -c '
+    set -e
+    # Re-create a meta.json fixture to feed augment_meta.
+    fixture_dir="'"$WORK"'/path-check"
+    mkdir -p "$fixture_dir/.tmux-agent-worktree"
+    cat >"$fixture_dir/.tmux-agent-worktree/meta.json" <<JSON
+{"schema_version":1,"path":"'"$WORK"'/path-check","agent_name":"path-check","tool":"claude","cleanup_policy":"always-keep","branch":"x","source_repo":"'"$SRC"'"}
+JSON
+    # Source the script as a library by sentinel-stripping `main "$@"`.
+    cli="'"$WT_CLI"'"
+    tmp_lib="'"$WORK"'/wt_lib.zsh"
+    grep -v "^main \"\$@\"$" "$cli" > "$tmp_lib"
+    source "$tmp_lib"
+    augment_meta "$fixture_dir/.tmux-agent-worktree/meta.json" >/dev/null
+    # If PATH was clobbered, /usr/bin lookup would fail.
+    if [[ "$PATH" == "$PATH_BEFORE" && "$PATH" == *"/usr/bin"* ]]; then
+      print -r -- "intact"
+    else
+      print -r -- "clobbered:$PATH"
+    fi
+  '
+)"
+assert "PATH intact after augment_meta" "$path_check_out" "intact"
+
 # Cleanup remaining managed worktrees.
 "$WT_CLI" prune --force >/dev/null 2>&1 || true
 
