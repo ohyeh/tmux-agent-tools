@@ -1583,8 +1583,9 @@ secret_uri_backend() {
   esac
 }
 
-# Per-agent redact list path. Stores one secret value per line so that
-# transcript/capture surfaces can filter it out before display. Mode 0600.
+# Per-agent redact list path. Stores `KEY\tBASE64(VALUE)\n` per line so that
+# multi-line/binary/regex-meta secret values survive on-disk round-trip
+# safely. Mode 0600.
 secret_redact_list_path() {
   local nm="$1"
   local sub
@@ -1592,39 +1593,69 @@ secret_redact_list_path() {
   echo "$sub/secrets-redact.list"
 }
 
+# Base64-encode without line wrapping (portable across BSD/GNU).
+secret_b64enc() {
+  if base64 --help 2>&1 | grep -q -- '-w'; then
+    printf '%s' "$1" | base64 -w0
+  else
+    # BSD base64 emits a single line by default but may add trailing
+    # newline; strip whitespace defensively.
+    printf '%s' "$1" | base64 | tr -d '\n\r '
+  fi
+}
+secret_b64dec() {
+  if base64 --help 2>&1 | grep -q -- '-d'; then
+    printf '%s' "$1" | base64 -d 2>/dev/null
+  else
+    printf '%s' "$1" | base64 -D 2>/dev/null
+  fi
+}
+
 # Register a (key,value) pair into the in-memory and on-disk redact set.
-# `__secret_redact_pairs` is a global parallel array of "KEY\tVALUE" entries.
+# `__secret_redact_pairs` is a global parallel array of "KEY\tBASE64" entries
+# (base64 keeps newlines/tabs/NUL/regex-meta intact on disk and in arrays).
 secret_redact_register() {
   local nm="$1" skey="$2" sval="$3"
   [[ -z "$sval" ]] && return 0
-  __secret_redact_pairs+=("${skey}"$'\t'"${sval}")
+  local enc
+  enc="$(secret_b64enc "$sval")"
+  __secret_redact_pairs+=("${skey}"$'\t'"${enc}")
   local lp
   lp="$(secret_redact_list_path "$nm")"
-  ( umask 077; printf '%s\t%s\n' "$skey" "$sval" >> "$lp" ) 2>/dev/null || true
+  ( umask 077; printf '%s\t%s\n' "$skey" "$enc" >> "$lp" ) 2>/dev/null || true
 }
 
 # Filter a text blob, substituting each registered secret value with
-# `[REDACTED:KEYNAME]`. Honors --secret-redact=false bypass.
+# `[REDACTED:KEYNAME]`. Multi-line safe: awk reads whole input as one
+# record (RS="\0") and uses literal index(); the secret may itself
+# contain newlines, regex metacharacters, or other binary bytes.
+# Honors --secret-redact=false bypass.
 secret_redact_apply() {
   local text="$1"
   [[ "${SECRET_REDACT_DISABLE:-0}" == "1" ]] && { printf '%s' "$text"; return 0; }
-  local pair skey sval
+  local pair skey sval_enc sval
   for pair in "${__secret_redact_pairs[@]:-}"; do
     [[ -z "$pair" ]] && continue
     skey="${pair%%$'\t'*}"
-    sval="${pair#*$'\t'}"
+    sval_enc="${pair#*$'\t'}"
+    sval="$(secret_b64dec "$sval_enc")"
     [[ -z "$sval" ]] && continue
-    # Replace literal value globally. Bash/zsh ${var//pat/repl} treats
-    # `pat` literally except for glob metachars; sval may contain them.
-    # Escape sval for safe substitution via awk fallback.
+    # Trim trailing newlines on the *match* value: stored secrets from
+    # files frequently end in \n which won't appear in captured panes.
+    # The full value (with newline) is still injected into the agent env.
+    while [[ "$sval" == *$'\n' || "$sval" == *$'\r' ]]; do
+      sval="${sval%[$'\n\r']}"
+    done
+    [[ -z "$sval" ]] && continue
     text="$(printf '%s' "$text" | awk -v s="$sval" -v r="[REDACTED:${skey}]" '
-      BEGIN { n=length(s) }
-      { line=$0; out=""; while ((i=index(line,s))>0) { out=out substr(line,1,i-1) r; line=substr(line,i+n) } print out line }')"
+      BEGIN { RS="\0"; ORS=""; n=length(s) }
+      { out=""; while ((i=index($0,s))>0) { out=out substr($0,1,i-1) r; $0=substr($0,i+n) } print out $0 }')"
   done
   printf '%s' "$text"
 }
 
 # Load redact list from disk into `__secret_redact_pairs` (called by capture).
+# Lines are `KEY\tBASE64`; preserved as-is so secret_redact_apply decodes once.
 secret_redact_load_for() {
   local nm="$1"
   local lp
@@ -1633,6 +1664,8 @@ secret_redact_load_for() {
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
+    # Skip malformed entries lacking the KEY\tB64 separator.
+    [[ "$line" != *$'\t'* ]] && continue
     __secret_redact_pairs+=("$line")
   done < "$lp"
 }
