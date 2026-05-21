@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Smoke for #188 tmux-agent-audit query subcommand.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AUDIT_BIN="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-audit"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-audit-query.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+export TMUX_AGENT_DIR="$WORK/state"
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS+1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2; FAIL=$((FAIL+1))
+  fi
+}
+
+LOG="$WORK/audit.jsonl"
+
+# Produce events from both wrappers, in two tenants.
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG"
+TMUX_AGENT_TOOLS_TENANT=alpha CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact q-claude-a "$WORK" >/dev/null
+TMUX_AGENT_TOOLS_TENANT=beta  CODEX="$WORK/fake.sh"  "$CODEX_TMUX"  start --exact q-codex-b  "$WORK" >/dev/null
+sleep 1
+"$CLAUDE_TMUX" stop q-claude-a >/dev/null 2>&1 || true
+"$CODEX_TMUX"  stop q-codex-b  >/dev/null 2>&1 || true
+
+assert "log was written" "$(test -s "$LOG" && echo yes)" "yes"
+
+# Filter by tool
+assert "filter tool=claude" \
+  "$("$AUDIT_BIN" query --log "$LOG" --tool claude | jq -r 'select(.tool!="claude") | .event' | wc -l | tr -d ' ')" "0"
+assert "filter tool=codex"  \
+  "$("$AUDIT_BIN" query --log "$LOG" --tool codex  | jq -r 'select(.tool!="codex")  | .event' | wc -l | tr -d ' ')" "0"
+
+# Filter by tenant
+assert "filter tenant=alpha" \
+  "$("$AUDIT_BIN" query --log "$LOG" --tenant alpha | jq -r 'select(.tenant!="alpha") | .event' | wc -l | tr -d ' ')" "0"
+
+# Filter by agent
+assert "filter agent" \
+  "$("$AUDIT_BIN" query --log "$LOG" --agent q-claude-a | jq -r 'select(.name!="q-claude-a") | .event' | wc -l | tr -d ' ')" "0"
+
+# Filter by event
+assert "filter event=wrapper.start nonzero" \
+  "$("$AUDIT_BIN" query --log "$LOG" --event wrapper.start | wc -l | tr -d ' ' | { read n; [[ $n -gt 0 ]] && echo yes || echo no; })" "yes"
+
+# since/until: pick a time before everything → returns >=1 record
+PAST="1970-01-01T00:00:00Z"
+FUTURE="9999-12-31T23:59:59Z"
+assert "since=PAST returns all" \
+  "$("$AUDIT_BIN" query --log "$LOG" --since "$PAST" | wc -l | tr -d ' ' | { read n; [[ $n -gt 0 ]] && echo yes || echo no; })" "yes"
+assert "until=PAST returns none" \
+  "$("$AUDIT_BIN" query --log "$LOG" --until "$PAST" | wc -l | tr -d ' ')" "0"
+assert "since=FUTURE returns none" \
+  "$("$AUDIT_BIN" query --log "$LOG" --since "$FUTURE" | wc -l | tr -d ' ')" "0"
+
+# Default-path resolution: with $TMUX_AGENT_TOOLS_AUDIT_LOG set, path should match.
+unset TMUX_AGENT_TOOLS_AUDIT_LOG
+expected="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl"
+assert "default path" "$("$AUDIT_BIN" path)" "$expected"
+
+# No secret values in output: there should be no .secret_value field anywhere.
+assert "no secret_value leaks" \
+  "$("$AUDIT_BIN" query --log "$LOG" | jq -r 'select(has("secret_value")) | .event' | wc -l | tr -d ' ')" "0"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

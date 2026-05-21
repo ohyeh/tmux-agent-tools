@@ -1395,14 +1395,71 @@ audit_log_chain_key() {
   fi
 }
 
-audit_log_append() {
-  # Append a single JSONL event to TMUX_AGENT_TOOLS_AUDIT_LOG (#119).
-  # Chains via SHA-256 of (prev_hash || line). No-op when env unset.
-  # Synchronous; never blocks long since it's append-only file IO.
-  local event_json="$1"
-  local audit_target="${TMUX_AGENT_TOOLS_AUDIT_LOG:-}"
-  [[ -z "$audit_target" ]] && return 0
-  require_jq
+audit_log_lock_around() {
+  # Serialize concurrent audit_log_append + rotate on the same log file.
+  # Without this, two agents can race between size-check, mv, and the
+  # tail-1 prev_hash read — yielding duplicate audit.rotation records or
+  # a prev_chain_hash sourced from the rotated-out file, breaking verify.
+  local log_path="$1" timeout_seconds="${2:-30}"
+  shift 2
+  local lock_file="$log_path.lock"
+  mkdir -p "$(dirname "$lock_file")" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    : > "$lock_file" 2>/dev/null || true
+    (
+      flock -w "$timeout_seconds" -x 9 || exit 75
+      "$@"
+    ) 9>"$lock_file"
+    return $?
+  fi
+  zmodload zsh/datetime 2>/dev/null || true
+  local lock_dir="$lock_file.d"
+  local now_epoch end
+  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  end=$(( now_epoch + timeout_seconds ))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      rm -rf "$lock_dir" 2>/dev/null || true; continue
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    (( now_epoch >= end )) && return 75
+    sleep 0.05
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # Run "$@" in the current shell (NOT a subshell): wrapping in `( ... )`
+  # with an EXIT trap proved racy under stress.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lock_dir' 2>/dev/null || true" INT TERM
+  "$@"
+  local rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  trap - INT TERM
+  return $rc
+}
+
+_audit_log_append_locked() {
+  local event_json="$1" audit_target="$2"
+  if [[ -f "$audit_target" ]]; then
+    local _max="${TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES:-10485760}"
+    local _sz
+    if stat -f%z "$audit_target" >/dev/null 2>&1; then
+      _sz="$(stat -f%z "$audit_target")"
+    else
+      _sz="$(stat -c%s "$audit_target" 2>/dev/null || echo 0)"
+    fi
+    if (( _sz >= _max )); then
+      local _tool_dir _audit_bin
+      _tool_dir="$(dirname "$SELF")"
+      _audit_bin="$_tool_dir/tmux-agent-audit"
+      # Already inside the lock — invoke the rotate routine in-process
+      # via TMUX_AGENT_AUDIT_NO_LOCK so it does not re-acquire.
+      if [[ -x "$_audit_bin" ]]; then
+        TMUX_AGENT_AUDIT_NO_LOCK=1 "$_audit_bin" rotate --log "$audit_target" --force >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
   local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
   if [[ -f "$audit_target" ]]; then
     prev_hash="$(tail -1 "$audit_target" 2>/dev/null | "$JQ" -r .chain_hash 2>/dev/null || echo "$prev_hash")"
@@ -1412,8 +1469,11 @@ audit_log_append() {
   chain_key="$(audit_log_chain_key)"
   local with_meta
   with_meta="$("$JQ" -c -n --argjson e "$event_json" --arg pv "$prev_hash" \
-    --arg at "$(transcript_iso_now)" \
-    '$e + {prev_chain_hash: $pv, at: $at, schema_version: 1}')"
+    --arg at "$(transcript_iso_now)" --arg tenant "${TMUX_AGENT_TOOLS_TENANT:-}" \
+    '$e
+     | .event = (if (.event|tostring|contains(".")) then .event else "wrapper." + (.event|tostring) end)
+     | . + {prev_chain_hash: $pv, at: $at, schema_version: 1}
+     | (if $tenant != "" then . + {tenant: $tenant} else . end)')"
   local sha_cmd
   if command -v sha256sum >/dev/null 2>&1; then
     sha_cmd="sha256sum"
@@ -1426,6 +1486,18 @@ audit_log_append() {
   final_line="$("$JQ" -c -n --argjson e "$with_meta" --arg h "$new_hash" \
     '$e + {chain_hash: $h}')"
   ( printf '%s\n' "$final_line" >> "$audit_target" ) 2>/dev/null || true
+}
+
+audit_log_append() {
+  # Append a single JSONL event to TMUX_AGENT_TOOLS_AUDIT_LOG (#119, #188).
+  # Chains via SHA-256 of (prev_hash || line). No-op when env unset.
+  # Holds an advisory lock on <log>.lock around size-check + rotate +
+  # prev_hash read + append so concurrent agents cannot break the chain.
+  local event_json="$1"
+  local audit_target="${TMUX_AGENT_TOOLS_AUDIT_LOG:-}"
+  [[ -z "$audit_target" ]] && return 0
+  require_jq
+  audit_log_lock_around "$audit_target" 30 _audit_log_append_locked "$event_json" "$audit_target"
 }
 
 audit_log_verify() {
@@ -3561,6 +3633,43 @@ stop_session() {
 # its helpers without executing the dispatcher.
 if [[ -n "${TMUX_AGENT_TOOLS_SOURCE_ONLY:-}" ]]; then
   return 0 2>/dev/null || exit 0
+fi
+
+_resolve_audit_default_path() {
+  # #188: default log when AUDIT_LOG=1 or --audit-log used without path.
+  local base="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools"
+  printf '%s/audit.jsonl\n' "$base"
+}
+
+# Global --audit-log handling (#188). Accepts:
+#   --audit-log <path>   → export TMUX_AGENT_TOOLS_AUDIT_LOG
+#   --audit-log          → default path
+# Env AUDIT_LOG=1 also enables default path (lower precedence than env-set
+# TMUX_AGENT_TOOLS_AUDIT_LOG, higher than nothing).
+_global_args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --audit-log)
+      if [[ -n "${2:-}" && "$2" != --* ]]; then
+        export TMUX_AGENT_TOOLS_AUDIT_LOG="$2"
+        shift 2
+      else
+        export TMUX_AGENT_TOOLS_AUDIT_LOG="$(_resolve_audit_default_path)"
+        shift
+      fi
+      ;;
+    --) shift; break;;
+    *) _global_args+=("$1"); shift;;
+  esac
+done
+if (( ${#_global_args[@]} > 0 )); then
+  set -- "${_global_args[@]}" "$@"
+fi
+if [[ -z "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" && "${AUDIT_LOG:-}" == "1" ]]; then
+  export TMUX_AGENT_TOOLS_AUDIT_LOG="$(_resolve_audit_default_path)"
+fi
+if [[ -n "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" ]]; then
+  mkdir -p "$(dirname "$TMUX_AGENT_TOOLS_AUDIT_LOG")" 2>/dev/null || true
 fi
 
 command="${1:-help}"

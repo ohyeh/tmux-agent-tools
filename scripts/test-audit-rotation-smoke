@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Smoke for #188 audit rotation + chain preservation.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AUDIT_BIN="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-audit"
+
+WORK="$(mktemp -d -t tmux-agent-audit-rot.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS+1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2; FAIL=$((FAIL+1))
+  fi
+}
+
+# Build a small valid chain by sourcing the wrapper's audit_log_append.
+# Simpler: call the wrapper via env to write a few events, then force-rotate.
+LOG="$WORK/audit.jsonl"
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG"
+export TMUX_AGENT_DIR="$WORK/state"
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact rot-a "$WORK" >/dev/null
+sleep 1
+"$CLAUDE_TMUX" stop rot-a >/dev/null 2>&1 || true
+
+assert "initial log nonempty" "$(test -s "$LOG" && echo yes)" "yes"
+lines_before="$(wc -l < "$LOG" | tr -d ' ')"
+assert "verify clean pre-rotate" "$("$AUDIT_BIN" verify --log "$LOG" | jq -r .ok)" "true"
+
+# Force-rotate with tiny threshold.
+TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$LOG" --force >/dev/null
+
+assert "rotated file exists" "$(test -f "$LOG.1" && echo yes)" "yes"
+assert "new log has HEAD-link" "$(head -1 "$LOG" | jq -r .event)" "audit.rotation"
+assert "HEAD-link prev matches old last hash" \
+  "$(head -1 "$LOG" | jq -r .prev_chain_hash)" \
+  "$(tail -1 "$LOG.1" | jq -r .chain_hash)"
+
+# Verify both files independently.
+assert "verify rotated-out file" "$("$AUDIT_BIN" verify --log "$LOG.1" | jq -r .ok)" "true"
+assert "verify new file"         "$("$AUDIT_BIN" verify --log "$LOG"   | jq -r .ok)" "true"
+
+# Append more via wrapper, then verify still clean.
+CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact rot-b "$WORK" >/dev/null
+sleep 1
+"$CLAUDE_TMUX" stop rot-b >/dev/null 2>&1 || true
+assert "verify after append" "$("$AUDIT_BIN" verify --log "$LOG" | jq -r .ok)" "true"
+
+# Retention: rotate several times and ensure cap.
+TMUX_AGENT_TOOLS_AUDIT_RETAIN=3
+export TMUX_AGENT_TOOLS_AUDIT_RETAIN
+for i in 1 2 3 4 5; do
+  CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact rot-loop-$i "$WORK" >/dev/null
+  sleep 1
+  "$CLAUDE_TMUX" stop rot-loop-$i >/dev/null 2>&1 || true
+  TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$LOG" --force >/dev/null
+done
+assert "retain caps at 3" "$(test ! -f "$LOG.4" && echo yes)" "yes"
+assert ".1 exists post-loop" "$(test -f "$LOG.1" && echo yes)" "yes"
+
+# Concurrent appends + rotations must not break the chain (HIGH on PR #193).
+# Two appenders racing with a force-rotate triggered each iteration.
+CON_LOG="$WORK/concurrent.jsonl"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" CLAUDE="$WORK/fake.sh" \
+  "$CLAUDE_TMUX" start --exact con-seed "$WORK" >/dev/null
+sleep 1
+TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" "$CLAUDE_TMUX" stop con-seed >/dev/null 2>&1 || true
+
+unset TMUX_AGENT_TOOLS_AUDIT_RETAIN
+appender() {
+  local label="$1"
+  for i in 1 2 3 4 5 6; do
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" CLAUDE="$WORK/fake.sh" \
+      "$CLAUDE_TMUX" start --exact "con-$label-$i" "$WORK" >/dev/null 2>&1 || true
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" \
+      "$CLAUDE_TMUX" stop "con-$label-$i" >/dev/null 2>&1 || true
+  done
+}
+rotator() {
+  for _ in 1 2 3 4 5 6; do
+    TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$CON_LOG" --force >/dev/null 2>&1 || true
+  done
+}
+appender a &
+A=$!
+appender b &
+B=$!
+rotator &
+R=$!
+wait "$A" "$B" "$R"
+
+assert "concurrent: verify active log" \
+  "$("$AUDIT_BIN" verify --log "$CON_LOG" | jq -r .ok)" "true"
+# Every rotated-out file must also verify cleanly.
+con_bad=0
+for f in "$CON_LOG".*; do
+  [[ "$f" == "$CON_LOG.lock" || "$f" == "$CON_LOG.lock.d" ]] && continue
+  [[ -f "$f" ]] || continue
+  if [[ "$("$AUDIT_BIN" verify --log "$f" | jq -r .ok)" != "true" ]]; then
+    con_bad=$((con_bad+1))
+    echo "  concurrent: rotated file failed verify: $f" >&2
+  fi
+done
+assert "concurrent: rotated files clean" "$con_bad" "0"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
