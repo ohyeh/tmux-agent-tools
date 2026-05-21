@@ -1508,8 +1508,191 @@ transcript_append() {
   # for the zsh PATH/path tied-pair gotcha.
   local target="$1" line="$2"
   [[ -z "$target" ]] && return 0
+  line="$(secret_redact_apply "$line")"
   printf '%s\n' "$line" >> "$target" 2>/dev/null || true
 }
+
+# --- Secret URI backends + redaction (#189) ------------------------------
+# Mirror of the same helpers in claude-tmux. See that file for full docs.
+secret_resolve_uri() {
+  local skey="$1" uri="$2"
+  case "$uri" in
+    file:*)
+      local f="${uri#file:}"
+      if [[ ! -f "$f" ]]; then
+        echo "--secret file not found: $f" >&2; return 4
+      fi
+      cat "$f"
+      ;;
+    env-file:*)
+      local f="${uri#env-file:}"
+      if [[ ! -f "$f" ]]; then
+        echo "--secret env-file not found: $f" >&2; return 4
+      fi
+      local line key val found=0
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        key="${key#export }"
+        key="${key//[[:space:]]/}"
+        [[ "$key" != "$skey" ]] && continue
+        val="${line#*=}"
+        if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
+          val="${val:1:${#val}-2}"
+        fi
+        printf '%s' "$val"
+        found=1
+        break
+      done < "$f"
+      if (( ! found )); then
+        echo "--secret env-file missing key $skey in $f" >&2; return 4
+      fi
+      ;;
+    op://*)
+      if ! command -v op >/dev/null 2>&1; then
+        echo "--secret backend op:// requires the 1Password 'op' CLI in PATH" >&2; return 4
+      fi
+      local out
+      if ! out="$(op read "$uri" 2>&1)"; then
+        echo "--secret op read failed for $uri: $out" >&2; return 4
+      fi
+      printf '%s' "$out"
+      ;;
+    keychain:*)
+      if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "--secret backend keychain: only supported on macOS (darwin)" >&2; return 4
+      fi
+      if ! command -v security >/dev/null 2>&1; then
+        echo "--secret backend keychain: requires macOS 'security' CLI" >&2; return 4
+      fi
+      local spec="${uri#keychain:}"
+      local acct="${spec%%/*}" svc="${spec#*/}"
+      if [[ -z "$acct" || -z "$svc" || "$acct" == "$spec" ]]; then
+        echo "--secret keychain URI must be keychain:<account>/<service>: $uri" >&2; return 4
+      fi
+      local out
+      if ! out="$(security find-generic-password -a "$acct" -s "$svc" -w 2>&1)"; then
+        echo "--secret keychain lookup failed for $uri: $out" >&2; return 4
+      fi
+      printf '%s' "$out"
+      ;;
+    *)
+      if [[ ! -f "$uri" ]]; then
+        echo "--secret file not found: $uri" >&2; return 4
+      fi
+      cat "$uri"
+      ;;
+  esac
+}
+
+secret_uri_backend() {
+  case "$1" in
+    file:*)      echo file ;;
+    env-file:*)  echo env-file ;;
+    op://*)      echo op ;;
+    keychain:*)  echo keychain ;;
+    *)           echo file ;;
+  esac
+}
+
+# Per-agent redact list path. Stores `KEY\tBASE64(VALUE)\n` per line so that
+# multi-line/binary/regex-meta secret values survive on-disk round-trip
+# safely. Mode 0600.
+secret_redact_list_path() {
+  local nm="$1"
+  local sub
+  sub="$(ensure_agent_dir "$nm")"
+  echo "$sub/secrets-redact.list"
+}
+
+# Base64-encode without line wrapping (portable across BSD/GNU).
+secret_b64enc() {
+  if base64 --help 2>&1 | grep -q -- '-w'; then
+    printf '%s' "$1" | base64 -w0
+  else
+    printf '%s' "$1" | base64 | tr -d '\n\r '
+  fi
+}
+secret_b64dec() {
+  if base64 --help 2>&1 | grep -q -- '-d'; then
+    printf '%s' "$1" | base64 -d 2>/dev/null
+  else
+    printf '%s' "$1" | base64 -D 2>/dev/null
+  fi
+}
+
+# Register a (key,value) pair. In-memory and on-disk values are base64-
+# encoded so newlines/regex-meta/binary bytes round-trip safely.
+secret_redact_register() {
+  local nm="$1" skey="$2" sval="$3"
+  [[ -z "$sval" ]] && return 0
+  local enc
+  enc="$(secret_b64enc "$sval")"
+  __secret_redact_pairs+=("${skey}"$'\t'"${enc}")
+  local lp
+  lp="$(secret_redact_list_path "$nm")"
+  ( umask 077; printf '%s\t%s\n' "$skey" "$enc" >> "$lp" ) 2>/dev/null || true
+}
+
+# Filter a text blob, substituting each registered secret value with
+# `[REDACTED:KEYNAME]`. Multi-line safe: awk reads whole input as one
+# record (RS="\0") and uses literal index().
+secret_redact_apply() {
+  local text="$1"
+  [[ "${SECRET_REDACT_DISABLE:-0}" == "1" ]] && { printf '%s' "$text"; return 0; }
+  local pair skey sval_enc sval
+  for pair in "${__secret_redact_pairs[@]:-}"; do
+    [[ -z "$pair" ]] && continue
+    skey="${pair%%$'\t'*}"
+    sval_enc="${pair#*$'\t'}"
+    sval="$(secret_b64dec "$sval_enc")"
+    [[ -z "$sval" ]] && continue
+    while [[ "$sval" == *$'\n' || "$sval" == *$'\r' ]]; do
+      sval="${sval%[$'\n\r']}"
+    done
+    [[ -z "$sval" ]] && continue
+    text="$(printf '%s' "$text" | awk -v s="$sval" -v r="[REDACTED:${skey}]" '
+      BEGIN { RS="\0"; ORS=""; n=length(s) }
+      { out=""; while ((i=index($0,s))>0) { out=out substr($0,1,i-1) r; $0=substr($0,i+n) } print out $0 }')"
+  done
+  printf '%s' "$text"
+}
+
+secret_redact_load_for() {
+  local nm="$1"
+  local lp
+  lp="$(secret_redact_list_path "$nm")"
+  [[ -f "$lp" ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *$'\t'* ]] && continue
+    __secret_redact_pairs+=("$line")
+  done < "$lp"
+}
+
+secret_process_pending() {
+  local nm="$1"
+  local sec sec_key sec_uri sec_value backend
+  for sec in "${pending_secrets[@]:-}"; do
+    [[ -z "$sec" ]] && continue
+    sec_key="${sec%%=*}"
+    sec_uri="${sec#*=}"
+    if ! sec_value="$(secret_resolve_uri "$sec_key" "$sec_uri")"; then
+      exit 4
+    fi
+    backend="$(secret_uri_backend "$sec_uri")"
+    secret_redact_register "$nm" "$sec_key" "$sec_value"
+    audit_log_append "$("$JQ" -c -n --arg event secret.read --arg tool codex \
+      --arg name "$nm" --arg key "$sec_key" --arg backend "$backend" \
+      '{event:$event, tool:$tool, name:$name, key:$key, backend:$backend}')"
+    session_env_args+=("-e" "${sec_key}=${sec_value}")
+  done
+}
+
+__secret_redact_pairs=()
+# --- /Secret URI backends + redaction ------------------------------------
 
 apply_result_env_args() {
   # Appends -e TMUX_AGENT_NAME=... and -e TMUX_AGENT_RESULT=... to the
@@ -1569,8 +1752,17 @@ start_session() {
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--workdir-fresh" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
+      --secret-redact|--secret-redact=true)
+        SECRET_REDACT_DISABLE=0
+        shift
+        ;;
+      --secret-redact=false)
+        SECRET_REDACT_DISABLE=1
+        echo "WARNING: --secret-redact=false — secret values will appear in transcripts/captures unredacted (#189)" >&2
+        shift
+        ;;
       --transcript|--record)
         if (( $# < 2 )); then
           echo "--transcript requires a value (absolute path)" >&2
@@ -1740,16 +1932,7 @@ start_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
-  for sec in "${pending_secrets[@]}"; do
-    sec_key="${sec%%=*}"
-    sec_path="${sec#*=}"
-    if [[ ! -f "$sec_path" ]]; then
-      echo "--secret file not found: $sec_path" >&2
-      exit 4
-    fi
-    sec_value="$(cat "$sec_path")"
-    session_env_args+=("-e" "${sec_key}=${sec_value}")
-  done
+  secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
@@ -1860,8 +2043,17 @@ resume_session() {
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--workdir-fresh" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
+      --secret-redact|--secret-redact=true)
+        SECRET_REDACT_DISABLE=0
+        shift
+        ;;
+      --secret-redact=false)
+        SECRET_REDACT_DISABLE=1
+        echo "WARNING: --secret-redact=false — secret values will appear in transcripts/captures unredacted (#189)" >&2
+        shift
+        ;;
       --transcript|--record)
         if (( $# < 2 )); then
           echo "--transcript requires a value (absolute path)" >&2
@@ -2016,16 +2208,7 @@ resume_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
-  for sec in "${pending_secrets[@]}"; do
-    sec_key="${sec%%=*}"
-    sec_path="${sec#*=}"
-    if [[ ! -f "$sec_path" ]]; then
-      echo "--secret file not found: $sec_path" >&2
-      exit 4
-    fi
-    sec_value="$(cat "$sec_path")"
-    session_env_args+=("-e" "${sec_key}=${sec_value}")
-  done
+  secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
   record_started_at "$name"
@@ -2371,6 +2554,10 @@ capture_session() {
 
   local raw
   raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$lines")"
+
+  # Redact registered secret values (#189) before any downstream sink.
+  secret_redact_load_for "$name"
+  raw="$(secret_redact_apply "$raw")"
 
   if (( strip_ansi )); then
     # Strip ANSI escape sequences (#96 + #135 extension). Covers:
