@@ -1,9 +1,52 @@
 #!/usr/bin/env zsh
-# tmux-agent-dag (issue #113 v1 — synchronous DAG walker).
+# tmux-agent-dag (issue #186 — DAG validation + topological execution).
 #
-# v1 ships a synchronous DAG walker: walks tasks in topological order,
-# launches each, BLOCKS until completion, then advances. No daemon, no
-# async dispatch — respects "no hidden autonomy".
+# Validates a task manifest as a DAG (missing-dep / duplicate-name /
+# self-dependency / cycle detection via Kahn's algorithm) BEFORE launching
+# any task, then executes tasks in topological order synchronously.
+#
+# Manifest schema (JSON, canonical — see docs/design-issue-186-dag-manifest.md):
+#   {
+#     "schema_version": 1,
+#     "fail_fast": true,                       # default true
+#     "tasks": [
+#       {
+#         "name": "a",
+#         "depends_on": [],                    # alias: "after"
+#         "command": "shell command string",   # executed via sh -c
+#         "result_path": "/path/to/result.json"
+#       },
+#       {
+#         "name": "b",
+#         "depends_on": ["a"],
+#         "command": "...",
+#         "result_path": "..."
+#       }
+#     ]
+#   }
+#
+# fail_fast=true  : when a task fails, ALL downstream tasks are marked "skipped".
+# fail_fast=false : continue independent branches; only the failed task's
+#                   transitive descendants are skipped.
+#
+# Task status decision:
+#   - exit code 0 AND (no result_path OR result_path exists AND status=="ok") -> ok
+#   - otherwise -> failed
+#
+# Final JSON summary (stdout, also --summary-out PATH):
+#   {
+#     "schema_version": 1,
+#     "manifest": "<path>",
+#     "ordered_tasks": ["a","b",...],
+#     "results": [
+#       {"name":"a","status":"ok|failed|skipped","result_path":"...","error":null|"..."}
+#     ],
+#     "ok": true|false,
+#     "at": "<ISO-8601 UTC>"
+#   }
+#
+# YAML manifests: NOT supported (deferred — JSON only).
+# Parallel execution: NOT supported (deferred — strictly synchronous).
 
 set -euo pipefail
 
@@ -11,140 +54,351 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 
 usage() {
   cat <<'EOF'
-tmux-agent-dag - synchronous task DAG walker (#113 v1).
+tmux-agent-dag - DAG validator + synchronous topological executor (#186).
 
 Usage:
-  tmux-agent-dag run <manifest.json>
+  tmux-agent-dag <manifest.json> [--summary-out PATH]
+  tmux-agent-dag run <manifest.json> [--summary-out PATH]    # legacy alias
+  tmux-agent-dag --help
 
-Manifest format (JSON, NOT YAML — keep deps small):
-  {
-    "schema_version": 1,
-    "tool": "codex",
-    "tasks": [
-      {"name": "build",  "workdir": "/path", "prompt": "...", "after": []},
-      {"name": "test",   "workdir": "/path", "prompt": "...", "after": ["build"]},
-      {"name": "deploy", "workdir": "/path", "prompt": "...", "after": ["test"]}
-    ]
-  }
+Validates the manifest as a DAG before launching any task. Fails fast on:
+  - missing dependency reference
+  - duplicate task name
+  - self-dependency
+  - cycle (Kahn's algorithm)
 
-The walker runs tasks in topological order. Each task BLOCKS until the
-agent writes result.json. If any task fails (status != "ok"), the
-walker aborts unless `"continue_on_failure": true` is set on the task.
-
-Emits a final JSON summary:
-  {
-    "schema_version": 1,
-    "manifest": "<path>",
-    "results": [{"name": "...", "result": {...}, "ok": true/false}],
-    "ok": true/false,
-    "at": "<ISO-8601 UTC>"
-  }
+Then executes tasks in topological order. See
+docs/design-issue-186-dag-manifest.md for the full schema and semantics.
 EOF
 }
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-if [[ "${1:-}" != "run" ]]; then
+emit_summary() {
+  local manifest_arg="$1" ordered_json="$2" results_json="$3" ok_val="$4" summary_out="$5"
+  local summary
+  summary="$("$JQ" -n \
+    --arg manifest "$manifest_arg" \
+    --argjson ordered "$ordered_json" \
+    --argjson results "$results_json" \
+    --argjson ok "$ok_val" \
+    --arg at "$(iso_now)" \
+    '{schema_version:1, manifest:$manifest, ordered_tasks:$ordered, results:$results, ok:$ok, at:$at}')"
+  printf '%s\n' "$summary"
+  if [[ -n "$summary_out" ]]; then
+    printf '%s\n' "$summary" > "$summary_out"
+  fi
+}
+
+fail_validation() {
+  local manifest_arg="$1" msg="$2" summary_out="$3"
+  local results_json
+  results_json="$("$JQ" -n --arg err "$msg" '[{name:null,status:"failed",result_path:null,error:$err}]')"
+  emit_summary "$manifest_arg" "[]" "$results_json" "false" "$summary_out" >&2
+  exit 2
+}
+
+# ---- arg parse ----
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -eq 0 ]]; then
   usage
   exit 0
 fi
-shift
 
-manifest="${1:-}"
-if [[ -z "$manifest" || ! -f "$manifest" ]]; then
-  echo "Usage: tmux-agent-dag run <manifest.json>" >&2
-  exit 2
+if [[ "${1:-}" == "run" ]]; then
+  shift
 fi
 
+manifest="${1:-}"
+shift || true
+summary_out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --summary-out)
+      summary_out="${2:-}"
+      [[ -n "$summary_out" ]] || { echo "--summary-out requires PATH" >&2; exit 2; }
+      shift 2
+      ;;
+    --help|-h)
+      usage; exit 0
+      ;;
+    *)
+      echo "unknown arg: $1" >&2; exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$manifest" || ! -f "$manifest" ]]; then
+  echo "tmux-agent-dag: manifest not found: ${manifest:-<empty>}" >&2
+  exit 2
+fi
 [[ -n "$JQ" ]] || { echo "jq not found" >&2; exit 1; }
 
-tool="$("$JQ" -r '.tool // "codex"' "$manifest")"
-SCRIPT_DIR="${0:A:h}"
-case "$tool" in
-  claude) WRAPPER="$SCRIPT_DIR/claude-tmux" ;;
-  codex)  WRAPPER="$SCRIPT_DIR/codex-tmux" ;;
-  *)      echo "manifest .tool must be claude or codex" >&2; exit 2 ;;
-esac
+# ---- load manifest ----
+if ! "$JQ" -e . "$manifest" >/dev/null 2>&1; then
+  fail_validation "$manifest" "manifest is not valid JSON" "$summary_out"
+fi
 
-# Build a simple topological order. v1 trusts the manifest's task order
-# matches the dependency declaration — i.e., authors list tasks in valid
-# topo order. Cycle detection deferred to v2.
-task_names="$("$JQ" -r '.tasks[].name' "$manifest")"
-ts="$(date +%s)"
+fail_fast="$("$JQ" -r 'if has("fail_fast") then .fail_fast else true end' "$manifest")"
+task_count="$("$JQ" -r '.tasks | length' "$manifest")"
+if [[ "$task_count" == "0" ]]; then
+  fail_validation "$manifest" "manifest has no tasks" "$summary_out"
+fi
 
-typeset -A status
+# Extract names (preserve order) and detect duplicates.
+typeset -a names
+names=()
+while IFS= read -r n; do
+  names+=("$n")
+done < <("$JQ" -r '.tasks[].name // ""' "$manifest")
+
+typeset -A name_seen
+for n in "${names[@]}"; do
+  if [[ -z "$n" ]]; then
+    fail_validation "$manifest" "task missing 'name' field" "$summary_out"
+  fi
+  if [[ -n "${name_seen[$n]:-}" ]]; then
+    fail_validation "$manifest" "duplicate task name: $n" "$summary_out"
+  fi
+  name_seen[$n]=1
+done
+
+# Build adjacency. deps[name] is newline-delimited (safe for names with spaces).
+# rdeps[name] is newline-delimited list of tasks that depend on name (reverse edges)
+# for O(N+E) Kahn relaxation. Duplicate deps within a task are a validation error.
+typeset -A deps
+typeset -A rdeps
+typeset -A indeg
+typeset -A cmd_of
+typeset -A result_path_of
+
+for n in "${names[@]}"; do
+  deps[$n]=""
+  rdeps[$n]=""
+  indeg[$n]=0
+done
+
+# Single jq pass: emit per-task records using ASCII Unit Separator (US, 0x1f)
+# between fields and Record Separator (RS, 0x1e) between tasks. These bytes
+# never appear unescaped inside JSON strings, so they preserve names/commands
+# that contain spaces or newlines verbatim — fixing the previous space-split
+# bug. Record layout: name<US>command<US>result_path<US>dep1<US>dep2<US>...
+# Records joined by <RS>.
+tasks_blob="$("$JQ" -j '
+  .tasks
+  | map([(.name // ""), (.command // ""), (.result_path // ""),
+         ((.depends_on // .after // []))]
+        | [.[0], "", .[1], "", .[2], "",
+           (.[3] | map(. + "") | join(""))] | join(""))
+  | join("")
+' "$manifest")"
+
+# Parse records.
+typeset -a _records
+_records=("${(@ps:\x1e:)tasks_blob}")
+for rec in "${_records[@]}"; do
+  [[ -z "$rec" ]] && continue
+  typeset -a _fields
+  _fields=("${(@ps:\x1f:)rec}")
+  # fields: 1=name 2=command 3=result_path 4..=deps (last may be empty)
+  n="${_fields[1]}"
+  cmd_of[$n]="${_fields[2]}"
+  result_path_of[$n]="${_fields[3]}"
+  # iterate fields 4..end; skip trailing empty
+  typeset -A _dep_seen
+  _dep_seen=()
+  local _i=4
+  while (( _i <= ${#_fields} )); do
+    d="${_fields[$_i]}"
+    _i=$(( _i + 1 ))
+    [[ -z "$d" ]] && continue
+    if [[ "$d" == "$n" ]]; then
+      fail_validation "$manifest" "self-dependency: task '$n' depends on itself" "$summary_out"
+    fi
+    if [[ -z "${name_seen[$d]:-}" ]]; then
+      fail_validation "$manifest" "missing dependency: task '$n' depends on unknown '$d'" "$summary_out"
+    fi
+    if [[ -n "${_dep_seen[$d]:-}" ]]; then
+      fail_validation "$manifest" "duplicate dependency in task '$n': '$d'" "$summary_out"
+    fi
+    _dep_seen[$d]=1
+    if [[ -z "${deps[$n]}" ]]; then
+      deps[$n]="$d"
+    else
+      deps[$n]="${deps[$n]}"$'\n'"$d"
+    fi
+    if [[ -z "${rdeps[$d]}" ]]; then
+      rdeps[$d]="$n"
+    else
+      rdeps[$d]="${rdeps[$d]}"$'\n'"$n"
+    fi
+    indeg[$n]=$(( indeg[$n] + 1 ))
+  done
+  unset _dep_seen
+done
+
+# Kahn's algorithm: pick zero-indegree nodes in manifest order (stable).
+# O(N+E) using reverse-edge list for relaxation.
+typeset -a order
+order=()
+typeset -A removed
+typeset -A cur_indeg
+for n in "${names[@]}"; do
+  cur_indeg[$n]=${indeg[$n]}
+done
+
+while :; do
+  picked=""
+  for n in "${names[@]}"; do
+    [[ -n "${removed[$n]:-}" ]] && continue
+    if [[ "${cur_indeg[$n]}" == "0" ]]; then
+      picked="$n"
+      break
+    fi
+  done
+  [[ -z "$picked" ]] && break
+  order+=("$picked")
+  removed[$picked]=1
+  # decrement indeg of every node that lists picked as a dep (reverse edges).
+  for m in "${(@f)rdeps[$picked]}"; do
+    [[ -z "$m" ]] && continue
+    cur_indeg[$m]=$(( cur_indeg[$m] - 1 ))
+  done
+done
+
+if (( ${#order[@]} != ${#names[@]} )); then
+  # Build cycle path from remaining nodes.
+  typeset -a remaining
+  remaining=()
+  for n in "${names[@]}"; do
+    [[ -z "${removed[$n]:-}" ]] && remaining+=("$n")
+  done
+  # Walk one cycle: follow first remaining dep until repeat.
+  start="${remaining[1]}"
+  typeset -A on_path
+  typeset -a cycle_path
+  cur="$start"
+  while :; do
+    cycle_path+=("$cur")
+    on_path[$cur]=${#cycle_path[@]}
+    next=""
+    for d in "${(@f)deps[$cur]}"; do
+      [[ -z "$d" ]] && continue
+      if [[ -z "${removed[$d]:-}" ]]; then
+        next="$d"
+        break
+      fi
+    done
+    if [[ -z "$next" ]]; then
+      break
+    fi
+    if [[ -n "${on_path[$next]:-}" ]]; then
+      cycle_path+=("$next")
+      break
+    fi
+    cur="$next"
+  done
+  cycle_str="${(j: -> :)cycle_path}"
+  fail_validation "$manifest" "cycle detected: $cycle_str" "$summary_out"
+fi
+
+# ---- execute ----
+typeset -A task_status   # ok|failed|skipped
+typeset -A task_error
 typeset -a results
 results=()
 overall_ok=true
 
-while IFS= read -r task_name; do
-  [[ -z "$task_name" ]] && continue
-  workdir="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | .workdir' "$manifest")"
-  prompt="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | .prompt' "$manifest")"
-  continue_on_failure="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | (.continue_on_failure // false)' "$manifest")"
-  afters="$("$JQ" -r --arg n "$task_name" '.tasks[] | select(.name==$n) | (.after // [])[]' "$manifest")"
-  # Verify dependencies passed
-  skip=0
-  while IFS= read -r dep; do
-    [[ -z "$dep" ]] && continue
-    if [[ "${status[$dep]:-pending}" != "ok" ]]; then
-      echo "dag: skipping '$task_name' — dependency '$dep' not ok" >&2
-      skip=1
-      break
+run_task() {
+  local name="$1"
+  local cmd="${cmd_of[$name]}"
+  local rp="${result_path_of[$name]}"
+  if [[ -z "$cmd" ]]; then
+    task_status[$name]="failed"
+    task_error[$name]="missing command"
+    return 1
+  fi
+  local rc=0
+  sh -c "$cmd" || rc=$?
+  if (( rc != 0 )); then
+    task_status[$name]="failed"
+    task_error[$name]="command exited with status $rc"
+    return 1
+  fi
+  if [[ -n "$rp" ]]; then
+    if [[ ! -f "$rp" ]]; then
+      task_status[$name]="failed"
+      task_error[$name]="result_path not produced: $rp"
+      return 1
     fi
-  done <<< "$afters"
-  if (( skip )); then
-    status[$task_name]="skipped"
-    results+=("$("$JQ" -c -n --arg name "$task_name" '{name:$name, ok:false, skipped:true, result:null}')")
-    overall_ok=false
-    continue
+    local st
+    st="$("$JQ" -r '.status // ""' "$rp" 2>/dev/null || echo "")"
+    if [[ -n "$st" && "$st" != "ok" ]]; then
+      task_status[$name]="failed"
+      task_error[$name]="result.status=$st"
+      return 1
+    fi
   fi
-  if [[ ! -d "$workdir" ]]; then
-    echo "dag: workdir not found for '$task_name': $workdir" >&2
-    status[$task_name]="missing_workdir"
-    results+=("$("$JQ" -c -n --arg name "$task_name" '{name:$name, ok:false, skipped:false, result:null}')")
-    overall_ok=false
-    continue
-  fi
-  agent_name="dag-${ts}-${task_name}"
-  "$WRAPPER" start --exact "$agent_name" "$workdir" "$prompt" >/dev/null
-  # Block until result.json (60s default; not configurable in v1)
-  result_path="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}/$agent_name/result.json"
-  deadline=$(( $(date +%s) + 60 ))
-  while [[ ! -f "$result_path" ]]; do
-    if (( $(date +%s) >= deadline )); then break; fi
-    /bin/sleep 1
+  task_status[$name]="ok"
+  return 0
+}
+
+# Precompute: does any dep have a non-ok status?
+dep_blocked() {
+  local name="$1"
+  local d
+  for d in "${(@f)deps[$name]}"; do
+    [[ -z "$d" ]] && continue
+    if [[ "${task_status[$d]:-}" != "ok" ]]; then
+      return 0
+    fi
   done
-  ok=false
-  result_body='{}'
-  if [[ -f "$result_path" ]]; then
-    result_body="$(cat "$result_path")"
-    if [[ "$("$JQ" -r '.status // ""' <<< "$result_body")" == "ok" ]]; then
-      ok=true
-    fi
-  fi
-  status[$task_name]=$([ "$ok" = true ] && echo ok || echo failed)
-  results+=("$("$JQ" -c -n --arg name "$task_name" --argjson ok "$ok" --argjson result "$result_body" \
-    '{name:$name, ok:$ok, skipped:false, result:$result}')")
-  if [[ "$ok" != "true" && "$continue_on_failure" != "true" ]]; then
+  return 1
+}
+
+any_failed=false
+for n in "${order[@]}"; do
+  if [[ "$any_failed" == "true" && "$fail_fast" == "true" ]]; then
+    task_status[$n]="skipped"
+    task_error[$n]="upstream failure (fail_fast=true)"
     overall_ok=false
-    "$WRAPPER" stop "$agent_name" >/dev/null 2>&1 || true
-    echo "dag: '$task_name' failed; aborting walk (continue_on_failure=false)" >&2
-    break
+    continue
   fi
-  "$WRAPPER" stop "$agent_name" >/dev/null 2>&1 || true
-done <<< "$task_names"
-
-# Emit final summary
-results_array="["
-for i in {1..${#results[@]}}; do
-  results_array+="${results[$i]}"
-  (( i < ${#results[@]} )) && results_array+=","
+  if dep_blocked "$n"; then
+    task_status[$n]="skipped"
+    task_error[$n]="dependency not ok"
+    overall_ok=false
+    continue
+  fi
+  if ! run_task "$n"; then
+    overall_ok=false
+    any_failed=true
+  fi
 done
-results_array+="]"
 
-"$JQ" -n --argjson results "$results_array" --argjson ok "$overall_ok" \
-  --arg manifest "$manifest" --arg at "$(iso_now)" \
-  '{schema_version: 1, manifest: $manifest, ok: $ok, results: $results, at: $at}'
+# Build results JSON array in topo order.
+results_json="["
+first=1
+for n in "${order[@]}"; do
+  st="${task_status[$n]:-failed}"
+  err="${task_error[$n]:-}"
+  rp="${result_path_of[$n]}"
+  entry="$("$JQ" -n \
+    --arg name "$n" \
+    --arg status "$st" \
+    --arg rp "$rp" \
+    --arg err "$err" \
+    '{name:$name, status:$status, result_path:(if $rp=="" then null else $rp end), error:(if $err=="" then null else $err end)}')"
+  if (( first )); then
+    results_json+="$entry"
+    first=0
+  else
+    results_json+=",$entry"
+  fi
+done
+results_json+="]"
+
+ordered_json="$(printf '%s\n' "${order[@]}" | "$JQ" -R . | "$JQ" -s .)"
+
+emit_summary "$manifest" "$ordered_json" "$results_json" "$overall_ok" "$summary_out"
 
 [[ "$overall_ok" == "true" ]] && exit 0 || exit 1
