@@ -494,6 +494,37 @@ CODEX=/path/to/codex codex-tmux help
 
 ## Codex Skill
 
+### Secret injection (`--secret KEY=URI`, #189)
+
+`claude-tmux start` and `codex-tmux start` accept one or more `--secret KEY=URI`
+flags to inject a value into the tmux session env. Supported URI backends:
+
+| URI                                | Source                                                  |
+| ---------------------------------- | ------------------------------------------------------- |
+| `file:<path>`                      | Read entire file contents.                              |
+| `<path>` (bare)                    | Backcompat alias for `file:<path>`.                     |
+| `env-file:<path>`                  | Dotenv-style file; reads the line `KEY=...`.            |
+| `op://Vault/Item/field`            | 1Password CLI (`op read`), if `op` is in `PATH`.        |
+| `keychain:<account>/<service>`     | macOS Keychain via `security find-generic-password`.    |
+
+If the required backend CLI is missing, or the file/key is not found, the
+wrapper exits non-zero with a clear diagnostic **before** creating the tmux
+session — secrets never partially apply.
+
+Secret values are automatically redacted from `capture` output and transcript
+events as `[REDACTED:KEYNAME]`. Pass `--secret-redact=false` to bypass the
+redactor for debugging (a loud stderr warning is printed). When
+`TMUX_AGENT_TOOLS_AUDIT_LOG` is set, each resolution records a `secret.read`
+event with the key name and backend label only — the value itself is never
+written.
+
+Example (safe):
+
+```bash
+codex-tmux start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
+  agent-x ~/work
+```
+
 The reusable Codex skill lives at:
 
 ```text

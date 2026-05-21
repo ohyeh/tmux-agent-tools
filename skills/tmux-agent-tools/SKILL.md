@@ -271,3 +271,24 @@ Requirements:
 - `CLAUDE_TMUX_CLIPBOARD` / `CODEX_TMUX_CLIPBOARD` (`auto`, `internal`, or a copy command)
 - `CLAUDE_TMUX_STATUS_TAIL_LINES` / `CODEX_TMUX_STATUS_TAIL_LINES`
 - `TMUX_AGENT_TOOLS_PARTICIPANTS`
+
+## Secret injection (`--secret KEY=URI`, #189)
+
+`claude-tmux start` and `codex-tmux start` accept `--secret KEY=URI` to inject
+a value into the tmux session env. Backends: `file:<path>`, bare `<path>`
+(backcompat = file:), `env-file:<path>`, `op://...` (1Password `op read`), and
+`keychain:<account>/<service>` (macOS only).
+
+Missing backend CLI or missing key/file aborts with a non-zero exit before
+the tmux session is created. Registered secret values are redacted from
+`capture` output and transcript events as `[REDACTED:KEYNAME]`. Use
+`--secret-redact=false` to bypass for debugging (loud stderr warning).
+When `TMUX_AGENT_TOOLS_AUDIT_LOG` is set, a `secret.read` event records the
+key and backend label only — never the value.
+
+Safe example:
+
+```bash
+codex-tmux start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
+  agent-x ~/work
+```
