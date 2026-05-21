@@ -43,7 +43,7 @@ Usage:
   claude-tmux wait <name> [timeout_seconds]
   claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]
   claude-tmux wait-literal <name> <text> [timeout_seconds]
-  claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] <name>
+  claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>
   claude-tmux capture <name> [lines]
   claude-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>
   claude-tmux list
@@ -2722,8 +2722,111 @@ wait_literal_session() {
   return 1
 }
 
+approval_gate_status_path() {
+  # Per-agent approval-gate status file (issue #185). Set/cleared by the
+  # pause-until-file loop in wait-and-capture so external watchers can see
+  # `awaiting_approval` while the wrapper is blocked.
+  local name="$1"
+  printf '%s' "$(agent_root_dir)/$name/approval-status.json"
+}
+
+approval_gate_write_status() {
+  # Args: name, state ("awaiting_approval"|"resolved"), marker_path,
+  #       decision (approve|reject|timeout|""), reason ("")
+  local name="$1" state="$2" marker_path="$3" decision="${4:-}" reason="${5:-}"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local status_target="$subdir/approval-status.json"
+  local at
+  at="$(transcript_iso_now 2>/dev/null || true)"
+  ( "$JQ" -c -n --arg state "$state" --arg mp "$marker_path" \
+      --arg decision "$decision" --arg reason "$reason" --arg at "$at" \
+      '{schema_version: 1, state: $state, marker_path: $mp,
+        decision: (if $decision == "" then null else $decision end),
+        reason: (if $reason == "" then null else $reason end),
+        at: $at}' > "$status_target" ) 2>/dev/null || true
+}
+
+approval_gate_clear_status() {
+  local name="$1"
+  rm -f "$(agent_root_dir)/$name/approval-status.json" 2>/dev/null || true
+}
+
+approval_gate_emit_transcript() {
+  # Append an approval event into the transcript when one is configured.
+  local name="$1" decision="$2" marker_path="$3"
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  [[ -n "$transcript_path" ]] || return 0
+  local line
+  line="$("$JQ" -c -n \
+    --arg name "$name" --arg decision "$decision" --arg mp "$marker_path" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, kind: "approval", name: $name,
+      decision: $decision, marker_path: $mp, decided_at: $at}')"
+  transcript_append "$transcript_path" "$line"
+}
+
+approval_gate_emit_audit() {
+  # Append an approval.* event to the audit log (#119 schema).
+  local name="$1" decision="$2" marker_path="$3"
+  local event_json
+  event_json="$("$JQ" -c -n \
+    --arg event "approval.$decision" --arg tool claude --arg name "$name" \
+    --arg mp "$marker_path" \
+    '{event: $event, tool: $tool, name: $name, marker_path: $mp}')"
+  audit_log_append "$event_json"
+}
+
+approval_gate_wait() {
+  # Sets globals: APPROVAL_DECISION, APPROVAL_REASON. Avoids returning the
+  # decision via $() so the parent's `set -e` does not abort on the inner
+  # subshell exit code.
+  # Args: name, marker_path, pause_timeout (0 = wait forever)
+  local name="$1" marker_path="$2" pause_timeout="$3"
+  approval_gate_write_status "$name" "awaiting_approval" "$marker_path" "" ""
+  local started=$SECONDS
+  local content=""
+  local decision=""
+  APPROVAL_REASON=""
+  APPROVAL_DECISION=""
+  while :; do
+    if [[ -s "$marker_path" ]]; then
+      content="$(cat "$marker_path" 2>/dev/null || true)"
+      # Strip leading whitespace; case-insensitive compare on first token.
+      local trimmed
+      trimmed="$(printf '%s' "$content" | sed -E 's/^[[:space:]]+//')"
+      local first
+      first="$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')"
+      case "$first" in
+        approve*) decision="approve" ;;
+        reject*)
+          decision="reject"
+          APPROVAL_REASON="$(printf '%s' "$trimmed" | head -c 200)"
+          ;;
+        *)
+          decision="reject"
+          APPROVAL_REASON="invalid marker content: $(printf '%s' "$trimmed" | head -c 80)"
+          ;;
+      esac
+      break
+    fi
+    if (( pause_timeout > 0 )) && (( SECONDS - started >= pause_timeout )); then
+      decision="timeout"
+      APPROVAL_REASON="pause-timeout after ${pause_timeout}s"
+      break
+    fi
+    /bin/sleep 1
+  done
+  approval_gate_write_status "$name" "resolved" "$marker_path" "$decision" "$APPROVAL_REASON"
+  approval_gate_emit_transcript "$name" "$decision" "$marker_path"
+  approval_gate_emit_audit "$name" "$decision" "$marker_path"
+  APPROVAL_DECISION="$decision"
+}
+
 wait_and_capture_session() {
   local pause_until_file=""
+  local pause_timeout=0
   # Combined wait + capture — the golden-path shortcut described in
   # issue #99. Replaces the two-step `wait-literal` / `capture` pair.
   # `--no-timeout-error` decouples soft-timeout opt-in from `--json`
@@ -2768,13 +2871,21 @@ wait_and_capture_session() {
         pause_until_file="$2"
         shift 2
         ;;
+      --pause-timeout)
+        if (( $# < 2 )); then
+          echo "--pause-timeout requires a value (seconds)" >&2
+          exit 2
+        fi
+        pause_timeout="$2"
+        shift 2
+        ;;
       *) echo "Unknown wait-and-capture flag: $1" >&2; exit 2 ;;
     esac
   done
 
   local name="${1:-}"
   if [[ -z "$name" || -z "$marker" ]]; then
-    echo "Usage: claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] <name>" >&2
+    echo "Usage: claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>" >&2
     exit 2
   fi
   if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
@@ -2784,6 +2895,13 @@ wait_and_capture_session() {
   if [[ ! "$tail_lines" =~ '^[0-9]+$' || "$tail_lines" -lt 1 ]]; then
     echo "Invalid --tail: $tail_lines" >&2
     exit 2
+  fi
+  if [[ ! "$pause_timeout" =~ '^[0-9]+$' ]]; then
+    echo "Invalid --pause-timeout: $pause_timeout" >&2
+    exit 2
+  fi
+  if [[ -n "$pause_until_file" ]]; then
+    require_jq
   fi
   if (( output_json )); then
     require_jq
@@ -2862,18 +2980,21 @@ wait_and_capture_session() {
   fi
 
   local reason
+  local approval_decision=""
   if (( matched )); then
     reason="matched"
     if [[ -n "$pause_until_file" ]]; then
-      # #114 approval gate: after matching the marker, block until the
-      # operator writes the gate file. No daemon — synchronous poll.
-      while [[ ! -f "$pause_until_file" ]]; do
-        if (( SECONDS >= deadline )); then
-          reason="gate_timeout"
-          break
-        fi
-        /bin/sleep 1
-      done
+      # #185 approval gate: after matching the marker, block until the
+      # operator writes the gate file with an approve/reject decision.
+      # `approval_gate_wait` polls the file synchronously, writes a
+      # `awaiting_approval` status, and emits transcript + audit events.
+      approval_gate_wait "$name" "$pause_until_file" "$pause_timeout"
+      approval_decision="$APPROVAL_DECISION"
+      case "$approval_decision" in
+        approve) reason="approved" ;;
+        reject)  reason="rejected" ;;
+        timeout) reason="gate_timeout" ;;
+      esac
     fi
     transcript_emit_wait_event "$name" wait_and_capture matched "$marker" "$timeout_seconds"
   else
@@ -2905,6 +3026,11 @@ wait_and_capture_session() {
   if (( ! matched && ! no_timeout_error )); then
     return 1
   fi
+  # #185 approval-gate exit codes: 7 = reject, 8 = pause-timeout.
+  case "$approval_decision" in
+    reject)  return 7 ;;
+    timeout) return 8 ;;
+  esac
   return 0
 }
 

@@ -13,6 +13,8 @@ Stable contract for `claude-tmux start --ci` / `codex-tmux start --ci`
 | 3 | prompt / permission wall detected (first-run auth, confirmation, etc.) |
 | 4 | secret-missing (when #116 lands — placeholder; never emitted in v1) |
 | 5 | schema validation failed (when #125 `--enforce` lands; placeholder) |
+| 7 | approval gate decision = reject (#185, `wait-and-capture --pause-until-file`) |
+| 8 | approval gate decision = pause-timeout (#185, `--pause-timeout`) |
 | 124 | timeout — `--max-runtime` / `--max-idle` fuse fired (#105) |
 
 CI consumers should branch on these directly:

@@ -243,6 +243,45 @@ codex-tmux wait-and-capture --literal --marker '[DONE]' --strip-ansi --json work
 Without `--no-timeout-error`, timeout exits 1 — keeps `if wait-and-capture ...`
 shell-friendly without forcing every caller to write a special case.
 
+#### Human-in-the-loop approval gate (`--pause-until-file`)
+
+`--pause-until-file <path>` turns `wait-and-capture` into a synchronous
+approval gate (issue #185). After the marker matches, the wrapper polls
+`<path>` every 1s and refuses to resume until an operator writes a
+decision to that file.
+
+```bash
+# Agent: wait for "[NEEDS-APPROVAL]" and pause for human review.
+marker=/tmp/agent-7/approve.txt
+codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
+  --pause-until-file "$marker" --pause-timeout 1800 worker
+rc=$?
+
+# Operator (from another terminal):
+echo approve         > /tmp/agent-7/approve.txt   # rc=0, resume
+# or
+echo "reject unsafe" > /tmp/agent-7/approve.txt   # rc=7, exits with reason
+
+case "$rc" in
+  0) echo "approved" ;;
+  7) echo "rejected" ;;
+  8) echo "timed out waiting for human" ;;
+esac
+```
+
+Decision parsing is case-insensitive on the first whitespace-stripped
+token: content starting with `approve` resumes (exit 0); content
+starting with `reject` exits 7 and the remainder is captured as the
+reject reason; any other non-empty content is treated as a malformed
+reject. Without `--pause-timeout`, the wrapper waits forever.
+
+While blocked, `$TMUX_AGENT_DIR/<name>/approval-status.json` records
+`state: "awaiting_approval"` so external watchers can detect the gate.
+On resolution, the same file is rewritten with the final decision. When
+a transcript or `TMUX_AGENT_TOOLS_AUDIT_LOG` is configured, the wrapper
+emits a `kind: "approval"` transcript event and an `approval.<decision>`
+audit event respectively. See `docs/design-issue-185-approval-gate.md`.
+
 ### Result-file convention (`result` subcommand)
 
 `start` and `resume` export two env vars into the pane shell so the agent CLI can write its structured result without inventing a path:
