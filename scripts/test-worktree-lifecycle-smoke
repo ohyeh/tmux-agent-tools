@@ -1,0 +1,125 @@
+#!/usr/bin/env zsh
+# Smoke for #187 managed worktree lifecycle: list / prune / policies / meta.json.
+#
+# Uses claude-tmux to allocate worktrees; isolates state via TMUX_AGENT_DIR
+# and XDG_STATE_HOME so the test does not touch the developer's real state.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+WT_CLI="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-worktrees"
+
+WORK="$(mktemp -d -t tmux-agent-wt-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state/agents"
+export XDG_STATE_HOME="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Init a real git repo as the source.
+SRC="$WORK/src"
+git init "$SRC" >/dev/null 2>&1
+( cd "$SRC" && git -c user.email=a@b -c user.name=t commit --allow-empty -m init >/dev/null 2>&1 )
+
+# --- Case 1: creation populates meta.json correctly -------------------------
+echo "case: create populates meta.json"
+env CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact --workdir-fresh \
+  "wt-a" "$SRC" >/dev/null 2>"$WORK/stderr-a"
+sleep 1
+assert "stderr mentions fresh worktree" \
+  "$(grep -c 'fresh worktree:' "$WORK/stderr-a")" "1"
+
+marker="$TMUX_AGENT_DIR/wt-a/fresh-worktree"
+assert "legacy fresh-worktree marker exists" \
+  "$(test -f "$marker" && echo yes)" "yes"
+wt_path_a="$(cat "$marker")"
+assert "worktree dir exists" "$(test -d "$wt_path_a" && echo yes)" "yes"
+meta_a="$wt_path_a/.tmux-agent-worktree/meta.json"
+assert "meta.json exists" "$(test -f "$meta_a" && echo yes)" "yes"
+assert "meta.schema_version" "$(jq -r '.schema_version' "$meta_a")" "1"
+assert "meta.tool" "$(jq -r '.tool' "$meta_a")" "claude"
+assert "meta.agent_name" "$(jq -r '.agent_name' "$meta_a")" "wt-a"
+assert "meta.cleanup_policy default" \
+  "$(jq -r '.cleanup_policy' "$meta_a")" "no-change-cleanup"
+assert "meta.branch prefix" \
+  "$(jq -r '.branch' "$meta_a" | awk -F/ '{print $1}')" "tmux-agent"
+assert "worktree.json schema in agent dir" \
+  "$(jq -r '.schema_version' "$TMUX_AGENT_DIR/wt-a/worktree.json")" "1"
+
+# --- Case 2: list finds it ---------------------------------------------------
+echo "case: list finds worktree"
+out_json="$("$WT_CLI" list --json)"
+assert "list --json count >= 1" \
+  "$(printf '%s' "$out_json" | jq 'length')" "1"
+assert "list --json path matches" \
+  "$(printf '%s' "$out_json" | jq -r '.[0].path')" "$wt_path_a"
+
+# Stop the session so worktree is "dead".
+"$CLAUDE_TMUX" stop "wt-a" >/dev/null 2>&1 || true
+sleep 1
+
+# --- Case 3: prune --dry-run reports cleanup --------------------------------
+echo "case: prune --dry-run reports removal of clean dead worktree"
+dry_out="$("$WT_CLI" prune --dry-run)"
+echo "$dry_out" | grep -q "would remove: wt-a" && r=ok || r=missing
+assert "dry-run marks wt-a for removal" "$r" "ok"
+assert "wt-a still exists after dry-run" \
+  "$(test -d "$wt_path_a" && echo yes)" "yes"
+
+# --- Case 4: prune removes no-change stale worktree -------------------------
+echo "case: prune removes no-change stale worktree"
+"$WT_CLI" prune >/dev/null
+assert "wt-a removed by prune" \
+  "$(test -d "$wt_path_a" && echo yes || echo no)" "no"
+
+# --- Case 5: prune keeps has-change worktree --------------------------------
+echo "case: prune keeps has-change-keep when dirty"
+env TMUX_AGENT_WORKTREE_POLICY=has-change-keep CLAUDE="$WORK/fake.sh" \
+  "$CLAUDE_TMUX" start --exact --workdir-fresh "wt-b" "$SRC" >/dev/null 2>&1
+sleep 1
+wt_path_b="$(cat "$TMUX_AGENT_DIR/wt-b/fresh-worktree")"
+# Make it dirty.
+echo "dirt" > "$wt_path_b/dirty.txt"
+"$CLAUDE_TMUX" stop "wt-b" >/dev/null 2>&1 || true
+sleep 1
+"$WT_CLI" prune >/dev/null
+assert "wt-b kept because dirty + has-change-keep" \
+  "$(test -d "$wt_path_b" && echo yes)" "yes"
+
+# --- Case 6: prune keeps always-keep regardless -----------------------------
+echo "case: prune keeps always-keep even when clean+dead"
+env TMUX_AGENT_WORKTREE_POLICY=always-keep CLAUDE="$WORK/fake.sh" \
+  "$CLAUDE_TMUX" start --exact --workdir-fresh "wt-c" "$SRC" >/dev/null 2>&1
+sleep 1
+wt_path_c="$(cat "$TMUX_AGENT_DIR/wt-c/fresh-worktree")"
+"$CLAUDE_TMUX" stop "wt-c" >/dev/null 2>&1 || true
+sleep 1
+"$WT_CLI" prune >/dev/null
+assert "wt-c kept because always-keep" \
+  "$(test -d "$wt_path_c" && echo yes)" "yes"
+
+# Cleanup remaining managed worktrees.
+"$WT_CLI" prune --force >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
