@@ -1732,6 +1732,39 @@ secret_uri_backend() {
   esac
 }
 
+# Preflight backend availability for the entire pending_secrets list BEFORE
+# any tmux session is touched. This is defense-in-depth: secret_resolve_uri
+# also checks per-URI, but running this immediately after argument parsing
+# guarantees a fast (<1s) exit 4 with a clear diagnostic if a required CLI
+# is missing, regardless of any work that might be inserted between parsing
+# and secret_process_pending (issue #189 reverify).
+secrets_preflight_backends() {
+  local sec sec_key sec_uri
+  for sec in "${pending_secrets[@]:-}"; do
+    [[ -z "$sec" ]] && continue
+    sec_key="${sec%%=*}"
+    sec_uri="${sec#*=}"
+    case "$sec_uri" in
+      op://*)
+        if ! command -v op >/dev/null 2>&1; then
+          printf '%s\n' "ERROR: --secret backend 'op' (1Password CLI) not found on PATH for ${sec_key}=${sec_uri}" >&2
+          exit 4
+        fi
+        ;;
+      keychain:*)
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+          printf '%s\n' "ERROR: --secret backend 'keychain' only supported on macOS (darwin) for ${sec_key}=${sec_uri}" >&2
+          exit 4
+        fi
+        if ! command -v security >/dev/null 2>&1; then
+          printf '%s\n' "ERROR: --secret backend 'keychain' requires macOS 'security' CLI on PATH for ${sec_key}=${sec_uri}" >&2
+          exit 4
+        fi
+        ;;
+    esac
+  done
+}
+
 # Per-agent redact list path. Stores `KEY\tBASE64(VALUE)\n` per line so that
 # multi-line/binary/regex-meta secret values survive on-disk round-trip
 # safely. Mode 0600.
@@ -1989,6 +2022,11 @@ start_session() {
         ;;
     esac
   done
+
+  # Fail fast on missing secret backends BEFORE any tmux/jq/worktree work
+  # so a missing CLI exits with code 4 in <1s instead of hanging on a
+  # downstream timeout (issue #189 reverify).
+  secrets_preflight_backends
 
   local requested_name="${1:-}"
   local directory="${2:-}"
@@ -2275,6 +2313,8 @@ resume_session() {
         ;;
     esac
   done
+
+  secrets_preflight_backends
 
   local requested_name="${1:-}"
   local directory="${2:-}"
