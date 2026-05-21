@@ -22,6 +22,36 @@ This project is inspired by two tmux skills in the `skills.sh` ecosystem:
 - `codex-tmux`: starts Codex CLI in tmux with `--yolo`.
 - `tmux-agent-dialogue`: runs a bounded two-party tmux dialogue, writes a JSONL transcript, and validates transcript artifacts.
 - `tmux-agent-sessions`: lists and safely cleans up tmux-agent-tools owned sessions.
+- `tmux-agent-fanout`: synchronous fan-out coordinator across mixed `claude-tmux` / `codex-tmux` wrappers (issue #184).
+
+### Fanout (mixed wrappers, one prompt)
+
+Canonical form (`run` subcommand). Each agent gets its own `result.json`
+under `--result-dir`, and a consolidated summary goes to stdout
+(schema: `schemas/fanout-summary.schema.json`):
+
+```bash
+tmux-agent-fanout run \
+  --prompt-file ./prompt.txt \
+  --agent claude:reviewer --workdir ~/repo \
+  --agent codex:refactor  --workdir ~/repo \
+  --agent claude:tests    --workdir ~/repo \
+  --result-dir /tmp/fanout-demo \
+  --merge-mode first-success \
+  --summary-out /tmp/fanout-demo/summary.json
+```
+
+Legacy form (single tool, list of workdirs) still works:
+
+```bash
+tmux-agent-fanout --prompt-file ./prompt.txt \
+  --workdir ~/a --workdir ~/b --tool claude
+```
+
+Merge modes: `all` (default — `ok=true` iff every agent ok) or
+`first-success` (any agent ok; others continue running and are still
+recorded — they are NOT killed). Majority/custom modes are explicitly
+deferred — see `docs/design-issue-184-fanout.md`.
 
 The `claude-tmux` and `codex-tmux` wrapper tools support:
 

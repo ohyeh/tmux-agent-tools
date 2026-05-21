@@ -217,6 +217,33 @@ Parent reads it via `result --json --wait <seconds> <name>` and branches on `.pr
 | `result.json` missing after agent says "done" | agent never wrote `$TMUX_AGENT_RESULT` | re-prompt with explicit "write $TMUX_AGENT_RESULT before signaling done" |
 | Pane shows exit code marker but session lingers | normal — wrapper keeps the pane open for inspection | `stop <name>` to clean up |
 
+## Fan-out across mixed wrappers (#184)
+
+`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix
+`claude:` and `codex:` in a single call) or one per `--workdir` (legacy
+single-tool form). Each child writes its own `result.json` under
+`--result-dir`; the parent emits a consolidated summary on stdout
+(schema: `schemas/fanout-summary.schema.json`).
+
+```bash
+tmux-agent-fanout run \
+  --prompt-file ./prompt.txt \
+  --agent claude:reviewer --workdir ~/repo \
+  --agent codex:refactor  --workdir ~/repo \
+  --result-dir /tmp/fanout-demo \
+  --merge-mode all
+```
+
+- `--merge-mode all` (default): `ok=true` iff every agent succeeds.
+- `--merge-mode first-success`: `ok=true` if any agent succeeds.
+  Remaining agents continue (they are NOT killed) and are still
+  recorded in the summary.
+- Failure isolation: each agent's `result.json` is preserved on disk
+  even if a sibling fails or times out.
+
+Daemon / async / supervisor-tree / cross-agent cancellation remain
+deferred — see `docs/design-issue-184-fanout.md`.
+
 ## Concurrency model (#107)
 
 - Single caller per agent name. Two `start --exact same-name` kills the first session.

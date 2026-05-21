@@ -1,57 +1,134 @@
 #!/usr/bin/env zsh
-# tmux-agent-fanout (issue #112 v1 — synchronous slice).
+# tmux-agent-fanout (issue #184 runtime — synchronous slice with operator controls).
 #
-# v1 ships SYNCHRONOUS fan-out: caller waits for all children to complete.
-# No daemon, no async dispatch — respects "no hidden autonomy".
-# Each child writes its result.json (#97) and the fanout aggregates.
+# Synchronous fan-out: caller waits for all children to complete.
+# Per-agent result.json is written under --result-dir; consolidated JSON
+# summary goes to stdout (and optional --summary-out PATH).
+# No daemon, no async dispatch — supervisor-tree stays deferred (#184 design doc).
 
 set -euo pipefail
 
 JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+if [[ -z "$JQ" ]]; then
+  echo "tmux-agent-fanout: jq is required" >&2
+  exit 127
+fi
 
 usage() {
   cat <<'EOF'
-tmux-agent-fanout - synchronous fan-out coordinator (#112 v1).
+tmux-agent-fanout - synchronous fan-out coordinator.
 
-Usage:
-  tmux-agent-fanout --prompt-file <prompt> --workdir <a> --workdir <b> [--workdir <c>]... \
+Canonical:
+  tmux-agent-fanout run --prompt-file <prompt> \
+                        (--agent claude:foo --agent codex:bar ... | --workdir <dir> ...) \
+                        [--result-dir <path>] [--summary-out <path>] \
+                        [--merge-mode all|first-success] \
+                        [--timeout <seconds>] [--name-prefix <p>]
+
+Legacy (back-compat):
+  tmux-agent-fanout --prompt-file <prompt> --workdir <a> [--workdir <b> ...] \
                     [--tool claude|codex] [--timeout <seconds>] [--name-prefix <p>]
 
-Spawns one agent per --workdir, sends the prompt, waits for each to
-write $TMUX_AGENT_RESULT, then emits a consolidated JSON:
+  Bare invocation forwards to `run` only when the legacy arg shape is
+  detected (--prompt-file + --workdir present, no --agent).
 
+Flags:
+  --prompt-file <path>   Prompt body sent to every spawned agent. Required.
+  --agent tool:name      Repeatable. tool ∈ {claude,codex}. Name is the
+                         agent label (also used as result subdir). When
+                         used WITHOUT --workdir, each agent runs in $PWD.
+                         When mixed with --workdir, --agent[i] pairs with
+                         --workdir[i] positionally.
+  --workdir <dir>        Repeatable working directory. Without --agent the
+                         tool defaults to claude:default-<i>.
+  --tool <claude|codex>  Legacy single-tool selector (applies when only
+                         --workdir is used). Default: claude.
+  --result-dir <path>    Directory for per-agent result.json files. Each
+                         agent writes <result-dir>/<name>-<i>/result.json.
+                         Default: $XDG_STATE_HOME/tmux-agent-tools/fanout/<run-id>/
+                         The chosen path is printed to stderr at start.
+  --summary-out <path>   Also write consolidated JSON to this path.
+  --merge-mode <mode>    all (default) or first-success. Custom/majority
+                         deferred — see docs/design-issue-184-fanout.md.
+  --timeout <seconds>    Per-run wait deadline. Default: 600.
+  --name-prefix <p>      Prefix for synthesized agent names. Default: fan.
+  -h, --help             Show this help.
+
+Summary JSON (stdout):
   {
     "schema_version": 1,
-    "tool": "<claude|codex>",
-    "prompt_file": "<path>",
-    "agents": [
-      {"workdir": "...", "name": "...", "exit_code": 0, "result": {...}, "error": null},
-      ...
-    ],
-    "at": "<ISO-8601 UTC>"
+    "run_id": "<id>",
+    "mode": "all|first-success",
+    "agents": [{"name":"...","tool":"...","status":"ok|failed|timeout",
+                "result_path":"...","error":"..."}],
+    "ok": true|false
   }
-
-Synchronous wait: this tool blocks until all agents complete or the
-timeout fires. No daemon process is spawned.
 EOF
 }
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# -------- Parse argv --------
+
+subcommand=""
+typeset -a raw_args
+raw_args=("$@")
+
+if (( $# == 0 )); then
+  usage
+  exit 0
+fi
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+  run) subcommand="run"; shift ;;
+  *)
+    # Legacy back-compat: forward to `run` if arg shape matches
+    # (no --agent, has --prompt-file and --workdir).
+    has_pf=0; has_wd=0; has_agent=0
+    for a in "${raw_args[@]}"; do
+      case "$a" in
+        --prompt-file) has_pf=1 ;;
+        --workdir) has_wd=1 ;;
+        --agent) has_agent=1 ;;
+      esac
+    done
+    if (( has_pf == 1 && has_wd == 1 && has_agent == 0 )); then
+      subcommand="run"
+    else
+      usage
+      exit 2
+    fi
+    ;;
+esac
+
+if [[ "$subcommand" != "run" ]]; then
+  usage
+  exit 2
+fi
+
 prompt_file=""
-typeset -a workdirs
+typeset -a workdirs agent_specs
 workdirs=()
-tool="codex"
+agent_specs=()
+tool_default="claude"
 timeout_s=600
 name_prefix="fan"
+result_dir=""
+summary_out=""
+merge_mode="all"
 
 while (( $# )); do
   case "$1" in
     --prompt-file) prompt_file="${2:-}"; shift 2 || true ;;
     --workdir)     workdirs+=("${2:-}"); shift 2 || true ;;
-    --tool)        tool="${2:-codex}"; shift 2 || true ;;
+    --agent)       agent_specs+=("${2:-}"); shift 2 || true ;;
+    --tool)        tool_default="${2:-claude}"; shift 2 || true ;;
     --timeout)     timeout_s="${2:-600}"; shift 2 || true ;;
     --name-prefix) name_prefix="${2:-fan}"; shift 2 || true ;;
+    --result-dir)  result_dir="${2:-}"; shift 2 || true ;;
+    --summary-out) summary_out="${2:-}"; shift 2 || true ;;
+    --merge-mode)  merge_mode="${2:-all}"; shift 2 || true ;;
     -h|--help|help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; exit 2 ;;
   esac
@@ -60,75 +137,216 @@ done
 if [[ -z "$prompt_file" ]]; then
   echo "--prompt-file required" >&2; exit 2
 fi
-if (( ${#workdirs[@]} == 0 )); then
-  echo "at least one --workdir required" >&2; exit 2
-fi
 if [[ ! -f "$prompt_file" ]]; then
   echo "prompt-file not found: $prompt_file" >&2; exit 1
 fi
-
-SCRIPT_DIR="${0:A:h}"
-case "$tool" in
-  claude) WRAPPER="$SCRIPT_DIR/claude-tmux" ;;
-  codex)  WRAPPER="$SCRIPT_DIR/codex-tmux" ;;
-  *) echo "--tool must be claude or codex" >&2; exit 2 ;;
+case "$merge_mode" in
+  all|first-success) ;;
+  *) echo "--merge-mode must be all|first-success" >&2; exit 2 ;;
 esac
 
-prompt_text="$(cat "$prompt_file")"
+# Build effective agent list: array of "tool:name:workdir".
+typeset -a agents_tool agents_name agents_workdir
+agents_tool=(); agents_name=(); agents_workdir=()
 
-# Spawn each agent.
-typeset -a agent_names
-agent_names=()
-ts="$(date +%s)"
-for i in {1..${#workdirs[@]}}; do
-  workdir="${workdirs[$i]}"
-  name="${name_prefix}-${ts}-${i}"
-  agent_names+=("$name")
-  if [[ ! -d "$workdir" ]]; then
-    echo "skipping (not a dir): $workdir" >&2
-    continue
+n_agents=${#agent_specs[@]}
+n_workdirs=${#workdirs[@]}
+
+if (( n_agents == 0 && n_workdirs == 0 )); then
+  echo "at least one --agent or --workdir required" >&2; exit 2
+fi
+
+# Determine count: max of the two; pair positionally where both present.
+count=$(( n_agents > n_workdirs ? n_agents : n_workdirs ))
+
+for i in {1..$count}; do
+  if (( i <= n_agents )); then
+    spec="${agent_specs[$i]}"
+    a_tool="${spec%%:*}"
+    a_name="${spec#*:}"
+    if [[ "$a_tool" == "$spec" || -z "$a_name" ]]; then
+      echo "--agent must be tool:name (got: $spec)" >&2; exit 2
+    fi
+  else
+    a_tool="$tool_default"
+    a_name="default-${i}"
   fi
-  "$WRAPPER" start --exact "$name" "$workdir" "$prompt_text" >/dev/null
+  case "$a_tool" in
+    claude|codex) ;;
+    *) echo "--agent tool must be claude|codex (got: $a_tool)" >&2; exit 2 ;;
+  esac
+  if (( i <= n_workdirs )); then
+    a_wd="${workdirs[$i]}"
+  else
+    a_wd="$PWD"
+  fi
+  agents_tool+=("$a_tool")
+  agents_name+=("$a_name")
+  agents_workdir+=("$a_wd")
 done
 
-# Synchronously wait for each agent's result.json. Bounded by timeout.
+# -------- Setup result directory --------
+
+run_id="${name_prefix}-$(date +%s)-$$"
+
+if [[ -z "$result_dir" ]]; then
+  base="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/fanout"
+  result_dir="$base/$run_id"
+fi
+mkdir -p "$result_dir"
+echo "tmux-agent-fanout: result-dir=$result_dir" >&2
+
+# -------- Resolve wrappers --------
+
+SCRIPT_DIR="${0:A:h}"
+wrapper_for() {
+  case "$1" in
+    claude) echo "$SCRIPT_DIR/claude-tmux" ;;
+    codex)  echo "$SCRIPT_DIR/codex-tmux" ;;
+  esac
+}
+
+# Test-mode override: when TMUX_AGENT_FANOUT_FAKE_WRAPPER is set, use it
+# in place of the real wrapper. Used by the smoke test to avoid spawning
+# real tmux sessions. The fake is invoked with the SAME argv shape as
+# the real wrapper start: `<fake> start --exact <name> <workdir> <prompt>`.
+fake_wrapper="${TMUX_AGENT_FANOUT_FAKE_WRAPPER:-}"
+
+prompt_text="$(cat "$prompt_file")"
+total=${#agents_name[@]}
+
+# -------- Spawn agents --------
+
+typeset -a session_names result_paths
+session_names=(); result_paths=()
+ts="$(date +%s)"
+
+for i in {1..$total}; do
+  a_tool="${agents_tool[$i]}"
+  a_name="${agents_name[$i]}"
+  a_wd="${agents_workdir[$i]}"
+  session_name="${a_name}-${ts}-${i}"
+  per_result_dir="$result_dir/${a_name}-${i}"
+  mkdir -p "$per_result_dir"
+  per_result_path="$per_result_dir/result.json"
+
+  session_names+=("$session_name")
+  result_paths+=("$per_result_path")
+
+  if [[ -n "$fake_wrapper" ]]; then
+    wrapper="$fake_wrapper"
+  else
+    wrapper="$(wrapper_for "$a_tool")"
+  fi
+
+  if [[ ! -d "$a_wd" ]]; then
+    echo "skipping (not a dir): $a_wd" >&2
+    continue
+  fi
+
+  # Tell the wrapper where to write result.json (real wrapper honors
+  # TMUX_AGENT_RESULT; fake wrapper honors the same env var).
+  TMUX_AGENT_RESULT="$per_result_path" \
+    "$wrapper" start --exact "$session_name" "$a_wd" "$prompt_text" >/dev/null 2>&1 || true
+done
+
+# -------- Wait and collect --------
+
 deadline=$(( $(date +%s) + timeout_s ))
-typeset -a agent_results
-agent_results=()
-for i in {1..${#workdirs[@]}}; do
-  workdir="${workdirs[$i]}"
-  name="${agent_names[$i]}"
-  result_path="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}/$name/result.json"
-  agent_result='{}'
-  exit_code=0
+typeset -a agent_statuses agent_errors
+agent_statuses=(); agent_errors=()
+
+first_success_seen=0
+
+for i in {1..$total}; do
+  per_result_path="${result_paths[$i]}"
+  status_val="ok"
   error_msg=""
-  while [[ ! -f "$result_path" ]]; do
+
+  while [[ ! -f "$per_result_path" ]]; do
     if (( $(date +%s) >= deadline )); then
-      exit_code=124
-      error_msg="timeout"
+      status_val="timeout"
+      error_msg="deadline exceeded"
       break
     fi
     /bin/sleep 1
   done
-  if [[ -f "$result_path" ]]; then
-    agent_result="$(cat "$result_path")"
+
+  if [[ -f "$per_result_path" ]]; then
+    # Inspect status in result.json; treat missing/unparsable as failed.
+    inner_status="$("$JQ" -r '.status // "unknown"' "$per_result_path" 2>/dev/null || echo "unknown")"
+    case "$inner_status" in
+      ok|success|completed) status_val="ok" ;;
+      *) status_val="failed"; error_msg="result.status=$inner_status" ;;
+    esac
   fi
-  agent_results+=("$("$JQ" -c -n --arg workdir "$workdir" --arg name "$name" \
-    --argjson exit_code "$exit_code" --argjson result "$agent_result" \
-    --arg error "$error_msg" \
-    '{workdir: $workdir, name: $name, exit_code: $exit_code, result: $result, error: (if $error == "" then null else $error end)}')")
-  "$WRAPPER" stop "$name" >/dev/null 2>&1 || true
+
+  agent_statuses+=("$status_val")
+  agent_errors+=("$error_msg")
+
+  if [[ "$status_val" == "ok" ]]; then
+    first_success_seen=1
+  fi
+
+  # NOTE: first-success mode does NOT kill remaining agents (per acceptance).
 done
 
-# Emit consolidated payload.
-agents_array="["
-for i in {1..${#agent_results[@]}}; do
-  agents_array+="${agent_results[$i]}"
-  (( i < ${#agent_results[@]} )) && agents_array+=","
-done
-agents_array+="]"
+# -------- Stop sessions (real wrapper only) --------
 
-"$JQ" -n --argjson agents "$agents_array" --arg tool "$tool" \
-  --arg prompt_file "$prompt_file" --arg at "$(iso_now)" \
-  '{schema_version: 1, tool: $tool, prompt_file: $prompt_file,
-    agents: $agents, at: $at}'
+if [[ -z "$fake_wrapper" ]]; then
+  for i in {1..$total}; do
+    a_tool="${agents_tool[$i]}"
+    session_name="${session_names[$i]}"
+    wrapper="$(wrapper_for "$a_tool")"
+    "$wrapper" stop "$session_name" >/dev/null 2>&1 || true
+  done
+fi
+
+# -------- Compute ok flag --------
+
+ok_flag="true"
+case "$merge_mode" in
+  all)
+    for i in {1..$total}; do
+      if [[ "${agent_statuses[$i]}" != "ok" ]]; then
+        ok_flag="false"; break
+      fi
+    done
+    ;;
+  first-success)
+    if (( first_success_seen == 0 )); then
+      ok_flag="false"
+    fi
+    ;;
+esac
+
+# -------- Build summary JSON --------
+
+agents_json="[]"
+for i in {1..$total}; do
+  entry="$("$JQ" -c -n \
+    --arg name "${agents_name[$i]}" \
+    --arg tool "${agents_tool[$i]}" \
+    --arg status "${agent_statuses[$i]}" \
+    --arg result_path "${result_paths[$i]}" \
+    --arg error "${agent_errors[$i]}" \
+    '{name:$name, tool:$tool, status:$status, result_path:$result_path,
+      error:(if $error == "" then null else $error end)}')"
+  agents_json="$("$JQ" -c -n --argjson arr "$agents_json" --argjson e "$entry" \
+    '$arr + [$e]')"
+done
+
+summary="$("$JQ" -n \
+  --arg run_id "$run_id" \
+  --arg mode "$merge_mode" \
+  --argjson agents "$agents_json" \
+  --argjson ok "$ok_flag" \
+  '{schema_version:1, run_id:$run_id, mode:$mode, agents:$agents, ok:$ok}')"
+
+if [[ -n "$summary_out" ]]; then
+  printf '%s\n' "$summary" >"$summary_out"
+fi
+
+printf '%s\n' "$summary"
+
+[[ "$ok_flag" == "true" ]]

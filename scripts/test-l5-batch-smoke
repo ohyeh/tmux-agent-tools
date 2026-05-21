@@ -24,7 +24,11 @@ assert() {
 echo "case: #112 fanout argv validation"
 code=0
 "$FANOUT" >/dev/null 2>&1 || code=$?
-assert "fanout no --prompt-file exit=2" "$code" "2"
+assert "fanout bare prints help exit=0" "$code" "0"
+
+code=0
+"$FANOUT" --bogus-flag >/dev/null 2>&1 || code=$?
+assert "fanout unknown-shape exit=2" "$code" "2"
 
 code=0
 "$FANOUT" --prompt-file /no/such --workdir /tmp >/dev/null 2>&1 || code=$?
