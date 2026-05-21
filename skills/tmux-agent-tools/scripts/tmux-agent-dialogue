@@ -470,9 +470,9 @@ capture_agent() {
 capture_agent_tail() {
   local label="$1"
   local agent="$2"
-  local lines="${3:-80}"
+  local tail_count="${3:-80}"
 
-  capture_agent "$label" "$agent" | tail -n "$lines"
+  capture_agent "$label" "$agent" | tail -n "$tail_count"
 }
 
 agent_session_exists() {
@@ -518,18 +518,18 @@ classify_failure_type() {
 summarize_previous() {
   local captured="$1"
   local max_lines=24
-  local -a lines
+  local -a out_lines
   local start=1
   local i
   local line
 
-  lines=("${(@f)captured}")
-  if (( ${#lines[@]} > max_lines )); then
-    start=$(( ${#lines[@]} - max_lines + 1 ))
+  out_lines=("${(@f)captured}")
+  if (( ${#out_lines[@]} > max_lines )); then
+    start=$(( ${#out_lines[@]} - max_lines + 1 ))
   fi
 
-  for (( i = start; i <= ${#lines[@]}; i++ )); do
-    line="${lines[$i]}"
+  for (( i = start; i <= ${#out_lines[@]}; i++ )); do
+    line="${out_lines[$i]}"
     [[ "$line" == \[TMUX_AGENT_DIALOGUE_*_DONE\] ]] && continue
     print -r -- "$line"
   done
@@ -592,9 +592,9 @@ limit_markdown_lines() {
   local max_lines="$2"
   [[ -n "$max_lines" ]] || { print -r -- "$body"; return; }
 
-  local -a lines
-  lines=("${(@f)body}")
-  if (( ${#lines[@]} <= max_lines )); then
+  local -a out_lines
+  out_lines=("${(@f)body}")
+  if (( ${#out_lines[@]} <= max_lines )); then
     print -r -- "$body"
     return
   fi
@@ -603,9 +603,9 @@ limit_markdown_lines() {
   local i
   for (( i = 1; i <= max_lines; i++ )); do
     if [[ -z "$limited" ]]; then
-      limited="${lines[$i]}"
+      limited="${out_lines[$i]}"
     else
-      limited="${limited}"$'\n'"${lines[$i]}"
+      limited="${limited}"$'\n'"${out_lines[$i]}"
     fi
   done
   limited="$(close_open_markdown_fence "$limited")"
@@ -626,11 +626,11 @@ limit_markdown_bytes() {
     return
   fi
 
-  local -a lines
+  local -a out_lines
   local line next candidate candidate_bytes
   local limited=""
-  lines=("${(@f)body}")
-  for line in "${lines[@]}"; do
+  out_lines=("${(@f)body}")
+  for line in "${out_lines[@]}"; do
     if [[ -z "$limited" ]]; then
       candidate="$line"
     else

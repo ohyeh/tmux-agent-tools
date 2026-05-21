@@ -1,14 +1,16 @@
 #!/usr/bin/env zsh
-# Lint: ban `local +(path|cdpath|fignore|fpath|manpath|psvar)=` in wrapper
-# helpers (issue #139). zsh ties these lowercase identifiers to their
-# uppercase env counterparts — `local path="..."` clobbers $PATH for the
-# rest of the scope, which bit us in #100 transcript work.
+# Lint: ban `local|typeset` declarations of zsh tied-pair names (issue #139).
+# zsh ties these lowercase identifiers to their uppercase env counterparts —
+# `local path="..."` clobbers $PATH for the rest of the scope, which bit us
+# in #100 transcript work. PR #194 introduced the multi-name form
+# `local path agent foo` which the old single-name+`=` regex missed (#196).
 #
-# Scope: files under skills/tmux-agent-tools/scripts/ and scripts/. Smoke
-# runners that intentionally do not declare these names are unaffected.
+# This widened lint tokenizes every `local`/`typeset` declaration, strips
+# flags (-i, -r, -a, -A, -g, etc.), and rejects ANY name in the blocklist —
+# with or without `=value`, single or multi-name.
 #
-# Exit 0 on clean, exit 1 on any violation. Outputs grep-style file:line
-# matches so a CI run can point at the offending lines directly.
+# Scope: files under skills/tmux-agent-tools/scripts/ and scripts/.
+# Exit 0 on clean, exit 1 on any violation. Outputs grep-style file:line.
 
 set -euo pipefail
 
@@ -20,38 +22,74 @@ TARGETS=(
   "$REPO_ROOT/scripts"
 )
 
-# Pattern: `local <space>* <name>=` where <name> is a zsh tied-pair var.
-# Matches `local path=` and `typeset path=` styles. Allows `local +A`-style
-# typed declarations to pass — those are syntactically distinct.
-TIED_NAMES='(path|cdpath|fignore|fpath|manpath|psvar)'
-PATTERN="(^|[[:space:]])(local|typeset)[[:space:]]+([[:alnum:]_]+[[:space:]]+)*${TIED_NAMES}="
+# zsh tied-pair lowercase names that shadow UPPERCASE env vars.
+# Start with the high-impact trio per #196; full tied set follows.
+TIED_NAMES=(path cdpath fignore fpath manpath psvar status lines)
 
-# `local` is only legal inside zsh functions; use `typeset` at top level
-# (per gemini CRITICAL R-prio finding on PR #149).
+# `local` is only legal inside zsh functions; use `typeset` at top level.
 typeset -i violations=0
-typeset match
-# Resolve this script's own absolute path so the skip check is exact,
-# not a substring match (gemini MEDIUM finding on PR #149).
 typeset SELF
 SELF="$(cd "$(dirname "${(%):-%x}")" && pwd)/$(basename "${(%):-%x}")"
+
+# awk filter: for each line declaring `local`/`typeset`, walk tokens after
+# the keyword, skip flag tokens (start with `-` or `+`), strip `=value`,
+# and emit `file:line:content` if any remaining name is in BLOCKLIST.
+read -r -d '' AWK_PROG <<'AWK' || true
+BEGIN {
+  n = split(blocklist, arr, ",")
+  for (i = 1; i <= n; i++) banned[arr[i]] = 1
+}
+{
+  line = $0
+  # Strip trailing comments (best effort — leaves quoted #s alone enough
+  # for our purposes; lint scope is shell scripts with simple comments).
+  sub(/[[:space:]]#.*$/, "", line)
+  # Find `local` or `typeset` as a standalone keyword.
+  if (match(line, /(^|[[:space:]])(local|typeset)[[:space:]]+/) == 0) next
+  rest = substr(line, RSTART + RLENGTH)
+  # Normalize shell terminators / braces into whitespace so `local path;`
+  # and `local foo; }` tokenize cleanly. We are not parsing shell — we
+  # only need clean name boundaries.
+  gsub(/[;{}()|&]/, " ", rest)
+  # Tokenize on whitespace.
+  m = split(rest, toks, /[[:space:]]+/)
+  for (i = 1; i <= m; i++) {
+    t = toks[i]
+    if (t == "") continue
+    # Skip flag tokens: -i, --, +A, etc.
+    if (substr(t, 1, 1) == "-" || substr(t, 1, 1) == "+") continue
+    # Strip `=value` (and anything after).
+    eq = index(t, "=")
+    if (eq > 0) name = substr(t, 1, eq - 1); else name = t
+    if (name in banned) {
+      printf("%s:%d:%s\n", FILENAME, FNR, $0)
+      next
+    }
+  }
+}
+AWK
+
+blocklist_csv="${(j:,:)TIED_NAMES}"
+
 for dir in "${TARGETS[@]}"; do
   [[ -d "$dir" ]] || continue
+  # Collect candidate files (skip binaries; everything in scripts/ is text).
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
-    # Skip self by exact absolute-path match on the `path:line:...` prefix.
     [[ "${match%%:*}" == "$SELF" ]] && continue
     printf '%s\n' "$match"
     violations=$((violations + 1))
-  done < <(grep -REn -e "$PATTERN" "$dir" --include='*' 2>/dev/null || true)
+  done < <(find "$dir" -type f -print0 2>/dev/null \
+    | xargs -0 awk -v blocklist="$blocklist_csv" "$AWK_PROG" 2>/dev/null || true)
 done
 
 if (( violations > 0 )); then
   echo
   echo "lint-no-path-tied-locals: $violations violation(s) found" >&2
-  echo "Banned: \`local <tied-name>=...\` where tied-name in zsh is one of:" >&2
-  echo "  path / cdpath / fignore / fpath / manpath / psvar" >&2
-  echo "These shadow + tie to their UPPERCASE env counterparts and silently break PATH." >&2
-  echo "Rename the local to something else (e.g. \`target\` instead of \`path\`)." >&2
+  echo "Banned: \`local <tied-name>\` where tied-name in zsh is one of:" >&2
+  echo "  ${TIED_NAMES[*]}" >&2
+  echo "These shadow + tie to their UPPERCASE env counterparts and silently break them." >&2
+  echo "Rename the local (e.g. \`target\` instead of \`path\`, \`check_status\` instead of \`status\`)." >&2
   exit 1
 fi
 

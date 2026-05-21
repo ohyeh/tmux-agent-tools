@@ -1,8 +1,14 @@
 #!/usr/bin/env zsh
-# Smoke for issue #139 lint. Verifies the lint:
+# Smoke for issue #139 + #196 lint. Verifies the lint:
 #   1. passes on the clean tree
-#   2. catches a synthetic violation when one is planted
-#   3. ignores its own pattern documentation
+#   2. catches single-name `local path=` violation
+#   3. catches multi-name `local path agent foo` violation (#196)
+#   4. catches mid-list `local foo path bar`
+#   5. catches `local path` with no `=value`
+#   6. catches `local -i status=0` (flag prefix)
+#   7. catches multi-assignment `local foo=1 path=2 bar=3`
+#   8. ignores safe renames: check_status, out_lines, wt_path, target
+#   9. ignores its own pattern documentation
 
 set -euo pipefail
 
@@ -24,49 +30,109 @@ assert() {
   fi
 }
 
+# Run the lint and capture (exit_code, stdout) into globals.
+run_lint() {
+  LINT_CODE=0
+  LINT_OUT="$("$LINT" 2>&1)" || LINT_CODE=$?
+}
+
+# Helper: assemble banned tokens at runtime so this smoke file stays
+# self-clean (the lint scans scripts/ which includes this file).
+b_path() { local n="p"; printf '%s' "${n}ath"; }
+b_status() { local n="sta"; printf '%s' "${n}tus"; }
+b_lines() { local n="lin"; printf '%s' "${n}es"; }
+
+plant() {
+  # $1 = filename suffix tag, $2 = file body
+  local tag="$1" body="$2"
+  local f="$REPO_ROOT/scripts/_tmp_lint_violator_${tag}_$$"
+  printf '#!/bin/sh\n%s\n' "$body" > "$f"
+  printf '%s\n' "$f"
+}
+
 # 1. Clean tree should pass
 echo "case: clean tree"
-code=0
-"$LINT" >/dev/null || code=$?
-assert "lint clean tree exit=0" "$code" "0"
+run_lint
+assert "lint clean tree exit=0" "$LINT_CODE" "0"
 
-# 2. Plant a synthetic violation under scripts/, lint must catch it,
-#    then remove. Use a temp script-like file.
-echo "case: synthetic violation caught"
-VIOLATOR="$REPO_ROOT/scripts/_tmp_lint_violator_$$"
-# Build the banned line at runtime so this smoke source file itself stays
-# clean and the lint does not flag the smoke as a violation.
-banned_name="p"; banned_name="${banned_name}ath"
-printf '#!/bin/sh\nsome_fn() {\n  local %s="$1"\n}\n' "$banned_name" > "$VIOLATOR"
-trap 'rm -f "$VIOLATOR"' EXIT
-code=0
-out="$("$LINT" 2>&1)" || code=$?
-assert "lint catches synthetic violation exit=1" "$code" "1"
-if [[ "$out" == *"_tmp_lint_violator_"* ]]; then
-  echo "  ok   lint output names violating file"
-  PASS=$((PASS + 1))
-else
-  echo "  FAIL lint output did not name violator" >&2
-  FAIL=$((FAIL + 1))
-fi
-rm -f "$VIOLATOR"
-trap - EXIT
+# Positive cases — each must be flagged.
+typeset -a VIOLATORS=()
+trap 'for f in "${VIOLATORS[@]}"; do rm -f "$f"; done' EXIT
 
-# 3. Tied-pair names that are NOT banned (e.g. `local target=`) should pass
-echo "case: rename-to-target passes"
-SAFE_FILE="$REPO_ROOT/scripts/_tmp_lint_safe_$$"
-cat > "$SAFE_FILE" <<'EOF'
+PATH_NAME="$(b_path)"
+STAT_NAME="$(b_status)"
+LINE_NAME="$(b_lines)"
+
+echo "case: single-name local <path>=foo"
+f="$(plant single "some_fn() { local ${PATH_NAME}=\"\$1\"; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "single-name flagged exit=1" "$LINT_CODE" "1"
+[[ "$LINT_OUT" == *"$(basename "$f")"* ]] && { echo "  ok   names violator"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL no violator name in output" >&2; FAIL=$((FAIL+1)); }
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+echo "case: bare local <path> (no assignment)"
+f="$(plant bare "some_fn() { local ${PATH_NAME}; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "bare-name flagged exit=1" "$LINT_CODE" "1"
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+echo "case: multi-name local <path> agent foo (#196)"
+f="$(plant multi1 "some_fn() { local ${PATH_NAME} agent foo; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "multi-name lead flagged exit=1" "$LINT_CODE" "1"
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+echo "case: multi-name local foo <path> bar"
+f="$(plant multi2 "some_fn() { local foo ${PATH_NAME} bar; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "multi-name middle flagged exit=1" "$LINT_CODE" "1"
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+echo "case: multi-assign local foo=1 <path>=2 bar=3"
+f="$(plant multi3 "some_fn() { local foo=1 ${PATH_NAME}=2 bar=3; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "multi-assign flagged exit=1" "$LINT_CODE" "1"
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+echo "case: local -i <status>=0 (with flag)"
+f="$(plant flag "some_fn() { local -i ${STAT_NAME}=0; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "flag-prefixed flagged exit=1" "$LINT_CODE" "1"
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+echo "case: local -a <lines>"
+f="$(plant arr "some_fn() { local -a ${LINE_NAME}; }")"
+VIOLATORS+=("$f")
+run_lint
+assert "array tied flagged exit=1" "$LINT_CODE" "1"
+rm -f "$f"; VIOLATORS=("${VIOLATORS[@]:#$f}")
+
+# Negative cases — safe renames must NOT be flagged.
+echo "case: safe renames pass (check_status, out_lines, wt_path, target)"
+SAFE="$REPO_ROOT/scripts/_tmp_lint_safe_$$"
+cat > "$SAFE" <<'EOF'
 some_fn() {
+  local check_status=0
+  local out_lines
+  local -a out_lines2
+  local wt_path="/tmp/x"
   local target="$1"
-  echo "$target"
+  local foo=bar_path baz_status=1
+  echo "$target $check_status $wt_path"
 }
 EOF
-trap 'rm -f "$SAFE_FILE"' EXIT
-code=0
-"$LINT" >/dev/null || code=$?
-assert "lint passes with safe name" "$code" "0"
-rm -f "$SAFE_FILE"
-trap - EXIT
+trap 'rm -f "$SAFE"; for f in "${VIOLATORS[@]}"; do rm -f "$f"; done' EXIT
+run_lint
+assert "safe renames exit=0" "$LINT_CODE" "0"
+rm -f "$SAFE"
+trap 'for f in "${VIOLATORS[@]}"; do rm -f "$f"; done' EXIT
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

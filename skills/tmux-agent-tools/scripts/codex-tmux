@@ -2691,15 +2691,15 @@ capture_session() {
   done
 
   local name="${1:-}"
-  local lines="${2:-80}"
+  local tail_count="${2:-80}"
 
   if [[ -z "$name" ]]; then
     echo "Usage: codex-tmux capture [--strip-ansi] [--since-marker <text>] [--json] <name> [lines]" >&2
     exit 2
   fi
 
-  if [[ ! "$lines" =~ '^[0-9]+$' || "$lines" -lt 1 ]]; then
-    echo "Invalid lines: $lines" >&2
+  if [[ ! "$tail_count" =~ '^[0-9]+$' || "$tail_count" -lt 1 ]]; then
+    echo "Invalid lines: $tail_count" >&2
     exit 2
   fi
 
@@ -2714,7 +2714,7 @@ capture_session() {
   fi
 
   local raw
-  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$lines")"
+  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$tail_count")"
 
   # Redact registered secret values (#189) before any downstream sink.
   secret_redact_load_for "$name"

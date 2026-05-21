@@ -21,11 +21,11 @@ assert() {
   fi
 }
 assert_file_exists() {
-  local label="$1" path="$2"
-  if [[ -f "$path" ]]; then
+  local label="$1" target="$2"
+  if [[ -f "$target" ]]; then
     echo "  ok   $label"; PASS=$((PASS + 1))
   else
-    echo "  FAIL $label missing=$path" >&2; FAIL=$((FAIL + 1))
+    echo "  FAIL $label missing=$target" >&2; FAIL=$((FAIL + 1))
   fi
 }
 
