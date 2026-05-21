@@ -1,0 +1,29 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "tmux-agent-fanout summary",
+  "description": "Consolidated JSON emitted by tmux-agent-fanout run (issue #184).",
+  "type": "object",
+  "required": ["schema_version", "run_id", "mode", "agents", "ok"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "run_id": {"type": "string"},
+    "mode": {"type": "string", "enum": ["all", "first-success"]},
+    "ok": {"type": "boolean"},
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "tool", "status", "result_path"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "tool": {"type": "string", "enum": ["claude", "codex"]},
+          "status": {"type": "string", "enum": ["ok", "failed", "timeout"]},
+          "result_path": {"type": "string"},
+          "error": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}
