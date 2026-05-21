@@ -298,6 +298,8 @@ Requirements:
 - `CLAUDE_TMUX_CLIPBOARD` / `CODEX_TMUX_CLIPBOARD` (`auto`, `internal`, or a copy command)
 - `CLAUDE_TMUX_STATUS_TAIL_LINES` / `CODEX_TMUX_STATUS_TAIL_LINES`
 - `TMUX_AGENT_TOOLS_PARTICIPANTS`
+- `TMUX_AGENT_TOOLS_AUDIT_LOG` / `AUDIT_LOG=1` / `--audit-log [PATH]` — enable hash-chained JSONL audit log (#188)
+- `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default 10485760), `TMUX_AGENT_TOOLS_AUDIT_RETAIN` (default 5)
 
 ## Secret injection (`--secret KEY=URI`, #189)
 
@@ -319,3 +321,21 @@ Safe example:
 codex-tmux start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
   agent-x ~/work
 ```
+
+## Audit log operator surface (#188)
+
+Both wrappers can write a hash-chained JSONL audit log. The `tmux-agent-audit`
+binary exposes the operator surface:
+
+```bash
+tmux-agent-audit verify [--log PATH]
+tmux-agent-audit query  [--since ISO] [--until ISO] [--tenant T] \
+                        [--agent A] [--tool T] [--event E] [--log PATH]
+tmux-agent-audit rotate [--log PATH] [--force]
+tmux-agent-audit path
+```
+
+Default log path: `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.
+Event schema (`schema_version: 1`) and rotation semantics are documented in
+`docs/design-issue-188-audit-surface.md`. `secret.read` events carry only
+`secret_name` + `backend`, never the value.

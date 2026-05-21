@@ -508,6 +508,35 @@ tmux-agent-dialogue github-comment --summary-file review-summary.md --github-pr 
 
 `--redact-pattern` can be repeated. Redaction and truncation notes are included in the generated Markdown, and the dry-run `github-comment` body is the same body used for `--post-github-comment`. `summarize --output-format json` keeps Markdown as the default format while adding top-level `schema_version: "1"` plus structured `turns`, `failures`, `metadata`, and `rendered_markdown` fields for scripts; `--summary-file` writes the selected format. `github-comment --output-format json` returns a structured local result with `status` (`dry_run`, `posted`, or `edited`), `action`, repository fields, rendered body metadata, and `comment_url` or `comment_id` only when available from `gh`; GitHub writes still require explicit `--post-github-comment`.
 
+### Audit log operator surface (`tmux-agent-audit`)
+
+Both wrappers ship a hash-chained JSONL audit log (#119). The
+`tmux-agent-audit` binary (#188) provides verify / query / rotation:
+
+```bash
+# enable: any of these works
+claude-tmux --audit-log /var/log/tmux-agent.jsonl start ...
+AUDIT_LOG=1 codex-tmux start ...                          # default path
+TMUX_AGENT_TOOLS_AUDIT_LOG=/path codex-tmux start ...     # v0.10 contract
+
+# verify chain integrity
+tmux-agent-audit verify --log /var/log/tmux-agent.jsonl
+
+# filter events
+tmux-agent-audit query --tool claude --event wrapper.start \
+                       --since 2026-05-21T00:00:00Z
+
+# print default path; force rotation (mostly for tests)
+tmux-agent-audit path
+tmux-agent-audit rotate --force
+```
+
+Default log path: `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.
+Size-based rotation triggers at `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default
+10MB), retaining `TMUX_AGENT_TOOLS_AUDIT_RETAIN` files (default 5). A
+`audit.rotation` HEAD-link record preserves the chain across rotations.
+Schema documented in `docs/design-issue-188-audit-surface.md`.
+
 ## Requirements
 
 - `zsh`

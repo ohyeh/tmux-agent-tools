@@ -49,7 +49,7 @@ run_audit() {
   assert "$prefix verify ok=true" "$(printf '%s' "$verify_out" | jq -r .ok)" "true"
 
   # Tamper with the log: change first event then verify should fail.
-  sed -i.bak 's/"event":"start"/"event":"tampered"/' "$audit_log"
+  sed -i.bak 's/"event":"wrapper.start"/"event":"tampered"/' "$audit_log"
   rm -f "$audit_log.bak"
   code=0
   "$wrapper" audit-verify "$audit_log" >/dev/null 2>&1 || code=$?
