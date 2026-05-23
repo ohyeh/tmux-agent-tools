@@ -1,0 +1,23 @@
+[
+  {"query": "我要在 ~/github/auth-service 開兩個 Claude Code worker 並行，一個處理 src/middleware/jwt.ts 的 refactor，另一個跑 packages/api 的 vitest，跑完讓他們互相 review 對方輸出再合一個 diff 給我", "should_trigger": true, "note": "claude+claude pair worker"},
+  {"query": "open a codex agent and a claude agent — codex critiques PR #482 in ~/work/billing-svc and claude responds, save transcript to /tmp/review.jsonl but don't post to github yet", "should_trigger": true, "note": "codex+claude pair-review"},
+  {"query": "two codex sessions debating four turns whether we migrate analytics/ingest off Kafka onto NATS, save the transcript, no winner picking", "should_trigger": true, "note": "codex+codex debate"},
+  {"query": "the session I named 'planner' has been running 20 min on my mac, grab the tail of its pane and strip the colour codes so I can paste into a confluence doc", "should_trigger": true, "note": "partial: capture --strip-ansi"},
+  {"query": "I started a long codex run earlier called migrator, can you make it wait for it to either print '[BACKFILL_OK]' or 'requires-confirmation' before continuing, up to 8 minutes", "should_trigger": true, "note": "partial: alternation wait + literal-bracket trap"},
+  {"query": "got a codex session id 019e4f8a-bbbb-7c70-9abc-ee0011223344 from yesterday, resume it inside a managed tmux pane named hotfix in ~/repos/svc-api", "should_trigger": true, "note": "partial: resume"},
+  {"query": "fan out the same design-doc question (paths.md) to one claude reviewer focused on UX, one codex on perf, one codex on security; aggregate their result files; no nested workers", "should_trigger": true, "note": "fanout three workers"},
+  {"query": "set up a worker that touches prod terraform but stops before apply until I echo 'approve' into /tmp/tf-gate.txt — give me the wrapper invocation, exit codes, and where the gate state file lives", "should_trigger": true, "note": "approval gate --pause-until-file"},
+  {"query": "kick off a quick claude session on host bastion-3 (the repo is at /srv/work/web), task is 'find the slowest 5 endpoints in src/routes', tmux should be local", "should_trigger": true, "note": "start-ssh"},
+  {"query": "list everything I have running across claude-tmux and codex-tmux right now, sort by tool then by state, machine-readable", "should_trigger": true, "note": "tmux-agent-sessions list --json --sort"},
+
+  {"query": "my .tmux.conf isn't loading the catppuccin theme on macOS, also status bar doesn't show battery — how do I fix?", "should_trigger": false, "note": "near-miss: tmux config not agent management"},
+  {"query": "write a python subprocess.Popen wrapper that launches an agent shell and captures stdout line by line", "should_trigger": false, "note": "near-miss: subprocess not tmux wrapper"},
+  {"query": "I'm building a multi-agent orchestration framework in Go using gRPC for inter-agent messaging — review my proto definitions", "should_trigger": false, "note": "near-miss: multi-agent but unrelated framework"},
+  {"query": "claude code keeps asking 'do you want to allow this tool' on every read — is there a setting in ~/.config/claude/settings.json to allowlist Read?", "should_trigger": false, "note": "near-miss: claude code permission UX, not tmux wrappers"},
+  {"query": "how do I get the codex CLI to use a different reasoning effort by default without passing the flag every time", "should_trigger": false, "note": "near-miss: codex config not session orchestration"},
+  {"query": "in my Node app I want to spawn a child process that runs `claude -p 'summarize this'` and capture the output — what's the cleanest way", "should_trigger": false, "note": "near-miss: spawning claude CLI but headless not tmux"},
+  {"query": "review the audit log format we use for our internal RBAC service — does hash-chained JSONL make sense or should we use a Merkle tree", "should_trigger": false, "note": "near-miss: audit/hash-chain but unrelated to wrappers"},
+  {"query": "I want two of my human teammates to do a structured debate on whether we adopt Bun — give me a facilitation script", "should_trigger": false, "note": "near-miss: debate but humans not agents"},
+  {"query": "my fanout in AWS Lambda → SQS → 12 workers is taking 45 sec end to end, profile help?", "should_trigger": false, "note": "near-miss: 'fanout' word but AWS, not tmux-agent-fanout"},
+  {"query": "is there a way to attach to an existing tmux session on a remote box without ssh-ing in manually first?", "should_trigger": false, "note": "near-miss: tmux + remote but generic tmux not agent management"}
+]

@@ -1,0 +1,124 @@
+# Multi-agent coordination
+
+Read this when orchestrating two or more agents — pair-review, critic, debate, dialogue, or fanout. The skill body lists when each preset applies; this file covers the contracts, profiles, and bounded-orchestration discipline.
+
+## Bounded orchestration (read first)
+
+These tools are for **long-running supervised tasks**, not for unbounded agent sprawl. Apply every constraint below before launching anything that spawns more than one worker.
+
+1. **Ask the user for tool + model + effort per worker before any `start`/`start-ssh`/`fanout run`.** Do not assume defaults. Example: "Worker A: claude or codex? which model tier? what reasoning effort?"
+2. **Declare an explicit worker upper bound up front** (e.g., "I will run at most 3 workers; if one is insufficient I will report back, not spawn helpers").
+3. **Forbid cascade spawning inside worker prompts.** Add a literal instruction to each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH to other hosts. Reason only from the provided context and write your conclusion to `$TMUX_AGENT_RESULT`." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
+4. **Bound the dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6). Unbounded debate is a smell.
+5. **Stop and report instead of spawning more workers.** If a task is not making progress, surface that to the user. Do not "try with more workers".
+
+## Dialogue presets
+
+All presets share the same local transcript flow. None of them post comments, merge PRs, or publish externally on their own.
+
+| Preset | Default turns | Speaking order | When to use |
+| --- | --- | --- | --- |
+| `dialogue` (bare) | user-chosen | A then B alternating | Generic two-party exchange where you control every flag |
+| `pair-review` | 2 | A reviews, B responds | One reviewer, one responder. `--swap` to flip. `--summary-file` for local Markdown summary |
+| `critic` | 4 (must be positive even) | A odd turns, B even | Bounded critique/response loop — A critiques, B responds, A critiques again, B responds. No winner. |
+| `debate` | 4 (must be positive even) | A odd turns, B even | Bounded back-and-forth argument. No winner selection. No arbitration. |
+
+For dry-runs and credential-free smoke tests, use `--agent-a fake --agent-b fake`. Real `codex`/`claude` participants only run with explicit user authorization.
+
+## Worker → dialogue bridge pattern (eval-1 gap)
+
+A common pattern is: spawn two workers in parallel, then have them review each other's output through a dialogue preset. The wrappers do NOT auto-feed worker pane contents into the dialogue — you bridge manually:
+
+```bash
+# 1. Start workers
+claude-tmux start --exact wA ~/repo 'Refactor src/auth/. Write $TMUX_AGENT_RESULT when done with summary+diff path.'
+claude-tmux start --exact wB ~/repo 'Run tests for src/auth/. Write $TMUX_AGENT_RESULT with pass/fail+failing-test list.'
+
+# 2. Wait for both to write result.json
+claude-tmux result --json --wait 600 wA > /tmp/wA.json
+claude-tmux result --json --wait 600 wB > /tmp/wB.json
+
+# 3. Build a review prompt that includes both results
+cat > /tmp/review-prompt.md <<EOF
+Worker A produced this refactor: $(jq -r .summary /tmp/wA.json)
+Worker B observed these test results: $(jq -r .summary /tmp/wB.json)
+Review whether A's diff is consistent with B's observations. Do not call any tmux-agent-tools wrappers. Do not start workers.
+EOF
+
+# 4. Run the cross-review dialogue
+tmux-agent-dialogue pair-review --workdir ~/repo \
+  --prompt-file /tmp/review-prompt.md \
+  --transcript /tmp/cross-review.jsonl \
+  --agent-a fake --agent-b fake   # use real claude/claude for real run
+```
+
+## Marker contract for real-agent dialogue
+
+Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. Keep the literal out of the sent prompt or split it in the prompt instructions so the prompt echo cannot satisfy the wait.
+
+If a marker wait times out, inspect the emitted `failure` JSONL event and the captured pane tail before declaring a protocol failure. `failure_type` is conservative diagnostic metadata, not proof of root cause.
+
+`critic` and `pair-review` do NOT document a separate marker contract — they reuse the dialogue split-marker pattern internally.
+
+## Validating a transcript
+
+Run before summarizing, sharing, or posting any transcript:
+
+```bash
+tmux-agent-dialogue validate-transcript --transcript <path>
+```
+
+This checks `schema_version=1` and structural correctness of the JSONL.
+
+## Participant profiles
+
+Profiles live at `~/.config/tmux-agent-tools/participants.json` by default, or at `TMUX_AGENT_TOOLS_PARTICIPANTS` / `--participants-config <path>`. Each top-level profile may contain only `agent`, `ssh`, `workdir`, `timeout`, and `env`; command-line flags override profile values.
+
+- `timeout` must be a positive integer string in seconds; applies only when the run does not pass `--timeout`.
+- `env` must be an object of newline-free string values keyed by shell environment names; passed to the local wrapper/session process.
+- For SSH participants, remote environment behavior depends on SSH and remote shell configuration. Do not rely on profile `env` as a secret transport.
+- Use only generic, reusable defaults. Do not encode personal project shortcuts in public docs or examples.
+
+## SSH participants
+
+One real agent can run remotely while tmux stays local:
+
+```bash
+tmux-agent-dialogue --turns 2 --workdir . \
+  --agent-a codex --agent-a-ssh example-host --agent-a-workdir /Users/example/github/project \
+  --agent-b claude \
+  --prompt-file prompt.md --transcript transcript.jsonl
+```
+
+Only real `codex` or `claude` participants can use `--agent-a-ssh` / `--agent-b-ssh`. `fake` is local-only. Remote workdirs must be absolute paths on the target host.
+
+## github-comment (no posting by default)
+
+For any existing `dialogue`, `pair-review`, `critic`, or `debate` transcript, prepare a GitHub PR comment body without posting:
+
+```bash
+tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo
+```
+
+Only add `--post-github-comment` when the user explicitly asks to publish.
+Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize` or `github-comment` when transcript content may be too large or sensitive to share raw. The generated Markdown includes visible truncation and redaction notes.
+
+## Fanout (one-to-many)
+
+`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix `claude:` and `codex:` in a single call) or one per `--workdir` (legacy single-tool form). Each child writes its own `result.json` under `--result-dir`; the parent emits a consolidated summary on stdout (schema: `schemas/fanout-summary.schema.json`).
+
+```bash
+tmux-agent-fanout run \
+  --prompt-file ./prompt.txt \
+  --agent claude:reviewer --workdir ~/repo \
+  --agent codex:refactor  --workdir ~/repo \
+  --result-dir /tmp/fanout-demo \
+  --merge-mode all
+```
+
+- `--merge-mode all` (default): `ok=true` iff every agent succeeds.
+- `--merge-mode first-success`: `ok=true` if any agent succeeds. Remaining agents continue (they are NOT killed) and are still recorded in the summary.
+- Failure isolation: each agent's `result.json` is preserved on disk even if a sibling fails or times out.
+- The wrappers have no `--no-cascade` flag. Enforce no-cascade by writing it into the prompt sent to every child.
+
+Daemon / async / supervisor-tree / cross-agent cancellation are deferred. See `docs/design-issue-184-fanout.md`.

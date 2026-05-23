@@ -1,0 +1,70 @@
+{
+  "skill_name": "tmux-agent-tools",
+  "notes": "Mixed-mode eval: subagent writes a command plan with rationale AND performs a fake-participant dry-run where applicable. Grader checks (1) presence of correct flags/subcommands in the plan, (2) dry-run exit/transcript when applicable.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "claude-claude-pair-worker",
+      "prompt": "Open two Claude Code workers in tmux for ~/github/project. Worker A refactors src/auth/ (smallest viable diff), Worker B simultaneously runs the related test suite. When both stop, have them review each other's pane output and produce one consolidated diff. Walk me through the exact tmux-agent-tools commands you would run, ask me anything you need to decide up front, then dry-run the coordination using fake participants for tmux-agent-dialogue and a fresh transcript path.",
+      "expected_output": "Plan uses claude-tmux start --exact for both workers; asks user for model+effort before spawning; uses wait + capture (not raw tmux send-keys); dialogue dry-run uses --agent-a fake --agent-b fake; declares a worker upper bound.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 2,
+      "name": "codex-claude-pair-review",
+      "prompt": "I want codex to review PR #123 on this repo first, then claude to respond to its critique. Save the full transcript and produce a PR comment body but do NOT post anything to GitHub. Show me the commands and dry-run with fake participants.",
+      "expected_output": "Uses tmux-agent-dialogue pair-review or dialogue with --agent-a codex --agent-b claude; uses github-comment (NOT --post-github-comment); dry-run uses fake/fake; validates transcript before summarizing.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 3,
+      "name": "codex-codex-debate-bounded",
+      "prompt": "Have two codex agents debate whether we should split this module into a microservice. Four turns total, save transcript. I do not want them to spawn more workers mid-debate.",
+      "expected_output": "Uses tmux-agent-dialogue debate (or dialogue --turns 4) with --agent-a codex --agent-b codex; explicit reminder that debate is bounded and does not pick a winner or cascade-spawn; dry-run with fake/fake.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 4,
+      "name": "partial-capture-only",
+      "prompt": "I have a tmux agent session called refactor that I started earlier. Grab the last 80 lines of its pane and strip ANSI escapes so I can paste it cleanly into a doc.",
+      "expected_output": "Uses claude-tmux capture refactor --tail 80 --strip-ansi (or codex-tmux variant); does NOT spawn anything new; does NOT use raw tmux capture-pane.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 5,
+      "name": "partial-wait-text-only",
+      "prompt": "My worker session has been running a while. Wait until it prints either [DONE] or 'Need approval', up to 5 minutes, then tell me which one fired.",
+      "expected_output": "Uses wait-text with a regex (because of the alternation) OR wait-literal twice; respects 300s timeout; uses status --json or capture afterwards to identify which marker fired; does NOT poll in a loop with tmux capture-pane.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 6,
+      "name": "partial-resume-existing-codex",
+      "prompt": "I have a Codex session ID 019e356f-f95d-7570-9784-ea7b58e404a5 that I want to continue in a managed tmux session called inspector, working in ~/repo.",
+      "expected_output": "Uses codex-tmux resume --exact inspector ~/repo 019e... ; not start; not start-ssh; not claude-tmux.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 7,
+      "name": "fanout-three-workers-bounded",
+      "prompt": "Same design-doc prompt, three reviewers in parallel: one claude general-review, one codex refactor-suggestions, one codex security-audit. Merge their result.json into one summary. I do not want the workers to spawn helpers of their own.",
+      "expected_output": "Uses tmux-agent-fanout run with three --agent specs (claude:..., codex:..., codex:...) and --merge-mode all; asks user for model+effort per worker before launching; explicit no-cascade reminder in prompt sent to workers.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 8,
+      "name": "approval-gate-boundary",
+      "prompt": "Run a codex worker that will modify production config. Before it applies anything it must stop and wait for me to write 'approve' or 'reject' to /tmp/agent/approve.txt, with a 30 minute timeout. Show me how to set this up and how I issue the approval.",
+      "expected_output": "Uses wait-and-capture --pause-until-file with --pause-timeout 1800; explains exit codes 0/7/8; explains approval-status.json location; reminds operator to authorize destructive work; does NOT add --secret-redact=false.",
+      "files": [],
+      "assertions": []
+    }
+  ]
+}

@@ -1,84 +1,74 @@
 ---
 name: tmux-agent-tools
-description: Use when Codex needs to run, supervise, or coordinate Claude Code or Codex CLI through local tmux sessions using the claude-tmux and codex-tmux wrappers. Triggers include starting named agent sessions, sending prompts to an existing tmux agent, waiting for terminal stability, capturing pane output, listing agent sessions, stopping sessions, or using start-ssh to keep tmux local while running the CLI on a remote host.
+description: Use when running, supervising, or coordinating Claude Code or Codex CLI as managed tmux workers — including any mix of claude+claude, codex+claude, or codex+codex collaboration via pair-review, critic, debate, dialogue, or fanout. Also use for any single-command operation against a managed tmux agent session: start / start-ssh / resume to launch (including resuming a prior agent by session ID or name), send / send-wait-literal to feed prompts, wait / wait-text / wait-literal / wait-and-capture to wait for pane stability or specific output strings/markers, capture (with --tail / --strip-ansi / --since-marker) to read pane output, status / status --json / doctor / self-test to inspect health, tmux-agent-sessions list to enumerate running sessions, stop / cleanup to tear down, and --pause-until-file for human approval gates. Trigger on intent to supervise AI coding agents as background processes via tmux — NOT on general tmux config or theming, shell scripting or subprocess wrappers, headless `claude -p`/`codex` spawned without tmux, or human team coordination/debate. The distinctive signal is "claude-tmux or codex-tmux as the execution layer" managing the full lifecycle from start through capture, wait, health-check, and teardown. This is the canonical interface for managed agent sessions — prefer the wrappers over hand-written tmux send-keys flows even when only one subcommand is needed.
 ---
 
 # Tmux Agent Tools
 
 ## Overview
 
-Use `claude-tmux` and `codex-tmux` as the canonical interface for long-running Claude Code or Codex CLI sessions in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, and cleanup commands.
+Use `claude-tmux` and `codex-tmux` as the canonical interface for any long-running Claude Code or Codex CLI session in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, secret injection, and cleanup.
 
-Use `tmux-agent-dialogue` when the task needs a bounded two-party dialogue with a JSONL transcript. Use `fake` participants for credential-free smoke tests. Run real `codex` and `claude` participants only for explicit manual smoke tests or when the user asks for a real-agent dialogue. Run `tmux-agent-dialogue validate-transcript --transcript <path>` before summarizing, sharing, or posting a transcript. Treat `failure_type` as conservative diagnostic metadata, not proof of root cause.
-
-Use `tmux-agent-sessions list` for a read-only inventory across Claude, Codex, and dialogue sessions. Claude and Codex inventory rows reuse wrapper status fields and add `state` so exited-but-capturable sessions are visible before cleanup. Use `--tool`, `--name`, `--state`, and `--sort <tool|name|session|state>` when a script needs stable list output. Use `tmux-agent-sessions cleanup --preview` before any bulk cleanup, and only use `cleanup --execute --all` or filtered execution when the user has authorized stopping tool-owned sessions.
+Use `tmux-agent-dialogue` (and its `pair-review` / `critic` / `debate` presets) when the task is a bounded two-party exchange with a JSONL transcript. Use `tmux-agent-fanout` for parallel one-to-many work. Use `tmux-agent-sessions` for read-only inventory across all wrappers.
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 
-The wrapper scripts are bundled with this skill at:
+The wrapper scripts are bundled at:
 
 - `scripts/claude-tmux`
 - `scripts/codex-tmux`
 - `scripts/tmux-agent-dialogue`
 - `scripts/tmux-agent-sessions`
+- `scripts/tmux-agent-fanout`
 
-If the commands are not installed on `PATH`, resolve them from the skill directory and run the script path directly.
-
-## Command Choice
-
-- Use `claude-tmux` when the requested worker should run Claude Code.
-- Use `codex-tmux` when the requested worker should run Codex CLI.
-- Use `start` for a local working directory.
-- Use `claude-tmux resume` when an existing Claude Code session ID should continue inside a managed tmux session.
-- Use `codex-tmux resume` when an existing Codex session ID should continue inside a managed tmux session.
-- Use `start-ssh` when the tmux session should stay local but the agent CLI should run through SSH on another machine.
+If the commands are not on `PATH`, resolve them from the skill directory and run the script path directly.
 
 ## When Not To Use
 
-- Do not use tmux for one-off non-interactive shell commands; run those directly.
-- Do not start a new tmux agent when a simple file read, search, test, or build command is enough.
-- Do not use these wrappers for externally visible, destructive, or privacy-sensitive work unless the user has already authorized that work.
+- One-off non-interactive shell commands — run them directly.
+- A simple file read, search, test, or build command — don't spawn a tmux agent for it.
+- Externally visible, destructive, or privacy-sensitive work unless the user has already authorized it.
+
+## Command Choice
+
+- `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI.
+- `start` for a local working directory; `start-ssh` when tmux stays local but the CLI runs over SSH.
+- `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
+- The subcommands `send`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
+- If you don't know which wrapper owns a session, `tmux-agent-sessions list --name <n>` resolves it.
 
 ## Core Workflow
 
-1. Start a session with a short stable name:
+1. **Start** with a short stable name:
 
 ```bash
-codex-tmux start --exact worker ~/github/project 'Read the repo and report the failing test.'
-```
-
-Resume an existing Claude Code session inside tmux:
-
-```bash
+codex-tmux start --exact worker ~/github/project 'Read the repo and report the failing test. Write $TMUX_AGENT_RESULT when done.'
 claude-tmux resume --exact worker ~/github/project ee5aca88-a1af-48d3-af21-54f60d618f22
 ```
 
-Resume an existing Codex session inside tmux:
-
-```bash
-codex-tmux resume --exact worker ~/github/project 019e356f-f95d-7570-9784-ea7b58e404a5
-```
-
-2. Send follow-up work without attaching:
+2. **Send** follow-up work without attaching:
 
 ```bash
 codex-tmux send worker 'Now implement the smallest fix and run the targeted test.'
 codex-tmux send-wait-literal worker 'End with the split marker described here.' '[CODEX-01]' 180
 ```
 
-3. Wait for visible pane stability before reading output:
+Use `send-wait-literal` for marker-driven orchestration when stale pane content may already contain an older marker. Keep the literal out of the sent prompt (or split it in the prompt instructions) so the prompt echo cannot satisfy the wait.
+
+3. **Wait** for pane stability or a marker before reading output:
 
 ```bash
-codex-tmux wait worker 180
-codex-tmux wait-text worker 'Done|Need approval' 180
-codex-tmux wait-text --literal worker '[CODEX-01]' 180
-codex-tmux wait-literal worker '[CODEX-01]' 180
-codex-tmux capture worker 120
+codex-tmux wait worker 180                                # idle stability
+codex-tmux wait-literal worker '[CODEX-01]' 180           # literal marker
+codex-tmux wait-text --literal worker '[CODEX-01]' 180    # same, explicit
+codex-tmux wait-and-capture --literal --marker '[DONE]' --tail 80 --strip-ansi --json worker 180
 ```
 
-Use `send-wait-literal` for marker-driven orchestration when stale pane content may already contain an older marker. Keep the literal out of the sent prompt or split it in the prompt instructions so the prompt echo itself cannot satisfy the wait. If multiline prompts remain in a CLI input box instead of submitting, increase `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY`.
+`wait-literal` (or `wait-text --literal`) is required when the marker contains regex metacharacters like `[`, `]`, `(`, `)`, `.`, `*`, `?`. Use plain `wait-text` only when you intentionally want regex matching.
 
-4. Inspect status or clean up:
+For **alternation markers** (e.g. wait for `[DONE]` OR `Need approval`), use `wait-and-capture` with an escaped regex; do NOT race two `wait-literal` calls. See `references/cheatsheets.md` for the worked example.
+
+4. **Inspect or clean up**:
 
 ```bash
 codex-tmux status worker
@@ -88,10 +78,19 @@ codex-tmux self-test
 codex-tmux stop worker
 ```
 
-Use `wait-text --literal` or `wait-literal` when the expected text contains regex metacharacters such as `[`, `]`, `(`, `)`, `.`, `*`, or `?`. Use regex `wait-text` only when regex matching is intentional.
+`status --json` is the stable automation contract. Treat `running:false` as authoritative even if the tmux session still exists for capture.
 
-For a human-in-the-loop approval gate, pause `wait-and-capture` until an
-operator writes a decision file (issue #185):
+5. **Read the agent's structured result** instead of scraping the pane:
+
+```bash
+codex-tmux result --field '.status' --wait 30 --json worker
+```
+
+Agents should write `$TMUX_AGENT_RESULT` (a JSON file at `$TMUX_AGENT_DIR/<name>/result.json`) with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+
+## Approval gates
+
+To pause a worker until a human writes a decision file:
 
 ```bash
 marker=/tmp/agent-7/approve.txt
@@ -99,258 +98,54 @@ codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
   --pause-until-file "$marker" --pause-timeout 1800 worker
 # Operator (another shell): echo approve > "$marker"  → exit 0
 #                           echo reject  > "$marker"  → exit 7
-# --pause-timeout fires     →                            exit 8
+# Timeout fires             →                            exit 8
 ```
 
-While blocked, `$TMUX_AGENT_DIR/<name>/approval-status.json` shows
-`state: "awaiting_approval"`. See `docs/design-issue-185-approval-gate.md`.
+While blocked, `$TMUX_AGENT_DIR/<name>/approval-status.json` reports `state: "awaiting_approval"`. Use this gate for any destructive/irreversible action a worker is about to take.
 
-`status --json` is the stable automation contract for both wrappers. Expect the shared fields `tool`, `name`, `session`, `prefix`, `exists`, `running`, `exit_detected`, `local_or_remote`, and `diagnostic`. Treat `local_or_remote` and `diagnostic` as best-effort diagnostics; the other fields are stable. `running` is false when the pane shows the wrapper's local or remote exit-code marker even if the tmux session still exists for capture.
+## Orchestrator playbook (multi-agent collaboration)
 
-5. For bounded two-agent dialogue, write a prompt file and transcript path:
+These tools are for **long-running supervised work**, not for unbounded agent sprawl. Before spawning more than one worker — including any `dialogue` / `pair-review` / `critic` / `debate` / `fanout` — apply all four rules:
 
-```bash
-tmux-agent-dialogue --turns 4 --workdir . --agent-a fake --agent-b fake --prompt-file prompt.md --transcript transcript.jsonl
-```
+1. **Ask the user up front: tool (claude or codex), model tier, and effort/reasoning level per worker.** Never assume defaults.
+2. **Declare an explicit worker upper bound** (e.g., "I will run at most 3 workers; if that is insufficient I will stop and report, not spawn helpers").
+3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write `$TMUX_AGENT_RESULT` when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
+4. **Bound dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6).
 
-For a manual real-agent smoke after explicit authorization:
+For credential-free smoke tests of any preset, use `--agent-a fake --agent-b fake`. Real `codex` / `claude` participants only after explicit user authorization.
 
-```bash
-tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
-```
+Cross-review pattern (workers produce → dialogue reviews): see `references/multi-agent.md`. Fanout details, dialogue presets, SSH participants, participant profiles, and `github-comment` (which never posts without `--post-github-comment`): same file.
 
-Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. If a marker wait times out, inspect the emitted `failure` JSONL event and captured pane tail before treating the run as a protocol failure.
+Always run `tmux-agent-dialogue validate-transcript --transcript <path>` before summarizing, sharing, or posting a transcript.
 
-Use participant profiles only for generic, reusable defaults. Profiles live at `~/.config/tmux-agent-tools/participants.json` by default, or at `TMUX_AGENT_TOOLS_PARTICIPANTS` / `--participants-config <path>`. Each top-level profile may contain only `agent`, `ssh`, `workdir`, `timeout`, and `env`; command-line flags override profile values. `timeout` must be a positive integer string in seconds and applies only to that participant when the run does not pass `--timeout`. `env` must be an object of newline-free string values keyed by shell environment names and is passed to the local wrapper/session process. For SSH participants, remote environment behavior depends on SSH and remote shell configuration, so do not rely on profile env as a secret transport. Do not encode personal project shortcuts in public docs or examples.
+## Safety
 
-Use participant SSH options when one real agent should run remotely while tmux stays local:
+- Both wrappers run their CLIs with permissive flags (`--dangerously-skip-permissions` for Claude, `--yolo` for Codex). Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations without explicit user authorization.
+- `claude-tmux status <name>` reports a `diagnostic` when the pane looks like it is waiting for a first-run or permission confirmation. It does NOT auto-accept that prompt.
+- Prefer `doctor` and `self-test` before debugging agent behavior; they verify wrapper dependencies and tmux capture/wait without starting a real agent.
+- For secret injection (`--secret KEY=URI`) and audit log enablement (`TMUX_AGENT_TOOLS_AUDIT_LOG`): see `references/security.md`. Missing secrets fail closed before the session is created.
 
-```bash
-tmux-agent-dialogue --turns 2 --workdir . --agent-a codex --agent-a-ssh example-host --agent-a-workdir /Users/example/github/project --agent-b claude --prompt-file prompt.md --transcript transcript.jsonl
-```
-
-Only real `codex` or `claude` participants can use `--agent-a-ssh` or `--agent-b-ssh`; `fake` is local-only. Remote workdirs must be absolute paths on the target host.
-
-For a local review preset that only writes a transcript and terminal summary:
-
-```bash
-tmux-agent-dialogue pair-review --workdir . --prompt-file review.md --transcript review.jsonl
-```
-
-`pair-review` does not post comments, merge PRs, or publish externally. Use `--swap` when agent B should speak first and agent A should respond. Use `--summary-file <path>` for a local Markdown summary.
-
-Use `critic` when the user wants a bounded critique/response loop without any external action:
-
-```bash
-tmux-agent-dialogue critic --workdir . --prompt-file review.md --transcript critic.jsonl
-```
-
-`critic` defaults to four turns. Agent A speaks on odd turns, agent B speaks on even turns, and custom `--turns` values must be positive even numbers. It is only a preset over the same local transcript flow; it does not post comments, merge PRs, schedule work, or continue unbounded.
-
-Use `debate` when the user wants a bounded back-and-forth argument without winner selection or external action:
-
-```bash
-tmux-agent-dialogue debate --workdir . --prompt-file review.md --transcript debate.jsonl
-```
-
-`debate` defaults to four turns. Agent A speaks on odd turns, agent B speaks on even turns, and custom `--turns` values must be positive even numbers. It is only a preset over the same local transcript flow; it does not post comments, merge PRs, schedule work, pick a winner, arbitrate the result, or continue unbounded.
-
-For any existing `dialogue`, `pair-review`, `critic`, or `debate` transcript, prepare a GitHub PR comment body without posting:
-
-```bash
-tmux-agent-dialogue github-comment --transcript review.jsonl --github-pr 123 --github-repo owner/repo
-```
-
-Only add `--post-github-comment` when the user explicitly asks to publish the summary to GitHub.
-Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize` or `github-comment` when transcript content may be too large or sensitive to share raw. The generated Markdown includes visible truncation and redaction notes.
-
-## Scenario → command cheatsheet (issue #106)
-
-Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focused per-subcommand cheatsheet instead of dumping the full usage.
-
-| Scenario | Command |
-| --- | --- |
-| Know when an agent finished across processes | `start --sentinel /tmp/x.exit` + watch the file |
-| Run code at agent start | `start --on-start 'cmd'` (#101a) |
-| Run code at agent exit | `start --sentinel ... --on-exit 'cmd'` (#95) |
-| Get the last 80 lines of pane | `capture --tail 80` |
-| Strip ANSI for token-efficient capture | `capture --strip-ansi --since-marker '[T02]'` (#96) |
-| Wait for marker AND get tail in one call | `wait-and-capture --marker '[DONE]' --tail 80 --json` (#99) |
-| Read the agent's structured result | `result --field '.status' --wait 30 --json <name>` (#97) |
-| Check if agent is stuck | `status --json <name>` then read `idle_seconds` (#98) |
-| Record every wrapper event to disk | `start --transcript /tmp/run.jsonl` (#100) |
-| Per-subcommand cheatsheet | `claude-tmux help <subcommand>` (#106) |
-
-## Token-efficient patterns (#107)
-
-Default capture dumps raw scrollback — most of those tokens are ANSI escapes, banners, and pre-marker noise. Prefer the structured paths:
-
-| Pattern | Why it saves tokens |
-| --- | --- |
-| Agent writes `$TMUX_AGENT_RESULT` (a JSON file), parent reads the file (#97) | Parent never reads pane scrollback. Token cost = result body, not pane history. |
-| `capture --strip-ansi --since-marker '[T02]' --tail 80` (#96) | Strips CSI/SGR + trims pre-marker noise BEFORE returning. |
-| `wait-and-capture --marker '[DONE]' --tail 80 --strip-ansi --json` (#99) | One round-trip for "is it done + here is the relevant tail". |
-| `status --json` + `idle_seconds` / `marker_seen[]` (#98) | Liveness without reading any pane bytes. |
-| `--transcript /tmp/run.jsonl` (#100) | All wrapper events go to disk; replay later without re-capture. |
-
-## Completion signaling matrix (#107)
-
-| Need | Use | Cost | Cross-process |
-| --- | --- | --- | --- |
-| "Is pane idle?" | `status --json` → `idle_seconds` (#98) | 1 capture-pane | yes |
-| "Did marker appear?" | `wait-literal <text>` | poll until found | no (in-process) |
-| "Marker + tail in one call" | `wait-and-capture --marker ... --tail N` (#99) | poll + 1 capture | no |
-| "Notify when CLI exits" | `start --sentinel /path` (#95); watch the file | filesystem-event | yes |
-| "Run code on CLI exit" | `start --sentinel ... --on-exit 'cmd'` (#95) | hook runs in pane shell | yes |
-| "Run code on CLI start" | `start --on-start 'cmd'` (#101a) | detached subshell | yes |
-| "Aggregate inventory state" | `tmux-agent-sessions list --json` | one pass over sessions | yes |
-
-## Result file contract (#107, builds on #97)
-
-Agents should write `$TMUX_AGENT_RESULT` (path is `$TMUX_AGENT_DIR/<name>/result.json`) with this shape:
-
-```jsonc
-{
-  "schema_version": 1,
-  "status": "ok" | "blocked" | "error",
-  "summary": "one-line human-readable summary",
-  "artifacts": [{"kind": "pr|file|url", "ref": "PR-1234"}],
-  "errors": [{"code": "...", "message": "...", "remediation": "..."}]
-}
-```
-
-Parent reads it via `result --json --wait <seconds> <name>` and branches on `.present` (file existed) then `.valid` (parsed as JSON) before consuming `.body`.
-
-## Failure mode cheatsheet (#107)
-
-| Symptom | Likely cause | First action |
-| --- | --- | --- |
-| `wait-text` times out but pane has the text | regex metachar in marker | switch to `wait-literal` or `wait-text --literal` |
-| `wait-literal` returns immediately | stale marker from previous turn | use `send-wait-literal` instead |
-| `status --json` says `running:true` but no progress | CLI sitting on a permission prompt | check `diagnostic` field (`confirmation_detected`); attach + answer |
-| `--on-exit` hook never logged | `--on-exit` set without `--sentinel` | the wrapper warns and ignores; add `--sentinel <path>` |
-| `result.json` missing after agent says "done" | agent never wrote `$TMUX_AGENT_RESULT` | re-prompt with explicit "write $TMUX_AGENT_RESULT before signaling done" |
-| Pane shows exit code marker but session lingers | normal — wrapper keeps the pane open for inspection | `stop <name>` to clean up |
-
-## Fan-out across mixed wrappers (#184)
-
-`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix
-`claude:` and `codex:` in a single call) or one per `--workdir` (legacy
-single-tool form). Each child writes its own `result.json` under
-`--result-dir`; the parent emits a consolidated summary on stdout
-(schema: `schemas/fanout-summary.schema.json`).
-
-```bash
-tmux-agent-fanout run \
-  --prompt-file ./prompt.txt \
-  --agent claude:reviewer --workdir ~/repo \
-  --agent codex:refactor  --workdir ~/repo \
-  --result-dir /tmp/fanout-demo \
-  --merge-mode all
-```
-
-- `--merge-mode all` (default): `ok=true` iff every agent succeeds.
-- `--merge-mode first-success`: `ok=true` if any agent succeeds.
-  Remaining agents continue (they are NOT killed) and are still
-  recorded in the summary.
-- Failure isolation: each agent's `result.json` is preserved on disk
-  even if a sibling fails or times out.
-
-Daemon / async / supervisor-tree / cross-agent cancellation remain
-deferred — see `docs/design-issue-184-fanout.md`.
-
-## Concurrency model (#107)
-
-- Single caller per agent name. Two `start --exact same-name` kills the first session.
-- Wrapper state under `$TMUX_AGENT_DIR/<name>/` (`started_at`, `marker_seen`, `transcript-path`, etc.) is NOT lock-protected today. Don't share one agent name across two orchestrators.
-- The `marker_seen` FIFO is capped at 100 entries (#98) — oldest evicted first.
-- Multiple agents under different names are independent; `tmux-agent-sessions list --json` is a safe read across all of them.
-
-## Cost accounting (#107)
-
-- Per-turn usage capture (#103) is design-only today. When it lands, usage goes to `$TMUX_AGENT_DIR/<name>/usage.jsonl` with `schema_version: 1` and is aggregated via `status --usage` / `usage --top N`.
-- `--max-runtime` / `--max-idle` / `--max-cost` fuses (#105) are roadmap, not implemented.
-- For now, account cost via: transcript size as proxy + your provider's billing dashboard.
-
-## Session Naming
+## Session naming
 
 - Without `--exact`, `start` appends a random suffix to avoid collisions.
 - With `--exact`, the session uses the requested name exactly under the tool prefix.
-- `send`, `capture`, `wait`, `status`, `attach`, and `stop` take the agent name, not the full tmux session name.
+- **Single caller per agent name.** Two `start --exact same-name` kills the first. Wrapper state under `$TMUX_AGENT_DIR/<name>/` is NOT lock-protected.
 
-## Remote Sessions
+## Remote sessions
 
-Use `start-ssh` when the target repo is on another host:
+`start-ssh` when the target repo is on another host:
 
 ```bash
 claude-tmux start-ssh --exact review example-host ~/github/project 'Review the diff and return findings only.'
 ```
 
-Requirements:
+Requirements: local `tmux`; remote shell can resolve `claude` or `codex` on `PATH`; SSH target preconfigured.
 
-- local machine has `tmux`;
-- remote shell can resolve `claude` or `codex` on `PATH`;
-- SSH target is already configured.
+## References
 
-## Safety
+Load these only when you hit the relevant scenario — they are not needed for routine use:
 
-- These wrappers launch agent CLIs with permissive flags: Claude uses `--dangerously-skip-permissions`; Codex uses `--yolo`.
-- Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations unless the user explicitly authorized that work.
-- Prefer `capture` and `status` before assuming a worker is done.
-- `claude-tmux status <name>` reports a diagnostic when the pane appears to be waiting for a Claude first-run or permission confirmation. It does not auto-accept that prompt.
-- Prefer `doctor` and `self-test` before debugging agent behavior; they verify wrapper dependencies and tmux capture/wait behavior without starting a real agent.
-
-## Environment Overrides
-
-- `TMUX=/path/to/tmux`
-- `CLAUDE=/path/to/claude`
-- `CODEX=/path/to/codex`
-- `CLAUDE_TMUX_PREFIX` / `CODEX_TMUX_PREFIX`
-- `CLAUDE_TMUX_STABLE_SECONDS` / `CODEX_TMUX_STABLE_SECONDS`
-- `CLAUDE_TMUX_SUBMIT_DELAY` / `CODEX_TMUX_SUBMIT_DELAY`
-- `CLAUDE_TMUX_CONF` / `CODEX_TMUX_CONF`
-- `CLAUDE_TMUX_MOUSE` / `CODEX_TMUX_MOUSE`
-- `CLAUDE_TMUX_CLIPBOARD` / `CODEX_TMUX_CLIPBOARD` (`auto`, `internal`, or a copy command)
-- `CLAUDE_TMUX_STATUS_TAIL_LINES` / `CODEX_TMUX_STATUS_TAIL_LINES`
-- `TMUX_AGENT_TOOLS_PARTICIPANTS`
-- `TMUX_AGENT_TOOLS_AUDIT_LOG` / `AUDIT_LOG=1` / `--audit-log [PATH]` — enable hash-chained JSONL audit log (#188)
-- `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default 10485760), `TMUX_AGENT_TOOLS_AUDIT_RETAIN` (default 5)
-
-## Secret injection (`--secret KEY=URI`, #189)
-
-`claude-tmux start` and `codex-tmux start` accept `--secret KEY=URI` to inject
-a value into the tmux session env. Backends: `file:<path>`, bare `<path>`
-(backcompat = file:), `env-file:<path>`, `op://...` (1Password `op read`), and
-`keychain:<account>/<service>` (macOS only).
-
-Missing backend CLI or missing key/file aborts with a non-zero exit before
-the tmux session is created. Registered secret values are redacted from
-`capture` output and transcript events as `[REDACTED:KEYNAME]`. Use
-`--secret-redact=false` to bypass for debugging (loud stderr warning).
-When `TMUX_AGENT_TOOLS_AUDIT_LOG` is set, a `secret.read` event records the
-key and backend label only — never the value.
-
-Safe example:
-
-```bash
-codex-tmux start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
-  agent-x ~/work
-```
-
-## Audit log operator surface (#188)
-
-Both wrappers can write a hash-chained JSONL audit log. The `tmux-agent-audit`
-binary exposes the operator surface:
-
-```bash
-tmux-agent-audit verify [--log PATH]
-tmux-agent-audit query  [--since ISO] [--until ISO] [--tenant T] \
-                        [--agent A] [--tool T] [--event E] [--log PATH]
-tmux-agent-audit rotate [--log PATH] [--force]
-tmux-agent-audit path
-```
-
-Default log path: `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.
-Event schema (`schema_version: 1`) and rotation semantics are documented in
-`docs/design-issue-188-audit-surface.md`. `secret.read` events carry only
-`secret_name` + `backend`, never the value.
+- `references/cheatsheets.md` — scenario → command, token-efficient patterns, completion-signaling matrix, marker pitfalls (including the alternation case), failure-mode triage.
+- `references/multi-agent.md` — dialogue / pair-review / critic / debate / fanout details, worker→dialogue bridge pattern, SSH participants, participant profiles, github-comment (no posting by default).
+- `references/contracts.md` — `status --json` stable fields, `result.json` schema with worked example, approval-gate state/exit codes, concurrency model, cost accounting, inventory/cleanup.
+- `references/security.md` — secret injection backends, audit log operator surface, full environment-override table, pre-flight checks.
