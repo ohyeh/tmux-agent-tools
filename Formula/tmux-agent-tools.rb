@@ -31,11 +31,16 @@ class TmuxAgentTools < Formula
                  shell_output("#{bin}/tmux-agent-dialogue help")
     assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",
                  shell_output("#{bin}/tmux-agent-sessions help")
-    assert_match "tmux-agent-fanout", shell_output("#{bin}/tmux-agent-fanout help")
-    assert_match "tmux-agent-dag", shell_output("#{bin}/tmux-agent-dag --help")
-    assert_match "tmux-agent-audit", shell_output("#{bin}/tmux-agent-audit help")
-    assert_match "tmux-agent-worktrees", shell_output("#{bin}/tmux-agent-worktrees help")
-    assert_match "tmux-agent-replay", shell_output("#{bin}/tmux-agent-replay help")
+    assert_match "tmux-agent-fanout - synchronous fan-out coordinator",
+                 shell_output("#{bin}/tmux-agent-fanout --help")
+    assert_match "tmux-agent-dag - DAG validator + synchronous topological executor",
+                 shell_output("#{bin}/tmux-agent-dag --help")
+    assert_match "Usage: tmux-agent-audit",
+                 shell_output("#{bin}/tmux-agent-audit --help")
+    assert_match "tmux-agent-worktrees — manage --workdir-fresh worktrees",
+                 shell_output("#{bin}/tmux-agent-worktrees --help")
+    assert_match "tmux-agent-replay - read-only utilities",
+                 shell_output("#{bin}/tmux-agent-replay --help")
 
     transcript = testpath/"transcript.jsonl"
     transcript.write <<~JSONL
