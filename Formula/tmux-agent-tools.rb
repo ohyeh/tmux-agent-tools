@@ -1,8 +1,8 @@
 class TmuxAgentTools < Formula
   desc "Tmux wrappers for controllable Claude Code and Codex CLI sessions"
   homepage "https://github.com/ohyeh/tmux-agent-tools"
-  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "7447ce4f8f88a8da2f2c8b0a610c68754886f642c63cc82f6a5749b7b8041318"
+  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.12.0.tar.gz"
+  sha256 "c7c2e76f3201139e9ef0266b729e66a929b0d2eedcecfd445637c310fe94e626"
   head "https://github.com/ohyeh/tmux-agent-tools.git", branch: "main"
 
   depends_on "jq"
@@ -16,6 +16,11 @@ class TmuxAgentTools < Formula
     bin.install "skills/tmux-agent-tools/scripts/codex-tmux"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dialogue"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-sessions"
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-fanout"
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dag"
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-audit"
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-worktrees"
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-replay"
     pkgshare.install "skills"
   end
 
@@ -26,6 +31,16 @@ class TmuxAgentTools < Formula
                  shell_output("#{bin}/tmux-agent-dialogue help")
     assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",
                  shell_output("#{bin}/tmux-agent-sessions help")
+    assert_match "tmux-agent-fanout - synchronous fan-out coordinator",
+                 shell_output("#{bin}/tmux-agent-fanout --help")
+    assert_match "tmux-agent-dag - DAG validator + synchronous topological executor",
+                 shell_output("#{bin}/tmux-agent-dag --help")
+    assert_match "Usage: tmux-agent-audit",
+                 shell_output("#{bin}/tmux-agent-audit --help")
+    assert_match "tmux-agent-worktrees — manage --workdir-fresh worktrees",
+                 shell_output("#{bin}/tmux-agent-worktrees --help")
+    assert_match "tmux-agent-replay - read-only utilities",
+                 shell_output("#{bin}/tmux-agent-replay --help")
 
     transcript = testpath/"transcript.jsonl"
     transcript.write <<~JSONL
