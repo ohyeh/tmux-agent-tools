@@ -64,9 +64,12 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `wait`
 - `wait-text`
 - `wait-literal`
+- `wait-and-capture`
 - `capture`
 - `list`
 - `status`
+- `ping`
+- `probe`
 - `doctor`
 - `self-test`
 - `stop`
@@ -164,6 +167,7 @@ Releases go through a focused release PR, the manual `Release` GitHub Actions wo
 ```bash
 codex-tmux start --exact worker ~/github/project 'Read the repo and report status.'
 codex-tmux send worker 'Run the targeted tests.'
+codex-tmux send --from-file /tmp/large-prompt.md --enter-count 3 worker
 codex-tmux send-wait-literal worker 'Reply with the marker described in this prompt.' '[CODEX-01]' 180
 codex-tmux wait worker 180
 codex-tmux wait-text worker 'Done|Need approval' 180
@@ -174,7 +178,9 @@ codex-tmux status --json worker
 codex-tmux stop worker
 ```
 
-Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`. Use `send-wait-literal` when a prompt should only count a marker that appears after the send operation; the dialogue runner uses this to avoid stale marker matches. The wrappers pause briefly between paste and submit for multiline prompts; tune this with `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY` when a local CLI needs more time.
+Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`. Use `send-wait-literal` when a prompt should only count a marker that appears after the send operation; the dialogue runner uses this to avoid stale marker matches.
+
+Use `send --from-file <abs-path>` for first-class multi-line / paste injection. It runs under the same per-agent send-lock as `send <text>`, records transcript metadata (`multiline`, `bytes`, `text_sha256`), and emits a body-free `send.multiline` audit event when audit logging is enabled. `--enter-count N` and `--enter-delay S` cover CLIs that need repeated Enter presses after a pasted prompt. Inline `send <name> <text>` keeps its existing behavior; the wrappers still pause briefly between paste and submit for inline multiline prompts. Tune that legacy delay with `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY` when a local CLI needs more time.
 
 Captured pane text joins tmux soft-wrapped screen lines before matching or writing transcripts. This keeps long model output, markers, and summaries from changing shape just because the tmux pane is narrow.
 
@@ -213,6 +219,22 @@ All five are ADDITIVE; existing fields (`exists`, `running`,
 `status --json` periodically is how `last_change_at` and
 `idle_seconds` stay current; without periodic polling the value
 reports "as of the last call".
+
+### CLI-aware progress probes
+
+`ping` answers "is the pane responsive?" by sending a benign key sequence and
+watching for pane changes. `probe` answers "what CLI-specific progress signal is
+visible?" by parsing the pane tail in the wrapper:
+
+```bash
+claude-tmux probe --metric context_percent --json reviewer
+codex-tmux probe --metric progress --json worker
+```
+
+Claude metrics: `context_percent`, `goal_active`, `active_spinner`. Codex
+metrics: `progress`, `tool_active`, `approval_pending`. JSON output is
+`{schema_version:1, name, metric, value, confidence, parsed_from}`. Unknown
+metrics exit 2 and print the supported list; missing sessions exit 1.
 
 ### Single-agent JSONL transcript
 

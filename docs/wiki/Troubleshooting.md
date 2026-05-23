@@ -34,6 +34,19 @@ codex-tmux attach worker
 
 The wrapper deliberately does not auto-accept permission prompts.
 
+## `ping` is ok but I need CLI-specific progress
+
+`ping` only proves the pane is responsive. Use `probe` when you need a
+wrapper-local parser for CLI footer/progress text:
+
+```bash
+claude-tmux probe --metric context_percent --json worker
+codex-tmux probe --metric progress --json worker
+```
+
+Branch on `.confidence`; a low-confidence parse is a signal to inspect the pane
+or update this repo's parser instead of copying regexes into downstream tools.
+
 ## `--on-exit` hook never logged
 
 `--on-exit` requires `--sentinel`. Add it:
@@ -67,7 +80,15 @@ codex-tmux stop worker
 
 ## Multiline prompt sits in the input box without submitting
 
-The submit timing is too tight for your environment. Raise the delay:
+For large handoff packets or prompts with embedded newlines, prefer the
+first-class file path:
+
+```bash
+codex-tmux send --from-file /abs/prompt.md --enter-count 3 --enter-delay 0.5 worker
+```
+
+If you are using inline `send <name> <text>`, the submit timing may be too tight
+for your environment. Raise the legacy delay:
 
 ```bash
 CODEX_TMUX_SUBMIT_DELAY=0.5 codex-tmux start --exact w ~/repo '...'

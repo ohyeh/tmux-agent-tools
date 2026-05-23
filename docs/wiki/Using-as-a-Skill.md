@@ -9,9 +9,9 @@ Every command falls into one of four categories:
 | Category | Commands | What it does |
 | --- | --- | --- |
 | **Lifecycle** | `start`, `resume`, `stop` | Create / continue / kill a tmux-managed agent session |
-| **I/O** | `send`, `send-wait-literal` | Push prompts into the agent without attaching to the pane |
+| **I/O** | `send`, `send --from-file`, `send-wait-literal` | Push prompts into the agent without attaching to the pane |
 | **Wait** | `wait`, `wait-text`, `wait-literal`, `wait-and-capture` | Block until the agent reaches a known state |
-| **Read** | `capture`, `status`, `result` | Surface what the agent has done |
+| **Read** | `capture`, `status`, `probe`, `result` | Surface what the agent has done |
 
 You orchestrate by interleaving these. Most automation looks like: `start → send → wait → result → stop`.
 
@@ -36,6 +36,21 @@ Token-efficient capture path. Strips CSI/SGR + trims pre-marker noise before ret
 ### `wait-and-capture --marker '<m>' --tail N --json`
 
 One round-trip for "is the marker present + here is the recent tail". Cheaper than `wait` + separate `capture`.
+
+### `send --from-file <abs-path> --enter-count N <name>`
+
+Use this for large or multi-line prompts. It holds the same send-lock as
+`send <text>`, uses tmux paste-buffer, records transcript metadata
+(`multiline`, `bytes`, `text_sha256`), and emits a body-free `send.multiline`
+audit event when audit logging is enabled.
+
+### `probe --metric <metric> --json <name>`
+
+Wrapper-local parser for CLI progress indicators. Claude metrics:
+`context_percent`, `goal_active`, `active_spinner`. Codex metrics: `progress`,
+`tool_active`, `approval_pending`. Output carries `value`, `confidence`, and
+`parsed_from`, so orchestrators can detect low-confidence parsing instead of
+silently trusting stale regexes.
 
 ## Marker discipline
 
@@ -80,6 +95,8 @@ In your prompt, be explicit: **"Write `$TMUX_AGENT_RESULT` before signaling done
 | Pattern | Commands |
 | --- | --- |
 | Fire-and-forget single agent with structured result | `start --transcript ... --sentinel ... ; wait for sentinel ; result --json` |
+| Inject large handoff / goal packet | `send --from-file /abs/prompt.md --enter-count 3 <name>` |
+| Poll CLI-specific progress | `probe --metric context_percent --json <name>` |
 | Long-running agent with mid-run human approval | `wait-and-capture --pause-until-file <marker>` ([approval gate recipe](Recipes#approval-gate)) |
 | Parallel agents on one prompt | `tmux-agent-fanout run --agent ... --result-dir ...` ([fanout recipe](Recipes#fanout)) |
 | Dependency-ordered pipeline | `tmux-agent-dag <manifest.json>` ([DAG recipe](Recipes#dag)) |

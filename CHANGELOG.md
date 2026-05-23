@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+## v0.12.0 - 2026-05-23
+
+`v0.12.0` is the skill-disclosure and wrapper followup release. It keeps the
+existing wrapper contracts backward-compatible while making the skill easier for
+agents to load progressively and closing the two post-v0.11 operator gaps:
+first-class multi-line send injection (#202) and CLI-aware progress probes
+(#203).
+
+### Added
+
+- `claude-tmux send --from-file <abs-path>` and `codex-tmux send --from-file
+  <abs-path>` for first-class multi-line / paste injection (#202). The new path
+  uses the existing per-agent send-lock, supports `--enter-count N` and
+  `--enter-delay S`, records transcript metadata (`multiline`, `bytes`,
+  `text_sha256`), and writes a body-free `send.multiline` audit event with size
+  and hash metadata. `scripts/test-send-multiline-smoke`: 22 sub-assertions
+  across both wrappers, including embedded newlines, payloads larger than 16 KB,
+  `--enter-count 3`, and concurrent multi-line + single-line sends under one
+  agent name.
+
+- `claude-tmux probe --metric <metric> [--json] <name>` and `codex-tmux probe
+  --metric <metric> [--json] <name>` for CLI-aware progress parsing (#203).
+  Claude metrics: `context_percent`, `goal_active`, `active_spinner`. Codex
+  metrics: `progress`, `tool_active`, `approval_pending`. JSON output carries
+  `schema_version: 1`, `name`, `metric`, `value`, `confidence`, and
+  `parsed_from`, so downstream watchdogs can depend on one wrapper-local parser
+  instead of each consumer shipping its own pane regex. `scripts/test-probe-smoke`:
+  10 sub-assertions covering valid metrics, unknown metric exit 2, missing
+  session exit 1, and JSON schema fields.
+
+- `skills/tmux-agent-tools/SKILL.md` now uses progressive disclosure: the top
+  file is the compact entrypoint, while detailed operator guidance lives under
+  `skills/tmux-agent-tools/references/`. New eval manifests under
+  `skills/tmux-agent-tools/evals/` cover trigger behavior, multi-agent
+  coordination, and safety-boundary expectations for skill consumers.
+
+### Notes
+
+- The new `probe` command complements `ping`: `ping` answers whether a pane is
+  responsive; `probe` extracts CLI-specific progress signals from the pane tail
+  with an explicit confidence field.
+- The new `send --from-file` path does not change existing `send <name> <text>`
+  behavior. Existing single-line and inline multi-line callers continue to work.
+
 ## v0.11.0 - 2026-05-21
 
 `v0.11.0` upgrades the L5/L6 surfaces from argv-smoke proofs to real runtime contracts. Closes 6 issues (#184–#189) re-opened against the v0.10.0 audit, plus a re-verified fix on #189 (PR #198) that hoists secret-backend preflight to parse-time. Adds two new operator binaries (`tmux-agent-audit`, `tmux-agent-worktrees`). All v0.10.0 callers continue working — every change preserves back-compat.

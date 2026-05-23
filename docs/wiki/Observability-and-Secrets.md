@@ -21,6 +21,16 @@ codex-tmux start --exact worker ~/repo \
 
 When a `send` text exceeds the threshold, the transcript records `text: "[truncated, original X bytes]"` plus `text_sha256` and `text_bytes` instead of the verbatim payload.
 
+For first-class multi-line injection, use:
+
+```bash
+codex-tmux send --from-file /abs/handoff.md --enter-count 3 worker
+```
+
+The `send --from-file` transcript event carries `multiline: true`, `bytes`, and
+`text_sha256`. If audit logging is enabled, the audit event is `send.multiline`
+and records only size/hash metadata, never the prompt body.
+
 ### Validating a transcript
 
 ```bash
@@ -92,7 +102,7 @@ Size-triggered. Defaults: `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=10485760` (10 MB), `
 
 ### Event coverage
 
-`schema_version: 1`. Events: `wrapper.start`, `wrapper.stop`, `wrapper.send`, `hook.allow`, `hook.reject`, `hook.run`, `secret.read` (records `secret_name` + `backend` only, **never** the value), `approval.approve`, `approval.reject`, `approval.timeout`, `fuse.max_trigger`.
+`schema_version: 1`. Events: `wrapper.start`, `wrapper.stop`, `wrapper.send`, `send.multiline`, `hook.allow`, `hook.reject`, `hook.run`, `secret.read` (records `secret_name` + `backend` only, **never** the value), `approval.approve`, `approval.reject`, `approval.timeout`, `fuse.max_trigger`.
 
 ## `--secret KEY=URI`: env injection without leakage
 
