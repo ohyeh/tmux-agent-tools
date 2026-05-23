@@ -13,7 +13,7 @@ This wiki teaches **two audiences**:
 
 A set of bash wrappers and helper binaries that turn the agent CLIs into something you can script against. Each agent gets a tmux session you can `send` prompts to and `capture` output from without stealing your terminal. State lives at `$TMUX_AGENT_DIR/<name>/` so multiple agents are independent and inspectable.
 
-**Why not raw `tmux send-keys`?** Because every pane-state edge case (multi-line prompts, ANSI noise, marker echo, exit detection, lock around concurrent sends) is already solved here. Raw `tmux` works for one-off demos and breaks the moment you script around it.
+**Why not raw `tmux send-keys`?** Because every pane-state edge case (multi-line prompts, ANSI noise, marker echo, exit detection, progress probes, lock around concurrent sends) is already solved here. Raw `tmux` works for one-off demos and breaks the moment you script around it.
 
 ## What you get
 
@@ -28,6 +28,8 @@ A set of bash wrappers and helper binaries that turn the agent CLIs into somethi
 | Hash-chained operator audit log | `tmux-agent-audit` (verify / query / rotate) |
 | Sandboxed `git worktree` lifecycle | `tmux-agent-worktrees` (list / prune) |
 | Replay / diff / redact transcripts | `tmux-agent-replay` |
+| First-class multi-line paste injection | `send --from-file <abs-path>` |
+| CLI-aware progress parsing | `probe --metric <metric> --json` |
 
 All JSON surfaces carry `schema_version: 1`.
 
