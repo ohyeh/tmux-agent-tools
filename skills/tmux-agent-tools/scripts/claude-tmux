@@ -56,12 +56,12 @@ Usage:
   claude-tmux help
 
 Examples:
-  claude-tmux start --attach pr5 ~/github/core-parking-service
-  claude-tmux resume --exact pr5 ~/github/core-parking-service ee5aca88-a1af-48d3-af21-54f60d618f22
-  claude-tmux start-ssh --attach pr5 openclaw-macmini ~/github/core-parking-service
-  claude-tmux start --exact pr5 ~/github/core-parking-service 'hi'
+  claude-tmux start --attach pr5 ~/github/example-service
+  claude-tmux resume --exact pr5 ~/github/example-service ee5aca88-a1af-48d3-af21-54f60d618f22
+  claude-tmux start-ssh --attach pr5 example-host ~/github/example-service
+  claude-tmux start --exact pr5 ~/github/example-service 'hi'
   claude-tmux attach pr5
-  claude-tmux send pr5 '請先讀 PR description'
+  claude-tmux send pr5 'Read the PR description first.'
   claude-tmux send-wait-literal pr5 'Reply with the requested marker.' '[CLAUDE-01]' 180
   claude-tmux wait pr5 180
   claude-tmux wait-text pr5 'Done|Need approval' 180
