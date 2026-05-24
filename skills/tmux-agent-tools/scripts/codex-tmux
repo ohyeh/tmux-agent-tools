@@ -56,12 +56,12 @@ Usage:
   codex-tmux help
 
 Examples:
-  codex-tmux start --attach pr5 ~/github/core-parking-service
-  codex-tmux resume --exact pr5 ~/github/core-parking-service 019e356f-f95d-7570-9784-ea7b58e404a5
-  codex-tmux start-ssh --attach pr5 openclaw-macmini ~/github/core-parking-service
-  codex-tmux start --exact pr5 ~/github/core-parking-service 'hi'
+  codex-tmux start --attach pr5 ~/github/example-service
+  codex-tmux resume --exact pr5 ~/github/example-service 019e356f-f95d-7570-9784-ea7b58e404a5
+  codex-tmux start-ssh --attach pr5 example-host ~/github/example-service
+  codex-tmux start --exact pr5 ~/github/example-service 'hi'
   codex-tmux attach pr5
-  codex-tmux send pr5 '請先讀 PR description'
+  codex-tmux send pr5 'Read the PR description first.'
   codex-tmux send-wait-literal pr5 'Reply with the requested marker.' '[CODEX-01]' 180
   codex-tmux wait pr5 180
   codex-tmux wait-text pr5 'Done|Need approval' 180
@@ -3886,27 +3886,27 @@ probe_session() {
   confidence="low"
   case "$metric" in
     progress)
-      parsed_from="$(printf '%s\n' "$pane" | rg -o '([Pp]rogress|[Rr]unning|[Tt]hinking)[^0-9]{0,20}[0-9]+%' | tail -1 || true)"
+      parsed_from="$(printf '%s\n' "$pane" | grep -Eo '([Pp]rogress|[Rr]unning|[Tt]hinking)[^0-9]{0,20}[0-9]+%' | tail -1 || true)"
       if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
         value="${match[1]}"
         confidence="medium"
       fi
       ;;
     tool_active)
-      if printf '%s\n' "$pane" | rg -qi '(running|executing|tool call|shell|command|apply_patch)'; then
+      if printf '%s\n' "$pane" | grep -qiE '(running|executing|tool call|shell|command|apply_patch)'; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | rg -i '(running|executing|tool call|shell|command|apply_patch)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(running|executing|tool call|shell|command|apply_patch)' | tail -1 || true)"
       else
         value="false"
         confidence="low"
       fi
       ;;
     approval_pending)
-      if printf '%s\n' "$pane" | rg -qi '(approval|approve|allow|deny|permission)'; then
+      if printf '%s\n' "$pane" | grep -qiE '(approval|approve|allow|deny|permission)'; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | rg -i '(approval|approve|allow|deny|permission)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(approval|approve|allow|deny|permission)' | tail -1 || true)"
       else
         value="false"
         confidence="low"

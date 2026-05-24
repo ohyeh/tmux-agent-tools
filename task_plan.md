@@ -69,7 +69,7 @@ Develop tmux-agent-tools through the public PR workflow: keep `main` protected, 
 - `v0.5.0` should improve observability and multi-session composability: bounded session watch, richer exit detail, transcript contract versioning, and local blocked-trigger artifacts.
 - `v0.6.0` should improve composability closure: stronger local output contracts, shell quality gates, and bounded presets without release side effects or credentials.
 - `D` personal workflow shortcuts should stay outside public core unless generalized.
-- Keep orchestration public and generic: transcript capture, pairing, and bounded turns are core; OpenClaw/Mac-mini shortcuts are not.
+- Keep orchestration public and generic: transcript capture, pairing, and bounded turns are core; private project or machine shortcuts are not.
 
 ## Completed Work
 
@@ -296,7 +296,7 @@ P2:
 
 Do not do:
 
-- personal OpenClaw/Mac mini shortcuts in core;
+- personal project or machine shortcuts in core;
 - hidden external side effects;
 - default real-agent orchestration in CI;
 - destructive cleanup outside owned tmux sessions.
