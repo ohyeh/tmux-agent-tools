@@ -3918,28 +3918,28 @@ probe_session() {
   confidence="low"
   case "$metric" in
     context_percent)
-      parsed_from="$(printf '%s\n' "$pane" | rg -o 'Context[[:space:]]+[0-9]+%' | tail -1 || true)"
+      parsed_from="$(printf '%s\n' "$pane" | grep -Eo 'Context[[:space:]]+[0-9]+%' | tail -1 || true)"
       if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
         value="${match[1]}"
         confidence="high"
       fi
       ;;
     goal_active)
-      if printf '%s\n' "$pane" | rg -qi 'goal[[:space:]-]*(active|in progress)|goal:'; then
+      if printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(active|in progress)|goal:'; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | rg -i 'goal[[:space:]-]*(active|in progress)|goal:' | tail -1 || true)"
-      elif printf '%s\n' "$pane" | rg -qi 'goal[[:space:]-]*(achieved|complete|completed)'; then
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(active|in progress)|goal:' | tail -1 || true)"
+      elif printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(achieved|complete|completed)'; then
         value="false"
         confidence="high"
-        parsed_from="$(printf '%s\n' "$pane" | rg -i 'goal[[:space:]-]*(achieved|complete|completed)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(achieved|complete|completed)' | tail -1 || true)"
       fi
       ;;
     active_spinner)
-      if printf '%s\n' "$pane" | rg -q '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)'; then
+      if printf '%s\n' "$pane" | grep -qE '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)'; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | rg '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -E '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)' | tail -1 || true)"
       else
         value="false"
         confidence="low"
