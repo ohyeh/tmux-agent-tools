@@ -3886,27 +3886,27 @@ probe_session() {
   confidence="low"
   case "$metric" in
     progress)
-      parsed_from="$(printf '%s\n' "$pane" | rg -o '([Pp]rogress|[Rr]unning|[Tt]hinking)[^0-9]{0,20}[0-9]+%' | tail -1 || true)"
+      parsed_from="$(printf '%s\n' "$pane" | grep -Eo '([Pp]rogress|[Rr]unning|[Tt]hinking)[^0-9]{0,20}[0-9]+%' | tail -1 || true)"
       if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
         value="${match[1]}"
         confidence="medium"
       fi
       ;;
     tool_active)
-      if printf '%s\n' "$pane" | rg -qi '(running|executing|tool call|shell|command|apply_patch)'; then
+      if printf '%s\n' "$pane" | grep -qiE '(running|executing|tool call|shell|command|apply_patch)'; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | rg -i '(running|executing|tool call|shell|command|apply_patch)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(running|executing|tool call|shell|command|apply_patch)' | tail -1 || true)"
       else
         value="false"
         confidence="low"
       fi
       ;;
     approval_pending)
-      if printf '%s\n' "$pane" | rg -qi '(approval|approve|allow|deny|permission)'; then
+      if printf '%s\n' "$pane" | grep -qiE '(approval|approve|allow|deny|permission)'; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | rg -i '(approval|approve|allow|deny|permission)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(approval|approve|allow|deny|permission)' | tail -1 || true)"
       else
         value="false"
         confidence="low"
