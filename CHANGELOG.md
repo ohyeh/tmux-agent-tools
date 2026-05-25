@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## v0.12.2 - 2026-05-25
+
+`v0.12.2` is a tmux color-environment patch release for managed Claude and
+Codex panes.
+
+### Fixed
+
+- `claude-tmux` and `codex-tmux` now normalize color-related environment
+  variables immediately before launching the CLI process. When color
+  normalization is enabled, managed panes unset leaked caller `NO_COLOR` instead
+  of passing `NO_COLOR=`, then set `COLORTERM=truecolor`, `FORCE_COLOR=3`, and
+  `CLICOLOR_FORCE=1`. Explicit `TMUX_AGENT_TOOLS_SESSION_ENV` entries still win,
+  including deliberate `NO_COLOR` overrides.
+
+- Local `start`, local `resume`, and `start-ssh` now share the same color policy
+  instead of hardcoding SSH-only behavior. Setting `CLAUDE_TMUX_COLOR_ENV=0` or
+  `CODEX_TMUX_COLOR_ENV=0` disables the wrapper color normalization for both
+  local and SSH launches.
+
+- Removed a stale `--workdir-fresh` branch from the SSH launch path that could
+  trip `set -u` before creating remote sessions.
+
+### Validation
+
+- Added `scripts/test-color-env-smoke` and wired it into CI. The smoke covers
+  default `NO_COLOR` removal, truecolor/force-color defaults, explicit
+  environment overrides, and disabled color normalization for SSH command
+  generation across both wrappers.
+
 ## v0.12.1 - 2026-05-25
 
 `v0.12.1` is a provider-environment isolation patch release for managed tmux
