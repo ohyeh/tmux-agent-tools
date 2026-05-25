@@ -73,12 +73,15 @@ For **alternation markers** (e.g. wait for `[DONE]` OR `Need approval`), use `wa
 ```bash
 codex-tmux status worker
 codex-tmux status --json worker
+codex-tmux env-doctor worker
 codex-tmux doctor
 codex-tmux self-test
 codex-tmux stop worker
 ```
 
 `status --json` is the stable automation contract. Treat `running:false` as authoritative even if the tmux session still exists for capture.
+
+Use `env-doctor [name]` before deeper debugging when an agent CLI uses the wrong provider, model, base URL, token, timeout, login state, or behaves differently inside tmux than outside tmux. It compares the caller environment, tmux global environment, and the running agent child process environment, redacting token/key values. This catches tmux-side provider pollution before chasing shell startup files, app switchers, or CLI login state.
 
 5. **Read the agent's structured result** instead of scraping the pane:
 
