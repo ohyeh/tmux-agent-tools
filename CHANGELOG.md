@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## v0.12.1 - 2026-05-25
+
+`v0.12.1` is a provider-environment isolation patch release for managed tmux
+workers.
+
+### Fixed
+
+- `claude-tmux` now clears known Claude provider environment variables by
+  default when starting or resuming a managed tmux session, including
+  `ANTHROPIC_*` model/base/token settings and `API_TIMEOUT_MS`. This prevents
+  stale shell or tmux server environment values from forcing Claude Code onto
+  the wrong provider or transport path. Explicit inheritance remains available
+  with `CLAUDE_TMUX_INHERIT_CLAUDE_ENV=1`, and explicit
+  `TMUX_AGENT_TOOLS_SESSION_ENV` entries still win.
+
+- `codex-tmux` now applies the same default isolation for Codex/OpenAI provider
+  variables, including `OPENAI_*`, `CODEX_*`, and `API_TIMEOUT_MS`, with
+  opt-in inheritance through `CODEX_TMUX_INHERIT_CODEX_ENV=1`.
+
+### Added
+
+- `claude-tmux env-doctor [name]` and `codex-tmux env-doctor [name]` compare
+  caller environment, tmux global environment, and the running CLI child process
+  environment with token/key redaction. This makes tmux-side provider pollution
+  visible before operators chase shell startup files, app switchers, or CLI
+  login state.
+
+### Validation
+
+- Added `scripts/test-claude-env-inherit-smoke` coverage for default provider
+  env clearing, explicit opt-in inheritance, explicit `TMUX_AGENT_TOOLS_SESSION_ENV`
+  precedence, and bare-key session env preservation.
+
 ## v0.12.0 - 2026-05-23
 
 `v0.12.0` is the skill-disclosure and wrapper followup release. It keeps the
