@@ -16,6 +16,8 @@ TMUX_CONF="${CODEX_TMUX_CONF:-${TMPDIR:-/tmp}/codex-tmux.tmux.conf}"
 TMUX_MOUSE="${CODEX_TMUX_MOUSE:-on}"
 TMUX_CLIPBOARD="${CODEX_TMUX_CLIPBOARD:-auto}"
 STATUS_TAIL_LINES="${CODEX_TMUX_STATUS_TAIL_LINES:-20}"
+INHERIT_CODEX_ENV="${CODEX_TMUX_INHERIT_CODEX_ENV:-0}"
+CLEAR_CODEX_ENV="${CODEX_TMUX_CLEAR_CODEX_ENV:-1}"
 
 resolve_tmux_bin() {
   if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
@@ -50,6 +52,7 @@ Usage:
   codex-tmux status [--json] <name>
   codex-tmux ping [--timeout <s>] [--json] <name>
   codex-tmux probe --metric <metric> [--json] <name>
+  codex-tmux env-doctor [name]
   codex-tmux doctor
   codex-tmux self-test
   codex-tmux stop <name>
@@ -96,6 +99,8 @@ Environment:
   CODEX_TMUX_MOUSE=on
   CODEX_TMUX_CLIPBOARD=auto
   CODEX_TMUX_STATUS_TAIL_LINES=20
+  CODEX_TMUX_INHERIT_CODEX_ENV=0
+  CODEX_TMUX_CLEAR_CODEX_ENV=1
 EOF
 }
 
@@ -453,6 +458,53 @@ random_suffix() {
 
 shell_quote() {
   printf "%q" "$1"
+}
+
+session_env_has_key() {
+  local key="$1"
+  local i entry
+  for (( i = 1; i <= ${#session_env_args[@]}; i += 2 )); do
+    entry="${session_env_args[$(( i + 1 ))]:-}"
+    [[ "$entry" == "$key" || "$entry" == "$key="* ]] && return 0
+  done
+  return 1
+}
+
+codex_provider_env_keys() {
+  printf '%s\n' \
+    OPENAI_API_KEY \
+    OPENAI_BASE_URL \
+    OPENAI_ORG_ID \
+    OPENAI_PROJECT \
+    OPENAI_MODEL \
+    OPENAI_TIMEOUT_MS \
+    CODEX_API_KEY \
+    CODEX_BASE_URL \
+    CODEX_MODEL \
+    CODEX_HOME \
+    API_TIMEOUT_MS
+}
+
+apply_codex_env_args() {
+  local key value
+  if [[ "$INHERIT_CODEX_ENV" != "1" ]]; then
+    [[ "$CLEAR_CODEX_ENV" == "1" ]] || return 0
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      session_env_has_key "$key" && continue
+      session_env_args+=("-e" "${key}=")
+    done < <(codex_provider_env_keys)
+    return 0
+  fi
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    (( ${+parameters[$key]} )) || continue
+    session_env_has_key "$key" && continue
+    value="${(P)key}"
+    [[ -n "$value" ]] || continue
+    session_env_args+=("-e" "$key=$value")
+  done < <(codex_provider_env_keys)
 }
 
 paste_and_submit() {
@@ -2152,6 +2204,7 @@ start_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_codex_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -2425,6 +2478,7 @@ resume_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_codex_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -2541,6 +2595,7 @@ start_ssh_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_codex_env_args
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
@@ -3546,6 +3601,118 @@ doctor_session() {
   fi
 }
 
+redact_env_value() {
+  local key="$1" value="$2"
+  case "$key" in
+    *TOKEN*|*KEY*)
+      [[ -n "$value" ]] && printf '%s' '***REDACTED***' || printf ''
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+process_env_value() {
+  local pid="$1" key="$2"
+  if [[ -r "/proc/$pid/environ" ]]; then
+    awk -v k="$key" 'BEGIN { RS = "\0" } index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "/proc/$pid/environ" 2>/dev/null || true
+    return 0
+  fi
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | sed -n "s/^${key}=//p" | tail -1 || true
+}
+
+env_doctor_print_map() {
+  local label="$1" source="$2"
+  local key value found=0
+  echo "$label:"
+  while IFS= read -r key; do
+    case "$source" in
+      caller)
+        (( ${+parameters[$key]} )) || continue
+        value="${(P)key}"
+        ;;
+      tmux-global)
+        value="$("$TMUX" show-environment -g "$key" 2>/dev/null | sed -n "s/^${key}=//p" || true)"
+        [[ -n "$value" ]] || continue
+        ;;
+      process:*)
+        local pid="${source#process:}"
+        value="$(process_env_value "$pid" "$key")"
+        [[ -n "$value" ]] || continue
+        ;;
+    esac
+    found=1
+    printf '  %s=%s\n' "$key" "$(redact_env_value "$key" "$value")"
+  done < <(codex_provider_env_keys)
+  (( found )) || echo "  <clean>"
+}
+
+descendant_pids() {
+  local root="$1"
+  local frontier pid children child
+  frontier=("$root")
+  while (( ${#frontier[@]} > 0 )); do
+    pid="${frontier[1]}"
+    frontier=("${frontier[@]:1}")
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      echo "$child"
+      frontier+=("$child")
+    done <<< "$children"
+  done
+}
+
+env_doctor_session() {
+  require_tmux
+  local name="${1:-}"
+  local session=""
+  local pane_pid=""
+  local codex_pid=""
+  local pid command_line
+
+  echo "codex-tmux env-doctor"
+  echo "inherit_codex_env: $INHERIT_CODEX_ENV"
+  echo "clear_codex_env: $CLEAR_CODEX_ENV"
+  env_doctor_print_map "caller env" caller
+  env_doctor_print_map "tmux global env" tmux-global
+
+  if [[ -z "$name" ]]; then
+    echo "session env: <skipped; pass an agent name to inspect a running pane>"
+    return 0
+  fi
+
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "session env: <not running: $session>"
+    return 1
+  fi
+
+  pane_pid="$("$TMUX" display-message -p -t "$session" '#{pane_pid}' 2>/dev/null || true)"
+  if [[ -z "$pane_pid" ]]; then
+    echo "session env: <unable to resolve pane pid: $session>"
+    return 1
+  fi
+
+  for pid in $(descendant_pids "$pane_pid"); do
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *codex* ]]; then
+      codex_pid="$pid"
+    fi
+  done
+
+  if [[ -z "$codex_pid" ]]; then
+    echo "session env: <no codex child found under $session pane pid $pane_pid>"
+    return 1
+  fi
+
+  echo "session: $session"
+  echo "pane_pid: $pane_pid"
+  echo "codex_pid: $codex_pid"
+  env_doctor_print_map "codex process env" "process:$codex_pid"
+}
+
 self_test_session() {
   require_tmux
   local name="self-test-$$"
@@ -4093,6 +4260,9 @@ case "$command" in
     ;;
   probe)
     probe_session "$@"
+    ;;
+  env-doctor)
+    env_doctor_session "$@"
     ;;
   doctor)
     doctor_session

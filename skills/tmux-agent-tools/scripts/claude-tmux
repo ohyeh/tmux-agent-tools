@@ -16,6 +16,8 @@ TMUX_CONF="${CLAUDE_TMUX_CONF:-${TMPDIR:-/tmp}/claude-tmux.tmux.conf}"
 TMUX_MOUSE="${CLAUDE_TMUX_MOUSE:-on}"
 TMUX_CLIPBOARD="${CLAUDE_TMUX_CLIPBOARD:-auto}"
 STATUS_TAIL_LINES="${CLAUDE_TMUX_STATUS_TAIL_LINES:-20}"
+INHERIT_CLAUDE_ENV="${CLAUDE_TMUX_INHERIT_CLAUDE_ENV:-0}"
+CLEAR_CLAUDE_ENV="${CLAUDE_TMUX_CLEAR_CLAUDE_ENV:-1}"
 
 resolve_tmux_bin() {
   if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
@@ -50,6 +52,7 @@ Usage:
   claude-tmux status [--json] <name>
   claude-tmux ping [--timeout <s>] [--json] <name>
   claude-tmux probe --metric <metric> [--json] <name>
+  claude-tmux env-doctor [name]
   claude-tmux doctor
   claude-tmux self-test
   claude-tmux stop <name>
@@ -96,6 +99,8 @@ Environment:
   CLAUDE_TMUX_MOUSE=on
   CLAUDE_TMUX_CLIPBOARD=auto
   CLAUDE_TMUX_STATUS_TAIL_LINES=20
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=0
+  CLAUDE_TMUX_CLEAR_CLAUDE_ENV=1
 EOF
 }
 
@@ -300,7 +305,7 @@ HELP_EOF
       ;;
     *)
       printf 'No focused help for %q. Available topics:\n' "$topic" >&2
-      printf '  start resume start-ssh attach send send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  list stop doctor self-test help\n' >&2
+      printf '  start resume start-ssh attach send send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  env-doctor list stop doctor self-test help\n' >&2
       return 2
       ;;
   esac
@@ -453,6 +458,38 @@ random_suffix() {
 
 shell_quote() {
   printf "%q" "$1"
+}
+
+session_env_has_key() {
+  local key="$1"
+  local i entry
+  for (( i = 1; i <= ${#session_env_args[@]}; i += 2 )); do
+    entry="${session_env_args[$(( i + 1 ))]:-}"
+    [[ "$entry" == "$key" || "$entry" == "$key="* ]] && return 0
+  done
+  return 1
+}
+
+inherit_claude_env_args() {
+  local key value
+  if [[ "$INHERIT_CLAUDE_ENV" != "1" ]]; then
+    [[ "$CLEAR_CLAUDE_ENV" == "1" ]] || return 0
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      session_env_has_key "$key" && continue
+      session_env_args+=("-e" "${key}=")
+    done < <(claude_provider_env_keys)
+    return 0
+  fi
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    (( ${+parameters[$key]} )) || continue
+    session_env_has_key "$key" && continue
+    value="${(P)key}"
+    [[ -n "$value" ]] || continue
+    session_env_args+=("-e" "$key=$value")
+  done < <(claude_provider_env_keys)
 }
 
 paste_and_submit() {
@@ -2162,6 +2199,7 @@ start_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  inherit_claude_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -2447,6 +2485,7 @@ resume_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  inherit_claude_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -3574,6 +3613,133 @@ doctor_session() {
   fi
 }
 
+claude_provider_env_keys() {
+  printf '%s\n' \
+    ANTHROPIC_AUTH_TOKEN \
+    ANTHROPIC_API_KEY \
+    ANTHROPIC_BASE_URL \
+    ANTHROPIC_API_BASE_URL \
+    ANTHROPIC_MODEL \
+    ANTHROPIC_DEFAULT_OPUS_MODEL \
+    ANTHROPIC_DEFAULT_SONNET_MODEL \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL \
+    ANTHROPIC_REASONING_MODEL \
+    CLAUDE_CODE_SUBAGENT_MODEL \
+    API_TIMEOUT_MS
+}
+
+redact_env_value() {
+  local key="$1" value="$2"
+  case "$key" in
+    *TOKEN*|*KEY*)
+      [[ -n "$value" ]] && printf '%s' '***REDACTED***' || printf ''
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+process_env_value() {
+  local pid="$1" key="$2"
+  if [[ -r "/proc/$pid/environ" ]]; then
+    awk -v k="$key" 'BEGIN { RS = "\0" } index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "/proc/$pid/environ" 2>/dev/null || true
+    return 0
+  fi
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | sed -n "s/^${key}=//p" | tail -1 || true
+}
+
+env_doctor_print_map() {
+  local label="$1" source="$2"
+  local key value found=0
+  echo "$label:"
+  while IFS= read -r key; do
+    case "$source" in
+      caller)
+        (( ${+parameters[$key]} )) || continue
+        value="${(P)key}"
+        ;;
+      tmux-global)
+        value="$("$TMUX" show-environment -g "$key" 2>/dev/null | sed -n "s/^${key}=//p" || true)"
+        [[ -n "$value" ]] || continue
+        ;;
+      process:*)
+        local pid="${source#process:}"
+        value="$(process_env_value "$pid" "$key")"
+        [[ -n "$value" ]] || continue
+        ;;
+    esac
+    found=1
+    printf '  %s=%s\n' "$key" "$(redact_env_value "$key" "$value")"
+  done < <(claude_provider_env_keys)
+  (( found )) || echo "  <clean>"
+}
+
+descendant_pids() {
+  local root="$1"
+  local frontier pid children child
+  frontier=("$root")
+  while (( ${#frontier[@]} > 0 )); do
+    pid="${frontier[1]}"
+    frontier=("${frontier[@]:1}")
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      echo "$child"
+      frontier+=("$child")
+    done <<< "$children"
+  done
+}
+
+env_doctor_session() {
+  require_tmux
+  local name="${1:-}"
+  local session=""
+  local pane_pid=""
+  local claude_pid=""
+  local pid command_line
+
+  echo "claude-tmux env-doctor"
+  echo "inherit_claude_env: $INHERIT_CLAUDE_ENV"
+  echo "clear_claude_env: $CLEAR_CLAUDE_ENV"
+  env_doctor_print_map "caller env" caller
+  env_doctor_print_map "tmux global env" tmux-global
+
+  if [[ -z "$name" ]]; then
+    echo "session env: <skipped; pass an agent name to inspect a running pane>"
+    return 0
+  fi
+
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "session env: <not running: $session>"
+    return 1
+  fi
+
+  pane_pid="$("$TMUX" display-message -p -t "$session" '#{pane_pid}' 2>/dev/null || true)"
+  if [[ -z "$pane_pid" ]]; then
+    echo "session env: <unable to resolve pane pid: $session>"
+    return 1
+  fi
+
+  for pid in $(descendant_pids "$pane_pid"); do
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *claude* ]]; then
+      claude_pid="$pid"
+    fi
+  done
+
+  if [[ -z "$claude_pid" ]]; then
+    echo "session env: <no claude child found under $session pane pid $pane_pid>"
+    return 1
+  fi
+
+  echo "session: $session"
+  echo "pane_pid: $pane_pid"
+  echo "claude_pid: $claude_pid"
+  env_doctor_print_map "claude process env" "process:$claude_pid"
+}
+
 status_pane_text() {
   local session="$1"
   "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
@@ -4131,6 +4297,9 @@ case "$command" in
     ;;
   probe)
     probe_session "$@"
+    ;;
+  env-doctor)
+    env_doctor_session "$@"
     ;;
   doctor)
     doctor_session
