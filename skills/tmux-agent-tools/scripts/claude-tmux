@@ -102,6 +102,7 @@ Environment:
   CLAUDE_TMUX_STATUS_TAIL_LINES=20
   CLAUDE_TMUX_INHERIT_CLAUDE_ENV=0
   CLAUDE_TMUX_CLEAR_CLAUDE_ENV=1
+  CLAUDE_TMUX_COLOR_ENV=1
 EOF
 }
 
@@ -471,6 +472,23 @@ session_env_has_key() {
   return 1
 }
 
+session_env_value_for_key() {
+  local key="$1"
+  local i entry
+  for (( i = 1; i <= ${#session_env_args[@]}; i += 2 )); do
+    entry="${session_env_args[$(( i + 1 ))]:-}"
+    if [[ "$entry" == "$key="* ]]; then
+      printf "%s" "${entry#*=}"
+      return 0
+    fi
+    if [[ "$entry" == "$key" ]]; then
+      (( ${+parameters[$key]} )) && printf "%s" "${(P)key}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 inherit_claude_env_args() {
   local key value
   if [[ "$INHERIT_CLAUDE_ENV" != "1" ]]; then
@@ -495,9 +513,6 @@ inherit_claude_env_args() {
 
 apply_color_env_args() {
   [[ "$COLOR_ENV" == "1" ]] || return 0
-  if ! session_env_has_key "NO_COLOR"; then
-    session_env_args+=("-e" "NO_COLOR=")
-  fi
   if ! session_env_has_key "COLORTERM"; then
     session_env_args+=("-e" "COLORTERM=truecolor")
   fi
@@ -507,6 +522,41 @@ apply_color_env_args() {
   if ! session_env_has_key "CLICOLOR_FORCE"; then
     session_env_args+=("-e" "CLICOLOR_FORCE=1")
   fi
+}
+
+color_env_shell_prefix() {
+  [[ "$COLOR_ENV" == "1" ]] || return 0
+
+  local prefix="" value
+  if session_env_has_key "NO_COLOR"; then
+    value="$(session_env_value_for_key "NO_COLOR")"
+    prefix+="export NO_COLOR=$(shell_quote "$value"); "
+  else
+    prefix+="unset NO_COLOR; "
+  fi
+
+  if session_env_has_key "COLORTERM"; then
+    value="$(session_env_value_for_key "COLORTERM")"
+  else
+    value="truecolor"
+  fi
+  prefix+="export COLORTERM=$(shell_quote "$value"); "
+
+  if session_env_has_key "FORCE_COLOR"; then
+    value="$(session_env_value_for_key "FORCE_COLOR")"
+  else
+    value="3"
+  fi
+  prefix+="export FORCE_COLOR=$(shell_quote "$value"); "
+
+  if session_env_has_key "CLICOLOR_FORCE"; then
+    value="$(session_env_value_for_key "CLICOLOR_FORCE")"
+  else
+    value="1"
+  fi
+  prefix+="export CLICOLOR_FORCE=$(shell_quote "$value"); "
+
+  printf "%s" "$prefix"
 }
 
 paste_and_submit() {
@@ -2249,8 +2299,10 @@ start_session() {
     "$TMUX" kill-session -t "$session"
   fi
 
+  local color_prefix
+  color_prefix="$(color_env_shell_prefix)"
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions; code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; ${color_prefix}$(shell_quote "$CLAUDE") --dangerously-skip-permissions; code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
@@ -2536,8 +2588,10 @@ resume_session() {
     "$TMUX" kill-session -t "$session"
   fi
 
+  local color_prefix
+  color_prefix="$(color_env_shell_prefix)"
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'claude session id: $claude_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; $(shell_quote "$CLAUDE") --dangerously-skip-permissions --resume $(shell_quote "$claude_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'claude session id: $claude_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; ${color_prefix}$(shell_quote "$CLAUDE") --dangerously-skip-permissions --resume $(shell_quote "$claude_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[claude-tmux] local command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
@@ -2603,16 +2657,6 @@ start_ssh_session() {
   if (( ! exact_name )); then
     name="$requested_name-$(random_suffix)"
   fi
-  if (( workdir_fresh )); then
-    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
-      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
-      exit 1
-    fi
-    local fresh_workdir
-    fresh_workdir="$(setup_fresh_worktree "$name" "claude" "$directory")" || exit 1
-    directory="$fresh_workdir"
-  fi
-
   local session="$(session_for_name "$name")"
   local -a session_env_args
   local session_env_entry
@@ -2627,7 +2671,9 @@ start_ssh_session() {
   fi
 
   local remote_command
-  remote_command="unset NO_COLOR; export TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=3 CLICOLOR_FORCE=1; cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'claude-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && claude --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] remote command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  local color_prefix
+  color_prefix="$(color_env_shell_prefix)"
+  remote_command="export TERM=xterm-256color; ${color_prefix}cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'claude-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && claude --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] remote command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")"
@@ -3722,6 +3768,7 @@ env_doctor_session() {
   echo "claude-tmux env-doctor"
   echo "inherit_claude_env: $INHERIT_CLAUDE_ENV"
   echo "clear_claude_env: $CLEAR_CLAUDE_ENV"
+  echo "color_env: $COLOR_ENV"
   env_doctor_print_map "caller env" caller
   env_doctor_print_map "tmux global env" tmux-global
 
