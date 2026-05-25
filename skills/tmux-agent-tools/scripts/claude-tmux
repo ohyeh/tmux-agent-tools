@@ -18,6 +18,7 @@ TMUX_CLIPBOARD="${CLAUDE_TMUX_CLIPBOARD:-auto}"
 STATUS_TAIL_LINES="${CLAUDE_TMUX_STATUS_TAIL_LINES:-20}"
 INHERIT_CLAUDE_ENV="${CLAUDE_TMUX_INHERIT_CLAUDE_ENV:-0}"
 CLEAR_CLAUDE_ENV="${CLAUDE_TMUX_CLEAR_CLAUDE_ENV:-1}"
+COLOR_ENV="${CLAUDE_TMUX_COLOR_ENV:-1}"
 
 resolve_tmux_bin() {
   if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
@@ -413,20 +414,20 @@ set -g history-limit 50000
 set -g status on
 set -g status-position bottom
 set -g status-interval 2
-set -g status-style "bg=#111827,fg=#cbd5e1"
+set -g status-style "bg=#020617,fg=#e5e7eb"
 set -g status-left-length 64
 set -g status-right-length 96
-set -g status-left "#[bg=#2563eb,fg=#ffffff,bold] Claude #[bg=#111827,fg=#93c5fd] #S "
-set -g status-right "#[fg=#64748b]#(pwd | sed 's#^$HOME#~#') #[fg=#22c55e]%H:%M "
-set -g window-status-format "#[fg=#94a3b8] #I:#W "
-set -g window-status-current-format "#[bg=#1f2937,fg=#ffffff,bold] #I:#W "
-set -g pane-border-style "fg=#334155"
-set -g pane-active-border-style "fg=#2563eb"
-set -g message-style "bg=#1f2937,fg=#ffffff"
-set -g mode-style "bg=#2563eb,fg=#ffffff"
-set -g clock-mode-colour "#2563eb"
-set -g display-panes-colour "#64748b"
-set -g display-panes-active-colour "#22c55e"
+set -g status-left "#[bg=#f97316,fg=#111827,bold] Claude #[bg=#020617,fg=#fbbf24,bold] #S "
+set -g status-right "#[fg=#94a3b8]#(pwd | sed 's#^$HOME#~#') #[fg=#34d399,bold]%H:%M "
+set -g window-status-format "#[fg=#cbd5e1] #I:#W "
+set -g window-status-current-format "#[bg=#334155,fg=#ffffff,bold] #I:#W "
+set -g pane-border-style "fg=#64748b"
+set -g pane-active-border-style "fg=#f59e0b"
+set -g message-style "bg=#f59e0b,fg=#111827,bold"
+set -g mode-style "bg=#f59e0b,fg=#111827,bold"
+set -g clock-mode-colour "#f59e0b"
+set -g display-panes-colour "#94a3b8"
+set -g display-panes-active-colour "#34d399"
 EOF
   local copy_command
   copy_command="$(clipboard_command)"
@@ -490,6 +491,22 @@ inherit_claude_env_args() {
     [[ -n "$value" ]] || continue
     session_env_args+=("-e" "$key=$value")
   done < <(claude_provider_env_keys)
+}
+
+apply_color_env_args() {
+  [[ "$COLOR_ENV" == "1" ]] || return 0
+  if ! session_env_has_key "NO_COLOR"; then
+    session_env_args+=("-e" "NO_COLOR=")
+  fi
+  if ! session_env_has_key "COLORTERM"; then
+    session_env_args+=("-e" "COLORTERM=truecolor")
+  fi
+  if ! session_env_has_key "FORCE_COLOR"; then
+    session_env_args+=("-e" "FORCE_COLOR=3")
+  fi
+  if ! session_env_has_key "CLICOLOR_FORCE"; then
+    session_env_args+=("-e" "CLICOLOR_FORCE=1")
+  fi
 }
 
 paste_and_submit() {
@@ -2200,6 +2217,7 @@ start_session() {
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   inherit_claude_env_args
+  apply_color_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -2486,6 +2504,7 @@ resume_session() {
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   inherit_claude_env_args
+  apply_color_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -2602,12 +2621,13 @@ start_ssh_session() {
     [[ -n "$session_env_entry" ]] || continue
     session_env_args+=("-e" "$session_env_entry")
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_color_env_args
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
   fi
 
   local remote_command
-  remote_command="export TERM=xterm-256color COLORTERM=truecolor; cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'claude-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && claude --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] remote command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  remote_command="unset NO_COLOR; export TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=3 CLICOLOR_FORCE=1; cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'claude-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && claude --dangerously-skip-permissions; code=\$?; printf '\n[claude-tmux] remote command exited with code %s\n' \"\$code\"; printf '[claude-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" \
     "printf '%s\n' 'claude-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")"
