@@ -47,7 +47,7 @@ Usage:
   codex-tmux wait <name> [timeout_seconds]
   codex-tmux wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]
   codex-tmux wait-literal <name> <text> [timeout_seconds]
-  codex-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>
+  codex-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] [--wait-for-human] [--cancel-file <path>] <name>
   codex-tmux capture <name> [lines]
   codex-tmux result [--path] [--field <jq>] [--wait <seconds>] [--json] <name>
   codex-tmux result path <name>
@@ -3734,6 +3734,21 @@ approval_gate_clear_status() {
   rm -f "$(agent_root_dir)/$name/approval-status.json" 2>/dev/null || true
 }
 
+awaiting_next_round_write_status() {
+  local name="$1" state="$2" marker="$3" cancel_file="${4:-}" reason="${5:-}"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local status_target="$subdir/awaiting-next-round.json"
+  local at
+  at="$(transcript_iso_now 2>/dev/null || true)"
+  ( "$JQ" -c -n --arg state "$state" --arg marker "$marker" \
+      --arg cancel_file "$cancel_file" --arg reason "$reason" --arg at "$at" \
+      '{schema_version: 1, state: $state, marker: $marker,
+        cancel_file: (if $cancel_file == "" then null else $cancel_file end),
+        reason: (if $reason == "" then null else $reason end),
+        at: $at}' > "$status_target" ) 2>/dev/null || true
+}
+
 approval_gate_emit_transcript() {
   local name="$1" decision="$2" marker_path="$3"
   local transcript_path
@@ -3805,6 +3820,8 @@ approval_gate_wait() {
 wait_and_capture_session() {
   local pause_until_file=""
   local pause_timeout=0
+  local wait_for_human=0
+  local cancel_file=""
   # Combined wait + capture — the golden-path shortcut described in
   # issue #99. Replaces the two-step `wait-literal` / `capture` pair.
   # `--no-timeout-error` decouples soft-timeout opt-in from `--json`
@@ -3840,6 +3857,15 @@ wait_and_capture_session() {
         since_marker="$2"; since_set=1; shift 2 ;;
       --json) output_json=1; shift ;;
       --no-timeout-error) no_timeout_error=1; shift ;;
+      --wait-for-human) wait_for_human=1; shift ;;
+      --cancel-file)
+        if (( $# < 2 )); then
+          echo "--cancel-file requires a path" >&2
+          exit 2
+        fi
+        cancel_file="$2"
+        shift 2
+        ;;
       --) shift; break ;;
       --pause-until-file)
         if (( $# < 2 )); then
@@ -3863,7 +3889,7 @@ wait_and_capture_session() {
 
   local name="${1:-}"
   if [[ -z "$name" || -z "$marker" ]]; then
-    echo "Usage: codex-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>" >&2
+    echo "Usage: codex-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] [--wait-for-human] [--cancel-file <path>] <name>" >&2
     exit 2
   fi
   if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
@@ -3879,6 +3905,9 @@ wait_and_capture_session() {
     exit 2
   fi
   if [[ -n "$pause_until_file" ]]; then
+    require_jq
+  fi
+  if (( wait_for_human )); then
     require_jq
   fi
   if (( output_json )); then
@@ -3921,9 +3950,17 @@ wait_and_capture_session() {
 
   local started=$SECONDS
   local matched=0
+  local cancelled=0
   local deadline=$((started + timeout_seconds))
   local current=""
-  while (( SECONDS < deadline )); do
+  if (( wait_for_human )); then
+    awaiting_next_round_write_status "$name" "awaiting_next_round" "$marker" "$cancel_file" ""
+  fi
+  while (( wait_for_human || SECONDS < deadline )); do
+    if (( wait_for_human )) && [[ -n "$cancel_file" && -e "$cancel_file" ]]; then
+      cancelled=1
+      break
+    fi
     current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
     if [[ "$match_style" == "literal" ]]; then
       if [[ "$current" == *"$marker"* ]]; then
@@ -3935,6 +3972,10 @@ wait_and_capture_session() {
         matched=1
         break
       fi
+    fi
+    if (( wait_for_human )) && (( SECONDS >= deadline )); then
+      awaiting_next_round_write_status "$name" "awaiting_next_round" "$marker" "$cancel_file" "heartbeat"
+      deadline=$((SECONDS + timeout_seconds))
     fi
     sleep 1
   done
@@ -3973,6 +4014,13 @@ wait_and_capture_session() {
       esac
     fi
     transcript_emit_wait_event "$name" wait_and_capture matched "$marker" "$timeout_seconds"
+    if (( wait_for_human )); then
+      awaiting_next_round_write_status "$name" "resolved" "$marker" "$cancel_file" "$reason"
+    fi
+  elif (( cancelled )); then
+    reason="cancelled"
+    transcript_emit_wait_event "$name" wait_and_capture timeout "$marker" "$timeout_seconds"
+    awaiting_next_round_write_status "$name" "resolved" "$marker" "$cancel_file" "$reason"
   else
     reason="timeout"
     transcript_emit_wait_event "$name" wait_and_capture timeout "$marker" "$timeout_seconds"
@@ -3999,6 +4047,9 @@ wait_and_capture_session() {
     printf '%s\n' "$raw"
   fi
 
+  if (( cancelled )); then
+    return 9
+  fi
   if (( ! matched && ! no_timeout_error )); then
     return 1
   fi

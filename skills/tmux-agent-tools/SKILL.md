@@ -19,6 +19,7 @@ The wrapper scripts are bundled at:
 - `scripts/codex-tmux`
 - `scripts/tmux-agent-dialogue`
 - `scripts/tmux-agent-sessions`
+- `scripts/tmux-agent-monitor`
 - `scripts/tmux-agent-fanout`
 
 If the commands are not on `PATH`, resolve them from the skill directory and run the script path directly.
@@ -36,6 +37,7 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 - `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
 - The subcommands `send`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
 - If you don't know which wrapper owns a session, use `tmux-agent-sessions resolve --name <partial-or-full-name> --json` before any `start`. It accepts a full tmux session name, wrapper-prefixed partial, or short agent name and returns the owning wrapper, short `agent_name`, full tmux session, cwd, result path, running state, and safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous or missing names exit non-zero and return JSON candidates/errors.
+- Use `tmux-agent-monitor --name <agent> --every <duration> --commands <manifest.json> --stop-on-change --summary-out <path> --json` when you need read-only periodic evidence checks against a managed session/repo. It polls manifest commands and emits JSONL observations plus a summary; it is distinct from `wait-and-capture`, which watches a tmux pane for a marker and captures pane output.
 
 ## Core Workflow
 

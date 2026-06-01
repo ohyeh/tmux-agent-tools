@@ -1,0 +1,133 @@
+#!/usr/bin/env zsh
+# Smoke test for Wave 4 monitor + wait-for-human behavior.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+MONITOR="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-monitor"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-monitor-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+export TMUX_AGENT_DIR="$WORK/state"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_file() {
+  local label="$1" path="$2"
+  if [[ -f "$path" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (missing $path)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+cat > "$WORK/change-command.sh" <<'EOF'
+#!/bin/sh
+state="$1"
+if [ -f "$state" ]; then
+  printf 'changed\n'
+else
+  printf 'initial\n'
+  : > "$state"
+fi
+EOF
+chmod +x "$WORK/change-command.sh"
+
+cat > "$WORK/monitor-manifest.json" <<EOF
+{
+  "commands": [
+    {"name": "steady", "command": "printf steady"},
+    {"name": "empty_stdout", "command": "true"},
+    {"name": "flip", "command": "$WORK/change-command.sh $WORK/flip.state"},
+    {"name": "false_cmd", "command": "false"}
+  ],
+  "expected": {
+    "steady": {"stdout": "steady", "exit_code": 0},
+    "empty_stdout": {"stdout": "", "exit_code": 0},
+    "flip": {"stdout": "initial", "exit_code": 0},
+    "false_cmd": {"exit_code": 1}
+  }
+}
+EOF
+
+echo "case: tmux-agent-monitor stop-on-change"
+monitor_jsonl="$WORK/monitor.jsonl"
+monitor_summary="$WORK/monitor-summary.json"
+"$MONITOR" --name smoke --every 1s --until 5s --commands "$WORK/monitor-manifest.json" \
+  --stop-on-change --summary-out "$monitor_summary" --json > "$monitor_jsonl"
+
+assert_file "monitor emitted JSONL" "$monitor_jsonl"
+assert_file "monitor wrote summary" "$monitor_summary"
+assert "monitor JSONL has observations" "$(jq -r 'select(.event=="observation") | .name' "$monitor_jsonl" | wc -l | tr -d ' ')" "8"
+assert "monitor summary reason" "$(jq -r .reason "$monitor_summary")" "changed"
+assert "monitor detected changed output" "$(jq -r '.changed' "$monitor_jsonl" | grep -c '^true$' | tr -d ' ')" "1"
+assert "monitor summary was also printed" "$(tail -1 "$monitor_jsonl" | jq -r .event)" "summary"
+
+cat > "$WORK/fake-human-agent.sh" <<'EOF'
+#!/bin/sh
+printf 'fake human wait ready\n'
+sleep 30
+EOF
+chmod +x "$WORK/fake-human-agent.sh"
+
+run_wait_for_human_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  local tmux_prefix="$4"
+  echo "case: $prefix wait-for-human ($wrapper)"
+  env "$cli_env=$WORK/fake-human-agent.sh" "$wrapper" start --exact "$prefix" "$WORK" >/dev/null
+  "$wrapper" wait-text "$prefix" "fake human wait ready" 5 >/dev/null
+
+  local out="$WORK/$prefix.wait.json"
+  local cancel="$WORK/$prefix.cancel"
+  local marker="HUMAN-$prefix-DONE"
+  "$wrapper" wait-and-capture --wait-for-human --cancel-file "$cancel" \
+    --marker "$marker" --timeout 2 --json "$prefix" > "$out" 2>"$WORK/$prefix.err" &
+  local pid=$!
+  sleep 4
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "  ok   $prefix does not return on idle/timeout"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix returned before marker/cancel" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  local state_file="${TMUX_AGENT_DIR:-$HOME/.local/state/tmux-agent-tools}/$prefix/awaiting-next-round.json"
+  assert_file "$prefix wrote awaiting-next-round.json" "$state_file"
+  assert "$prefix awaiting state" "$(jq -r .state "$state_file")" "awaiting_next_round"
+
+  tmux send-keys -t "$tmux_prefix-$prefix" "$marker" Enter
+  wait "$pid"
+  assert "$prefix marker matched" "$(jq -r .matched "$out")" "true"
+  assert "$prefix reason matched" "$(jq -r .reason "$out")" "matched"
+  assert "$prefix awaiting resolved" "$(jq -r .state "$state_file")" "resolved"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_wait_for_human_case "$CODEX_TMUX"  "CODEX"  "wfh-codex"  "codex-cli"
+run_wait_for_human_case "$CLAUDE_TMUX" "CLAUDE" "wfh-claude" "claude-cli"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
