@@ -20,7 +20,7 @@ Treat `local_or_remote` and `diagnostic` as best-effort; the other fields are st
 
 ## `result.json` (agent → parent contract)
 
-Agents write `$TMUX_AGENT_RESULT` (path: `$TMUX_AGENT_DIR/<name>/result.json`) with this shape:
+Agents write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with this shape:
 
 ```jsonc
 {
@@ -65,12 +65,17 @@ $ codex-tmux result --json --wait 30 worker
 }
 ```
 
-If `.present:false`, the agent never wrote the file — re-prompt it explicitly: "Before signaling done, write your conclusion to `$TMUX_AGENT_RESULT` with `schema_version:1`."
+If `.present:false`, the agent never wrote the file — re-prompt it explicitly with the literal result path.
+
+### Why the worker can't use `$TMUX_AGENT_RESULT`
+
+Agent CLIs run tool commands in a sandboxed environment that does not inherit the tmux session environment, so `$TMUX_AGENT_RESULT` is empty inside the worker. Orchestrators should get the literal absolute path with `result --path <name>`, embed that path in the worker prompt, and optionally run `result init <name>` first.
 
 Result helpers available in both wrappers:
 
 | Command | Behavior |
 | --- | --- |
+| `result --path <name>` | Prints the literal `$TMUX_AGENT_DIR/<name>/result.json` path and exits `0`, without requiring the file to exist. |
 | `result init <name>` | Writes `$TMUX_AGENT_DIR/<name>/result.json` as a valid skeleton: `schema_version:1`, `status:"ok"`, empty `summary`, `artifacts`, and `errors`. Exits `0` after writing the file path. |
 | `result validate <name> --json` | Validates `result.json` with the recorded schema path, or the bundled result schema when none was recorded. Valid files exit `0` with `valid:true`; missing files exit `1`; malformed or contract-invalid files exit `2` with `valid:false` and `errors[]`. |
 | `result wait-required <name> --fields status,summary,artifacts --wait 60 --json` | Polls until the file exists and every named field is non-empty. Success exits `0` with the normal `result --json` payload; timeout exits `1` with JSON including `timeout:true` and `missing_fields`. Usage errors exit `2`. |

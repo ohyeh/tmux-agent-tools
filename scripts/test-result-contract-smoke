@@ -53,6 +53,12 @@ run_contract_cases() {
   echo "case: $prefix ($wrapper)"
 
   local init_path valid code out
+  code=0
+  out="$("$wrapper" result --path "$prefix-path-missing" 2>&1)" || code=$?
+  assert "$prefix path missing exit" "$code" "0"
+  assert "$prefix path missing prints expected path" "$out" "$TMUX_AGENT_DIR/$prefix-path-missing/result.json"
+  assert "$prefix path missing does not create file" "$([[ -f "$out" ]] && echo yes || echo no)" "no"
+
   init_path="$("$wrapper" result init "$prefix-init")"
   assert "$prefix init writes file" "$([[ -f "$init_path" ]] && echo yes || echo no)" "yes"
   valid="$("$wrapper" result validate "$prefix-init" --json | jq -r .valid)"

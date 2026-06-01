@@ -89,7 +89,7 @@ Use `env-doctor [name]` before deeper debugging when an agent CLI uses the wrong
 codex-tmux result --field '.status' --wait 30 --json worker
 ```
 
-Agents should write `$TMUX_AGENT_RESULT` (a JSON file at `$TMUX_AGENT_DIR/<name>/result.json`) with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`. Agents cannot expand `$TMUX_AGENT_RESULT` from sandboxed tool envs; pass the literal path from `result --path <name>` in the worker prompt. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
 
 ## Approval gates
 
@@ -112,7 +112,7 @@ These tools are for **long-running supervised work**, not for unbounded agent sp
 
 1. **Ask the user up front: tool (claude or codex), model tier, and effort/reasoning level per worker.** Never assume defaults.
 2. **Declare an explicit worker upper bound** (e.g., "I will run at most 3 workers; if that is insufficient I will stop and report, not spawn helpers").
-3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write `$TMUX_AGENT_RESULT` when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
+3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write your result to <the literal path from `result --path <name>`> when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
 4. **Bound dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6).
 
 For credential-free smoke tests of any preset, use `--agent-a fake --agent-b fake`. Real `codex` / `claude` participants only after explicit user authorization.

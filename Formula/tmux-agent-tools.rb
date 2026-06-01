@@ -22,6 +22,7 @@ class TmuxAgentTools < Formula
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-worktrees"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-replay"
     pkgshare.install "skills"
+    pkgshare.install "schemas"
   end
 
   test do

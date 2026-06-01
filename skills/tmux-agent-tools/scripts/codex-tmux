@@ -49,7 +49,8 @@ Usage:
   codex-tmux wait-literal <name> <text> [timeout_seconds]
   codex-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>
   codex-tmux capture <name> [lines]
-  codex-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>
+  codex-tmux result [--path] [--field <jq>] [--wait <seconds>] [--json] <name>
+  codex-tmux result path <name>
   codex-tmux result init <name>
   codex-tmux result validate <name> --json
   codex-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
@@ -241,6 +242,8 @@ HELP_EOF
     result)
       cat <<'HELP_EOF'
 codex-tmux result [flags] <name>
+codex-tmux result --path <name>
+codex-tmux result path <name>
 codex-tmux result init <name>
 codex-tmux result validate <name> --json
 codex-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
@@ -248,6 +251,8 @@ codex-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
 Read the agent's result.json (#97) at $TMUX_AGENT_DIR/<name>/result.json.
 
 Flags:
+  --path                        Print the literal result.json path and exit 0.
+                                Does not require result.json to exist.
   --field <jq>                  Extract single value via `jq -r`. Exit 1 on
                                 missing path.
   --wait <seconds>              Poll until the file appears or timeout.
@@ -256,6 +261,7 @@ Flags:
                                   → exit 0 with present:false.
 
 Subcommands:
+  path                          Print the literal result.json path and exit 0.
   init                          Write a valid result.json skeleton.
   validate                      Validate result.json against the default or
                                 recorded result schema. Missing/invalid exits
@@ -1488,6 +1494,17 @@ result_init_session() {
   result_path="$subdir/result.json"
   "$JQ" -n '{schema_version: 1, status: "ok", summary: "", artifacts: [], errors: []}' > "$result_path"
   printf '%s\n' "$result_path"
+}
+
+result_path_session() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: codex-tmux result --path <name>" >&2
+    exit 2
+  fi
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  printf '%s\n' "$subdir/result.json"
 }
 
 result_validate_session() {
@@ -3357,6 +3374,11 @@ result_session() {
   # Optional --wait <seconds> polls until the file appears or timeout.
   # --field <jq> extracts a single value. --json wraps in metadata.
   case "${1:-}" in
+    path)
+      shift
+      result_path_session "$@"
+      return $?
+      ;;
     init)
       shift
       result_init_session "$@"
@@ -3383,8 +3405,13 @@ result_session() {
   local wait_seconds=0
   local output_json=0
   local validate_mode=0
+  local path_mode=0
   while [[ "${1:-}" == --* ]]; do
     case "$1" in
+      --path)
+        path_mode=1
+        shift
+        ;;
       --field)
         if (( $# < 2 )); then
           echo "--field requires a value (jq path)" >&2
@@ -3426,7 +3453,7 @@ result_session() {
 
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "Usage: codex-tmux result [init|validate|wait-required] ..." >&2
+    echo "Usage: codex-tmux result [--path] [init|validate|wait-required] ..." >&2
     exit 2
   fi
   if (( output_json )); then
@@ -3438,6 +3465,11 @@ result_session() {
 
   local result_path
   result_path="$(agent_root_dir)/$name/result.json"
+
+  if (( path_mode )); then
+    result_path_session "$name"
+    return 0
+  fi
 
   if (( validate_mode )); then
     require_jq
