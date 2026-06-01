@@ -28,9 +28,25 @@ Agents write `$TMUX_AGENT_RESULT` (path: `$TMUX_AGENT_DIR/<name>/result.json`) w
   "status": "ok" | "blocked" | "error",
   "summary": "one-line human-readable summary",
   "artifacts": [{"kind": "pr|file|url", "ref": "PR-1234"}],
-  "errors": [{"code": "...", "message": "...", "remediation": "..."}]
+  "errors": [{"code": "...", "message": "...", "remediation": "..."}],
+  "verdict": {
+    "verdict": "ACCEPT|BLOCK|ACCEPT_WITH_CHANGES",
+    "blockers": ["blocking issue, if any"],
+    "marker": "review marker or completion marker"
+  },
+  "decision": {
+    "decision_by": "agent|user|owner|delegate",
+    "delegate_name": "optional delegate name",
+    "authority": "why this actor can decide",
+    "scope": "decision boundary",
+    "decision": "what was decided",
+    "evidence": ["supporting artifact or observation"],
+    "limits": ["known limitation or excluded scope"]
+  }
 }
 ```
+
+`verdict` and `decision` are optional Wave 2 blocks. The lightweight validator checks `verdict.verdict` against `ACCEPT`, `BLOCK`, and `ACCEPT_WITH_CHANGES`; checks `verdict.blockers` is an array; and checks `decision.decision_by` against `agent`, `user`, `owner`, and `delegate`.
 
 Parent reads it via `result --json --wait <seconds> <name>`. Always branch in this order before consuming `.body`:
 
@@ -50,6 +66,14 @@ $ codex-tmux result --json --wait 30 worker
 ```
 
 If `.present:false`, the agent never wrote the file — re-prompt it explicitly: "Before signaling done, write your conclusion to `$TMUX_AGENT_RESULT` with `schema_version:1`."
+
+Result helpers available in both wrappers:
+
+| Command | Behavior |
+| --- | --- |
+| `result init <name>` | Writes `$TMUX_AGENT_DIR/<name>/result.json` as a valid skeleton: `schema_version:1`, `status:"ok"`, empty `summary`, `artifacts`, and `errors`. Exits `0` after writing the file path. |
+| `result validate <name> --json` | Validates `result.json` with the recorded schema path, or the bundled result schema when none was recorded. Valid files exit `0` with `valid:true`; missing files exit `1`; malformed or contract-invalid files exit `2` with `valid:false` and `errors[]`. |
+| `result wait-required <name> --fields status,summary,artifacts --wait 60 --json` | Polls until the file exists and every named field is non-empty. Success exits `0` with the normal `result --json` payload; timeout exits `1` with JSON including `timeout:true` and `missing_fields`. Usage errors exit `2`. |
 
 ## Approval-gate state file
 

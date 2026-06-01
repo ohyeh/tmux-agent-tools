@@ -50,6 +50,9 @@ Usage:
   codex-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>
   codex-tmux capture <name> [lines]
   codex-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>
+  codex-tmux result init <name>
+  codex-tmux result validate <name> --json
+  codex-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
   codex-tmux list
   codex-tmux status [--json] <name>
   codex-tmux ping [--timeout <s>] [--json] <name>
@@ -238,6 +241,9 @@ HELP_EOF
     result)
       cat <<'HELP_EOF'
 codex-tmux result [flags] <name>
+codex-tmux result init <name>
+codex-tmux result validate <name> --json
+codex-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
 
 Read the agent's result.json (#97) at $TMUX_AGENT_DIR/<name>/result.json.
 
@@ -248,6 +254,14 @@ Flags:
   --json                        Wrap as {schema_version, path, present,
                                   bytes, mtime, valid, body}. Missing file
                                   → exit 0 with present:false.
+
+Subcommands:
+  init                          Write a valid result.json skeleton.
+  validate                      Validate result.json against the default or
+                                recorded result schema. Missing/invalid exits
+                                non-zero and emits machine-readable JSON.
+  wait-required                 Poll until result.json exists and all named
+                                fields are non-empty, or timeout with JSON.
 HELP_EOF
       ;;
     status)
@@ -1310,6 +1324,24 @@ result_schema_path_for() {
   [[ -f "$marker" ]] && cat "$marker" || true
 }
 
+result_default_schema_path() {
+  local candidates=(
+    "${SELF:h:h:h:h}/schemas/result-status-summary.schema.json"
+    "${SELF:h:h}/schemas/result-status-summary.schema.json"
+    "${SELF:h:h}/share/tmux-agent-tools/schemas/result-status-summary.schema.json"
+    "${SELF:h:h}/opt/tmux-agent-tools/schemas/result-status-summary.schema.json"
+    "${SELF:h}/../share/tmux-agent-tools/schemas/result-status-summary.schema.json"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      print -r -- "${candidate:A}"
+      return 0
+    fi
+  done
+  print -r -- "${candidates[1]}"
+}
+
 result_validate_lightweight() {
   # Lightweight v1 validator (#125): checks top-level type + required +
   # additionalProperties:false. Emits a single JSON line.
@@ -1374,7 +1406,30 @@ result_validate_lightweight() {
                | map({path: ., message: "additional property not allowed"})
           else [] end
         ) as $extra_errors
-      | $type_errors + $required_errors + $extra_errors;
+      | # Wave 2 light validation for optional result contract blocks.
+        ( if ($body | type) == "object" and ($body | has("verdict"))
+          then
+            (if ($body.verdict | type) != "object"
+             then [{path: "verdict", message: "type mismatch: expected object"}]
+             else
+               ((if (($body.verdict.verdict // null) | IN("ACCEPT", "BLOCK", "ACCEPT_WITH_CHANGES")) then []
+                 else [{path: "verdict.verdict", message: "invalid verdict"}] end)
+                + (if ($body.verdict.blockers | type) == "array" then []
+                   else [{path: "verdict.blockers", message: "type mismatch: expected array"}] end))
+             end)
+          else [] end
+        ) as $verdict_errors
+      | ( if ($body | type) == "object" and ($body | has("decision"))
+          then
+            (if ($body.decision | type) != "object"
+             then [{path: "decision", message: "type mismatch: expected object"}]
+             else
+               (if (($body.decision.decision_by // null) | IN("agent", "user", "owner", "delegate")) then []
+                else [{path: "decision.decision_by", message: "invalid decision_by"}] end)
+             end)
+          else [] end
+        ) as $decision_errors
+      | $type_errors + $required_errors + $extra_errors + $verdict_errors + $decision_errors;
     ($body | tojson) as $body_json
     | v1_validate($schema; $body) as $errs
     | {schema_version: 1, present: true, valid: ($errs | length == 0),
@@ -1399,10 +1454,164 @@ result_validate_lightweight() {
           then ($body | keys) - (($schema.properties // {}) | keys)
           else [] end
         ) as $extra_errors
-      | ($type_errors + $required_errors + $extra_errors | length == 0);
+      | ( if ($body | type) == "object" and ($body | has("verdict"))
+          then
+            (if ($body.verdict | type) != "object" then [1]
+             else
+               ((if (($body.verdict.verdict // null) | IN("ACCEPT", "BLOCK", "ACCEPT_WITH_CHANGES")) then [] else [1] end)
+                + (if ($body.verdict.blockers | type) == "array" then [] else [1] end))
+             end)
+          else [] end
+        ) as $verdict_errors
+      | ( if ($body | type) == "object" and ($body | has("decision"))
+          then
+            (if ($body.decision | type) != "object" then [1]
+             elif (($body.decision.decision_by // null) | IN("agent", "user", "owner", "delegate")) then []
+             else [1] end)
+          else [] end
+        ) as $decision_errors
+      | ($type_errors + $required_errors + $extra_errors + $verdict_errors + $decision_errors | length == 0);
     v1_validate($schema; $body)
   ')"
   [[ "$valid" == "true" ]] && return 0 || return 2
+}
+
+result_init_session() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: codex-tmux result init <name>" >&2
+    exit 2
+  fi
+  require_jq
+  local subdir result_path
+  subdir="$(ensure_agent_dir "$name")"
+  result_path="$subdir/result.json"
+  "$JQ" -n '{schema_version: 1, status: "ok", summary: "", artifacts: [], errors: []}' > "$result_path"
+  printf '%s\n' "$result_path"
+}
+
+result_validate_session() {
+  local output_json=0
+  local name=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      --*)
+        echo "Unknown result validate flag: $1" >&2
+        exit 2
+        ;;
+      *)
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$name" || $# -gt 0 ]]; then
+    echo "Usage: codex-tmux result validate <name> --json" >&2
+    exit 2
+  fi
+  if (( ! output_json )); then
+    echo "result validate requires --json" >&2
+    exit 2
+  fi
+  require_jq
+  local result_path schema_path
+  result_path="$(agent_root_dir)/$name/result.json"
+  schema_path="$(result_schema_path_for "$name")"
+  [[ -n "$schema_path" ]] || schema_path="$(result_default_schema_path)"
+  if [[ ! -f "$result_path" ]]; then
+    "$JQ" -n --arg path "$result_path" \
+      '{schema_version: 1, path: $path, present: false, valid: false,
+        errors: [{path: ".", message: "result file not found"}], body: null}'
+    return 1
+  fi
+  result_validate_lightweight "$result_path" "$schema_path"
+}
+
+result_wait_required_session() {
+  local fields="" wait_seconds=0 output_json=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --fields)
+        if (( $# < 2 )); then
+          echo "--fields requires a comma-separated value" >&2
+          exit 2
+        fi
+        fields="$2"
+        shift 2
+        ;;
+      --wait)
+        if (( $# < 2 )); then
+          echo "--wait requires a value (seconds)" >&2
+          exit 2
+        fi
+        wait_seconds="$2"
+        shift 2
+        if [[ ! "$wait_seconds" =~ '^[0-9]+$' ]]; then
+          echo "--wait must be a non-negative integer" >&2
+          exit 2
+        fi
+        ;;
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      --*)
+        echo "Unknown result wait-required flag: $1" >&2
+        exit 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  local name="${1:-}"
+  if [[ -z "$name" || -z "$fields" || "$output_json" -ne 1 ]]; then
+    echo "Usage: codex-tmux result wait-required <name> --fields a,b --wait N --json" >&2
+    exit 2
+  fi
+  require_jq
+  local result_path deadline out missing
+  result_path="$(agent_root_dir)/$name/result.json"
+  deadline=$((SECONDS + wait_seconds))
+  while true; do
+    if [[ -f "$result_path" ]] && "$JQ" -e . "$result_path" >/dev/null 2>&1; then
+      missing="$("$JQ" -r --arg fields "$fields" '
+        ($fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $fields
+        | . as $body
+        | [ $fields[]
+            | select((. as $f
+              | ($body | getpath($f | split("."))? // null) as $v
+              | ($v == null or $v == "" or (($v | type) == "array" and ($v | length) == 0)
+                 or (($v | type) == "object" and ($v | length) == 0)))) ]
+        | join(",")
+      ' "$result_path")"
+      if [[ -z "$missing" ]]; then
+        out="$(result_session --json "$name")"
+        printf '%s\n' "$out"
+        return 0
+      fi
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep 1
+  done
+  local present=false
+  [[ -f "$result_path" ]] && present=true
+  "$JQ" -n --arg path "$result_path" --arg missing "$missing" --argjson present "$present" \
+    '{schema_version: 1, path: $path, present: $present,
+      valid: false, timeout: true, missing_fields: (if $missing == "" then [] else ($missing | split(",")) end)}'
+  return 1
 }
 
 tag_record() {
@@ -3147,6 +3356,29 @@ result_session() {
   #   $TMUX_AGENT_DIR/<name>/result.json
   # Optional --wait <seconds> polls until the file appears or timeout.
   # --field <jq> extracts a single value. --json wraps in metadata.
+  case "${1:-}" in
+    init)
+      shift
+      result_init_session "$@"
+      return $?
+      ;;
+    validate)
+      shift
+      result_validate_session "$@"
+      return $?
+      ;;
+    wait-required)
+      shift
+      local name="${1:-}"
+      if [[ -n "$name" && "$name" != --* ]]; then
+        shift
+        result_wait_required_session "$@" "$name"
+      else
+        result_wait_required_session "$@"
+      fi
+      return $?
+      ;;
+  esac
   local field=""
   local wait_seconds=0
   local output_json=0
@@ -3194,7 +3426,7 @@ result_session() {
 
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "Usage: codex-tmux result [--field <jq>] [--wait <seconds>] [--json] <name>" >&2
+    echo "Usage: codex-tmux result [init|validate|wait-required] ..." >&2
     exit 2
   fi
   if (( output_json )); then

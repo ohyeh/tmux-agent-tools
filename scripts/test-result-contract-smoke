@@ -1,0 +1,114 @@
+#!/usr/bin/env zsh
+# Smoke test for Wave 2 result contract helpers.
+#
+# No real agent is started. Cases fabricate result.json files directly
+# under TMUX_AGENT_DIR and exercise both wrappers.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-result-contract-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    needle: $needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+write_result() {
+  local name="$1" body="$2"
+  mkdir -p "$TMUX_AGENT_DIR/$name"
+  printf '%s\n' "$body" > "$TMUX_AGENT_DIR/$name/result.json"
+}
+
+run_contract_cases() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix ($wrapper)"
+
+  local init_path valid code out
+  init_path="$("$wrapper" result init "$prefix-init")"
+  assert "$prefix init writes file" "$([[ -f "$init_path" ]] && echo yes || echo no)" "yes"
+  valid="$("$wrapper" result validate "$prefix-init" --json | jq -r .valid)"
+  assert "$prefix init validates" "$valid" "true"
+
+  code=0
+  out="$("$wrapper" result validate "$prefix-missing" --json 2>&1)" || code=$?
+  assert "$prefix validate missing exit" "$code" "1"
+  assert "$prefix validate missing present=false" "$(printf '%s' "$out" | jq -r .present)" "false"
+
+  write_result "$prefix-invalid" '{"schema_version":1,"status":"ok"}'
+  code=0
+  out="$("$wrapper" result validate "$prefix-invalid" --json 2>&1)" || code=$?
+  assert "$prefix validate invalid exit" "$code" "2"
+  assert_contains "$prefix validate invalid names summary" "$out" "summary"
+
+  write_result "$prefix-valid" '{"schema_version":1,"status":"ok","summary":"done","artifacts":[],"errors":[],"verdict":{"verdict":"ACCEPT_WITH_CHANGES","blockers":[],"marker":"W2"},"decision":{"decision_by":"delegate","delegate_name":"reviewer","authority":"assigned","scope":"result contract","decision":"accept","evidence":[],"limits":[]}}'
+  code=0
+  out="$("$wrapper" result validate "$prefix-valid" --json 2>&1)" || code=$?
+  assert "$prefix valid verdict decision exit" "$code" "0"
+  assert "$prefix valid verdict decision valid=true" "$(printf '%s' "$out" | jq -r .valid)" "true"
+
+  write_result "$prefix-bad-verdict" '{"schema_version":1,"status":"ok","summary":"done","verdict":{"verdict":"MAYBE","blockers":[],"marker":"W2"}}'
+  code=0
+  out="$("$wrapper" result validate "$prefix-bad-verdict" --json 2>&1)" || code=$?
+  assert "$prefix bad verdict exit" "$code" "2"
+  assert_contains "$prefix bad verdict message" "$out" "invalid verdict"
+
+  write_result "$prefix-bad-decision" '{"schema_version":1,"status":"ok","summary":"done","decision":{"decision_by":"committee","decision":"accept"}}'
+  code=0
+  out="$("$wrapper" result validate "$prefix-bad-decision" --json 2>&1)" || code=$?
+  assert "$prefix bad decision exit" "$code" "2"
+  assert_contains "$prefix bad decision message" "$out" "invalid decision_by"
+
+  code=0
+  out="$("$wrapper" result wait-required "$prefix-wait-missing" --fields status,summary --wait 2 --json 2>&1)" || code=$?
+  assert "$prefix wait-required missing exit" "$code" "1"
+  assert "$prefix wait-required missing timeout" "$(printf '%s' "$out" | jq -r .timeout)" "true"
+
+  write_result "$prefix-wait-incomplete" '{"schema_version":1,"status":"ok","summary":"","artifacts":[],"errors":[]}'
+  code=0
+  out="$("$wrapper" result wait-required "$prefix-wait-incomplete" --fields status,summary --wait 2 --json 2>&1)" || code=$?
+  assert "$prefix wait-required incomplete exit" "$code" "1"
+  assert "$prefix wait-required incomplete timeout" "$(printf '%s' "$out" | jq -r .timeout)" "true"
+  assert_contains "$prefix wait-required missing summary" "$out" "summary"
+
+  write_result "$prefix-wait-complete" '{"schema_version":1,"status":"ok","summary":"done","artifacts":[{"kind":"file","ref":"x"}],"errors":[]}'
+  code=0
+  out="$("$wrapper" result wait-required "$prefix-wait-complete" --fields status,summary --wait 2 --json 2>&1)" || code=$?
+  assert "$prefix wait-required complete exit" "$code" "0"
+  assert "$prefix wait-required complete present" "$(printf '%s' "$out" | jq -r .present)" "true"
+}
+
+run_contract_cases "$CODEX_TMUX" "contract-codex"
+run_contract_cases "$CLAUDE_TMUX" "contract-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
