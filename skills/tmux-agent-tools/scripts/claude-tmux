@@ -42,9 +42,10 @@ Usage:
   claude-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
   claude-tmux attach <name>
   claude-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
+  claude-tmux send-wait <name> <text> [timeout_seconds]
   claude-tmux send-wait-literal <name> <text> <literal> [timeout_seconds]
   claude-tmux wait <name> [timeout_seconds]
-  claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]
+  claude-tmux wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]
   claude-tmux wait-literal <name> <text> [timeout_seconds]
   claude-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] <name>
   claude-tmux capture <name> [lines]
@@ -66,9 +67,10 @@ Examples:
   claude-tmux start --exact pr5 ~/github/example-service 'hi'
   claude-tmux attach pr5
   claude-tmux send pr5 'Read the PR description first.'
+  claude-tmux send-wait pr5 'Summarize the current state.' 180
   claude-tmux send-wait-literal pr5 'Reply with the requested marker.' '[CLAUDE-01]' 180
   claude-tmux wait pr5 180
-  claude-tmux wait-text pr5 'Done|Need approval' 180
+  claude-tmux wait-text --regex pr5 'Done|Need approval' 180
   claude-tmux wait-text --literal pr5 '[CLAUDE-01]' 180
   claude-tmux wait-literal pr5 '[CLAUDE-01]' 180
   claude-tmux capture pr5 80
@@ -84,9 +86,10 @@ Behavior:
   - start-ssh keeps tmux local, then runs Claude through ssh in the remote directory.
   - Claude is launched with --dangerously-skip-permissions.
   - wait returns when the visible pane is stable for a few seconds.
-  - wait-text returns when the visible pane matches a zsh extended regex.
-  - wait-text --literal returns when the visible pane contains exact text.
+  - wait-text returns when the visible pane contains exact text by default.
+  - wait-text --regex opts into zsh extended-regex matching.
   - wait-literal returns when the visible pane contains exact text.
+  - send-wait sends text with a fresh nonce instruction, then waits for that nonce on its own line.
   - send-wait-literal sends text, then waits for a new occurrence of exact text.
   - capture reads the tmux pane without stealing browser or terminal focus.
 
@@ -160,6 +163,15 @@ multi-line injection under the same send-lock, transcript, and audit surfaces.
 CLAUDE_TMUX_SUBMIT_DELAY.
 HELP_EOF
       ;;
+    send-wait)
+      cat <<'HELP_EOF'
+claude-tmux send-wait <name> <text> [timeout]
+
+Send text with a fresh MARK-<hex> nonce instruction appended, then wait for
+that nonce to appear alone on a line. Use this for prompt/response turns where
+prompt echo or stale markers must not satisfy the wait.
+HELP_EOF
+      ;;
     send-wait-literal)
       cat <<'HELP_EOF'
 claude-tmux send-wait-literal <name> <text> <literal> [timeout]
@@ -179,12 +191,13 @@ HELP_EOF
       ;;
     wait-text|wait-literal)
       cat <<'HELP_EOF'
-claude-tmux wait-text [--literal] <name> <pattern> [timeout_seconds]
+claude-tmux wait-text [--literal|--regex] <name> <pattern> [timeout_seconds]
 claude-tmux wait-literal       <name> <text>    [timeout_seconds]
 
-Both wait until the visible pane contains the pattern. `wait-text` uses zsh
-extended regex by default; `--literal` and `wait-literal` use exact-text
-match. Prefer literal forms for markers containing regex metacharacters
+Both wait until the visible pane contains the pattern. `wait-text` uses exact-text
+matching by default; `--regex` opts into zsh extended regex; `--literal` is
+accepted for compatibility. `wait-literal` is always exact-text match.
+Prefer literal forms for markers containing regex metacharacters
 (`[`, `]`, `(`, `)`, `.`, `*`, `?`).
 HELP_EOF
       ;;
@@ -307,7 +320,7 @@ HELP_EOF
       ;;
     *)
       printf 'No focused help for %q. Available topics:\n' "$topic" >&2
-      printf '  start resume start-ssh attach send send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  env-doctor list stop doctor self-test help\n' >&2
+      printf '  start resume start-ssh attach send send-wait send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  env-doctor list stop doctor self-test help\n' >&2
       return 2
       ;;
   esac
@@ -2323,7 +2336,7 @@ start_session() {
   echo "cwd:  $directory"
   echo "send: $SELF send $name <text>"
   echo "wait: $SELF wait $name 180"
-  echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "wait-text: $SELF wait-text $name '<text>' 180"
   echo "wait-literal: $SELF wait-literal $name '<text>' 180"
   echo "capture: $SELF capture $name 120"
   if [[ -n "$initial_text" ]]; then
@@ -2614,7 +2627,7 @@ resume_session() {
   echo "claude session id: $claude_session_id"
   echo "send: $SELF send $name <text>"
   echo "wait: $SELF wait $name 180"
-  echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "wait-text: $SELF wait-text $name '<text>' 180"
   echo "wait-literal: $SELF wait-literal $name '<text>' 180"
   echo "capture: $SELF capture $name 120"
 
@@ -2684,7 +2697,7 @@ start_ssh_session() {
   echo "cwd:  $remote_directory"
   echo "send: $SELF send $name <text>"
   echo "wait: $SELF wait $name 180"
-  echo "wait-text: $SELF wait-text $name '<regex>' 180"
+  echo "wait-text: $SELF wait-text $name '<text>' 180"
   echo "wait-literal: $SELF wait-literal $name '<text>' 180"
   echo "capture: $SELF capture $name 120"
   if [[ -n "$initial_text" ]]; then
@@ -2850,6 +2863,90 @@ count_literal_occurrences() {
   done
 
   echo "$count"
+}
+
+count_literal_line_occurrences() {
+  local haystack="$1"
+  local needle="$2"
+  local count=0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$needle" ]] && count=$((count + 1))
+  done <<< "$haystack"
+  echo "$count"
+}
+
+marker_nonce() {
+  local hex=""
+  if command -v od >/dev/null 2>&1; then
+    hex="$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  fi
+  if [[ ! "$hex" =~ '^[0-9a-fA-F]{6}$' ]]; then
+    hex="$(printf '%06x' $(( RANDOM * RANDOM % 16777216 )))"
+  fi
+  printf 'MARK-%s' "${hex:l}"
+}
+
+send_wait_session() {
+  require_tmux
+  local name="${1:-}"
+  local prompt_text="${2:-}"
+  local timeout_seconds="${3:-180}"
+
+  if [[ -z "$name" || -z "$prompt_text" ]]; then
+    echo "Usage: claude-tmux send-wait <name> <text> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local nonce
+  nonce="$(marker_nonce)"
+  local augmented_prompt="${prompt_text}"$'\n\n'"End your reply with this exact nonce on its own line: ${nonce}"
+  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds"
+}
+
+_send_wait_nonce_locked() {
+  local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5"
+
+  local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+  local before_count
+  before_count="$(count_literal_line_occurrences "$before" "$nonce")"
+
+  local buffer_name="$session-send-wait"
+  paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  audit_log_append "$("$JQ" -c -n --arg event send --arg tool claude --arg name "$name" --arg text_len "${#prompt_text}" --arg marker "$nonce" \
+    '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber), marker:$marker}')"
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+  local current_count=0
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+    current_count="$(count_literal_line_occurrences "$current" "$nonce")"
+    if (( current_count > before_count )); then
+      marker_seen_add "$name" "$nonce"
+      transcript_emit_wait_event "$name" send_wait matched "$nonce" "$timeout_seconds"
+      echo "matched nonce: $nonce"
+      return 0
+    fi
+    sleep 1
+  done
+
+  transcript_emit_wait_event "$name" send_wait timeout "$nonce" "$timeout_seconds"
+  echo "timeout waiting for nonce '$nonce': $session" >&2
+  return 1
 }
 
 send_wait_literal_session() {
@@ -3251,12 +3348,21 @@ wait_session() {
 wait_text_session() {
   require_tmux
   local literal=0
-  if [[ "${1:-}" == "--literal" ]]; then
-    literal=1
-    shift
+  local regex=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --literal) literal=1; shift ;;
+      --regex) regex=1; shift ;;
+      --) shift; break ;;
+      *) echo "Unknown wait-text flag: $1" >&2; exit 2 ;;
+    esac
+  done
+  if (( literal && regex )); then
+    echo "wait-text accepts only one of --literal or --regex" >&2
+    exit 2
   fi
 
-  if (( literal )); then
+  if (( literal || ! regex )); then
     wait_literal_session "$@"
     return
   fi
@@ -3266,7 +3372,7 @@ wait_text_session() {
   local timeout_seconds="${3:-180}"
 
   if [[ -z "$name" || -z "$pattern" ]]; then
-    echo "Usage: claude-tmux wait-text [--literal] <name> <regex-or-text> [timeout_seconds]" >&2
+    echo "Usage: claude-tmux wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]" >&2
     exit 2
   fi
 
@@ -4312,6 +4418,9 @@ case "$command" in
     ;;
   send)
     send_session "$@"
+    ;;
+  send-wait)
+    send_wait_session "$@"
     ;;
   send-wait-literal)
     send_wait_literal_session "$@"

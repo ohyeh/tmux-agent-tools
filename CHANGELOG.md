@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.13.0 - 2026-06-01
+
+### Breaking
+
+- BREAKING: `claude-tmux wait-text` and `codex-tmux wait-text` are now
+  literal-by-default; pass `--regex` to opt into zsh extended-regex matching.
+
+### Added
+
+- Added `claude-tmux send-wait` and `codex-tmux send-wait`, which append a
+  fresh `MARK-<hex>` nonce instruction to each send and wait for that nonce on
+  its own line.
+
 ## v0.12.2 - 2026-05-25
 
 `v0.12.2` is a tmux color-environment patch release for managed Claude and
