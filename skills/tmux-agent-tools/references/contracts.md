@@ -109,16 +109,24 @@ Exit codes from `wait-and-capture --pause-until-file`:
 
 ```bash
 tmux-agent-sessions list --name worker     # which tool owns "worker"?
+tmux-agent-sessions resolve --name worker --json
 tmux-agent-sessions list --json
+tmux-agent-sessions list --created-after 2026-01-01T00:00:00Z --json
+tmux-agent-sessions diff --since 2026-01-01T00:00:00Z --json
 tmux-agent-sessions list --tool claude --state running
 tmux-agent-sessions list --sort tool|name|session|state
 ```
 
-Claude and Codex inventory rows reuse wrapper status fields and add `state` so exited-but-capturable sessions are visible before cleanup.
+Claude and Codex inventory rows reuse wrapper status fields and add `state` so exited-but-capturable sessions are visible before cleanup. Wave 3 inventory rows also include `wrapper`, `agent_name`, `tmux_session`, `cwd`, `created_at`, `age`, `running`, and `result_path` for recovery workflows.
+
+`resolve --name <partial-or-full-name> --json` is the adopt-before-start path. It never creates or stops sessions; it returns the owning wrapper plus safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous and missing names exit non-zero with JSON on stderr.
 
 Bulk cleanup is destructive — always preview first:
 
 ```bash
 tmux-agent-sessions cleanup --preview
+tmux-agent-sessions cleanup --preview --created-after 2026-01-01T00:00:00Z --json
 tmux-agent-sessions cleanup --execute --tool claude --state exited   # only with user authorization
 ```
+
+For accidental worker creation, record a timestamp first, inspect `diff --since <timestamp> --json`, preview with `cleanup --preview --created-after <timestamp>`, then execute only the narrowed filter. `cleanup --execute` refuses dirty managed worktrees unless `--force` is passed.

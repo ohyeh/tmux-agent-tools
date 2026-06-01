@@ -35,7 +35,7 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 - `start` for a local working directory; `start-ssh` when tmux stays local but the CLI runs over SSH.
 - `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
 - The subcommands `send`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
-- If you don't know which wrapper owns a session, `tmux-agent-sessions list --name <n>` resolves it.
+- If you don't know which wrapper owns a session, use `tmux-agent-sessions resolve --name <partial-or-full-name> --json` before any `start`. It accepts a full tmux session name, wrapper-prefixed partial, or short agent name and returns the owning wrapper, short `agent_name`, full tmux session, cwd, result path, running state, and safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous or missing names exit non-zero and return JSON candidates/errors.
 
 ## Core Workflow
 
@@ -90,6 +90,17 @@ codex-tmux result --field '.status' --wait 30 --json worker
 ```
 
 Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`. Agents cannot expand `$TMUX_AGENT_RESULT` from sandboxed tool envs; pass the literal path from `result --path <name>` in the worker prompt. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+
+For accidental session creation recovery, capture a timestamp before the risky operation and then use the session inventory helpers:
+
+```bash
+since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+tmux-agent-sessions diff --since "$since" --json
+tmux-agent-sessions cleanup --preview --created-after "$since" --json
+tmux-agent-sessions cleanup --execute --created-after "$since"   # only after operator authorization
+```
+
+Rows include wrapper, short agent name, tmux session, cwd, age, running state, and result path. Combine `--created-after` with `--tool`, `--name`, `--state`, or `--cwd` to narrow cleanup. `cleanup --execute` refuses dirty managed worktrees unless `--force` is passed.
 
 ## Approval gates
 
