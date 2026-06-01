@@ -16,12 +16,14 @@ class TmuxAgentTools < Formula
     bin.install "skills/tmux-agent-tools/scripts/codex-tmux"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dialogue"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-sessions"
+    bin.install "skills/tmux-agent-tools/scripts/tmux-agent-monitor"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-fanout"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dag"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-audit"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-worktrees"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-replay"
     pkgshare.install "skills"
+    pkgshare.install "schemas"
   end
 
   test do
@@ -31,6 +33,8 @@ class TmuxAgentTools < Formula
                  shell_output("#{bin}/tmux-agent-dialogue help")
     assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",
                  shell_output("#{bin}/tmux-agent-sessions help")
+    assert_match "tmux-agent-monitor - poll read-only evidence commands",
+                 shell_output("#{bin}/tmux-agent-monitor --help")
     assert_match "tmux-agent-fanout - synchronous fan-out coordinator",
                  shell_output("#{bin}/tmux-agent-fanout --help")
     assert_match "tmux-agent-dag - DAG validator + synchronous topological executor",

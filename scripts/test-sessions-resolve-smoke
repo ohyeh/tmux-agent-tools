@@ -1,0 +1,166 @@
+#!/usr/bin/env zsh
+# Smoke test for Wave 3 session lifecycle helpers in tmux-agent-sessions.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
+
+[[ -x "$SESSIONS" ]] || { echo "not executable: $SESSIONS" >&2; exit 1; }
+
+WORK="$(mktemp -d -t tmux-agent-sessions-resolve-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+export CLAUDE_TMUX_PREFIX="claude-cli-smoke"
+export CODEX_TMUX_PREFIX="codex-cli-smoke"
+export TMUX="$WORK/fake-tmux"
+
+cleanup() {
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+mkdir -p "$TMUX_AGENT_DIR"
+cat > "$TMUX" <<'EOF'
+#!/usr/bin/env zsh
+set -euo pipefail
+cmd="${1:-}"
+case "$cmd" in
+  ls)
+    cat "$FAKE_TMUX_LS"
+    ;;
+  has-session)
+    shift
+    [[ "${1:-}" == "-t" ]] && shift
+    session="${1:-}"
+    cut -d: -f1 "$FAKE_TMUX_LS" | grep -Fxq "$session"
+    ;;
+  capture-pane)
+    session=""
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        -t)
+          shift
+          session="${1:-}"
+          ;;
+      esac
+      shift || true
+    done
+    cwd="$(awk -F '\t' -v s="$session" '$1 == s {print $2}' "$FAKE_TMUX_CWD")"
+    printf '%s\n' "tmux session: $session" "cwd: $cwd"
+    ;;
+  display-message)
+    session=""
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        -t)
+          shift
+          session="${1:-}"
+          ;;
+      esac
+      shift || true
+    done
+    awk -F '\t' -v s="$session" '$1 == s {print $2}' "$FAKE_TMUX_CWD"
+    ;;
+  kill-session)
+    shift
+    [[ "${1:-}" == "-t" ]] && shift
+    printf '%s\n' "${1:-}" >> "$FAKE_TMUX_KILLS"
+    ;;
+  *)
+    echo "fake tmux unsupported: $*" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$TMUX"
+
+export FAKE_TMUX_LS="$WORK/tmux-ls"
+export FAKE_TMUX_CWD="$WORK/tmux-cwd"
+export FAKE_TMUX_KILLS="$WORK/tmux-kills"
+: > "$FAKE_TMUX_KILLS"
+
+cat > "$FAKE_TMUX_LS" <<EOF
+$CLAUDE_TMUX_PREFIX-trade-pine-c5b475: 1 windows
+$CLAUDE_TMUX_PREFIX-trade-pine-d9e010: 1 windows
+$CODEX_TMUX_PREFIX-build-bot: 1 windows
+EOF
+cat > "$FAKE_TMUX_CWD" <<EOF
+$CLAUDE_TMUX_PREFIX-trade-pine-c5b475	$WORK/repo-a
+$CLAUDE_TMUX_PREFIX-trade-pine-d9e010	$WORK/repo-a
+$CODEX_TMUX_PREFIX-build-bot	$WORK/repo-b
+EOF
+
+mkdir -p "$TMUX_AGENT_DIR/trade-pine-c5b475" "$TMUX_AGENT_DIR/trade-pine-d9e010" "$TMUX_AGENT_DIR/build-bot"
+printf '%s\n' "2026-01-01T00:00:00Z" > "$TMUX_AGENT_DIR/trade-pine-c5b475/started_at"
+printf '%s\n' "2026-01-02T00:00:00Z" > "$TMUX_AGENT_DIR/trade-pine-d9e010/created_at"
+printf '%s\n' "2026-01-03T00:00:00Z" > "$TMUX_AGENT_DIR/build-bot/created_at"
+cat > "$TMUX_AGENT_DIR/trade-pine-c5b475/worktree.json" <<EOF
+{"schema_version":1,"path":"$WORK/repo-a","dirty":true}
+EOF
+
+PASS=0
+FAIL=0
+
+assert_eq() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_nonzero() {
+  local label="$1" code="$2"
+  if (( code != 0 )); then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: resolve full tmux session"
+full_json="$("$SESSIONS" resolve --name "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475" --json)"
+assert_eq "full session resolves agent name" "$(print -r -- "$full_json" | jq -r '.agent_name')" "trade-pine-c5b475"
+assert_eq "full session resolves wrapper" "$(print -r -- "$full_json" | jq -r '.wrapper')" "claude-tmux"
+assert_eq "full session includes wait-and-capture command" "$(print -r -- "$full_json" | jq -r '.recommended_next_commands[] | select(test("wait-and-capture"))' | wc -l | tr -d ' ')" "1"
+
+echo "case: resolve short name"
+short_json="$("$SESSIONS" resolve --name build-bot --json)"
+assert_eq "short name resolves tmux session" "$(print -r -- "$short_json" | jq -r '.tmux_session')" "$CODEX_TMUX_PREFIX-build-bot"
+
+echo "case: resolve ambiguous and no-match fail"
+code=0
+"$SESSIONS" resolve --name trade-pine --json >/dev/null 2>"$WORK/ambiguous.err" || code=$?
+assert_nonzero "ambiguous exits non-zero" "$code"
+assert_eq "ambiguous lists candidates" "$(jq -r '.candidates | length' "$WORK/ambiguous.err")" "2"
+code=0
+"$SESSIONS" resolve --name missing --json >/dev/null 2>"$WORK/missing.err" || code=$?
+assert_nonzero "no-match exits non-zero" "$code"
+
+echo "case: list created-after and diff since"
+created_count="$("$SESSIONS" list --created-after 2026-01-01T12:00:00Z --json | jq -s 'length')"
+assert_eq "created-after filters list rows" "$created_count" "2"
+cwd_count="$("$SESSIONS" list --cwd "$WORK/repo-b" --json | jq -s 'length')"
+assert_eq "cwd filters list rows" "$cwd_count" "1"
+diff_count="$("$SESSIONS" diff --since 2026-01-02T12:00:00Z --json | jq 'length')"
+assert_eq "diff returns sessions since timestamp" "$diff_count" "1"
+
+echo "case: cleanup refuses dirty managed worktree unless forced"
+code=0
+"$SESSIONS" cleanup --execute --name trade-pine-c5b475 >/dev/null 2>"$WORK/dirty.err" || code=$?
+assert_nonzero "dirty cleanup exits non-zero" "$code"
+assert_eq "dirty cleanup does not kill" "$(cat "$FAKE_TMUX_KILLS")" ""
+"$SESSIONS" cleanup --execute --name trade-pine-c5b475 --force >/dev/null
+assert_eq "force cleanup kills session" "$(cat "$FAKE_TMUX_KILLS")" "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ? 1 : 0 ))

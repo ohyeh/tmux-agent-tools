@@ -1,0 +1,250 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:t}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-monitor - poll read-only evidence commands for a managed agent/repo
+
+Usage:
+  tmux-agent-monitor --name <agent> --every <duration> [--until <HH:MM|duration>] --commands <manifest.json> [--stop-on-change] [--summary-out <path>] [--json]
+
+Behavior:
+  - runs only the commands listed in the manifest;
+  - never sends prompts to a teammate or tmux pane;
+  - emits one JSONL observation per cycle per command plus a final summary;
+  - stops on changed output/exit code when --stop-on-change is set, on --until, or on interrupt.
+
+Manifest:
+  {"commands":[{"name":"repo_status","command":"git status --short"}],
+   "expected":{"repo_status":{"stdout":""},"owner_gate":{"exit_code":10}}}
+
+This is distinct from wait-and-capture: monitor polls commands, while
+wait-and-capture watches a tmux pane for a marker and captures pane text.
+EOF
+}
+
+die() {
+  echo "$SELF: $*" >&2
+  exit 1
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
+}
+
+iso_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+duration_seconds() {
+  local value="$1"
+  if [[ "$value" =~ '^([0-9]+)([smh]?)$' ]]; then
+    local n="${match[1]}" unit="${match[2]}"
+    case "$unit" in
+      ""|s) print -r -- "$n" ;;
+      m) print -r -- "$((n * 60))" ;;
+      h) print -r -- "$((n * 3600))" ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+until_epoch() {
+  local value="$1"
+  local now target today
+  if [[ "$value" =~ '^[0-9]+[smh]?$' ]]; then
+    now="$(date +%s)"
+    print -r -- "$((now + $(duration_seconds "$value")))"
+    return 0
+  fi
+  if [[ "$value" =~ '^([0-9]{1,2}):([0-9]{2})$' ]]; then
+    today="$(date +%Y-%m-%d)"
+    target="$(date -j -f '%Y-%m-%d %H:%M' "$today $value" +%s 2>/dev/null || true)"
+    [[ -n "$target" ]] || return 1
+    now="$(date +%s)"
+    if (( target <= now )); then
+      target=$((target + 86400))
+    fi
+    print -r -- "$target"
+    return 0
+  fi
+  return 1
+}
+
+sha256_text() {
+  local hash rest
+  read -r hash rest < <(shasum -a 256)
+  print -r -- "$hash"
+}
+
+short_text() {
+  local text="$1"
+  printf '%s' "$text" | head -c 200
+}
+
+emit_summary() {
+  local reason="$1"
+  local ended_at
+  ended_at="$(iso_now)"
+  local summary
+  summary="$("$JQ" -cn \
+    --arg event "summary" \
+    --arg name "$NAME" \
+    --arg reason "$reason" \
+    --arg started_at "$STARTED_AT" \
+    --arg ended_at "$ended_at" \
+    --argjson cycles "$CYCLES" \
+    --argjson observations "$OBSERVATIONS" \
+    --argjson changed "$CHANGED_COUNT" \
+    '{event:$event,name:$name,reason:$reason,started_at:$started_at,ended_at:$ended_at,
+      cycles:$cycles,observations:$observations,changed_count:$changed}')"
+  if [[ -n "$SUMMARY_OUT" ]]; then
+    mkdir -p "$(dirname "$SUMMARY_OUT")"
+    printf '%s\n' "$summary" > "$SUMMARY_OUT"
+  fi
+  printf '%s\n' "$summary"
+}
+
+NAME=""
+EVERY=""
+UNTIL=""
+MANIFEST=""
+STOP_ON_CHANGE=0
+SUMMARY_OUT=""
+OUTPUT_JSON=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)
+      (( $# >= 2 )) || die "--name requires a value"
+      NAME="$2"; shift 2 ;;
+    --every)
+      (( $# >= 2 )) || die "--every requires a duration"
+      EVERY="$2"; shift 2 ;;
+    --until)
+      (( $# >= 2 )) || die "--until requires HH:MM or duration"
+      UNTIL="$2"; shift 2 ;;
+    --commands)
+      (( $# >= 2 )) || die "--commands requires a manifest path"
+      MANIFEST="$2"; shift 2 ;;
+    --stop-on-change)
+      STOP_ON_CHANGE=1; shift ;;
+    --summary-out)
+      (( $# >= 2 )) || die "--summary-out requires a path"
+      SUMMARY_OUT="$2"; shift 2 ;;
+    --json)
+      OUTPUT_JSON=1; shift ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      die "unknown argument: $1" ;;
+  esac
+done
+
+require_jq
+[[ -n "$NAME" ]] || die "--name is required"
+[[ -n "$EVERY" ]] || die "--every is required"
+[[ -n "$MANIFEST" ]] || die "--commands is required"
+[[ -f "$MANIFEST" ]] || die "manifest not found: $MANIFEST"
+
+EVERY_SECONDS="$(duration_seconds "$EVERY" || true)"
+[[ -n "$EVERY_SECONDS" && "$EVERY_SECONDS" -gt 0 ]] || die "invalid --every duration: $EVERY"
+
+UNTIL_EPOCH=0
+if [[ -n "$UNTIL" ]]; then
+  UNTIL_EPOCH="$(until_epoch "$UNTIL" || true)"
+  [[ -n "$UNTIL_EPOCH" ]] || die "invalid --until value: $UNTIL"
+fi
+
+"$JQ" -e '.commands | type == "array" and length > 0' "$MANIFEST" >/dev/null ||
+  die "manifest must contain non-empty commands array"
+
+typeset -A LAST_STDOUT LAST_EXIT
+STARTED_AT="$(iso_now)"
+CYCLES=0
+OBSERVATIONS=0
+CHANGED_COUNT=0
+INTERRUPTED=0
+SUMMARY_EMITTED=0
+
+on_interrupt() {
+  INTERRUPTED=1
+}
+trap on_interrupt INT TERM
+
+while :; do
+  if (( INTERRUPTED )); then
+    SUMMARY_EMITTED=1
+    emit_summary "interrupted"
+    exit 130
+  fi
+  if (( UNTIL_EPOCH > 0 )) && (( $(date +%s) >= UNTIL_EPOCH )); then
+    SUMMARY_EMITTED=1
+    emit_summary "until"
+    exit 0
+  fi
+
+  CYCLES=$((CYCLES + 1))
+  command_count="$("$JQ" '.commands | length' "$MANIFEST")"
+  cycle_changed=0
+  for idx in $(seq 0 $((command_count - 1))); do
+    cmd_name="$("$JQ" -r --argjson i "$idx" '.commands[$i].name' "$MANIFEST")"
+    cmd="$("$JQ" -r --argjson i "$idx" '.commands[$i].command' "$MANIFEST")"
+    [[ -n "$cmd_name" && "$cmd_name" != "null" ]] || die "command at index $idx missing name"
+    [[ -n "$cmd" && "$cmd" != "null" ]] || die "command at index $idx missing command"
+
+    stdout_file="$(mktemp -t tmux-agent-monitor.stdout.XXXXXX)"
+    rc=0
+    zsh -lc "$cmd" >"$stdout_file" 2>&1 || rc=$?
+    stdout="$(cat "$stdout_file")"
+    rm -f "$stdout_file"
+
+    expected_stdout_set="$("$JQ" -r --arg n "$cmd_name" '(.expected[$n] // {}) | has("stdout")' "$MANIFEST")"
+    expected_exit_set="$("$JQ" -r --arg n "$cmd_name" '(.expected[$n] // {}) | has("exit_code")' "$MANIFEST")"
+    expected_stdout="$("$JQ" -r --arg n "$cmd_name" '.expected[$n].stdout // ""' "$MANIFEST")"
+    expected_exit="$("$JQ" -r --arg n "$cmd_name" '.expected[$n].exit_code // ""' "$MANIFEST")"
+    changed=0
+    if [[ "$expected_stdout_set" == "true" && "$stdout" != "$expected_stdout" ]]; then
+      changed=1
+    fi
+    if [[ "$expected_exit_set" == "true" && "$rc" != "$expected_exit" ]]; then
+      changed=1
+    fi
+    if [[ "$expected_stdout_set" != "true" && "$expected_exit_set" != "true" && -n "${LAST_STDOUT[$cmd_name]:-}" ]]; then
+      [[ "$stdout" == "${LAST_STDOUT[$cmd_name]}" && "$rc" == "${LAST_EXIT[$cmd_name]}" ]] || changed=1
+    fi
+
+    LAST_STDOUT[$cmd_name]="$stdout"
+    LAST_EXIT[$cmd_name]="$rc"
+    OBSERVATIONS=$((OBSERVATIONS + 1))
+    if (( changed )); then
+      CHANGED_COUNT=$((CHANGED_COUNT + 1))
+      cycle_changed=1
+    fi
+
+    stdout_hash="$(printf '%s' "$stdout" | sha256_text)"
+    stdout_short="$(short_text "$stdout")"
+    "$JQ" -cn \
+      --arg event "observation" \
+      --arg name "$cmd_name" \
+      --arg command "$cmd" \
+      --arg at "$(iso_now)" \
+      --arg stdout_hash "$stdout_hash" \
+      --arg stdout_short "$stdout_short" \
+      --argjson exit_code "$rc" \
+      --argjson changed "$changed" \
+      '{event:$event,name:$name,command:$command,exit_code:$exit_code,
+        stdout_hash:$stdout_hash,stdout_short:$stdout_short,changed:($changed == 1),at:$at}'
+  done
+
+  if (( STOP_ON_CHANGE && cycle_changed )); then
+    SUMMARY_EMITTED=1
+    emit_summary "changed"
+    exit 0
+  fi
+  sleep "$EVERY_SECONDS"
+done

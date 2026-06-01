@@ -10,6 +10,26 @@
     "status": {"type": "string"},
     "summary": {"type": "string"},
     "artifacts": {"type": "array"},
-    "errors": {"type": "array"}
+    "errors": {"type": "array"},
+    "verdict": {
+      "type": "object",
+      "properties": {
+        "verdict": {"type": "string", "enum": ["ACCEPT", "BLOCK", "ACCEPT_WITH_CHANGES"]},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+        "marker": {"type": "string"}
+      }
+    },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "decision_by": {"type": "string", "enum": ["agent", "user", "owner", "delegate"]},
+        "delegate_name": {"type": "string"},
+        "authority": {"type": "string"},
+        "scope": {"type": "string"},
+        "decision": {"type": "string"},
+        "evidence": {"type": "array"},
+        "limits": {"type": "array"}
+      }
+    }
   }
 }

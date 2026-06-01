@@ -19,9 +19,30 @@ The wrapper scripts are bundled at:
 - `scripts/codex-tmux`
 - `scripts/tmux-agent-dialogue`
 - `scripts/tmux-agent-sessions`
+- `scripts/tmux-agent-monitor`
 - `scripts/tmux-agent-fanout`
 
 If the commands are not on `PATH`, resolve them from the skill directory and run the script path directly.
+
+## Script capability table
+
+| Name | One-line purpose | When to reach for it |
+| --- | --- | --- |
+| `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, or later capture. |
+| `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, or later capture. |
+| `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
+| `tmux-agent-audit` | Query and verify wrapper audit logs. | Use when you need an operator-facing record of wrapper events, secret use, approvals, or posting actions. |
+| `tmux-agent-cron` | Run scheduled/periodic tmux-agent-tool jobs from a manifest. | Use for repeatable local automation where a manifest should drive wrapper invocations. |
+| `tmux-agent-dag` | Execute a dependency-ordered task manifest and summarize per-task results. | Use when tasks have explicit dependencies and later tasks should wait for prerequisite results. |
+| `tmux-agent-dashboard` | Render a terminal dashboard for managed sessions. | Use when you need a live overview instead of inspecting each worker one at a time. |
+| `tmux-agent-dialogue` | Run bounded two-party dialogues and presets such as `pair-review`, `critic`, `debate`, and `handoff`. | Use when two participants should exchange a fixed number of turns with a JSONL transcript. |
+| `tmux-agent-fanout` | Spawn one prompt across multiple Claude/Codex workers and collect per-agent `result.json` files. | Use for parallel one-to-many work after the user has authorized worker count, tool, model, and effort. |
+| `tmux-agent-history` | Inspect stored wrapper/session history. | Use when you need prior local run metadata rather than current tmux state. |
+| `tmux-agent-monitor` | Poll read-only evidence commands for a managed agent or repo and emit JSONL observations plus a summary. | Use when you need periodic evidence checks; it does not send prompts unless the manifest commands do so. |
+| `tmux-agent-notify` | Send local notifications for wrapper-related events. | Use to alert an operator when a watched condition or job state changes. |
+| `tmux-agent-replay` | Replay or diff transcript/audit JSONL runs. | Use to compare runs, debug marker sequences, or inspect previously recorded wrapper events. |
+| `tmux-agent-sessions` | Inventory, resolve, diff, and clean up sessions across Claude, Codex, and dialogue wrappers. | Use before adopting an existing worker, after accidental starts, or before any cleanup. |
+| `tmux-agent-worktrees` | Manage worktrees created for agent work and apply cleanup policy. | Use when agent runs create isolated git worktrees that need listing or pruning. |
 
 ## When Not To Use
 
@@ -34,10 +55,34 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 - `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI.
 - `start` for a local working directory; `start-ssh` when tmux stays local but the CLI runs over SSH.
 - `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
-- The subcommands `send`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
-- If you don't know which wrapper owns a session, `tmux-agent-sessions list --name <n>` resolves it.
+- The subcommands `send`, `send-wait`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
+- If you don't know which wrapper owns a session, use `tmux-agent-sessions resolve --name <partial-or-full-name> --json` before any `start`. It accepts a full tmux session name, wrapper-prefixed partial, or short agent name and returns the owning wrapper, short `agent_name`, full tmux session, cwd, result path, running state, and safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous or missing names exit non-zero and return JSON candidates/errors.
+- Use `tmux-agent-monitor --name <agent> --every <duration> --commands <manifest.json> --stop-on-change --summary-out <path> --json` when you need read-only periodic evidence checks against a managed session/repo. It polls manifest commands and emits JSONL observations plus a summary; it is distinct from `wait-and-capture`, which watches a tmux pane for a marker and captures pane output.
 
 ## Core Workflow
+
+### Supervising an existing worker: listen before send
+
+Use an existing teammate when one already exists; resolve/discover it before creating another session. Pane capture is secondary evidence. Prefer wrapper status and `result.json` whenever they are available.
+
+```text
+resolve/discover
+  -> observe status
+  -> wait/capture current output
+  -> consume structured result
+  -> send only if idle or explicitly blocked on input
+```
+
+Copyable flow:
+
+```bash
+tmux-agent-sessions resolve --name worker --json
+codex-tmux status --json worker
+codex-tmux wait-and-capture --timeout 30 --tail 80 --strip-ansi --json worker
+codex-tmux result --json --wait 30 worker
+```
+
+Only send after those checks show the teammate is idle or explicitly blocked on human input. Repeated prompts while the teammate is thinking usually create duplicate work, prompt echoes, and stale-pane confusion.
 
 1. **Start** with a short stable name:
 
@@ -50,23 +95,24 @@ claude-tmux resume --exact worker ~/github/project ee5aca88-a1af-48d3-af21-54f60
 
 ```bash
 codex-tmux send worker 'Now implement the smallest fix and run the targeted test.'
-codex-tmux send-wait-literal worker 'End with the split marker described here.' '[CODEX-01]' 180
+codex-tmux send-wait worker 'Summarize the current blocker in result.json.' 180
 ```
 
-Use `send-wait-literal` for marker-driven orchestration when stale pane content may already contain an older marker. Keep the literal out of the sent prompt (or split it in the prompt instructions) so the prompt echo cannot satisfy the wait.
+Use `send-wait <name> <text> [timeout]` for marker-driven orchestration. It generates a fresh nonce, appends the instruction to end with that nonce, sends the text, and waits for that unique marker. Fresh nonce markers avoid both stale pane matches and prompt-echo matches.
 
 3. **Wait** for pane stability or a marker before reading output:
 
 ```bash
 codex-tmux wait worker 180                                # idle stability
 codex-tmux wait-literal worker '[CODEX-01]' 180           # literal marker
-codex-tmux wait-text --literal worker '[CODEX-01]' 180    # same, explicit
-codex-tmux wait-and-capture --literal --marker '[DONE]' --tail 80 --strip-ansi --json worker 180
+codex-tmux wait-text worker '[CODEX-01]' 180              # literal-by-default
+codex-tmux wait-text --regex worker 'DONE|Need approval' 180
+codex-tmux wait-and-capture --marker '[DONE]' --timeout 180 --tail 80 --strip-ansi --json worker
 ```
 
-`wait-literal` (or `wait-text --literal`) is required when the marker contains regex metacharacters like `[`, `]`, `(`, `)`, `.`, `*`, `?`. Use plain `wait-text` only when you intentionally want regex matching.
+`wait-text` is literal-by-default. Add `--regex` only when you intentionally want regex matching. Literal markers may contain regex metacharacters like `[`, `]`, `(`, `)`, `.`, `*`, or `?` without escaping.
 
-For **alternation markers** (e.g. wait for `[DONE]` OR `Need approval`), use `wait-and-capture` with an escaped regex; do NOT race two `wait-literal` calls. See `references/cheatsheets.md` for the worked example.
+For **alternation markers** (e.g. wait for `[DONE]` OR `Need approval`), use `wait-and-capture --regex --marker` with an escaped regex; do not race two raw wait calls. See `references/cheatsheets.md` for worked marker pitfalls.
 
 4. **Inspect or clean up**:
 
@@ -87,9 +133,45 @@ Use `env-doctor [name]` before deeper debugging when an agent CLI uses the wrong
 
 ```bash
 codex-tmux result --field '.status' --wait 30 --json worker
+codex-tmux result validate worker --json
+codex-tmux result wait-required worker --fields status,summary --wait 60 --json
 ```
 
-Agents should write `$TMUX_AGENT_RESULT` (a JSON file at `$TMUX_AGENT_DIR/<name>/result.json`) with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. Agents cannot expand `$TMUX_AGENT_RESULT` from sandboxed tool envs; pass the literal path from `result --path <name>` in the worker prompt. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+
+### Peer-review loop
+
+Use this when a human wants an open-ended N-round review cycle and will decide each round's content between rounds. The dialogue preset gives you the bounded review transcript; `send-wait` gives each follow-up a fresh completion marker; the `verdict` block gives the reviewer a structured decision.
+
+```bash
+# Round 1: produce a local two-turn review transcript.
+tmux-agent-dialogue pair-review \
+  --workdir ~/github/project \
+  --prompt-file /tmp/review-round-1.md \
+  --transcript /tmp/review-round-1.jsonl \
+  --turns 2 \
+  --summary-file /tmp/review-round-1.md
+
+# Between rounds, the human decides what should change next.
+codex-tmux send-wait reviewer 'Review the updated diff. Write result.json with verdict.verdict as ACCEPT, BLOCK, or ACCEPT_WITH_CHANGES, blockers as an array, and marker set to the nonce you end with.' 600
+codex-tmux result wait-required reviewer --fields status,summary,verdict --wait 60 --json
+
+# Repeat the send-wait/result pair for rounds 2..N until the human stops.
+```
+
+Do not let the agents decide how many rounds to run. The human chooses each next prompt based on the previous transcript, summary, and `verdict`.
+
+For accidental session creation recovery, capture a timestamp before the risky operation and then use the session inventory helpers:
+
+```bash
+since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+tmux-agent-sessions diff --since "$since" --json
+tmux-agent-sessions list --created-after "$since" --json
+tmux-agent-sessions cleanup --preview --created-after "$since" --json
+tmux-agent-sessions cleanup --execute --created-after "$since"   # only after operator authorization
+```
+
+Rows include wrapper, short agent name, tmux session, cwd, age, running state, and result path. Combine `--created-after` with `--tool`, `--name`, `--state`, or `--cwd` to narrow cleanup. `cleanup --execute` refuses dirty managed worktrees unless `--force` is passed.
 
 ## Approval gates
 
@@ -112,7 +194,7 @@ These tools are for **long-running supervised work**, not for unbounded agent sp
 
 1. **Ask the user up front: tool (claude or codex), model tier, and effort/reasoning level per worker.** Never assume defaults.
 2. **Declare an explicit worker upper bound** (e.g., "I will run at most 3 workers; if that is insufficient I will stop and report, not spawn helpers").
-3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write `$TMUX_AGENT_RESULT` when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
+3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write your result to <the literal path from `result --path <name>`> when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
 4. **Bound dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6).
 
 For credential-free smoke tests of any preset, use `--agent-a fake --agent-b fake`. Real `codex` / `claude` participants only after explicit user authorization.
