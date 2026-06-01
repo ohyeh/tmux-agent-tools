@@ -13,7 +13,34 @@
 
 - Added `claude-tmux send-wait` and `codex-tmux send-wait`, which append a
   fresh `MARK-<hex>` nonce instruction to each send and wait for that nonce on
-  its own line.
+  its own line (#223).
+- Result contract: optional `verdict` (`ACCEPT|BLOCK|ACCEPT_WITH_CHANGES`,
+  `blockers`, `marker`) and `decision` (`decision_by`, `delegate_name`,
+  `authority`, `scope`, `decision`, `evidence`, `limits`) blocks in
+  `result.json`, plus `result init`, `result validate`, `result wait-required`,
+  and `result --path` on both wrappers (#218, #224, #220). The default schema
+  path now resolves in both repo and Homebrew layouts; `schemas/` ships in the
+  formula.
+- `tmux-agent-sessions resolve --name <partial|full> --json` to map any name to
+  its owning wrapper and safe next commands, plus `diff --since`,
+  `list/cleanup --created-after`, `--cwd`, and `--force` (cleanup refuses dirty
+  managed worktrees without `--force`) for accidental-session recovery (#216,
+  #222).
+- New `tmux-agent-monitor`: polls a manifest of read-only commands on a cadence,
+  emits JSONL observations, stops on changed output/exit-code or `--until`, and
+  never sends prompts (#219).
+- `wait-and-capture --wait-for-human` heartbeat mode: holds without treating
+  idle/timeout as completion, returns only on the marker or cancel, and
+  maintains `awaiting-next-round.json` (#225).
+
+### Documentation
+
+- SKILL.md: capability table for all 14 scripts, "listen before send"
+  supervision recipe, and a peer-review loop recipe; `cheatsheets.md` gains a
+  marker-pitfalls section (stale-pane vs prompt-echo). Documented that agent
+  CLIs run tool commands in a sandboxed env where `$TMUX_AGENT_RESULT` is empty,
+  so orchestrators must pass the literal path from `result --path` (#226, #217,
+  #228, #221).
 
 ## v0.12.2 - 2026-05-25
 
