@@ -19,6 +19,9 @@ STATUS_TAIL_LINES="${CODEX_TMUX_STATUS_TAIL_LINES:-20}"
 INHERIT_CODEX_ENV="${CODEX_TMUX_INHERIT_CODEX_ENV:-0}"
 CLEAR_CODEX_ENV="${CODEX_TMUX_CLEAR_CODEX_ENV:-1}"
 COLOR_ENV="${CODEX_TMUX_COLOR_ENV:-1}"
+# Launch flags passed to the agent CLI at start/resume. Default preserves Codex's
+# --yolo; override (e.g. via the agy-tmux preset) to drive other CLIs unchanged.
+LAUNCH_FLAGS="${CODEX_TMUX_LAUNCH_FLAGS:---yolo}"
 
 resolve_tmux_bin() {
   if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
@@ -2546,7 +2549,7 @@ start_session() {
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; ${color_prefix}$(shell_quote "$CODEX") --yolo; code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; ${color_prefix}$(shell_quote "$CODEX") ${LAUNCH_FLAGS}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
@@ -2823,7 +2826,7 @@ resume_session() {
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'codex session id: $codex_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; ${color_prefix}$(shell_quote "$CODEX") --yolo resume $(shell_quote "$codex_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'codex-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'codex session id: $codex_session_id' 'send: $SELF send $name <text>' 'capture: $SELF capture $name 120' ''; ${color_prefix}$(shell_quote "$CODEX") ${LAUNCH_FLAGS} resume $(shell_quote "$codex_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[codex-tmux] local command exited with code %s\n' \"\$code\"; printf '[codex-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"

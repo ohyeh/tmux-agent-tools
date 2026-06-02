@@ -1,0 +1,31 @@
+#!/usr/bin/env zsh
+# agy-tmux — thin preset over codex-tmux for the Antigravity CLI (`agy`, Gemini).
+#
+# It reuses codex-tmux's entire machinery (start/resume/send/send-wait/wait*/
+# capture/status/result/stop) through the existing env seams, overriding only the
+# three per-CLI bits: the binary, the launch flags, and the session prefix. No
+# logic is duplicated; see issues #232 / #233.
+#
+# Usage mirrors codex-tmux exactly, e.g.:
+#   agy-tmux start --exact worker ~/project '@/path/to/prompt.md'
+#   agy-tmux result wait-required worker --fields status,summary --wait 60 --json
+#
+# Overridable: AGY (binary path), CODEX_TMUX_LAUNCH_FLAGS, CODEX_TMUX_PREFIX.
+set -euo pipefail
+
+SELF="${0:A}"
+
+# Binary: prefer an explicit AGY=..., else CODEX=... already set, else `agy` on PATH.
+AGY="${AGY:-${CODEX:-$(command -v agy 2>/dev/null || true)}}"
+if [[ -z "$AGY" ]]; then
+  echo "agy-tmux: 'agy' not found on PATH; set AGY=/path/to/agy" >&2
+  exit 127
+fi
+export CODEX="$AGY"
+
+# Antigravity's permissive launch flag (Codex's --yolo equivalent).
+export CODEX_TMUX_LAUNCH_FLAGS="${CODEX_TMUX_LAUNCH_FLAGS:---dangerously-skip-permissions}"
+# Distinct session prefix so inventory/cleanup never confuse agy with codex sessions.
+export CODEX_TMUX_PREFIX="${CODEX_TMUX_PREFIX:-agy-cli}"
+
+exec "${SELF:h}/codex-tmux" "$@"
