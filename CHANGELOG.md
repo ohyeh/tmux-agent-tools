@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## v0.14.0 - 2026-06-04
+
+### Added
+
+- `agent-tmux <cli> <command>` unified entrypoint: a single engine where the CLI
+  identity (`claude`, `codex`, `agy`, `cursor`, `grok`, or any custom binary) is a
+  hardcoded preset (binary, env namespace, launch flags, resume syntax, session
+  prefix, status `tool` field, pane-scraping heuristic family, provider-env keys).
+  `claude-tmux`, `codex-tmux`, and `agy-tmux` are now 1-line shims that delegate to
+  it; all existing commands, flags, and env vars behave identically.
+- `agent-tmux pair <cli> <team> <dir> [--workers N] [--worker-cli <cli>] [--role lead]`:
+  idempotent multi-agent worker bootstrap (resume-if-alive / start-if-gone),
+  conservative scale-down (surplus workers are warned `orphan`, never auto-stopped,
+  and retained in team state), per-team `mkdir` lock with stale reclaim, and atomic
+  team-state writes.
+- `agent-tmux team list|workers|lead|stop|rm|broadcast|send|wait|results`: team
+  lifecycle plus collaboration primitives over a `teams/<team>.json` state file.
+  Mixed-CLI teams are first-class — every per-member operation re-invokes the engine
+  with that member's own CLI. `team wait` exits `0` idle / `7` blocked / `8` timeout;
+  `team results` branches on `.present`/`.valid` and reports missing results.
+- `--role <value>` flag on `start`/`resume` (free-form sugar for `--tag role=<value>`).
+- `AGENT_TMUX_*` universal env-override namespace; CLI-specific `<CLI>_TMUX_*`
+  variables still take precedence.
+
+### Changed
+
+- Per-CLI `TMUX_CONF` default path is now `${TMPDIR:-/tmp}/agent-tmux-<cli>.tmux.conf`
+  (scoped per CLI; `*_TMUX_CONF` overrides are still honoured).
+
 ## v0.13.0 - 2026-06-01
 
 ### Breaking
