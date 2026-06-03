@@ -2026,7 +2026,7 @@ start_session() {
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
       --secret-redact|--secret-redact=true)
         SECRET_REDACT_DISABLE=0
@@ -2083,6 +2083,15 @@ start_session() {
           exit 2
         fi
         pending_tags+=("$2")
+        shift 2
+        ;;
+      --role)
+        if (( $# < 2 )); then
+          echo "--role requires a value" >&2
+          exit 2
+        fi
+        # --role <value> is free-form sugar for --tag role=<value>.
+        pending_tags+=("role=$2")
         shift 2
         ;;
       --usage)
@@ -2316,7 +2325,7 @@ resume_session() {
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
       --secret-redact|--secret-redact=true)
         SECRET_REDACT_DISABLE=0
@@ -2373,6 +2382,15 @@ resume_session() {
           exit 2
         fi
         pending_tags+=("$2")
+        shift 2
+        ;;
+      --role)
+        if (( $# < 2 )); then
+          echo "--role requires a value" >&2
+          exit 2
+        fi
+        # --role <value> is free-form sugar for --tag role=<value>.
+        pending_tags+=("role=$2")
         shift 2
         ;;
       --usage)
@@ -4093,6 +4111,335 @@ stop_session() {
 
 # Allow test harnesses (issue #102 smoke) to source the wrapper purely for
 # its helpers without executing the dispatcher.
+# ===========================================================================
+# PR B — pair + team (multi-agent lifecycle + collaboration primitives)
+# These commands orchestrate ACROSS clis: they never touch the local $PREFIX
+# (which is meaningless in `pair`/`team` mode); every per-member op is done by
+# re-invoking the engine as `"$SELF" <member-cli> <subcommand>` so each member
+# resolves its own preset/prefix. See docs/agent-tmux-design.md.
+# ===========================================================================
+
+_team_state_dir()  { printf '%s/teams' "$(agent_root_dir)"; }
+_team_state_file() { printf '%s/%s.json' "$(_team_state_dir)" "$1"; }
+_agt()             { "$SELF" "$@"; }   # re-invoke engine: _agt <cli> <subcmd...>
+_file_mtime()      { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+# ---- per-team lock: mkdir (atomic) + pid owner + stale detect + timeout ----
+_TEAM_LOCKDIR=""
+_team_lock_release() {
+  [[ -n "${_TEAM_LOCKDIR:-}" ]] && rm -rf "$_TEAM_LOCKDIR" 2>/dev/null
+  _TEAM_LOCKDIR=""
+  trap - EXIT INT TERM
+}
+_team_lock_acquire() {
+  local team="$1" lockdir
+  lockdir="$(_team_state_file "$team").lock"
+  local timeout="${AGENT_TMUX_LOCK_TIMEOUT:-30}" grace=60 waited=0
+  mkdir -p "$(_team_state_dir)"
+  while true; do
+    if mkdir "$lockdir" 2>/dev/null; then
+      printf '%s\n' "$$" > "$lockdir/pid"
+      _TEAM_LOCKDIR="$lockdir"
+      trap '_team_lock_release' EXIT INT TERM
+      return 0
+    fi
+    local opid; opid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    if [[ -n "$opid" ]] && ! kill -0 "$opid" 2>/dev/null; then
+      rm -rf "$lockdir" 2>/dev/null || true; continue          # dead owner → reclaim
+    fi
+    if [[ -z "$opid" ]]; then
+      local now age; now="$(date +%s 2>/dev/null || echo 0)"
+      age=$(( now - $(_file_mtime "$lockdir") ))
+      if (( age > grace )); then rm -rf "$lockdir" 2>/dev/null || true; continue; fi
+    fi
+    if (( waited >= timeout )); then
+      echo "team busy: $team locked by pid ${opid:-unknown}" >&2
+      return 1
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+}
+
+# ---- atomic state write: same-dir temp + fsync + mv -----------------------
+_team_write_state() {   # <team> <lead_cli> <members_json>
+  require_jq
+  local team="$1" lead_cli="$2" members="$3"
+  local dir file tmp
+  dir="$(_team_state_dir)"; file="$(_team_state_file "$team")"; tmp="$file.tmp.$$"
+  mkdir -p "$dir"
+  "$JQ" -n --arg team "$team" --arg lc "$lead_cli" --argjson m "$members" \
+    '{schema_version:1, team:$team, lead_cli:$lc, members:$m}' > "$tmp"
+  sync "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
+_team_state_or_die() {  # <team> → echoes file path or exits 1
+  local file; file="$(_team_state_file "$1")"
+  [[ -f "$file" ]] || { echo "team not found: $1" >&2; return 1; }
+  printf '%s' "$file"
+}
+_team_worker_rows() { "$JQ" -c '.members[] | select(.role=="worker")' "$(_team_state_file "$1")"; }
+
+_pair_worker_prompt() {
+  local name="$1" rp; rp="$(agent_root_dir)/$name/result.json"
+  printf '%s' "You are worker $name. Await instructions sent by the team lead via send. Do not call claude-tmux, codex-tmux, agent-tmux, tmux-agent-fanout, or tmux-agent-dialogue; do not start background jobs; do not SSH out; do not spawn other agents. When given a task, write your result to $rp when done."
+}
+
+# ---- pair: idempotent worker bootstrap + conservative reconcile -----------
+cmd_pair() {
+  require_jq
+  local workers=1 worker_cli="" role="lead"
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      --workers)    workers="${2:-}"; shift 2 ;;
+      --worker-cli) worker_cli="${2:-}"; shift 2 ;;
+      --role)       role="${2:-}"; shift 2 ;;
+      --) shift; while (( $# )); do pos+=("$1"); shift; done ;;
+      -*) echo "pair: unknown flag: $1" >&2; return 2 ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  local lead_cli="${pos[1]:-}" team="${pos[2]:-}" dir="${pos[3]:-}"
+  if [[ -z "$lead_cli" || -z "$team" || -z "$dir" ]]; then
+    echo "Usage: agent-tmux pair <cli> <team> <dir> [--workers N] [--worker-cli C] [--role lead]" >&2
+    return 2
+  fi
+  [[ -d "$dir" ]] || { echo "pair: directory not found: $dir" >&2; return 1; }
+  [[ -z "$worker_cli" ]] && worker_cli="$lead_cli"
+  if ! [[ "$workers" =~ ^[0-9]+$ ]] || (( workers < 1 )); then
+    echo "pair: --workers must be a positive integer: $workers" >&2; return 2
+  fi
+
+  _team_lock_acquire "$team" || return 1
+
+  local file existing
+  file="$(_team_state_file "$team")"
+  existing='{"members":[]}'; [[ -f "$file" ]] && existing="$(cat "$file")"
+
+  # Existing workers from prior state, indexed for reconcile-by-stored-cli.
+  local existing_workers
+  existing_workers="$(printf '%s' "$existing" | "$JQ" -c '[.members[]? | select(.role=="worker")]' 2>/dev/null || echo '[]')"
+
+  local lead_rp; lead_rp="$(agent_root_dir)/$team/result.json"
+  local members
+  members="$("$JQ" -cn --arg n "$team" --arg c "$lead_cli" --arg rp "$lead_rp" \
+    '[{name:$n, role:"lead", cli:$c, result_path:$rp}]')"
+
+  local rc=0 i wname wstate alive wrp rcli stored
+  local -a out=()
+  for (( i=1; i<=workers; i++ )); do
+    wname="$team-w$i"
+    # Reconcile each existing worker under its STORED cli; only brand-new
+    # workers use --worker-cli. Preserve the stored result_path too.
+    stored="$(printf '%s' "$existing_workers" | "$JQ" -c --arg n "$wname" 'map(select(.name==$n))[0] // empty')"
+    if [[ -n "$stored" ]]; then
+      rcli="$(printf '%s' "$stored" | "$JQ" -r '.cli')"
+      wrp="$(printf '%s'  "$stored" | "$JQ" -r '.result_path')"
+    else
+      rcli="$worker_cli"
+      wrp="$(agent_root_dir)/$wname/result.json"
+    fi
+    wstate="$(_agt "$rcli" status --json "$wname" 2>/dev/null || echo '{}')"
+    alive="$(printf '%s' "$wstate" | "$JQ" -r '.exists // false' 2>/dev/null || echo false)"
+    if [[ "$alive" == "true" ]]; then
+      out+=("$wname  $rcli  resumed")
+    elif _agt "$rcli" start --exact --role worker "$wname" "$dir" "$(_pair_worker_prompt "$wname")" >/dev/null 2>&1; then
+      out+=("$wname  $rcli  started")
+    else
+      out+=("$wname  $rcli  FAILED: start/resume failed")
+      rc=1
+    fi
+    members="$(printf '%s' "$members" | "$JQ" -c --arg n "$wname" --arg c "$rcli" --arg rp "$wrp" \
+      '. + [{name:$n, role:"worker", cli:$c, result_path:$rp}]')"
+  done
+
+  # Conservative scale-down: surplus prior workers (index > N) are warned but
+  # NOT stopped, and are RETAINED in the authoritative state file with their
+  # stored cli/result_path so later team stop/results/send/rm still see them.
+  local orphans orow
+  orphans="$(printf '%s' "$existing_workers" | "$JQ" -c \
+    --argjson n "$workers" \
+    '[.[] | select(((.name | capture("-w(?<i>[0-9]+)$").i | tonumber) // 0) > $n)]' 2>/dev/null || echo '[]')"
+  for orow in ${(f)$(printf '%s' "$orphans" | "$JQ" -c '.[]')}; do
+    members="$(printf '%s' "$members" | "$JQ" -c --argjson o "$orow" '. + [$o]')"
+    out+=("$(printf '%s' "$orow" | "$JQ" -r '"\(.name)  \(.cli)  orphan  (not stopped; use team stop to remove)"')")
+  done
+
+  _team_write_state "$team" "$lead_cli" "$members"
+  _team_lock_release
+  printf '%s\n' "${out[@]}"
+  return $rc
+}
+
+# ---- team subcommands ------------------------------------------------------
+cmd_team() {
+  require_jq
+  local sub="${1:-}"; (( $# )) && shift
+  case "$sub" in
+    list)      _team_list "$@" ;;
+    workers)   _team_field worker "$@" ;;
+    lead)      _team_field lead "$@" ;;
+    stop)      _team_stop "$@" ;;
+    rm)        _team_rm "$@" ;;
+    broadcast) _team_broadcast "$@" ;;
+    send)      _team_send "$@" ;;
+    wait)      _team_wait "$@" ;;
+    results)   _team_results "$@" ;;
+    *) echo "Usage: agent-tmux team <list|workers|lead|stop|rm|broadcast|send|wait|results> ..." >&2; return 2 ;;
+  esac
+}
+
+_team_member_state() {  # <cli> <name> → "stopped|running|idle|unknown"
+  local st
+  st="$(_agt "$1" status --json "$2" 2>/dev/null || echo '{}')"
+  printf '%s' "$st" | "$JQ" -r \
+    'if (.exists//false)==false then "stopped" elif (.running//false) then "running" else "idle" end' \
+    2>/dev/null || echo unknown
+}
+
+_team_list_one() {
+  local team="$1" file; file="$(_team_state_file "$team")"
+  [[ -f "$file" ]] || { echo "team not found: $team" >&2; return 1; }
+  echo "team: $team"
+  local rows row name cli role state; rows="$("$JQ" -c '.members[]' "$file")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"
+    cli="$(printf '%s'  "$row" | "$JQ" -r .cli)"
+    role="$(printf '%s' "$row" | "$JQ" -r .role)"
+    state="$(_team_member_state "$cli" "$name")"
+    printf '  %-7s %-7s %-24s %s\n' "$role" "$cli" "$name" "$state"
+  done
+}
+_team_list() {
+  if [[ -n "${1:-}" ]]; then _team_list_one "$1"; return $?; fi
+  local d; d="$(_team_state_dir)"; [[ -d "$d" ]] || return 0
+  local f
+  for f in "$d"/*.json(N); do _team_list_one "$(basename "$f" .json)"; done
+}
+_team_field() {
+  local which="$1" team="${2:-}"
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team $which <team>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  "$JQ" -r --arg r "$which" '.members[] | select(.role==$r) | .name' "$file"
+}
+_team_stop() {
+  local team="${1:-}"
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team stop <team>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  local self_name=""
+  [[ -n "${TMUX_AGENT_RESULT:-}" ]] && self_name="$(basename "$(dirname "$TMUX_AGENT_RESULT")")"
+  local rows row name cli; rows="$("$JQ" -c '.members[]' "$file")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    if [[ -n "$self_name" && "$name" == "$self_name" ]]; then
+      echo "warning: skipping self ($name) — stop it from outside the session" >&2; continue
+    fi
+    if _agt "$cli" stop "$name" >/dev/null 2>&1; then echo "stopped $name"; else echo "stop $name: not running"; fi
+  done
+}
+_team_rm() {
+  local team="${1:-}"
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team rm <team>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  local rows row live=0 name cli ex
+  rows="$("$JQ" -c '.members[]' "$file")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    ex="$(_agt "$cli" status --json "$name" 2>/dev/null | "$JQ" -r '.exists // false' 2>/dev/null || echo false)"
+    if [[ "$ex" == "true" ]]; then echo "team rm refused: member still live: $name (stop it first)" >&2; live=1; fi
+  done
+  (( live )) && return 1
+  rm -f "$file" && echo "removed team: $team"
+}
+_team_broadcast() {
+  local team="${1:-}"; (( $# )) && shift; local prompt="${1:-}"
+  [[ -z "$team" || -z "$prompt" ]] && { echo "Usage: agent-tmux team broadcast <team> <prompt>" >&2; return 2; }
+  _team_state_or_die "$team" >/dev/null || return 1
+  local rows row rc=0 name cli rp full; rows="$(_team_worker_rows "$team")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"; rp="$(printf '%s' "$row" | "$JQ" -r .result_path)"
+    full="$prompt
+When done, write your result to $rp. Do not call claude-tmux, codex-tmux, agent-tmux, tmux-agent-fanout, or tmux-agent-dialogue; do not spawn other agents."
+    if ! _agt "$cli" send "$name" "$full" >/dev/null 2>&1; then echo "broadcast failed: $name" >&2; rc=1; fi
+  done
+  return $rc
+}
+_team_send() {
+  local team="${1:-}" worker="${2:-}"; (( $# >= 2 )) && shift 2; local prompt="${1:-}"
+  [[ -z "$team" || -z "$worker" || -z "$prompt" ]] && { echo "Usage: agent-tmux team send <team> <worker> <prompt>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  local target="$worker"; [[ "$worker" != "$team-"* ]] && target="$team-$worker"
+  local cli; cli="$("$JQ" -r --arg n "$target" '.members[] | select(.name==$n) | .cli' "$file")"
+  [[ -z "$cli" ]] && { echo "team send: '$worker' is not a member of $team" >&2; return 1; }
+  _agt "$cli" send "$target" "$prompt"
+}
+_team_wait() {
+  local team="${1:-}"; (( $# )) && shift
+  local timeout=600 require_result=0
+  while (( $# )); do
+    case "$1" in
+      --require-result) require_result=1; shift ;;
+      *) timeout="$1"; shift ;;
+    esac
+  done
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team wait <team> [timeout] [--require-result]" >&2; return 2; }
+  _team_state_or_die "$team" >/dev/null || return 1
+  local rows; rows="$(_team_worker_rows "$team")"
+  local waited=0
+  while true; do
+    local all_done=1 blocked="" still="" row
+    local name cli st running cd br diag res present valid
+    for row in ${(f)rows}; do
+      name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+      st="$(_agt "$cli" status --json "$name" 2>/dev/null || echo '{}')"
+      running="$(printf '%s' "$st" | "$JQ" -r '.running // false')"
+      cd="$(printf '%s'      "$st" | "$JQ" -r '.confirmation_detected // false')"
+      br="$(printf '%s'      "$st" | "$JQ" -r '.blocked_reason // empty')"
+      diag="$(printf '%s'    "$st" | "$JQ" -r '.diagnostic // empty')"
+      [[ "$cd" == "true" || -n "$br" || -n "$diag" ]] && blocked="$blocked $name"
+      if [[ "$running" == "true" ]]; then all_done=0; still="$still $name"; continue; fi
+      if (( require_result )); then
+        res="$(_agt "$cli" result --json "$name" 2>/dev/null || echo '{}')"
+        present="$(printf '%s' "$res" | "$JQ" -r '.present // false')"
+        valid="$(printf '%s'   "$res" | "$JQ" -r '.valid // false')"
+        [[ "$present" == "true" && "$valid" == "true" ]] || { all_done=0; still="$still $name"; }
+      fi
+    done
+    if [[ -n "$blocked" ]]; then echo "team wait: blocked on input:$blocked" >&2; return 7; fi
+    (( all_done )) && return 0
+    if (( waited >= timeout )); then echo "team wait: timeout; still busy:$still" >&2; return 8; fi
+    sleep 2; waited=$((waited+2))
+  done
+}
+_team_results() {
+  local team="${1:-}"; (( $# )) && shift
+  local as_json=0; [[ "${1:-}" == "--json" ]] && as_json=1
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team results <team> [--json]" >&2; return 2; }
+  _team_state_or_die "$team" >/dev/null || return 1
+  local rows row agg='[]' rc=0 missing=""
+  local name cli res present valid body
+  rows="$(_team_worker_rows "$team")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    res="$(_agt "$cli" result --json "$name" 2>/dev/null || echo '{}')"
+    present="$(printf '%s' "$res" | "$JQ" -r '.present // false')"
+    valid="$(printf '%s'   "$res" | "$JQ" -r '.valid // false')"
+    body="$(printf '%s'    "$res" | "$JQ" -c '.body // null' 2>/dev/null || echo null)"
+    [[ "$present" == "true" && "$valid" == "true" ]] || { missing="$missing $name"; rc=1; }
+    agg="$(printf '%s' "$agg" | "$JQ" -c --arg n "$name" --arg c "$cli" \
+      --argjson p "$present" --argjson v "$valid" --argjson b "$body" \
+      '. + [{name:$n, cli:$c, present:$p, valid:$v, body:$b}]')"
+  done
+  if (( as_json )); then
+    printf '%s\n' "$agg"
+  else
+    printf '%s\n' "$agg" | "$JQ" -r '.[] | "\(.name) [\(.cli)] present=\(.present) valid=\(.valid)"'
+  fi
+  [[ -n "$missing" ]] && echo "results missing/invalid:$missing" >&2
+  return $rc
+}
+
 if [[ -n "${TMUX_AGENT_TOOLS_SOURCE_ONLY:-}" ]]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -4133,6 +4480,11 @@ fi
 if [[ -n "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" ]]; then
   mkdir -p "$(dirname "$TMUX_AGENT_TOOLS_AUDIT_LOG")" 2>/dev/null || true
 fi
+
+# pair / team are management modes, not a <cli>: $CLI holds the keyword and
+# "$@" holds the remaining args (the global pre-pass left them in order).
+if [[ "$CLI" == "pair" ]]; then cmd_pair "$@"; exit $?; fi
+if [[ "$CLI" == "team" ]]; then cmd_team "$@"; exit $?; fi
 
 command="${1:-help}"
 if [[ "$#" -gt 0 ]]; then

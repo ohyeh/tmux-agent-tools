@@ -83,6 +83,48 @@ design changes — not regressions**:
 `agent-tmux <cli>` is behaviour-identical to the original `<cli>-tmux`. The new env knobs are
 additive opt-in. No code change required from round 1.
 
+## PR B — pair + team + collaboration primitives
+
+Added to `agent-tmux` (now a real editable file, no longer regenerated):
+
+- `--role <value>` in `start`/`resume` — free-form sugar for `--tag role=<value>` (listed under
+  PR A in the design but slipped; implemented here since pair/team need it).
+- `pair <cli> <team> <dir> [--workers N] [--worker-cli C] [--role lead]` — idempotent worker
+  bootstrap: per-worker live-check via `status --json` → `resumed` if alive else `started`;
+  conservative scale-down (surplus prior workers printed `orphan`, never auto-stopped);
+  exit 0 all-ok / 1 any-failure; per-team `mkdir` lock (pid owner + dead-owner reclaim + pid-less
+  grace via mtime + `AGENT_TMUX_LOCK_TIMEOUT` + EXIT/INT/TERM trap); atomic state write
+  (same-dir `.tmp.$$` + `sync` + `mv`).
+- `team list|workers|lead|stop|rm|broadcast|send|wait|results`. State file
+  `$TMUX_AGENT_DIR/teams/<team>.json` (schema_version 1; members[] = {name, role, cli, result_path}).
+  `team stop` self-guard via `basename $(dirname $TMUX_AGENT_RESULT)`; `team rm` refuses while any
+  member live. `wait` exit 0 idle / 7 blocked / 8 timeout (+`--require-result`). `results` branches
+  on `.present`→`.valid`→`.body`, never on command success; missing/invalid named on stderr.
+
+### Architecture decisions
+
+1. **`pair`/`team` are management *modes*, not a `<cli>`** — `$CLI` holds the keyword, intercepted
+   before normal command dispatch (preset_for_cli still runs on the keyword: harmless noise).
+2. **All per-member ops re-invoke `"$SELF" <member-cli> <subcommand>`**, never the local `$PREFIX`
+   (meaningless in pair/team mode). This makes **mixed-CLI teams** first-class and keeps the
+   orchestration runtime-agnostic.
+3. **`pair` records a `lead` member but does NOT start a lead session** — the lead is the caller
+   (possibly unmanaged). `team list` shows it `stopped` when absent; the self-guard covers the case
+   where the caller *is* a managed session named `<team>`.
+4. **zsh gotcha fixed:** re-declaring `local` inside a loop on a var that previously held a
+   *multi-line* value makes zsh echo `name=value` to stdout (corrupted `team results --json`). All
+   loop-body `local` declarations were hoisted above their `for` loops.
+
+### Verification
+
+- New smoke tests (real tmux + fake CLI; deterministic status/state-file/exit-code assertions):
+  `test-agent-tmux-pair-smoke` (18 checks), `test-agent-tmux-team-smoke` (13, incl. mixed-CLI +
+  self-guard), `test-agent-tmux-collab-smoke` (15, incl. wait timeout/idle + results missing/present).
+- Full suite = 36 pre-existing + 3 new = **39 pass / 9 unchanged pre-existing fail → zero regressions**.
+- `agent-tmux` adds **zero** path-tied-local lint violations.
+- New smoke tests are not wired into CI (repo convention: CI runs only `test-color-env-smoke` +
+  inline assertions). Left as-is.
+
 ## Verification gate
 
 - `zsh -n` on agent-tmux + all shims.
