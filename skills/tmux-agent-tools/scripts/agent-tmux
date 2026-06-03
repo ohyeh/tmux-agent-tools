@@ -1,0 +1,5263 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:A}"
+# ---- CLI preset dispatch (agent-tmux) -------------------------------------
+# agent-tmux <cli> <command> [args...].  <cli> selects a preset; everything
+# else delegates to the shared (claude-derived) machinery below.
+CLI="${1:-}"
+if [[ -z "$CLI" || "$CLI" == -* ]]; then
+  echo "Usage: agent-tmux <cli> <command> [args...]" >&2
+  echo "  <cli>: claude | codex | agy | cursor | grok | <custom-binary>" >&2
+  exit 2
+fi
+shift
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+# Per-CLI preset. Sets: _ENV_NS, _bin, _PRESET_PREFIX, _PRESET_FLAGS,
+# RESUME_KEYWORD, HEURISTIC_FAMILY, _USAGE_KIND.
+preset_for_cli() {
+  case "$1" in
+    claude) _ENV_NS=CLAUDE; _bin=claude; _PRESET_PREFIX=claude-cli; _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='--resume'; HEURISTIC_FAMILY=claude; _USAGE_KIND='Code' ;;
+    codex)  _ENV_NS=CODEX;  _bin=codex;  _PRESET_PREFIX=codex-cli;  _PRESET_FLAGS='--yolo';                          RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+    agy)    _ENV_NS=AGY;    _bin=agy;    _PRESET_PREFIX=agy-cli;    _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+    cursor) _ENV_NS=CURSOR; _bin=cursor; _PRESET_PREFIX=cursor-cli; _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+    grok)   _ENV_NS=GROK;   _bin=grok;   _PRESET_PREFIX=grok-cli;   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+    *)      _ENV_NS=AGENT;  _bin="$1";   _PRESET_PREFIX="$1-cli";   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+  esac
+}
+preset_for_cli "$CLI"
+
+# Env precedence: <NS>_TMUX_<KEY> > AGENT_TMUX_<KEY> > preset default.
+# Empty-or-unset falls through (matches legacy `${CLAUDE_TMUX_X:-default}`).
+_pref() {
+  local key="$1" def="$2" name v
+  name="${_ENV_NS}_TMUX_${key}"; v="${(P)name:-}"
+  [[ -n "$v" ]] && { print -r -- "$v"; return; }
+  name="AGENT_TMUX_${key}"; v="${(P)name:-}"
+  [[ -n "$v" ]] && { print -r -- "$v"; return; }
+  print -r -- "$def"
+}
+# LAUNCH_FLAGS: set-wins so `AGENT_TMUX_LAUNCH_FLAGS=""` can clear flags.
+_pref_set() {
+  local key="$1" def="$2" name
+  name="${_ENV_NS}_TMUX_${key}"; if [[ -n "${(P)name+x}" ]]; then print -r -- "${(P)name}"; return; fi
+  name="AGENT_TMUX_${key}";     if [[ -n "${(P)name+x}" ]]; then print -r -- "${(P)name}"; return; fi
+  print -r -- "$def"
+}
+
+# Binary override: bare ${_ENV_NS} env var (e.g. CLAUDE=, CODEX=), else PATH.
+_binvar="$_ENV_NS"
+CLI_BIN="${(P)_binvar:-}"
+[[ -z "$CLI_BIN" ]] && CLI_BIN="$(command -v "$_bin" 2>/dev/null || true)"
+
+_BASE_PREFIX="$(_pref PREFIX "$_PRESET_PREFIX")"
+if [[ -n "${TMUX_AGENT_TOOLS_TENANT:-}" ]]; then
+  PREFIX="${_BASE_PREFIX}-${TMUX_AGENT_TOOLS_TENANT}"
+else
+  PREFIX="$_BASE_PREFIX"
+fi
+STABLE_SECONDS="$(_pref STABLE_SECONDS 3)"
+SUBMIT_DELAY="$(_pref SUBMIT_DELAY 0.2)"
+TMUX_CONF="$(_pref CONF "${TMPDIR:-/tmp}/agent-tmux-${CLI}.tmux.conf")"
+TMUX_MOUSE="$(_pref MOUSE on)"
+TMUX_CLIPBOARD="$(_pref CLIPBOARD auto)"
+STATUS_TAIL_LINES="$(_pref STATUS_TAIL_LINES 20)"
+LAUNCH_FLAGS="$(_pref_set LAUNCH_FLAGS "$_PRESET_FLAGS")"
+
+# Per-CLI env inheritance flags. Legacy names <NS>_TMUX_INHERIT_<NS>_ENV /
+# <NS>_TMUX_CLEAR_<NS>_ENV (kept for back-compat) > AGENT_TMUX_* > preset default.
+_iv="${_ENV_NS}_TMUX_INHERIT_${_ENV_NS}_ENV"; INHERIT_ENV="${(P)_iv:-${AGENT_TMUX_INHERIT_ENV:-0}}"
+_cv="${_ENV_NS}_TMUX_CLEAR_${_ENV_NS}_ENV";   CLEAR_ENV="${(P)_cv:-${AGENT_TMUX_CLEAR_ENV:-1}}"
+_xv="${_ENV_NS}_TMUX_COLOR_ENV";              COLOR_ENV="${(P)_xv:-${AGENT_TMUX_COLOR_ENV:-1}}"
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
+    print -r -- "$TMUX"
+    return
+  fi
+  command -v tmux 2>/dev/null || true
+}
+
+TMUX_BIN="$(resolve_tmux_bin)"
+unset TMUX
+TMUX="$TMUX_BIN"
+
+usage() {
+  cat <<'EOF'
+agent-tmux - run Claude Code in tmux and drive it programmatically.
+
+Usage:
+  agent-tmux start [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
+  agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
+  agent-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
+  agent-tmux attach <name>
+  agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
+  agent-tmux send-wait <name> <text> [timeout_seconds]
+  agent-tmux send-wait-literal <name> <text> <literal> [timeout_seconds]
+  agent-tmux wait <name> [timeout_seconds]
+  agent-tmux wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]
+  agent-tmux wait-literal <name> <text> [timeout_seconds]
+  agent-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] [--wait-for-human] [--cancel-file <path>] <name>
+  agent-tmux capture <name> [lines]
+  agent-tmux result [--path] [--field <jq>] [--wait <seconds>] [--json] <name>
+  agent-tmux result path <name>
+  agent-tmux result init <name>
+  agent-tmux result validate <name> --json
+  agent-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
+  agent-tmux list
+  agent-tmux status [--json] <name>
+  agent-tmux ping [--timeout <s>] [--json] <name>
+  agent-tmux probe --metric <metric> [--json] <name>
+  agent-tmux env-doctor [name]
+  agent-tmux doctor
+  agent-tmux self-test
+  agent-tmux stop <name>
+  agent-tmux help
+
+Examples:
+  agent-tmux start --attach pr5 ~/github/example-service
+  agent-tmux resume --exact pr5 ~/github/example-service ee5aca88-a1af-48d3-af21-54f60d618f22
+  agent-tmux start-ssh --attach pr5 example-host ~/github/example-service
+  agent-tmux start --exact pr5 ~/github/example-service 'hi'
+  agent-tmux attach pr5
+  agent-tmux send pr5 'Read the PR description first.'
+  agent-tmux send-wait pr5 'Summarize the current state.' 180
+  agent-tmux send-wait-literal pr5 'Reply with the requested marker.' '[CLAUDE-01]' 180
+  agent-tmux wait pr5 180
+  agent-tmux wait-text --regex pr5 'Done|Need approval' 180
+  agent-tmux wait-text --literal pr5 '[CLAUDE-01]' 180
+  agent-tmux wait-literal pr5 '[CLAUDE-01]' 180
+  agent-tmux capture pr5 80
+  agent-tmux doctor
+  agent-tmux self-test
+  agent-tmux list
+  agent-tmux stop pr5
+
+Behavior:
+  - Session name is claude-cli-<name> by default.
+  - start and resume append a random 6-character suffix to <name>, unless --exact is used.
+  - start and resume always recreate that named tmux session.
+  - start-ssh keeps tmux local, then runs Claude through ssh in the remote directory.
+  - Claude is launched with --dangerously-skip-permissions.
+  - wait returns when the visible pane is stable for a few seconds.
+  - wait-text returns when the visible pane contains exact text by default.
+  - wait-text --regex opts into zsh extended-regex matching.
+  - wait-literal returns when the visible pane contains exact text.
+  - send-wait sends text with a fresh nonce instruction, then waits for that nonce on its own line.
+  - send-wait-literal sends text, then waits for a new occurrence of exact text.
+  - capture reads the tmux pane without stealing browser or terminal focus.
+
+Environment:
+  TMUX=$(command -v tmux)
+  CLAUDE=$(command -v claude)
+  CLAUDE_TMUX_PREFIX=claude-cli
+  CLAUDE_TMUX_STABLE_SECONDS=3
+  CLAUDE_TMUX_SUBMIT_DELAY=0.2
+  CLAUDE_TMUX_CONF=/tmp/agent-tmux.tmux.conf
+  CLAUDE_TMUX_MOUSE=on
+  CLAUDE_TMUX_CLIPBOARD=auto
+  CLAUDE_TMUX_STATUS_TAIL_LINES=20
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=0
+  CLAUDE_TMUX_CLEAR_CLAUDE_ENV=1
+  CLAUDE_TMUX_COLOR_ENV=1
+EOF
+}
+
+help_for_subcommand() {
+  # Per-subcommand cheatsheet for issue #106 discoverability.
+  # Falls through to the full `usage` when no topic matches.
+  local topic="${1:-}"
+  case "$topic" in
+    "")
+      usage
+      return 0
+      ;;
+    start)
+      cat <<'HELP_EOF'
+agent-tmux start [flags] <name> <directory> [initial text]
+
+Launch claude inside a fresh tmux session.
+
+Flags (place BEFORE <name>):
+  --attach                       Attach immediately after creating the session.
+  --exact                        Use <name> verbatim (no random suffix).
+  --sentinel <abs-path>          Write CLI exit code to file when CLI exits (#95).
+  --on-start <shell-cmd>         Run hook after `tmux new-session` returns (#101a).
+  --on-exit  <shell-cmd>         Run hook after CLI exit; needs --sentinel.
+  --sentinel-keep                Keep sentinel file across `stop` cleanup.
+  --transcript <abs-path>        Append JSONL events to this path (#100).
+
+Examples:
+  agent-tmux start --exact worker ~/proj 'Run targeted tests.'
+  agent-tmux start --sentinel /tmp/w.exit --on-exit 'curl -X POST $URL' \
+                  --on-start 'date >> /tmp/start.log' worker ~/proj 'hi'
+
+See also: README "Event-driven completion" and `agent-tmux help resume`.
+HELP_EOF
+      ;;
+    resume)
+      cat <<'HELP_EOF'
+agent-tmux resume [flags] <name> <directory> <session-id>
+
+Resume an existing claude session-id inside tmux. Accepts the same flags as
+`start`: --attach, --exact, --sentinel, --on-start, --on-exit, --sentinel-keep,
+--transcript.
+
+Example:
+  agent-tmux resume --exact rev ~/proj 019e356f-f95d-7570-9784-ea7b58e404a5
+HELP_EOF
+      ;;
+    send)
+      cat <<'HELP_EOF'
+agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
+
+Paste text into the agent CLI and submit. Use --from-file for first-class
+multi-line injection under the same send-lock, transcript, and audit surfaces.
+--enter-count defaults to 1 for --from-file. Tune delay with --enter-delay or
+CLAUDE_TMUX_SUBMIT_DELAY.
+HELP_EOF
+      ;;
+    send-wait)
+      cat <<'HELP_EOF'
+agent-tmux send-wait <name> <text> [timeout]
+
+Send text with a fresh MARK-<hex> nonce instruction appended, then wait for
+that nonce to appear alone on a line. Use this for prompt/response turns where
+prompt echo or stale markers must not satisfy the wait.
+HELP_EOF
+      ;;
+    send-wait-literal)
+      cat <<'HELP_EOF'
+agent-tmux send-wait-literal <name> <text> <literal> [timeout]
+
+Send text then wait for a NEW occurrence of <literal> after the send. Use
+this over `send` + `wait-literal` when stale pane content may already
+contain the marker.
+HELP_EOF
+      ;;
+    wait)
+      cat <<'HELP_EOF'
+agent-tmux wait <name> [timeout_seconds]
+
+Block until pane bytes have been stable for CLAUDE_TMUX_STABLE_SECONDS. Times
+out with exit 1 if the pane keeps changing.
+HELP_EOF
+      ;;
+    wait-text|wait-literal)
+      cat <<'HELP_EOF'
+agent-tmux wait-text [--literal|--regex] <name> <pattern> [timeout_seconds]
+agent-tmux wait-literal       <name> <text>    [timeout_seconds]
+
+Both wait until the visible pane contains the pattern. `wait-text` uses exact-text
+matching by default; `--regex` opts into zsh extended regex; `--literal` is
+accepted for compatibility. `wait-literal` is always exact-text match.
+Prefer literal forms for markers containing regex metacharacters
+(`[`, `]`, `(`, `)`, `.`, `*`, `?`).
+HELP_EOF
+      ;;
+    wait-and-capture)
+      cat <<'HELP_EOF'
+agent-tmux wait-and-capture --marker <text> [flags] <name>
+
+One-shot combination of wait + capture (#99). Default match style is
+literal (regex would false-positive on `[DONE]`-shaped markers).
+
+Flags:
+  --marker <text>              Required marker text.
+  --literal | --regex          Match style. Default --literal (#137 R6).
+  --timeout <s>                Wait timeout.
+  --tail <n>                   Capture last N lines.
+  --strip-ansi                 Strip CSI/SGR escapes.
+  --since-marker <text>        Trim pane output before <text>; defaults to
+                                --marker when match style is literal.
+  --json                       Structured payload with reason:
+                                  matched | timeout | session_gone.
+  --no-timeout-error           SOFT timeout exits 0; session_gone still exits 1.
+HELP_EOF
+      ;;
+    capture)
+      cat <<'HELP_EOF'
+agent-tmux capture [flags] <name> [lines]
+
+Read the tmux pane without stealing focus.
+
+Flags:
+  --strip-ansi                 Remove CSI/SGR escapes (#96).
+  --since-marker <text>        Keep only lines after the LAST <text>.
+  --json                       Wrap as {schema_version, name, session,
+                                  lines_requested, marker_found,
+                                  stripped_ansi, lines}.
+HELP_EOF
+      ;;
+    result)
+      cat <<'HELP_EOF'
+agent-tmux result [flags] <name>
+agent-tmux result --path <name>
+agent-tmux result path <name>
+agent-tmux result init <name>
+agent-tmux result validate <name> --json
+agent-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
+
+Read the agent's result.json (#97) at $TMUX_AGENT_DIR/<name>/result.json.
+
+Flags:
+  --path                        Print the literal result.json path and exit 0.
+                                Does not require result.json to exist.
+  --field <jq>                  Extract single value via `jq -r`. Exit 1 on
+                                missing path.
+  --wait <seconds>              Poll until the file appears or timeout.
+  --json                        Wrap as {schema_version, path, present,
+                                  bytes, mtime, valid, body}. Missing file
+                                  → exit 0 with present:false.
+
+Subcommands:
+  path                          Print the literal result.json path and exit 0.
+  init                          Write a valid result.json skeleton.
+  validate                      Validate result.json against the default or
+                                recorded result schema. Missing/invalid exits
+                                non-zero and emits machine-readable JSON.
+  wait-required                 Poll until result.json exists and all named
+                                fields are non-empty, or timeout with JSON.
+HELP_EOF
+      ;;
+    status)
+      cat <<'HELP_EOF'
+agent-tmux status [--json] <name>
+
+Show pane state + diagnostics. `--json` emits the stable contract
+including liveness fields (#98): started_at, last_change_at, idle_seconds,
+bytes_in_pane, marker_seen[], plus the shared exists/running/exit_detected/
+local_or_remote/diagnostic fields.
+HELP_EOF
+      ;;
+    probe)
+      cat <<'HELP_EOF'
+agent-tmux probe --metric <metric> [--json] <name>
+
+Parse Claude-specific progress signals from the pane.
+
+Metrics:
+  (claude)  context_percent / goal_active / active_spinner
+  (other)   progress / tool_active / approval_pending
+  Pane-scraping heuristics; the supported set depends on <cli>.
+HELP_EOF
+      ;;
+    list)
+      cat <<'HELP_EOF'
+agent-tmux list
+
+List active agent-tmux-prefixed tmux sessions. Use `tmux-agent-sessions list`
+for the cross-tool inventory with state filters.
+HELP_EOF
+      ;;
+    attach)
+      cat <<'HELP_EOF'
+agent-tmux attach <name>
+
+Attach to the session in the current terminal. Detach with the usual tmux
+prefix + `d` (default Ctrl-b d).
+HELP_EOF
+      ;;
+    stop)
+      cat <<'HELP_EOF'
+agent-tmux stop <name>
+
+Kill the tmux session. Removes the sentinel file by default; pass
+--sentinel-keep at start to retain it.
+HELP_EOF
+      ;;
+    doctor|self-test)
+      cat <<'HELP_EOF'
+agent-tmux doctor          Check binaries + tmux + capture/wait behavior.
+agent-tmux self-test       End-to-end smoke without launching a real CLI.
+
+Both are credential-free and safe to run anywhere.
+HELP_EOF
+      ;;
+    start-ssh)
+      cat <<'HELP_EOF'
+agent-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
+
+Keep tmux local but run claude over ssh on <ssh-target>. The remote shell
+must resolve `claude` on PATH.
+HELP_EOF
+      ;;
+    help)
+      cat <<'HELP_EOF'
+agent-tmux help               Show full usage.
+agent-tmux help <subcommand>  Show focused cheatsheet for one subcommand.
+HELP_EOF
+      ;;
+    *)
+      printf 'No focused help for %q. Available topics:\n' "$topic" >&2
+      printf '  start resume start-ssh attach send send-wait send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  env-doctor list stop doctor self-test help\n' >&2
+      return 2
+      ;;
+  esac
+}
+
+
+require_bins() {
+  if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
+    echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
+    exit 1
+  fi
+
+  if [[ -z "$CLI_BIN" || ! -x "$CLI_BIN" ]]; then
+    local claude_lookup
+    claude_lookup="$(command -v "$_bin" 2>/dev/null || true)"
+    echo "${CLI} not found at ${CLI_BIN:-<empty>}." >&2
+    if [[ -n "$claude_lookup" ]]; then
+      echo "Current PATH resolves ${CLI} to: $claude_lookup" >&2
+      echo "Unset ${_ENV_NS} or set ${_ENV_NS}=$claude_lookup to use that install." >&2
+    else
+      echo "Current PATH does not resolve ${CLI}. Install ${CLI} or set ${_ENV_NS}=/path/to/${CLI}." >&2
+    fi
+    exit 1
+  fi
+}
+
+require_tmux() {
+  if [[ -z "$TMUX" || ! -x "$TMUX" ]]; then
+    echo "tmux not found. Install it with Homebrew or set TMUX=/path/to/tmux." >&2
+    exit 1
+  fi
+}
+
+require_jq() {
+  if [[ -z "$JQ" || ! -x "$JQ" ]]; then
+    echo "jq not found. Install it with Homebrew or set JQ=/path/to/jq." >&2
+    exit 1
+  fi
+}
+
+clipboard_command() {
+  if [[ "$TMUX_CLIPBOARD" == "internal" ]]; then
+    return 0
+  fi
+  if [[ "$TMUX_CLIPBOARD" != "auto" ]]; then
+    echo "$TMUX_CLIPBOARD"
+    return 0
+  fi
+
+  if command -v pbcopy >/dev/null 2>&1; then
+    echo "pbcopy"
+  elif command -v wl-copy >/dev/null 2>&1; then
+    echo "wl-copy"
+  elif command -v xclip >/dev/null 2>&1; then
+    echo "xclip -selection clipboard"
+  elif command -v xsel >/dev/null 2>&1; then
+    echo "xsel --clipboard --input"
+  fi
+}
+
+tmux_conf_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf "%s" "$value"
+}
+
+clipboard_description() {
+  local command
+  command="$(clipboard_command)"
+  if [[ -n "$command" ]]; then
+    if [[ "$TMUX_CLIPBOARD" == "auto" ]]; then
+      echo "auto ($command)"
+    else
+      echo "$command"
+    fi
+  elif [[ "$TMUX_CLIPBOARD" == "auto" ]]; then
+    echo "auto (internal fallback)"
+  else
+    echo "internal"
+  fi
+}
+
+write_tmux_conf() {
+  cat > "$TMUX_CONF" <<'EOF'
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",xterm-256color:RGB"
+set -as terminal-features ",tmux-256color:RGB"
+set -ga terminal-overrides ",xterm-256color:Tc"
+set -ga terminal-overrides ",tmux-256color:Tc"
+set -g allow-passthrough on
+set -s extended-keys on
+set -as terminal-features ",xterm*:extkeys"
+set -as terminal-features ",tmux*:extkeys"
+set -as terminal-features ",xterm*:clipboard"
+set -as terminal-features ",tmux*:clipboard"
+set -g focus-events on
+set -sg escape-time 10
+set -g xterm-keys on
+set -g set-clipboard on
+set -g mode-keys vi
+set -g status-keys vi
+set-environment -g COLORTERM truecolor
+set -g history-limit 50000
+set -g status on
+set -g status-position bottom
+set -g status-interval 2
+set -g status-style "bg=#020617,fg=#e5e7eb"
+set -g status-left-length 64
+set -g status-right-length 96
+set -g status-left "#[bg=#f97316,fg=#111827,bold] Claude #[bg=#020617,fg=#fbbf24,bold] #S "
+set -g status-right "#[fg=#94a3b8]#(pwd | sed 's#^$HOME#~#') #[fg=#34d399,bold]%H:%M "
+set -g window-status-format "#[fg=#cbd5e1] #I:#W "
+set -g window-status-current-format "#[bg=#334155,fg=#ffffff,bold] #I:#W "
+set -g pane-border-style "fg=#64748b"
+set -g pane-active-border-style "fg=#f59e0b"
+set -g message-style "bg=#f59e0b,fg=#111827,bold"
+set -g mode-style "bg=#f59e0b,fg=#111827,bold"
+set -g clock-mode-colour "#f59e0b"
+set -g display-panes-colour "#94a3b8"
+set -g display-panes-active-colour "#34d399"
+EOF
+  local copy_command
+  copy_command="$(clipboard_command)"
+  if [[ -n "$copy_command" ]]; then
+    copy_command="$(tmux_conf_quote "$copy_command")"
+    printf 'bind-key -T copy-mode-vi y send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi Enter send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "%s"\n' "$copy_command" >> "$TMUX_CONF"
+  else
+    printf 'bind-key -T copy-mode-vi y send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi Enter send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
+    printf 'bind-key -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel\n' >> "$TMUX_CONF"
+  fi
+  printf 'set -g mouse "%s"\n' "$TMUX_MOUSE" >> "$TMUX_CONF"
+}
+
+session_for_name() {
+  local name="$1"
+  if [[ ! "$name" =~ '^[A-Za-z0-9_.-]+$' ]]; then
+    echo "Invalid session name: $name" >&2
+    exit 2
+  fi
+  echo "$PREFIX-$name"
+}
+
+random_suffix() {
+  LC_ALL=C /usr/bin/od -An -N3 -tx1 /dev/urandom | /usr/bin/tr -d ' \n'
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+session_env_has_key() {
+  local key="$1"
+  local i entry
+  for (( i = 1; i <= ${#session_env_args[@]}; i += 2 )); do
+    entry="${session_env_args[$(( i + 1 ))]:-}"
+    [[ "$entry" == "$key" || "$entry" == "$key="* ]] && return 0
+  done
+  return 1
+}
+
+session_env_value_for_key() {
+  local key="$1"
+  local i entry
+  for (( i = 1; i <= ${#session_env_args[@]}; i += 2 )); do
+    entry="${session_env_args[$(( i + 1 ))]:-}"
+    if [[ "$entry" == "$key="* ]]; then
+      printf "%s" "${entry#*=}"
+      return 0
+    fi
+    if [[ "$entry" == "$key" ]]; then
+      (( ${+parameters[$key]} )) && printf "%s" "${(P)key}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_cli_env_args() {
+  local key value
+  if [[ "$INHERIT_ENV" != "1" ]]; then
+    [[ "$CLEAR_ENV" == "1" ]] || return 0
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      session_env_has_key "$key" && continue
+      session_env_args+=("-e" "${key}=")
+    done < <(cli_provider_env_keys)
+    return 0
+  fi
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    (( ${+parameters[$key]} )) || continue
+    session_env_has_key "$key" && continue
+    value="${(P)key}"
+    [[ -n "$value" ]] || continue
+    session_env_args+=("-e" "$key=$value")
+  done < <(cli_provider_env_keys)
+}
+
+apply_color_env_args() {
+  [[ "$COLOR_ENV" == "1" ]] || return 0
+  if ! session_env_has_key "COLORTERM"; then
+    session_env_args+=("-e" "COLORTERM=truecolor")
+  fi
+  if ! session_env_has_key "FORCE_COLOR"; then
+    session_env_args+=("-e" "FORCE_COLOR=3")
+  fi
+  if ! session_env_has_key "CLICOLOR_FORCE"; then
+    session_env_args+=("-e" "CLICOLOR_FORCE=1")
+  fi
+}
+
+color_env_shell_prefix() {
+  [[ "$COLOR_ENV" == "1" ]] || return 0
+
+  local prefix="" value
+  if session_env_has_key "NO_COLOR"; then
+    value="$(session_env_value_for_key "NO_COLOR")"
+    prefix+="export NO_COLOR=$(shell_quote "$value"); "
+  else
+    prefix+="unset NO_COLOR; "
+  fi
+
+  if session_env_has_key "COLORTERM"; then
+    value="$(session_env_value_for_key "COLORTERM")"
+  else
+    value="truecolor"
+  fi
+  prefix+="export COLORTERM=$(shell_quote "$value"); "
+
+  if session_env_has_key "FORCE_COLOR"; then
+    value="$(session_env_value_for_key "FORCE_COLOR")"
+  else
+    value="3"
+  fi
+  prefix+="export FORCE_COLOR=$(shell_quote "$value"); "
+
+  if session_env_has_key "CLICOLOR_FORCE"; then
+    value="$(session_env_value_for_key "CLICOLOR_FORCE")"
+  else
+    value="1"
+  fi
+  prefix+="export CLICOLOR_FORCE=$(shell_quote "$value"); "
+
+  printf "%s" "$prefix"
+}
+
+paste_and_submit() {
+  local session="$1"
+  local buffer_name="$2"
+  local prompt_text="$3"
+
+  printf "%s" "$prompt_text" | "$TMUX" load-buffer -b "$buffer_name" -
+  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+  sleep "$SUBMIT_DELAY"
+  "$TMUX" send-keys -t "$session" Enter
+  if [[ "$prompt_text" == *$'\n'* ]]; then
+    sleep "$SUBMIT_DELAY"
+    "$TMUX" send-keys -t "$session" Enter
+  fi
+}
+
+paste_file_and_submit() {
+  local session="$1"
+  local buffer_name="$2"
+  local payload_file="$3"
+  local enter_count="$4"
+  local enter_delay="$5"
+
+  "$TMUX" load-buffer -b "$buffer_name" "$payload_file"
+  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+  local i
+  for (( i = 0; i < enter_count; i++ )); do
+    sleep "$enter_delay"
+    "$TMUX" send-keys -t "$session" Enter
+  done
+}
+
+strip_ansi_text() {
+  sed -E $'
+    s/\x1b\\[[0-9;?]*[A-Za-z]//g
+    s/\x1b\\][^\x07\x1b]*\x07//g
+    s/\x1b\\][^\x1b]*\x1b\\\\//g
+    s/\x1bP[^\x1b]*\x1b\\\\//g
+    s/\x1b_[^\x1b]*\x1b\\\\//g
+    s/\x1b\\^[^\x1b]*\x1b\\\\//g
+    s/\x1bX[^\x1b]*\x1b\\\\//g
+  '
+}
+
+# --- Sentinel / on-exit hook helpers (shared by start/resume; issue #132) ---
+# Each helper either uses globals declared in the caller (sentinel,
+# on_exit_cmd, sentinel_keep, session_env_args) or returns its output via
+# stdout. Centralising them removes the duplication called out in the
+# PR #130 review.
+
+parse_sentinel_flags() {
+  # Consumes --sentinel / --on-exit / --sentinel-keep from "$@" until the
+  # next non-flag positional is seen, then publishes the remainder via the
+  # SENTINEL_PARSE_REMAINING global. Caller does:
+  #   parse_sentinel_flags "$@"; set -- "${SENTINEL_PARSE_REMAINING[@]}"
+  #
+  # `--sentinel` and `--on-exit` MUST take a value. If the value is missing
+  # the function exits explicitly rather than letting `shift 2` fail under
+  # `set -e` with a cryptic "shift count must be <= $#".
+  SENTINEL_PARSE_REMAINING=()
+  while [[ "${1:-}" == "--sentinel" || "${1:-}" == "--on-exit" || "${1:-}" == "--on-start" || "${1:-}" == "--sentinel-keep" ]]; do
+    case "$1" in
+      --sentinel)
+        if (( $# < 2 )); then
+          echo "--sentinel requires a value (absolute path)" >&2
+          exit 2
+        fi
+        sentinel="$2"
+        shift 2
+        ;;
+      --on-exit)
+        if (( $# < 2 )); then
+          echo "--on-exit requires a value (shell command)" >&2
+          exit 2
+        fi
+        on_exit_cmd="$2"
+        shift 2
+        ;;
+      --on-start)
+        if (( $# < 2 )); then
+          echo "--on-start requires a value (shell command)" >&2
+          exit 2
+        fi
+        on_start_cmd="$2"
+        shift 2
+        ;;
+      --sentinel-keep)
+        # Placeholder: future stop_session work will use this flag to keep
+        # the sentinel file across an explicit stop. Nothing reads it yet;
+        # tracked alongside the #95 design doc cleanup semantics.
+        sentinel_keep=1
+        shift
+        ;;
+    esac
+  done
+  SENTINEL_PARSE_REMAINING=("$@")
+}
+
+validate_sentinel_flags() {
+  # Validates sentinel (absolute path; not pre-existing) and warns if
+  # --on-exit is set without --sentinel. May exit non-zero on hard errors.
+  local tool="$1"
+  if [[ -n "$sentinel" && "${sentinel:0:1}" != "/" ]]; then
+    echo "--sentinel must be an absolute path: $sentinel" >&2
+    exit 2
+  fi
+  if [[ -n "$sentinel" && -e "$sentinel" ]]; then
+    echo "Sentinel path already exists: $sentinel" >&2
+    echo "Remove it or pass a fresh --sentinel path to avoid stale-completion false positives." >&2
+    exit 1
+  fi
+  if [[ -n "$on_exit_cmd" && -z "$sentinel" ]]; then
+    echo "[$tool] warning: --on-exit ignored without --sentinel" >&2
+    on_exit_cmd=""
+  fi
+}
+
+apply_sentinel_env_args() {
+  # Appends -e TMUX_AGENT_TOOLS_SENTINEL=... and -e TMUX_AGENT_TOOLS_ON_EXIT=...
+  # to the caller's session_env_args array when set.
+  if [[ -n "$sentinel" ]]; then
+    session_env_args+=("-e" "TMUX_AGENT_TOOLS_SENTINEL=$sentinel")
+  fi
+  if [[ -n "$on_exit_cmd" ]]; then
+    session_env_args+=("-e" "TMUX_AGENT_TOOLS_ON_EXIT=$on_exit_cmd")
+  fi
+}
+
+sentinel_inline_block() {
+  # Emits the shell snippet that goes between `code=$?` and the exit-message
+  # printfs inside the tmux new-session command. The snippet:
+  #   1. atomically writes the exit code to $TMUX_AGENT_TOOLS_SENTINEL
+  #   2. runs the --on-exit hook with ON_EXIT_CODE / ON_EXIT_NAME exported,
+  #      only when BOTH the sentinel path and the hook command are set.
+  #
+  # Escape gymnastics (DO NOT touch without re-running scripts/test-sentinel-smoke):
+  #   - Outer printf is SINGLE-QUOTED so the wrapper shell does NOT expand
+  #     $TMUX_AGENT_TOOLS_SENTINEL / $code etc. — those are for the pane shell.
+  #   - '\''...'\'' = end-quote + literal `'` + start-quote, used to embed the
+  #     inner `printf '%s\n'`.
+  #   - %%s\\n = printf format that emits literal `%s\n` (two chars: percent-s
+  #     and backslash-n). NOT a real newline; the tmux pane shell re-processes
+  #     the `\n` when running the inner printf.
+  #   - The last `%s` is the only real format spec, filled with the
+  #     shell_quoted agent name so dangerous names cannot break out.
+  local agent_name="$1"
+  printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
+}
+
+# --- Safety fuses: --max-runtime / --max-idle (issue #105) ----------------
+# Consumes `--max-runtime <seconds>` and `--max-idle <seconds>` from "$@",
+# exposing MAX_FUSE_PARSE_REMAINING with the rest of the argv. Caller must
+# pre-declare scalar locals `max_runtime` and `max_idle` (empty = unset).
+parse_max_fuse_flags() {
+  MAX_FUSE_PARSE_REMAINING=()
+  while [[ "${1:-}" == "--max-runtime" || "${1:-}" == "--max-idle" ]]; do
+    case "$1" in
+      --max-runtime)
+        if (( $# < 2 )); then
+          echo "--max-runtime requires a value (seconds)" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--max-runtime must be a positive integer (seconds): $2" >&2
+          exit 2
+        fi
+        max_runtime="$2"
+        shift 2
+        ;;
+      --max-idle)
+        if (( $# < 2 )); then
+          echo "--max-idle requires a value (seconds)" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--max-idle must be a positive integer (seconds): $2" >&2
+          exit 2
+        fi
+        max_idle="$2"
+        shift 2
+        ;;
+    esac
+  done
+  MAX_FUSE_PARSE_REMAINING=("$@")
+}
+
+# Background watcher loop, runs in a detached subshell launched via nohup.
+# Polls the tmux session every second; if --max-runtime or --max-idle is
+# tripped, writes 124 + reason to the sentinel/reason sidecar, runs the
+# on-exit hook with ON_EXIT_REASON, and tears down the tmux session.
+#
+# Invariants:
+#   - Both fuses may coexist; whichever fires first wins.
+#   - Watcher exits silently when the tmux session disappears (normal stop
+#     handled teardown).
+#   - Pane idle = sha256 of `capture-pane -p` unchanged. Hash kept in the
+#     watcher's own memory to avoid racing `status --json`'s hash file.
+max_fuse_watcher_loop() {
+  local agent_name="$1" tmux_session="$2" sentinel="$3" on_exit_cmd="$4"
+  local max_runtime="$5" max_idle="$6" tmux_bin="$7"
+  zmodload zsh/datetime 2>/dev/null || true
+  local started_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  local last_hash=""
+  local last_change_epoch="$started_epoch"
+  local reason=""
+  local now_epoch pane_text new_hash
+  while :; do
+    sleep 1
+    if ! "$tmux_bin" has-session -t "$tmux_session" 2>/dev/null; then
+      return 0
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if [[ -n "$max_runtime" ]] && (( now_epoch - started_epoch >= max_runtime )); then
+      reason="max_runtime"
+      break
+    fi
+    if [[ -n "$max_idle" ]]; then
+      pane_text="$("$tmux_bin" capture-pane -p -t "$tmux_session" 2>/dev/null || true)"
+      if command -v sha256sum >/dev/null 2>&1; then
+        new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
+      else
+        new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+      fi
+      if [[ "$new_hash" != "$last_hash" ]]; then
+        last_hash="$new_hash"
+        last_change_epoch="$now_epoch"
+      elif (( now_epoch - last_change_epoch >= max_idle )); then
+        reason="max_idle"
+        break
+      fi
+    fi
+  done
+
+  if [[ -z "$reason" ]]; then
+    return 0
+  fi
+
+  # Trip: write sentinel + reason BEFORE killing the session so the pane
+  # epilogue's own sentinel write loses the race (mv -f is last writer,
+  # and we want 124 to win).
+  if [[ -n "$sentinel" ]]; then
+    ( printf '%s\n' "124" > "$sentinel.tmp" && mv -f "$sentinel.tmp" "$sentinel" ) 2>/dev/null || true
+    ( printf '%s\n' "$reason" > "$sentinel.reason.tmp" && mv -f "$sentinel.reason.tmp" "$sentinel.reason" ) 2>/dev/null || true
+  fi
+  if [[ -n "$on_exit_cmd" && -n "$sentinel" ]]; then
+    (
+      export ON_EXIT_CODE=124 ON_EXIT_NAME="$agent_name" ON_EXIT_REASON="$reason"
+      eval "$on_exit_cmd"
+    ) >> "$sentinel.hook.log" 2>&1 || true
+  fi
+  "$tmux_bin" kill-session -t "$tmux_session" 2>/dev/null || true
+  rm -f "$(agent_root_dir)/$agent_name/fuse.pid" 2>/dev/null || true
+  return 0
+}
+
+# Spawn the watcher as a detached background process. Records PID under
+# $TMUX_AGENT_DIR/<name>/fuse.pid so `stop` can kill it before tearing
+# down tmux.
+spawn_max_fuse_watcher() {
+  local agent_name="$1" tmux_session="$2" sentinel="$3" on_exit_cmd="$4"
+  local max_runtime="$5" max_idle="$6"
+  [[ -z "$max_runtime" && -z "$max_idle" ]] && return 0
+  local subdir
+  subdir="$(ensure_agent_dir "$agent_name")"
+  local pid_file="$subdir/fuse.pid"
+  nohup "$SELF" "$CLI" __fuse_watcher \
+    "$agent_name" "$tmux_session" "$sentinel" "$on_exit_cmd" \
+    "$max_runtime" "$max_idle" "$TMUX" \
+    >/dev/null 2>&1 </dev/null &
+  local watcher_pid=$!
+  disown 2>/dev/null || true
+  printf '%s\n' "$watcher_pid" > "$pid_file" 2>/dev/null || true
+}
+
+# Kill the watcher PID recorded by spawn_max_fuse_watcher, if any.
+kill_max_fuse_watcher() {
+  local agent_name="$1"
+  local pid_file
+  pid_file="$(agent_root_dir)/$agent_name/fuse.pid"
+  [[ -f "$pid_file" ]] || return 0
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file" 2>/dev/null || true
+}
+
+run_on_start_hook() {
+  # Fires the --on-start hook (issue #101a) after `tmux new-session` returns.
+  # Best-effort timing: pane is created but the CLI may not yet have rendered
+  # its first prompt. Hook runs in a detached subshell so wrapper return is
+  # not blocked. Non-zero hook exit is logged but never fails the agent.
+  #
+  # Hook log path mirrors the on-exit hook:
+  #   - <sentinel>.hook.log when --sentinel is set
+  #   - $TMUX_AGENT_DIR/<name>/hook.log otherwise
+  local agent_name="$1" agent_session="$2"
+  [[ -n "$on_start_cmd" ]] || return 0
+  local log_path
+  if [[ -n "$sentinel" ]]; then
+    log_path="$sentinel.hook.log"
+  else
+    ensure_agent_dir "$agent_name"
+    log_path="$(agent_root_dir)/$agent_name/hook.log"
+  fi
+  (
+    export TMUX_AGENT_NAME="$agent_name" TMUX_AGENT_SESSION="$agent_session"
+    {
+      printf '[on-start %s] %s\n' "$(transcript_iso_now)" "$agent_name"
+      # Isolate eval in its OWN subshell so `exit N` only kills the inner
+      # shell, allowing the exit-code line below to still be logged.
+      hook_code=0
+      ( eval "$on_start_cmd" ) || hook_code=$?
+      printf '[on-start exit] %s\n' "$hook_code"
+    } >> "$log_path" 2>&1
+  ) &
+}
+
+# --- Dry-run pre-flight checks (issue #110) -------------------------------
+# Verify the named start would succeed without launching tmux or the CLI.
+# Emits a JSON summary on stdout. Exit 0 if all checks pass, 2 if any
+# critical check fails. Warnings (e.g. transcript probe fallback) do not
+# fail the run.
+run_dry_run_checks() {
+  require_jq
+  local tool="$1" req_name="$2" directory="$3" exact_name="$4"
+  local sentinel="$5" on_exit_cmd="$6" transcript_path="$7"
+  local checks_json="[]"
+
+  add_check() {
+    local check_name="$1" check_status="$2" detail="$3"
+    checks_json="$("$JQ" -c -n --argjson cs "$checks_json" \
+      --arg name "$check_name" --arg status "$check_status" --arg detail "$detail" \
+      '$cs + [{name: $name, status: $status, detail: $detail}]')"
+  }
+
+  local ok=1
+  # workdir
+  if [[ -d "$directory" ]]; then
+    add_check "workdir_exists" "pass" "$directory"
+  else
+    add_check "workdir_exists" "fail" "directory not found: $directory"
+    ok=0
+  fi
+
+  # tmux binary
+  if [[ -x "$TMUX" ]] || command -v "$TMUX" >/dev/null 2>&1; then
+    add_check "tmux_binary" "pass" "$TMUX"
+  else
+    add_check "tmux_binary" "fail" "tmux not found at $TMUX"
+    ok=0
+  fi
+
+  # agent CLI binary — pick the correct env var based on tool
+  local cli_path="$CLI_BIN"
+  if [[ -n "$cli_path" ]] && ( [[ -x "$cli_path" ]] || command -v "$cli_path" >/dev/null 2>&1 ); then
+    add_check "agent_cli_binary" "pass" "$cli_path"
+  else
+    add_check "agent_cli_binary" "fail" "agent CLI not resolvable: $cli_path (tool=$tool)"
+    ok=0
+  fi
+
+  # session name conflict (only with --exact; non-exact appends a suffix)
+  local session_name
+  if (( exact_name )); then
+    session_name="$(session_for_name "$req_name")"
+    if "$TMUX" has-session -t "$session_name" 2>/dev/null; then
+      add_check "session_not_in_use" "fail" "session already exists: $session_name (would be killed by start)"
+      ok=0
+    else
+      add_check "session_not_in_use" "pass" "$session_name"
+    fi
+  else
+    add_check "session_not_in_use" "skip" "non-exact name appends random suffix"
+  fi
+
+  # sentinel
+  if [[ -n "$sentinel" ]]; then
+    if [[ "${sentinel:0:1}" != "/" ]]; then
+      add_check "sentinel_path" "fail" "--sentinel must be absolute: $sentinel"
+      ok=0
+    elif [[ -e "$sentinel" ]]; then
+      add_check "sentinel_path" "fail" "pre-existing: $sentinel (would block start)"
+      ok=0
+    else
+      local sentinel_parent="${sentinel:h}"
+      if [[ -d "$sentinel_parent" && -w "$sentinel_parent" ]]; then
+        add_check "sentinel_path" "pass" "$sentinel"
+      else
+        add_check "sentinel_path" "fail" "parent not writable: $sentinel_parent"
+        ok=0
+      fi
+    fi
+  else
+    add_check "sentinel_path" "skip" "no --sentinel"
+  fi
+
+  # on-exit hook requires sentinel
+  if [[ -n "$on_exit_cmd" ]]; then
+    if [[ -z "$sentinel" ]]; then
+      add_check "on_exit_pairing" "fail" "--on-exit requires --sentinel"
+      ok=0
+    else
+      add_check "on_exit_pairing" "pass" "hook = $on_exit_cmd"
+    fi
+  else
+    add_check "on_exit_pairing" "skip" "no --on-exit"
+  fi
+
+  # transcript — check parent dir is writable WITHOUT creating the file
+  if [[ -n "$transcript_path" ]]; then
+    if [[ "${transcript_path:0:1}" != "/" ]]; then
+      add_check "transcript_path" "fail" "--transcript must be absolute: $transcript_path"
+      ok=0
+    elif [[ -e "$transcript_path" ]]; then
+      add_check "transcript_path" "fail" "pre-existing: $transcript_path"
+      ok=0
+    else
+      local transcript_parent="${transcript_path:h}"
+      if [[ -d "$transcript_parent" && -w "$transcript_parent" ]]; then
+        add_check "transcript_path" "pass" "$transcript_path"
+      else
+        add_check "transcript_path" "fail" "parent not writable: $transcript_parent"
+        ok=0
+      fi
+    fi
+  else
+    add_check "transcript_path" "skip" "no --transcript"
+  fi
+
+  local ok_bool
+  if (( ok )); then ok_bool=true; else ok_bool=false; fi
+  "$JQ" -n --argjson checks "$checks_json" --argjson ok "$ok_bool" \
+    --arg tool "$tool" --arg name "$req_name" --arg directory "$directory" \
+    '{schema_version: 1, tool: $tool, name: $name, directory: $directory,
+      ok: $ok, checks: $checks}'
+  if (( ok )); then return 0; else return 2; fi
+}
+
+# --- Result-file convention helpers (issue #97) ---------------------------
+# Layout under $TMUX_AGENT_DIR (default $XDG_STATE_HOME/tmux-agent-tools):
+#   <dir>/<agent-name>/result.json
+# Wrapper exports TMUX_AGENT_NAME and TMUX_AGENT_RESULT into the pane so the
+# agent CLI can write its structured result without inventing a path.
+
+agent_root_dir() {
+  printf '%s' "${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}"
+}
+
+ensure_agent_dir() {
+  local name="$1"
+  local dir
+  dir="$(agent_root_dir)/$name"
+  mkdir -p "$dir"
+  printf '%s' "$dir"
+}
+
+# --- Managed fresh worktree (issue #187) ----------------------------------
+# Allocate a managed git worktree with:
+#   branch:  tmux-agent/<sanitized-name>-<uuid8>
+#   path:    $XDG_STATE_HOME/tmux-agent-tools/worktrees/<sanitized-name>-<uuid8>
+# Writes <path>/.tmux-agent-worktree/meta.json with schema_version: 1, and
+# records the path under the agent dir (legacy fresh-worktree marker and
+# machine-readable worktree.json). Caller passes: name tool source_repo.
+# Echoes the new worktree path on stdout. Logs a notice on stderr.
+setup_fresh_worktree() {
+  local agent_name="$1" tool="$2" source_repo="$3"
+  local sanitized="${agent_name//[^A-Za-z0-9._-]/_}"
+  local uuid
+  uuid="$(LC_ALL=C /usr/bin/od -An -N4 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+  local branch="tmux-agent/${sanitized}-${uuid}"
+  local root="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/worktrees"
+  mkdir -p "$root"
+  local wt_path="$root/${sanitized}-${uuid}"
+  local base_ref
+  base_ref="$( cd "$source_repo" && git rev-parse --abbrev-ref HEAD 2>/dev/null )"
+  if [[ -z "$base_ref" || "$base_ref" == "HEAD" ]]; then
+    base_ref="$( cd "$source_repo" && git rev-parse --short HEAD 2>/dev/null )"
+  fi
+  if ! ( cd "$source_repo" && git worktree add -b "$branch" "$wt_path" >/dev/null 2>&1 ); then
+    echo "git worktree add failed" >&2
+    return 1
+  fi
+  local policy="${TMUX_AGENT_WORKTREE_POLICY:-no-change-cleanup}"
+  case "$policy" in
+    no-change-cleanup|has-change-keep|always-keep) ;;
+    *) policy="no-change-cleanup" ;;
+  esac
+  local created_at
+  created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local meta_dir="$wt_path/.tmux-agent-worktree"
+  mkdir -p "$meta_dir"
+  # Exclude our managed metadata from git status so dirty detection reflects
+  # only user-authored changes.
+  local exclude_dir
+  exclude_dir="$( cd "$wt_path" && git rev-parse --git-path info 2>/dev/null )"
+  if [[ -n "$exclude_dir" ]]; then
+    ( cd "$wt_path" && mkdir -p "$exclude_dir" && \
+      printf '%s\n' '/.tmux-agent-worktree/' >> "$exclude_dir/exclude" ) 2>/dev/null || true
+  fi
+  local abs_repo
+  abs_repo="$(cd "$source_repo" && pwd)"
+  "$JQ" -n \
+    --argjson schema_version 1 \
+    --arg source_repo "$abs_repo" \
+    --arg base_ref "$base_ref" \
+    --arg agent_name "$agent_name" \
+    --arg tool "$tool" \
+    --arg created_at "$created_at" \
+    --arg wt_path "$wt_path" \
+    --arg branch "$branch" \
+    --arg cleanup_policy "$policy" \
+    '{schema_version:$schema_version, source_repo:$source_repo, base_ref:$base_ref,
+      agent_name:$agent_name, tool:$tool, created_at:$created_at, path:$wt_path,
+      branch:$branch, cleanup_policy:$cleanup_policy}' > "$meta_dir/meta.json"
+  ensure_agent_dir "$agent_name" >/dev/null
+  local agent_dir
+  agent_dir="$(agent_root_dir)/$agent_name"
+  ( printf '%s\n' "$wt_path" > "$agent_dir/fresh-worktree" ) 2>/dev/null || true
+  "$JQ" -n \
+    --argjson schema_version 1 \
+    --arg wt_path "$wt_path" \
+    --arg branch "$branch" \
+    --arg source_repo "$abs_repo" \
+    --arg cleanup_policy "$policy" \
+    '{schema_version:$schema_version, path:$wt_path, branch:$branch,
+      source_repo:$source_repo, cleanup_policy:$cleanup_policy}' \
+    > "$agent_dir/worktree.json" 2>/dev/null || true
+  echo "fresh worktree: $wt_path" >&2
+  printf '%s' "$wt_path"
+}
+
+# --- Advisory send lock (issue #102) --------------------------------------
+# Serialize concurrent pane-mutating calls (`send`, `send-wait-literal`) on
+# the same agent so two callers cannot interleave keystrokes into the same
+# tmux pane.
+#
+# Lock file: $TMUX_AGENT_DIR/<name>/send.lock
+# Prefers flock(1) (Linux/coreutils). On macOS without flock, falls back to
+# mkdir-based locking with PID stamping for stale-holder recovery — design
+# in docs/design-issue-102-advisory-lock.md.
+#
+# The fallback recovers from `kill -9`, OOM, or reboot by probing the
+# holder PID with `kill -0`. The trap inside the subshell is intentionally
+# scoped to the subshell so it does NOT clobber the caller's process-wide
+# trap (partner review on the original sketch).
+
+SEND_LOCK_DEFAULT_TIMEOUT=30
+
+send_lock_around() {
+  # Usage: send_lock_around <agent_name> <timeout_seconds> <cmd> [args...]
+  # Returns 75 on timeout (EX_TEMPFAIL) with stderr message, else inner rc.
+  local agent_name="$1"
+  local timeout_seconds="$2"
+  shift 2
+  local subdir
+  subdir="$(ensure_agent_dir "$agent_name")"
+  local lock_file="$subdir/send.lock"
+
+  if command -v flock >/dev/null 2>&1; then
+    : > "$lock_file" 2>/dev/null || true
+    (
+      flock -w "$timeout_seconds" -x 9 || {
+        echo "lock contended on $agent_name after ${timeout_seconds}s" >&2
+        exit 75
+      }
+      "$@"
+    ) 9>"$lock_file"
+    return $?
+  fi
+
+  # mkdir fallback with PID-stamped stale-holder recovery.
+  zmodload zsh/datetime 2>/dev/null || true
+  local lock_dir="$lock_file.d"
+  local now_epoch end
+  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  end=$(( now_epoch + timeout_seconds ))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      # Holder died without releasing — reclaim. rm -rf because the pid
+      # file lives inside the lock dir; rmdir alone would fail.
+      rm -rf "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    if [[ -z "$holder_pid" ]]; then
+      sleep 0.2
+      [[ -f "$lock_dir/pid" ]] || { rm -rf "$lock_dir" 2>/dev/null || true; continue; }
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if (( now_epoch >= end )); then
+      echo "lock contended on $agent_name after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
+      return 75
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # Subshell-scoped trap: do NOT use a process-wide trap here, it would
+  # overwrite the caller's trap. rm -rf because the pid file lives inside
+  # the lock dir; rmdir alone would fail and leak the lock.
+  (
+    trap "rm -rf '$lock_dir' 2>/dev/null || true" EXIT INT TERM
+    "$@"
+  )
+  local rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  return $rc
+}
+
+# --- Single-agent transcript helpers (issue #100) -------------------------
+# A transcript captures wrapper-level events (start / send / capture / stop)
+# as JSONL. Path is configured at `start --transcript <abs>` and remembered
+# for subsequent subcommands via $TMUX_AGENT_DIR/<name>/transcript-path.
+
+transcript_path_for() {
+  # IMPORTANT: zsh aliases lowercase `path` to PATH; never use `local
+  # path=` in any helper here. Use `target` or another name.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/transcript-path"
+  [[ -f "$marker" ]] && cat "$marker" || true
+}
+
+transcript_record_path() {
+  # NOTE: parameter named `target` not `path` — zsh ties lowercase `path`
+  # to PATH, and `local path=...` would clobber PATH for the rest of the
+  # function, breaking every external command lookup that follows.
+  local name="$1" target="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  printf '%s\n' "$target" > "$subdir/transcript-path"
+}
+
+transcript_iso_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+transcript_truncate_record() {
+  # Persist per-agent text-truncate threshold (#140). Stored as a single
+  # decimal byte-count under $TMUX_AGENT_DIR/<name>/transcript-truncate.
+  local name="$1" bytes="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( printf '%s\n' "$bytes" > "$subdir/transcript-truncate" ) 2>/dev/null || true
+}
+
+transcript_truncate_threshold() {
+  # Returns the persisted threshold, or empty when unset.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/transcript-truncate"
+  [[ -f "$marker" ]] && cat "$marker" || true
+}
+
+transcript_truncate_text() {
+  # Apply the #140 truncate policy to a send-event text payload.
+  # Echoes a JSON object with `text`, `text_sha256`, `text_bytes`. When the
+  # threshold is unset or the text fits, `text` is the verbatim payload
+  # and the hash/bytes fields are null.
+  local name="$1" text="$2"
+  local threshold
+  threshold="$(transcript_truncate_threshold "$name")"
+  local bytes=${#text}
+  if [[ -n "$threshold" ]] && (( threshold > 0 )) && (( bytes > threshold )); then
+    local sha
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha="$(printf '%s' "$text" | sha256sum | awk '{print $1}')"
+    else
+      sha="$(printf '%s' "$text" | shasum -a 256 | awk '{print $1}')"
+    fi
+    "$JQ" -c -n --arg text "[truncated, original $bytes bytes]" \
+      --arg sha "$sha" --argjson bytes "$bytes" \
+      '{text: $text, text_sha256: $sha, text_bytes: $bytes}'
+  else
+    "$JQ" -c -n --arg text "$text" --argjson bytes "$bytes" \
+      '{text: $text, text_sha256: null, text_bytes: $bytes}'
+  fi
+}
+
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+transcript_emit_wait_event() {
+  # Emit a single wait_* event into the transcript when one is configured
+  # (issue #141). Caller passes the wrapper-specific wait kind and the
+  # outcome reason. needle/timeout are best-effort metadata.
+  local name="$1" event_name="$2" outcome="$3" needle="${4:-}" timeout="${5:-}"
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  [[ -n "$transcript_path" ]] || return 0
+  local line
+  line="$("$JQ" -c -n \
+    --arg event "$event_name" --arg name "$name" --arg outcome "$outcome" \
+    --arg needle "$needle" --arg timeout "$timeout" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, event: $event, name: $name, outcome: $outcome,
+      needle: (if $needle == "" then null else $needle end),
+      timeout_seconds: (if $timeout == "" then null else ($timeout | tonumber) end),
+      at: $at}')"
+  transcript_append "$transcript_path" "$line"
+}
+
+result_schema_record() {
+  # Persist per-agent --result-schema path (#125) under
+  # $TMUX_AGENT_DIR/<name>/result-schema-path. Best-effort write.
+  local name="$1" target="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( printf '%s\n' "$target" > "$subdir/result-schema-path" ) 2>/dev/null || true
+}
+
+result_schema_path_for() {
+  # Returns the configured schema path or empty if none.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/result-schema-path"
+  [[ -f "$marker" ]] && cat "$marker" || true
+}
+
+result_default_schema_path() {
+  local candidates=(
+    "${SELF:h:h:h:h}/schemas/result-status-summary.schema.json"
+    "${SELF:h:h}/schemas/result-status-summary.schema.json"
+    "${SELF:h:h}/share/tmux-agent-tools/schemas/result-status-summary.schema.json"
+    "${SELF:h:h}/opt/tmux-agent-tools/schemas/result-status-summary.schema.json"
+    "${SELF:h}/../share/tmux-agent-tools/schemas/result-status-summary.schema.json"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      print -r -- "${candidate:A}"
+      return 0
+    fi
+  done
+  print -r -- "${candidates[1]}"
+}
+
+result_validate_lightweight() {
+  # Lightweight v1 validator (#125): checks top-level type + required +
+  # additionalProperties:false. Emits a single JSON line.
+  # Args: $1 result_path, $2 schema_path
+  local result_path="$1" schema_path="$2"
+  require_jq
+
+  if [[ ! -f "$schema_path" ]]; then
+    "$JQ" -n --arg p "$schema_path" \
+      '{schema_version: 1, present: false, valid: false,
+        errors: [{path: ".", message: ("schema file not found: " + $p)}], body: null}'
+    return 1
+  fi
+  local schema
+  schema="$(cat "$schema_path")"
+
+  if [[ ! -f "$result_path" ]]; then
+    "$JQ" -n '{schema_version: 1, present: false, valid: false, errors: [], body: null}'
+    return 0
+  fi
+
+  # Parse result. If parse fails, report parse_error.
+  local body
+  body="$("$JQ" '.' "$result_path" 2>/dev/null)" || {
+    "$JQ" -n --arg raw "$(cat "$result_path")" \
+      '{schema_version: 1, present: true, valid: false,
+        errors: [{path: ".", message: "parse_error: result is not valid JSON"}],
+        body: $raw}'
+    return 2
+  }
+
+  # Run v1 validator in one jq invocation.
+  "$JQ" -n --argjson schema "$schema" --argjson body "$body" '
+    def v1_validate($schema; $body):
+      # type check
+      ( $schema.type as $t
+        | if $t == "object" and ($body | type) != "object"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "array" and ($body | type) != "array"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "string" and ($body | type) != "string"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "integer" and ($body | type) != "number"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "number" and ($body | type) != "number"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          elif $t == "boolean" and ($body | type) != "boolean"
+          then [{path: ".", message: ("type mismatch: expected " + $t + ", got " + ($body | type))}]
+          else [] end
+      ) as $type_errors
+      | # required keys (object only)
+        ( if ($schema.type // "object") == "object" and ($body | type) == "object"
+          then ($schema.required // [])
+               | map(select(. as $k | ($body | has($k)) | not))
+               | map({path: ".", message: ("missing required key: " + .)})
+          else [] end
+        ) as $required_errors
+      | # additionalProperties:false (object only)
+        ( if $schema.additionalProperties == false
+             and ($body | type) == "object"
+          then ($body | keys) - (($schema.properties // {}) | keys)
+               | map({path: ., message: "additional property not allowed"})
+          else [] end
+        ) as $extra_errors
+      | # Wave 2 light validation for optional result contract blocks.
+        ( if ($body | type) == "object" and ($body | has("verdict"))
+          then
+            (if ($body.verdict | type) != "object"
+             then [{path: "verdict", message: "type mismatch: expected object"}]
+             else
+               ((if (($body.verdict.verdict // null) | IN("ACCEPT", "BLOCK", "ACCEPT_WITH_CHANGES")) then []
+                 else [{path: "verdict.verdict", message: "invalid verdict"}] end)
+                + (if ($body.verdict.blockers | type) == "array" then []
+                   else [{path: "verdict.blockers", message: "type mismatch: expected array"}] end))
+             end)
+          else [] end
+        ) as $verdict_errors
+      | ( if ($body | type) == "object" and ($body | has("decision"))
+          then
+            (if ($body.decision | type) != "object"
+             then [{path: "decision", message: "type mismatch: expected object"}]
+             else
+               (if (($body.decision.decision_by // null) | IN("agent", "user", "owner", "delegate")) then []
+                else [{path: "decision.decision_by", message: "invalid decision_by"}] end)
+             end)
+          else [] end
+        ) as $decision_errors
+      | $type_errors + $required_errors + $extra_errors + $verdict_errors + $decision_errors;
+    ($body | tojson) as $body_json
+    | v1_validate($schema; $body) as $errs
+    | {schema_version: 1, present: true, valid: ($errs | length == 0),
+       errors: $errs, body: $body}'
+
+  # Exit code: 0 if valid, 2 if invalid.
+  local valid
+  valid="$("$JQ" -n --argjson schema "$schema" --argjson body "$body" '
+    def v1_validate($schema; $body):
+      ( $schema.type as $t
+        | if $t == "object" and ($body | type) != "object" then [1]
+          elif $t == "array" and ($body | type) != "array" then [1]
+          else [] end
+      ) as $type_errors
+      | ( if ($schema.type // "object") == "object" and ($body | type) == "object"
+          then ($schema.required // [])
+               | map(select(. as $k | ($body | has($k)) | not))
+          else [] end
+        ) as $required_errors
+      | ( if $schema.additionalProperties == false
+             and ($body | type) == "object"
+          then ($body | keys) - (($schema.properties // {}) | keys)
+          else [] end
+        ) as $extra_errors
+      | ( if ($body | type) == "object" and ($body | has("verdict"))
+          then
+            (if ($body.verdict | type) != "object" then [1]
+             else
+               ((if (($body.verdict.verdict // null) | IN("ACCEPT", "BLOCK", "ACCEPT_WITH_CHANGES")) then [] else [1] end)
+                + (if ($body.verdict.blockers | type) == "array" then [] else [1] end))
+             end)
+          else [] end
+        ) as $verdict_errors
+      | ( if ($body | type) == "object" and ($body | has("decision"))
+          then
+            (if ($body.decision | type) != "object" then [1]
+             elif (($body.decision.decision_by // null) | IN("agent", "user", "owner", "delegate")) then []
+             else [1] end)
+          else [] end
+        ) as $decision_errors
+      | ($type_errors + $required_errors + $extra_errors + $verdict_errors + $decision_errors | length == 0);
+    v1_validate($schema; $body)
+  ')"
+  [[ "$valid" == "true" ]] && return 0 || return 2
+}
+
+result_init_session() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux result init <name>" >&2
+    exit 2
+  fi
+  require_jq
+  local subdir result_path
+  subdir="$(ensure_agent_dir "$name")"
+  result_path="$subdir/result.json"
+  "$JQ" -n '{schema_version: 1, status: "ok", summary: "", artifacts: [], errors: []}' > "$result_path"
+  printf '%s\n' "$result_path"
+}
+
+result_path_session() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux result --path <name>" >&2
+    exit 2
+  fi
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  printf '%s\n' "$subdir/result.json"
+}
+
+result_validate_session() {
+  local output_json=0
+  local name=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      --*)
+        echo "Unknown result validate flag: $1" >&2
+        exit 2
+        ;;
+      *)
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$name" || $# -gt 0 ]]; then
+    echo "Usage: agent-tmux result validate <name> --json" >&2
+    exit 2
+  fi
+  if (( ! output_json )); then
+    echo "result validate requires --json" >&2
+    exit 2
+  fi
+  require_jq
+  local result_path schema_path
+  result_path="$(agent_root_dir)/$name/result.json"
+  schema_path="$(result_schema_path_for "$name")"
+  [[ -n "$schema_path" ]] || schema_path="$(result_default_schema_path)"
+  if [[ ! -f "$result_path" ]]; then
+    "$JQ" -n --arg path "$result_path" \
+      '{schema_version: 1, path: $path, present: false, valid: false,
+        errors: [{path: ".", message: "result file not found"}], body: null}'
+    return 1
+  fi
+  result_validate_lightweight "$result_path" "$schema_path"
+}
+
+result_wait_required_session() {
+  local fields="" wait_seconds=0 output_json=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --fields)
+        if (( $# < 2 )); then
+          echo "--fields requires a comma-separated value" >&2
+          exit 2
+        fi
+        fields="$2"
+        shift 2
+        ;;
+      --wait)
+        if (( $# < 2 )); then
+          echo "--wait requires a value (seconds)" >&2
+          exit 2
+        fi
+        wait_seconds="$2"
+        shift 2
+        if [[ ! "$wait_seconds" =~ '^[0-9]+$' ]]; then
+          echo "--wait must be a non-negative integer" >&2
+          exit 2
+        fi
+        ;;
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      --*)
+        echo "Unknown result wait-required flag: $1" >&2
+        exit 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  local name="${1:-}"
+  if [[ -z "$name" || -z "$fields" || "$output_json" -ne 1 ]]; then
+    echo "Usage: agent-tmux result wait-required <name> --fields a,b --wait N --json" >&2
+    exit 2
+  fi
+  require_jq
+  local result_path deadline out missing
+  result_path="$(agent_root_dir)/$name/result.json"
+  deadline=$((SECONDS + wait_seconds))
+  while true; do
+    if [[ -f "$result_path" ]] && "$JQ" -e . "$result_path" >/dev/null 2>&1; then
+      missing="$("$JQ" -r --arg fields "$fields" '
+        ($fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $fields
+        | . as $body
+        | [ $fields[]
+            | select((. as $f
+              | ($body | getpath($f | split("."))? // null) as $v
+              | ($v == null or $v == "" or (($v | type) == "array" and ($v | length) == 0)
+                 or (($v | type) == "object" and ($v | length) == 0)))) ]
+        | join(",")
+      ' "$result_path")"
+      if [[ -z "$missing" ]]; then
+        out="$(result_session --json "$name")"
+        printf '%s\n' "$out"
+        return 0
+      fi
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep 1
+  done
+  local present=false
+  [[ -f "$result_path" ]] && present=true
+  "$JQ" -n --arg path "$result_path" --arg missing "$missing" --argjson present "$present" \
+    '{schema_version: 1, path: $path, present: $present,
+      valid: false, timeout: true, missing_fields: (if $missing == "" then [] else ($missing | split(",")) end)}'
+  return 1
+}
+
+tag_record() {
+  # Persist --tag key=value pairs (#124) under $TMUX_AGENT_DIR/<name>/tags.json.
+  # Args: $1 name, $2 raw "k=v" string. Validates k matches [A-Za-z0-9_.-]+.
+  # Multiple values for the same key are kept (last write wins per repeat).
+  local name="$1" kv="$2"
+  if [[ "$kv" != *=* ]]; then
+    echo "--tag must be key=value: $kv" >&2
+    return 2
+  fi
+  local k="${kv%%=*}" v="${kv#*=}"
+  if ! [[ "$k" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "--tag key must match [A-Za-z0-9_.-]+: $k" >&2
+    return 2
+  fi
+  require_jq
+  local subdir tags_file existing
+  subdir="$(ensure_agent_dir "$name")"
+  tags_file="$subdir/tags.json"
+  existing='{}'
+  if [[ -f "$tags_file" ]]; then
+    existing="$(cat "$tags_file")"
+  fi
+  local merged
+  merged="$("$JQ" -c -n --arg k "$k" --arg v "$v" --argjson cur "$existing" \
+    '$cur + {($k): $v}')"
+  ( printf '%s\n' "$merged" > "$tags_file" ) 2>/dev/null || true
+}
+
+tag_list_json() {
+  # Emit the persisted tags as a JSON object, or {} if absent.
+  local name="$1"
+  local tags_file="$(agent_root_dir)/$name/tags.json"
+  if [[ -f "$tags_file" ]]; then
+    cat "$tags_file"
+  else
+    printf '{}'
+  fi
+}
+
+usage_record_path() {
+  # Persist the per-agent usage stream path (#103 v1 skeleton).
+  local name="$1" target="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( printf '%s\n' "$target" > "$subdir/usage-path" ) 2>/dev/null || true
+}
+
+usage_path_for() {
+  # Returns the configured usage path, or the default fallback.
+  local name="$1"
+  local marker="$(agent_root_dir)/$name/usage-path"
+  if [[ -f "$marker" ]]; then
+    cat "$marker"
+  else
+    printf '%s' "$(agent_root_dir)/$name/usage.jsonl"
+  fi
+}
+
+usage_init_event() {
+  # Write a single usage_init line so consumers can detect the stream
+  # exists even before any real usage data lands (v1 skeleton).
+  local name="$1"
+  local usage_target
+  usage_target="$(usage_path_for "$name")"
+  require_jq
+  local line
+  line="$("$JQ" -c -n --arg event usage_init --arg name "$name" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, event: $event, name: $name, at: $at}')"
+  ( printf '%s\n' "$line" >> "$usage_target" ) 2>/dev/null || true
+}
+
+usage_aggregate_json() {
+  # Read usage.jsonl, fold the well-known token / cost fields. Missing
+  # fields are returned as null with a note documenting the gap. v1
+  # never reads real CLI usage data — that's deferred per design.
+  local name="$1"
+  local usage_target
+  usage_target="$(usage_path_for "$name")"
+  require_jq
+  if [[ ! -f "$usage_target" ]]; then
+    "$JQ" -n --arg name "$name" \
+      '{schema_version: 1, name: $name, input_tokens: null,
+        output_tokens: null, cache_read_tokens: null, cache_write_tokens: null,
+        cost_usd: null, turns: 0,
+        note: ["usage.jsonl not present — capture mechanism deferred per #103 v1"]}'
+    return 0
+  fi
+  "$JQ" -cs --arg name "$name" '
+    {schema_version: 1, name: $name,
+     input_tokens:        ((map(.input_tokens // 0)        | add) // null),
+     output_tokens:       ((map(.output_tokens // 0)       | add) // null),
+     cache_read_tokens:   ((map(.cache_read_tokens // 0)   | add) // null),
+     cache_write_tokens:  ((map(.cache_write_tokens // 0)  | add) // null),
+     cost_usd:            (map(.cost_usd // 0) | (if length > 0 and any(. > 0) then add else null end)),
+     turns: (map(select(.event == "turn_usage")) | length),
+     note: (if any(.event == "turn_usage") then [] else ["no turn_usage events yet — CLI stream tee mechanism deferred per #103 v1"] end)}' "$usage_target"
+}
+
+checkpoint_session() {
+  # Package agent state + a pane snapshot into a tarball (#111 v1).
+  # Args: $1 name, $2 output tarball path (absolute).
+  local name="${1:-}" out="${2:-}"
+  if [[ -z "$name" || -z "$out" ]]; then
+    echo "Usage: $SELF $CLI checkpoint <name> <output.tar.gz>" >&2
+    return 2
+  fi
+  if [[ "${out:0:1}" != "/" ]]; then
+    echo "checkpoint output must be an absolute path: $out" >&2
+    return 2
+  fi
+  local subdir="$(agent_root_dir)/$name"
+  if [[ ! -d "$subdir" ]]; then
+    echo "No agent state for: $name" >&2
+    return 1
+  fi
+  # Capture pane scrollback if the session still exists.
+  local session
+  session="$(session_for_name "$name")"
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" capture-pane -J -t "$session" -p -S -2000 > "$subdir/pane-snapshot.txt" 2>/dev/null || true
+  fi
+  # Pack the per-agent state dir into the tarball.
+  tar -czf "$out" -C "$(agent_root_dir)" "$name" 2>/dev/null || {
+    echo "checkpoint: tar failed" >&2
+    return 1
+  }
+  echo "checkpoint written: $out"
+  return 0
+}
+
+restore_session() {
+  # Read-only restore: extract a checkpoint tarball into a scratch dir
+  # and print its contents (#111 v1). Does NOT spawn a new tmux session.
+  local input="${1:-}"
+  if [[ -z "$input" ]]; then
+    echo "Usage: $SELF $CLI restore <input.tar.gz>" >&2
+    return 2
+  fi
+  if [[ ! -f "$input" ]]; then
+    echo "Not a file: $input" >&2
+    return 1
+  fi
+  local extract_dir
+  extract_dir="$(mktemp -d -t tmux-agent-restore.XXXXXX)"
+  tar -xzf "$input" -C "$extract_dir" 2>/dev/null || {
+    echo "restore: tar extract failed" >&2
+    return 1
+  }
+  echo "restored to: $extract_dir"
+  echo "contents:"
+  ls -la "$extract_dir"/*
+  return 0
+}
+
+audit_log_chain_key() {
+  # Derive a per-host HMAC chain key. Linux: /etc/machine-id. macOS:
+  # IOPlatformUUID. Fallback: hash of $HOME (per-user). All values are
+  # operator-derivable so the log is verifiable on the same host.
+  if [[ -f /etc/machine-id ]]; then
+    cat /etc/machine-id
+  elif command -v ioreg >/dev/null 2>&1; then
+    ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+      | awk -F\" '/IOPlatformUUID/{print $4; exit}' || echo "$HOME"
+  else
+    echo "$HOME"
+  fi
+}
+
+audit_log_lock_around() {
+  # Serialize concurrent audit_log_append + rotate on the same log file.
+  # Without this, two agents can race between size-check, mv, and the
+  # tail-1 prev_hash read — yielding duplicate audit.rotation records or
+  # a prev_chain_hash sourced from the rotated-out file, breaking verify.
+  local log_path="$1" timeout_seconds="${2:-30}"
+  shift 2
+  local lock_file="$log_path.lock"
+  mkdir -p "$(dirname "$lock_file")" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    : > "$lock_file" 2>/dev/null || true
+    (
+      flock -w "$timeout_seconds" -x 9 || exit 75
+      "$@"
+    ) 9>"$lock_file"
+    return $?
+  fi
+  zmodload zsh/datetime 2>/dev/null || true
+  local lock_dir="$lock_file.d"
+  local now_epoch end
+  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  end=$(( now_epoch + timeout_seconds ))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      rm -rf "$lock_dir" 2>/dev/null || true; continue
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    (( now_epoch >= end )) && return 75
+    sleep 0.05
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # Run "$@" in the current shell (NOT a subshell): wrapping in `( ... )`
+  # with an EXIT trap proved racy under stress.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lock_dir' 2>/dev/null || true" INT TERM
+  "$@"
+  local rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  trap - INT TERM
+  return $rc
+}
+
+_audit_log_append_locked() {
+  local event_json="$1" audit_target="$2"
+  if [[ -f "$audit_target" ]]; then
+    local _max="${TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES:-10485760}"
+    local _sz
+    if stat -f%z "$audit_target" >/dev/null 2>&1; then
+      _sz="$(stat -f%z "$audit_target")"
+    else
+      _sz="$(stat -c%s "$audit_target" 2>/dev/null || echo 0)"
+    fi
+    if (( _sz >= _max )); then
+      local _tool_dir _audit_bin
+      _tool_dir="$(dirname "$SELF")"
+      _audit_bin="$_tool_dir/tmux-agent-audit"
+      # Already inside the lock — invoke the rotate routine in-process
+      # via TMUX_AGENT_AUDIT_NO_LOCK so it does not re-acquire.
+      if [[ -x "$_audit_bin" ]]; then
+        TMUX_AGENT_AUDIT_NO_LOCK=1 "$_audit_bin" rotate --log "$audit_target" --force >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+  local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  if [[ -f "$audit_target" ]]; then
+    prev_hash="$(tail -1 "$audit_target" 2>/dev/null | "$JQ" -r .chain_hash 2>/dev/null || echo "$prev_hash")"
+    [[ -z "$prev_hash" || "$prev_hash" == "null" ]] && prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  fi
+  local chain_key
+  chain_key="$(audit_log_chain_key)"
+  local with_meta
+  with_meta="$("$JQ" -c -n --argjson e "$event_json" --arg pv "$prev_hash" \
+    --arg at "$(transcript_iso_now)" --arg tenant "${TMUX_AGENT_TOOLS_TENANT:-}" \
+    '$e
+     | .event = (if (.event|tostring|contains(".")) then .event else "wrapper." + (.event|tostring) end)
+     | . + {prev_chain_hash: $pv, at: $at, schema_version: 1}
+     | (if $tenant != "" then . + {tenant: $tenant} else . end)')"
+  local sha_cmd
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha_cmd="sha256sum"
+  else
+    sha_cmd="shasum -a 256"
+  fi
+  local new_hash
+  new_hash="$(printf '%s%s%s' "$chain_key" "$prev_hash" "$with_meta" | eval "$sha_cmd" | awk '{print $1}')"
+  local final_line
+  final_line="$("$JQ" -c -n --argjson e "$with_meta" --arg h "$new_hash" \
+    '$e + {chain_hash: $h}')"
+  ( printf '%s\n' "$final_line" >> "$audit_target" ) 2>/dev/null || true
+}
+
+audit_log_append() {
+  # Append a single JSONL event to TMUX_AGENT_TOOLS_AUDIT_LOG (#119, #188).
+  # Chains via SHA-256 of (prev_hash || line). No-op when env unset.
+  # Holds an advisory lock on <log>.lock around size-check + rotate +
+  # prev_hash read + append so concurrent agents cannot break the chain.
+  local event_json="$1"
+  local audit_target="${TMUX_AGENT_TOOLS_AUDIT_LOG:-}"
+  [[ -z "$audit_target" ]] && return 0
+  require_jq
+  audit_log_lock_around "$audit_target" 30 _audit_log_append_locked "$event_json" "$audit_target"
+}
+
+audit_log_verify() {
+  # Walk the audit log, re-derive each chain_hash, report mismatches.
+  local audit_target="${1:-}"
+  if [[ -z "$audit_target" || ! -f "$audit_target" ]]; then
+    echo "Usage: $SELF $CLI audit-verify <audit.jsonl>" >&2
+    return 2
+  fi
+  require_jq
+  local chain_key sha_cmd
+  chain_key="$(audit_log_chain_key)"
+  if command -v sha256sum >/dev/null 2>&1; then sha_cmd="sha256sum"; else sha_cmd="shasum -a 256"; fi
+  local expected_prev="0000000000000000000000000000000000000000000000000000000000000000"
+  local lineno=0 bad=0
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    local pv hv stripped recomputed
+    pv="$(printf '%s' "$line" | "$JQ" -r .prev_chain_hash)"
+    hv="$(printf '%s' "$line" | "$JQ" -r .chain_hash)"
+    stripped="$(printf '%s' "$line" | "$JQ" -c 'del(.chain_hash)')"
+    recomputed="$(printf '%s%s%s' "$chain_key" "$expected_prev" "$stripped" | eval "$sha_cmd" | awk '{print $1}')"
+    if [[ "$pv" != "$expected_prev" ]]; then
+      echo "line $lineno: prev_chain_hash mismatch (expected $expected_prev, got $pv)" >&2
+      bad=$((bad + 1))
+    elif [[ "$recomputed" != "$hv" ]]; then
+      echo "line $lineno: chain_hash mismatch (expected $recomputed, got $hv)" >&2
+      bad=$((bad + 1))
+    fi
+    expected_prev="$hv"
+  done < "$audit_target"
+  if (( bad == 0 )); then
+    "$JQ" -n --arg path "$audit_target" --argjson lines "$lineno" \
+      '{schema_version: 1, audit_log: $path, lines: $lines, ok: true}'
+    return 0
+  else
+    "$JQ" -n --arg path "$audit_target" --argjson lines "$lineno" --argjson bad "$bad" \
+      '{schema_version: 1, audit_log: $path, lines: $lines, bad_lines: $bad, ok: false}'
+    return 2
+  fi
+}
+
+# --- status --json liveness helpers (issue #98) ----------------------------
+
+record_started_at() {
+  local name="$1"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  ( date -u +%Y-%m-%dT%H:%M:%SZ > "$subdir/started_at" ) 2>/dev/null || true
+}
+
+read_started_at() {
+  local name="$1"
+  local file="$(agent_root_dir)/$name/started_at"
+  [[ -f "$file" ]] && cat "$file" || true
+}
+
+marker_seen_add() {
+  local name="$1" needle="$2"
+  [[ -z "$needle" ]] && return 0
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local file="$subdir/marker_seen"
+  if [[ -f "$file" ]] && grep -Fxq "$needle" "$file" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$needle" >> "$file"
+  if [[ -f "$file" ]] && (( $(wc -l < "$file") > 100 )); then
+    tail -n 100 "$file" > "$file.tmp" && mv -f "$file.tmp" "$file"
+  fi
+}
+
+marker_seen_list_json() {
+  # Single-jq form (gemini-code-assist on PR #142): `-Rs` slurps the file
+  # as a string, then split on newline and drop empty entries.
+  local name="$1"
+  local file="$(agent_root_dir)/$name/marker_seen"
+  if [[ -f "$file" ]]; then
+    "$JQ" -Rs 'split("\n") | map(select(length > 0))' "$file"
+  else
+    printf '[]'
+  fi
+}
+
+update_pane_hash() {
+  local name="$1" pane_text="$2"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local hash_file="$subdir/pane-hash"
+  # Prefer sha256sum (GNU coreutils — ubiquitous on Linux); fall back to
+  # shasum (Perl-based, default on macOS). gemini-code-assist on PR #142
+  # caught that minimal Linux distros may ship without Perl.
+  local new_hash
+  if command -v sha256sum >/dev/null 2>&1; then
+    new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
+  else
+    new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+  fi
+  local now_iso
+  now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local stored_hash="" stored_at=""
+  if [[ -f "$hash_file" ]]; then
+    stored_hash="$(awk '{print $1}' "$hash_file")"
+    stored_at="$(awk '{print $2}' "$hash_file")"
+  fi
+  if [[ "$new_hash" != "$stored_hash" ]]; then
+    # #144: degrade silently — status --json must remain readable even
+    # if the hash file cannot be written.
+    # Subshell isolates the shell's own redirect-open error, which
+    # `2>/dev/null` on the printf line alone does NOT catch in zsh.
+    if ( printf '%s %s\n' "$new_hash" "$now_iso" > "$hash_file" ) 2>/dev/null; then
+      stored_at="$now_iso"
+    fi
+  fi
+  printf '%s' "$stored_at"
+}
+
+iso_epoch_diff_seconds() {
+  local iso="$1"
+  [[ -z "$iso" ]] && { printf '%s' 0; return 0; }
+  local now=$(date -u +%s)
+  local then
+  if [[ "$(uname)" == "Darwin" ]]; then
+    then="$(date -u -j -f %Y-%m-%dT%H:%M:%SZ "$iso" +%s 2>/dev/null || echo "$now")"
+  else
+    then="$(date -u -d "$iso" +%s 2>/dev/null || echo "$now")"
+  fi
+  printf '%s' $((now - then))
+}
+
+transcript_append() {
+  # NOTE: parameter is `target` (not `path`) — see transcript_record_path
+  # for the zsh PATH/path tied-pair gotcha.
+  local target="$1" line="$2"
+  [[ -z "$target" ]] && return 0
+  line="$(secret_redact_apply "$line")"
+  printf '%s\n' "$line" >> "$target" 2>/dev/null || true
+}
+
+# --- Secret URI backends + redaction (#189) ------------------------------
+# Resolve a `--secret KEY=URI` URI to its plaintext value. Supported URIs:
+#   file:<path>                    read entire file
+#   <path>                         bare path = file: (backcompat with #116)
+#   env-file:<path>                dotenv loader; reads KEY from file
+#   op://...                       1Password CLI (`op read`) when available
+#   keychain:<account>/<service>   macOS Keychain (security CLI) on darwin
+# Echoes value to stdout; exit 4 with diagnostic on missing CLI/key/file.
+secret_resolve_uri() {
+  local skey="$1" uri="$2"
+  case "$uri" in
+    file:*)
+      local f="${uri#file:}"
+      if [[ ! -f "$f" ]]; then
+        echo "--secret file not found: $f" >&2; return 4
+      fi
+      cat "$f"
+      ;;
+    env-file:*)
+      local f="${uri#env-file:}"
+      if [[ ! -f "$f" ]]; then
+        echo "--secret env-file not found: $f" >&2; return 4
+      fi
+      local line key val found=0
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        key="${key#export }"
+        key="${key//[[:space:]]/}"
+        [[ "$key" != "$skey" ]] && continue
+        val="${line#*=}"
+        # strip optional surrounding quotes
+        if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
+          val="${val:1:${#val}-2}"
+        fi
+        printf '%s' "$val"
+        found=1
+        break
+      done < "$f"
+      if (( ! found )); then
+        echo "--secret env-file missing key $skey in $f" >&2; return 4
+      fi
+      ;;
+    op://*)
+      if ! command -v op >/dev/null 2>&1; then
+        echo "--secret backend op:// requires the 1Password 'op' CLI in PATH" >&2; return 4
+      fi
+      local out
+      if ! out="$(op read "$uri" 2>&1)"; then
+        echo "--secret op read failed for $uri: $out" >&2; return 4
+      fi
+      printf '%s' "$out"
+      ;;
+    keychain:*)
+      if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "--secret backend keychain: only supported on macOS (darwin)" >&2; return 4
+      fi
+      if ! command -v security >/dev/null 2>&1; then
+        echo "--secret backend keychain: requires macOS 'security' CLI" >&2; return 4
+      fi
+      local spec="${uri#keychain:}"
+      local acct="${spec%%/*}" svc="${spec#*/}"
+      if [[ -z "$acct" || -z "$svc" || "$acct" == "$spec" ]]; then
+        echo "--secret keychain URI must be keychain:<account>/<service>: $uri" >&2; return 4
+      fi
+      local out
+      if ! out="$(security find-generic-password -a "$acct" -s "$svc" -w 2>&1)"; then
+        echo "--secret keychain lookup failed for $uri: $out" >&2; return 4
+      fi
+      printf '%s' "$out"
+      ;;
+    *)
+      # bare path = file: shorthand (backcompat with v0.10.0 #116)
+      if [[ ! -f "$uri" ]]; then
+        echo "--secret file not found: $uri" >&2; return 4
+      fi
+      cat "$uri"
+      ;;
+  esac
+}
+
+# Identify backend label for audit log (never logs value).
+secret_uri_backend() {
+  case "$1" in
+    file:*)      echo file ;;
+    env-file:*)  echo env-file ;;
+    op://*)      echo op ;;
+    keychain:*)  echo keychain ;;
+    *)           echo file ;;
+  esac
+}
+
+# Preflight backend availability for the entire pending_secrets list BEFORE
+# any tmux session is touched. Defense-in-depth alongside per-URI checks in
+# secret_resolve_uri: guarantees a fast (<1s) exit 4 with a clear diagnostic
+# if a required backend CLI is missing, regardless of any work that might be
+# inserted between argument parsing and secret_process_pending (issue #189
+# reverify).
+secrets_preflight_backends() {
+  local sec sec_key sec_uri
+  for sec in "${pending_secrets[@]:-}"; do
+    [[ -z "$sec" ]] && continue
+    sec_key="${sec%%=*}"
+    sec_uri="${sec#*=}"
+    case "$sec_uri" in
+      op://*)
+        if ! command -v op >/dev/null 2>&1; then
+          printf '%s\n' "ERROR: --secret backend 'op' (1Password CLI) not found on PATH for ${sec_key}=${sec_uri}" >&2
+          exit 4
+        fi
+        ;;
+      keychain:*)
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+          printf '%s\n' "ERROR: --secret backend 'keychain' only supported on macOS (darwin) for ${sec_key}=${sec_uri}" >&2
+          exit 4
+        fi
+        if ! command -v security >/dev/null 2>&1; then
+          printf '%s\n' "ERROR: --secret backend 'keychain' requires macOS 'security' CLI on PATH for ${sec_key}=${sec_uri}" >&2
+          exit 4
+        fi
+        ;;
+    esac
+  done
+}
+
+# Per-agent redact list path. Stores `KEY\tBASE64(VALUE)\n` per line so that
+# multi-line/binary/regex-meta secret values survive on-disk round-trip
+# safely. Mode 0600.
+secret_redact_list_path() {
+  local nm="$1"
+  local sub
+  sub="$(ensure_agent_dir "$nm")"
+  echo "$sub/secrets-redact.list"
+}
+
+# Base64-encode without line wrapping (portable across BSD/GNU).
+secret_b64enc() {
+  if base64 --help 2>&1 | grep -q -- '-w'; then
+    printf '%s' "$1" | base64 -w0
+  else
+    # BSD base64 emits a single line by default but may add trailing
+    # newline; strip whitespace defensively.
+    printf '%s' "$1" | base64 | tr -d '\n\r '
+  fi
+}
+secret_b64dec() {
+  if base64 --help 2>&1 | grep -q -- '-d'; then
+    printf '%s' "$1" | base64 -d 2>/dev/null
+  else
+    printf '%s' "$1" | base64 -D 2>/dev/null
+  fi
+}
+
+# Register a (key,value) pair into the in-memory and on-disk redact set.
+# `__secret_redact_pairs` is a global parallel array of "KEY\tBASE64" entries
+# (base64 keeps newlines/tabs/NUL/regex-meta intact on disk and in arrays).
+secret_redact_register() {
+  local nm="$1" skey="$2" sval="$3"
+  [[ -z "$sval" ]] && return 0
+  local enc
+  enc="$(secret_b64enc "$sval")"
+  __secret_redact_pairs+=("${skey}"$'\t'"${enc}")
+  local lp
+  lp="$(secret_redact_list_path "$nm")"
+  ( umask 077; printf '%s\t%s\n' "$skey" "$enc" >> "$lp" ) 2>/dev/null || true
+}
+
+# Filter a text blob, substituting each registered secret value with
+# `[REDACTED:KEYNAME]`. Multi-line safe: awk reads whole input as one
+# record (RS="\0") and uses literal index(); the secret may itself
+# contain newlines, regex metacharacters, or other binary bytes.
+# Honors --secret-redact=false bypass.
+secret_redact_apply() {
+  local text="$1"
+  [[ "${SECRET_REDACT_DISABLE:-0}" == "1" ]] && { printf '%s' "$text"; return 0; }
+  local pair skey sval_enc sval
+  for pair in "${__secret_redact_pairs[@]:-}"; do
+    [[ -z "$pair" ]] && continue
+    skey="${pair%%$'\t'*}"
+    sval_enc="${pair#*$'\t'}"
+    sval="$(secret_b64dec "$sval_enc")"
+    [[ -z "$sval" ]] && continue
+    # Trim trailing newlines on the *match* value: stored secrets from
+    # files frequently end in \n which won't appear in captured panes.
+    # The full value (with newline) is still injected into the agent env.
+    while [[ "$sval" == *$'\n' || "$sval" == *$'\r' ]]; do
+      sval="${sval%[$'\n\r']}"
+    done
+    [[ -z "$sval" ]] && continue
+    text="$(printf '%s' "$text" | awk -v s="$sval" -v r="[REDACTED:${skey}]" '
+      BEGIN { RS="\0"; ORS=""; n=length(s) }
+      { out=""; while ((i=index($0,s))>0) { out=out substr($0,1,i-1) r; $0=substr($0,i+n) } print out $0 }')"
+  done
+  printf '%s' "$text"
+}
+
+# Load redact list from disk into `__secret_redact_pairs` (called by capture).
+# Lines are `KEY\tBASE64`; preserved as-is so secret_redact_apply decodes once.
+secret_redact_load_for() {
+  local nm="$1"
+  local lp
+  lp="$(secret_redact_list_path "$nm")"
+  [[ -f "$lp" ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    # Skip malformed entries lacking the KEY\tB64 separator.
+    [[ "$line" != *$'\t'* ]] && continue
+    __secret_redact_pairs+=("$line")
+  done < "$lp"
+}
+
+# Resolve all pending --secret entries, register redaction, emit audit
+# events, and append `-e KEY=VAL` pairs into session_env_args. Caller is
+# `start`/`resume`; runs BEFORE tmux new-session so failures abort cleanly.
+# Args: <name>
+secret_process_pending() {
+  local nm="$1"
+  local sec sec_key sec_uri sec_value backend
+  for sec in "${pending_secrets[@]:-}"; do
+    [[ -z "$sec" ]] && continue
+    sec_key="${sec%%=*}"
+    sec_uri="${sec#*=}"
+    if ! sec_value="$(secret_resolve_uri "$sec_key" "$sec_uri")"; then
+      exit 4
+    fi
+    backend="$(secret_uri_backend "$sec_uri")"
+    secret_redact_register "$nm" "$sec_key" "$sec_value"
+    audit_log_append "$("$JQ" -c -n --arg event secret.read --arg tool "$CLI" \
+      --arg name "$nm" --arg key "$sec_key" --arg backend "$backend" \
+      '{event:$event, tool:$tool, name:$name, key:$key, backend:$backend}')"
+    session_env_args+=("-e" "${sec_key}=${sec_value}")
+  done
+}
+
+# Initialize global redact array (zsh/bash compatible).
+__secret_redact_pairs=()
+# --- /Secret URI backends + redaction ------------------------------------
+
+apply_result_env_args() {
+  local name="$1"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local result_path="$subdir/result.json"
+  rm -f "$result_path"
+  session_env_args+=("-e" "TMUX_AGENT_NAME=$name")
+  session_env_args+=("-e" "TMUX_AGENT_RESULT=$result_path")
+}
+
+start_session() {
+  require_bins
+  write_tmux_conf
+  local should_attach=0
+  local exact_name=0
+
+  local dry_run=0
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" || "${1:-}" == "--dry-run" ]]; do
+    case "$1" in
+      --attach)
+        should_attach=1
+        ;;
+      --exact)
+        exact_name=1
+        ;;
+      --dry-run)
+        dry_run=1
+        ;;
+    esac
+    shift
+  done
+
+  local sentinel=""
+  local on_exit_cmd=""
+  local on_start_cmd=""
+  local sentinel_keep=0
+  parse_sentinel_flags "$@"
+  set -- "${SENTINEL_PARSE_REMAINING[@]}"
+
+  local max_runtime=""
+  local max_idle=""
+  parse_max_fuse_flags "$@"
+  set -- "${MAX_FUSE_PARSE_REMAINING[@]}"
+
+  local transcript_path=""
+  local transcript_truncate=""
+  local result_schema_path=""
+  local usage_path=""
+  local ci_mode=0
+  local on_exit_allow=""
+  local workdir_fresh=0
+  local -a pending_secrets
+  pending_secrets=()
+  local -a pending_tags
+  pending_tags=()
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+    case "$1" in
+      --secret-redact|--secret-redact=true)
+        SECRET_REDACT_DISABLE=0
+        shift
+        ;;
+      --secret-redact=false)
+        SECRET_REDACT_DISABLE=1
+        echo "WARNING: --secret-redact=false — secret values will appear in transcripts/captures unredacted (#189)" >&2
+        shift
+        ;;
+      --transcript|--record)
+        if (( $# < 2 )); then
+          echo "--transcript requires a value (absolute path)" >&2
+          exit 2
+        fi
+        transcript_path="$2"
+        shift 2
+        ;;
+      --transcript-text-truncate)
+        if (( $# < 2 )); then
+          echo "--transcript-text-truncate requires a positive integer" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--transcript-text-truncate must be a positive integer: $2" >&2
+          exit 2
+        fi
+        transcript_truncate="$2"
+        shift 2
+        ;;
+      --result-schema)
+        if (( $# < 2 )); then
+          echo "--result-schema requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--result-schema must be an absolute path: $2" >&2
+          exit 2
+        fi
+        if [[ ! -f "$2" ]]; then
+          echo "--result-schema file not found: $2" >&2
+          exit 1
+        fi
+        result_schema_path="$2"
+        shift 2
+        ;;
+      --tag)
+        if (( $# < 2 )); then
+          echo "--tag requires a value (key=value)" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--tag must be key=value: $2" >&2
+          exit 2
+        fi
+        pending_tags+=("$2")
+        shift 2
+        ;;
+      --role)
+        if (( $# < 2 )); then
+          echo "--role requires a value" >&2
+          exit 2
+        fi
+        pending_tags+=("role=$2")
+        shift 2
+        ;;
+      --usage)
+        if (( $# < 2 )); then
+          echo "--usage requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--usage must be an absolute path: $2" >&2
+          exit 2
+        fi
+        usage_path="$2"
+        shift 2
+        ;;
+      --ci)
+        ci_mode=1
+        shift
+        ;;
+      --on-exit-allow)
+        if (( $# < 2 )); then
+          echo "--on-exit-allow requires a regex value" >&2
+          exit 2
+        fi
+        on_exit_allow="$2"
+        shift 2
+        ;;
+      --secret)
+        if (( $# < 2 )); then
+          echo "--secret requires KEY=PATH value" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--secret must be KEY=PATH: $2" >&2
+          exit 2
+        fi
+        pending_secrets+=("$2")
+        shift 2
+        ;;
+      --workdir-fresh)
+        workdir_fresh=1
+        shift
+        ;;
+    esac
+  done
+
+  # Fail fast on missing secret backends BEFORE any tmux/jq/worktree work
+  # so a missing CLI exits with code 4 in <1s instead of hanging on a
+  # downstream timeout (issue #189 reverify).
+  secrets_preflight_backends
+
+  local requested_name="${1:-}"
+  local directory="${2:-}"
+  shift 2 || true
+  local initial_text="${*:-}"
+
+  if [[ -z "$requested_name" || -z "$directory" ]]; then
+    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
+    exit 2
+  fi
+
+  if (( dry_run )); then
+    run_dry_run_checks "${CLI}-tmux" "$requested_name" "$directory" "$exact_name" \
+      "$sentinel" "$on_exit_cmd" "$transcript_path"
+    exit $?
+  fi
+
+  if [[ ! -d "$directory" ]]; then
+    echo "Directory not found: $directory" >&2
+    exit 1
+  fi
+
+  if [[ -n "$on_exit_allow" && -n "$on_exit_cmd" ]]; then
+    if ! [[ "$on_exit_cmd" =~ $on_exit_allow ]]; then
+      echo "--on-exit hook does not match --on-exit-allow regex: $on_exit_cmd" >&2
+      echo "  allow regex: $on_exit_allow" >&2
+      exit 3
+    fi
+  fi
+  validate_sentinel_flags agent-tmux
+  if [[ -n "$transcript_path" && "${transcript_path:0:1}" != "/" ]]; then
+    echo "--transcript must be an absolute path: $transcript_path" >&2
+    exit 2
+  fi
+  if [[ -n "$transcript_path" && -e "$transcript_path" ]]; then
+    echo "Transcript path already exists: $transcript_path" >&2
+    exit 1
+  fi
+  if [[ -n "$transcript_path" ]]; then
+    require_jq
+    # Write probe (partner R7 critique): transcript_append is best-effort
+    # for runtime resilience, but a silent silent-failure at start would
+    # produce an empty audit trail with no operator-visible warning. Fail
+    # loudly at start if the path is not writable.
+    if ! ( : > "$transcript_path" ) 2>/dev/null; then
+      echo "--transcript path is not writable: $transcript_path" >&2
+      exit 1
+    fi
+    rm -f "$transcript_path"
+  fi
+
+  local name="$requested_name"
+  if (( ! exact_name )); then
+    name="$requested_name-$(random_suffix)"
+  fi
+  if (( workdir_fresh )); then
+    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
+      exit 1
+    fi
+    local fresh_workdir
+    fresh_workdir="$(setup_fresh_worktree "$name" "$CLI" "$directory")" || exit 1
+    directory="$fresh_workdir"
+  fi
+
+  local session="$(session_for_name "$name")"
+  local -a session_env_args
+  local session_env_entry
+  session_env_args=()
+  while IFS= read -r session_env_entry; do
+    [[ -n "$session_env_entry" ]] || continue
+    session_env_args+=("-e" "$session_env_entry")
+  done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_cli_env_args
+  apply_color_env_args
+  secret_process_pending "$name"
+  apply_sentinel_env_args
+  apply_result_env_args "$name"
+  record_started_at "$name"
+  audit_log_append "$("$JQ" -c -n --arg event start --arg tool "$CLI" --arg name "$name" \
+    --arg session "$session" --arg cwd "$directory" '{event:$event, tool:$tool, name:$name, session:$session, cwd:$cwd}')"
+  if (( ci_mode )); then
+    ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
+  fi
+  if [[ -n "$usage_path" ]]; then
+    usage_record_path "$name" "$usage_path"
+  fi
+  usage_init_event "$name"
+  for tag in "${pending_tags[@]}"; do
+    tag_record "$name" "$tag" || true
+  done
+  if [[ -n "$transcript_path" ]]; then
+    transcript_record_path "$name" "$transcript_path"
+    if [[ -n "$transcript_truncate" ]]; then
+      transcript_truncate_record "$name" "$transcript_truncate"
+    fi
+  fi
+  if [[ -n "$result_schema_path" ]]; then
+    result_schema_record "$name" "$result_schema_path"
+  fi
+  if true; then
+  fi
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+  fi
+
+  local color_prefix
+  color_prefix="$(color_env_shell_prefix)"
+  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
+  run_on_start_hook "$name" "$session"
+
+  if [[ -n "$transcript_path" ]]; then
+    local start_line
+    start_line="$("$JQ" -c -n \
+      --arg event start --arg tool "$CLI" --arg name "$name" \
+      --arg session "$session" --arg cwd "$directory" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, tool: $tool, name: $name,
+        session: $session, cwd: $cwd, at: $at}')"
+    transcript_append "$transcript_path" "$start_line"
+  fi
+
+  echo "agent: $name"
+  echo "Started $session"
+  echo "cwd:  $directory"
+  echo "send: $SELF $CLI send $name <text>"
+  echo "wait: $SELF $CLI wait $name 180"
+  echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
+  echo "wait-literal: $SELF $CLI wait-literal $name '<text>' 180"
+  echo "capture: $SELF $CLI capture $name 120"
+  if [[ -n "$initial_text" ]]; then
+    sleep 3
+    local buffer_name="$session-init"
+    paste_and_submit "$session" "$buffer_name" "$initial_text"
+    echo "sent: $initial_text"
+  else
+    echo "sent: <none>"
+  fi
+
+  if (( should_attach )); then
+    "$TMUX" attach -t "$session"
+  fi
+}
+
+resume_session() {
+  require_bins
+  write_tmux_conf
+  local should_attach=0
+  local exact_name=0
+
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
+    case "$1" in
+      --attach)
+        should_attach=1
+        ;;
+      --exact)
+        exact_name=1
+        ;;
+    esac
+    shift
+  done
+
+  local sentinel=""
+  local on_exit_cmd=""
+  local on_start_cmd=""
+  local sentinel_keep=0
+  parse_sentinel_flags "$@"
+  set -- "${SENTINEL_PARSE_REMAINING[@]}"
+
+  local max_runtime=""
+  local max_idle=""
+  parse_max_fuse_flags "$@"
+  set -- "${MAX_FUSE_PARSE_REMAINING[@]}"
+
+  local transcript_path=""
+  local transcript_truncate=""
+  local result_schema_path=""
+  local usage_path=""
+  local ci_mode=0
+  local on_exit_allow=""
+  local workdir_fresh=0
+  local -a pending_secrets
+  pending_secrets=()
+  local -a pending_tags
+  pending_tags=()
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+    case "$1" in
+      --secret-redact|--secret-redact=true)
+        SECRET_REDACT_DISABLE=0
+        shift
+        ;;
+      --secret-redact=false)
+        SECRET_REDACT_DISABLE=1
+        echo "WARNING: --secret-redact=false — secret values will appear in transcripts/captures unredacted (#189)" >&2
+        shift
+        ;;
+      --transcript|--record)
+        if (( $# < 2 )); then
+          echo "--transcript requires a value (absolute path)" >&2
+          exit 2
+        fi
+        transcript_path="$2"
+        shift 2
+        ;;
+      --transcript-text-truncate)
+        if (( $# < 2 )); then
+          echo "--transcript-text-truncate requires a positive integer" >&2
+          exit 2
+        fi
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "--transcript-text-truncate must be a positive integer: $2" >&2
+          exit 2
+        fi
+        transcript_truncate="$2"
+        shift 2
+        ;;
+      --result-schema)
+        if (( $# < 2 )); then
+          echo "--result-schema requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--result-schema must be an absolute path: $2" >&2
+          exit 2
+        fi
+        if [[ ! -f "$2" ]]; then
+          echo "--result-schema file not found: $2" >&2
+          exit 1
+        fi
+        result_schema_path="$2"
+        shift 2
+        ;;
+      --tag)
+        if (( $# < 2 )); then
+          echo "--tag requires a value (key=value)" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--tag must be key=value: $2" >&2
+          exit 2
+        fi
+        pending_tags+=("$2")
+        shift 2
+        ;;
+      --role)
+        if (( $# < 2 )); then
+          echo "--role requires a value" >&2
+          exit 2
+        fi
+        pending_tags+=("role=$2")
+        shift 2
+        ;;
+      --usage)
+        if (( $# < 2 )); then
+          echo "--usage requires a value (absolute path)" >&2
+          exit 2
+        fi
+        if [[ "${2:0:1}" != "/" ]]; then
+          echo "--usage must be an absolute path: $2" >&2
+          exit 2
+        fi
+        usage_path="$2"
+        shift 2
+        ;;
+      --ci)
+        ci_mode=1
+        shift
+        ;;
+      --on-exit-allow)
+        if (( $# < 2 )); then
+          echo "--on-exit-allow requires a regex value" >&2
+          exit 2
+        fi
+        on_exit_allow="$2"
+        shift 2
+        ;;
+      --secret)
+        if (( $# < 2 )); then
+          echo "--secret requires KEY=PATH value" >&2
+          exit 2
+        fi
+        if [[ "$2" != *=* ]]; then
+          echo "--secret must be KEY=PATH: $2" >&2
+          exit 2
+        fi
+        pending_secrets+=("$2")
+        shift 2
+        ;;
+      --workdir-fresh)
+        workdir_fresh=1
+        shift
+        ;;
+    esac
+  done
+
+  secrets_preflight_backends
+
+  local requested_name="${1:-}"
+  local directory="${2:-}"
+  local cli_session_id="${3:-}"
+
+  if [[ -z "$requested_name" || -z "$directory" || -z "$cli_session_id" ]]; then
+    echo "Usage: agent-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>" >&2
+    exit 2
+  fi
+
+  if [[ ! -d "$directory" ]]; then
+    echo "Directory not found: $directory" >&2
+    exit 1
+  fi
+
+  if [[ ! "$cli_session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    echo "Invalid session id: $cli_session_id" >&2
+    exit 2
+  fi
+
+  if [[ -n "$on_exit_allow" && -n "$on_exit_cmd" ]]; then
+    if ! [[ "$on_exit_cmd" =~ $on_exit_allow ]]; then
+      echo "--on-exit hook does not match --on-exit-allow regex: $on_exit_cmd" >&2
+      echo "  allow regex: $on_exit_allow" >&2
+      exit 3
+    fi
+  fi
+  validate_sentinel_flags agent-tmux
+  if [[ -n "$transcript_path" && "${transcript_path:0:1}" != "/" ]]; then
+    echo "--transcript must be an absolute path: $transcript_path" >&2
+    exit 2
+  fi
+  if [[ -n "$transcript_path" && -e "$transcript_path" ]]; then
+    echo "Transcript path already exists: $transcript_path" >&2
+    exit 1
+  fi
+  if [[ -n "$transcript_path" ]]; then
+    require_jq
+    # Write probe (partner R7 critique): transcript_append is best-effort
+    # for runtime resilience, but a silent silent-failure at start would
+    # produce an empty audit trail with no operator-visible warning. Fail
+    # loudly at start if the path is not writable.
+    if ! ( : > "$transcript_path" ) 2>/dev/null; then
+      echo "--transcript path is not writable: $transcript_path" >&2
+      exit 1
+    fi
+    rm -f "$transcript_path"
+  fi
+
+  local name="$requested_name"
+  if (( ! exact_name )); then
+    name="$requested_name-$(random_suffix)"
+  fi
+  if (( workdir_fresh )); then
+    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
+      exit 1
+    fi
+    local fresh_workdir
+    fresh_workdir="$(setup_fresh_worktree "$name" "$CLI" "$directory")" || exit 1
+    directory="$fresh_workdir"
+  fi
+
+  local session="$(session_for_name "$name")"
+  local -a session_env_args
+  local session_env_entry
+  session_env_args=()
+  while IFS= read -r session_env_entry; do
+    [[ -n "$session_env_entry" ]] || continue
+    session_env_args+=("-e" "$session_env_entry")
+  done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_cli_env_args
+  apply_color_env_args
+  secret_process_pending "$name"
+  apply_sentinel_env_args
+  apply_result_env_args "$name"
+  record_started_at "$name"
+  audit_log_append "$("$JQ" -c -n --arg event start --arg tool "$CLI" --arg name "$name" \
+    --arg session "$session" --arg cwd "$directory" '{event:$event, tool:$tool, name:$name, session:$session, cwd:$cwd}')"
+  if (( ci_mode )); then
+    ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
+  fi
+  if [[ -n "$usage_path" ]]; then
+    usage_record_path "$name" "$usage_path"
+  fi
+  usage_init_event "$name"
+  for tag in "${pending_tags[@]}"; do
+    tag_record "$name" "$tag" || true
+  done
+  if [[ -n "$transcript_path" ]]; then
+    transcript_record_path "$name" "$transcript_path"
+    if [[ -n "$transcript_truncate" ]]; then
+      transcript_truncate_record "$name" "$transcript_truncate"
+    fi
+  fi
+  if [[ -n "$result_schema_path" ]]; then
+    result_schema_record "$name" "$result_schema_path"
+  fi
+  if true; then
+  fi
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+  fi
+
+  local color_prefix
+  color_prefix="$(color_env_shell_prefix)"
+  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'session id: $cli_session_id' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS} ${RESUME_KEYWORD} $(shell_quote "$cli_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
+  run_on_start_hook "$name" "$session"
+
+  if [[ -n "$transcript_path" ]]; then
+    local start_line
+    start_line="$("$JQ" -c -n \
+      --arg event start --arg tool "$CLI" --arg name "$name" \
+      --arg session "$session" --arg cwd "$directory" \
+      --arg resume_id "$cli_session_id" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, tool: $tool, name: $name,
+        session: $session, cwd: $cwd, resume_id: $resume_id, at: $at}')"
+    transcript_append "$transcript_path" "$start_line"
+  fi
+
+  echo "agent: $name"
+  echo "Started $session"
+  echo "cwd:  $directory"
+  echo "session id: $cli_session_id"
+  echo "send: $SELF $CLI send $name <text>"
+  echo "wait: $SELF $CLI wait $name 180"
+  echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
+  echo "wait-literal: $SELF $CLI wait-literal $name '<text>' 180"
+  echo "capture: $SELF $CLI capture $name 120"
+
+  if (( should_attach )); then
+    "$TMUX" attach -t "$session"
+  fi
+}
+
+start_ssh_session() {
+  require_tmux
+  write_tmux_conf
+  local should_attach=0
+  local exact_name=0
+
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
+    case "$1" in
+      --attach)
+        should_attach=1
+        ;;
+      --exact)
+        exact_name=1
+        ;;
+    esac
+    shift
+  done
+
+  local requested_name="${1:-}"
+  local ssh_target="${2:-}"
+  local remote_directory="${3:-}"
+
+  if [[ -z "$requested_name" || -z "$ssh_target" || -z "$remote_directory" ]]; then
+    echo "Usage: agent-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]" >&2
+    exit 2
+  fi
+
+  shift 3
+  local initial_text="${*:-}"
+
+  local name="$requested_name"
+  if (( ! exact_name )); then
+    name="$requested_name-$(random_suffix)"
+  fi
+  local session="$(session_for_name "$name")"
+  local -a session_env_args
+  local session_env_entry
+  session_env_args=()
+  while IFS= read -r session_env_entry; do
+    [[ -n "$session_env_entry" ]] || continue
+    session_env_args+=("-e" "$session_env_entry")
+  done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
+  apply_color_env_args
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+  fi
+
+  local remote_command
+  local color_prefix
+  color_prefix="$(color_env_shell_prefix)"
+  remote_command="export TERM=xterm-256color; ${color_prefix}cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'agent-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && ${CLI} ${LAUNCH_FLAGS}; code=\$?; printf '\n[agent-tmux] remote command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+
+  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" \
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")"
+
+  echo "agent: $name"
+  echo "Started $session"
+  echo "ssh:  $ssh_target"
+  echo "cwd:  $remote_directory"
+  echo "send: $SELF $CLI send $name <text>"
+  echo "wait: $SELF $CLI wait $name 180"
+  echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
+  echo "wait-literal: $SELF $CLI wait-literal $name '<text>' 180"
+  echo "capture: $SELF $CLI capture $name 120"
+  if [[ -n "$initial_text" ]]; then
+    sleep 5
+    local buffer_name="$session-init"
+    paste_and_submit "$session" "$buffer_name" "$initial_text"
+    echo "sent: $initial_text"
+  else
+    echo "sent: <none>"
+  fi
+
+  if (( should_attach )); then
+    "$TMUX" attach -t "$session"
+  fi
+}
+
+attach_session() {
+  require_tmux
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux attach <name>" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  "$TMUX" attach -t "$session"
+}
+
+send_session() {
+  require_tmux
+  local from_file=""
+  local enter_count=1
+  local enter_delay="$SUBMIT_DELAY"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-file)
+        if [[ -z "${2:-}" ]]; then
+          echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+          exit 2
+        fi
+        from_file="$2"; shift 2 ;;
+      --from-file=*) from_file="${1#--from-file=}"; shift ;;
+      --enter-count)
+        if [[ -z "${2:-}" ]]; then
+          echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+          exit 2
+        fi
+        enter_count="$2"; shift 2 ;;
+      --enter-count=*) enter_count="${1#--enter-count=}"; shift ;;
+      --enter-delay)
+        if [[ -z "${2:-}" ]]; then
+          echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+          exit 2
+        fi
+        enter_delay="$2"; shift 2 ;;
+      --enter-delay=*) enter_delay="${1#--enter-delay=}"; shift ;;
+      --) shift; break ;;
+      -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local name="${1:-}"
+  shift || true
+
+  if [[ -z "$name" || ( -z "$from_file" && "$#" -eq 0 ) || ( -n "$from_file" && "$#" -ne 0 ) ]]; then
+    echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+    exit 2
+  fi
+  if ! [[ "$enter_count" =~ '^[0-9]+$' ]] || (( enter_count < 1 )); then
+    echo "Invalid --enter-count: $enter_count (expect positive integer)" >&2
+    exit 2
+  fi
+  if ! [[ "$enter_delay" =~ '^[0-9]+([.][0-9]+)?$' ]]; then
+    echo "Invalid --enter-delay: $enter_delay (expect seconds)" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local prompt_text="$*"
+  local multiline=false
+  local payload_file=""
+  if [[ -n "$from_file" ]]; then
+    if [[ "$from_file" != /* || ! -f "$from_file" ]]; then
+      echo "Invalid --from-file: $from_file (expect existing absolute path)" >&2
+      exit 2
+    fi
+    prompt_text="$(cat "$from_file")"
+    payload_file="$(mktemp -t agent-tmux-send.XXXXXX)"
+    printf '%s' "$prompt_text" > "$payload_file"
+    multiline=true
+  fi
+  local buffer_name="$session-send"
+  if [[ -n "$from_file" ]]; then
+    send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+      paste_file_and_submit "$session" "$buffer_name" "$payload_file" "$enter_count" "$enter_delay"
+    local send_rc=$?
+    rm -f "$payload_file" 2>/dev/null || true
+    (( send_rc == 0 )) || return "$send_rc"
+  else
+    send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+      paste_and_submit "$session" "$buffer_name" "$prompt_text" || return $?
+  fi
+
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  if [[ -n "$transcript_path" ]]; then
+    # #140: apply optional --transcript-text-truncate to keep long send
+    # payloads out of the transcript while preserving an integrity hash.
+    local text_obj send_line text_sha
+    text_obj="$(transcript_truncate_text "$name" "$prompt_text")"
+    text_sha="$(printf '%s' "$prompt_text" | sha256_text)"
+    send_line="$("$JQ" -c -n \
+      --argjson text_obj "$text_obj" \
+      --arg event send --arg name "$name" \
+      --arg text_sha256 "$text_sha" \
+      --argjson multiline "$multiline" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, name: $name,
+        text: $text_obj.text,
+        text_sha256: (if $multiline then $text_sha256 else $text_obj.text_sha256 end),
+        text_bytes: $text_obj.text_bytes, bytes: $text_obj.text_bytes,
+        multiline: $multiline, at: $at}')"
+    transcript_append "$transcript_path" "$send_line"
+  fi
+  if [[ -n "$from_file" ]]; then
+    local audit_line text_sha
+    text_sha="$(printf '%s' "$prompt_text" | sha256_text)"
+    audit_line="$("$JQ" -c -n \
+      --arg event send.multiline --arg name "$name" \
+      --arg text_sha256 "$text_sha" \
+      --arg at "$(transcript_iso_now)" \
+      --argjson bytes "${#prompt_text}" \
+      --argjson enter_count "$enter_count" \
+      '{schema_version: 1, event: $event, name: $name, multiline: true,
+        bytes: $bytes, text_bytes: $bytes, text_sha256: $text_sha256,
+        enter_count: $enter_count, at: $at}')"
+    audit_log_append "$audit_line"
+  fi
+
+  echo "Sent to $session: $prompt_text"
+}
+
+count_literal_occurrences() {
+  local haystack="$1"
+  local needle="$2"
+  local count=0
+  local rest="$haystack"
+
+  while [[ "$rest" == *"$needle"* ]]; do
+    rest="${rest#*"$needle"}"
+    count=$((count + 1))
+  done
+
+  echo "$count"
+}
+
+count_literal_line_occurrences() {
+  local haystack="$1"
+  local needle="$2"
+  local count=0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$needle" ]] && count=$((count + 1))
+  done <<< "$haystack"
+  echo "$count"
+}
+
+marker_nonce() {
+  local hex=""
+  if command -v od >/dev/null 2>&1; then
+    hex="$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  fi
+  if [[ ! "$hex" =~ '^[0-9a-fA-F]{6}$' ]]; then
+    hex="$(printf '%06x' $(( RANDOM * RANDOM % 16777216 )))"
+  fi
+  printf 'MARK-%s' "${hex:l}"
+}
+
+send_wait_session() {
+  require_tmux
+  local name="${1:-}"
+  local prompt_text="${2:-}"
+  local timeout_seconds="${3:-180}"
+
+  if [[ -z "$name" || -z "$prompt_text" ]]; then
+    echo "Usage: agent-tmux send-wait <name> <text> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local nonce
+  nonce="$(marker_nonce)"
+  local augmented_prompt="${prompt_text}"$'\n\n'"End your reply with this exact nonce on its own line: ${nonce}"
+  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds"
+}
+
+_send_wait_nonce_locked() {
+  local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5"
+
+  local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+  local before_count
+  before_count="$(count_literal_line_occurrences "$before" "$nonce")"
+
+  local buffer_name="$session-send-wait"
+  paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" --arg marker "$nonce" \
+    '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber), marker:$marker}')"
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+  local current_count=0
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+    current_count="$(count_literal_line_occurrences "$current" "$nonce")"
+    if (( current_count > before_count )); then
+      marker_seen_add "$name" "$nonce"
+      transcript_emit_wait_event "$name" send_wait matched "$nonce" "$timeout_seconds"
+      echo "matched nonce: $nonce"
+      return 0
+    fi
+    sleep 1
+  done
+
+  transcript_emit_wait_event "$name" send_wait timeout "$nonce" "$timeout_seconds"
+  echo "timeout waiting for nonce '$nonce': $session" >&2
+  return 1
+}
+
+send_wait_literal_session() {
+  require_tmux
+  local name="${1:-}"
+  local prompt_text="${2:-}"
+  local needle="${3:-}"
+  local timeout_seconds="${4:-180}"
+
+  if [[ -z "$name" || -z "$prompt_text" || -z "$needle" ]]; then
+    echo "Usage: agent-tmux send-wait-literal <name> <text> <literal> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds"
+}
+
+_send_wait_literal_locked() {
+  local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5"
+
+  local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+  local before_count
+  before_count="$(count_literal_occurrences "$before" "$needle")"
+
+  local buffer_name="$session-send-wait"
+  paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" \
+    '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber)}')"
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+  local current_count=0
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+    current_count="$(count_literal_occurrences "$current" "$needle")"
+    if (( current_count > before_count )); then
+      marker_seen_add "$name" "$needle"
+      transcript_emit_wait_event "$name" send_wait_literal matched "$needle" "$timeout_seconds"
+      echo "matched new literal: $needle"
+      return 0
+    fi
+    sleep 1
+  done
+
+  transcript_emit_wait_event "$name" send_wait_literal timeout "$needle" "$timeout_seconds"
+  echo "timeout waiting for new literal text '$needle': $session" >&2
+  return 1
+}
+
+capture_session() {
+  require_tmux
+  local strip_ansi=0
+  local since_marker=""
+  local output_json=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --strip-ansi)
+        strip_ansi=1
+        shift
+        ;;
+      --since-marker)
+        if (( $# < 2 )); then
+          echo "--since-marker requires a value (literal text)" >&2
+          exit 2
+        fi
+        since_marker="$2"
+        shift 2
+        ;;
+      --json)
+        output_json=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "Unknown capture flag: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  local name="${1:-}"
+  local tail_count="${2:-80}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux capture [--strip-ansi] [--since-marker <text>] [--json] <name> [lines]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$tail_count" =~ '^[0-9]+$' || "$tail_count" -lt 1 ]]; then
+    echo "Invalid lines: $tail_count" >&2
+    exit 2
+  fi
+
+  if (( output_json )); then
+    require_jq
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local raw
+  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$tail_count")"
+
+  # Redact registered secret values (#189) before any downstream sink.
+  secret_redact_load_for "$name"
+  raw="$(secret_redact_apply "$raw")"
+
+  if (( strip_ansi )); then
+    # Strip ANSI escape sequences (#96 + #135 extension). Covers:
+    #   - CSI / SGR:  ESC [ ... <letter>
+    #   - OSC:        ESC ] ...  (terminated by BEL \x07 or ST ESC \\)
+    #   - DCS:        ESC P ... ESC \\
+    #   - APC:        ESC _ ... ESC \\
+    #   - PM:         ESC ^ ... ESC \\
+    #   - SOS:        ESC X ... ESC \\
+    # Out of scope (per design doc non-goal): 8-bit C1 controls like \x9b.
+    # Note: sed strips per-line, which is fine because tmux capture-pane
+    # joins soft-wrapped lines and terminal OSC/DCS payloads do not span
+    # logical lines in normal CLI output.
+    raw="$(printf '%s' "$raw" | sed -E $'
+      s/\x1b\\[[0-9;?]*[A-Za-z]//g
+      s/\x1b\\][^\x07\x1b]*\x07//g
+      s/\x1b\\][^\x1b]*\x1b\\\\//g
+      s/\x1bP[^\x1b]*\x1b\\\\//g
+      s/\x1b_[^\x1b]*\x1b\\\\//g
+      s/\x1b\\^[^\x1b]*\x1b\\\\//g
+      s/\x1bX[^\x1b]*\x1b\\\\//g
+    ')"
+  fi
+
+  local marker_found=0
+  if [[ -n "$since_marker" ]]; then
+    # Slice to lines AFTER the LAST occurrence of the literal marker.
+    local last_idx
+    # grep -nF exits 1 when no match; tolerate that under `set -e + pipefail`.
+    last_idx="$(printf '%s\n' "$raw" | { grep -nF "$since_marker" || true; } | tail -1 | cut -d: -f1)"
+    if [[ -n "$last_idx" ]]; then
+      marker_found=1
+      raw="$(printf '%s\n' "$raw" | tail -n +"$((last_idx + 1))")"
+    else
+      raw=""
+    fi
+  fi
+
+  if (( output_json )); then
+    "$JQ" -n \
+      --arg name "$name" \
+      --arg session "$session" \
+      --argjson lines_requested "$lines" \
+      --argjson marker_found "$marker_found" \
+      --argjson stripped_ansi "$strip_ansi" \
+      --arg body "$raw" \
+      '{schema_version: 1,
+        name: $name, session: $session, lines_requested: $lines_requested,
+        marker_found: ($marker_found == 1), stripped_ansi: ($stripped_ansi == 1),
+        lines: ($body | split("\n"))}'
+  else
+    printf '%s\n' "$raw"
+  fi
+
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  if [[ -n "$transcript_path" ]]; then
+    local capture_line
+    capture_line="$("$JQ" -c -n \
+      --arg event capture --arg name "$name" \
+      --argjson lines_requested "$lines" \
+      --argjson strip_ansi "$strip_ansi" \
+      --arg since_marker "$since_marker" \
+      --argjson marker_found "$marker_found" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, name: $name,
+        lines_requested: $lines_requested,
+        stripped_ansi: ($strip_ansi == 1),
+        since_marker: $since_marker,
+        marker_found: ($marker_found == 1),
+        at: $at}')"
+    transcript_append "$transcript_path" "$capture_line"
+  fi
+}
+
+result_session() {
+  # Read the structured result an agent wrote to its conventional path
+  # (see #97 design doc). Path resolution:
+  #   $TMUX_AGENT_DIR/<name>/result.json
+  case "${1:-}" in
+    path)
+      shift
+      result_path_session "$@"
+      return $?
+      ;;
+    init)
+      shift
+      result_init_session "$@"
+      return $?
+      ;;
+    validate)
+      shift
+      result_validate_session "$@"
+      return $?
+      ;;
+    wait-required)
+      shift
+      local name="${1:-}"
+      if [[ -n "$name" && "$name" != --* ]]; then
+        shift
+        result_wait_required_session "$@" "$name"
+      else
+        result_wait_required_session "$@"
+      fi
+      return $?
+      ;;
+  esac
+  local field=""
+  local wait_seconds=0
+  local output_json=0
+  local validate_mode=0
+  local path_mode=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --path)
+        path_mode=1
+        shift
+        ;;
+      --field)
+        if (( $# < 2 )); then
+          echo "--field requires a value (jq path)" >&2
+          exit 2
+        fi
+        field="$2"
+        shift 2
+        ;;
+      --wait)
+        if (( $# < 2 )); then
+          echo "--wait requires a value (seconds)" >&2
+          exit 2
+        fi
+        wait_seconds="$2"
+        shift 2
+        if [[ ! "$wait_seconds" =~ '^[0-9]+$' ]]; then
+          echo "--wait must be a non-negative integer" >&2
+          exit 2
+        fi
+        ;;
+      --json)
+        output_json=1
+        shift
+        ;;
+      --validate)
+        validate_mode=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "Unknown result flag: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux result [--path] [init|validate|wait-required] ..." >&2
+    exit 2
+  fi
+  if (( output_json )); then
+    require_jq
+  fi
+  if [[ -n "$field" ]]; then
+    require_jq
+  fi
+
+  local result_path
+  result_path="$(agent_root_dir)/$name/result.json"
+
+  if (( path_mode )); then
+    result_path_session "$name"
+    return 0
+  fi
+
+  if (( validate_mode )); then
+    require_jq
+    local schema_path
+    schema_path="$(result_schema_path_for "$name")"
+    if [[ -z "$schema_path" ]]; then
+      # No schema configured: emit a skipped-validation marker.
+      "$JQ" -n --arg path "$result_path" \
+        '{schema_version: 1, present: ($path | test("/")), valid: true,
+          errors: [{path: ".", message: "no --result-schema configured for this agent"}],
+          body: null}'
+      return 0
+    fi
+    result_validate_lightweight "$result_path" "$schema_path"
+    return $?
+  fi
+
+  if (( wait_seconds > 0 )); then
+    local elapsed=0
+    while [[ ! -f "$result_path" && "$elapsed" -lt "$wait_seconds" ]]; do
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+  fi
+
+  if [[ ! -f "$result_path" ]]; then
+    if (( output_json )); then
+      # gemini-code-assist on PR #136: `--json` is a structured-output
+      # mode; if JSON was emitted, the subcommand succeeded. The
+      # "result-not-yet" condition lives in `.present`. Callers branch
+      # on the payload, not the exit code.
+      "$JQ" -n --arg path "$result_path" \
+        '{schema_version: 1, path: $path, present: false, valid: false, body: null}'
+      return 0
+    fi
+    echo "Result file not found: $result_path" >&2
+    exit 1
+  fi
+
+  local body bytes mtime
+  body="$(cat "$result_path")"
+  bytes=$(wc -c < "$result_path" | tr -d ' ')
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # BSD stat: -f %m emits epoch seconds. Format via `date -u -r EPOCH`
+    # so the value is genuinely UTC.
+    local epoch
+    epoch=$(stat -f %m "$result_path")
+    mtime=$(date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ)
+  else
+    # GNU stat: -c %Y emits epoch seconds. `stat -c %y` was wrong because
+    # it formatted in the local timezone but the wrapper appended a `Z`
+    # suffix as if it were UTC (gemini-code-assist on PR #136).
+    local epoch
+    epoch=$(stat -c %Y "$result_path")
+    mtime=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)
+  fi
+
+  if (( output_json )); then
+    # body=null ambiguity (partner R5 critique): a `null` literal in
+    # result.json is valid JSON; without a `valid` flag the consumer
+    # cannot tell that case apart from "wrapper failed to parse". Emit
+    # both: valid=true with parsed body, or valid=false with the raw
+    # bytes wrapped as a JSON string so the caller can still inspect.
+    local body_json valid_flag
+    if printf '%s' "$body" | "$JQ" -e . >/dev/null 2>&1; then
+      body_json="$body"
+      valid_flag=true
+    else
+      body_json="$(printf '%s' "$body" | "$JQ" -Rs .)"
+      valid_flag=false
+    fi
+    "$JQ" -n \
+      --arg path "$result_path" \
+      --argjson bytes "$bytes" \
+      --arg mtime "$mtime" \
+      --argjson valid "$valid_flag" \
+      --argjson body "$body_json" \
+      '{schema_version: 1, path: $path, present: true, bytes: $bytes,
+        mtime: $mtime, valid: $valid, body: $body}'
+    return 0
+  fi
+
+  if [[ -n "$field" ]]; then
+    if ! printf '%s' "$body" | "$JQ" -e -r "$field"; then
+      echo "Field not found in result.json: $field" >&2
+      exit 1
+    fi
+    return 0
+  fi
+
+  printf '%s\n' "$body"
+}
+
+wait_session() {
+  require_tmux
+  local name="${1:-}"
+  local timeout_seconds="${2:-180}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux wait <name> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local last=""
+  local stable_count=0
+  local current=""
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -100)"
+    if [[ "$current" == "$last" ]]; then
+      stable_count=$((stable_count + 1))
+      if (( stable_count >= STABLE_SECONDS )); then
+        transcript_emit_wait_event "$name" wait stable "" "$timeout_seconds"
+        echo "stable"
+        return 0
+      fi
+    else
+      stable_count=0
+      last="$current"
+    fi
+    sleep 1
+  done
+
+  transcript_emit_wait_event "$name" wait timeout "" "$timeout_seconds"
+  echo "timeout waiting for stable output: $session" >&2
+  return 1
+}
+
+wait_text_session() {
+  require_tmux
+  local literal=0
+  local regex=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --literal) literal=1; shift ;;
+      --regex) regex=1; shift ;;
+      --) shift; break ;;
+      *) echo "Unknown wait-text flag: $1" >&2; exit 2 ;;
+    esac
+  done
+  if (( literal && regex )); then
+    echo "wait-text accepts only one of --literal or --regex" >&2
+    exit 2
+  fi
+
+  if (( literal || ! regex )); then
+    wait_literal_session "$@"
+    return
+  fi
+
+  local name="${1:-}"
+  local pattern="${2:-}"
+  local timeout_seconds="${3:-180}"
+
+  if [[ -z "$name" || -z "$pattern" ]]; then
+    echo "Usage: agent-tmux wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    if [[ "$current" =~ $pattern ]]; then
+      transcript_emit_wait_event "$name" wait_text matched "$pattern" "$timeout_seconds"
+      echo "matched: $pattern"
+      return 0
+    fi
+    sleep 1
+  done
+
+  transcript_emit_wait_event "$name" wait_text timeout "$pattern" "$timeout_seconds"
+  echo "timeout waiting for text '$pattern': $session" >&2
+  return 1
+}
+
+wait_literal_session() {
+  require_tmux
+  local name="${1:-}"
+  local needle="${2:-}"
+  local timeout_seconds="${3:-180}"
+
+  if [[ -z "$name" || -z "$needle" ]]; then
+    echo "Usage: agent-tmux wait-literal <name> <text> [timeout_seconds]" >&2
+    exit 2
+  fi
+
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid timeout_seconds: $timeout_seconds" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local current=""
+
+  while (( SECONDS < deadline )); do
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    if [[ "$current" == *"$needle"* ]]; then
+      marker_seen_add "$name" "$needle"
+      transcript_emit_wait_event "$name" wait_literal matched "$needle" "$timeout_seconds"
+      echo "matched literal: $needle"
+      return 0
+    fi
+    sleep 1
+  done
+
+  transcript_emit_wait_event "$name" wait_literal timeout "$needle" "$timeout_seconds"
+  echo "timeout waiting for literal text '$needle': $session" >&2
+  return 1
+}
+
+approval_gate_status_path() {
+  # Per-agent approval-gate status file (issue #185). Set/cleared by the
+  # pause-until-file loop in wait-and-capture so external watchers can see
+  # `awaiting_approval` while the wrapper is blocked.
+  local name="$1"
+  printf '%s' "$(agent_root_dir)/$name/approval-status.json"
+}
+
+approval_gate_write_status() {
+  # Args: name, state ("awaiting_approval"|"resolved"), marker_path,
+  #       decision (approve|reject|timeout|""), reason ("")
+  local name="$1" state="$2" marker_path="$3" decision="${4:-}" reason="${5:-}"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local status_target="$subdir/approval-status.json"
+  local at
+  at="$(transcript_iso_now 2>/dev/null || true)"
+  ( "$JQ" -c -n --arg state "$state" --arg mp "$marker_path" \
+      --arg decision "$decision" --arg reason "$reason" --arg at "$at" \
+      '{schema_version: 1, state: $state, marker_path: $mp,
+        decision: (if $decision == "" then null else $decision end),
+        reason: (if $reason == "" then null else $reason end),
+        at: $at}' > "$status_target" ) 2>/dev/null || true
+}
+
+approval_gate_clear_status() {
+  local name="$1"
+  rm -f "$(agent_root_dir)/$name/approval-status.json" 2>/dev/null || true
+}
+
+awaiting_next_round_write_status() {
+  local name="$1" state="$2" marker="$3" cancel_file="${4:-}" reason="${5:-}"
+  local subdir
+  subdir="$(ensure_agent_dir "$name")"
+  local status_target="$subdir/awaiting-next-round.json"
+  local at
+  at="$(transcript_iso_now 2>/dev/null || true)"
+  ( "$JQ" -c -n --arg state "$state" --arg marker "$marker" \
+      --arg cancel_file "$cancel_file" --arg reason "$reason" --arg at "$at" \
+      '{schema_version: 1, state: $state, marker: $marker,
+        cancel_file: (if $cancel_file == "" then null else $cancel_file end),
+        reason: (if $reason == "" then null else $reason end),
+        at: $at}' > "$status_target" ) 2>/dev/null || true
+}
+
+approval_gate_emit_transcript() {
+  # Append an approval event into the transcript when one is configured.
+  local name="$1" decision="$2" marker_path="$3"
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  [[ -n "$transcript_path" ]] || return 0
+  local line
+  line="$("$JQ" -c -n \
+    --arg name "$name" --arg decision "$decision" --arg mp "$marker_path" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, kind: "approval", name: $name,
+      decision: $decision, marker_path: $mp, decided_at: $at}')"
+  transcript_append "$transcript_path" "$line"
+}
+
+approval_gate_emit_audit() {
+  # Append an approval.* event to the audit log (#119 schema).
+  local name="$1" decision="$2" marker_path="$3"
+  local event_json
+  event_json="$("$JQ" -c -n \
+    --arg event "approval.$decision" --arg tool "$CLI" --arg name "$name" \
+    --arg mp "$marker_path" \
+    '{event: $event, tool: $tool, name: $name, marker_path: $mp}')"
+  audit_log_append "$event_json"
+}
+
+approval_gate_wait() {
+  # Sets globals: APPROVAL_DECISION, APPROVAL_REASON. Avoids returning the
+  # decision via $() so the parent's `set -e` does not abort on the inner
+  # subshell exit code.
+  # Args: name, marker_path, pause_timeout (0 = wait forever)
+  local name="$1" marker_path="$2" pause_timeout="$3"
+  approval_gate_write_status "$name" "awaiting_approval" "$marker_path" "" ""
+  local started=$SECONDS
+  local content=""
+  local decision=""
+  APPROVAL_REASON=""
+  APPROVAL_DECISION=""
+  while :; do
+    if [[ -s "$marker_path" ]]; then
+      content="$(cat "$marker_path" 2>/dev/null || true)"
+      # Strip leading whitespace; case-insensitive compare on first token.
+      local trimmed
+      trimmed="$(printf '%s' "$content" | sed -E 's/^[[:space:]]+//')"
+      local first
+      first="$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')"
+      case "$first" in
+        approve*) decision="approve" ;;
+        reject*)
+          decision="reject"
+          APPROVAL_REASON="$(printf '%s' "$trimmed" | head -c 200)"
+          ;;
+        *)
+          decision="reject"
+          APPROVAL_REASON="invalid marker content: $(printf '%s' "$trimmed" | head -c 80)"
+          ;;
+      esac
+      break
+    fi
+    if (( pause_timeout > 0 )) && (( SECONDS - started >= pause_timeout )); then
+      decision="timeout"
+      APPROVAL_REASON="pause-timeout after ${pause_timeout}s"
+      break
+    fi
+    /bin/sleep 1
+  done
+  approval_gate_write_status "$name" "resolved" "$marker_path" "$decision" "$APPROVAL_REASON"
+  approval_gate_emit_transcript "$name" "$decision" "$marker_path"
+  approval_gate_emit_audit "$name" "$decision" "$marker_path"
+  APPROVAL_DECISION="$decision"
+}
+
+wait_and_capture_session() {
+  local pause_until_file=""
+  local pause_timeout=0
+  local wait_for_human=0
+  local cancel_file=""
+  # Combined wait + capture — the golden-path shortcut described in
+  # issue #99. Replaces the two-step `wait-literal` / `capture` pair.
+  # `--no-timeout-error` decouples soft-timeout opt-in from `--json`
+  # (partner R3 critique on the original design).
+  require_tmux
+  local marker=""
+  local match_style="literal"
+  local timeout_seconds=180
+  local tail_lines=80
+  local strip_ansi=0
+  local since_marker=""
+  local output_json=0
+  local no_timeout_error=0
+  local since_set=0
+  local style_set=0
+
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --marker)
+        if (( $# < 2 )); then echo "--marker requires a value" >&2; exit 2; fi
+        marker="$2"; shift 2 ;;
+      --literal) match_style="literal"; style_set=1; shift ;;
+      --regex) match_style="regex"; style_set=1; shift ;;
+      --timeout)
+        if (( $# < 2 )); then echo "--timeout requires a value (seconds)" >&2; exit 2; fi
+        timeout_seconds="$2"; shift 2 ;;
+      --tail)
+        if (( $# < 2 )); then echo "--tail requires a value (lines)" >&2; exit 2; fi
+        tail_lines="$2"; shift 2 ;;
+      --strip-ansi) strip_ansi=1; shift ;;
+      --since-marker)
+        if (( $# < 2 )); then echo "--since-marker requires a value (literal text)" >&2; exit 2; fi
+        since_marker="$2"; since_set=1; shift 2 ;;
+      --json) output_json=1; shift ;;
+      --no-timeout-error) no_timeout_error=1; shift ;;
+      --wait-for-human) wait_for_human=1; shift ;;
+      --cancel-file)
+        if (( $# < 2 )); then
+          echo "--cancel-file requires a path" >&2
+          exit 2
+        fi
+        cancel_file="$2"
+        shift 2
+        ;;
+      --) shift; break ;;
+      --pause-until-file)
+        if (( $# < 2 )); then
+          echo "--pause-until-file requires a path" >&2
+          exit 2
+        fi
+        pause_until_file="$2"
+        shift 2
+        ;;
+      --pause-timeout)
+        if (( $# < 2 )); then
+          echo "--pause-timeout requires a value (seconds)" >&2
+          exit 2
+        fi
+        pause_timeout="$2"
+        shift 2
+        ;;
+      *) echo "Unknown wait-and-capture flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local name="${1:-}"
+  if [[ -z "$name" || -z "$marker" ]]; then
+    echo "Usage: agent-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] [--wait-for-human] [--cancel-file <path>] <name>" >&2
+    exit 2
+  fi
+  if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
+    echo "Invalid --timeout: $timeout_seconds" >&2
+    exit 2
+  fi
+  if [[ ! "$tail_lines" =~ '^[0-9]+$' || "$tail_lines" -lt 1 ]]; then
+    echo "Invalid --tail: $tail_lines" >&2
+    exit 2
+  fi
+  if [[ ! "$pause_timeout" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --pause-timeout: $pause_timeout" >&2
+    exit 2
+  fi
+  if [[ -n "$pause_until_file" ]]; then
+    require_jq
+  fi
+  if (( wait_for_human )); then
+    require_jq
+  fi
+  if (( output_json )); then
+    require_jq
+  fi
+
+  # Default since-marker = marker, but ONLY when the marker is a literal.
+  # Under --regex, defaulting since-marker to the regex pattern would feed
+  # `grep -F` a string that may not appear in the pane (e.g. `Done|Error`
+  # never matches `grep -F`). Caller must opt-in with explicit
+  # --since-marker for regex match style. Partner R6 critique on PR #137.
+  if (( ! since_set )); then
+    if [[ "$match_style" == "literal" ]]; then
+      since_marker="$marker"
+    else
+      since_marker=""
+    fi
+  fi
+
+  local session
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    if (( output_json )); then
+      "$JQ" -n \
+        --arg marker "$marker" --arg style "$match_style" \
+        --arg since "$since_marker" \
+        --argjson timeout "$timeout_seconds" \
+        '{schema_version: 1, matched: false, marker: $marker,
+          match_style: $style, since_marker: $since,
+          wait_seconds: 0, timeout: $timeout,
+          stripped_ansi: false, reason: "session_gone", lines: []}'
+    else
+      echo "Session does not exist: $session" >&2
+    fi
+    # session_gone is a HARD failure (the agent is no longer reachable);
+    # --no-timeout-error decouples only the soft-timeout case from exit
+    # code, NOT session-gone. gemini-code-assist on PR #137.
+    return 1
+  fi
+
+  local started=$SECONDS
+  local matched=0
+  local cancelled=0
+  local deadline=$((started + timeout_seconds))
+  local current=""
+  if (( wait_for_human )); then
+    awaiting_next_round_write_status "$name" "awaiting_next_round" "$marker" "$cancel_file" ""
+  fi
+  while (( wait_for_human || SECONDS < deadline )); do
+    if (( wait_for_human )) && [[ -n "$cancel_file" && -e "$cancel_file" ]]; then
+      cancelled=1
+      break
+    fi
+    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    if [[ "$match_style" == "literal" ]]; then
+      if [[ "$current" == *"$marker"* ]]; then
+        matched=1
+        break
+      fi
+    else
+      if [[ "$current" =~ $marker ]]; then
+        matched=1
+        break
+      fi
+    fi
+    if (( wait_for_human )) && (( SECONDS >= deadline )); then
+      awaiting_next_round_write_status "$name" "awaiting_next_round" "$marker" "$cancel_file" "heartbeat"
+      deadline=$((SECONDS + timeout_seconds))
+    fi
+    sleep 1
+  done
+  local elapsed=$((SECONDS - started))
+
+  local raw
+  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$tail_lines")"
+
+  if (( strip_ansi )); then
+    raw="$(printf '%s' "$raw" | sed $'s/\x1b\\[[0-9;?]*[A-Za-z]//g')"
+  fi
+
+  if (( matched )) && [[ -n "$since_marker" ]]; then
+    local last_idx
+    last_idx="$(printf '%s\n' "$raw" | { grep -nF "$since_marker" || true; } | tail -1 | cut -d: -f1)"
+    if [[ -n "$last_idx" ]]; then
+      raw="$(printf '%s\n' "$raw" | tail -n +"$((last_idx + 1))")"
+    else
+      raw=""
+    fi
+  fi
+
+  local reason
+  local approval_decision=""
+  if (( matched )); then
+    reason="matched"
+    if [[ -n "$pause_until_file" ]]; then
+      # #185 approval gate: after matching the marker, block until the
+      # operator writes the gate file with an approve/reject decision.
+      # `approval_gate_wait` polls the file synchronously, writes a
+      # `awaiting_approval` status, and emits transcript + audit events.
+      approval_gate_wait "$name" "$pause_until_file" "$pause_timeout"
+      approval_decision="$APPROVAL_DECISION"
+      case "$approval_decision" in
+        approve) reason="approved" ;;
+        reject)  reason="rejected" ;;
+        timeout) reason="gate_timeout" ;;
+      esac
+    fi
+    transcript_emit_wait_event "$name" wait_and_capture matched "$marker" "$timeout_seconds"
+    if (( wait_for_human )); then
+      awaiting_next_round_write_status "$name" "resolved" "$marker" "$cancel_file" "$reason"
+    fi
+  elif (( cancelled )); then
+    reason="cancelled"
+    transcript_emit_wait_event "$name" wait_and_capture timeout "$marker" "$timeout_seconds"
+    awaiting_next_round_write_status "$name" "resolved" "$marker" "$cancel_file" "$reason"
+  else
+    reason="timeout"
+    transcript_emit_wait_event "$name" wait_and_capture timeout "$marker" "$timeout_seconds"
+  fi
+
+  if (( output_json )); then
+    "$JQ" -n \
+      --arg marker "$marker" --arg style "$match_style" \
+      --argjson matched "$matched" \
+      --argjson elapsed "$elapsed" \
+      --argjson timeout "$timeout_seconds" \
+      --argjson stripped "$strip_ansi" \
+      --arg since "$since_marker" \
+      --arg reason "$reason" \
+      --arg body "$raw" \
+      '{schema_version: 1,
+        matched: ($matched == 1), marker: $marker, match_style: $style,
+        wait_seconds: $elapsed, timeout: $timeout,
+        stripped_ansi: ($stripped == 1),
+        since_marker: $since,
+        reason: $reason,
+        lines: ($body | split("\n"))}'
+  else
+    printf '%s\n' "$raw"
+  fi
+
+  if (( cancelled )); then
+    return 9
+  fi
+  if (( ! matched && ! no_timeout_error )); then
+    return 1
+  fi
+  # #185 approval-gate exit codes: 7 = reject, 8 = pause-timeout.
+  case "$approval_decision" in
+    reject)  return 7 ;;
+    timeout) return 8 ;;
+  esac
+  return 0
+}
+
+doctor_session() {
+  require_tmux
+  echo "tmux: $TMUX"
+  if [[ -n "$CLI_BIN" && -x "$CLI_BIN" ]]; then
+    echo "${CLI}: $CLI_BIN"
+  else
+    echo "${CLI}: not found; start requires ${_ENV_NS}=/path/to/${CLI} or ${CLI} on PATH"
+  fi
+  echo "prefix: $PREFIX"
+  echo "stable_seconds: $STABLE_SECONDS"
+  echo "submit_delay: $SUBMIT_DELAY"
+  echo "tmux_conf: $TMUX_CONF"
+  echo "mouse: $TMUX_MOUSE"
+  echo "clipboard: $(clipboard_description)"
+  if command -v git >/dev/null 2>&1; then
+    echo "git: $(command -v git)"
+    if git worktree --help >/dev/null 2>&1; then
+      echo "git worktree: ok"
+    else
+      echo "git worktree: not available"
+    fi
+  else
+    echo "git: not found"
+    echo "git worktree: not available (git missing)"
+  fi
+}
+
+cli_provider_env_keys() {
+  if [[ "$HEURISTIC_FAMILY" == claude ]]; then
+    printf '%s\n' \
+      ANTHROPIC_AUTH_TOKEN \
+      ANTHROPIC_API_KEY \
+      ANTHROPIC_BASE_URL \
+      ANTHROPIC_API_BASE_URL \
+      ANTHROPIC_MODEL \
+      ANTHROPIC_DEFAULT_OPUS_MODEL \
+      ANTHROPIC_DEFAULT_SONNET_MODEL \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL \
+      ANTHROPIC_REASONING_MODEL \
+      CLAUDE_CODE_SUBAGENT_MODEL \
+      API_TIMEOUT_MS
+  else
+    printf '%s\n' \
+      OPENAI_API_KEY \
+      OPENAI_BASE_URL \
+      OPENAI_ORG_ID \
+      OPENAI_PROJECT \
+      OPENAI_MODEL \
+      OPENAI_TIMEOUT_MS \
+      CODEX_API_KEY \
+      CODEX_BASE_URL \
+      CODEX_MODEL \
+      CODEX_HOME \
+      API_TIMEOUT_MS
+  fi
+}
+
+redact_env_value() {
+  local key="$1" value="$2"
+  case "$key" in
+    *TOKEN*|*KEY*)
+      [[ -n "$value" ]] && printf '%s' '***REDACTED***' || printf ''
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+process_env_value() {
+  local pid="$1" key="$2"
+  if [[ -r "/proc/$pid/environ" ]]; then
+    awk -v k="$key" 'BEGIN { RS = "\0" } index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "/proc/$pid/environ" 2>/dev/null || true
+    return 0
+  fi
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | sed -n "s/^${key}=//p" | tail -1 || true
+}
+
+env_doctor_print_map() {
+  local label="$1" source="$2"
+  local key value found=0
+  echo "$label:"
+  while IFS= read -r key; do
+    case "$source" in
+      caller)
+        (( ${+parameters[$key]} )) || continue
+        value="${(P)key}"
+        ;;
+      tmux-global)
+        value="$("$TMUX" show-environment -g "$key" 2>/dev/null | sed -n "s/^${key}=//p" || true)"
+        [[ -n "$value" ]] || continue
+        ;;
+      process:*)
+        local pid="${source#process:}"
+        value="$(process_env_value "$pid" "$key")"
+        [[ -n "$value" ]] || continue
+        ;;
+    esac
+    found=1
+    printf '  %s=%s\n' "$key" "$(redact_env_value "$key" "$value")"
+  done < <(cli_provider_env_keys)
+  (( found )) || echo "  <clean>"
+}
+
+descendant_pids() {
+  local root="$1"
+  local frontier pid children child
+  frontier=("$root")
+  while (( ${#frontier[@]} > 0 )); do
+    pid="${frontier[1]}"
+    frontier=("${frontier[@]:1}")
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      echo "$child"
+      frontier+=("$child")
+    done <<< "$children"
+  done
+}
+
+env_doctor_session() {
+  require_tmux
+  local name="${1:-}"
+  local session=""
+  local pane_pid=""
+  local claude_pid=""
+  local pid command_line
+
+  echo "agent-tmux env-doctor"
+  echo "inherit_claude_env: $INHERIT_ENV"
+  echo "clear_claude_env: $CLEAR_ENV"
+  echo "color_env: $COLOR_ENV"
+  env_doctor_print_map "caller env" caller
+  env_doctor_print_map "tmux global env" tmux-global
+
+  if [[ -z "$name" ]]; then
+    echo "session env: <skipped; pass an agent name to inspect a running pane>"
+    return 0
+  fi
+
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "session env: <not running: $session>"
+    return 1
+  fi
+
+  pane_pid="$("$TMUX" display-message -p -t "$session" '#{pane_pid}' 2>/dev/null || true)"
+  if [[ -z "$pane_pid" ]]; then
+    echo "session env: <unable to resolve pane pid: $session>"
+    return 1
+  fi
+
+  for pid in $(descendant_pids "$pane_pid"); do
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *${_bin}* || "$command_line" == *${CLI}* ]]; then
+      claude_pid="$pid"
+    fi
+  done
+
+  if [[ -z "$claude_pid" ]]; then
+    echo "session env: <no ${CLI} child found under $session pane pid $pane_pid>"
+    return 1
+  fi
+
+  echo "session: $session"
+  echo "pane_pid: $pane_pid"
+  echo "${CLI}_pid: $claude_pid"
+  env_doctor_print_map "${CLI} process env" "process:$claude_pid"
+}
+
+status_pane_text() {
+  local session="$1"
+  "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
+}
+
+blocked_reason_for_text() {
+  local lowered="$1"
+  if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+    print -r -- "cli_exited"
+  elif [[ "$lowered" == *"password:"* || "$lowered" == *"permission denied"* || "$lowered" == *"are you sure you want to continue connecting"* ]]; then
+    print -r -- "ssh_prompt"
+  elif [[ "$lowered" == *"do you want to proceed"* || "$lowered" == *"press enter to continue"* || "$lowered" == *"permission confirmation"* || "$lowered" == *"permission prompt"* || "$lowered" == *"permission required"* || "$lowered" == *"trust this"* || "$lowered" == *"trust the files"* ]]; then
+    print -r -- "permission_prompt"
+  elif [[ "$lowered" == *"approval"* || "$lowered" == *"approve"* || "$lowered" == *"[y/n]"* ]]; then
+    print -r -- "approval_prompt"
+  elif [[ "$lowered" == *"please log in"* || "$lowered" == *"log in to"* || "$lowered" == *"sign in to"* || "$lowered" == *"not logged in"* ]]; then
+    print -r -- "login_prompt"
+  fi
+}
+
+exit_code_for_text() {
+  local current="$1"
+  local line
+  local code=""
+  local exit_re='(local|remote) command exited with code ([0-9]+)'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $exit_re ]]; then
+      code="${match[2]}"
+    fi
+  done <<< "$current"
+  print -r -- "$code"
+}
+
+diagnostic_for_blocked_reason() {
+  local reason="$1"
+  case "$reason" in
+    permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+      echo "session may be waiting for interactive confirmation; attach or capture the pane before sending prompts"
+      ;;
+  esac
+}
+
+status_tail_json() {
+  local current="$1"
+  local max_lines="$STATUS_TAIL_LINES"
+  if [[ "$max_lines" != <-> ]] || (( max_lines <= 0 )); then
+    max_lines=20
+  fi
+  print -r -- "$current" | "$JQ" -R -s --argjson max_lines "$max_lines" '
+    split("\n")
+    | map(select(length > 0))
+    | .[-$max_lines:]
+  '
+}
+
+self_test_session() {
+  require_tmux
+  local name="self-test-$$"
+  local session="$(session_for_name "$name")"
+  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  "$TMUX" new-session -d -s "$session" "zsh -lc 'printf \"%s\n\" \"TMUX_AGENT_TOOLS_SELF_TEST_OK\" \"[TMUX_AGENT_TOOLS_SELF_TEST_OK]\"; if IFS= read -r line; then printf \"%s\n\" \"echo:\$line\" \"[TMUX_AGENT_TOOLS_SEND_WAIT_OK]\"; fi; sleep 5'"
+  wait_literal_session "$name" "TMUX_AGENT_TOOLS_SELF_TEST_OK" 5
+  wait_text_session --literal "$name" "[TMUX_AGENT_TOOLS_SELF_TEST_OK]" 5
+  send_wait_literal_session "$name" $'trigger send-wait\nsecond line' "[TMUX_AGENT_TOOLS_SEND_WAIT_OK]" 5
+  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  echo "self-test: ok"
+}
+
+status_session() {
+  require_tmux
+  local output_json=0
+
+  if [[ "${1:-}" == "--json" ]]; then
+    output_json=1
+    shift
+  fi
+  if [[ "${1:-}" == "--usage" ]]; then
+    shift
+    local name_for_usage="${1:-}"
+    if [[ -z "$name_for_usage" ]]; then
+      echo "Usage: status --usage <name>" >&2
+      exit 2
+    fi
+    usage_aggregate_json "$name_for_usage"
+    return $?
+  fi
+
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux status [--json] <name>" >&2
+    exit 2
+  fi
+
+  local session="$(session_for_name "$name")"
+  local exists=false
+  local running=false
+  local exit_detected=false
+  local local_or_remote=""
+  local diagnostic=""
+  local blocked_reason=""
+  local exit_code=""
+  local confirmation_detected=false
+  local current=""
+  # Liveness fields (issue #98). Additive only — existing field shape is preserved.
+  local last_change_at=""
+  local bytes_in_pane=""
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    exists=true
+    running=true
+    local lowered
+    current="$(status_pane_text "$session")"
+    lowered="${current:l}"
+    if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+      exit_detected=true
+      running=false
+      exit_code="$(exit_code_for_text "$current")"
+    fi
+    if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
+      local_or_remote="remote"
+    else
+      local_or_remote="local"
+    fi
+    blocked_reason="$(blocked_reason_for_text "$lowered")"
+    diagnostic="$(diagnostic_for_blocked_reason "$blocked_reason")"
+    case "$blocked_reason" in
+      permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+        confirmation_detected=true
+        ;;
+    esac
+    last_change_at="$(update_pane_hash "$name" "$current")"
+    bytes_in_pane=$(printf '%s' "$current" | wc -c | tr -d ' ')
+  fi
+  local started_at
+  started_at="$(read_started_at "$name")"
+  local idle_seconds=""
+  if [[ "$exists" == true && -n "$last_change_at" ]]; then
+    idle_seconds="$(iso_epoch_diff_seconds "$last_change_at")"
+  fi
+  local marker_seen_json
+  if [[ "$exists" == true || -f "$(agent_root_dir)/$name/marker_seen" ]]; then
+    marker_seen_json="$(marker_seen_list_json "$name")"
+  else
+    marker_seen_json='[]'
+  fi
+
+  if (( output_json )); then
+    require_jq
+    "$JQ" -cn \
+      --arg tool "$CLI" \
+      --arg name "$name" \
+      --arg session "$session" \
+      --arg prefix "$PREFIX" \
+      --arg local_or_remote "$local_or_remote" \
+      --arg diagnostic "$diagnostic" \
+      --arg blocked_reason "$blocked_reason" \
+      --arg exit_code "$exit_code" \
+      --arg started_at "$started_at" \
+      --arg last_change_at "$last_change_at" \
+      --arg idle_seconds "$idle_seconds" \
+      --arg bytes_in_pane "$bytes_in_pane" \
+      --argjson marker_seen "$marker_seen_json" \
+      --argjson last_capture_lines "$(status_tail_json "$current")" \
+      --argjson exists "$exists" \
+      --argjson running "$running" \
+      --argjson exit_detected "$exit_detected" \
+      --argjson confirmation_detected "$confirmation_detected" \
+      '{schema_version:1,tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end),started_at:(if $started_at == "" then null else $started_at end),last_change_at:(if $last_change_at == "" then null else $last_change_at end),idle_seconds:(if $idle_seconds == "" then null else ($idle_seconds | tonumber) end),bytes_in_pane:(if $bytes_in_pane == "" then null else ($bytes_in_pane | tonumber) end),marker_seen:$marker_seen}'
+  elif [[ "$running" == true ]]; then
+    echo "running: $session"
+    if [[ -n "$diagnostic" ]]; then
+      echo "diagnostic: $diagnostic"
+    fi
+  else
+    echo "stopped: $session"
+  fi
+}
+
+# ping_now_ms: monotonic-enough millisecond timestamp. Uses zsh $EPOCHREALTIME
+# when zsh/datetime is available (sub-second precision); falls back to
+# `date +%s%3N` (GNU date / coreutils) and finally to `date +%s` * 1000.
+ping_now_ms() {
+  if zmodload -e zsh/datetime 2>/dev/null || zmodload zsh/datetime 2>/dev/null; then
+    # EPOCHREALTIME looks like "1716256789.123456" — strip the dot, keep ms.
+    local ert="$EPOCHREALTIME"
+    local secs="${ert%%.*}"
+    local frac="${ert#*.}"
+    # Pad/truncate to exactly 3 digits.
+    frac="${frac}000"
+    frac="${frac[1,3]}"
+    print -r -- $(( secs * 1000 + frac ))
+    return
+  fi
+  local out
+  out=$(date +%s%3N 2>/dev/null || true)
+  if [[ "$out" =~ '^[0-9]+$' ]]; then
+    print -r -- "$out"
+  else
+    print -r -- $(( $(date +%s) * 1000 ))
+  fi
+}
+
+# --- ping: active liveness probe (issue #128) ------------------------------
+# Complements status --json (#98) which only observes idle_seconds passively.
+# ping sends a no-op key sequence (C-u clears the input line; we do NOT submit
+# Enter so a real interactive CLI keeps its in-progress buffer untouched) and
+# watches the pane byte count for any change within --timeout seconds.
+#   exit 0: pane changed         result=ok       (CLI responsive)
+#   exit 1: pane unchanged       result=timeout  (tmux alive, CLI silent / hung)
+#   exit 2: tmux session gone    result=dead
+ping_session() {
+  require_tmux
+  local output_json=0
+  local timeout=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      --timeout)
+        if [[ -z "${2:-}" ]]; then
+          echo "Usage: agent-tmux ping [--timeout <s>] [--json] <name>" >&2
+          exit 2
+        fi
+        timeout="$2"; shift 2 ;;
+      --timeout=*) timeout="${1#--timeout=}"; shift ;;
+      --) shift; break ;;
+      -*)
+        echo "Unknown flag: $1" >&2
+        exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux ping [--timeout <s>] [--json] <name>" >&2
+    exit 2
+  fi
+  if ! [[ "$timeout" =~ '^[0-9]+$' ]] || (( timeout < 1 )); then
+    echo "Invalid --timeout: $timeout (expect positive integer)" >&2
+    exit 2
+  fi
+
+  local session
+  session="$(session_for_name "$name")"
+  local at
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local result="dead"
+  local rtt_ms=0
+  local exit_code=2
+
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    local before_bytes after_bytes
+    before_bytes="$("$TMUX" capture-pane -J -t "$session" -p -S -200 2>/dev/null | wc -c | tr -d ' ')"
+    # Send Enter then C-u: Enter pokes line-buffered consumers (CLIs that
+    # block on `read`); C-u immediately clears the input line so no stray
+    # text persists in an interactive REPL's prompt buffer.
+    "$TMUX" send-keys -t "$session" Enter C-u 2>/dev/null || true
+    local start_ms deadline_ms now_ms timeout_ms
+    timeout_ms=$(( timeout * 1000 ))
+    start_ms=$(ping_now_ms)
+    deadline_ms=$(( start_ms + timeout_ms ))
+    result="timeout"
+    exit_code=1
+    while :; do
+      after_bytes="$("$TMUX" capture-pane -J -t "$session" -p -S -200 2>/dev/null | wc -c | tr -d ' ')"
+      if [[ -n "$after_bytes" && -n "$before_bytes" && "$after_bytes" != "$before_bytes" ]]; then
+        result="ok"
+        exit_code=0
+        break
+      fi
+      now_ms=$(ping_now_ms)
+      if (( now_ms >= deadline_ms )); then
+        break
+      fi
+      sleep 0.1
+    done
+    now_ms=$(ping_now_ms)
+    rtt_ms=$(( now_ms - start_ms ))
+    (( rtt_ms < 0 )) && rtt_ms=0
+  fi
+
+  if (( output_json )); then
+    require_jq
+    "$JQ" -cn \
+      --arg name "$name" \
+      --arg session "$session" \
+      --arg result "$result" \
+      --arg at "$at" \
+      --argjson rtt_ms "$rtt_ms" \
+      '{schema_version: 1, name: $name, session: $session, result: $result, rtt_ms: $rtt_ms, at: $at}'
+  else
+    case "$result" in
+      ok)      echo "ping ok: $name (rtt ${rtt_ms}ms)" ;;
+      timeout) echo "ping timeout: $name (after ${timeout}s)" ;;
+      dead)    echo "ping dead: $name (no tmux session)" ;;
+    esac
+  fi
+  exit "$exit_code"
+}
+
+probe_session() {
+  require_tmux
+  local output_json=0
+  local metric=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      --metric)
+        if [[ -z "${2:-}" ]]; then
+          echo "Usage: agent-tmux probe --metric <metric> [--json] <name>" >&2
+          exit 2
+        fi
+        metric="$2"; shift 2 ;;
+      --metric=*) metric="${1#--metric=}"; shift ;;
+      --) shift; break ;;
+      -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local name="${1:-}"
+  if [[ -z "$name" || -z "$metric" ]]; then
+    echo "Usage: agent-tmux probe --metric <metric> [--json] <name>" >&2
+    exit 2
+  fi
+  local _agt_metrics
+  if [[ "$HEURISTIC_FAMILY" == claude ]]; then
+    _agt_metrics="context_percent goal_active active_spinner"
+  else
+    _agt_metrics="progress tool_active approval_pending"
+  fi
+  case " $_agt_metrics " in
+    *" $metric "*) ;;
+    *)
+      echo "Unknown metric: $metric (supported: $_agt_metrics)" >&2
+      exit 2 ;;
+  esac
+
+  local session
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local pane parsed_from value confidence
+  pane="$("$TMUX" capture-pane -J -t "$session" -p -S -120 2>/dev/null | strip_ansi_text)"
+  parsed_from=""
+  value="null"
+  confidence="low"
+  if [[ "$HEURISTIC_FAMILY" == claude ]]; then
+   case "$metric" in
+    context_percent)
+      parsed_from="$(printf '%s\n' "$pane" | grep -Eo 'Context[[:space:]]+[0-9]+%' | tail -1 || true)"
+      if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
+        value="${match[1]}"
+        confidence="high"
+      fi
+      ;;
+    goal_active)
+      if printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(active|in progress)|goal:'; then
+        value="true"
+        confidence="medium"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(active|in progress)|goal:' | tail -1 || true)"
+      elif printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(achieved|complete|completed)'; then
+        value="false"
+        confidence="high"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(achieved|complete|completed)' | tail -1 || true)"
+      fi
+      ;;
+    active_spinner)
+      if printf '%s\n' "$pane" | grep -qE '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)'; then
+        value="true"
+        confidence="medium"
+        parsed_from="$(printf '%s\n' "$pane" | grep -E '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)' | tail -1 || true)"
+      else
+        value="false"
+        confidence="low"
+      fi
+      ;;
+   esac
+  else
+   case "$metric" in
+    progress)
+      parsed_from="$(printf '%s\n' "$pane" | grep -Eo '([Pp]rogress|[Rr]unning|[Tt]hinking)[^0-9]{0,20}[0-9]+%' | tail -1 || true)"
+      if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
+        value="${match[1]}"
+        confidence="medium"
+      fi
+      ;;
+    tool_active)
+      if printf '%s\n' "$pane" | grep -qiE '(running|executing|tool call|shell|command|apply_patch)'; then
+        value="true"
+        confidence="medium"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(running|executing|tool call|shell|command|apply_patch)' | tail -1 || true)"
+      else
+        value="false"
+        confidence="low"
+      fi
+      ;;
+    approval_pending)
+      if printf '%s\n' "$pane" | grep -qiE '(approval|approve|allow|deny|permission)'; then
+        value="true"
+        confidence="medium"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(approval|approve|allow|deny|permission)' | tail -1 || true)"
+      else
+        value="false"
+        confidence="low"
+      fi
+      ;;
+   esac
+  fi
+
+  if (( output_json )); then
+    require_jq
+    "$JQ" -cn \
+      --arg name "$name" --arg metric "$metric" --arg confidence "$confidence" \
+      --arg parsed_from "$parsed_from" --argjson value "$value" \
+      '{schema_version: 1, name: $name, metric: $metric, value: $value,
+        confidence: $confidence, parsed_from: $parsed_from}'
+  else
+    printf '%s %s=%s confidence=%s\n' "$name" "$metric" "$value" "$confidence"
+  fi
+}
+
+list_sessions() {
+  require_tmux
+  "$TMUX" ls 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      "$PREFIX"-*)
+        local session="${line%%:*}"
+        local name="${session#$PREFIX-}"
+        echo "$name -> $session"
+        ;;
+    esac
+  done
+}
+
+stop_session() {
+  require_tmux
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: agent-tmux stop <name>" >&2
+    exit 2
+  fi
+
+  # Kill the safety-fuse watcher (issue #105) BEFORE tearing down tmux so
+  # the watcher cannot race a sentinel write against a clean stop.
+  kill_max_fuse_watcher "$name"
+
+  local session
+  session="$(session_for_name "$name")"
+  local stopped=0
+  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$session"
+    stopped=1
+    echo "Stopped $session"
+  else
+    echo "Already stopped: $session"
+  fi
+
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  if [[ -n "$transcript_path" ]]; then
+    local stop_line
+    stop_line="$("$JQ" -c -n \
+      --arg event stop --arg name "$name" \
+      --argjson stopped "$stopped" \
+      --arg at "$(transcript_iso_now)" \
+      '{schema_version: 1, event: $event, name: $name,
+        stopped: ($stopped == 1), at: $at}')"
+    transcript_append "$transcript_path" "$stop_line"
+  fi
+}
+
+# Allow test harnesses (issue #102 smoke) to source the wrapper purely for
+# its helpers without executing the dispatcher.
+# ===========================================================================
+# PR B — pair + team (multi-agent lifecycle + collaboration primitives)
+# These commands orchestrate ACROSS clis: they never touch the local $PREFIX
+# (which is meaningless in `pair`/`team` mode); every per-member op is done by
+# re-invoking the engine as `"$SELF" <member-cli> <subcommand>` so each member
+# resolves its own preset/prefix. See docs/agent-tmux-design.md.
+# ===========================================================================
+
+_team_state_dir()  { printf '%s/teams' "$(agent_root_dir)"; }
+_team_state_file() { printf '%s/%s.json' "$(_team_state_dir)" "$1"; }
+_agt()             { "$SELF" "$@"; }   # re-invoke engine: _agt <cli> <subcmd...>
+_file_mtime()      { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+# ---- per-team lock: mkdir (atomic) + pid owner + stale detect + timeout ----
+_TEAM_LOCKDIR=""
+_team_lock_release() {
+  [[ -n "${_TEAM_LOCKDIR:-}" ]] && rm -rf "$_TEAM_LOCKDIR" 2>/dev/null
+  _TEAM_LOCKDIR=""
+  trap - EXIT INT TERM
+}
+_team_lock_acquire() {
+  local team="$1" lockdir
+  lockdir="$(_team_state_file "$team").lock"
+  local timeout="${AGENT_TMUX_LOCK_TIMEOUT:-30}" grace=60 waited=0
+  mkdir -p "$(_team_state_dir)"
+  while true; do
+    if mkdir "$lockdir" 2>/dev/null; then
+      printf '%s\n' "$$" > "$lockdir/pid"
+      _TEAM_LOCKDIR="$lockdir"
+      trap '_team_lock_release' EXIT INT TERM
+      return 0
+    fi
+    local opid; opid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    if [[ -n "$opid" ]] && ! kill -0 "$opid" 2>/dev/null; then
+      rm -rf "$lockdir" 2>/dev/null || true; continue          # dead owner → reclaim
+    fi
+    if [[ -z "$opid" ]]; then
+      local now age; now="$(date +%s 2>/dev/null || echo 0)"
+      age=$(( now - $(_file_mtime "$lockdir") ))
+      if (( age > grace )); then rm -rf "$lockdir" 2>/dev/null || true; continue; fi
+    fi
+    if (( waited >= timeout )); then
+      echo "team busy: $team locked by pid ${opid:-unknown}" >&2
+      return 1
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+}
+
+# ---- atomic state write: same-dir temp + fsync + mv -----------------------
+_team_write_state() {   # <team> <lead_cli> <members_json>
+  require_jq
+  local team="$1" lead_cli="$2" members="$3"
+  local dir file tmp
+  dir="$(_team_state_dir)"; file="$(_team_state_file "$team")"; tmp="$file.tmp.$$"
+  mkdir -p "$dir"
+  "$JQ" -n --arg team "$team" --arg lc "$lead_cli" --argjson m "$members" \
+    '{schema_version:1, team:$team, lead_cli:$lc, members:$m}' > "$tmp"
+  sync "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
+_team_state_or_die() {  # <team> → echoes file path or exits 1
+  local file; file="$(_team_state_file "$1")"
+  [[ -f "$file" ]] || { echo "team not found: $1" >&2; return 1; }
+  printf '%s' "$file"
+}
+_team_worker_rows() { "$JQ" -c '.members[] | select(.role=="worker")' "$(_team_state_file "$1")"; }
+
+_pair_worker_prompt() {
+  local name="$1" rp; rp="$(agent_root_dir)/$name/result.json"
+  printf '%s' "You are worker $name. Await instructions sent by the team lead via send. Do not call claude-tmux, codex-tmux, agent-tmux, tmux-agent-fanout, or tmux-agent-dialogue; do not start background jobs; do not SSH out; do not spawn other agents. When given a task, write your result to $rp when done."
+}
+
+# ---- pair: idempotent worker bootstrap + conservative reconcile -----------
+cmd_pair() {
+  require_jq
+  local workers=1 worker_cli="" role="lead"
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      --workers)    workers="${2:-}"; shift 2 ;;
+      --worker-cli) worker_cli="${2:-}"; shift 2 ;;
+      --role)       role="${2:-}"; shift 2 ;;
+      --) shift; while (( $# )); do pos+=("$1"); shift; done ;;
+      -*) echo "pair: unknown flag: $1" >&2; return 2 ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  local lead_cli="${pos[1]:-}" team="${pos[2]:-}" dir="${pos[3]:-}"
+  if [[ -z "$lead_cli" || -z "$team" || -z "$dir" ]]; then
+    echo "Usage: agent-tmux pair <cli> <team> <dir> [--workers N] [--worker-cli C] [--role lead]" >&2
+    return 2
+  fi
+  [[ -d "$dir" ]] || { echo "pair: directory not found: $dir" >&2; return 1; }
+  [[ -z "$worker_cli" ]] && worker_cli="$lead_cli"
+  if ! [[ "$workers" =~ ^[0-9]+$ ]] || (( workers < 1 )); then
+    echo "pair: --workers must be a positive integer: $workers" >&2; return 2
+  fi
+
+  _team_lock_acquire "$team" || return 1
+
+  local file existing
+  file="$(_team_state_file "$team")"
+  existing='{"members":[]}'; [[ -f "$file" ]] && existing="$(cat "$file")"
+
+  # Existing workers from prior state, indexed for reconcile-by-stored-cli.
+  local existing_workers
+  existing_workers="$(printf '%s' "$existing" | "$JQ" -c '[.members[]? | select(.role=="worker")]' 2>/dev/null || echo '[]')"
+
+  local lead_rp; lead_rp="$(agent_root_dir)/$team/result.json"
+  local members
+  members="$("$JQ" -cn --arg n "$team" --arg c "$lead_cli" --arg rp "$lead_rp" \
+    '[{name:$n, role:"lead", cli:$c, result_path:$rp}]')"
+
+  local rc=0 i wname wstate alive wrp rcli stored
+  local -a out=()
+  for (( i=1; i<=workers; i++ )); do
+    wname="$team-w$i"
+    # Reconcile each existing worker under its STORED cli; only brand-new
+    # workers use --worker-cli. Preserve the stored result_path too.
+    stored="$(printf '%s' "$existing_workers" | "$JQ" -c --arg n "$wname" 'map(select(.name==$n))[0] // empty')"
+    if [[ -n "$stored" ]]; then
+      rcli="$(printf '%s' "$stored" | "$JQ" -r '.cli')"
+      wrp="$(printf '%s'  "$stored" | "$JQ" -r '.result_path')"
+    else
+      rcli="$worker_cli"
+      wrp="$(agent_root_dir)/$wname/result.json"
+    fi
+    wstate="$(_agt "$rcli" status --json "$wname" 2>/dev/null || echo '{}')"
+    alive="$(printf '%s' "$wstate" | "$JQ" -r '.exists // false' 2>/dev/null || echo false)"
+    if [[ "$alive" == "true" ]]; then
+      out+=("$wname  $rcli  resumed")
+    elif _agt "$rcli" start --exact --role worker "$wname" "$dir" "$(_pair_worker_prompt "$wname")" >/dev/null 2>&1; then
+      out+=("$wname  $rcli  started")
+    else
+      out+=("$wname  $rcli  FAILED: start/resume failed")
+      rc=1
+    fi
+    members="$(printf '%s' "$members" | "$JQ" -c --arg n "$wname" --arg c "$rcli" --arg rp "$wrp" \
+      '. + [{name:$n, role:"worker", cli:$c, result_path:$rp}]')"
+  done
+
+  # Conservative scale-down: surplus prior workers (index > N) are warned but
+  # NOT stopped, and are RETAINED in the authoritative state file with their
+  # stored cli/result_path so later team stop/results/send/rm still see them.
+  local orphans orow
+  orphans="$(printf '%s' "$existing_workers" | "$JQ" -c \
+    --argjson n "$workers" \
+    '[.[] | select(((.name | capture("-w(?<i>[0-9]+)$").i | tonumber) // 0) > $n)]' 2>/dev/null || echo '[]')"
+  for orow in ${(f)$(printf '%s' "$orphans" | "$JQ" -c '.[]')}; do
+    members="$(printf '%s' "$members" | "$JQ" -c --argjson o "$orow" '. + [$o]')"
+    out+=("$(printf '%s' "$orow" | "$JQ" -r '"\(.name)  \(.cli)  orphan  (not stopped; use team stop to remove)"')")
+  done
+
+  _team_write_state "$team" "$lead_cli" "$members"
+  _team_lock_release
+  printf '%s\n' "${out[@]}"
+  return $rc
+}
+
+# ---- team subcommands ------------------------------------------------------
+cmd_team() {
+  require_jq
+  local sub="${1:-}"; (( $# )) && shift
+  case "$sub" in
+    list)      _team_list "$@" ;;
+    workers)   _team_field worker "$@" ;;
+    lead)      _team_field lead "$@" ;;
+    stop)      _team_stop "$@" ;;
+    rm)        _team_rm "$@" ;;
+    broadcast) _team_broadcast "$@" ;;
+    send)      _team_send "$@" ;;
+    wait)      _team_wait "$@" ;;
+    results)   _team_results "$@" ;;
+    *) echo "Usage: agent-tmux team <list|workers|lead|stop|rm|broadcast|send|wait|results> ..." >&2; return 2 ;;
+  esac
+}
+
+_team_member_state() {  # <cli> <name> → "stopped|running|idle|unknown"
+  local st
+  st="$(_agt "$1" status --json "$2" 2>/dev/null || echo '{}')"
+  printf '%s' "$st" | "$JQ" -r \
+    'if (.exists//false)==false then "stopped" elif (.running//false) then "running" else "idle" end' \
+    2>/dev/null || echo unknown
+}
+
+_team_list_one() {
+  local team="$1" file; file="$(_team_state_file "$team")"
+  [[ -f "$file" ]] || { echo "team not found: $team" >&2; return 1; }
+  echo "team: $team"
+  local rows row name cli role state; rows="$("$JQ" -c '.members[]' "$file")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"
+    cli="$(printf '%s'  "$row" | "$JQ" -r .cli)"
+    role="$(printf '%s' "$row" | "$JQ" -r .role)"
+    state="$(_team_member_state "$cli" "$name")"
+    printf '  %-7s %-7s %-24s %s\n' "$role" "$cli" "$name" "$state"
+  done
+}
+_team_list() {
+  if [[ -n "${1:-}" ]]; then _team_list_one "$1"; return $?; fi
+  local d; d="$(_team_state_dir)"; [[ -d "$d" ]] || return 0
+  local f
+  for f in "$d"/*.json(N); do _team_list_one "$(basename "$f" .json)"; done
+}
+_team_field() {
+  local which="$1" team="${2:-}"
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team $which <team>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  "$JQ" -r --arg r "$which" '.members[] | select(.role==$r) | .name' "$file"
+}
+_team_stop() {
+  local team="${1:-}"
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team stop <team>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  local self_name=""
+  [[ -n "${TMUX_AGENT_RESULT:-}" ]] && self_name="$(basename "$(dirname "$TMUX_AGENT_RESULT")")"
+  local rows row name cli; rows="$("$JQ" -c '.members[]' "$file")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    if [[ -n "$self_name" && "$name" == "$self_name" ]]; then
+      echo "warning: skipping self ($name) — stop it from outside the session" >&2; continue
+    fi
+    if _agt "$cli" stop "$name" >/dev/null 2>&1; then echo "stopped $name"; else echo "stop $name: not running"; fi
+  done
+}
+_team_rm() {
+  local team="${1:-}"
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team rm <team>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  local rows row live=0 name cli ex
+  rows="$("$JQ" -c '.members[]' "$file")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    ex="$(_agt "$cli" status --json "$name" 2>/dev/null | "$JQ" -r '.exists // false' 2>/dev/null || echo false)"
+    if [[ "$ex" == "true" ]]; then echo "team rm refused: member still live: $name (stop it first)" >&2; live=1; fi
+  done
+  (( live )) && return 1
+  rm -f "$file" && echo "removed team: $team"
+}
+_team_broadcast() {
+  local team="${1:-}"; (( $# )) && shift; local prompt="${1:-}"
+  [[ -z "$team" || -z "$prompt" ]] && { echo "Usage: agent-tmux team broadcast <team> <prompt>" >&2; return 2; }
+  _team_state_or_die "$team" >/dev/null || return 1
+  local rows row rc=0 name cli rp full; rows="$(_team_worker_rows "$team")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"; rp="$(printf '%s' "$row" | "$JQ" -r .result_path)"
+    full="$prompt
+When done, write your result to $rp. Do not call claude-tmux, codex-tmux, agent-tmux, tmux-agent-fanout, or tmux-agent-dialogue; do not spawn other agents."
+    if ! _agt "$cli" send "$name" "$full" >/dev/null 2>&1; then echo "broadcast failed: $name" >&2; rc=1; fi
+  done
+  return $rc
+}
+_team_send() {
+  local team="${1:-}" worker="${2:-}"; (( $# >= 2 )) && shift 2; local prompt="${1:-}"
+  [[ -z "$team" || -z "$worker" || -z "$prompt" ]] && { echo "Usage: agent-tmux team send <team> <worker> <prompt>" >&2; return 2; }
+  local file; file="$(_team_state_or_die "$team")" || return 1
+  local target="$worker"; [[ "$worker" != "$team-"* ]] && target="$team-$worker"
+  local cli; cli="$("$JQ" -r --arg n "$target" '.members[] | select(.name==$n) | .cli' "$file")"
+  [[ -z "$cli" ]] && { echo "team send: '$worker' is not a member of $team" >&2; return 1; }
+  _agt "$cli" send "$target" "$prompt"
+}
+_team_wait() {
+  local team="${1:-}"; (( $# )) && shift
+  local timeout=600 require_result=0
+  while (( $# )); do
+    case "$1" in
+      --require-result) require_result=1; shift ;;
+      *) timeout="$1"; shift ;;
+    esac
+  done
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team wait <team> [timeout] [--require-result]" >&2; return 2; }
+  _team_state_or_die "$team" >/dev/null || return 1
+  local rows; rows="$(_team_worker_rows "$team")"
+  local waited=0
+  while true; do
+    local all_done=1 blocked="" still="" row
+    local name cli st running cd br diag res present valid
+    for row in ${(f)rows}; do
+      name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+      st="$(_agt "$cli" status --json "$name" 2>/dev/null || echo '{}')"
+      running="$(printf '%s' "$st" | "$JQ" -r '.running // false')"
+      cd="$(printf '%s'      "$st" | "$JQ" -r '.confirmation_detected // false')"
+      br="$(printf '%s'      "$st" | "$JQ" -r '.blocked_reason // empty')"
+      diag="$(printf '%s'    "$st" | "$JQ" -r '.diagnostic // empty')"
+      [[ "$cd" == "true" || -n "$br" || -n "$diag" ]] && blocked="$blocked $name"
+      if [[ "$running" == "true" ]]; then all_done=0; still="$still $name"; continue; fi
+      if (( require_result )); then
+        res="$(_agt "$cli" result --json "$name" 2>/dev/null || echo '{}')"
+        present="$(printf '%s' "$res" | "$JQ" -r '.present // false')"
+        valid="$(printf '%s'   "$res" | "$JQ" -r '.valid // false')"
+        [[ "$present" == "true" && "$valid" == "true" ]] || { all_done=0; still="$still $name"; }
+      fi
+    done
+    if [[ -n "$blocked" ]]; then echo "team wait: blocked on input:$blocked" >&2; return 7; fi
+    (( all_done )) && return 0
+    if (( waited >= timeout )); then echo "team wait: timeout; still busy:$still" >&2; return 8; fi
+    sleep 2; waited=$((waited+2))
+  done
+}
+_team_results() {
+  local team="${1:-}"; (( $# )) && shift
+  local as_json=0; [[ "${1:-}" == "--json" ]] && as_json=1
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team results <team> [--json]" >&2; return 2; }
+  _team_state_or_die "$team" >/dev/null || return 1
+  local rows row agg='[]' rc=0 missing=""
+  local name cli res present valid body
+  rows="$(_team_worker_rows "$team")"
+  for row in ${(f)rows}; do
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    res="$(_agt "$cli" result --json "$name" 2>/dev/null || echo '{}')"
+    present="$(printf '%s' "$res" | "$JQ" -r '.present // false')"
+    valid="$(printf '%s'   "$res" | "$JQ" -r '.valid // false')"
+    body="$(printf '%s'    "$res" | "$JQ" -c '.body // null' 2>/dev/null || echo null)"
+    [[ "$present" == "true" && "$valid" == "true" ]] || { missing="$missing $name"; rc=1; }
+    agg="$(printf '%s' "$agg" | "$JQ" -c --arg n "$name" --arg c "$cli" \
+      --argjson p "$present" --argjson v "$valid" --argjson b "$body" \
+      '. + [{name:$n, cli:$c, present:$p, valid:$v, body:$b}]')"
+  done
+  if (( as_json )); then
+    printf '%s\n' "$agg"
+  else
+    printf '%s\n' "$agg" | "$JQ" -r '.[] | "\(.name) [\(.cli)] present=\(.present) valid=\(.valid)"'
+  fi
+  [[ -n "$missing" ]] && echo "results missing/invalid:$missing" >&2
+  return $rc
+}
+
+if [[ -n "${TMUX_AGENT_TOOLS_SOURCE_ONLY:-}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+_resolve_audit_default_path() {
+  # #188: default log when AUDIT_LOG=1 or --audit-log used without path.
+  local base="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools"
+  printf '%s/audit.jsonl\n' "$base"
+}
+
+# Global --audit-log handling (#188). Accepts:
+#   --audit-log <path>   → export TMUX_AGENT_TOOLS_AUDIT_LOG
+#   --audit-log          → default path
+# Env AUDIT_LOG=1 also enables default path (lower precedence than env-set
+# TMUX_AGENT_TOOLS_AUDIT_LOG, higher than nothing).
+_global_args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --audit-log)
+      if [[ -n "${2:-}" && "$2" != --* ]]; then
+        export TMUX_AGENT_TOOLS_AUDIT_LOG="$2"
+        shift 2
+      else
+        export TMUX_AGENT_TOOLS_AUDIT_LOG="$(_resolve_audit_default_path)"
+        shift
+      fi
+      ;;
+    --) shift; break;;
+    *) _global_args+=("$1"); shift;;
+  esac
+done
+if (( ${#_global_args[@]} > 0 )); then
+  set -- "${_global_args[@]}" "$@"
+fi
+if [[ -z "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" && "${AUDIT_LOG:-}" == "1" ]]; then
+  export TMUX_AGENT_TOOLS_AUDIT_LOG="$(_resolve_audit_default_path)"
+fi
+if [[ -n "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" ]]; then
+  mkdir -p "$(dirname "$TMUX_AGENT_TOOLS_AUDIT_LOG")" 2>/dev/null || true
+fi
+
+# pair / team are management modes, not a <cli>: $CLI holds the keyword and
+# "$@" holds the remaining args (the global pre-pass left them in order).
+if [[ "$CLI" == "pair" ]]; then cmd_pair "$@"; exit $?; fi
+if [[ "$CLI" == "team" ]]; then cmd_team "$@"; exit $?; fi
+
+command="${1:-help}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  __fuse_watcher)
+    # Internal: detached safety-fuse watcher (issue #105). Args:
+    # <agent_name> <tmux_session> <sentinel> <on_exit_cmd> <max_runtime> <max_idle> <tmux_bin>
+    max_fuse_watcher_loop "$@"
+    exit 0
+    ;;
+  start)
+    start_session "$@"
+    ;;
+  resume)
+    resume_session "$@"
+    ;;
+  start-ssh)
+    start_ssh_session "$@"
+    ;;
+  attach)
+    attach_session "$@"
+    ;;
+  send)
+    send_session "$@"
+    ;;
+  send-wait)
+    send_wait_session "$@"
+    ;;
+  send-wait-literal)
+    send_wait_literal_session "$@"
+    ;;
+  wait)
+    wait_session "$@"
+    ;;
+  wait-text)
+    wait_text_session "$@"
+    ;;
+  wait-literal)
+    wait_literal_session "$@"
+    ;;
+  wait-and-capture)
+    wait_and_capture_session "$@"
+    ;;
+  capture)
+    capture_session "$@"
+    ;;
+  result)
+    result_session "$@"
+    ;;
+  audit-verify)
+    audit_log_verify "${1:-}"
+    ;;
+  tenant)
+    # Print the effective prefix (with --tenant suffix if any) so callers
+    # can inspect multi-tenant scoping (#118).
+    printf '%s\n' "$PREFIX"
+    exit 0
+    ;;
+  tags)
+    if [[ -z "${1:-}" ]]; then
+      echo "Usage: $SELF $CLI tags <name>" >&2
+      exit 2
+    fi
+    tag_list_json "$1"
+    ;;
+  checkpoint)
+    checkpoint_session "$@"
+    ;;
+  restore)
+    restore_session "$@"
+    ;;
+  status)
+    status_session "$@"
+    ;;
+  ping)
+    ping_session "$@"
+    ;;
+  probe)
+    probe_session "$@"
+    ;;
+  env-doctor)
+    env_doctor_session "$@"
+    ;;
+  doctor)
+    doctor_session
+    ;;
+  self-test)
+    self_test_session
+    ;;
+  list)
+    list_sessions
+    ;;
+  stop)
+    stop_session "$@"
+    ;;
+  -h|--help|help)
+    help_for_subcommand "${1:-}"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
