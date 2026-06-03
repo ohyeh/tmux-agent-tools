@@ -4139,7 +4139,7 @@ doctor_session() {
   require_tmux
   echo "tmux: $TMUX"
   if [[ -n "$CLI_BIN" && -x "$CLI_BIN" ]]; then
-    echo "claude: $CLAUDE"
+    echo "${CLI}: $CLI_BIN"
   else
     echo "${CLI}: not found; start requires ${_ENV_NS}=/path/to/${CLI} or ${CLI} on PATH"
   fi
