@@ -27,8 +27,10 @@ jobs:
 
       - name: Validate shell scripts
         run: |
+          zsh -n skills/tmux-agent-tools/scripts/agent-tmux
           zsh -n skills/tmux-agent-tools/scripts/claude-tmux
           zsh -n skills/tmux-agent-tools/scripts/codex-tmux
+          zsh -n skills/tmux-agent-tools/scripts/agy-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
           zsh -n skills/tmux-agent-tools/scripts/install-bin
