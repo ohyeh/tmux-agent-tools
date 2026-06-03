@@ -406,10 +406,10 @@ require_bins() {
 
   if [[ -z "$CLI_BIN" || ! -x "$CLI_BIN" ]]; then
     local claude_lookup
-    claude_lookup="$(command -v claude 2>/dev/null || true)"
+    claude_lookup="$(command -v "$_bin" 2>/dev/null || true)"
     echo "${CLI} not found at ${CLI_BIN:-<empty>}." >&2
     if [[ -n "$claude_lookup" ]]; then
-      echo "Current PATH resolves claude to: $claude_lookup" >&2
+      echo "Current PATH resolves ${CLI} to: $claude_lookup" >&2
       echo "Unset ${_ENV_NS} or set ${_ENV_NS}=$claude_lookup to use that install." >&2
     else
       echo "Current PATH does not resolve ${CLI}. Install ${CLI} or set ${_ENV_NS}=/path/to/${CLI}." >&2
@@ -2547,7 +2547,7 @@ start_session() {
       exit 1
     fi
     local fresh_workdir
-    fresh_workdir="$(setup_fresh_worktree "$name" "claude" "$directory")" || exit 1
+    fresh_workdir="$(setup_fresh_worktree "$name" "$CLI" "$directory")" || exit 1
     directory="$fresh_workdir"
   fi
 
@@ -2844,7 +2844,7 @@ resume_session() {
       exit 1
     fi
     local fresh_workdir
-    fresh_workdir="$(setup_fresh_worktree "$name" "claude" "$directory")" || exit 1
+    fresh_workdir="$(setup_fresh_worktree "$name" "$CLI" "$directory")" || exit 1
     directory="$fresh_workdir"
   fi
 
@@ -4289,20 +4289,20 @@ env_doctor_session() {
 
   for pid in $(descendant_pids "$pane_pid"); do
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [[ "$command_line" == *claude* ]]; then
+    if [[ "$command_line" == *${_bin}* || "$command_line" == *${CLI}* ]]; then
       claude_pid="$pid"
     fi
   done
 
   if [[ -z "$claude_pid" ]]; then
-    echo "session env: <no claude child found under $session pane pid $pane_pid>"
+    echo "session env: <no ${CLI} child found under $session pane pid $pane_pid>"
     return 1
   fi
 
   echo "session: $session"
   echo "pane_pid: $pane_pid"
-  echo "claude_pid: $claude_pid"
-  env_doctor_print_map "claude process env" "process:$claude_pid"
+  echo "${CLI}_pid: $claude_pid"
+  env_doctor_print_map "${CLI} process env" "process:$claude_pid"
 }
 
 status_pane_text() {
