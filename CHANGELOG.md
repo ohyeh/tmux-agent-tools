@@ -29,7 +29,7 @@
 ### Changed
 
 - Per-CLI `TMUX_CONF` default path is now `${TMPDIR:-/tmp}/agent-tmux-<cli>.tmux.conf`
-  (scoped per CLI; `*_TMUX_CONF` overrides are still honoured).
+  (scoped per CLI; `*_TMUX_CONF` overrides are still honored).
 
 ## v0.13.0 - 2026-06-01
 
