@@ -24,7 +24,7 @@ fi
 export CODEX="$AGY"
 
 # Antigravity's permissive launch flag (Codex's --yolo equivalent).
-export CODEX_TMUX_LAUNCH_FLAGS="${CODEX_TMUX_LAUNCH_FLAGS:---dangerously-skip-permissions}"
+export CODEX_TMUX_LAUNCH_FLAGS="${CODEX_TMUX_LAUNCH_FLAGS---dangerously-skip-permissions}"
 # Distinct session prefix so inventory/cleanup never confuse agy with codex sessions.
 export CODEX_TMUX_PREFIX="${CODEX_TMUX_PREFIX:-agy-cli}"
 
