@@ -61,6 +61,28 @@ Branched off `refactor/skill-progressive-disclosure` (dev tip, contains the desi
 `status probe` heuristic feature), NOT `main` — `main` (1f30b1c) is ~477 lines behind and lacks the
 probe feature. PR target decided at PR time (likely after dev branch merges to main).
 
+## Codex review — round 1 (verdict: ACCEPT_WITH_CHANGES)
+
+Reviewed commit 7e3266d via a codex teammate (tmux-agent-tools). Core parity **confirmed with
+no defects** in: resume syntax, session prefix, status `tool`, dry-run `tool`, probe metric set,
+and fuse-watcher self-reinvocation. The three items it raised are all **intentional, documented
+design changes — not regressions**:
+
+1. **LAUNCH_FLAGS override** (`CODEX_TMUX_LAUNCH_FLAGS` / `AGENT_TMUX_LAUNCH_FLAGS`). Pristine
+   codex-tmux always launched `--yolo`; agent-tmux lets that be overridden. **Default (no override)
+   is byte-identical (`--yolo`)** — the override is opt-in new capability per design §"Env Precedence".
+2. **`AGENT_TMUX_*` universal fallback.** New cross-CLI override namespace per design §"Env
+   Precedence". With no `AGENT_TMUX_*` set in the environment, behaviour is identical to pristine.
+   Caveat acknowledged: an *ambient* `AGENT_TMUX_*` var now influences any CLI — that is the
+   intended semantics of a universal namespace, and CLI-specific vars still take precedence.
+3. **TMUX_CONF default path** `/tmp/<cli>-tmux.tmux.conf` → `/tmp/agent-tmux-<cli>.tmux.conf`
+   (deviation #5 above). Regenerated tmp file; `*_TMUX_CONF` override still honoured.
+
+**Parity contract, stated precisely:** with no `AGENT_TMUX_*` / `*_TMUX_LAUNCH_FLAGS` /
+`*_TMUX_CONF` overrides set (the default environment the existing tests and callers run in),
+`agent-tmux <cli>` is behaviour-identical to the original `<cli>-tmux`. The new env knobs are
+additive opt-in. No code change required from round 1.
+
 ## Verification gate
 
 - `zsh -n` on agent-tmux + all shims.
