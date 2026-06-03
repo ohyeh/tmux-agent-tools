@@ -64,10 +64,19 @@ out="$("$AGENT" pair codex demo "$WORK/work" --workers 2)"
 contains "w1 restarted" "$out" "demo-w1  codex  started"
 contains "w2 still resumed" "$out" "demo-w2  codex  resumed"
 
-echo "case: conservative scale-down → w2 orphan, not stopped"
+echo "case: conservative scale-down → w2 orphan, retained in state, not stopped"
 out="$("$AGENT" pair codex demo "$WORK/work" --workers 1)"
-contains "w2 orphan-warned" "$out" "demo-w2  orphan"
+contains "w2 orphan-warned" "$out" "demo-w2  codex  orphan"
 assert "w2 still running (not auto-stopped)" "$("$AGENT" codex status --json demo-w2 | jq -r .running)" "true"
+sf="$TMUX_AGENT_DIR/teams/demo.json"
+assert "w2 retained in state (deterministic for team stop/results)" \
+  "$(jq -r '[.members[].name] | index("demo-w2") != null' "$sf")" "true"
+assert "w2 keeps stored cli in state" "$(jq -r '.members[]|select(.name=="demo-w2")|.cli' "$sf")" "codex"
+
+echo "case: reconcile uses STORED member cli, not the new --worker-cli"
+out="$("$AGENT" pair codex demo "$WORK/work" --workers 1 --worker-cli claude)"
+contains "w1 reconciled as codex (stored), not claude" "$out" "demo-w1  codex  resumed"
+assert "w1 cli unchanged in state" "$(jq -r '.members[]|select(.name=="demo-w1")|.cli' "$sf")" "codex"
 
 echo "case: pair rejects bad --workers"
 code=0; "$AGENT" pair codex demo "$WORK/work" --workers 0 >/dev/null 2>&1 || code=$?
