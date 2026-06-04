@@ -22,7 +22,16 @@
   "interface": {
     "displayName": "tmux-agent-tools",
     "shortDescription": "Supervise Claude Code / Codex CLI as controllable tmux sessions",
+    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill with no MCP server or hooks.",
     "developerName": "PaulYeh",
-    "category": "Productivity"
+    "category": "Productivity",
+    "capabilities": [
+      "Run Claude Code or Codex CLI as named, supervised tmux sessions",
+      "Send prompts, wait for markers, and capture pane output without attaching",
+      "Read structured result.json files instead of scraping panes",
+      "Gate destructive actions behind human approval files",
+      "Orchestrate multi-agent pair and team review workflows"
+    ],
+    "defaultPrompt": "Use claude-tmux or codex-tmux to start a supervised agent session for this task and report its structured result."
   }
 }
