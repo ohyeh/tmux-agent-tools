@@ -111,6 +111,26 @@ Install globally for all projects:
 npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools --global
 ```
 
+## Install as a CLI Plugin
+
+The repository doubles as a plugin for agent CLIs. Every manifest points at the same
+`./skills/` directory, so the skill content is identical across CLIs — only the wrapper
+manifest differs. No MCP server or hooks are involved; this is a skill plus shell wrappers.
+
+Claude Code (the repository is its own marketplace):
+
+```bash
+/plugin marketplace add ohyeh/tmux-agent-tools
+/plugin install tmux-agent-tools@tmux-agent-tools
+```
+
+Codex CLI and Cursor read `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json`
+respectively from a clone of this repository; both expose the same skill.
+
+The plugin installs the skill, not the `*-tmux` binaries. To get `claude-tmux`,
+`codex-tmux`, and the helpers on `PATH`, still use Homebrew or `install-bin` below; the
+skill resolves the bundled scripts from its own directory when they are not on `PATH`.
+
 ## Install Commands With Homebrew
 
 This repository intentionally uses the project name `tmux-agent-tools` instead of Homebrew's `homebrew-` prefix. Because of that, tap it with the explicit Git URL.
