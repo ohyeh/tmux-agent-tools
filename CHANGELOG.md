@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v0.15.0 - 2026-06-04
+
+### Added
+
+- Plugin-form distribution. The repository now ships CLI plugin manifests, all
+  pointing at the same `./skills/` directory (no duplicated content):
+  - `.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json` — installable
+    via `/plugin marketplace add ohyeh/tmux-agent-tools` then
+    `/plugin install tmux-agent-tools@tmux-agent-tools` in Claude Code.
+  - `.codex-plugin/plugin.json` — skills-only manifest for Codex CLI.
+  - `.cursor-plugin/plugin.json` — skills-only manifest for Cursor.
+  No MCP server or hooks are declared: this project is a skill + shell wrappers,
+  so the manifests intentionally expose only the shared skill.
+
 ## v0.14.0 - 2026-06-04
 
 ### Added

@@ -1,0 +1,37 @@
+{
+  "name": "tmux-agent-tools",
+  "version": "0.15.0",
+  "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: start/resume, send, wait, capture, status/doctor, result files, human approval gates, and multi-agent pair/team orchestration.",
+  "author": {
+    "name": "PaulYeh",
+    "url": "https://github.com/ohyeh"
+  },
+  "homepage": "https://github.com/ohyeh/tmux-agent-tools#readme",
+  "repository": "https://github.com/ohyeh/tmux-agent-tools",
+  "keywords": [
+    "tmux",
+    "claude-code",
+    "codex",
+    "agent",
+    "orchestration",
+    "multi-agent",
+    "session",
+    "supervision"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "tmux-agent-tools",
+    "shortDescription": "Supervise Claude Code / Codex CLI as controllable tmux sessions",
+    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill with no MCP server or hooks.",
+    "developerName": "PaulYeh",
+    "category": "Productivity",
+    "capabilities": [
+      "Run Claude Code or Codex CLI as named, supervised tmux sessions",
+      "Send prompts, wait for markers, and capture pane output without attaching",
+      "Read structured result.json files instead of scraping panes",
+      "Gate destructive actions behind human approval files",
+      "Orchestrate multi-agent pair and team review workflows"
+    ],
+    "defaultPrompt": "Use claude-tmux or codex-tmux to start a supervised agent session for this task and report its structured result."
+  }
+}
