@@ -33,24 +33,21 @@ preset_for_cli() {
 preset_for_cli "$CLI"
 
 # Use-time profile selection (highest priority, before env/default dirs):
-#   --profile-dir <dir>   look up <cli>.conf in a user-managed directory
-#   --profile <file>      load this exact profile file
-# Stripped here so subcommands never see them.
+#   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
+# Only recognized in this leading position (between <cli> and <command>);
+# scanning stops at the first non-flag token so subcommand payloads (e.g.
+# send text) are never consumed.
 _PROFILE_DIR_FLAG=''
 _PROFILE_FILE_FLAG=''
-_profile_args=()
 while (( $# > 0 )); do
   case "$1" in
     --profile-dir)   [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile-dir needs a path" >&2; exit 2; }; _PROFILE_DIR_FLAG="$2"; shift 2 ;;
     --profile-dir=*) _PROFILE_DIR_FLAG="${1#--profile-dir=}"; shift ;;
     --profile)       [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile needs a file path" >&2; exit 2; }; _PROFILE_FILE_FLAG="$2"; shift 2 ;;
     --profile=*)     _PROFILE_FILE_FLAG="${1#--profile=}"; shift ;;
-    *) _profile_args+=("$1"); shift ;;
+    *) break ;;
   esac
 done
-if (( ${#_profile_args[@]} > 0 )); then
-  set -- "${_profile_args[@]}"
-fi
 
 # Declarative CLI profile: <dir>/<cli>.conf overrides the preset above.
 # Search order: --profile-dir > $AGENT_TMUX_PROFILE_DIR >
@@ -164,7 +161,7 @@ usage() {
 agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
-  agent-tmux [--profile <file> | --profile-dir <dir>] <command> ...
+  agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
   agent-tmux start [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   agent-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
