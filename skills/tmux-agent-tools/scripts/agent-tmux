@@ -204,10 +204,10 @@ Usage:
   agent-tmux ping [--timeout <s>] [--json] <name>
   agent-tmux probe --metric <metric> [--json] <name>
   agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>
-  agent-tmux room post <team> --from <member> [--topic t] <text...>
-  agent-tmux room read <team> --member <m> [--since <seq>] [--topic t] [--json]
-  agent-tmux room wait <team> --member <m> [--since <seq>] [--topic t] [--timeout 300] [--interval 5] [--json]
-  agent-tmux room status <team> [--json]
+  agent-tmux room post <team> --from <member> [--topic t] <text...> [--hub user@host]
+  agent-tmux room read <team> --member <m> [--since <seq>] [--topic t] [--json] [--hub user@host]
+  agent-tmux room wait <team> --member <m> [--since <seq>] [--topic t] [--timeout 300] [--interval 5] [--json] [--hub user@host]
+  agent-tmux room status <team> [--json] [--hub user@host]
   agent-tmux env-doctor [name]
   agent-tmux doctor
   agent-tmux self-test
@@ -5638,6 +5638,29 @@ _room_local_status() {
   return 0
 }
 
+_room_ssh_dispatch() {
+  # _room_ssh_dispatch <hub> <verb> [args...]
+  # Forwards "agent-tmux room <verb> [args...]" to hub via SSH.
+  # stdout/stderr pass through unmodified; remote exit 0-3 pass through.
+  # SSH-layer failure (exit 255 or other non-remote error) → exit 2 + JSON error on stderr.
+  local hub="$1"; shift
+  local -a remote_cmd
+  remote_cmd=(agent-tmux room "$@")
+  local quoted_cmd
+  quoted_cmd="$(printf '%q ' "${remote_cmd[@]}")"
+  local rc
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$hub" "$quoted_cmd" && rc=0 || rc=$?
+  if (( rc == 255 )); then
+    _room_json_error "ssh_failed" "hub" "$hub" "detail" "SSH connection or auth failed" >&2
+    return 2
+  elif (( rc > 3 )); then
+    # Any other SSH-layer error (not a remote agent-tmux exit code) → exit 2
+    _room_json_error "ssh_failed" "hub" "$hub" "detail" "SSH exited with code $rc" >&2
+    return 2
+  fi
+  return $rc
+}
+
 _room_backend() {
   local hub="${AGENT_TMUX_ROOM_HUB:-}"
   local sub="$1"; shift
@@ -5650,8 +5673,14 @@ _room_backend() {
     esac
   done
   if [[ -n "$hub" && "$hub" != "local" ]]; then
-    echo "room backend '$hub' not implemented yet" >&2
-    return 2
+    if [[ "$hub" == *@* && "$hub" != https://* ]]; then
+      # SSH backend: user@host pattern
+      _room_ssh_dispatch "$hub" "$sub" "${rest[@]}"
+      return $?
+    else
+      echo "room backend '$hub' not implemented yet" >&2
+      return 2
+    fi
   fi
   case "$sub" in
     post)   _room_local_post   "${rest[@]}" ;;
