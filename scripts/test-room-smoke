@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Smoke test for agent-tmux room subcommand (P3-tests packet).
 #
-# Covers 18 protocol cases:
+# Covers 17 executable cases (case 12 merged into case 16):
 #  1.  post→read roundtrip + --json schema
 #  2.  wait wakeup (background post) + no-message exit 1
 #  3.  quota enforcement + invalid env exit 2
@@ -13,11 +13,12 @@
 #  9.  injection: bad from/topic exit 2, msg with special chars round-trips cleanly
 # 10.  membership: --from non-member exit 2
 # 11.  stale lock recovery: dead-pid lock dir reclaimed, post succeeds
-# 12.  (superseded by 16)
+# 12.  (superseded by 16; no separate executable case)
 # 13.  --since explicit: cursor file not created/modified
 # 14.  doctor equivalence: 5 wrapper CLIs, doctor output stable (uses fake bins)
 # 15.  read-side auth: non-member read/wait/status --member exit 2, no cursor file
 # 16.  dirty file fail-closed: truncated line → read/wait/status exit 2 + JSON error
+#      (stderr always contains stable JSON even without --json)
 # 17.  at-least-once: concurrent reads may duplicate but cursor finalises correctly
 # 18.  team name injection: ../evil, path with / → exit 2, no stray files
 #
@@ -375,6 +376,34 @@ for subcli in claude codex; do
   assert_eq "doctor stable: agent-tmux $subcli" "$out1" "$out2"
 done
 
+# Baseline comparison against df8be63 (room feature introduction commit).
+# Strategy: extract baseline, run doctor on both, then verify every line present in the
+# baseline is also present in HEAD output.  HEAD may have additional lines (e.g. the new
+# "profile:" field added post-df8be63) — that is intentional forward-growth, not regression.
+# Limitation: requires git; skipped gracefully if unavailable.
+_baseline_agent="$WORK/baseline-agent-tmux"
+if git -C "$REPO_ROOT" show df8be63:skills/tmux-agent-tools/scripts/agent-tmux > "$_baseline_agent" 2>/dev/null; then
+  chmod +x "$_baseline_agent"
+  _b_out="$(PATH="$FAKEDIR:$PATH" TMUX_AGENT_DIR="$WORK/state14b" "$_baseline_agent" claude doctor 2>&1)"
+  _c_out="$(PATH="$FAKEDIR:$PATH" TMUX_AGENT_DIR="$WORK/state14b" "$AGENT" claude doctor 2>&1)"
+  # Check every baseline line is present in HEAD (subset check, not equality).
+  # Skip lines whose key may change in format while keeping the same semantics
+  # (e.g. "profile:" was "<none>" in df8be63 but now shows the actual path).
+  _missing=0
+  while IFS= read -r _bline; do
+    [[ -z "$_bline" ]] && continue
+    # Skip profile line: df8be63 printed "profile: <none>"; HEAD prints the resolved path
+    [[ "$_bline" == profile:* ]] && continue
+    if [[ "$_c_out" != *"$_bline"* ]]; then
+      fail "doctor baseline: HEAD missing line from df8be63: '$_bline'" "HEAD output: $_c_out"
+      _missing=1
+    fi
+  done <<< "$_b_out"
+  (( _missing == 0 )) && ok "doctor baseline df8be63 lines all present in HEAD (claude)"
+else
+  ok "doctor baseline: git show df8be63 unavailable, skipped"
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== Case 15: read-side auth: non-member read/wait/status --member exit 2 ==="
 make_team "t15" "alice"
@@ -420,26 +449,39 @@ jsonl16="$TMUX_AGENT_DIR/teams/t16.room.jsonl"
 # Append a truncated (non-JSON) line
 printf 'TRUNCATED_GARBAGE\n' >> "$jsonl16"
 
-# read → exit 2
-rc=0; read_out16="$("$AGENT" room read t16 --member alice --json 2>&1)" || rc=$?
+# Helper: capture stderr to a temp file (portable; $() cannot capture stderr directly)
+_errf16="$(mktemp)"
+trap 'rm -f "$_errf16"' EXIT
+
+# read --json → exit 2 + JSON error on stdout
+rc=0; read_out16="$("$AGENT" room read t16 --member alice --json 2>/dev/null)" || rc=$?
 assert_exit "corrupt file: read exit 2" "2" "$rc"
-# JSON error should contain room_file_corrupt
 rc2=0; printf '%s' "$read_out16" | jq -e '.error == "room_file_corrupt"' >/dev/null 2>&1 || rc2=$?
-assert_exit "corrupt file: read --json has error=room_file_corrupt" "0" "$rc2"
+assert_exit "corrupt file: read --json has error=room_file_corrupt (stdout)" "0" "$rc2"
 
-# wait → exit 2
-rc=0; "$AGENT" room wait t16 --member alice --timeout 1 --interval 1 2>/dev/null || rc=$?
+# read (plain) → stderr must have stable JSON error even without --json
+rc=0; "$AGENT" room read t16 --member alice >/dev/null 2>"$_errf16" || rc=$?
+assert_exit "corrupt file: read plain exit 2" "2" "$rc"
+rc2=0; jq -e '.error == "room_file_corrupt"' "$_errf16" >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: read plain stderr has JSON error=room_file_corrupt" "0" "$rc2"
+
+# wait → exit 2 + stderr JSON error (plain mode)
+rc=0; "$AGENT" room wait t16 --member alice --timeout 1 --interval 1 >/dev/null 2>"$_errf16" || rc=$?
 assert_exit "corrupt file: wait exit 2" "2" "$rc"
+rc2=0; jq -e '.error == "room_file_corrupt"' "$_errf16" >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: wait stderr has JSON error=room_file_corrupt" "0" "$rc2"
 
-# status → exit 2
-rc=0; "$AGENT" room status t16 2>/dev/null || rc=$?
+# status (plain) → exit 2 + stderr JSON error
+rc=0; "$AGENT" room status t16 >/dev/null 2>"$_errf16" || rc=$?
 assert_exit "corrupt file: status exit 2" "2" "$rc"
+rc2=0; jq -e '.error == "room_file_corrupt"' "$_errf16" >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: status plain stderr has JSON error=room_file_corrupt" "0" "$rc2"
 
-# status --json → exit 2 + JSON error
-rc=0; status_out16="$("$AGENT" room status t16 --json 2>&1)" || rc=$?
+# status --json → exit 2 + JSON error on stdout
+rc=0; status_out16="$("$AGENT" room status t16 --json 2>/dev/null)" || rc=$?
 assert_exit "corrupt file: status --json exit 2" "2" "$rc"
 rc2=0; printf '%s' "$status_out16" | jq -e '.error == "room_file_corrupt"' >/dev/null 2>&1 || rc2=$?
-assert_exit "corrupt file: status --json has error=room_file_corrupt" "0" "$rc2"
+assert_exit "corrupt file: status --json has error=room_file_corrupt (stdout)" "0" "$rc2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== Case 17: at-least-once - concurrent reads may duplicate, cursor finalises correctly ==="
