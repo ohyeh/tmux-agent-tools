@@ -1,6 +1,6 @@
 ---
 name: tmux-agent-tools
-description: Use when running or supervising AI coding CLIs (Claude Code, Codex, or any custom CLI) as managed tmux workers via agent-tmux, claude-tmux, codex-tmux, or tmux-agent-sessions. Covers start/resume, send, wait, capture, status/doctor/self-test, list, stop/cleanup, reading structured result.json files, watching multiple workers for the first/all completions (watch --any, no hand-rolled polling loops), human approval gates, declarative per-CLI profiles for adding new or renamed CLIs, and multi-agent pair-review, critic, debate, dialogue, or fanout. Also use for questions like "which worker finished first", "wait for any of these agents", or "supervise this long-running agent". Trigger on tmux as the execution layer for managed AI agent sessions; not for general tmux config, theming, shell wrappers, non-tmux headless claude/codex, or human team debate.
+description: Use when running or supervising AI coding CLIs (Claude Code, Codex, or any custom CLI) as managed tmux workers via agent-tmux, claude-tmux, codex-tmux, or tmux-agent-sessions. Covers start/resume, send, wait, capture, status/doctor/self-test, list, stop/cleanup, reading structured result.json files, watching multiple workers for the first/all completions (watch --any, no hand-rolled polling loops), human approval gates, declarative per-CLI profiles for adding new or renamed CLIs, multi-agent pair-review, critic, debate, dialogue, or fanout, and a chat-style room bus for workers to exchange status messages. Also use for questions like "which worker finished first", "wait for any of these agents", "supervise this long-running agent", "let my workers talk to each other", or 「worker 之間互相通知」. Trigger on tmux as the execution layer for managed AI agent sessions; not for general tmux config, theming, shell wrappers, non-tmux headless claude/codex, or human team debate.
 ---
 
 # Tmux Agent Tools
@@ -11,6 +11,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 - **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>`. Pane capture is fallback evidence only.
 - **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `codex-tmux result --json <winner>`.
 - **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
+- **Workers need to exchange status?** `agent-tmux room post <team> --from <worker> --topic status "done with auth module"` → other workers poll with `agent-tmux room read <team> --member <worker>`. No polling loop needed; `room wait` blocks until new messages arrive.
 
 ## Overview
 
@@ -270,6 +271,88 @@ claude-tmux start-ssh --exact review example-host ~/github/project 'Review the d
 ```
 
 Requirements: local `tmux`; remote shell can resolve `claude` or `codex` on `PATH`; SSH target preconfigured.
+
+## Room (team chat bus)
+
+`agent-tmux room` is a lightweight, append-only message bus scoped to a named team. Workers post short status messages; other workers read or wait for new ones. It complements `result.json` and `send`: use the bus for **lateral, real-time status** between peers, not for orchestrator commands (use `send`) and not for final structured results (use `result.json`).
+
+### Commands
+
+```bash
+# post a status update from a worker
+agent-tmux room post <team> --from <member> [--topic <t>] <text…>
+
+# read new messages since the cursor (advances cursor)
+agent-tmux room read <team> --member <m> [--since <seq>] [--topic <t>] [--json]
+
+# block until new messages arrive (same semantics as read, exits 1 on timeout)
+agent-tmux room wait <team> --member <m> [--since <seq>] [--topic <t>] \
+  [--timeout 300] [--interval 5] [--json]
+
+# show members, message count, per-member cursors, quota usage
+agent-tmux room status <team> [--json]
+```
+
+### Examples
+
+```bash
+# --- Orchestrator: check what workers have reported ---
+agent-tmux room read sprint --member orchestrator --json
+
+# --- Worker w1: report completion of a stage ---
+agent-tmux room post sprint --from w1 --topic status "auth module done, tests green"
+
+# --- Worker w2: block until there's something new, then continue ---
+agent-tmux room wait sprint --member w2 --timeout 120
+agent-tmux room read sprint --member w2 --json
+
+# --- Orchestrator: inspect the room state ---
+agent-tmux room status sprint --json
+```
+
+Topic filtering (`--topic`) is stateless: it does **not** advance the cursor. Use it with `--since` when you want to scan for a specific topic without consuming the full stream.
+
+### Worker prompt conventions
+
+When embedding room use in a worker prompt, include these conventions explicitly:
+
+1. **Read before proceeding**: after completing each stage, run `agent-tmux room read <team> --member <name> --json` to pick up messages from peers before starting the next stage.
+2. **Report via room**: post stage completions with `agent-tmux room post <team> --from <name> --topic status "<summary>"` so the orchestrator and peers can see progress without polling pane captures.
+3. **Quota**: state the quota limit in the prompt (default 200 posts per member per room). Workers should batch their updates rather than spamming one message per line.
+4. **Cascade ban**: do not spawn sub-workers from within a room-enabled worker unless the orchestrator has explicitly authorized it.
+
+Template snippet for a worker prompt:
+
+```
+You are worker w2 on team sprint.
+- After finishing each stage, read the room: agent-tmux room read sprint --member w2 --json
+- Report your stage completions: agent-tmux room post sprint --from w2 --topic status "<what you finished>"
+- Quota: 200 posts maximum. Batch updates; do not post every line.
+- Do NOT post secrets, tokens, API keys, or sensitive diffs to the room.
+- Do not start sub-workers. Write your final result to <literal result path>.
+```
+
+### Division of labor
+
+| Channel | Purpose | When |
+| --- | --- | --- |
+| `codex-tmux send` / `claude-tmux send` | Orchestrator → worker instructions | Sending the next task |
+| `agent-tmux room post/read/wait` | Worker ↔ worker lateral status | Peer coordination, progress reports |
+| `result.json` | Worker → orchestrator final result | Task complete, structured output |
+
+The room is not an interrupt channel. `room wait` polls at `--interval` (default 5 s); it does not push notifications. Workers must cooperate by posting updates voluntarily.
+
+### Delivery semantics and caveats
+
+- **At-least-once delivery**: the same member can call `room read` concurrently from multiple processes. Cursor writes are serialized under the room lock and monotonically increase, so messages are never dropped, but a message may be delivered more than once if two reads race before either updates the cursor. Callers must be idempotent with respect to duplicate message delivery.
+- **Cooperative mailbox**: the room is not a locking queue or a single-consumer channel. All members of the team have independent cursors and read independently.
+- **No ordering guarantee across members**: `seq` is a global append-order counter for the room, not a causal clock. Do not rely on seq ordering for distributed consensus.
+
+### Privacy prohibition
+
+`room.jsonl` is a **plaintext local log** stored at `$TMUX_AGENT_DIR/teams/<team>.room.jsonl`. It is not encrypted, not redacted, and not access-controlled beyond filesystem permissions.
+
+**Do not post secrets, API tokens, passwords, private keys, or sensitive diff hunks to any room.** This prohibition applies in worker prompts and in any code that calls `room post`. Treat the room the same way you treat a shared terminal: assume other team members and the operator can read everything.
 
 ## References
 

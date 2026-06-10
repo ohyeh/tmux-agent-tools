@@ -1,0 +1,494 @@
+#!/usr/bin/env zsh
+# Smoke test for agent-tmux room subcommand (P3-tests packet).
+#
+# Covers 18 protocol cases:
+#  1.  post→read roundtrip + --json schema
+#  2.  wait wakeup (background post) + no-message exit 1
+#  3.  quota enforcement + invalid env exit 2
+#  4.  concurrent post: no dup/gap seqs, all valid JSON
+#  5.  bad input: team not found / --timeout 0 / --interval 0 / --hub remote
+#  6.  cursor monotonicity: topic-filtered read does NOT advance cursor
+#  7.  concurrent read: cursor does not go backwards (max semantics)
+#  8.  wait with --topic that never matches: exit 1
+#  9.  injection: bad from/topic exit 2, msg with special chars round-trips cleanly
+# 10.  membership: --from non-member exit 2
+# 11.  stale lock recovery: dead-pid lock dir reclaimed, post succeeds
+# 12.  (superseded by 16)
+# 13.  --since explicit: cursor file not created/modified
+# 14.  doctor equivalence: 5 wrapper CLIs, doctor output stable (uses fake bins)
+# 15.  read-side auth: non-member read/wait/status --member exit 2, no cursor file
+# 16.  dirty file fail-closed: truncated line → read/wait/status exit 2 + JSON error
+# 17.  at-least-once: concurrent reads may duplicate but cursor finalises correctly
+# 18.  team name injection: ../evil, path with / → exit 2, no stray files
+#
+# Black-box CLI testing; TMUX_AGENT_DIR set to mktemp sandbox.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+[[ -x "$AGENT" ]] || { echo "not executable: $AGENT" >&2; exit 1; }
+
+WORK="$(mktemp -d -t tmux-agent-room-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+mkdir -p "$TMUX_AGENT_DIR/teams"
+
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0; FAIL=0
+
+ok()    { echo "  ok   $1"; PASS=$((PASS+1)); }
+fail()  { echo "  FAIL $1" >&2; echo "    $2" >&2; FAIL=$((FAIL+1)); }
+
+assert_eq() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then ok "$label"
+  else fail "$label" "expected='$expected' got='$actual'"; fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then ok "$label"
+  else fail "$label" "needle='$needle' not in '$haystack'"; fi
+}
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then ok "$label"
+  else fail "$label" "needle='$needle' should be absent but found"; fi
+}
+
+assert_exit() {
+  local label="$1" expected_rc="$2" actual_rc="$3"
+  if [[ "$actual_rc" == "$expected_rc" ]]; then ok "$label"
+  else fail "$label" "expected exit $expected_rc got $actual_rc"; fi
+}
+
+# Helper: create a minimal team JSON with members array (strings)
+make_team() {
+  local name="$1"; shift
+  local members_json="[]"
+  for m in "$@"; do
+    members_json="$(printf '%s' "$members_json" | jq -c --arg m "$m" '. + [$m]')"
+  done
+  printf '{"name":"%s","members":%s}\n' "$name" "$members_json" \
+    > "$TMUX_AGENT_DIR/teams/${name}.json"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 1: post→read roundtrip + --json schema ==="
+make_team "t1" "alice" "bob"
+
+rc=0; post_out="$("$AGENT" room post t1 --from alice Hello world 2>&1)" || rc=$?
+assert_exit "post exit 0" "0" "$rc"
+assert_contains "post output has seq" "$post_out" "posted seq="
+
+# plain read
+read_out="$("$AGENT" room read t1 --member alice 2>&1)"
+assert_contains "read delivers message" "$read_out" "Hello world"
+
+# --json read
+json_out="$("$AGENT" room read t1 --member bob --json 2>&1)"
+rc=0; printf '%s' "$json_out" | jq -e '.messages | length > 0' >/dev/null 2>&1 || rc=$?
+assert_exit "json read parses, has messages" "0" "$rc"
+rc=0; printf '%s' "$json_out" | jq -e '.cursor' >/dev/null 2>&1 || rc=$?
+assert_exit "json read has cursor field" "0" "$rc"
+
+# cursor advanced for alice (already read above without --since)
+# Second read should yield 0 messages
+read_out2="$("$AGENT" room read t1 --member alice 2>&1)"
+assert_eq "second read empty (cursor advanced)" "$read_out2" ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 2: wait wakeup + no-message exit 1 ==="
+make_team "t2" "alice" "bob"
+
+# No messages → wait exit 1
+rc=0; "$AGENT" room wait t2 --member alice --timeout 1 --interval 1 2>/dev/null || rc=$?
+assert_exit "wait with no messages exit 1" "1" "$rc"
+
+# Post in background, then wait should wake up
+"$AGENT" room post t2 --from bob "wake up" >/dev/null
+rc=0; wait_out="$("$AGENT" room wait t2 --member alice --timeout 5 --interval 1 2>&1)" || rc=$?
+assert_exit "wait wakeup exit 0" "0" "$rc"
+assert_contains "wait delivers message" "$wait_out" "wake up"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 3: quota enforcement + invalid env ==="
+make_team "t3" "alice"
+
+# quota=2, third post should exit 3
+AGENT_TMUX_ROOM_QUOTA=2 "$AGENT" room post t3 --from alice "msg1" >/dev/null
+AGENT_TMUX_ROOM_QUOTA=2 "$AGENT" room post t3 --from alice "msg2" >/dev/null
+rc=0; AGENT_TMUX_ROOM_QUOTA=2 "$AGENT" room post t3 --from alice "msg3" 2>/dev/null || rc=$?
+assert_exit "third post hits quota exit 3" "3" "$rc"
+
+# invalid quota values → exit 2
+for badq in 0 -1 abc 99999 10001; do
+  rc=0; AGENT_TMUX_ROOM_QUOTA=$badq "$AGENT" room post t3 --from alice "x" 2>/dev/null || rc=$?
+  assert_exit "quota=$badq exit 2" "2" "$rc"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 4: concurrent post: no dup/gap seqs, all valid JSON ==="
+make_team "t4" "alice" "bob"
+
+(
+  "$AGENT" room post t4 --from alice "concurrent-a" >/dev/null
+) &
+pid_a=$!
+(
+  "$AGENT" room post t4 --from bob "concurrent-b" >/dev/null
+) &
+pid_b=$!
+wait $pid_a $pid_b
+
+jsonl="$TMUX_AGENT_DIR/teams/t4.room.jsonl"
+line_count="$(wc -l < "$jsonl" | tr -d ' ')"
+assert_eq "concurrent posts: 2 lines" "$line_count" "2"
+
+# All lines valid JSON
+bad_json=0
+while IFS= read -r line; do
+  printf '%s' "$line" | jq -e . >/dev/null 2>&1 || bad_json=1
+done < "$jsonl"
+assert_eq "all lines valid JSON" "$bad_json" "0"
+
+# seqs are 1 and 2 (no dup, no gap)
+seqs="$(jq -s 'map(.seq) | sort | join(",")' "$jsonl")"
+assert_eq "seqs 1,2 no dup/gap" "$seqs" '"1,2"'
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 5: bad input ==="
+make_team "t5" "alice"
+
+# team not found
+rc=0; "$AGENT" room post no_such_team --from alice "hi" 2>/dev/null || rc=$?
+assert_exit "post nonexistent team exit 2" "2" "$rc"
+
+rc=0; "$AGENT" room read no_such_team --member alice 2>/dev/null || rc=$?
+assert_exit "read nonexistent team exit 2" "2" "$rc"
+
+# --timeout 0
+rc=0; "$AGENT" room wait t5 --member alice --timeout 0 --interval 1 2>/dev/null || rc=$?
+assert_exit "wait --timeout 0 exit 2" "2" "$rc"
+
+# --interval 0
+rc=0; "$AGENT" room wait t5 --member alice --timeout 5 --interval 0 2>/dev/null || rc=$?
+assert_exit "wait --interval 0 exit 2" "2" "$rc"
+
+# --hub remote (not implemented)
+rc=0; "$AGENT" room post t5 --hub remote --from alice "hi" 2>/dev/null || rc=$?
+assert_exit "hub=remote exit 2" "2" "$rc"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 6: cursor monotonicity - topic-filtered read does not advance cursor ==="
+make_team "t6" "alice"
+
+"$AGENT" room post t6 --from alice --topic general "msg-general" >/dev/null
+"$AGENT" room post t6 --from alice --topic status  "msg-status"  >/dev/null
+
+# Topic-filtered read for 'other' topic → no messages, cursor NOT created
+rc=0; topic_out="$("$AGENT" room read t6 --member alice --topic other 2>&1)" || rc=$?
+cursor_file="$TMUX_AGENT_DIR/teams/t6.room-cursors/alice"
+# Cursor should not exist yet (no topic-free read done)
+if [[ ! -f "$cursor_file" ]]; then
+  ok "topic read did not create cursor file"
+else
+  # If cursor was created from earlier, check it's 0
+  cval="$(cat "$cursor_file")"
+  assert_eq "cursor not advanced by topic read" "$cval" "0"
+fi
+
+# Now do a plain (no topic) read → delivers both msgs, advances cursor
+plain_out="$("$AGENT" room read t6 --member alice 2>&1)"
+assert_contains "plain read delivers general msg" "$plain_out" "msg-general"
+assert_contains "plain read delivers status msg" "$plain_out" "msg-status"
+
+# Cursor should now be 2
+[[ -f "$cursor_file" ]] && cval="$(cat "$cursor_file")" || cval="0"
+assert_eq "cursor=2 after plain read" "$cval" "2"
+
+# Another plain read: nothing new
+plain_out2="$("$AGENT" room read t6 --member alice 2>&1)"
+assert_eq "plain read 2 empty" "$plain_out2" ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 7: concurrent reads - cursor does not go backwards ==="
+make_team "t7" "alice"
+
+for i in 1 2 3 4 5; do
+  "$AGENT" room post t7 --from alice "m$i" >/dev/null
+done
+
+# Two concurrent reads from scratch (cursor starts at 0)
+# Both will try to update cursor; final should be 5 (max)
+"$AGENT" room read t7 --member alice >"$WORK/t7-read-a.out" 2>&1 &
+pid_a=$!
+"$AGENT" room read t7 --member alice >"$WORK/t7-read-b.out" 2>&1 &
+pid_b=$!
+wait $pid_a $pid_b || true
+
+cursor_file="$TMUX_AGENT_DIR/teams/t7.room-cursors/alice"
+final_cursor="$(cat "$cursor_file" 2>/dev/null || echo 0)"
+assert_eq "cursor=5 after concurrent reads" "$final_cursor" "5"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 8: wait --topic that never matches: exit 1 ==="
+make_team "t8" "alice" "bob"
+
+# Post to a different topic
+"$AGENT" room post t8 --from bob --topic other "noise" >/dev/null
+
+rc=0
+"$AGENT" room wait t8 --member alice --topic wanted --timeout 1 --interval 1 2>/dev/null || rc=$?
+assert_exit "wait unmatched topic exit 1" "1" "$rc"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 9: injection defense ==="
+make_team "t9" "alice"
+
+# Bad from: contains special chars → exit 2
+rc=0; "$AGENT" room post t9 --from 'al"ice' "hi" 2>/dev/null || rc=$?
+assert_exit "from with quote exit 2" "2" "$rc"
+
+rc=0; "$AGENT" room post t9 --from 'alice;evil' "hi" 2>/dev/null || rc=$?
+assert_exit "from with semicolon exit 2" "2" "$rc"
+
+# Bad topic: special chars → exit 2
+rc=0; "$AGENT" room post t9 --from alice --topic 'bad topic' "hi" 2>/dev/null || rc=$?
+assert_exit "topic with space exit 2" "2" "$rc"
+
+rc=0; "$AGENT" room post t9 --from alice --topic 'bad"topic' "hi" 2>/dev/null || rc=$?
+assert_exit "topic with quote exit 2" "2" "$rc"
+
+# msg with quotes/backslashes/newline → round-trips as valid JSON
+tricky_msg='say "hello" \n and {"key":"val"}'
+"$AGENT" room post t9 --from alice "$tricky_msg" >/dev/null
+
+jsonl9="$TMUX_AGENT_DIR/teams/t9.room.jsonl"
+bad_json=0
+while IFS= read -r line; do
+  printf '%s' "$line" | jq -e . >/dev/null 2>&1 || bad_json=1
+done < "$jsonl9"
+assert_eq "tricky msg: room.jsonl still all valid JSON" "$bad_json" "0"
+
+retrieved="$(jq -r '.msg' "$jsonl9")"
+assert_eq "tricky msg round-trips correctly" "$retrieved" "$tricky_msg"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 10: membership enforcement on post ==="
+make_team "t10" "alice"
+
+rc=0; "$AGENT" room post t10 --from outsider "hi" 2>/dev/null || rc=$?
+assert_exit "non-member post exit 2" "2" "$rc"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 11: stale lock recovery ==="
+make_team "t11" "alice"
+
+# Plant a stale lock with a dead PID
+stale_lockdir="$TMUX_AGENT_DIR/teams/t11.room.lock"
+mkdir -p "$stale_lockdir"
+echo "2147483646" > "$stale_lockdir/pid"
+
+# post should reclaim the stale lock and succeed
+rc=0; "$AGENT" room post t11 --from alice "after stale lock" 2>/dev/null || rc=$?
+assert_exit "post recovers stale lock exit 0" "0" "$rc"
+
+jsonl11="$TMUX_AGENT_DIR/teams/t11.room.jsonl"
+[[ -f "$jsonl11" ]] && line11="$(wc -l < "$jsonl11" | tr -d ' ')" || line11=0
+assert_eq "message written after stale lock recovery" "$line11" "1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Case 12 is superseded by case 16 (fail-closed). No separate case 12.
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 13: --since explicit does not touch cursor file ==="
+make_team "t13" "alice"
+
+"$AGENT" room post t13 --from alice "early msg" >/dev/null
+"$AGENT" room post t13 --from alice "later msg" >/dev/null
+
+cursor_file13="$TMUX_AGENT_DIR/teams/t13.room-cursors/alice"
+
+# Explicit --since 0: should NOT create cursor file
+"$AGENT" room read t13 --member alice --since 0 >/dev/null
+
+if [[ ! -f "$cursor_file13" ]]; then
+  ok "--since explicit: cursor file not created"
+else
+  fail "--since explicit: cursor file was created unexpectedly" "cursor file exists at $cursor_file13"
+fi
+
+# If the cursor file already existed (from prior call), check it was NOT modified
+# Plant a cursor file with value 99, then check it after --since read
+mkdir -p "$TMUX_AGENT_DIR/teams/t13.room-cursors"
+printf '99\n' > "$cursor_file13"
+before_mtime="$(stat -f '%m' "$cursor_file13" 2>/dev/null || stat -c '%Y' "$cursor_file13" 2>/dev/null || echo 0)"
+sleep 0.05
+"$AGENT" room read t13 --member alice --since 0 >/dev/null
+after_mtime="$(stat -f '%m' "$cursor_file13" 2>/dev/null || stat -c '%Y' "$cursor_file13" 2>/dev/null || echo 0)"
+cursor_val13="$(cat "$cursor_file13")"
+assert_eq "--since explicit: cursor file content unchanged" "$cursor_val13" "99"
+assert_eq "--since explicit: cursor file mtime unchanged" "$before_mtime" "$after_mtime"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 14: doctor equivalence for 5 legacy CLIs (stable output with fake bins) ==="
+# The 5 wrapper CLIs: claude-tmux, codex-tmux, agy-tmux (+ variants via agent-tmux <cli>)
+# We verify that running doctor twice yields identical output.
+# We don't need real CLI binaries — doctor reports paths, and fakes on PATH work.
+# Use fake bins so output is deterministic regardless of installed tools.
+
+FAKEDIR="$WORK/fakebins"
+mkdir -p "$FAKEDIR"
+for bin in claude codex agy; do
+  printf '#!/bin/sh\necho "fake-%s 1.0"\n' "$bin" > "$FAKEDIR/$bin"
+  chmod +x "$FAKEDIR/$bin"
+done
+
+LEGACY_CLIS=(
+  "$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+  "$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+  "$REPO_ROOT/skills/tmux-agent-tools/scripts/agy-tmux"
+)
+
+for cli in "${LEGACY_CLIS[@]}"; do
+  name="$(basename "$cli")"
+  out1="$(PATH="$FAKEDIR:$PATH" TMUX_AGENT_DIR="$WORK/state14" "$cli" doctor 2>&1)"
+  out2="$(PATH="$FAKEDIR:$PATH" TMUX_AGENT_DIR="$WORK/state14" "$cli" doctor 2>&1)"
+  if [[ "$out1" == "$out2" ]]; then
+    ok "doctor stable: $name"
+  else
+    fail "doctor stable: $name" "run1 != run2"
+    echo "  run1: $out1" >&2
+    echo "  run2: $out2" >&2
+  fi
+done
+
+# Also verify agent-tmux with claude/codex sub-CLI modes
+for subcli in claude codex; do
+  out1="$(PATH="$FAKEDIR:$PATH" TMUX_AGENT_DIR="$WORK/state14" "$AGENT" "$subcli" doctor 2>&1)"
+  out2="$(PATH="$FAKEDIR:$PATH" TMUX_AGENT_DIR="$WORK/state14" "$AGENT" "$subcli" doctor 2>&1)"
+  assert_eq "doctor stable: agent-tmux $subcli" "$out1" "$out2"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 15: read-side auth: non-member read/wait/status --member exit 2 ==="
+make_team "t15" "alice"
+
+cursor_file15="$TMUX_AGENT_DIR/teams/t15.room-cursors/outsider"
+
+rc=0; "$AGENT" room read t15 --member outsider 2>/dev/null || rc=$?
+assert_exit "read non-member exit 2" "2" "$rc"
+if [[ ! -f "$cursor_file15" ]]; then
+  ok "read non-member: no cursor file created"
+else
+  fail "read non-member: cursor file created unexpectedly" "$cursor_file15 exists"
+fi
+
+rc=0; "$AGENT" room wait t15 --member outsider --timeout 1 --interval 1 2>/dev/null || rc=$?
+assert_exit "wait non-member exit 2" "2" "$rc"
+if [[ ! -f "$cursor_file15" ]]; then
+  ok "wait non-member: no cursor file created"
+else
+  fail "wait non-member: cursor file created unexpectedly" "$cursor_file15 exists"
+fi
+
+# status --member <outsider> → exit 2 (R15 authorization check), no cursor file created
+rc=0; "$AGENT" room status t15 --member outsider 2>/dev/null || rc=$?
+assert_exit "status --member outsider exit 2" "2" "$rc"
+if [[ ! -f "$cursor_file15" ]]; then
+  ok "status non-member: no cursor file created"
+else
+  fail "status non-member: cursor file created unexpectedly" "$cursor_file15 exists"
+fi
+
+# status --member alice (member) → exit 0
+rc=0; "$AGENT" room status t15 --member alice >/dev/null 2>&1 || rc=$?
+assert_exit "status --member alice exit 0" "0" "$rc"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 16: dirty file fail-closed ==="
+make_team "t16" "alice"
+
+"$AGENT" room post t16 --from alice "good line" >/dev/null
+
+jsonl16="$TMUX_AGENT_DIR/teams/t16.room.jsonl"
+# Append a truncated (non-JSON) line
+printf 'TRUNCATED_GARBAGE\n' >> "$jsonl16"
+
+# read → exit 2
+rc=0; read_out16="$("$AGENT" room read t16 --member alice --json 2>&1)" || rc=$?
+assert_exit "corrupt file: read exit 2" "2" "$rc"
+# JSON error should contain room_file_corrupt
+rc2=0; printf '%s' "$read_out16" | jq -e '.error == "room_file_corrupt"' >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: read --json has error=room_file_corrupt" "0" "$rc2"
+
+# wait → exit 2
+rc=0; "$AGENT" room wait t16 --member alice --timeout 1 --interval 1 2>/dev/null || rc=$?
+assert_exit "corrupt file: wait exit 2" "2" "$rc"
+
+# status → exit 2
+rc=0; "$AGENT" room status t16 2>/dev/null || rc=$?
+assert_exit "corrupt file: status exit 2" "2" "$rc"
+
+# status --json → exit 2 + JSON error
+rc=0; status_out16="$("$AGENT" room status t16 --json 2>&1)" || rc=$?
+assert_exit "corrupt file: status --json exit 2" "2" "$rc"
+rc2=0; printf '%s' "$status_out16" | jq -e '.error == "room_file_corrupt"' >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: status --json has error=room_file_corrupt" "0" "$rc2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 17: at-least-once - concurrent reads may duplicate, cursor finalises correctly ==="
+make_team "t17" "alice"
+
+for i in 1 2 3; do
+  "$AGENT" room post t17 --from alice "m$i" >/dev/null
+done
+
+# Two concurrent reads from cursor=0 → may deliver overlapping results (at-least-once)
+"$AGENT" room read t17 --member alice >"$WORK/t17-read-a.out" 2>&1 &
+pid_a=$!
+"$AGENT" room read t17 --member alice >"$WORK/t17-read-b.out" 2>&1 &
+pid_b=$!
+wait $pid_a $pid_b || true
+
+# Final cursor must be 3
+cursor_file17="$TMUX_AGENT_DIR/teams/t17.room-cursors/alice"
+final_cursor17="$(cat "$cursor_file17" 2>/dev/null || echo 0)"
+assert_eq "at-least-once: cursor=3 after concurrent reads" "$final_cursor17" "3"
+
+# Cursor must not have gone backwards (still 3, not some intermediate value)
+rc=0; [[ "$final_cursor17" -ge 3 ]] || rc=1
+assert_exit "at-least-once: cursor not less than 3" "0" "$rc"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Case 18: team name injection ==="
+make_team "legit" "alice"
+
+# ../evil should be rejected
+rc=0; "$AGENT" room post '../evil' --from alice "hi" 2>/dev/null || rc=$?
+assert_exit "../evil team exit 2" "2" "$rc"
+
+# team with slash
+rc=0; "$AGENT" room post 'foo/bar' --from alice "hi" 2>/dev/null || rc=$?
+assert_exit "slash in team exit 2" "2" "$rc"
+
+# team with .. embedded
+rc=0; "$AGENT" room post 'foo..bar' --from alice "hi" 2>/dev/null || rc=$?
+assert_exit ".. in team exit 2" "2" "$rc"
+
+# Verify no stray files were created outside TMUX_AGENT_DIR
+stray=0
+for d in "$WORK/state/teams/evil" "$WORK/evil" /tmp/evil; do
+  [[ -e "$d" ]] && stray=1
+done
+assert_eq "no stray files from injection" "$stray" "0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "summary: $PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ? 1 : 0 ))
