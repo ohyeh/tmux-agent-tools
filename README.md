@@ -51,7 +51,7 @@ tmux-agent-fanout --prompt-file ./prompt.txt \
 Merge modes: `all` (default — `ok=true` iff every agent ok) or
 `first-success` (any agent ok; others continue running and are still
 recorded — they are NOT killed). Majority/custom modes are explicitly
-deferred — see `docs/design-issue-184-fanout.md`.
+deferred.
 
 The `claude-tmux` and `codex-tmux` wrapper tools support:
 
@@ -171,16 +171,6 @@ Before publishing, validate the checkout as a local tap:
 brew tap ohyeh/tmux-agent-tools "file://$PWD"
 brew style ohyeh/tmux-agent-tools/tmux-agent-tools
 ```
-
-## Release Process
-
-Releases go through a focused release PR, the manual `Release` GitHub Actions workflow, and a follow-up Formula bump PR. See [docs/release-process.md](docs/release-process.md).
-
-## Roadmaps
-
-- [v0.4.0 roadmap](docs/v0.4.0-roadmap.md)
-- [v0.5.0 roadmap](docs/v0.5.0-roadmap.md)
-- [v0.6.0 roadmap](docs/v0.6.0-roadmap.md)
 
 ## Usage
 
