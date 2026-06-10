@@ -371,4 +371,8 @@ Phase 2a and 2b are mutually exclusive per team. A team cannot span both backend
 4. DO and Worker treat `enc_msg` as an opaque blob (no content inspection).
 5. `room status` seq counts remain unencrypted metadata.
 
-**Please confirm Option A or Option B before Phase 2b implementation begins.**
+**DECIDED 2026-06-10: Option A (TLS-only).** Rationale: room messages are
+coordination signals (secrets are prohibited by SKILL.md policy), shell-side
+AES-GCM is error-prone (nonce reuse), key distribution adds a new secret-management
+problem, and encrypting `topic` would break server-side filtering. The wire schema
+keeps `msg` as-is; adding `enc_msg` later is an additive change if requirements shift.
