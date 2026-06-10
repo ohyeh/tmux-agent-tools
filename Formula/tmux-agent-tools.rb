@@ -12,6 +12,7 @@ class TmuxAgentTools < Formula
   end
 
   def install
+    bin.install "skills/tmux-agent-tools/scripts/agent-tmux"
     bin.install "skills/tmux-agent-tools/scripts/claude-tmux"
     bin.install "skills/tmux-agent-tools/scripts/codex-tmux"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dialogue"
@@ -27,8 +28,8 @@ class TmuxAgentTools < Formula
   end
 
   test do
-    assert_match "claude-tmux - run Claude Code in tmux", shell_output("#{bin}/claude-tmux help")
-    assert_match "codex-tmux - run Codex CLI in tmux", shell_output("#{bin}/codex-tmux help")
+    assert_match "agent-tmux - run Claude Code in tmux", shell_output("#{bin}/claude-tmux help")
+    assert_match "agent-tmux - run Claude Code in tmux", shell_output("#{bin}/codex-tmux help")
     assert_match "tmux-agent-dialogue - run a bounded two-agent tmux dialogue",
                  shell_output("#{bin}/tmux-agent-dialogue help")
     assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",
