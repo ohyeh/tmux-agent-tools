@@ -27,7 +27,7 @@
 #  B6.  HTTP 429 → exit 3
 #  B7.  HTTP 500 → exit 2
 #  B8.  curl error (rc≠0) → exit 2
-#  B9.  read HTTP 200 empty messages → exit 0 (no cursor advance)
+#  B9.  read HTTP 200 empty messages → exit 1 (spec §11: no new messages; no cursor advance)
 #  B10. read HTTP 200 with messages → cursor advances (unfiltered, no --since)
 #  B11. read with --since: cursor NOT created/modified
 #  B12. read with --topic filter: cursor NOT advanced
@@ -328,14 +328,14 @@ rc=0
 "$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
 assert_exit "B8 curl error rc 6 → exit 2" "2" "$rc"
 
-# ── B9: read 200 empty messages → exit 0 (no cursor advance) ──
-echo "--- B9: read 200 empty messages → exit 0, no cursor ---"
+# ── B9: read 200 empty messages → exit 1 (spec §11: no new messages) ──
+echo "--- B9: read 200 empty messages → exit 1, no cursor ---"
 set_curl 0 200 '{"messages":[]}'
 cf_cursor_alice="$TMUX_AGENT_DIR/teams/myteam.room-cursors/alice"
 rm -f "$cf_cursor_alice"
 rc=0
 "$AGENT" room read myteam --member alice --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
-assert_exit "B9 empty read exit 0" "0" "$rc"
+assert_exit "B9 empty read exit 1" "1" "$rc"
 # No messages → cursor should not be created (or stay at 0 if it was already there)
 if [[ ! -f "$cf_cursor_alice" ]]; then
   ok "B9 no cursor file created for empty read"

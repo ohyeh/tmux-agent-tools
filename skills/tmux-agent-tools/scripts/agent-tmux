@@ -5828,6 +5828,8 @@ _room_cf_read() {
   else
     printf '%s' "$msgs" | "$JQ" -r '.[] | "[\(.seq)] \(.from) [\(.topic)]: \(.msg)"'
   fi
+  # spec §11: 200 with empty messages → exit 1 (no new messages); cursor not advanced
+  (( max_seq >= 0 )) || return 1
   return 0
 }
 
@@ -5863,7 +5865,8 @@ _room_cf_wait() {
   local out rc
   while :; do
     out="$(_room_cf_read "$hub" "${remaining[@]}")" && rc=0 || rc=$?
-    if (( rc != 0 )); then
+    # rc=1 means empty messages (spec §11); rc>=2 is a real HTTP/curl error
+    if (( rc >= 2 )); then
       [[ -n "$out" ]] && printf '%s\n' "$out"
       return $rc
     fi
