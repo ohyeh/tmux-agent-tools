@@ -9,3 +9,9 @@
 .tmux-agent-result.json
 .claude/
 skills/tmux-agent-tools-workspace/
+
+# Cloudflare cf-room: never commit local secrets/state
+cf-room/.dev.vars*
+cf-room/.wrangler/
+cf-room/node_modules/
+cf-room/package-lock.json

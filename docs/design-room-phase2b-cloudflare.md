@@ -181,8 +181,10 @@ Response (200):
 Client connects:
 ```
 wss://<worker-host>/room/<team>/watch?since=42&member=w2
-Authorization: Bearer <token>  (passed as query param token= for WS, since headers not supported in browser WS)
+Sec-WebSocket-Protocol: bearer.<token>
 ```
+
+> **Security note:** The token is carried in the `Sec-WebSocket-Protocol` header, **not** as a `?token=` query parameter. URLs (including query strings) are written to Cloudflare access logs and CDN/proxy logs; putting a secret token there would cause persistent log exposure. The browser WebSocket API does not allow arbitrary request headers, but it does allow setting the `Sec-WebSocket-Protocol` value. The Worker parses the first `bearer.<token>` entry from that header, validates it with a constant-time comparison (HMAC-SHA-256 digest of both values to prevent timing attacks), and echoes the accepted protocol value back in the 101 response — required by the WebSocket spec for the handshake to complete.
 
 Server → client frames (JSON text):
 ```json

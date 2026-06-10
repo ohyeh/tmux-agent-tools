@@ -204,10 +204,10 @@ Usage:
   agent-tmux ping [--timeout <s>] [--json] <name>
   agent-tmux probe --metric <metric> [--json] <name>
   agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>
-  agent-tmux room post <team> --from <member> [--topic t] <text...>
-  agent-tmux room read <team> --member <m> [--since <seq>] [--topic t] [--json]
-  agent-tmux room wait <team> --member <m> [--since <seq>] [--topic t] [--timeout 300] [--interval 5] [--json]
-  agent-tmux room status <team> [--json]
+  agent-tmux room post <team> --from <member> [--topic t] <text...> [--hub user@host]
+  agent-tmux room read <team> --member <m> [--since <seq>] [--topic t] [--json] [--hub user@host]
+  agent-tmux room wait <team> --member <m> [--since <seq>] [--topic t] [--timeout 300] [--interval 5] [--json] [--hub user@host]
+  agent-tmux room status <team> [--json] [--hub user@host]
   agent-tmux env-doctor [name]
   agent-tmux doctor
   agent-tmux self-test
@@ -5638,6 +5638,337 @@ _room_local_status() {
   return 0
 }
 
+# ---- Phase 2b: Cloudflare Workers backend (_room_cf_*) ---------------------
+# Requires AGENT_TMUX_ROOM_TOKEN env var (bearer token for the team).
+# All HTTP calls via curl -sf; HTTP status captured with -w '%{http_code}'.
+# Exit code mapping (§11): 200→0, 200-empty→1, 400/401/403/404→2, 429→3, 5xx/curl-err→2.
+
+_room_cf_token_check() {
+  if [[ -z "${AGENT_TMUX_ROOM_TOKEN:-}" ]]; then
+    "$JQ" -n '{"error":"missing_token","detail":"AGENT_TMUX_ROOM_TOKEN is required for Cloudflare hub"}' >&2
+    return 2
+  fi
+}
+
+# _room_cf_http_exit <http_status> <curl_rc> [--empty-is-1]
+# Maps HTTP/curl result to a shell exit code per §11.
+# Sets _CF_EXIT global (avoids subshell).
+_room_cf_http_exit() {
+  local http_status="$1" curl_rc="$2" empty_is_1="${3:-}"
+  if (( curl_rc != 0 )); then
+    _CF_EXIT=2; return
+  fi
+  case "$http_status" in
+    200) if [[ "$empty_is_1" == "--empty-is-1" ]]; then _CF_EXIT=1; else _CF_EXIT=0; fi ;;
+    429) _CF_EXIT=3 ;;
+    400|401|403|404) _CF_EXIT=2 ;;
+    *)   _CF_EXIT=2 ;;
+  esac
+}
+
+_room_cf_post() {
+  require_jq
+  _room_cf_token_check || return 2
+  local hub="$1"; shift
+  local team="" from="" topic="general" msg=""
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      --from)  (( $# < 2 )) && { echo "room post: --from requires a value" >&2; return 2; }; from="$2";  shift 2 ;;
+      --topic) (( $# < 2 )) && { echo "room post: --topic requires a value" >&2; return 2; }; topic="$2"; shift 2 ;;
+      --) shift; pos+=("$@"); break ;;
+      -*) echo "room post: unknown flag: $1" >&2; return 2 ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  team="${pos[1]:-}"
+  if (( ${#pos[@]} >= 2 )); then
+    msg="${pos[*]:1}"
+  fi
+
+  _room_validate_team "$team" || return 2
+  _room_validate_name "from" "$from"   || return 2
+  _room_validate_name "topic" "$topic" || return 2
+  [[ -z "$msg" ]] && { echo "room post: message text required" >&2; return 2; }
+
+  local body
+  body="$("$JQ" -cn --arg from "$from" --arg topic "$topic" --arg msg "$msg" \
+    '{from:$from,topic:$topic,msg:$msg}')"
+
+  local resp http_status curl_rc
+  local _post_tmp
+  _post_tmp="$(mktemp)" || { echo "_room_cf_post: mktemp failed" >&2; return 2; }
+  resp="$(curl -sf -o "$_post_tmp" \
+    -w '%{http_code}' \
+    -X POST \
+    -H "Authorization: Bearer ${AGENT_TMUX_ROOM_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    "${hub}/room/${team}/post")" && curl_rc=0 || curl_rc=$?
+  http_status="$resp"
+  local resp_body=""
+  resp_body="$(cat "$_post_tmp" 2>/dev/null || true)" ; rm -f "$_post_tmp"
+
+  if (( curl_rc != 0 )) || [[ "$http_status" != "200" ]]; then
+    local _CF_EXIT
+    _room_cf_http_exit "$http_status" "$curl_rc"
+    # emit server error JSON to stderr if available, else synthesize
+    if [[ -n "$resp_body" ]]; then
+      printf '%s\n' "$resp_body" >&2
+    else
+      "$JQ" -n --arg s "$http_status" '{"error":"http_error","status":$s}' >&2
+    fi
+    return $_CF_EXIT
+  fi
+
+  local seq ts
+  seq="$("$JQ" -r '.seq' <<< "$resp_body" 2>/dev/null || echo "")"
+  ts="$("$JQ"  -r '.ts'  <<< "$resp_body" 2>/dev/null || echo "")"
+  printf 'posted seq=%s\n' "$seq"
+  return 0
+}
+
+_room_cf_read() {
+  require_jq
+  _room_cf_token_check || return 2
+  local hub="$1"; shift
+  local team="" member="" since="" topic="" as_json=0
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      --member)  (( $# < 2 )) && { echo "room read: --member requires a value" >&2; return 2; }; member="$2";  shift 2 ;;
+      --since)   (( $# < 2 )) && { echo "room read: --since requires a value"  >&2; return 2; }; since="$2";   shift 2 ;;
+      --topic)   (( $# < 2 )) && { echo "room read: --topic requires a value"  >&2; return 2; }; topic="$2";   shift 2 ;;
+      --json)    as_json=1; shift ;;
+      --) shift; pos+=("$@"); break ;;
+      -*) echo "room read: unknown flag: $1" >&2; return 2 ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  team="${pos[1]:-}"
+
+  _room_validate_team "$team" || return 2
+  _room_validate_name "member" "$member" || return 2
+  [[ -n "$topic" ]] && { _room_validate_name "topic" "$topic" || return 2; }
+
+  # Cursor management (§10 item 7): local cursor files, identical to Phase 1
+  local use_cursor=0 cursor_file effective_since
+  cursor_file="$(_room_cursor_file "$team" "$member")"
+  if [[ -n "$since" ]]; then
+    if [[ ! "$since" =~ ^[0-9]+$ ]]; then
+      if (( as_json )); then _room_json_error "bad_input" "detail" "--since must be a non-negative integer"
+      else echo "room read: --since must be a non-negative integer" >&2; fi
+      return 2
+    fi
+    effective_since="$since"
+    use_cursor=0
+  else
+    use_cursor=1
+    if [[ -f "$cursor_file" ]]; then
+      effective_since="$(cat "$cursor_file" 2>/dev/null || echo 0)"
+      [[ "$effective_since" =~ ^[0-9]+$ ]] || effective_since=0
+    else
+      effective_since=0
+    fi
+  fi
+
+  # Build query string
+  local url="${hub}/room/${team}/read?since=${effective_since}&limit=100"
+  [[ -n "$topic" ]] && url="${url}&topic=${topic}"
+
+  local resp_body http_status curl_rc
+  local _read_tmp
+  _read_tmp="$(mktemp)" || { echo "_room_cf_read: mktemp failed" >&2; return 2; }
+  http_status="$(curl -sf -o "$_read_tmp" \
+    -w '%{http_code}' \
+    -H "Authorization: Bearer ${AGENT_TMUX_ROOM_TOKEN}" \
+    "$url")" && curl_rc=0 || curl_rc=$?
+  resp_body="$(cat "$_read_tmp" 2>/dev/null || true)" ; rm -f "$_read_tmp"
+
+  if (( curl_rc != 0 )) || [[ "$http_status" != "200" ]]; then
+    local _CF_EXIT
+    _room_cf_http_exit "$http_status" "$curl_rc"
+    if [[ -n "$resp_body" ]]; then
+      if (( as_json )); then printf '%s\n' "$resp_body"; else printf '%s\n' "$resp_body" >&2; fi
+    else
+      "$JQ" -n --arg s "$http_status" '{"error":"http_error","status":$s}' >&2
+    fi
+    return $_CF_EXIT
+  fi
+
+  local msgs
+  msgs="$("$JQ" -r '.messages // []' <<< "$resp_body" 2>/dev/null || echo '[]')"
+  # Normalize to array JSON string
+  msgs="$("$JQ" -c '.' <<< "$msgs" 2>/dev/null || echo '[]')"
+
+  local max_seq
+  max_seq="$("$JQ" -r 'if length==0 then -1 else map(.seq) | max end' <<< "$msgs" 2>/dev/null || echo -1)"
+
+  # Advance cursor: only when no --topic AND use_cursor mode (not explicit --since)
+  if (( use_cursor )) && [[ -z "$topic" ]] && (( max_seq >= 0 )); then
+    local new_cursor=$(( max_seq > effective_since ? max_seq : effective_since ))
+    mkdir -p "$(_room_cursor_dir "$team")"
+    local current_cursor=0
+    [[ -f "$cursor_file" ]] && current_cursor="$(cat "$cursor_file" 2>/dev/null || echo 0)"
+    [[ "$current_cursor" =~ ^[0-9]+$ ]] || current_cursor=0
+    (( new_cursor > current_cursor )) && printf '%d\n' "$new_cursor" > "$cursor_file"
+  fi
+
+  local new_cursor_val
+  if (( use_cursor )) && [[ -z "$topic" ]]; then
+    if [[ -f "$cursor_file" ]]; then
+      new_cursor_val="$(cat "$cursor_file" 2>/dev/null || echo "$effective_since")"
+    else
+      new_cursor_val="$effective_since"
+    fi
+  else
+    if (( max_seq >= 0 )); then new_cursor_val="$max_seq"; else new_cursor_val="$effective_since"; fi
+  fi
+
+  if (( as_json )); then
+    "$JQ" -n --argjson msgs "$msgs" --argjson cursor "$new_cursor_val" \
+      '{messages:$msgs,cursor:$cursor}'
+  else
+    printf '%s' "$msgs" | "$JQ" -r '.[] | "[\(.seq)] \(.from) [\(.topic)]: \(.msg)"'
+  fi
+  # spec §11: 200 with empty messages → exit 1 (no new messages); cursor not advanced
+  (( max_seq >= 0 )) || return 1
+  return 0
+}
+
+_room_cf_wait() {
+  require_jq
+  _room_cf_token_check || return 2
+  local hub="$1"; shift
+  local timeout=300 interval=5 as_json=0
+  local -a remaining=()
+  while (( $# )); do
+    case "$1" in
+      --timeout)
+        (( $# < 2 )) && { echo "room wait: --timeout requires a value" >&2; return 2; }
+        timeout="$2"; shift 2 ;;
+      --interval)
+        (( $# < 2 )) && { echo "room wait: --interval requires a value" >&2; return 2; }
+        interval="$2"; shift 2 ;;
+      --json) as_json=1; remaining+=("$1"); shift ;;
+      *)      remaining+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ "$timeout" != <-> ]] || (( timeout <= 0 )); then
+    echo "room wait: --timeout must be a positive integer (seconds), got: $timeout" >&2
+    return 2
+  fi
+  if [[ "$interval" != (<->|<->.<->|.<->) ]] || ! (( interval > 0 )); then
+    echo "room wait: --interval must be a positive number (seconds), got: $interval" >&2
+    return 2
+  fi
+
+  local deadline=$(( SECONDS + timeout ))
+  local out rc
+  while :; do
+    out="$(_room_cf_read "$hub" "${remaining[@]}")" && rc=0 || rc=$?
+    # rc=1 means empty messages (spec §11); rc>=2 is a real HTTP/curl error
+    if (( rc >= 2 )); then
+      [[ -n "$out" ]] && printf '%s\n' "$out"
+      return $rc
+    fi
+    local count=0
+    if (( as_json )); then
+      count="$(printf '%s' "$out" | "$JQ" -r '.messages | length' 2>/dev/null || echo 0)"
+    else
+      count="$(printf '%s\n' "$out" | awk 'NF{c++}END{print c+0}')"
+    fi
+    if (( count > 0 )); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep "$interval"
+  done
+  if (( as_json )); then
+    "$JQ" -n '{messages:[],cursor:0,"error":"timeout"}'
+  else
+    echo "room wait: timeout waiting for messages" >&2
+  fi
+  return 1
+}
+
+_room_cf_status() {
+  require_jq
+  _room_cf_token_check || return 2
+  local hub="$1"; shift
+  local team="" as_json=0 member=""
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      --json)   as_json=1; shift ;;
+      --member) (( $# < 2 )) && { echo "room status: --member requires a value" >&2; return 2; }; member="$2"; shift 2 ;;
+      --) shift; pos+=("$@"); break ;;
+      -*) echo "room status: unknown flag: $1" >&2; return 2 ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  team="${pos[1]:-}"
+
+  _room_validate_team "$team" || return 2
+  [[ -n "$member" ]] && { _room_validate_name "member" "$member" || return 2; }
+
+  local resp_body http_status curl_rc
+  local _status_tmp
+  _status_tmp="$(mktemp)" || { echo "_room_cf_status: mktemp failed" >&2; return 2; }
+  http_status="$(curl -sf -o "$_status_tmp" \
+    -w '%{http_code}' \
+    -H "Authorization: Bearer ${AGENT_TMUX_ROOM_TOKEN}" \
+    "${hub}/room/${team}/status")" && curl_rc=0 || curl_rc=$?
+  resp_body="$(cat "$_status_tmp" 2>/dev/null || true)" ; rm -f "$_status_tmp"
+
+  if (( curl_rc != 0 )) || [[ "$http_status" != "200" ]]; then
+    local _CF_EXIT
+    _room_cf_http_exit "$http_status" "$curl_rc"
+    if [[ -n "$resp_body" ]]; then
+      if (( as_json )); then printf '%s\n' "$resp_body"; else printf '%s\n' "$resp_body" >&2; fi
+    else
+      "$JQ" -n --arg s "$http_status" '{"error":"http_error","status":$s}' >&2
+    fi
+    return $_CF_EXIT
+  fi
+
+  if (( as_json )); then
+    printf '%s\n' "$resp_body"
+  else
+    local mc msg_count
+    mc="$("$JQ"    -r '.member_count  // "?"' <<< "$resp_body" 2>/dev/null)"
+    msg_count="$("$JQ" -r '.message_count // "?"' <<< "$resp_body" 2>/dev/null)"
+    printf 'team=%s members=%s messages=%s\n' "$team" "$mc" "$msg_count"
+  fi
+  return 0
+}
+
+# ---- Phase 2a: SSH hub backend ---------------------------------------------
+_room_ssh_dispatch() {
+  # _room_ssh_dispatch <hub> <verb> [args...]
+  # Forwards "agent-tmux room <verb> [args...]" to hub via SSH.
+  # stdout/stderr pass through unmodified; remote exit 0-3 pass through.
+  # SSH-layer failure (exit 255 or other non-remote error) → exit 2 + JSON error on stderr.
+  local hub="$1"; shift
+  local -a remote_cmd
+  remote_cmd=(agent-tmux room "$@")
+  local quoted_cmd
+  quoted_cmd="$(printf '%q ' "${remote_cmd[@]}")"
+  local rc
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$hub" "$quoted_cmd" && rc=0 || rc=$?
+  if (( rc == 255 )); then
+    _room_json_error "ssh_failed" "hub" "$hub" "detail" "SSH connection or auth failed" >&2
+    return 2
+  elif (( rc > 3 )); then
+    # Any other SSH-layer error (not a remote agent-tmux exit code) → exit 2
+    _room_json_error "ssh_failed" "hub" "$hub" "detail" "SSH exited with code $rc" >&2
+    return 2
+  fi
+  return $rc
+}
+
 _room_backend() {
   local hub="${AGENT_TMUX_ROOM_HUB:-}"
   local sub="$1"; shift
@@ -5650,8 +5981,24 @@ _room_backend() {
     esac
   done
   if [[ -n "$hub" && "$hub" != "local" ]]; then
-    echo "room backend '$hub' not implemented yet" >&2
-    return 2
+    if [[ "$hub" == https://* ]]; then
+      # Cloudflare Workers backend (Phase 2b)
+      case "$sub" in
+        post)   _room_cf_post   "$hub" "${rest[@]}" ;;
+        read)   _room_cf_read   "$hub" "${rest[@]}" ;;
+        wait)   _room_cf_wait   "$hub" "${rest[@]}" ;;
+        status) _room_cf_status "$hub" "${rest[@]}" ;;
+        *) echo "room: unknown subcommand: $sub" >&2; return 2 ;;
+      esac
+      return $?
+    elif [[ "$hub" == *@* ]]; then
+      # SSH backend: user@host pattern (Phase 2a)
+      _room_ssh_dispatch "$hub" "$sub" "${rest[@]}"
+      return $?
+    else
+      echo "room backend '$hub' not implemented yet" >&2
+      return 2
+    fi
   fi
   case "$sub" in
     post)   _room_local_post   "${rest[@]}" ;;
@@ -5678,7 +6025,7 @@ cmd_room() {
   local sub="${pre[1]:-}"
   case "$sub" in
     post|read|wait|status) _room_backend "$sub" "${hub_flag[@]}" "$@" ;;
-    *) echo "Usage: agent-tmux room [--hub <backend>] <post|read|wait|status> ..." >&2; return 2 ;;
+    *) echo "Usage: agent-tmux room [--hub <user@host|https://worker-host>] <post|read|wait|status> ...  (AGENT_TMUX_ROOM_TOKEN required for https:// hub)" >&2; return 2 ;;
   esac
 }
 
