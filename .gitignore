@@ -9,3 +9,4 @@
 .tmux-agent-result.json
 .claude/
 skills/tmux-agent-tools-workspace/
+.workflow/
