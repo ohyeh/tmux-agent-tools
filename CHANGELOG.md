@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.19.0 - 2026-06-10
+
+### Added
+
+- `agent-tmux room` chat-style team communication bus: `post`, `read`, `wait`,
+  and `status` subcommands backed by an append-only `teams/<team>.room.jsonl`
+  log with per-member cursors, mkdir-based locking, quota enforcement
+  (default 200 posts/member/room; `AGENT_TMUX_ROOM_QUOTA`), and a pluggable
+  backend dispatch (`--hub` / `AGENT_TMUX_ROOM_HUB`; only `local` implemented
+  in Phase 1). Exit-code contract: 0 success, 1 timeout/no-messages, 2 bad
+  input/team not found/not-implemented, 3 quota exceeded.
+- SKILL.md: new "Room (team chat bus)" section covering post/read/wait/status
+  examples, worker prompt conventions (read room after each stage, report via
+  `--topic status`, quota stated in prompt), division of labor vs
+  broadcast/result.json, at-least-once delivery semantics and cooperative
+  mailbox caveat, and a privacy prohibition (plaintext local log; no
+  secrets/tokens). Fast paths shortcut added. Frontmatter description extended
+  with trigger phrases "let my workers talk to each other" and
+  「worker 之間互相通知」.
+
 ## v0.18.0 - 2026-06-10
 
 ### Changed
