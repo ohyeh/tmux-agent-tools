@@ -39,15 +39,24 @@ preset_for_cli "$CLI"
 # send text) are never consumed.
 _PROFILE_DIR_FLAG=''
 _PROFILE_FILE_FLAG=''
+# _lead keeps other leading global flags (--audit-log) in place so the two
+# global prepasses compose in either order.
+_lead=()
 while (( $# > 0 )); do
   case "$1" in
     --profile-dir)   [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile-dir needs a path" >&2; exit 2; }; _PROFILE_DIR_FLAG="$2"; shift 2 ;;
     --profile-dir=*) _PROFILE_DIR_FLAG="${1#--profile-dir=}"; shift ;;
     --profile)       [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile needs a file path" >&2; exit 2; }; _PROFILE_FILE_FLAG="$2"; shift 2 ;;
     --profile=*)     _PROFILE_FILE_FLAG="${1#--profile=}"; shift ;;
+    --audit-log)
+      if [[ -n "${2:-}" && "$2" != --* ]]; then _lead+=("$1" "$2"); shift 2; else _lead+=("$1"); shift; fi ;;
     *) break ;;
   esac
 done
+if (( ${#_lead[@]} > 0 )); then
+  set -- "${_lead[@]}" "$@"
+fi
+unset _lead
 
 # Declarative CLI profile: <dir>/<cli>.conf overrides the preset above.
 # Search order: --profile-dir > $AGENT_TMUX_PROFILE_DIR >
