@@ -1,9 +1,16 @@
 ---
 name: tmux-agent-tools
-description: Use when running or supervising AI coding CLIs (Claude Code, Codex, or any custom CLI) as managed tmux workers via agent-tmux, claude-tmux, codex-tmux, or tmux-agent-sessions. Covers start/resume, send, wait, capture, status/doctor/self-test, list, stop/cleanup, human approval gates, declarative per-CLI profiles for adding new CLIs, and multi-agent pair-review, critic, debate, dialogue, or fanout. Trigger on tmux as the execution layer for managed AI agent sessions; not for general tmux config, theming, shell wrappers, non-tmux headless claude/codex, or human team debate.
+description: Use when running or supervising AI coding CLIs (Claude Code, Codex, or any custom CLI) as managed tmux workers via agent-tmux, claude-tmux, codex-tmux, or tmux-agent-sessions. Covers start/resume, send, wait, capture, status/doctor/self-test, list, stop/cleanup, reading structured result.json files, watching multiple workers for the first/all completions (watch --any, no hand-rolled polling loops), human approval gates, declarative per-CLI profiles for adding new or renamed CLIs, and multi-agent pair-review, critic, debate, dialogue, or fanout. Also use for questions like "which worker finished first", "wait for any of these agents", or "supervise this long-running agent". Trigger on tmux as the execution layer for managed AI agent sessions; not for general tmux config, theming, shell wrappers, non-tmux headless claude/codex, or human team debate.
 ---
 
 # Tmux Agent Tools
+
+## Fast paths (read this first)
+
+- **Wrapper not on PATH?** Run it from the skill bundle directly: `<skill-dir>/scripts/codex-tmux …` (this file's directory). Don't waste steps on `which`/`find`/`tmux ls` discovery.
+- **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>`. Pane capture is fallback evidence only.
+- **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `result --json <winner>`.
+- **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
 
 ## Overview
 

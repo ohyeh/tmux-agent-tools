@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.18.0 - 2026-06-10
+
+### Changed
+
+- SKILL.md: new "Fast paths" decision block at the top (bundle-path
+  resolution when wrappers are off PATH; resolve → status → result
+  supervision quick path; `watch --any|--all` instead of hand-rolled
+  polling loops; profile + doctor proof for new/renamed CLIs), and the
+  frontmatter description now includes natural-language triggers
+  (result.json, watch --any, "which worker finished first",
+  "wait for any of these agents"). Driven by a two-iteration
+  with-skill/without-skill benchmark: the without-skill baseline
+  repeatedly hand-rolled polling loops and omitted orchestration
+  guardrails (cascade-spawn ban, literal result paths); iteration-2
+  pass rate was 100% with skill vs 68.8% without.
+
 ## v0.17.0 - 2026-06-10
 
 ### Changed
