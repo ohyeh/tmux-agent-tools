@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.19.0 - Unreleased
+## v0.19.0 - 2026-06-10
 
 ### Added
 
