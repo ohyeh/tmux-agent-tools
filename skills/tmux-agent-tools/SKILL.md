@@ -1,13 +1,15 @@
 ---
 name: tmux-agent-tools
-description: Use when running or supervising Claude Code or Codex CLI as managed tmux workers via claude-tmux, codex-tmux, or tmux-agent-sessions. Covers start/resume, send, wait, capture, status/doctor/self-test, list, stop/cleanup, human approval gates, and multi-agent pair-review, critic, debate, dialogue, or fanout. Trigger on tmux as the execution layer for managed AI agent sessions; not for general tmux config, theming, shell wrappers, non-tmux headless claude/codex, or human team debate.
+description: Use when running or supervising AI coding CLIs (Claude Code, Codex, or any custom CLI) as managed tmux workers via agent-tmux, claude-tmux, codex-tmux, or tmux-agent-sessions. Covers start/resume, send, wait, capture, status/doctor/self-test, list, stop/cleanup, human approval gates, declarative per-CLI profiles for adding new CLIs, and multi-agent pair-review, critic, debate, dialogue, or fanout. Trigger on tmux as the execution layer for managed AI agent sessions; not for general tmux config, theming, shell wrappers, non-tmux headless claude/codex, or human team debate.
 ---
 
 # Tmux Agent Tools
 
 ## Overview
 
-Use `claude-tmux` and `codex-tmux` as the canonical interface for any long-running Claude Code or Codex CLI session in tmux. Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, secret injection, and cleanup.
+`agent-tmux <cli> <command>` is the single engine: it runs **any** AI coding CLI as a managed tmux worker. `claude-tmux` and `codex-tmux` are one-line shims for the two most common CLIs (`claude-tmux start … ` ≡ `agent-tmux claude start …`). Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, secret injection, and cleanup.
+
+Any other CLI works without code changes: `agent-tmux gemini start …` uses generic defaults, and a declarative profile file (`~/.config/agent-tmux/profiles/<cli>.conf`) can customize the binary, launch flags, resume keyword, and busy/blocked detection patterns. See "Custom CLIs and profiles" below.
 
 Use `tmux-agent-dialogue` (and its `pair-review` / `critic` / `debate` presets) when the task is a bounded two-party exchange with a JSONL transcript. Use `tmux-agent-fanout` for parallel one-to-many work. Use `tmux-agent-sessions` for read-only inventory across all wrappers.
 
@@ -15,8 +17,10 @@ Local and SSH sessions keep the pane open after the agent CLI exits, showing the
 
 The wrapper scripts are bundled at:
 
+- `scripts/agent-tmux` (engine; `agent-tmux <cli> <command>`)
 - `scripts/claude-tmux`
 - `scripts/codex-tmux`
+- `scripts/profiles/` (built-in profile dir + README and examples)
 - `scripts/tmux-agent-dialogue`
 - `scripts/tmux-agent-sessions`
 - `scripts/tmux-agent-monitor`
@@ -28,6 +32,7 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 
 | Name | One-line purpose | When to reach for it |
 | --- | --- | --- |
+| `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools) or when scripting across multiple CLIs. |
 | `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, or later capture. |
 | `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, or later capture. |
 | `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
@@ -52,12 +57,36 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 
 ## Command Choice
 
-- `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI.
+- `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI; `agent-tmux <cli>` for any other CLI (gemini, cursor, grok, custom binaries).
 - `start` for a local working directory; `start-ssh` when tmux stays local but the CLI runs over SSH.
 - `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
 - The subcommands `send`, `send-wait`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
 - If you don't know which wrapper owns a session, use `tmux-agent-sessions resolve --name <partial-or-full-name> --json` before any `start`. It accepts a full tmux session name, wrapper-prefixed partial, or short agent name and returns the owning wrapper, short `agent_name`, full tmux session, cwd, result path, running state, and safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous or missing names exit non-zero and return JSON candidates/errors.
 - Use `tmux-agent-monitor --name <agent> --every <duration> --commands <manifest.json> --stop-on-change --summary-out <path> --json` when you need read-only periodic evidence checks against a managed session/repo. It polls manifest commands and emits JSONL observations plus a summary; it is distinct from `wait-and-capture`, which watches a tmux pane for a marker and captures pane output.
+
+## Custom CLIs and profiles
+
+`agent-tmux <cli>` works for any binary out of the box: unknown CLI names get generic defaults (binary = the CLI name, codex-family heuristics, no launch flags). To customize, write a declarative profile at `~/.config/agent-tmux/profiles/<cli>.conf` (or set `AGENT_TMUX_PROFILE_DIR`). Profiles are plain `key=value` files — never sourced, so they cannot execute code. Precedence: env vars (`<NS>_TMUX_*` > `AGENT_TMUX_*`) > profile > built-in preset.
+
+```ini
+# ~/.config/agent-tmux/profiles/gemini.conf
+bin=gemini
+env_ns=GEMINI
+launch_flags=--yolo
+resume_keyword=resume
+heuristic_family=codex
+# Optional detection overrides (extended regex, case-insensitive):
+pattern_busy=(thinking|generating|esc to cancel)
+pattern_approval_prompt=allow this (command|action)\?
+```
+
+Common cases:
+
+- **Same CLI, different binary name per machine** (e.g. `agy` installed as `agy-local`): a one-line profile `bin=agy-local` — no code change, no env var to remember.
+- **Brand-new CLI**: write the profile, then `agent-tmux gemini start --exact worker ~/repo 'prompt'`. All subcommands (`send`, `wait*`, `status`, `result`, approval gates) work identically.
+- **Detection mismatch**: if `status`/`probe` misreads the new CLI's busy/approval output, set `pattern_busy` / `pattern_permission_prompt` / `pattern_approval_prompt` / `pattern_login_prompt`.
+
+`agent-tmux <cli> doctor` shows which profile file was loaded (`profile: <path>` or `<none>`). Supported keys: see `scripts/profiles/README.md`.
 
 ## Core Workflow
 
@@ -109,6 +138,15 @@ codex-tmux wait-text worker '[CODEX-01]' 180              # literal-by-default
 codex-tmux wait-text --regex worker 'DONE|Need approval' 180
 codex-tmux wait-and-capture --marker '[DONE]' --timeout 180 --tail 80 --strip-ansi --json worker
 ```
+
+To supervise **multiple workers with one blocking call** (no per-worker polling from the orchestrator), use `watch`. A worker counts as done when it (re)writes `result.json` after the watch started, or when its tmux session exits:
+
+```bash
+codex-tmux watch --any --timeout 600 --json w1 w2 w3   # first completion wins
+codex-tmux watch --all --timeout 600 --json w1 w2 w3   # block until all done
+```
+
+Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` and `reason` (`result_updated` | `exited`). Polling happens inside the shell call, so the supervising agent spends one tool call instead of a status loop — this is the token-efficient pattern for fanout supervision.
 
 `wait-text` is literal-by-default. Add `--regex` only when you intentionally want regex matching. Literal markers may contain regex metacharacters like `[`, `]`, `(`, `)`, `.`, `*`, or `?` without escaping.
 
@@ -205,7 +243,7 @@ Always run `tmux-agent-dialogue validate-transcript --transcript <path>` before 
 
 ## Safety
 
-- Both wrappers run their CLIs with permissive flags (`--dangerously-skip-permissions` for Claude, `--yolo` for Codex). Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations without explicit user authorization.
+- The wrappers run their CLIs with permissive flags by default (`--dangerously-skip-permissions` for Claude, `--yolo` for Codex; profiles may set their own `launch_flags`). Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations without explicit user authorization.
 - `claude-tmux status <name>` reports a `diagnostic` when the pane looks like it is waiting for a first-run or permission confirmation. It does NOT auto-accept that prompt.
 - Prefer `doctor` and `self-test` before debugging agent behavior; they verify wrapper dependencies and tmux capture/wait without starting a real agent.
 - For secret injection (`--secret KEY=URI`) and audit log enablement (`TMUX_AGENT_TOOLS_AUDIT_LOG`): see `references/security.md`. Missing secrets fail closed before the session is created.

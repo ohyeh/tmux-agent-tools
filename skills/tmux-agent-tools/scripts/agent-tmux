@@ -28,6 +28,48 @@ preset_for_cli() {
 }
 preset_for_cli "$CLI"
 
+# Declarative CLI profile: <dir>/<cli>.conf overrides the preset above.
+# Search order: $AGENT_TMUX_PROFILE_DIR > ~/.config/agent-tmux/profiles >
+# <script-dir>/profiles. Plain key=value lines ('#' comments); never sourced,
+# so profiles cannot execute code. Env vars still override profile values.
+CLI_PROFILE_FILE=''
+PROFILE_PATTERN_BUSY=''
+PROFILE_PATTERN_PERMISSION=''
+PROFILE_PATTERN_APPROVAL=''
+PROFILE_PATTERN_LOGIN=''
+load_cli_profile() {
+  local cli="$1" dir file='' line key value
+  for dir in "${AGENT_TMUX_PROFILE_DIR:-}" "${XDG_CONFIG_HOME:-$HOME/.config}/agent-tmux/profiles" "${SELF:h}/profiles"; do
+    [[ -n "$dir" && -f "$dir/$cli.conf" ]] && { file="$dir/$cli.conf"; break; }
+  done
+  [[ -n "$file" ]] || return 0
+  CLI_PROFILE_FILE="$file"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ "$line" == \#* || "$line" != *=* ]] && continue
+    key="${line%%=*}"; value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      bin)                       _bin="$value" ;;
+      env_ns)                    _ENV_NS="${value:u}" ;;
+      prefix)                    _PRESET_PREFIX="$value" ;;
+      launch_flags)              _PRESET_FLAGS="$value" ;;
+      resume_keyword)            RESUME_KEYWORD="$value" ;;
+      heuristic_family)          HEURISTIC_FAMILY="$value" ;;
+      usage_kind)                _USAGE_KIND="$value" ;;
+      pattern_busy)              PROFILE_PATTERN_BUSY="$value" ;;
+      pattern_permission_prompt) PROFILE_PATTERN_PERMISSION="$value" ;;
+      pattern_approval_prompt)   PROFILE_PATTERN_APPROVAL="$value" ;;
+      pattern_login_prompt)      PROFILE_PATTERN_LOGIN="$value" ;;
+      *) echo "agent-tmux: unknown profile key '$key' in $file" >&2 ;;
+    esac
+  done < "$file"
+}
+load_cli_profile "$CLI"
+
 # Env precedence: <NS>_TMUX_<KEY> > AGENT_TMUX_<KEY> > preset default.
 # Empty-or-unset falls through (matches legacy `${CLAUDE_TMUX_X:-default}`).
 _pref() {
@@ -109,6 +151,7 @@ Usage:
   agent-tmux status [--json] <name>
   agent-tmux ping [--timeout <s>] [--json] <name>
   agent-tmux probe --metric <metric> [--json] <name>
+  agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>
   agent-tmux env-doctor [name]
   agent-tmux doctor
   agent-tmux self-test
@@ -4144,6 +4187,7 @@ doctor_session() {
     echo "${CLI}: not found; start requires ${_ENV_NS}=/path/to/${CLI} or ${CLI} on PATH"
   fi
   echo "prefix: $PREFIX"
+  echo "profile: ${CLI_PROFILE_FILE:-<none>}"
   echo "stable_seconds: $STABLE_SECONDS"
   echo "submit_delay: $SUBMIT_DELAY"
   echo "tmux_conf: $TMUX_CONF"
@@ -4312,6 +4356,13 @@ status_pane_text() {
 
 blocked_reason_for_text() {
   local lowered="$1"
+  if [[ -n "$PROFILE_PATTERN_PERMISSION" ]] && print -r -- "$lowered" | grep -qiE "$PROFILE_PATTERN_PERMISSION"; then
+    print -r -- "permission_prompt"; return 0
+  elif [[ -n "$PROFILE_PATTERN_APPROVAL" ]] && print -r -- "$lowered" | grep -qiE "$PROFILE_PATTERN_APPROVAL"; then
+    print -r -- "approval_prompt"; return 0
+  elif [[ -n "$PROFILE_PATTERN_LOGIN" ]] && print -r -- "$lowered" | grep -qiE "$PROFILE_PATTERN_LOGIN"; then
+    print -r -- "login_prompt"; return 0
+  fi
   if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
     print -r -- "cli_exited"
   elif [[ "$lowered" == *"password:"* || "$lowered" == *"permission denied"* || "$lowered" == *"are you sure you want to continue connecting"* ]]; then
@@ -4674,10 +4725,11 @@ probe_session() {
       fi
       ;;
     active_spinner)
-      if printf '%s\n' "$pane" | grep -qE '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)'; then
+      local _busy_re="${PROFILE_PATTERN_BUSY:-[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)}"
+      if printf '%s\n' "$pane" | grep -qE "$_busy_re"; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | grep -E '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -E "$_busy_re" | tail -1 || true)"
       else
         value="false"
         confidence="low"
@@ -4694,20 +4746,22 @@ probe_session() {
       fi
       ;;
     tool_active)
-      if printf '%s\n' "$pane" | grep -qiE '(running|executing|tool call|shell|command|apply_patch)'; then
+      local _busy_re="${PROFILE_PATTERN_BUSY:-(running|executing|tool call|shell|command|apply_patch)}"
+      if printf '%s\n' "$pane" | grep -qiE "$_busy_re"; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(running|executing|tool call|shell|command|apply_patch)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE "$_busy_re" | tail -1 || true)"
       else
         value="false"
         confidence="low"
       fi
       ;;
     approval_pending)
-      if printf '%s\n' "$pane" | grep -qiE '(approval|approve|allow|deny|permission)'; then
+      local _appr_re="${PROFILE_PATTERN_APPROVAL:-(approval|approve|allow|deny|permission)}"
+      if printf '%s\n' "$pane" | grep -qiE "$_appr_re"; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(approval|approve|allow|deny|permission)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE "$_appr_re" | tail -1 || true)"
       else
         value="false"
         confidence="low"
@@ -4726,6 +4780,102 @@ probe_session() {
   else
     printf '%s %s=%s confidence=%s\n' "$name" "$metric" "$value" "$confidence"
   fi
+}
+
+# watch: one blocking call over N workers. Done per worker = result.json
+# (re)written after watch started, or tmux session gone. Polling happens in
+# shell (zero supervisor/model round-trips), so callers make exactly one call.
+watch_session() {
+  require_tmux
+  zmodload zsh/stat 2>/dev/null || true
+  local mode=any timeout=600 interval=1 output_json=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --any) mode=any; shift ;;
+      --all) mode=all; shift ;;
+      --timeout)  [[ -n "${2:-}" ]] || { echo "watch: --timeout needs a value" >&2; exit 2; }; timeout="$2"; shift 2 ;;
+      --interval) [[ -n "${2:-}" ]] || { echo "watch: --interval needs a value" >&2; exit 2; }; interval="$2"; shift 2 ;;
+      --json) output_json=1; shift ;;
+      --) shift; break ;;
+      -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  if (( $# < 1 )); then
+    echo "Usage: agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>" >&2
+    exit 2
+  fi
+  if [[ "$timeout" != <-> ]] || (( timeout <= 0 )); then
+    echo "watch: --timeout must be a positive integer (seconds), got: $timeout" >&2
+    exit 2
+  fi
+  if [[ "$interval" != (<->|<->.<->|.<->) ]] || ! (( interval > 0 )); then
+    echo "watch: --interval must be a positive number (seconds), got: $interval" >&2
+    exit 2
+  fi
+  local -a names
+  names=("$@")
+  local -A base_sig done_reason
+  local name rp m
+  # Signature = mtime + content checksum + exists. mtime alone has 1s
+  # resolution; cksum catches same-second rewrites regardless of size.
+  # result.json files are small, so per-poll cksum cost is negligible. The
+  # only undetectable case is a same-second rewrite with byte-identical
+  # content, which carries no new result by definition.
+  _watch_result_sig() {
+    local p="$1"
+    if [[ -f "$p" ]]; then
+      print -r -- "$(zstat +mtime "$p" 2>/dev/null || echo 0):$(cksum < "$p" 2>/dev/null | tr ' ' ':' || echo 0:0):1"
+    else
+      print -r -- "0:0:0:0"
+    fi
+  }
+  for name in "${names[@]}"; do
+    rp="$(result_path_session "$name")"
+    base_sig[$name]="$(_watch_result_sig "$rp")"
+  done
+  local deadline=$(( SECONDS + timeout )) all_done=0
+  while :; do
+    all_done=1
+    for name in "${names[@]}"; do
+      [[ -n "${done_reason[$name]:-}" ]] && continue
+      rp="$(result_path_session "$name")"
+      m="$(_watch_result_sig "$rp")"
+      if [[ "$m" != "${base_sig[$name]}" ]]; then
+        done_reason[$name]="result_updated"
+      elif ! "$TMUX" has-session -t "$(session_for_name "$name")" 2>/dev/null; then
+        done_reason[$name]="exited"
+      else
+        all_done=0
+      fi
+    done
+    if [[ "$mode" == any ]] && (( ${#done_reason[@]} > 0 )); then break; fi
+    (( all_done )) && break
+    (( SECONDS >= deadline )) && break
+    sleep "$interval"
+  done
+  local met=0
+  if [[ "$mode" == any ]]; then
+    (( ${#done_reason[@]} > 0 )) && met=1
+  else
+    (( all_done )) && met=1
+  fi
+  if (( output_json )); then
+    require_jq
+    local items='[]'
+    for name in "${names[@]}"; do
+      items="$(print -r -- "$items" | "$JQ" -c --arg n "$name" --arg r "${done_reason[$name]:-}" \
+        '. + [{name: $n, done: ($r != ""), reason: (if $r == "" then null else $r end)}]')"
+    done
+    print -r -- "$items" | "$JQ" -c --arg mode "$mode" --argjson met "$met" \
+      '{schema_version: 1, mode: $mode, met: ($met == 1), agents: .}'
+  else
+    for name in "${names[@]}"; do
+      printf '%s %s\n' "$name" "${done_reason[$name]:-pending}"
+    done
+  fi
+  (( met )) && return 0
+  return 1
 }
 
 list_sessions() {
@@ -5237,6 +5387,9 @@ case "$command" in
     ;;
   probe)
     probe_session "$@"
+    ;;
+  watch)
+    watch_session "$@"
     ;;
   env-doctor)
     env_doctor_session "$@"

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## v0.16.0 - 2026-06-10
+
+### Added
+
+- Declarative CLI profiles: `agent-tmux <cli>` now loads `<cli>.conf` from
+  `$AGENT_TMUX_PROFILE_DIR` > `~/.config/agent-tmux/profiles` > the bundled
+  `scripts/profiles/` directory. Plain `key=value` files (never sourced) can
+  override `bin`, `env_ns`, `prefix`, `launch_flags`, `resume_keyword`,
+  `heuristic_family`, `usage_kind`, and detection regexes (`pattern_busy`,
+  `pattern_permission_prompt`, `pattern_approval_prompt`,
+  `pattern_login_prompt`). Precedence stays env vars > profile > built-in
+  preset. `doctor` reports the loaded profile path. Adding a new CLI or
+  renaming a binary per machine no longer requires code changes.
+- `agent-tmux <cli> watch [--any|--all] [--timeout <s>] [--interval <s>]
+  [--json] <name...>`: one blocking call that supervises N workers. A worker
+  counts as done when it (re)writes `result.json` after the watch started
+  (mtime + content checksum signature, so same-second rewrites are caught) or
+  its tmux session exits. Exit 0 when the condition is met, 1 on timeout,
+  2 on invalid input.
+- `scripts/profiles/README.md` and `gemini.conf.example`; SKILL.md rewritten
+  around the unified `agent-tmux` engine and the profile mechanism.
+
 ## v0.15.0 - 2026-06-04
 
 ### Added
