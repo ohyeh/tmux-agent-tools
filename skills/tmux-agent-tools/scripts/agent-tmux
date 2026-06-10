@@ -4756,10 +4756,11 @@ probe_session() {
       fi
       ;;
     approval_pending)
-      if printf '%s\n' "$pane" | grep -qiE '(approval|approve|allow|deny|permission)'; then
+      local _appr_re="${PROFILE_PATTERN_APPROVAL:-(approval|approve|allow|deny|permission)}"
+      if printf '%s\n' "$pane" | grep -qiE "$_appr_re"; then
         value="true"
         confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | grep -iE '(approval|approve|allow|deny|permission)' | tail -1 || true)"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE "$_appr_re" | tail -1 || true)"
       else
         value="false"
         confidence="low"
@@ -4805,12 +4806,21 @@ watch_session() {
   fi
   local -a names
   names=("$@")
-  local -A base_mtime done_reason
+  local -A base_sig done_reason
   local name rp m
+  # Signature = mtime:size:exists. mtime alone has 1s resolution, so a rewrite
+  # in the same second as the baseline would be missed with mtime comparison.
+  _watch_result_sig() {
+    local p="$1"
+    if [[ -f "$p" ]]; then
+      print -r -- "$(zstat +mtime "$p" 2>/dev/null || echo 0):$(zstat +size "$p" 2>/dev/null || echo 0):1"
+    else
+      print -r -- "0:0:0"
+    fi
+  }
   for name in "${names[@]}"; do
     rp="$(result_path_session "$name")"
-    m=0; [[ -f "$rp" ]] && m="$(zstat +mtime "$rp" 2>/dev/null || echo 0)"
-    base_mtime[$name]="$m"
+    base_sig[$name]="$(_watch_result_sig "$rp")"
   done
   local deadline=$(( SECONDS + timeout )) all_done=0
   while :; do
@@ -4818,8 +4828,8 @@ watch_session() {
     for name in "${names[@]}"; do
       [[ -n "${done_reason[$name]:-}" ]] && continue
       rp="$(result_path_session "$name")"
-      m=0; [[ -f "$rp" ]] && m="$(zstat +mtime "$rp" 2>/dev/null || echo 0)"
-      if (( m > ${base_mtime[$name]} )); then
+      m="$(_watch_result_sig "$rp")"
+      if [[ "$m" != "${base_sig[$name]}" ]]; then
         done_reason[$name]="result_updated"
       elif ! "$TMUX" has-session -t "$(session_for_name "$name")" 2>/dev/null; then
         done_reason[$name]="exited"
