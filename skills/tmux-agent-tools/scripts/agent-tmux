@@ -4808,14 +4808,17 @@ watch_session() {
   names=("$@")
   local -A base_sig done_reason
   local name rp m
-  # Signature = mtime:size:exists. mtime alone has 1s resolution, so a rewrite
-  # in the same second as the baseline would be missed with mtime comparison.
+  # Signature = mtime + content checksum + exists. mtime alone has 1s
+  # resolution; cksum catches same-second rewrites regardless of size.
+  # result.json files are small, so per-poll cksum cost is negligible. The
+  # only undetectable case is a same-second rewrite with byte-identical
+  # content, which carries no new result by definition.
   _watch_result_sig() {
     local p="$1"
     if [[ -f "$p" ]]; then
-      print -r -- "$(zstat +mtime "$p" 2>/dev/null || echo 0):$(zstat +size "$p" 2>/dev/null || echo 0):1"
+      print -r -- "$(zstat +mtime "$p" 2>/dev/null || echo 0):$(cksum < "$p" 2>/dev/null | tr ' ' ':' || echo 0:0):1"
     else
-      print -r -- "0:0:0"
+      print -r -- "0:0:0:0"
     fi
   }
   for name in "${names[@]}"; do
