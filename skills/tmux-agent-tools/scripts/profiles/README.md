@@ -1,12 +1,21 @@
 # agent-tmux CLI profiles
 
-Declarative per-CLI profiles. `agent-tmux <cli> ...` looks for `<cli>.conf` in:
+Declarative per-CLI profiles. **This directory is the canonical source of
+per-CLI defaults**: `claude.conf`, `codex.conf`, `agy.conf`, `cursor.conf`,
+and `grok.conf` mirror the legacy in-script preset table, which is frozen and
+only acts as a fallback when this directory is missing. New CLIs are added as
+profiles, not as code.
 
-1. `$AGENT_TMUX_PROFILE_DIR`
-2. `~/.config/agent-tmux/profiles` (or `$XDG_CONFIG_HOME/agent-tmux/profiles`)
-3. this directory (built-in defaults)
+`agent-tmux <cli> ...` looks for `<cli>.conf` in:
 
-The first match wins and overrides the built-in preset for that CLI.
+1. `--profile-dir <dir>` (use-time flag, e.g. a user-managed profile repo)
+2. `$AGENT_TMUX_PROFILE_DIR`
+3. `~/.config/agent-tmux/profiles` (or `$XDG_CONFIG_HOME/agent-tmux/profiles`)
+4. this directory (bundled defaults)
+
+`agent-tmux <cli> --profile <file> ...` bypasses the search and loads that
+exact file. The first match wins and overrides the built-in preset for that
+CLI.
 Files are plain `key=value` (never sourced, so they cannot execute code).
 Env vars (`<NS>_TMUX_*`, `AGENT_TMUX_*`, bare `<NS>` binary override) still
 take precedence over profile values.

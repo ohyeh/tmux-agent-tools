@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.17.0 - 2026-06-10
+
+### Changed
+
+- Profiles are now the canonical per-CLI configuration. The bundled
+  `scripts/profiles/` directory ships default profiles for
+  claude/codex/agy/cursor/grok that exactly mirror the legacy in-script
+  preset table; `preset_for_cli()` is frozen as a fallback for when the
+  profiles directory is missing. New CLIs are added as `.conf` files, not
+  code. Equivalence verified: `doctor` output is identical between the
+  legacy table and the bundled profiles for all five CLIs.
+
+### Added
+
+- Use-time profile selection flags, recognized between `<cli>` and
+  `<command>`: `--profile-dir <dir>` (look up `<cli>.conf` in a
+  user-managed directory; highest-priority search location) and
+  `--profile <file>` (load an exact file, bypassing the search). They
+  compose with the existing leading `--audit-log` flag in either order.
+
 ## v0.16.0 - 2026-06-10
 
 ### Added
