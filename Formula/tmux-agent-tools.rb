@@ -12,6 +12,7 @@ class TmuxAgentTools < Formula
   end
 
   def install
+    bin.install "skills/tmux-agent-tools/scripts/agent-tmux"
     bin.install "skills/tmux-agent-tools/scripts/claude-tmux"
     bin.install "skills/tmux-agent-tools/scripts/codex-tmux"
     bin.install "skills/tmux-agent-tools/scripts/tmux-agent-dialogue"
