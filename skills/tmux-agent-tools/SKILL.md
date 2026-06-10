@@ -9,7 +9,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 
 - **Wrapper not on PATH?** Run it from the skill bundle directly: `<skill-dir>/scripts/codex-tmux …` (this file's directory). Don't waste steps on `which`/`find`/`tmux ls` discovery.
 - **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>`. Pane capture is fallback evidence only.
-- **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `result --json <winner>`.
+- **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `codex-tmux result --json <winner>`.
 - **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
 
 ## Overview
