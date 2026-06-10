@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.18.1 - 2026-06-11
+
+### Changed
+
+- Removed internal planning/design docs and task_plan.md from the public repo; no functional changes.
+
 ## v0.18.0 - 2026-06-10
 
 ### Changed
