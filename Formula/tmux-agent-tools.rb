@@ -1,8 +1,8 @@
 class TmuxAgentTools < Formula
   desc "Tmux wrappers for controllable Claude Code and Codex CLI sessions"
   homepage "https://github.com/ohyeh/tmux-agent-tools"
-  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.19.0.tar.gz"
-  sha256 "484d9e01f282422601bb1597b5bd6f2816226b19323439d579d1362adc695bbb"
+  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.20.0.tar.gz"
+  sha256 "ddb0d26a12ccfed6853b15f4823ceb60ffd4725870c709bc10e55cbfd35480b4"
   head "https://github.com/ohyeh/tmux-agent-tools.git", branch: "main"
 
   depends_on "jq"
