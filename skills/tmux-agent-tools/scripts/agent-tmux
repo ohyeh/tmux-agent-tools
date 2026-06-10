@@ -49,7 +49,14 @@ while (( $# > 0 )); do
     --profile)       [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile needs a file path" >&2; exit 2; }; _PROFILE_FILE_FLAG="$2"; shift 2 ;;
     --profile=*)     _PROFILE_FILE_FLAG="${1#--profile=}"; shift ;;
     --audit-log)
-      if [[ -n "${2:-}" && "$2" != --* ]]; then _lead+=("$1" "$2"); shift 2; else _lead+=("$1"); shift; fi ;;
+      if [[ -n "${2:-}" && "$2" != --* ]]; then
+        _lead+=("$1" "$2"); shift 2
+      else
+        # Bare form: freeze the default path at the original position, before
+        # argv is rewritten (otherwise the later audit parser could mistake
+        # the subcommand for the path). Must match _resolve_audit_default_path.
+        _lead+=("$1" "${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl"); shift
+      fi ;;
     *) break ;;
   esac
 done
