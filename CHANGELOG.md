@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.20.0 - 2026-06-11
+
+### Added
+
+- SSH hub backend (`--hub user@host`): every `room` verb is forwarded over SSH
+  to `agent-tmux` on the hub; stdout/stderr/exit-code pass through unchanged.
+  Exit 255 (SSH layer error) maps to local exit 2. No automatic retry; caller
+  is responsible for at-least-once semantics.
+- Cloudflare Workers + Durable Objects backend (`--hub https://...`): stateless
+  Worker router (~50 lines) fronts a `RoomDO` per team storing messages in
+  SQLite AUTOINCREMENT; long-poll `/read` and WebSocket `/watch` delivery;
+  per-team bearer token via `AGENT_TMUX_ROOM_TOKEN`; cursors tracked locally.
+  `cf-room/` wrangler project skeleton added to the repo.
+- Smoke test covering SSH and CF backend dispatch paths.
+- SKILL.md: "Room backend selection" decision table (SSH reachable → `user@host`;
+  NAT/no inbound SSH → `https://...`) with prerequisites for each backend.
+
 ## v0.19.0 - 2026-06-10
 
 ### Added

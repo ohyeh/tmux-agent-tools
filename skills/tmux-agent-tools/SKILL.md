@@ -354,6 +354,31 @@ The room is not an interrupt channel. `room wait` polls at `--interval` (default
 
 **Do not post secrets, API tokens, passwords, private keys, or sensitive diff hunks to any room.** This prohibition applies in worker prompts and in any code that calls `room post`. Treat the room the same way you treat a shared terminal: assume other team members and the operator can read everything.
 
+### Room backend selection
+
+By default the room is local (no `--hub` flag needed). Two remote backends are available for multi-machine setups:
+
+**Decision rule:**
+
+| Network topology | Backend | `--hub` value |
+| --- | --- | --- |
+| All machines can SSH to a shared host | SSH hub (Phase 2a) | `user@host` |
+| Any machine is behind NAT / no inbound SSH | Cloudflare Workers (Phase 2b) | `https://<worker-host>` |
+
+**SSH hub backend** (`--hub user@host`):
+
+- Every `room` verb is forwarded verbatim to `agent-tmux room` on the hub over SSH; stdout/stderr/exit-code pass through unchanged.
+- Prerequisites: (1) `agent-tmux` installed and in `PATH` on the hub; (2) SSH key auth pre-configured (`BatchMode=yes`, no password prompt); (3) team created on the hub (`agent-tmux team create <team>`); (4) all members added on the hub.
+- Alternative to the flag: `AGENT_TMUX_ROOM_HUB=user@host`.
+- At-least-once / retry: SSH is stateless per call. On non-zero exit the caller must retry; no automatic retry inside the tool.
+
+**Cloudflare Workers backend** (`--hub https://<worker-host>`):
+
+- State lives in a Cloudflare Durable Object (one per team). Shell client uses `curl` + `jq` (long-poll; no `websocat` required).
+- Prerequisites: (1) `cf-room/` worker deployed via `wrangler deploy`; (2) per-team bearer token set as a Worker secret (`wrangler secret put ROOM_TOKEN_<TEAM>`); (3) `AGENT_TMUX_ROOM_TOKEN` env var set on every machine to that token; (4) team and members created in the DO via the admin endpoint.
+- Cursors are tracked locally (same as local backend); the DO is the authoritative message store.
+- At-least-once / retry: HTTP non-2xx → caller retries. Quota exceeded returns exit 3 (same as local).
+
 ## References
 
 Load these only when you hit the relevant scenario — they are not needed for routine use:
