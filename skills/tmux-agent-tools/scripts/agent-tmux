@@ -4804,6 +4804,14 @@ watch_session() {
     echo "Usage: agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>" >&2
     exit 2
   fi
+  if [[ "$timeout" != <-> ]] || (( timeout <= 0 )); then
+    echo "watch: --timeout must be a positive integer (seconds), got: $timeout" >&2
+    exit 2
+  fi
+  if [[ "$interval" != (<->|<->.<->|.<->) ]] || ! (( interval > 0 )); then
+    echo "watch: --interval must be a positive number (seconds), got: $interval" >&2
+    exit 2
+  fi
   local -a names
   names=("$@")
   local -A base_sig done_reason
