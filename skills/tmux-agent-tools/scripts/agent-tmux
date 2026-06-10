@@ -5493,15 +5493,14 @@ _room_local_wait() {
   local deadline=$(( SECONDS + timeout ))
   local out rc
   while :; do
-    if (( as_json )); then
-      out="$(_room_local_read "${remaining[@]}" 2>&1)"; rc=$?
-    else
-      # Non-json: let _room_local_read's stderr flow out directly (carries JSON error on corrupt).
-      # Only capture stdout (message lines).
-      out="$(_room_local_read "${remaining[@]}")"; rc=$?
-    fi
+    # Capture stdout only; stderr flows through so _room_validate_jsonl's JSON error
+    # always reaches the caller's stderr regardless of --json mode (R12 contract).
+    # Use "&&...|| rc=$?" to prevent set -e from aborting on non-zero exit before
+    # we can forward the captured stdout to our caller.
+    out="$(_room_local_read "${remaining[@]}")" && rc=0 || rc=$?
     if (( rc != 0 )); then
-      if (( as_json )); then printf '%s\n' "$out"; else printf '%s\n' "$out" >&2; fi
+      # Forward any captured stdout (e.g. --json corrupt error) to our stdout.
+      [[ -n "$out" ]] && printf '%s\n' "$out"
       return $rc
     fi
     # Check if any messages were delivered

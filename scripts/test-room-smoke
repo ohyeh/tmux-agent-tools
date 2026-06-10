@@ -465,11 +465,22 @@ assert_exit "corrupt file: read plain exit 2" "2" "$rc"
 rc2=0; jq -e '.error == "room_file_corrupt"' "$_errf16" >/dev/null 2>&1 || rc2=$?
 assert_exit "corrupt file: read plain stderr has JSON error=room_file_corrupt" "0" "$rc2"
 
-# wait → exit 2 + stderr JSON error (plain mode)
+# wait (plain) → exit 2 + stderr JSON error
 rc=0; "$AGENT" room wait t16 --member alice --timeout 1 --interval 1 >/dev/null 2>"$_errf16" || rc=$?
 assert_exit "corrupt file: wait exit 2" "2" "$rc"
 rc2=0; jq -e '.error == "room_file_corrupt"' "$_errf16" >/dev/null 2>&1 || rc2=$?
 assert_exit "corrupt file: wait stderr has JSON error=room_file_corrupt" "0" "$rc2"
+
+# wait --json → exit 2 + exactly one JSON object on stdout + stderr also has room_file_corrupt
+rc=0; wait_json16="$("$AGENT" room wait t16 --member alice --json --timeout 1 --interval 1 2>"$_errf16")" || rc=$?
+assert_exit "corrupt file: wait --json exit 2" "2" "$rc"
+rc2=0; printf '%s' "$wait_json16" | jq -e '.error == "room_file_corrupt"' >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: wait --json stdout has error=room_file_corrupt" "0" "$rc2"
+# stdout must be exactly one JSON object (no duplication)
+json_count16="$(printf '%s\n' "$wait_json16" | jq -s 'length' 2>/dev/null || echo 0)"
+assert_eq "corrupt file: wait --json stdout has exactly one JSON object" "$json_count16" "1"
+rc2=0; jq -e '.error == "room_file_corrupt"' "$_errf16" >/dev/null 2>&1 || rc2=$?
+assert_exit "corrupt file: wait --json stderr has room_file_corrupt" "0" "$rc2"
 
 # status (plain) → exit 2 + stderr JSON error
 rc=0; "$AGENT" room status t16 >/dev/null 2>"$_errf16" || rc=$?
