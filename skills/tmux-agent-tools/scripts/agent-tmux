@@ -45,9 +45,9 @@ _lead=()
 while (( $# > 0 )); do
   case "$1" in
     --profile-dir)   [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile-dir needs a path" >&2; exit 2; }; _PROFILE_DIR_FLAG="$2"; shift 2 ;;
-    --profile-dir=*) _PROFILE_DIR_FLAG="${1#--profile-dir=}"; shift ;;
+    --profile-dir=*) _PROFILE_DIR_FLAG="${1#--profile-dir=}"; [[ -n "$_PROFILE_DIR_FLAG" ]] || { echo "agent-tmux: --profile-dir needs a path" >&2; exit 2; }; shift ;;
     --profile)       [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile needs a file path" >&2; exit 2; }; _PROFILE_FILE_FLAG="$2"; shift 2 ;;
-    --profile=*)     _PROFILE_FILE_FLAG="${1#--profile=}"; shift ;;
+    --profile=*)     _PROFILE_FILE_FLAG="${1#--profile=}"; [[ -n "$_PROFILE_FILE_FLAG" ]] || { echo "agent-tmux: --profile needs a file path" >&2; exit 2; }; shift ;;
     --audit-log)
       if [[ -n "${2:-}" && "$2" != --* ]]; then
         _lead+=("$1" "$2"); shift 2
@@ -85,6 +85,10 @@ load_cli_profile() {
     fi
     file="$_PROFILE_FILE_FLAG"
   else
+    if [[ -n "$_PROFILE_DIR_FLAG" && ! -d "$_PROFILE_DIR_FLAG" ]]; then
+      echo "agent-tmux: --profile-dir directory not found: $_PROFILE_DIR_FLAG" >&2
+      exit 2
+    fi
     for dir in "$_PROFILE_DIR_FLAG" "${AGENT_TMUX_PROFILE_DIR:-}" "${XDG_CONFIG_HOME:-$HOME/.config}/agent-tmux/profiles" "${SELF:h}/profiles"; do
       [[ -n "$dir" && -f "$dir/$cli.conf" ]] && { file="$dir/$cli.conf"; break; }
     done
