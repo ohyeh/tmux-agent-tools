@@ -1,0 +1,441 @@
+#!/usr/bin/env zsh
+# Smoke test for agent-tmux room Phase 2a (SSH hub) and Phase 2b (Cloudflare).
+#
+# No real SSH or network connections: fake 'ssh' and 'curl' scripts are prepended
+# to PATH.  They record argv to log files and emit canned stdout/exit codes
+# controlled via exported env vars pointing at state files in $WORK.
+#
+# Phase 2a cases:
+#  A1.  verb forwarding: remote command contains agent-tmux room <verb> <team> [flags]
+#  A2.  flag reconstruction: --hub stripped; other flags forwarded; --from/--topic present
+#  A3.  BatchMode and ConnectTimeout options present in ssh argv
+#  A4.  post text with spaces/quotes/$( ) survives quoting intact
+#  A5.  remote exit 0 → local exit 0
+#  A6.  remote exit 1 → local exit 1
+#  A7.  remote exit 2 → local exit 2
+#  A8.  remote exit 3 → local exit 3
+#  A9.  ssh exit 255 → local exit 2 + stderr JSON (ssh_failed)
+#  A10. AGENT_TMUX_ROOM_HUB env var used when --hub absent
+#  A11. --hub flag wins over AGENT_TMUX_ROOM_HUB env var
+#
+# Phase 2b cases:
+#  B1.  missing AGENT_TMUX_ROOM_TOKEN → exit 2
+#  B2.  HTTP 200 post → exit 0, stdout has "posted seq="
+#  B3.  HTTP 400 → exit 2
+#  B4.  HTTP 403 → exit 2
+#  B5.  HTTP 404 → exit 2
+#  B6.  HTTP 429 → exit 3
+#  B7.  HTTP 500 → exit 2
+#  B8.  curl error (rc≠0) → exit 2
+#  B9.  read HTTP 200 empty messages → exit 0 (no cursor advance)
+#  B10. read HTTP 200 with messages → cursor advances (unfiltered, no --since)
+#  B11. read with --since: cursor NOT created/modified
+#  B12. read with --topic filter: cursor NOT advanced
+#  B13. wait HTTP 200 non-empty on first poll → exit 0
+#  B14. wait timeout (always empty) → exit 1
+#  B15. --json schema: messages array + seq/ts/from/topic/msg fields + cursor
+#
+# Also: regression check by running scripts/test-room-smoke.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+[[ -x "$AGENT" ]] || { echo "not executable: $AGENT" >&2; exit 1; }
+
+WORK="$(mktemp -d -t tmux-agent-backends-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+mkdir -p "$TMUX_AGENT_DIR/teams"
+
+FAKEDIR="$WORK/fakebin"
+mkdir -p "$FAKEDIR"
+
+# macOS /etc/zshenv (loaded via path_helper) resets PATH in every new zsh process,
+# wiping FAKEDIR.  Point ZDOTDIR at an empty dir so new zsh subshells don't load
+# any system rc files and our PATH override survives into the agent subprocess.
+_EMPTY_ZDOTDIR="$WORK/zdotdir"
+mkdir -p "$_EMPTY_ZDOTDIR"
+export ZDOTDIR="$_EMPTY_ZDOTDIR"
+
+# State files for fake binaries — exported so subshell scripts see them.
+export _FAKE_SSH_LOG="$WORK/ssh.log"
+export _FAKE_SSH_RC_FILE="$WORK/ssh_rc"
+export _FAKE_SSH_STDOUT_FILE="$WORK/ssh_stdout"
+
+export _FAKE_CURL_LOG="$WORK/curl.log"
+export _FAKE_CURL_RC_FILE="$WORK/curl_rc"
+export _FAKE_CURL_HTTP_STATUS_FILE="$WORK/curl_http_status"
+export _FAKE_CURL_BODY_FILE="$WORK/curl_body"
+
+# Defaults
+printf '0\n'   > "$_FAKE_SSH_RC_FILE"
+printf ''      > "$_FAKE_SSH_STDOUT_FILE"
+printf '0\n'   > "$_FAKE_CURL_RC_FILE"
+printf '200\n' > "$_FAKE_CURL_HTTP_STATUS_FILE"
+printf '{"seq":1,"ts":"2026-06-10T00:00:00Z"}\n' > "$_FAKE_CURL_BODY_FILE"
+
+# ── fake ssh ──────────────────────────────────────────────────────────────────
+# Single-quote heredoc → $vars are literal; exported vars are read at runtime.
+cat > "$FAKEDIR/ssh" << 'FAKESSH'
+#!/usr/bin/env zsh
+printf '%s\n' "$*" >> "$_FAKE_SSH_LOG"
+cat "$_FAKE_SSH_STDOUT_FILE" 2>/dev/null || true
+rc="$(cat "$_FAKE_SSH_RC_FILE" 2>/dev/null || echo 0)"
+exit "$rc"
+FAKESSH
+chmod +x "$FAKEDIR/ssh"
+
+# ── fake curl ─────────────────────────────────────────────────────────────────
+cat > "$FAKEDIR/curl" << 'FAKECURL'
+#!/usr/bin/env zsh
+printf '%s\n' "$*" >> "$_FAKE_CURL_LOG"
+
+local_rc="$(cat "$_FAKE_CURL_RC_FILE" 2>/dev/null || echo 0)"
+http_status="$(cat "$_FAKE_CURL_HTTP_STATUS_FILE" 2>/dev/null || echo 200)"
+
+# Find the -o <outfile> argument
+output_file=""
+i=1
+while (( i <= $# )); do
+  arg="${@[$i]}"
+  case "$arg" in
+    -o)
+      i=$(( i + 1 ))
+      output_file="${@[$i]:-}"
+      ;;
+    -o*)
+      output_file="${arg#-o}"
+      ;;
+  esac
+  i=$(( i + 1 ))
+done
+
+if (( local_rc == 0 )); then
+  # Write body to the -o file if provided
+  if [[ -n "$output_file" ]]; then
+    cp "$_FAKE_CURL_BODY_FILE" "$output_file" 2>/dev/null || true
+  fi
+  # Print http_code (agent-tmux uses -w '%{http_code}', output goes to stdout)
+  printf '%s' "$http_status"
+fi
+exit "$local_rc"
+FAKECURL
+chmod +x "$FAKEDIR/curl"
+
+export PATH="$FAKEDIR:$PATH"
+
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0; FAIL=0
+
+ok()    { printf '  ok   %s\n' "$1"; PASS=$(( PASS + 1 )); }
+fail()  { printf '  FAIL %s\n' "$1" >&2; printf '    %s\n' "$2" >&2; FAIL=$(( FAIL + 1 )); }
+
+assert_eq() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then ok "$label"
+  else fail "$label" "expected='$expected' got='$actual'"; fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then ok "$label"
+  else fail "$label" "needle='$needle' not in: $haystack"; fi
+}
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then ok "$label"
+  else fail "$label" "needle='$needle' found but should be absent"; fi
+}
+
+assert_exit() {
+  local label="$1" expected_rc="$2" actual_rc="$3"
+  if [[ "$actual_rc" == "$expected_rc" ]]; then ok "$label"
+  else fail "$label" "expected exit $expected_rc got $actual_rc"; fi
+}
+
+# Helper: reset fake ssh state
+set_ssh() {
+  # set_ssh <rc> [stdout_text]
+  printf '%s\n' "$1" > "$_FAKE_SSH_RC_FILE"
+  printf '%s' "${2:-}" > "$_FAKE_SSH_STDOUT_FILE"
+  > "$_FAKE_SSH_LOG"
+}
+
+# Helper: reset fake curl state; body_string written to body file
+set_curl() {
+  # set_curl <rc> <http_status> <body_string>
+  printf '%s\n' "$1" > "$_FAKE_CURL_RC_FILE"
+  printf '%s\n' "$2" > "$_FAKE_CURL_HTTP_STATUS_FILE"
+  printf '%s'   "$3" > "$_FAKE_CURL_BODY_FILE"
+  > "$_FAKE_CURL_LOG"
+}
+
+# Return the last recorded ssh argv line
+last_ssh_argv() { tail -1 "$_FAKE_SSH_LOG" 2>/dev/null || printf ''; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== Phase 2a: SSH hub backend ==="
+
+# ── A1+A2+A3: verb forwarding, flag reconstruction, BatchMode/ConnectTimeout ──
+echo "--- A1-A3: verb forwarding + flags + SSH options ---"
+set_ssh 0 'posted seq=7'
+unset AGENT_TMUX_ROOM_HUB 2>/dev/null || true
+
+rc=0
+out="$("$AGENT" room post myteam --from alice --topic work 'hello world' \
+    --hub tester@hub.local 2>&1)" && rc=0 || rc=$?
+assert_exit "A1 post via ssh exit 0" "0" "$rc"
+
+argv="$(last_ssh_argv)"
+
+# BatchMode and ConnectTimeout must appear
+assert_contains "A3 BatchMode=yes in argv" "$argv" "BatchMode=yes"
+assert_contains "A3 ConnectTimeout=10 in argv" "$argv" "ConnectTimeout=10"
+
+# Hub must be the user@host
+assert_contains "A1 hub in argv" "$argv" "tester@hub.local"
+
+# --hub must NOT appear in the remote command (stripped before forwarding)
+assert_not_contains "A2 --hub stripped from remote" "$argv" "--hub"
+
+# Remote command must contain the verb and team
+assert_contains "A1 verb forwarded: post" "$argv" "room post"
+assert_contains "A1 team forwarded" "$argv" "myteam"
+
+# --from and --topic must appear in remote command
+assert_contains "A2 --from forwarded" "$argv" "--from"
+assert_contains "A2 --topic forwarded" "$argv" "--topic"
+
+# ── A4: text with spaces/quotes/$( ) survives quoting ──
+echo "--- A4: special char quoting ---"
+set_ssh 0 'posted seq=8'
+rc=0
+_special='hello world "quotes" $(evil) $var'
+"$AGENT" room post myteam --from alice "$_special" --hub tester@hub.local >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "A4 special chars exit 0" "0" "$rc"
+argv="$(last_ssh_argv)"
+# The word 'hello' must appear somewhere in the quoted argv
+assert_contains "A4 text reaches ssh argv" "$argv" "hello"
+
+# ── A5-A8: remote exit passthrough ──
+echo "--- A5-A8: remote exit code passthrough ---"
+local_rc=0
+set_ssh 0 ""; "$AGENT" room read myteam --member alice --hub tester@hub.local >/dev/null 2>&1 && local_rc=0 || local_rc=$?
+assert_exit "A5 remote exit 0 → local 0" "0" "$local_rc"
+
+set_ssh 1 ""; "$AGENT" room read myteam --member alice --hub tester@hub.local >/dev/null 2>&1 && local_rc=0 || local_rc=$?
+assert_exit "A6 remote exit 1 → local 1" "1" "$local_rc"
+
+set_ssh 2 ""; "$AGENT" room read myteam --member alice --hub tester@hub.local >/dev/null 2>&1 && local_rc=0 || local_rc=$?
+assert_exit "A7 remote exit 2 → local 2" "2" "$local_rc"
+
+set_ssh 3 ""; "$AGENT" room read myteam --member alice --hub tester@hub.local >/dev/null 2>&1 && local_rc=0 || local_rc=$?
+assert_exit "A8 remote exit 3 → local 3" "3" "$local_rc"
+
+# ── A9: ssh exit 255 → local exit 2 + stderr JSON ──
+echo "--- A9: ssh exit 255 → exit 2 + JSON error ---"
+set_ssh 255 ""
+rc=0
+err="$("$AGENT" room post myteam --from alice hi --hub tester@hub.local 2>&1 >/dev/null)" && rc=0 || rc=$?
+assert_exit "A9 ssh 255 → exit 2" "2" "$rc"
+rc2=0; printf '%s' "$err" | jq -e '.error == "ssh_failed"' >/dev/null 2>&1 || rc2=$?
+assert_exit "A9 stderr JSON has error=ssh_failed" "0" "$rc2"
+
+# ── A10: AGENT_TMUX_ROOM_HUB env var ──
+echo "--- A10: AGENT_TMUX_ROOM_HUB env var ---"
+set_ssh 0 'posted seq=1'
+export AGENT_TMUX_ROOM_HUB="envuser@envhost.local"
+rc=0
+"$AGENT" room post myteam --from alice "env test" >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "A10 env var hub exit 0" "0" "$rc"
+argv="$(last_ssh_argv)"
+assert_contains "A10 env hub used" "$argv" "envuser@envhost.local"
+unset AGENT_TMUX_ROOM_HUB
+
+# ── A11: --hub flag wins over AGENT_TMUX_ROOM_HUB ──
+echo "--- A11: --hub flag wins over env var ---"
+set_ssh 0 'posted seq=2'
+export AGENT_TMUX_ROOM_HUB="envuser@envhost.local"
+rc=0
+"$AGENT" room post myteam --from alice "flag wins" --hub flaguser@flaghost.local >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "A11 flag wins exit 0" "0" "$rc"
+argv="$(last_ssh_argv)"
+assert_contains "A11 flag hub in argv" "$argv" "flaguser@flaghost.local"
+assert_not_contains "A11 env hub NOT used" "$argv" "envuser@envhost.local"
+unset AGENT_TMUX_ROOM_HUB
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== Phase 2b: Cloudflare Workers backend ==="
+
+# Token set for most tests
+export AGENT_TMUX_ROOM_TOKEN="test-bearer-token-abc123"
+
+# ── B1: missing token → exit 2 ──
+echo "--- B1: missing AGENT_TMUX_ROOM_TOKEN → exit 2 ---"
+unset AGENT_TMUX_ROOM_TOKEN
+rc=0
+err="$("$AGENT" room post myteam --from alice hi --hub https://worker.example.com 2>&1 >/dev/null)" && rc=0 || rc=$?
+assert_exit "B1 missing token exit 2" "2" "$rc"
+rc2=0; printf '%s' "$err" | jq -e '.error == "missing_token"' >/dev/null 2>&1 || rc2=$?
+assert_exit "B1 missing token stderr JSON" "0" "$rc2"
+export AGENT_TMUX_ROOM_TOKEN="test-bearer-token-abc123"
+
+# ── B2: HTTP 200 post → exit 0 + "posted seq=" ──
+echo "--- B2: HTTP 200 post → exit 0 ---"
+set_curl 0 200 '{"seq":42,"ts":"2026-06-10T00:00:00Z"}'
+rc=0
+out="$("$AGENT" room post myteam --from alice "hello" --hub https://worker.example.com 2>&1)" && rc=0 || rc=$?
+assert_exit "B2 HTTP 200 post exit 0" "0" "$rc"
+assert_contains "B2 stdout has posted seq=" "$out" "posted seq="
+
+# ── B3–B7: HTTP error codes → exit mapping ──
+echo "--- B3-B7: HTTP error codes → exit mapping ---"
+
+set_curl 0 400 '{"error":"bad_input"}'
+rc=0
+"$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B3 HTTP 400 → exit 2" "2" "$rc"
+
+set_curl 0 403 '{"error":"auth_failed"}'
+rc=0
+"$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B4 HTTP 403 → exit 2" "2" "$rc"
+
+set_curl 0 404 '{"error":"not_found"}'
+rc=0
+"$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B5 HTTP 404 → exit 2" "2" "$rc"
+
+set_curl 0 429 '{"error":"quota_exceeded"}'
+rc=0
+"$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B6 HTTP 429 → exit 3" "3" "$rc"
+
+set_curl 0 500 '{"error":"server_error"}'
+rc=0
+"$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B7 HTTP 500 → exit 2" "2" "$rc"
+
+# ── B8: curl error (rc≠0) → exit 2 ──
+echo "--- B8: curl error → exit 2 ---"
+set_curl 6 "" ""
+rc=0
+"$AGENT" room post myteam --from alice "x" --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B8 curl error rc 6 → exit 2" "2" "$rc"
+
+# ── B9: read 200 empty messages → exit 0 (no cursor advance) ──
+echo "--- B9: read 200 empty messages → exit 0, no cursor ---"
+set_curl 0 200 '{"messages":[]}'
+cf_cursor_alice="$TMUX_AGENT_DIR/teams/myteam.room-cursors/alice"
+rm -f "$cf_cursor_alice"
+rc=0
+"$AGENT" room read myteam --member alice --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B9 empty read exit 0" "0" "$rc"
+# No messages → cursor should not be created (or stay at 0 if it was already there)
+if [[ ! -f "$cf_cursor_alice" ]]; then
+  ok "B9 no cursor file created for empty read"
+else
+  cursor_val="$(cat "$cf_cursor_alice" 2>/dev/null || printf -1)"
+  assert_eq "B9 cursor stays 0 for empty read" "$cursor_val" "0"
+fi
+
+# ── B10: read 200 with messages → cursor advances ──
+echo "--- B10: read with messages → cursor advances ---"
+set_curl 0 200 '{"messages":[{"seq":5,"ts":"2026-06-10T01:00:00Z","from":"w1","topic":"general","msg":"hi"},{"seq":6,"ts":"2026-06-10T01:01:00Z","from":"w2","topic":"general","msg":"there"}]}'
+rm -f "$cf_cursor_alice"
+rc=0
+"$AGENT" room read myteam --member alice --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B10 read with messages exit 0" "0" "$rc"
+if [[ -f "$cf_cursor_alice" ]]; then
+  cursor_val="$(cat "$cf_cursor_alice")"
+  assert_eq "B10 cursor advanced to 6" "$cursor_val" "6"
+else
+  fail "B10 cursor file not created after unfiltered read" "missing: $cf_cursor_alice"
+fi
+
+# ── B11: read with --since → cursor NOT created/modified ──
+echo "--- B11: read --since: cursor not created ---"
+set_curl 0 200 '{"messages":[{"seq":10,"ts":"2026-06-10T02:00:00Z","from":"w1","topic":"general","msg":"msg"}]}'
+cf_cursor_b11="$TMUX_AGENT_DIR/teams/myteam.room-cursors/b11member"
+rm -f "$cf_cursor_b11"
+rc=0
+"$AGENT" room read myteam --member b11member --since 5 --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B11 read --since exit 0" "0" "$rc"
+if [[ ! -f "$cf_cursor_b11" ]]; then
+  ok "B11 --since: no cursor file created"
+else
+  fail "B11 --since: cursor file was created unexpectedly" "$cf_cursor_b11 exists"
+fi
+
+# ── B12: read with --topic filter → cursor NOT advanced ──
+echo "--- B12: read --topic filtered: cursor NOT advanced ---"
+set_curl 0 200 '{"messages":[{"seq":20,"ts":"2026-06-10T03:00:00Z","from":"w1","topic":"work","msg":"scoped"}]}'
+cf_cursor_b12="$TMUX_AGENT_DIR/teams/myteam.room-cursors/topicmember"
+rm -f "$cf_cursor_b12"
+rc=0
+"$AGENT" room read myteam --member topicmember --topic work --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B12 read --topic exit 0" "0" "$rc"
+if [[ ! -f "$cf_cursor_b12" ]]; then
+  ok "B12 --topic: no cursor file created"
+else
+  fail "B12 --topic: cursor file created unexpectedly" "$cf_cursor_b12 exists"
+fi
+
+# ── B13: wait non-empty on first poll → exit 0 ──
+echo "--- B13: wait exits 0 when messages available ---"
+set_curl 0 200 '{"messages":[{"seq":1,"ts":"2026-06-10T00:00:00Z","from":"w1","topic":"general","msg":"wake up"}]}'
+rc=0
+"$AGENT" room wait myteam --member alice --timeout 5 --interval 1 \
+    --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B13 wait non-empty exit 0" "0" "$rc"
+
+# ── B14: wait timeout (always empty) → exit 1 ──
+echo "--- B14: wait timeout → exit 1 ---"
+set_curl 0 200 '{"messages":[]}'
+rc=0
+"$AGENT" room wait myteam --member alice --timeout 1 --interval 1 \
+    --hub https://worker.example.com >/dev/null 2>&1 && rc=0 || rc=$?
+assert_exit "B14 wait timeout exit 1" "1" "$rc"
+
+# ── B15: --json schema: seq/ts/from/topic/msg + cursor field ──
+echo "--- B15: --json schema validation ---"
+set_curl 0 200 '{"messages":[{"seq":3,"ts":"2026-06-10T00:00:00Z","from":"w1","topic":"general","msg":"hello"}]}'
+rc=0
+json_out="$("$AGENT" room read myteam --member alice --json \
+    --hub https://worker.example.com 2>&1)" && rc=0 || rc=$?
+assert_exit "B15 --json exit 0" "0" "$rc"
+
+rc2=0; printf '%s' "$json_out" | jq -e 'has("messages") and has("cursor")' >/dev/null 2>&1 || rc2=$?
+assert_exit "B15 --json has messages + cursor fields" "0" "$rc2"
+
+rc2=0; printf '%s' "$json_out" | \
+  jq -e '.messages[0] | has("seq") and has("ts") and has("from") and has("topic") and has("msg")' \
+  >/dev/null 2>&1 || rc2=$?
+assert_exit "B15 message has seq/ts/from/topic/msg" "0" "$rc2"
+
+rc2=0; printf '%s' "$json_out" | jq -e '.messages[0].seq | type == "number"' >/dev/null 2>&1 || rc2=$?
+assert_exit "B15 seq is number" "0" "$rc2"
+
+rc2=0; printf '%s' "$json_out" | jq -e '.cursor | type == "number"' >/dev/null 2>&1 || rc2=$?
+assert_exit "B15 cursor is number" "0" "$rc2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== Regression: running scripts/test-room-smoke ==="
+reg_rc=0
+"$SCRIPT_DIR/test-room-smoke" && reg_rc=0 || reg_rc=$?
+if (( reg_rc == 0 )); then
+  ok "regression test-room-smoke passed"
+else
+  fail "regression test-room-smoke failed" "exit code: $reg_rc"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "summary: $PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ? 1 : 0 ))
