@@ -184,6 +184,19 @@ assert_exit "wait --interval 0 exit 2" "2" "$rc"
 rc=0; "$AGENT" room post t5 --hub remote --from alice "hi" 2>/dev/null || rc=$?
 assert_exit "hub=remote exit 2" "2" "$rc"
 
+# flag missing value: --from with no argument → exit 2, no crash
+rc=0; "$AGENT" room post t5 --from 2>/dev/null || rc=$?
+assert_exit "post --from missing value exit 2" "2" "$rc"
+
+# flag missing value: --member with no argument → exit 2, no crash
+rc=0; "$AGENT" room read t5 --member 2>/dev/null || rc=$?
+assert_exit "read --member missing value exit 2" "2" "$rc"
+
+# status on a brand-new room with no cursor files → exit 0 (nullglob, no crash)
+make_team "t5b" "alice"
+rc=0; "$AGENT" room status t5b >/dev/null 2>&1 || rc=$?
+assert_exit "status empty room (no cursors) exit 0" "0" "$rc"
+
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== Case 6: cursor monotonicity - topic-filtered read does not advance cursor ==="
 make_team "t6" "alice"
