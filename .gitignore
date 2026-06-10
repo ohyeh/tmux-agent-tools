@@ -7,3 +7,4 @@
 # macOS SMB transient files
 **/.smbdelete*
 .tmux-agent-result.json
+.claude/
