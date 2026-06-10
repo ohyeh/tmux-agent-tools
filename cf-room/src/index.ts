@@ -107,8 +107,7 @@ export default {
     // Echo back the accepted Sec-WebSocket-Protocol so browsers complete the WS handshake
     if (isWS && doResp.status === 101) {
       const respHeaders = new Headers(doResp.headers);
-      respHeaders.set("Sec-WebSocket-Protocol", "bearer." + provided.split(".")[0]);
-      // actually echo the full token prefix negotiated; spec requires echoing one of the offered values
+      // Echo the full offered bearer.* token; spec requires echoing one of the offered values
       const offered = rawProto
         .split(",")
         .map((p) => p.trim())

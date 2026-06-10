@@ -145,17 +145,17 @@ export class RoomDO implements DurableObject {
       JSON.stringify({ since, topic, member })
     ]);
 
-    // Replay missed messages immediately
+    // Replay missed messages immediately (capped at DEFAULT_LIMIT; client can long-poll /read for the rest)
     let missed: MsgRow[];
     if (topic) {
       missed = Array.from(this.sql.exec<MsgRow>(
-        `SELECT seq, ts, from_, topic, msg FROM messages WHERE seq > ? AND topic = ? ORDER BY seq`,
-        since, topic
+        `SELECT seq, ts, from_, topic, msg FROM messages WHERE seq > ? AND topic = ? ORDER BY seq LIMIT ?`,
+        since, topic, DEFAULT_LIMIT
       ));
     } else {
       missed = Array.from(this.sql.exec<MsgRow>(
-        `SELECT seq, ts, from_, topic, msg FROM messages WHERE seq > ? ORDER BY seq`,
-        since
+        `SELECT seq, ts, from_, topic, msg FROM messages WHERE seq > ? ORDER BY seq LIMIT ?`,
+        since, DEFAULT_LIMIT
       ));
     }
     for (const r of missed) {

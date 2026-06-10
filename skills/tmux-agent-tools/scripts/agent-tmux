@@ -5696,7 +5696,9 @@ _room_cf_post() {
     '{from:$from,topic:$topic,msg:$msg}')"
 
   local resp http_status curl_rc
-  resp="$(curl -sf -o /tmp/_room_cf_post_body.$$ \
+  local _post_tmp
+  _post_tmp="$(mktemp)" || { echo "_room_cf_post: mktemp failed" >&2; return 2; }
+  resp="$(curl -sf -o "$_post_tmp" \
     -w '%{http_code}' \
     -X POST \
     -H "Authorization: Bearer ${AGENT_TMUX_ROOM_TOKEN}" \
@@ -5705,7 +5707,7 @@ _room_cf_post() {
     "${hub}/room/${team}/post")" && curl_rc=0 || curl_rc=$?
   http_status="$resp"
   local resp_body=""
-  [[ -f /tmp/_room_cf_post_body.$$ ]] && resp_body="$(cat /tmp/_room_cf_post_body.$$)" ; rm -f /tmp/_room_cf_post_body.$$
+  resp_body="$(cat "$_post_tmp" 2>/dev/null || true)" ; rm -f "$_post_tmp"
 
   if (( curl_rc != 0 )) || [[ "$http_status" != "200" ]]; then
     local _CF_EXIT
@@ -5775,12 +5777,13 @@ _room_cf_read() {
   [[ -n "$topic" ]] && url="${url}&topic=${topic}"
 
   local resp_body http_status curl_rc
-  http_status="$(curl -sf -o /tmp/_room_cf_read_body.$$ \
+  local _read_tmp
+  _read_tmp="$(mktemp)" || { echo "_room_cf_read: mktemp failed" >&2; return 2; }
+  http_status="$(curl -sf -o "$_read_tmp" \
     -w '%{http_code}' \
     -H "Authorization: Bearer ${AGENT_TMUX_ROOM_TOKEN}" \
     "$url")" && curl_rc=0 || curl_rc=$?
-  resp_body=""
-  [[ -f /tmp/_room_cf_read_body.$$ ]] && resp_body="$(cat /tmp/_room_cf_read_body.$$)" ; rm -f /tmp/_room_cf_read_body.$$
+  resp_body="$(cat "$_read_tmp" 2>/dev/null || true)" ; rm -f "$_read_tmp"
 
   if (( curl_rc != 0 )) || [[ "$http_status" != "200" ]]; then
     local _CF_EXIT
@@ -5912,12 +5915,13 @@ _room_cf_status() {
   [[ -n "$member" ]] && { _room_validate_name "member" "$member" || return 2; }
 
   local resp_body http_status curl_rc
-  http_status="$(curl -sf -o /tmp/_room_cf_status_body.$$ \
+  local _status_tmp
+  _status_tmp="$(mktemp)" || { echo "_room_cf_status: mktemp failed" >&2; return 2; }
+  http_status="$(curl -sf -o "$_status_tmp" \
     -w '%{http_code}' \
     -H "Authorization: Bearer ${AGENT_TMUX_ROOM_TOKEN}" \
     "${hub}/room/${team}/status")" && curl_rc=0 || curl_rc=$?
-  resp_body=""
-  [[ -f /tmp/_room_cf_status_body.$$ ]] && resp_body="$(cat /tmp/_room_cf_status_body.$$)" ; rm -f /tmp/_room_cf_status_body.$$
+  resp_body="$(cat "$_status_tmp" 2>/dev/null || true)" ; rm -f "$_status_tmp"
 
   if (( curl_rc != 0 )) || [[ "$http_status" != "200" ]]; then
     local _CF_EXIT
