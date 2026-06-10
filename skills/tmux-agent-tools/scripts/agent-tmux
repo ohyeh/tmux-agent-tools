@@ -16,6 +16,10 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 
 # Per-CLI preset. Sets: _ENV_NS, _bin, _PRESET_PREFIX, _PRESET_FLAGS,
 # RESUME_KEYWORD, HEURISTIC_FAMILY, _USAGE_KIND.
+# LEGACY — frozen fallback. The canonical per-CLI defaults live in the bundled
+# scripts/profiles/<cli>.conf files (same values); this table only covers the
+# case where the profiles directory is missing. Add new CLIs as profiles, not
+# as new branches here.
 preset_for_cli() {
   case "$1" in
     claude) _ENV_NS=CLAUDE; _bin=claude; _PRESET_PREFIX=claude-cli; _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='--resume'; HEURISTIC_FAMILY=claude; _USAGE_KIND='Code' ;;
@@ -28,10 +32,32 @@ preset_for_cli() {
 }
 preset_for_cli "$CLI"
 
+# Use-time profile selection (highest priority, before env/default dirs):
+#   --profile-dir <dir>   look up <cli>.conf in a user-managed directory
+#   --profile <file>      load this exact profile file
+# Stripped here so subcommands never see them.
+_PROFILE_DIR_FLAG=''
+_PROFILE_FILE_FLAG=''
+_profile_args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --profile-dir)   [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile-dir needs a path" >&2; exit 2; }; _PROFILE_DIR_FLAG="$2"; shift 2 ;;
+    --profile-dir=*) _PROFILE_DIR_FLAG="${1#--profile-dir=}"; shift ;;
+    --profile)       [[ -n "${2:-}" ]] || { echo "agent-tmux: --profile needs a file path" >&2; exit 2; }; _PROFILE_FILE_FLAG="$2"; shift 2 ;;
+    --profile=*)     _PROFILE_FILE_FLAG="${1#--profile=}"; shift ;;
+    *) _profile_args+=("$1"); shift ;;
+  esac
+done
+if (( ${#_profile_args[@]} > 0 )); then
+  set -- "${_profile_args[@]}"
+fi
+
 # Declarative CLI profile: <dir>/<cli>.conf overrides the preset above.
-# Search order: $AGENT_TMUX_PROFILE_DIR > ~/.config/agent-tmux/profiles >
-# <script-dir>/profiles. Plain key=value lines ('#' comments); never sourced,
-# so profiles cannot execute code. Env vars still override profile values.
+# Search order: --profile-dir > $AGENT_TMUX_PROFILE_DIR >
+# ~/.config/agent-tmux/profiles > <script-dir>/profiles (bundled defaults).
+# --profile <file> bypasses the search entirely. Plain key=value lines
+# ('#' comments); never sourced, so profiles cannot execute code. Env vars
+# still override profile values.
 CLI_PROFILE_FILE=''
 PROFILE_PATTERN_BUSY=''
 PROFILE_PATTERN_PERMISSION=''
@@ -39,9 +65,17 @@ PROFILE_PATTERN_APPROVAL=''
 PROFILE_PATTERN_LOGIN=''
 load_cli_profile() {
   local cli="$1" dir file='' line key value
-  for dir in "${AGENT_TMUX_PROFILE_DIR:-}" "${XDG_CONFIG_HOME:-$HOME/.config}/agent-tmux/profiles" "${SELF:h}/profiles"; do
-    [[ -n "$dir" && -f "$dir/$cli.conf" ]] && { file="$dir/$cli.conf"; break; }
-  done
+  if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
+    if [[ ! -f "$_PROFILE_FILE_FLAG" ]]; then
+      echo "agent-tmux: --profile file not found: $_PROFILE_FILE_FLAG" >&2
+      exit 2
+    fi
+    file="$_PROFILE_FILE_FLAG"
+  else
+    for dir in "$_PROFILE_DIR_FLAG" "${AGENT_TMUX_PROFILE_DIR:-}" "${XDG_CONFIG_HOME:-$HOME/.config}/agent-tmux/profiles" "${SELF:h}/profiles"; do
+      [[ -n "$dir" && -f "$dir/$cli.conf" ]] && { file="$dir/$cli.conf"; break; }
+    done
+  fi
   [[ -n "$file" ]] || return 0
   CLI_PROFILE_FILE="$file"
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -130,6 +164,7 @@ usage() {
 agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
+  agent-tmux [--profile <file> | --profile-dir <dir>] <command> ...
   agent-tmux start [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   agent-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]
