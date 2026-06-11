@@ -1,8 +1,8 @@
 class TmuxAgentTools < Formula
   desc "Tmux wrappers for controllable Claude Code and Codex CLI sessions"
   homepage "https://github.com/ohyeh/tmux-agent-tools"
-  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.18.1.tar.gz"
-  sha256 "0c07e69d0f589dd48b350ff91648b1ece48ee41d9f69cf403cbc8103dd590d45"
+  url "https://github.com/ohyeh/tmux-agent-tools/archive/refs/tags/v0.20.0.tar.gz"
+  sha256 "ddb0d26a12ccfed6853b15f4823ceb60ffd4725870c709bc10e55cbfd35480b4"
   head "https://github.com/ohyeh/tmux-agent-tools.git", branch: "main"
 
   depends_on "jq"
@@ -28,8 +28,11 @@ class TmuxAgentTools < Formula
   end
 
   test do
-    assert_match "agent-tmux - run Claude Code in tmux", shell_output("#{bin}/claude-tmux help")
-    assert_match "agent-tmux - run Claude Code in tmux", shell_output("#{bin}/codex-tmux help")
+    # The engine prints one shared usage text for every CLI preset, so the
+    # shim tests assert the shim->engine exec works, not per-CLI branding.
+    assert_match "run Claude Code in tmux", shell_output("#{bin}/claude-tmux help")
+    assert_match "agent-tmux room post", shell_output("#{bin}/codex-tmux help")
+    assert_match "agent-tmux room post", shell_output("#{bin}/agent-tmux claude help")
     assert_match "tmux-agent-dialogue - run a bounded two-agent tmux dialogue",
                  shell_output("#{bin}/tmux-agent-dialogue help")
     assert_match "tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions",

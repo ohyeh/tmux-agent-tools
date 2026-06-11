@@ -1,5 +1,8 @@
 #!/usr/bin/env zsh
 # Smoke test for issue #104 `tmux-agent-sessions watch` event subscribe mode.
+# Must run under zsh (uses ${(%):-%x} for reliable $0 resolution).
+# If invoked via bash/sh, re-exec under zsh automatically.
+if [ -z "${ZSH_VERSION:-}" ]; then exec zsh "$0" "$@"; fi
 
 set -euo pipefail
 
