@@ -7,5 +7,8 @@
 # macOS SMB transient files
 **/.smbdelete*
 .tmux-agent-result.json
-.claude/
+# .claude: ignore local/runtime by default, but track shared artifacts
+.claude/*
+!.claude/handoffs/
+!.claude/workflows/
 skills/tmux-agent-tools-workspace/
