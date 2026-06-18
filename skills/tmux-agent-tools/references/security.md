@@ -78,6 +78,8 @@ Before debugging agent behavior, prefer:
 ```bash
 codex-tmux doctor      # verify wrapper dependencies
 codex-tmux self-test   # verify tmux capture/wait without spawning real CLI
+codex-tmux status --json worker
+codex-tmux ping --json --timeout 5 worker
 ```
 
-These do not start a real agent and surface 90% of "why didn't it work" issues.
+`doctor` and `self-test` do not start a real agent and surface 90% of "why didn't it work" issues. For an existing worker, use structured `status`/`ping` before pane capture.

@@ -8,7 +8,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 ## Fast paths (read this first)
 
 - **Wrapper not on PATH?** Run it from the skill bundle directly: `<skill-dir>/scripts/codex-tmux …` (this file's directory). Don't waste steps on `which`/`find`/`tmux ls` discovery.
-- **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>`. Pane capture is fallback evidence only.
+- **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>` → `codex-tmux ping --json --timeout 5 <n>` only if liveness is unclear. Pane capture is diagnostic fallback only.
 - **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `codex-tmux result --json <winner>`.
 - **Want to auto-delegate a substantial task?** Use the `.claude/agents/tmux-delegate.md` subagent to decide inline vs worker, then run its exact wrapper command.
 - **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
@@ -41,8 +41,8 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 | Name | One-line purpose | When to reach for it |
 | --- | --- | --- |
 | `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets, `doctor --json`, `setup`, and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools), when scripting across multiple CLIs, or when running JSON preflight via `agent-tmux <cli> setup`. |
-| `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, or later capture. |
-| `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, or later capture. |
+| `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, ping, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
+| `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
 | `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
 | `tmux-agent-audit` | Query and verify wrapper audit logs. | Use when you need an operator-facing record of wrapper events, secret use, approvals, or posting actions. |
 | `tmux-agent-cron` | Run scheduled/periodic tmux-agent-tool jobs from a manifest. | Use for repeatable local automation where a manifest should drive wrapper invocations. |
@@ -74,7 +74,7 @@ Claude Code can use `.claude/agents/tmux-delegate.md` as the decision gate for s
 - `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI; `agent-tmux <cli>` for any other CLI (gemini, cursor, grok, custom binaries).
 - `start` for a local working directory; `start-ssh` when tmux stays local but the CLI runs over SSH.
 - `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
-- The subcommands `send`, `send-wait`, `capture`, `wait*`, `status`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
+- The subcommands `send`, `send-wait`, `capture`, `wait*`, `status`, `ping`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
 - If you don't know which wrapper owns a session, use `tmux-agent-sessions resolve --name <partial-or-full-name> --json` before any `start`. It accepts a full tmux session name, wrapper-prefixed partial, or short agent name and returns the owning wrapper, short `agent_name`, full tmux session, cwd, result path, running state, and safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous or missing names exit non-zero and return JSON candidates/errors.
 - Use `tmux-agent-monitor --name <agent> --every <duration> --commands <manifest.json> --stop-on-change --summary-out <path> --json` when you need read-only periodic evidence checks against a managed session/repo. It polls manifest commands and emits JSONL observations plus a summary; it is distinct from `wait-and-capture`, which watches a tmux pane for a marker and captures pane output.
 
@@ -106,14 +106,15 @@ Common cases:
 
 ### Supervising an existing worker: listen before send
 
-Use an existing teammate when one already exists; resolve/discover it before creating another session. Pane capture is secondary evidence. Prefer wrapper status and `result.json` whenever they are available.
+Use an existing teammate when one already exists; resolve it before creating another session. Status/result/watch are the automation contract.
 
 ```text
-resolve/discover
-  -> observe status
-  -> wait/capture current output
-  -> consume structured result
-  -> send only if idle or explicitly blocked on input
+resolve
+  -> status --json
+  -> result --json --wait 30
+  -> ping only if status is running but progress is unclear
+  -> capture only for diagnostic tail
+  -> send only if idle, blocked on input, or explicitly asked
 ```
 
 Copyable flow:
@@ -121,11 +122,11 @@ Copyable flow:
 ```bash
 tmux-agent-sessions resolve --name worker --json
 codex-tmux status --json worker
-codex-tmux wait-and-capture --timeout 30 --tail 80 --strip-ansi --json worker
 codex-tmux result --json --wait 30 worker
+codex-tmux ping --json --timeout 5 worker
 ```
 
-Only send after those checks show the teammate is idle or explicitly blocked on human input. Repeated prompts while the teammate is thinking usually create duplicate work, prompt echoes, and stale-pane confusion.
+Only send after those checks show the teammate is idle, stalled, or explicitly blocked on human input. Repeated prompts while the teammate is thinking usually create duplicate work, prompt echoes, and stale-pane confusion.
 
 1. **Start** with a short stable name:
 
@@ -141,9 +142,9 @@ codex-tmux send worker 'Now implement the smallest fix and run the targeted test
 codex-tmux send-wait worker 'Summarize the current blocker in result.json.' 180
 ```
 
-Use `send-wait <name> <text> [timeout]` for marker-driven orchestration. It generates a fresh nonce, appends the instruction to end with that nonce, sends the text, and waits for that unique marker. Fresh nonce markers avoid both stale pane matches and prompt-echo matches.
+Use `send-wait <name> <text> <timeout>` for marker-driven orchestration. It generates a fresh nonce, appends the instruction to end with that nonce, sends the text, and waits for that unique marker. Fresh nonce markers avoid both stale pane matches and prompt-echo matches.
 
-3. **Wait** for pane stability or a marker before reading output:
+3. **Wait with a bounded wrapper call**. Every blocking wait needs a timeout; never write shell `sleep`, `while status ...`, or hand-rolled capture polling loops.
 
 ```bash
 codex-tmux wait worker 180                                # idle stability
@@ -162,22 +163,25 @@ codex-tmux watch --all --timeout 600 --json w1 w2 w3   # block until all done
 
 Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` and `reason` (`result_updated` | `exited`). Polling happens inside the shell call, so the supervising agent spends one tool call instead of a status loop — this is the token-efficient pattern for fanout supervision.
 
+If `watch` times out, run one structured liveness pass per worker: `status --json`, then `ping --json --timeout 5` for workers with `running:true` and high `idle_seconds`, then `result --json --wait 30`. If `diagnostic` shows an approval/permission prompt, attach and answer only with authorization. If ping fails and no result appears, report the worker as stalled with status JSON and one `capture --strip-ansi <name> 80` diagnostic tail.
+
 `wait-text` is literal-by-default. Add `--regex` only when you intentionally want regex matching. Literal markers may contain regex metacharacters like `[`, `]`, `(`, `)`, `.`, `*`, or `?` without escaping.
 
 For **alternation markers** (e.g. wait for `[DONE]` OR `Need approval`), use `wait-and-capture --regex --marker` with an escaped regex; do not race two raw wait calls. See `references/cheatsheets.md` for worked marker pitfalls.
 
-4. **Inspect or clean up**:
+4. **Inspect, probe liveness, or clean up**:
 
 ```bash
 codex-tmux status worker
 codex-tmux status --json worker
+codex-tmux ping --json --timeout 5 worker
 codex-tmux env-doctor worker
 codex-tmux doctor
 codex-tmux self-test
 codex-tmux stop worker
 ```
 
-`status --json` is the stable automation contract. Treat `running:false` as authoritative even if the tmux session still exists for capture.
+`status --json` is the passive liveness contract. Treat `running:false` as authoritative even if the tmux session still exists for capture. `ping --json --timeout <s>` is the active liveness check; it proves the pane responds to benign input, not that the agent has completed.
 
 Use `env-doctor [name]` before deeper debugging when an agent CLI uses the wrong provider, model, base URL, token, timeout, login state, or behaves differently inside tmux than outside tmux. It compares the caller environment, tmux global environment, and the running agent child process environment, redacting token/key values. This catches tmux-side provider pollution before chasing shell startup files, app switchers, or CLI login state.
 
@@ -190,6 +194,8 @@ codex-tmux result wait-required worker --fields status,summary --wait 60 --json
 ```
 
 Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. Agents cannot expand `$TMUX_AGENT_RESULT` from sandboxed tool envs; pass the literal path from `result --path <name>` in the worker prompt. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+
+Stall fallback: if `status --json` reports `running:true` with high `idle_seconds` and `ping` times out, send one bounded recovery prompt with `send-wait`: "Write result.json now with status blocked and the current blocker." Then read `result wait-required worker --fields status,summary --wait 60 --json`. If that also times out, stop waiting and report stalled with structured status plus one diagnostic capture tail.
 
 ### Peer-review loop
 
@@ -232,7 +238,7 @@ To pause a worker until a human writes a decision file:
 ```bash
 marker=/tmp/agent-7/approve.txt
 codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
-  --pause-until-file "$marker" --pause-timeout 1800 worker
+  --timeout 300 --pause-until-file "$marker" --pause-timeout 1800 worker
 # Operator (another shell): echo approve > "$marker"  → exit 0
 #                           echo reject  > "$marker"  → exit 7
 # Timeout fires             →                            exit 8

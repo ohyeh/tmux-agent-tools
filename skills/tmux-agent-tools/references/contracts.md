@@ -15,8 +15,11 @@ The shared automation contract for both `claude-tmux status --json` and `codex-t
 - `exit_detected` — wrapper observed CLI exit
 - `local_or_remote` — best-effort
 - `diagnostic` — best-effort (e.g. `confirmation_detected`)
+- `idle_seconds` / `last_change_at` — liveness hints when available
 
 Treat `local_or_remote` and `diagnostic` as best-effort; the other fields are stable.
+
+Use `status --json` first for passive liveness. If it reports `running:true` but `idle_seconds` is high or progress is unclear, run `ping --json --timeout <seconds> <name>` for active liveness. `ping` sends benign input and reports whether the pane responds; it is not a completion signal.
 
 ## `result.json` (agent → parent contract)
 
@@ -48,7 +51,7 @@ Agents write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with this sha
 
 `verdict` and `decision` are optional Wave 2 blocks. The lightweight validator checks `verdict.verdict` against `ACCEPT`, `BLOCK`, and `ACCEPT_WITH_CHANGES`; checks `verdict.blockers` is an array; and checks `decision.decision_by` against `agent`, `user`, `owner`, and `delegate`.
 
-Parent reads it via `result --json --wait <seconds> <name>`. Always branch in this order before consuming `.body`:
+Parent reads it via `result --json --wait <seconds> <name>`. Always branch in this order before consuming `.body`; do not scrape the pane when a valid result exists:
 
 1. `.present` — file existed
 2. `.valid` — parsed as JSON
@@ -66,6 +69,8 @@ $ codex-tmux result --json --wait 30 worker
 ```
 
 If `.present:false`, the agent never wrote the file — re-prompt it explicitly with the literal result path.
+
+If the worker stalls (`status --json` has `running:true` with high `idle_seconds`, and `ping --json --timeout 5` times out), send one bounded recovery prompt asking it to write a blocked `result.json`, then wait with `result wait-required <name> --fields status,summary --wait 60 --json`. If that times out, report the stall with status JSON and one diagnostic capture tail.
 
 ### Why the worker can't use `$TMUX_AGENT_RESULT`
 
@@ -94,6 +99,7 @@ Exit codes from `wait-and-capture --pause-until-file`:
 
 - **Single caller per agent name.** Two `start --exact same-name` kills the first session.
 - Wrapper state under `$TMUX_AGENT_DIR/<name>/` (`started_at`, `marker_seen`, `transcript-path`, etc.) is NOT lock-protected today. Do not share one agent name across two orchestrators.
+- Do not run concurrent waits against the same agent. For many agents, use one `watch --any|--all --timeout <s> --json` call; for one agent, use one bounded `result --wait`, `send-wait`, or `wait-and-capture`.
 - The `marker_seen` FIFO is capped at 100 entries — oldest evicted first.
 - Multiple agents under different names are independent. `tmux-agent-sessions list --json` is a safe read across all of them.
 
@@ -119,7 +125,7 @@ tmux-agent-sessions list --sort tool|name|session|state
 
 Claude and Codex inventory rows reuse wrapper status fields and add `state` so exited-but-capturable sessions are visible before cleanup. Wave 3 inventory rows also include `wrapper`, `agent_name`, `tmux_session`, `cwd`, `created_at`, `age`, `running`, and `result_path` for recovery workflows.
 
-`resolve --name <partial-or-full-name> --json` is the adopt-before-start path. It never creates or stops sessions; it returns the owning wrapper plus safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous and missing names exit non-zero with JSON on stderr.
+`resolve --name <partial-or-full-name> --json` is the adopt-before-start path. It never creates or stops sessions; it returns the owning wrapper plus safe next commands for `status`, `wait-and-capture`, and `result`. Prefer `status`, `result`, and `ping` before any diagnostic capture. Ambiguous and missing names exit non-zero with JSON on stderr.
 
 Bulk cleanup is destructive — always preview first:
 

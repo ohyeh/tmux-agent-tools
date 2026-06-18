@@ -34,9 +34,10 @@ A common pattern is: spawn two workers in parallel, then have them review each o
 claude-tmux start --exact wA ~/repo 'Refactor src/auth/. Write $TMUX_AGENT_RESULT when done with summary+diff path.'
 claude-tmux start --exact wB ~/repo 'Run tests for src/auth/. Write $TMUX_AGENT_RESULT with pass/fail+failing-test list.'
 
-# 2. Wait for both to write result.json
-claude-tmux result --json --wait 600 wA > /tmp/wA.json
-claude-tmux result --json --wait 600 wB > /tmp/wB.json
+# 2. Wait for both workers with one bounded watcher, then read results
+claude-tmux watch --all --timeout 600 --json wA wB > /tmp/watch.json
+claude-tmux result --json wA > /tmp/wA.json
+claude-tmux result --json wB > /tmp/wB.json
 
 # 3. Build a review prompt that includes both results
 cat > /tmp/review-prompt.md <<EOF
@@ -56,7 +57,7 @@ tmux-agent-dialogue pair-review --workdir ~/repo \
 
 Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. Keep the literal out of the sent prompt or split it in the prompt instructions so the prompt echo cannot satisfy the wait.
 
-If a marker wait times out, inspect the emitted `failure` JSONL event and the captured pane tail before declaring a protocol failure. `failure_type` is conservative diagnostic metadata, not proof of root cause.
+If a marker wait times out, inspect the emitted `failure` JSONL event and the captured pane tail once, then stop and report the blocker. Do not loop marker waits. `failure_type` is conservative diagnostic metadata, not proof of root cause.
 
 `critic` and `pair-review` do NOT document a separate marker contract — they reuse the dialogue split-marker pattern internally.
 
@@ -105,7 +106,7 @@ Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize`
 
 ## Fanout (one-to-many)
 
-`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix `claude:` and `codex:` in a single call) or one per `--workdir` (legacy single-tool form). Each child writes its own `result.json` under `--result-dir`; the parent emits a consolidated summary on stdout (schema: `schemas/fanout-summary.schema.json`).
+`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix `claude:` and `codex:` in a single call) or one per `--workdir` (legacy single-tool form). Each child writes its own `result.json` under `--result-dir`; the parent emits a consolidated summary on stdout (schema: `schemas/fanout-summary.schema.json`). The summary and per-child results are authoritative; do not scrape child panes in a fanout loop.
 
 ```bash
 tmux-agent-fanout run \
