@@ -10,6 +10,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 - **Wrapper not on PATH?** Run it from the skill bundle directly: `<skill-dir>/scripts/codex-tmux …` (this file's directory). Don't waste steps on `which`/`find`/`tmux ls` discovery.
 - **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>`. Pane capture is fallback evidence only.
 - **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `codex-tmux result --json <winner>`.
+- **Want to auto-delegate a substantial task?** Use the `.claude/agents/tmux-delegate.md` subagent to decide inline vs worker, then run its exact wrapper command.
 - **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
 
 ## Overview
@@ -39,7 +40,7 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 
 | Name | One-line purpose | When to reach for it |
 | --- | --- | --- |
-| `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools) or when scripting across multiple CLIs. |
+| `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets, `doctor --json`, `setup`, and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools), when scripting across multiple CLIs, or when running JSON preflight via `agent-tmux <cli> setup`. |
 | `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, or later capture. |
 | `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, or later capture. |
 | `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
@@ -61,6 +62,12 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 - One-off non-interactive shell commands — run them directly.
 - A simple file read, search, test, or build command — don't spawn a tmux agent for it.
 - Externally visible, destructive, or privacy-sensitive work unless the user has already authorized it.
+
+## Auto-delegation via tmux-delegate
+
+Claude Code can use `.claude/agents/tmux-delegate.md` as the decision gate for substantial work. It delegates when the task is likely to take more than 30s, modifies 2 files or more, needs an independent context window, requires a multi-step read-plan-write cycle, or runs tests/builds/lint across the codebase. It handles inline for single-file reads/searches/formatting, one-liners with immediate output, explicit "quick"/"inline" requests, and marginal cases.
+
+`tmux-delegate` must include this literal worker constraint in every delegated prompt: "Do not spawn additional tmux sessions or delegate further." It uses a hardcoded wrapper command skeleton instead of interpolating raw task text into Bash. `--resume` is not supported in v1 because wrapper resume requires a CLI UUID that `start` does not emit yet.
 
 ## Command Choice
 

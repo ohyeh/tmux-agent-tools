@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.19.0 - 2026-06-19
+
+### Added
+
+- Added the Claude Code `tmux-delegate` subagent for deciding inline vs supervised tmux-worker execution.
+- Added `agent-tmux <cli> doctor --json` with independent named checks for tmux, agent CLI binary, git, and git worktree support.
+- Added `agent-tmux <cli> setup` as a combined JSON preflight for `doctor --json` plus `self-test`.
+- Added delegation-path eval coverage for trigger decisions and exact-call planning.
+
 ## v0.18.1 - 2026-06-11
 
 ### Changed

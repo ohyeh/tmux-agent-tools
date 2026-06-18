@@ -19,5 +19,8 @@
   {"query": "review the audit log format we use for our internal RBAC service — does hash-chained JSONL make sense or should we use a Merkle tree", "should_trigger": false, "note": "near-miss: audit/hash-chain but unrelated to wrappers"},
   {"query": "I want two of my human teammates to do a structured debate on whether we adopt Bun — give me a facilitation script", "should_trigger": false, "note": "near-miss: debate but humans not agents"},
   {"query": "my fanout in AWS Lambda → SQS → 12 workers is taking 45 sec end to end, profile help?", "should_trigger": false, "note": "near-miss: 'fanout' word but AWS, not tmux-agent-fanout"},
-  {"query": "is there a way to attach to an existing tmux session on a remote box without ssh-ing in manually first?", "should_trigger": false, "note": "near-miss: tmux + remote but generic tmux not agent management"}
+  {"query": "is there a way to attach to an existing tmux session on a remote box without ssh-ing in manually first?", "should_trigger": false, "note": "near-miss: tmux + remote but generic tmux not agent management"},
+  {"query": "refactor 5 files across src/ and run the test suite", "should_trigger": true, "note": "tmux-delegate threshold: >=2 files + test suite"},
+  {"query": "read this file and tell me what the main exported function is called", "should_trigger": false, "note": "tmux-delegate trivial inline read"},
+  {"query": "run a multi-step data migration across 3 modules, write a summary when done", "should_trigger": true, "note": "tmux-delegate threshold: multi-step + >=2 modules"}
 ]

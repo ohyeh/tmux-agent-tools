@@ -65,6 +65,14 @@
       "expected_output": "Uses wait-and-capture --pause-until-file with --pause-timeout 1800; explains exit codes 0/7/8; explains approval-status.json location; reminds operator to authorize destructive work; does NOT add --secret-redact=false.",
       "files": [],
       "assertions": []
+    },
+    {
+      "id": 9,
+      "name": "tmux-delegate-substantial-auth-refactor",
+      "prompt": "I need to refactor auth/ across 4 files and run all tests. Should I use tmux-delegate or handle this inline? If delegate, show the exact call.",
+      "expected_output": "Chooses tmux-delegate because the task modifies >=2 files and runs all tests; includes an exact tmux-delegate or wrapper call; includes the literal worker constraint: Do not spawn additional tmux sessions or delegate further.",
+      "files": [],
+      "assertions": []
     }
   ]
 }

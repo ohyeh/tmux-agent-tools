@@ -1,7 +1,7 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.18.1",
-  "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: start/resume, send, wait, capture, status/doctor, result files, human approval gates, and multi-agent pair/team orchestration.",
+  "version": "0.19.0",
+  "description": "Tmux wrappers, tmux-delegate, and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent pair/team orchestration.",
   "author": {
     "name": "PaulYeh",
     "url": "https://github.com/ohyeh"
@@ -27,6 +27,7 @@
     "category": "Productivity",
     "capabilities": [
       "Run Claude Code or Codex CLI as named, supervised tmux sessions",
+      "Decide inline vs worker execution with the tmux-delegate subagent",
       "Send prompts, wait for markers, and capture pane output without attaching",
       "Read structured result.json files instead of scraping panes",
       "Gate destructive actions behind human approval files",

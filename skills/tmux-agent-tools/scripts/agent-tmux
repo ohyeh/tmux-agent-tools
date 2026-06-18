@@ -206,6 +206,7 @@ Usage:
   agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>
   agent-tmux env-doctor [name]
   agent-tmux doctor
+  agent-tmux setup
   agent-tmux self-test
   agent-tmux stop <name>
   agent-tmux help
@@ -225,6 +226,7 @@ Examples:
   agent-tmux wait-literal pr5 '[CLAUDE-01]' 180
   agent-tmux capture pr5 80
   agent-tmux doctor
+  agent-tmux setup
   agent-tmux self-test
   agent-tmux list
   agent-tmux stop pr5
@@ -462,9 +464,10 @@ Kill the tmux session. Removes the sentinel file by default; pass
 --sentinel-keep at start to retain it.
 HELP_EOF
       ;;
-    doctor|self-test)
+    doctor|self-test|setup)
       cat <<'HELP_EOF'
 agent-tmux doctor          Check binaries + tmux + capture/wait behavior.
+agent-tmux setup           Emit combined JSON for doctor --json + self-test.
 agent-tmux self-test       End-to-end smoke without launching a real CLI.
 
 Both are credential-free and safe to run anywhere.
@@ -486,7 +489,7 @@ HELP_EOF
       ;;
     *)
       printf 'No focused help for %q. Available topics:\n' "$topic" >&2
-      printf '  start resume start-ssh attach send send-wait send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  env-doctor list stop doctor self-test help\n' >&2
+      printf '  start resume start-ssh attach send send-wait send-wait-literal wait\n  wait-text wait-literal wait-and-capture capture result status ping probe\n  env-doctor list stop doctor setup self-test help\n' >&2
       return 2
       ;;
   esac
@@ -639,6 +642,16 @@ random_suffix() {
 
 shell_quote() {
   printf "%q" "$1"
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//$'\r'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\t'/ }"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
 }
 
 session_env_has_key() {
@@ -2682,6 +2695,7 @@ start_session() {
     result_schema_record "$name" "$result_schema_path"
   fi
   if true; then
+    :
   fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
@@ -2979,6 +2993,7 @@ resume_session() {
     result_schema_record "$name" "$result_schema_path"
   fi
   if true; then
+    :
   fi
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
     "$TMUX" kill-session -t "$session"
@@ -4231,6 +4246,58 @@ wait_and_capture_session() {
 }
 
 doctor_session() {
+  local output_json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    output_json=1
+    shift
+  fi
+
+  if (( output_json )); then
+    if (( $# > 0 )); then
+      printf '{"ok":false,"checks":[{"name":"usage","ok":false,"detail":"unexpected argument: %s"}]}\n' "$(json_escape "$1")"
+      return 1
+    fi
+
+    local ok=1 checks=()
+    local git_bin
+    add_doctor_check() {
+      local name="$1" check_ok="$2" detail="$3"
+      checks+=("$(printf '{"name":"%s","ok":%s,"detail":"%s"}' "$(json_escape "$name")" "$check_ok" "$(json_escape "$detail")")")
+      [[ "$check_ok" == "true" ]] || ok=0
+    }
+
+    if [[ -n "$TMUX" && -x "$TMUX" ]]; then
+      add_doctor_check "tmux" true "$TMUX"
+    else
+      add_doctor_check "tmux" false "tmux not executable: ${TMUX:-<empty>}"
+    fi
+
+    if [[ -n "$CLI_BIN" && -x "$CLI_BIN" ]]; then
+      add_doctor_check "agent_cli_binary" true "$CLI_BIN"
+    else
+      add_doctor_check "agent_cli_binary" false "${CLI}: not found; start requires ${_ENV_NS}=/path/to/${CLI} or ${CLI} on PATH"
+    fi
+
+    if git_bin="$(command -v git 2>/dev/null)"; then
+      add_doctor_check "git" true "$git_bin"
+      if git worktree --help >/dev/null 2>&1; then
+        add_doctor_check "git_worktree" true "git worktree: ok"
+      else
+        add_doctor_check "git_worktree" false "git worktree: not available"
+      fi
+    else
+      add_doctor_check "git" false "git: not found"
+      add_doctor_check "git_worktree" false "git worktree: not available (git missing)"
+    fi
+
+    if (( ok )); then
+      printf '{"ok":true,"checks":[%s]}\n' "${(j:,:)checks}"
+      return 0
+    fi
+    printf '{"ok":false,"checks":[%s]}\n' "${(j:,:)checks}"
+    return 1
+  fi
+
   require_tmux
   echo "tmux: $TMUX"
   if [[ -n "$CLI_BIN" && -x "$CLI_BIN" ]]; then
@@ -4256,6 +4323,40 @@ doctor_session() {
     echo "git: not found"
     echo "git worktree: not available (git missing)"
   fi
+}
+
+setup_session() {
+  local doctor_json doctor_rc self_output self_rc ok_bool self_ok
+  if doctor_json="$(doctor_session --json)"; then
+    doctor_rc=0
+  else
+    doctor_rc=$?
+  fi
+
+  if self_output="$(self_test_session 2>&1)"; then
+    self_rc=0
+  else
+    self_rc=$?
+  fi
+
+  if (( doctor_rc == 0 && self_rc == 0 )); then
+    ok_bool=true
+  else
+    ok_bool=false
+  fi
+  if (( self_rc == 0 )); then
+    self_ok=true
+  else
+    self_ok=false
+  fi
+
+  printf '{"ok":%s,"doctor":%s,"self_test":{"ok":%s,"output":"%s"}}\n' \
+    "$ok_bool" \
+    "$doctor_json" \
+    "$self_ok" \
+    "$(json_escape "$self_output")"
+
+  if [[ "$ok_bool" == "true" ]]; then return 0; else return 1; fi
 }
 
 cli_provider_env_keys() {
@@ -4453,7 +4554,7 @@ diagnostic_for_blocked_reason() {
 status_tail_json() {
   local current="$1"
   local max_lines="$STATUS_TAIL_LINES"
-  if [[ "$max_lines" != <-> ]] || (( max_lines <= 0 )); then
+  if [[ ! "$max_lines" =~ ^[0-9]+$ ]] || (( max_lines <= 0 )); then
     max_lines=20
   fi
   print -r -- "$current" | "$JQ" -R -s --argjson max_lines "$max_lines" '
@@ -4857,11 +4958,11 @@ watch_session() {
     echo "Usage: agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>" >&2
     exit 2
   fi
-  if [[ "$timeout" != <-> ]] || (( timeout <= 0 )); then
+  if [[ ! "$timeout" =~ ^[0-9]+$ ]] || (( timeout <= 0 )); then
     echo "watch: --timeout must be a positive integer (seconds), got: $timeout" >&2
     exit 2
   fi
-  if [[ "$interval" != (<->|<->.<->|.<->) ]] || ! (( interval > 0 )); then
+  if [[ ! "$interval" =~ ^([0-9]+|[0-9]+\.[0-9]+|\.[0-9]+)$ ]] || ! (( interval > 0 )); then
     echo "watch: --interval must be a positive number (seconds), got: $interval" >&2
     exit 2
   fi
@@ -5187,7 +5288,10 @@ _team_list() {
   if [[ -n "${1:-}" ]]; then _team_list_one "$1"; return $?; fi
   local d; d="$(_team_state_dir)"; [[ -d "$d" ]] || return 0
   local f
-  for f in "$d"/*.json(N); do _team_list_one "$(basename "$f" .json)"; done
+  for f in "$d"/*.json; do
+    [[ -e "$f" ]] || continue
+    _team_list_one "$(basename "$f" .json)"
+  done
 }
 _team_field() {
   local which="$1" team="${2:-}"
@@ -5447,7 +5551,10 @@ case "$command" in
     env_doctor_session "$@"
     ;;
   doctor)
-    doctor_session
+    doctor_session "$@"
+    ;;
+  setup)
+    setup_session "$@"
     ;;
   self-test)
     self_test_session
