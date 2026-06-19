@@ -73,6 +73,7 @@ unset _lead
 # still override profile values.
 CLI_PROFILE_FILE=''
 PROFILE_APPROVAL='prompt'
+PROFILE_RESULT_REQUIRED_FIELDS=''
 PROFILE_PATTERN_BUSY=''
 PROFILE_PATTERN_PERMISSION=''
 PROFILE_PATTERN_APPROVAL=''
@@ -122,6 +123,7 @@ load_cli_profile() {
           *) echo "agent-tmux: unknown approval value '$value' in $file (expected auto|prompt); using prompt" >&2 ;;
         esac
         ;;
+      result_required_fields) PROFILE_RESULT_REQUIRED_FIELDS="$value" ;;
       *) echo "agent-tmux: unknown profile key '$key' in $file" >&2 ;;
     esac
   done < "$file"
@@ -1744,6 +1746,8 @@ result_wait_required_session() {
     esac
   done
   local name="${1:-}"
+  # Fall back to profile-declared fields when --fields is not passed explicitly.
+  [[ -z "$fields" && -n "$PROFILE_RESULT_REQUIRED_FIELDS" ]] && fields="$PROFILE_RESULT_REQUIRED_FIELDS"
   if [[ -z "$name" || -z "$fields" || "$output_json" -ne 1 ]]; then
     echo "Usage: agent-tmux result wait-required <name> --fields a,b --wait N --json" >&2
     exit 2
@@ -4628,6 +4632,50 @@ self_test_approval() {
   echo "self-test approval: ok"
 }
 
+self_test_result_required_fields() {
+  # P2 self-check: result_required_fields profile key drives wait-required.
+  require_jq
+  local tmp_dir agent_dir result missing saved_fields saved_dir
+  tmp_dir="$(mktemp -d)"
+  agent_dir="$tmp_dir/agents"
+  mkdir -p "$agent_dir/st-agent"
+
+  # Save and override globals (exported so subshells see TMUX_AGENT_DIR).
+  saved_fields="$PROFILE_RESULT_REQUIRED_FIELDS"
+  saved_dir="${TMUX_AGENT_DIR:-}"
+  PROFILE_RESULT_REQUIRED_FIELDS='status,output'
+  export TMUX_AGENT_DIR="$agent_dir"
+
+  # Case 1: result.json missing declared field → missing_fields contains "output"
+  # (result_wait_required_session returns 1 on timeout/missing; capture without set -e abort)
+  printf '{"status":"done"}\n' > "$agent_dir/st-agent/result.json"
+  result="$(result_wait_required_session --wait 0 --json st-agent 2>/dev/null)" || true
+  missing="$("$JQ" -r '.missing_fields | join(",")' <<< "$result" 2>/dev/null)"
+  if [[ "$missing" != "output" ]]; then
+    PROFILE_RESULT_REQUIRED_FIELDS="$saved_fields"
+    export TMUX_AGENT_DIR="$saved_dir"
+    rm -rf "$tmp_dir"
+    echo "self-test result-required-fields: FAIL (expected missing=output, got '$missing')" >&2
+    return 1
+  fi
+
+  # Case 2: result.json with all declared fields → missing_fields empty, returns 0
+  printf '{"status":"done","output":"hello"}\n' > "$agent_dir/st-agent/result.json"
+  result="$(result_wait_required_session --wait 0 --json st-agent 2>/dev/null)" || true
+  missing="$("$JQ" -r '.missing_fields // [] | join(",")' <<< "$result" 2>/dev/null)"
+
+  PROFILE_RESULT_REQUIRED_FIELDS="$saved_fields"
+  export TMUX_AGENT_DIR="$saved_dir"
+  rm -rf "$tmp_dir"
+
+  if [[ -n "$missing" ]]; then
+    echo "self-test result-required-fields: FAIL (expected no missing fields, got '$missing')" >&2
+    return 1
+  fi
+
+  echo "self-test result-required-fields: ok"
+}
+
 status_session() {
   require_tmux
   local output_json=0
@@ -5609,6 +5657,7 @@ case "$command" in
     ;;
   self-test)
     self_test_approval
+    self_test_result_required_fields
     self_test_session
     ;;
   list)
