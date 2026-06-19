@@ -8,6 +8,14 @@ Reduce manual lead supervision when several workers run the same packet: let the
 ## Why now (evidence, not speculation)
 After #266 workers can declare `result_required_fields` and dry-run launch, but the lead still hand-polls `team results --json` or over-waits on `team wait --require-result` (all-or-nothing). The "first 2 of 3 reviewers with valid result.json" pattern has no primitive.
 
+## Packet 0 — codex-family result-path contract (do FIRST; debated with codex)
+**Why first:** a sandboxed codex worker cannot read the wrapper-injected `$TMUX_AGENT_RESULT`/`$TMUX_AGENT_NAME` (env set only as tmux session env `:2465-2472`; `contracts.md:75-83`/`SKILL.md:196` already admit this), and with non-exact random-suffix names it cannot derive the path either. So it can't reliably write `result.json` — which means watch/quorum (Packets A/B) would have nothing to consume. Correctness papercut, every codex participant.
+
+**Decision (codex debate):** rejected the cwd-sentinel idea (option A) — a single `<cwd>/.tmux-agent-result` clobbers when multiple workers share one repo cwd (pair/fanout/review norm); per-agent files reintroduce the in-sandbox name-locator problem. Chosen: **auto-append a result contract to every prompt-sending boundary** for codex-family CLIs: `Write final JSON to this exact path: <absolute result_path>`, computed from `agent_root_dir()/name/result.json`. No user flags; keep `result --path <name>` as the debug surface.
+- Landing: prompt-send sites — `start` initial text `:2768-2772`, `send` `:3238-3248`, `send-wait` `:3347-3363`, `send-wait-literal` `:3410-3423`. Path source `:1227-1228`/`:2465-2472`.
+- Out of scope this packet: `start-ssh` remote result placement (`:3074-3127`, already unresolved), `resume` (no prompt), new schema/sentinel format.
+- Self-check: start two non-exact fake codex-family workers in the SAME cwd; assert each received a DISTINCT path equal to `result --path <its-name>`; a `send-wait` check that the augmented prompt carries the path without breaking nonce matching.
+
 ## Packets (sequenced — A first, B builds on the counting idea)
 1. **Packet A — `watch --count N`**: watch met when ≥N named agents done (existing done def: result.json changed or session exited). Mutually exclusive with `--any`/`--all`. JSON adds `required_count`/`done_count`. Landing: `watch_session()` ~`agent-tmux:5125`.
 2. **Packet B — `team quorum <team> --count N [--field <jq> --value <literal>] --json`**: count present+valid worker `result.json` (optionally matching a predicate); exit 0 when met. Reuses team state result paths + `result --json` body. Landing: `cmd_team()` dispatch ~`:5433`, helper beside `_team_results` ~`:5575`.
