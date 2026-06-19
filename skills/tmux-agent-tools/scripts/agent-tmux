@@ -72,6 +72,7 @@ unset _lead
 # ('#' comments); never sourced, so profiles cannot execute code. Env vars
 # still override profile values.
 CLI_PROFILE_FILE=''
+PROFILE_APPROVAL='prompt'
 PROFILE_PATTERN_BUSY=''
 PROFILE_PATTERN_PERMISSION=''
 PROFILE_PATTERN_APPROVAL=''
@@ -115,6 +116,12 @@ load_cli_profile() {
       pattern_permission_prompt) PROFILE_PATTERN_PERMISSION="$value" ;;
       pattern_approval_prompt)   PROFILE_PATTERN_APPROVAL="$value" ;;
       pattern_login_prompt)      PROFILE_PATTERN_LOGIN="$value" ;;
+      approval)
+        case "$value" in
+          auto|prompt) PROFILE_APPROVAL="$value" ;;
+          *) echo "agent-tmux: unknown approval value '$value' in $file (expected auto|prompt); using prompt" >&2 ;;
+        esac
+        ;;
       *) echo "agent-tmux: unknown profile key '$key' in $file" >&2 ;;
     esac
   done < "$file"
@@ -4293,6 +4300,8 @@ doctor_session() {
       add_doctor_check "git_worktree" false "git worktree: not available (git missing)"
     fi
 
+    add_doctor_check "approval" true "$PROFILE_APPROVAL"
+
     if (( ok )); then
       printf '{"ok":true,"checks":[%s]}\n' "${(j:,:)checks}"
       return 0
@@ -4578,6 +4587,45 @@ self_test_session() {
   send_wait_literal_session "$name" $'trigger send-wait\nsecond line' "[TMUX_AGENT_TOOLS_SEND_WAIT_OK]" 5
   "$TMUX" kill-session -t "$session" 2>/dev/null || true
   echo "self-test: ok"
+}
+
+self_test_approval() {
+  # P1 self-check: profile parser stores approval value correctly.
+  local tmp_dir tmp_conf result
+  tmp_dir="$(mktemp -d)"
+
+  # Case 1: approval=auto → PROFILE_APPROVAL must be "auto"
+  tmp_conf="$tmp_dir/test-cli.conf"
+  printf 'approval=auto\n' > "$tmp_conf"
+  result="$(
+    PROFILE_APPROVAL=prompt
+    _PROFILE_FILE_FLAG="$tmp_conf"
+    _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$PROFILE_APPROVAL"
+  )"
+  if [[ "$result" != "auto" ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test approval: FAIL (expected auto, got $result)" >&2
+    return 1
+  fi
+
+  # Case 2: no approval key → PROFILE_APPROVAL stays "prompt"
+  printf 'bin=test\n' > "$tmp_conf"
+  result="$(
+    PROFILE_APPROVAL=prompt
+    _PROFILE_FILE_FLAG="$tmp_conf"
+    _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$PROFILE_APPROVAL"
+  )"
+  rm -rf "$tmp_dir"
+  if [[ "$result" != "prompt" ]]; then
+    echo "self-test approval: FAIL (expected prompt, got $result)" >&2
+    return 1
+  fi
+
+  echo "self-test approval: ok"
 }
 
 status_session() {
@@ -5560,6 +5608,7 @@ case "$command" in
     setup_session "$@"
     ;;
   self-test)
+    self_test_approval
     self_test_session
     ;;
   list)
