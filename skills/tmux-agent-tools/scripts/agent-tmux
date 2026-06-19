@@ -1080,9 +1080,11 @@ run_on_start_hook() {
 
 # --- Dry-run pre-flight checks (issue #110) -------------------------------
 # Verify the named start would succeed without launching tmux or the CLI.
-# Emits a JSON summary on stdout. Exit 0 if all checks pass, 2 if any
-# critical check fails. Warnings (e.g. transcript probe fallback) do not
-# fail the run.
+# Emits a JSON summary on stdout with checks[] and an invocation{} object
+# showing the resolved session name, launch flags, env namespace, and CLI
+# binary. Exit 0 if all checks pass, 2 if any critical check fails.
+# Warnings (e.g. transcript probe fallback) do not fail the run.
+# Approval is NOT verified here; use doctor --json to read the approval value.
 run_dry_run_checks() {
   require_jq
   local tool="$1" req_name="$2" directory="$3" exact_name="$4"
@@ -1190,12 +1192,26 @@ run_dry_run_checks() {
     add_check "transcript_path" "skip" "no --transcript"
   fi
 
+  # Resolved invocation preview (P3 — #266): emitted alongside checks so the
+  # caller can see exactly what would be launched without spawning tmux.
+  # Does NOT verify approval (use doctor --json for the approval readout).
+  local invocation_session
+  invocation_session="$(session_for_name "$req_name")"
+  local invocation_json
+  invocation_json="$("$JQ" -c -n \
+    --arg session  "$invocation_session" \
+    --arg flags    "${_PRESET_FLAGS:-}" \
+    --arg env_ns   "$_ENV_NS" \
+    --arg cli_bin  "${CLI_BIN:-$CLI}" \
+    '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}')"
+
   local ok_bool
   if (( ok )); then ok_bool=true; else ok_bool=false; fi
   "$JQ" -n --argjson checks "$checks_json" --argjson ok "$ok_bool" \
+    --argjson invocation "$invocation_json" \
     --arg tool "$tool" --arg name "$req_name" --arg directory "$directory" \
     '{schema_version: 1, tool: $tool, name: $name, directory: $directory,
-      ok: $ok, checks: $checks}'
+      ok: $ok, checks: $checks, invocation: $invocation}'
   if (( ok )); then return 0; else return 2; fi
 }
 
@@ -4676,6 +4692,33 @@ self_test_result_required_fields() {
   echo "self-test result-required-fields: ok"
 }
 
+self_test_dry_run() {
+  # P3 self-check: --dry-run prints invocation block, exits 0, no tmux session.
+  require_jq
+  local tmp_dir out session_count_before session_count_after
+  tmp_dir="$(mktemp -d)"
+
+  out="$(start_session --dry-run "st-dry-$$" "$tmp_dir" 2>/dev/null)" || true
+  rm -rf "$tmp_dir"
+
+  # Must contain an invocation key
+  local inv_session
+  inv_session="$("$JQ" -r '.invocation.session // ""' <<< "$out" 2>/dev/null)"
+  if [[ -z "$inv_session" ]]; then
+    echo "self-test dry-run: FAIL (invocation.session missing in output)" >&2
+    return 1
+  fi
+
+  # Must NOT have spawned a tmux session
+  if "$TMUX" has-session -t "$inv_session" 2>/dev/null; then
+    "$TMUX" kill-session -t "$inv_session" 2>/dev/null || true
+    echo "self-test dry-run: FAIL (tmux session was created despite --dry-run)" >&2
+    return 1
+  fi
+
+  echo "self-test dry-run: ok"
+}
+
 status_session() {
   require_tmux
   local output_json=0
@@ -5658,6 +5701,7 @@ case "$command" in
   self-test)
     self_test_approval
     self_test_result_required_fields
+    self_test_dry_run
     self_test_session
     ;;
   list)
