@@ -120,7 +120,10 @@ load_cli_profile() {
       approval)
         case "$value" in
           auto|prompt) PROFILE_APPROVAL="$value" ;;
-          *) echo "agent-tmux: unknown approval value '$value' in $file (expected auto|prompt); using prompt" >&2 ;;
+          *)
+            PROFILE_APPROVAL='prompt'
+            echo "agent-tmux: unknown approval value '$value' in $file (expected auto|prompt); using prompt" >&2
+            ;;
         esac
         ;;
       result_required_fields) PROFILE_RESULT_REQUIRED_FIELDS="$value" ;;
@@ -1200,7 +1203,7 @@ run_dry_run_checks() {
   local invocation_json
   invocation_json="$("$JQ" -c -n \
     --arg session  "$invocation_session" \
-    --arg flags    "${_PRESET_FLAGS:-}" \
+    --arg flags    "${LAUNCH_FLAGS:-}" \
     --arg env_ns   "$_ENV_NS" \
     --arg cli_bin  "${CLI_BIN:-$CLI}" \
     '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}')"
@@ -1771,12 +1774,16 @@ result_wait_required_session() {
   require_jq
   local result_path deadline out missing requested_fields_json
   result_path="$(agent_root_dir)/$name/result.json"
-  requested_fields_json="$("$JQ" -c -n --arg fields "$fields" '$fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))')"
+  requested_fields_json="$("$JQ" -c -n --arg fields "$fields" '$fields | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')"
+  if [[ "$requested_fields_json" == "[]" ]]; then
+    echo "Usage: agent-tmux result wait-required <name> --fields a,b --wait N --json" >&2
+    exit 2
+  fi
   deadline=$((SECONDS + wait_seconds))
   while true; do
     if [[ -f "$result_path" ]] && "$JQ" -e . "$result_path" >/dev/null 2>&1; then
       missing="$("$JQ" -r --arg fields "$fields" '
-        ($fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $fields
+        ($fields | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $fields
         | . as $body
         | [ $fields[]
             | select((. as $f
@@ -4630,7 +4637,22 @@ self_test_approval() {
     return 1
   fi
 
-  # Case 2: no approval key → PROFILE_APPROVAL stays "prompt"
+  # Case 2: invalid approval value warns and falls back to prompt.
+  printf 'approval=auto\napproval=wat\n' > "$tmp_conf"
+  result="$(
+    PROFILE_APPROVAL=prompt
+    _PROFILE_FILE_FLAG="$tmp_conf"
+    _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$PROFILE_APPROVAL"
+  )"
+  if [[ "$result" != "prompt" ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test approval: FAIL (expected invalid value fallback to prompt, got $result)" >&2
+    return 1
+  fi
+
+  # Case 3: no approval key → PROFILE_APPROVAL stays "prompt"
   printf 'bin=test\n' > "$tmp_conf"
   result="$(
     PROFILE_APPROVAL=prompt
@@ -4659,7 +4681,7 @@ self_test_result_required_fields() {
   # Save and override globals (exported so subshells see TMUX_AGENT_DIR).
   saved_fields="$PROFILE_RESULT_REQUIRED_FIELDS"
   saved_dir="${TMUX_AGENT_DIR:-}"
-  PROFILE_RESULT_REQUIRED_FIELDS='status,output'
+  PROFILE_RESULT_REQUIRED_FIELDS=' status , output, '
   export TMUX_AGENT_DIR="$agent_dir"
 
   # Case 1: result.json missing declared field → missing_fields contains "output"
@@ -4675,7 +4697,18 @@ self_test_result_required_fields() {
     return 1
   fi
 
-  # Case 2: result.json with all declared fields → missing_fields empty, returns 0
+  # Case 2: explicit --fields wins over the profile default.
+  result="$(result_wait_required_session --fields status --wait 0 --json st-agent 2>/dev/null)" || true
+  missing="$("$JQ" -r '.missing_fields // [] | join(",")' <<< "$result" 2>/dev/null)"
+  if [[ -n "$missing" ]]; then
+    PROFILE_RESULT_REQUIRED_FIELDS="$saved_fields"
+    export TMUX_AGENT_DIR="$saved_dir"
+    rm -rf "$tmp_dir"
+    echo "self-test result-required-fields: FAIL (explicit --fields should win, got '$missing')" >&2
+    return 1
+  fi
+
+  # Case 3: result.json with all declared fields → missing_fields empty, returns 0
   printf '{"status":"done","output":"hello"}\n' > "$agent_dir/st-agent/result.json"
   result="$(result_wait_required_session --wait 0 --json st-agent 2>/dev/null)" || true
   missing="$("$JQ" -r '.missing_fields // [] | join(",")' <<< "$result" 2>/dev/null)"
@@ -4695,10 +4728,13 @@ self_test_result_required_fields() {
 self_test_dry_run() {
   # P3 self-check: --dry-run prints invocation block, exits 0, no tmux session.
   require_jq
-  local tmp_dir out session_count_before session_count_after
+  local tmp_dir out saved_launch_flags invocation_flags
   tmp_dir="$(mktemp -d)"
 
+  saved_launch_flags="$LAUNCH_FLAGS"
+  LAUNCH_FLAGS='--self-test-flag'
   out="$(start_session --dry-run "st-dry-$$" "$tmp_dir" 2>/dev/null)" || true
+  LAUNCH_FLAGS="$saved_launch_flags"
   rm -rf "$tmp_dir"
 
   # Must contain an invocation key
@@ -4706,6 +4742,12 @@ self_test_dry_run() {
   inv_session="$("$JQ" -r '.invocation.session // ""' <<< "$out" 2>/dev/null)"
   if [[ -z "$inv_session" ]]; then
     echo "self-test dry-run: FAIL (invocation.session missing in output)" >&2
+    return 1
+  fi
+
+  invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$out" 2>/dev/null)"
+  if [[ "$invocation_flags" != "--self-test-flag" ]]; then
+    echo "self-test dry-run: FAIL (expected resolved launch_flags, got '$invocation_flags')" >&2
     return 1
   fi
 
