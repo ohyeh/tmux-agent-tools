@@ -246,6 +246,12 @@ run_preset() {
 
 run_preset codex CODEX
 
+if "$AGENT_TMUX" claude doctor --json | jq -e '.ok == true' >/dev/null 2>&1; then
+  run_preset claude CLAUDE
+else
+  echo "SKIP claude: claude unavailable or doctor failed"
+fi
+
 if "$AGENT_TMUX" agy doctor --json | jq -e '.ok == true' >/dev/null 2>&1; then
   run_preset agy AGY
 else
