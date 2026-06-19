@@ -1,6 +1,6 @@
-# Next implementation plan (post-#266) — endorsed
+# Next implementation plan (post-#266)
 
-Synthesized with fixed teammate **codex**. Full proposal: `next-plan-codex.md` (endorsed as-is).
+Synthesized with fixed teammate **codex**. This file is the SINGLE SOURCE OF TRUTH. `next-plan-codex.md` is codex's original raw proposal kept only as a historical record — it is **superseded** by this file wherever they differ (notably the stale `--field status` / fake-path-test wording; the corrected forms live in the operative packets below).
 
 ## Goal
 Reduce manual lead supervision when several workers run the same packet: let the lead proceed on a **quorum** of usable results instead of `--any` (too early) or `--all` (one stuck worker blocks convergence).
@@ -23,10 +23,10 @@ The taxonomy is wrong: `HEURISTIC_FAMILY=codex` doubles as "codex" AND "default 
 ## Packet 0b — result-path contract for env-strip CLIs (was "Packet 0"; rides 0a)
 **Why first:** a sandboxed codex worker cannot read the wrapper-injected `$TMUX_AGENT_RESULT`/`$TMUX_AGENT_NAME` (env set only as tmux session env `:2465-2472`; `contracts.md:75-83`/`SKILL.md:196` already admit this), and with non-exact random-suffix names it cannot derive the path either. So it can't reliably write `result.json` — which means watch/quorum (Packets A/B) would have nothing to consume. Correctness papercut, every codex participant.
 
-**Decision (codex debate):** rejected the cwd-sentinel idea (option A) — a single `<cwd>/.tmux-agent-result` clobbers when multiple workers share one repo cwd (pair/fanout/review norm); per-agent files reintroduce the in-sandbox name-locator problem. Chosen: **auto-append a result contract to every prompt-sending boundary** for codex-family CLIs: `Write final JSON to this exact path: <absolute result_path>`, computed from `agent_root_dir()/name/result.json`. No user flags; keep `result --path <name>` as the debug surface.
-- Landing: prompt-send sites — `start` initial text `:2768-2772`, `send` `:3238-3248`, `send-wait` `:3347-3363`, `send-wait-literal` `:3410-3423`. Path source `:1227-1228`/`:2465-2472`.
+**Decision (codex debate):** rejected the cwd-sentinel idea (option A) — a single `<cwd>/.tmux-agent-result` clobbers when multiple workers share one repo cwd (pair/fanout/review norm); per-agent files reintroduce the in-sandbox name-locator problem. Chosen: **auto-append a result contract to every prompt-sending boundary** — `Write final JSON to this exact path: <absolute result_path>`, computed from `agent_root_dir()/name/result.json`. **Gated on the declarative key `result_path_via_prompt`** (defined per family in 0a: `claude=false` → keeps env mechanism; `codex=true`; `generic=true`), NOT on family name. Keep `result --path <name>` as the debug surface.
+- Landing: prompt-send sites — `start` initial text `:2768-2772`, `send` `:3238-3248`, `send-wait` `:3347-3363`, `send-wait-literal` `:3410-3423`. Path source `:1227-1228`/`:2465-2472`. Append BEFORE any nonce/literal marker so send-wait last-line matching is preserved.
 - Out of scope this packet: `start-ssh` remote result placement (`:3074-3127`, already unresolved), `resume` (no prompt), new schema/sentinel format.
-- Self-check: start two non-exact fake codex-family workers in the SAME cwd; assert each received a DISTINCT path equal to `result --path <its-name>`; a `send-wait` check that the augmented prompt carries the path without breaking nonce matching.
+- Self-check: start two non-exact workers with `result_path_via_prompt=true` in the SAME cwd; assert each received a DISTINCT path equal to `result --path <its-name>`; a `send-wait` check that the augmented prompt carries the path without breaking nonce matching.
 
 ## Packets (sequenced — A first, B builds on the counting idea)
 1. **Packet A — `watch --count N`**: an EXPLICIT count mode (not the default `mode=any`). Met when `done_count >= N` named agents are done (existing done def: result.json changed or session exited), computed from the existing `done_reason` map (`:5128-5137,5175-5191`). Reject mixing `--count` with `--any`/`--all`; validate `--count` is a positive integer (decide `--count > #names` = usage error vs timeout-only at impl). JSON adds `required_count`/`done_count`; `--any`/`--all` output unchanged; update usage/help. Landing: `watch_session()` ~`agent-tmux:5125`.

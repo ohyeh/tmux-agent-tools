@@ -1,19 +1,17 @@
 {
   "verdict": "changes_required",
   "blocking": [
-    {
-      "packet": "A",
-      "issue": "Packet A still contains an unfixed self-check contradiction: .workflow/tier1-issue-266/next-plan.md:36 says self_test_watch_count should use three fake result paths and rewrite two, but the same plan's correction at .workflow/tier1-issue-266/next-plan.md:47 says this must use live tmux sessions because missing sessions are treated as done-by-exit. The current implementation confirms that risk at skills/tmux-agent-tools/scripts/agent-tmux:5181-5184. A final folded plan cannot leave both instructions active."
-    },
-    {
-      "packet": "B",
-      "issue": "Packet B is not fully folded: .workflow/tier1-issue-266/next-plan.md:33 still describes reusing `result --json` body, while .workflow/tier1-issue-266/next-plan.md:45 says `result --json <name>` is wrong for team members whose stored result_path differs and must be replaced by a row result_path reader. The current result command reads only `$(agent_root_dir)/$name/result.json` at skills/tmux-agent-tools/scripts/agent-tmux:3679-3684, while team state preserves row result_path at skills/tmux-agent-tools/scripts/agent-tmux:5381-5411."
-    }
+    "Whole-plan contradiction remains: next-plan.md:3 says next-plan-codex.md is endorsed as-is, but next-plan-codex.md still contains the stale Packet B predicate interface (`--field status`, simple field style) at lines 66, 74, and 127, while the operative packet requires jq expressions and examples using `--field .status` at next-plan.md:33 and next-plan.md:36. Because next-plan.md explicitly endorses the stale companion proposal, zero-contradiction consensus is not available.",
+    "Whole-plan contradiction remains for Packet A test design: next-plan.md:36 correctly requires live tmux sessions because missing sessions count as done-by-exit, but the endorsed-as-is next-plan-codex.md still describes fake result paths plus only one pending tmux session at lines 118-122. That reintroduces the vacuous-pass risk the operative packet says to avoid.",
+    "Packet 0b is still ambiguous against corrected 0a: next-plan.md:21 says generic defaults include `result_path_via_prompt=true` and next-plan.md:46 says 0b rides 0a's generic/codex families, but the actual 0b decision and self-check at next-plan.md:26 and next-plan.md:29 still say codex-family CLIs only. The plan should specify the new profile/family key behavior directly, e.g. append the prompt contract when `result_path_via_prompt=true` with codex=true and generic=true, not leave codex-family wording as the operative gate."
   ],
-  "nonblocking": [],
+  "nonblocking": [
+    "The operative Packet 0a text now captures the requested family-model corrections: three peer families, explicit generic provider-key/probe branches, preserving agy/cursor/grok as named arms, docs/examples cleanup, and a migration note.",
+    "The operative Packet B text now captures the row `result_path` reader and jq-expression `.status` correction, but the endorsed companion proposal still contradicts it."
+  ],
   "packet_0a_ok": true,
-  "packet_0b_ok": true,
+  "packet_0b_ok": false,
   "packet_A_ok": false,
   "packet_B_ok": false,
-  "notes": "Packet 0a corrections are captured: three peer families claude|codex|generic, explicit generic provider-key no-inherit branch, explicit 3-way family branches, agy/cursor/grok retained as named arms, docs/examples called out, and back-compat note required. Packet 0b remains consistent enough with corrected 0a, but whole-plan consensus is blocked by A/B corrections that remain as addenda instead of being folded into the operative packet text."
+  "notes": "Static review only. I read final-consensus-brief.md and the whole next-plan.md, then checked the cited live source/doc seams plus the referenced next-plan-codex.md because next-plan.md explicitly endorses it as-is. Consensus requires zero objections across the whole plan; the stale endorsed companion proposal and 0b family-gate ambiguity leave blockers."
 }
