@@ -1,0 +1,19 @@
+{
+  "verdict": "changes_required",
+  "blocking": [
+    {
+      "packet": "A",
+      "issue": "Packet A still contains an unfixed self-check contradiction: .workflow/tier1-issue-266/next-plan.md:36 says self_test_watch_count should use three fake result paths and rewrite two, but the same plan's correction at .workflow/tier1-issue-266/next-plan.md:47 says this must use live tmux sessions because missing sessions are treated as done-by-exit. The current implementation confirms that risk at skills/tmux-agent-tools/scripts/agent-tmux:5181-5184. A final folded plan cannot leave both instructions active."
+    },
+    {
+      "packet": "B",
+      "issue": "Packet B is not fully folded: .workflow/tier1-issue-266/next-plan.md:33 still describes reusing `result --json` body, while .workflow/tier1-issue-266/next-plan.md:45 says `result --json <name>` is wrong for team members whose stored result_path differs and must be replaced by a row result_path reader. The current result command reads only `$(agent_root_dir)/$name/result.json` at skills/tmux-agent-tools/scripts/agent-tmux:3679-3684, while team state preserves row result_path at skills/tmux-agent-tools/scripts/agent-tmux:5381-5411."
+    }
+  ],
+  "nonblocking": [],
+  "packet_0a_ok": true,
+  "packet_0b_ok": true,
+  "packet_A_ok": false,
+  "packet_B_ok": false,
+  "notes": "Packet 0a corrections are captured: three peer families claude|codex|generic, explicit generic provider-key no-inherit branch, explicit 3-way family branches, agy/cursor/grok retained as named arms, docs/examples called out, and back-compat note required. Packet 0b remains consistent enough with corrected 0a, but whole-plan consensus is blocked by A/B corrections that remain as addenda instead of being folded into the operative packet text."
+}
