@@ -1742,8 +1742,9 @@ result_wait_required_session() {
     exit 2
   fi
   require_jq
-  local result_path deadline out missing
+  local result_path deadline out missing requested_fields_json
   result_path="$(agent_root_dir)/$name/result.json"
+  requested_fields_json="$("$JQ" -c -n --arg fields "$fields" '$fields | split(",") | map(gsub("^\\s+|\\s+$"; ""))')"
   deadline=$((SECONDS + wait_seconds))
   while true; do
     if [[ -f "$result_path" ]] && "$JQ" -e . "$result_path" >/dev/null 2>&1; then
@@ -1768,9 +1769,11 @@ result_wait_required_session() {
   done
   local present=false
   [[ -f "$result_path" ]] && present=true
-  "$JQ" -n --arg path "$result_path" --arg missing "$missing" --argjson present "$present" \
+  "$JQ" -n --arg path "$result_path" --arg missing "$missing" --argjson present "$present" --argjson requested_fields "$requested_fields_json" \
     '{schema_version: 1, path: $path, present: $present,
-      valid: false, timeout: true, missing_fields: (if $missing == "" then [] else ($missing | split(",")) end)}'
+      valid: false, timeout: true,
+      missing_fields: (if $missing != "" then ($missing | split(","))
+        else $requested_fields end)}'
   return 1
 }
 
