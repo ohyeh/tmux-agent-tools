@@ -46,3 +46,41 @@ Source of truth for scope: `.workflow/tier1-issue-266/plan.md`. Target file: `sk
 **P3 scope: only invocation object added, no rewrite**
 - `run_dry_run_checks` output shape is backward-compatible: existing `checks[]` unchanged, new `invocation{}` appended at the top level.
 - `session_for_name` called with `req_name` (no exact-name suffix logic needed for a preview).
+
+---
+
+# Next-plan packets (0a / 0b / A / B) — post-#266
+
+Authoritative spec = `.workflow/tier1-issue-266/next-plan.md`. Same target file.
+
+## Operating mode
+- Commander mode: orchestrator (Claude) = brain (inventory/decide/dispatch/verify/gate). **All product code + review dispatched to codex** via `tmux-agent-tools` wrappers (`skills/tmux-agent-tools/scripts/codex-tmux`). Orchestrator does not hand-write product code beyond the 3 seed edits below.
+- Gates per batch: `zsh -n` + `scripts/ci-shellcheck` + codex/claude self-test. Final: codex adversarial review until AGREE, then commit + push.
+
+## Decisions / deviations
+
+### D1 — profile files agy/cursor/grok.conf left UNCHANGED (codex final verdict)
+next-plan.md 0a item 3: these are deliberate named arms (`delete_safe=false`; shipped shim + install-bin + stress-smoke refs). Being named ≠ being the silent default. The bug is the `*)` catch-all + docs, not the named arms. → No edit. Less surface, matches consensus.
+
+### D2 — orchestrator pre-applied 3 of 4 Packet-0a code edits (seed)
+Applied directly to `agent-tmux` (all `zsh -n` clean) before commander mode declared:
+1. case arm `*)` → `HEURISTIC_FAMILY=generic` (was codex). Unknown CLI no longer silently codex.
+2. `cli_provider_env_keys()` → 3-way `case`: claude (anthropic) / codex (openai+codex) / `generic|*)` inherits NO provider keys (worst credential-leak branch closed).
+3. probe metric set → `case`: claude metrics / `codex|generic|*)` generic metrics.
+codex picks up edit #4 (probe parsers) + docs + 0b/A/B.
+
+### D3 — `generic|*)` catch in non-credential branches is intentional
+For probe metric/parser (codex==generic behavior), `*)` folds unknown `heuristic_family` into SAFE generic parser. codex's "never via else" rule targets the *credential* branch (silent-codex = leak); parsers' catch-all maps to safe-generic, not codex.
+
+## Status log
+- (init) Plan re-read post-/clear. 3 seed edits applied + `zsh -n` clean. codex + tmux available. Dispatching remainder to codex worker.
+- (batch1) codex implemented 0a edit#4 (probe parsers if→case) + 0a docs + 0b result-path contract. Orchestrator-verified gates: `zsh -n` OK, `ci-shellcheck` rc0, codex+claude self-test ok (new `result-path-prompt` self-check). Tasks 0a/0b done.
+- (batch2) codex implemented Packet A (`watch --count N`) + Packet B (`team quorum --count`) with `self_test_watch_count` + `self_test_team_quorum` (live tmux). Orchestrator-verified: `zsh -n` OK, `ci-shellcheck` rc0, codex+claude self-test ok (`watch-count: ok`, `team-quorum: ok`). agent-tmux +521 lines total.
+
+### Adversarial review outcome
+- Round 1: codex (independent reviewer session, high effort) returned **BLOCK** — 2 blockers: probe metric set + probe parsers still used a folded `codex|generic|*)` branch instead of the explicit 3-way the plan (0a item 2) mandates. This overruled orchestrator decision **D3** (the lazy fold). Plan is SoT → complied.
+- Fix: implementer split both into explicit `claude)` / `codex)` / `generic|*)`; the ~30-line generic parser was factored into a helper called by both the `codex)` and `generic|*)` arms (avoids duplication while staying explicit peers).
+- Round 2: codex returned **ACCEPT**, no blockers, with extra independent verification (ci-shellcheck, zsh -n, git diff --check, generic provider-key check = 0 keys / codex = 2 hits, codex+claude self-test, probe smoke, test-help-smoke 42 passed/0 failed).
+
+### Verification caveat — worker self-reports were NOT trusted
+codex reported "gates passed" in result.json on BOTH batches while a transient mid-edit state still showed a runtime `team: parameter not set` at the quorum parser. Brain re-ran every gate independently; the error was a race during codex's own editing and was gone once codex went idle. Lesson: always re-run gates from the orchestrator; never accept a worker's "success" at face value, especially while `status --json` shows `running:true`.

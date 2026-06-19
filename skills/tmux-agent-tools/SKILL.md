@@ -9,7 +9,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 
 - **Wrapper not on PATH?** Run it from the skill bundle directly: `<skill-dir>/scripts/codex-tmux …` (this file's directory). Don't waste steps on `which`/`find`/`tmux ls` discovery.
 - **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>` → `codex-tmux ping --json --timeout 5 <n>` only if liveness is unclear. Pane capture is diagnostic fallback only.
-- **Multiple workers, need the first/all completions?** One blocking call: `codex-tmux watch --any|--all --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner, then `codex-tmux result --json <winner>`.
+- **Multiple workers, need first/all/quorum completions?** One blocking call: `codex-tmux watch --any|--all|--count <n> --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner/quorum, then `codex-tmux result --json <winner>`.
 - **Want to auto-delegate a substantial task?** Use the `.claude/agents/tmux-delegate.md` subagent to decide inline vs worker, then run its exact wrapper command.
 - **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
 
@@ -80,15 +80,17 @@ Claude Code can use `.claude/agents/tmux-delegate.md` as the decision gate for s
 
 ## Custom CLIs and profiles
 
-`agent-tmux <cli>` works for any binary out of the box: unknown CLI names get generic defaults (binary = the CLI name, codex-family heuristics, no launch flags). Profiles are the canonical per-CLI configuration: the bundled `scripts/profiles/` directory ships the defaults for claude/codex/agy/cursor/grok (the in-script preset table is a frozen legacy fallback), and new CLIs are added as profiles, not code. To customize, write a declarative profile at `~/.config/agent-tmux/profiles/<cli>.conf`, set `AGENT_TMUX_PROFILE_DIR`, or pass it at use time: `agent-tmux <cli> --profile-dir <your-managed-dir> …` / `--profile <file>`. Profiles are plain `key=value` files — never sourced, so they cannot execute code. Precedence: env vars (`<NS>_TMUX_*` > `AGENT_TMUX_*`) > `--profile`/`--profile-dir` > `$AGENT_TMUX_PROFILE_DIR` > user config dir > bundled defaults > legacy preset.
+`agent-tmux <cli>` works for any binary out of the box: unknown CLI names get generic defaults (binary = the CLI name, generic-family heuristics, no provider-key inheritance, no `--yolo`, result-path-via-prompt on, no launch flags). Profiles are the canonical per-CLI configuration: the bundled `scripts/profiles/` directory ships the defaults for claude/codex/agy/cursor/grok (the in-script preset table is a frozen legacy fallback), and new CLIs are added as profiles, not code. To customize, write a declarative profile at `~/.config/agent-tmux/profiles/<cli>.conf`, set `AGENT_TMUX_PROFILE_DIR`, or pass it at use time: `agent-tmux <cli> --profile-dir <your-managed-dir> …` / `--profile <file>`. Profiles are plain `key=value` files — never sourced, so they cannot execute code. Precedence: env vars (`<NS>_TMUX_*` > `AGENT_TMUX_*`) > `--profile`/`--profile-dir` > `$AGENT_TMUX_PROFILE_DIR` > user config dir > bundled defaults > legacy preset.
+
+Migration note: unlisted CLIs now use `generic` instead of Codex-family behavior. If a custom CLI intentionally needs Codex/OpenAI provider-key inheritance or `--yolo`, set those explicitly in its profile.
 
 ```ini
 # ~/.config/agent-tmux/profiles/gemini.conf
 bin=gemini
 env_ns=GEMINI
-launch_flags=--yolo
+launch_flags=
 resume_keyword=resume
-heuristic_family=codex
+heuristic_family=generic
 # Optional detection overrides (extended regex, case-insensitive):
 pattern_busy=(thinking|generating|esc to cancel)
 pattern_approval_prompt=allow this (command|action)\?
@@ -159,9 +161,12 @@ To supervise **multiple workers with one blocking call** (no per-worker polling 
 ```bash
 codex-tmux watch --any --timeout 600 --json w1 w2 w3   # first completion wins
 codex-tmux watch --all --timeout 600 --json w1 w2 w3   # block until all done
+codex-tmux watch --count 2 --timeout 600 --json w1 w2 w3 # proceed on 2 done
 ```
 
-Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` and `reason` (`result_updated` | `exited`). Polling happens inside the shell call, so the supervising agent spends one tool call instead of a status loop — this is the token-efficient pattern for fanout supervision.
+Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` and `reason` (`result_updated` | `exited`); `--count` also includes `required_count` and `done_count`. Polling happens inside the shell call, so the supervising agent spends one tool call instead of a status loop — this is the token-efficient pattern for fanout supervision.
+
+For team state, `team quorum <team> --count N [--field <jq> --value <literal>] --json` counts present, valid worker results using each worker row's stored `result_path`. Use `--field .status --value success` to require a specific result value.
 
 If `watch` times out, run one structured liveness pass per worker: `status --json`, then `ping --json --timeout 5` for workers with `running:true` and high `idle_seconds`, then `result --json --wait 30`. If `diagnostic` shows an approval/permission prompt, attach and answer only with authorization. If ping fails and no result appears, report the worker as stalled with status JSON and one `capture --strip-ansi <name> 80` diagnostic tail.
 
@@ -193,7 +198,7 @@ codex-tmux result validate worker --json
 codex-tmux result wait-required worker --fields status,summary --wait 60 --json
 ```
 
-Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. Agents cannot expand `$TMUX_AGENT_RESULT` from sandboxed tool envs; pass the literal path from `result --path <name>` in the worker prompt. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. For `result_path_via_prompt=true` families (Codex and generic by default), prompt sends automatically include the literal path because sandboxed tool envs cannot expand `$TMUX_AGENT_RESULT`. Use `result --path <name>` as the debug surface. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
 
 Stall fallback: if `status --json` reports `running:true` with high `idle_seconds` and `ping` times out, send one bounded recovery prompt with `send-wait`: "Write result.json now with status blocked and the current blocker." Then read `result wait-required worker --fields status,summary --wait 60 --json`. If that also times out, stop waiting and report stalled with structured status plus one diagnostic capture tail.
 

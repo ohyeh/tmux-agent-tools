@@ -3,9 +3,9 @@
 bin=gemini
 env_ns=GEMINI
 prefix=gemini-cli
-launch_flags=--yolo
+launch_flags=
 resume_keyword=resume
-heuristic_family=codex
+heuristic_family=generic
 # Optional detection overrides (extended regex, case-insensitive):
 # pattern_busy=(thinking|generating|esc to cancel)
 # pattern_approval_prompt=allow this (command|action)\?

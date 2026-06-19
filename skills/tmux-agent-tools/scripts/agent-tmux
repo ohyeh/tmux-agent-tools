@@ -27,7 +27,7 @@ preset_for_cli() {
     agy)    _ENV_NS=AGY;    _bin=agy;    _PRESET_PREFIX=agy-cli;    _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
     cursor) _ENV_NS=CURSOR; _bin=cursor; _PRESET_PREFIX=cursor-cli; _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
     grok)   _ENV_NS=GROK;   _bin=grok;   _PRESET_PREFIX=grok-cli;   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
-    *)      _ENV_NS=AGENT;  _bin="$1";   _PRESET_PREFIX="$1-cli";   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+    *)      _ENV_NS=AGENT;  _bin="$1";   _PRESET_PREFIX="$1-cli";   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
   esac
 }
 preset_for_cli "$CLI"
@@ -78,6 +78,7 @@ PROFILE_PATTERN_BUSY=''
 PROFILE_PATTERN_PERMISSION=''
 PROFILE_PATTERN_APPROVAL=''
 PROFILE_PATTERN_LOGIN=''
+RESULT_PATH_VIA_PROMPT=''
 load_cli_profile() {
   local cli="$1" dir file='' line key value
   if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
@@ -127,11 +128,30 @@ load_cli_profile() {
         esac
         ;;
       result_required_fields) PROFILE_RESULT_REQUIRED_FIELDS="$value" ;;
+      result_path_via_prompt)
+        case "$value" in
+          true|false) RESULT_PATH_VIA_PROMPT="$value" ;;
+          *)
+            RESULT_PATH_VIA_PROMPT=''
+            echo "agent-tmux: unknown result_path_via_prompt value '$value' in $file (expected true|false); using family default" >&2
+            ;;
+        esac
+        ;;
       *) echo "agent-tmux: unknown profile key '$key' in $file" >&2 ;;
     esac
   done < "$file"
 }
 load_cli_profile "$CLI"
+
+result_path_via_prompt_default() {
+  case "$HEURISTIC_FAMILY" in
+    claude)          printf '%s\n' false ;;
+    codex)           printf '%s\n' true ;;
+    generic|*)       printf '%s\n' true ;;
+  esac
+}
+
+[[ -n "$RESULT_PATH_VIA_PROMPT" ]] || RESULT_PATH_VIA_PROMPT="$(result_path_via_prompt_default)"
 
 # Env precedence: <NS>_TMUX_<KEY> > AGENT_TMUX_<KEY> > preset default.
 # Empty-or-unset falls through (matches legacy `${CLAUDE_TMUX_X:-default}`).
@@ -215,7 +235,7 @@ Usage:
   agent-tmux status [--json] <name>
   agent-tmux ping [--timeout <s>] [--json] <name>
   agent-tmux probe --metric <metric> [--json] <name>
-  agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>
+  agent-tmux watch [--any|--all|--count <n>] [--timeout <s>] [--interval <s>] [--json] <name...>
   agent-tmux env-doctor [name]
   agent-tmux doctor
   agent-tmux setup
@@ -1678,6 +1698,16 @@ result_path_session() {
   printf '%s\n' "$subdir/result.json"
 }
 
+prompt_with_result_path() {
+  local name="$1"
+  local prompt_text="$2"
+  if [[ "$RESULT_PATH_VIA_PROMPT" == true ]]; then
+    printf 'Write final JSON to this exact path: %s\n%s' "$(agent_root_dir)/$name/result.json" "$prompt_text"
+  else
+    printf '%s' "$prompt_text"
+  fi
+}
+
 result_validate_session() {
   local output_json=0
   local name=""
@@ -2768,6 +2798,7 @@ start_session() {
   if [[ -n "$initial_text" ]]; then
     sleep 3
     local buffer_name="$session-init"
+    initial_text="$(prompt_with_result_path "$name" "$initial_text")"
     paste_and_submit "$session" "$buffer_name" "$initial_text"
     echo "sent: $initial_text"
   else
@@ -3231,9 +3262,12 @@ send_session() {
       exit 2
     fi
     prompt_text="$(cat "$from_file")"
+    multiline=true
+  fi
+  prompt_text="$(prompt_with_result_path "$name" "$prompt_text")"
+  if [[ -n "$from_file" ]]; then
     payload_file="$(mktemp -t agent-tmux-send.XXXXXX)"
     printf '%s' "$prompt_text" > "$payload_file"
-    multiline=true
   fi
   local buffer_name="$session-send"
   if [[ -n "$from_file" ]]; then
@@ -3346,6 +3380,7 @@ send_wait_session() {
 
   local nonce
   nonce="$(marker_nonce)"
+  prompt_text="$(prompt_with_result_path "$name" "$prompt_text")"
   local augmented_prompt="${prompt_text}"$'\n\n'"End your reply with this exact nonce on its own line: ${nonce}"
   send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
     _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds"
@@ -3407,6 +3442,7 @@ send_wait_literal_session() {
     exit 1
   fi
 
+  prompt_text="$(prompt_with_result_path "$name" "$prompt_text")"
   send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
     _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds"
 }
@@ -4399,33 +4435,42 @@ setup_session() {
 }
 
 cli_provider_env_keys() {
-  if [[ "$HEURISTIC_FAMILY" == claude ]]; then
-    printf '%s\n' \
-      ANTHROPIC_AUTH_TOKEN \
-      ANTHROPIC_API_KEY \
-      ANTHROPIC_BASE_URL \
-      ANTHROPIC_API_BASE_URL \
-      ANTHROPIC_MODEL \
-      ANTHROPIC_DEFAULT_OPUS_MODEL \
-      ANTHROPIC_DEFAULT_SONNET_MODEL \
-      ANTHROPIC_DEFAULT_HAIKU_MODEL \
-      ANTHROPIC_REASONING_MODEL \
-      CLAUDE_CODE_SUBAGENT_MODEL \
-      API_TIMEOUT_MS
-  else
-    printf '%s\n' \
-      OPENAI_API_KEY \
-      OPENAI_BASE_URL \
-      OPENAI_ORG_ID \
-      OPENAI_PROJECT \
-      OPENAI_MODEL \
-      OPENAI_TIMEOUT_MS \
-      CODEX_API_KEY \
-      CODEX_BASE_URL \
-      CODEX_MODEL \
-      CODEX_HOME \
-      API_TIMEOUT_MS
-  fi
+  case "$HEURISTIC_FAMILY" in
+    claude)
+      printf '%s\n' \
+        ANTHROPIC_AUTH_TOKEN \
+        ANTHROPIC_API_KEY \
+        ANTHROPIC_BASE_URL \
+        ANTHROPIC_API_BASE_URL \
+        ANTHROPIC_MODEL \
+        ANTHROPIC_DEFAULT_OPUS_MODEL \
+        ANTHROPIC_DEFAULT_SONNET_MODEL \
+        ANTHROPIC_DEFAULT_HAIKU_MODEL \
+        ANTHROPIC_REASONING_MODEL \
+        CLAUDE_CODE_SUBAGENT_MODEL \
+        API_TIMEOUT_MS
+      ;;
+    codex)
+      printf '%s\n' \
+        OPENAI_API_KEY \
+        OPENAI_BASE_URL \
+        OPENAI_ORG_ID \
+        OPENAI_PROJECT \
+        OPENAI_MODEL \
+        OPENAI_TIMEOUT_MS \
+        CODEX_API_KEY \
+        CODEX_BASE_URL \
+        CODEX_MODEL \
+        CODEX_HOME \
+        API_TIMEOUT_MS
+      ;;
+    generic|*)
+      # generic (and any unknown family from a profile typo) inherits NO
+      # provider keys by default. Scrubbed deliberately so an unlisted CLI
+      # never silently inherits Codex/OpenAI credentials; opt in via a profile.
+      :
+      ;;
+  esac
 }
 
 redact_env_value() {
@@ -4761,6 +4806,248 @@ self_test_dry_run() {
   echo "self-test dry-run: ok"
 }
 
+self_test_result_path_prompt() {
+  require_tmux
+  local tmp_dir fake_cli saved_cli_bin saved_launch_flags saved_result_prompt saved_dir
+  local out1 out2 name1="" name2="" path1 path2 pane before_count after_count defaults profile_value
+  tmp_dir="$(mktemp -d)"
+  fake_cli="$tmp_dir/fake-cli"
+  cat > "$fake_cli" <<'FAKE_EOF'
+#!/bin/sh
+printf '%s\n' 'fake ready'
+while IFS= read -r line; do
+  printf 'recv:%s\n' "$line"
+  case "$line" in
+    "End your reply with this exact nonce on its own line: "*)
+      printf '%s\n' "${line##*: }"
+      ;;
+  esac
+done
+FAKE_EOF
+  chmod +x "$fake_cli"
+
+  defaults="$(
+    HEURISTIC_FAMILY=claude; result_path_via_prompt_default
+    HEURISTIC_FAMILY=codex; result_path_via_prompt_default
+    HEURISTIC_FAMILY=generic; result_path_via_prompt_default
+  )"
+  if [[ "$defaults" != $'false\ntrue\ntrue' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test result-path-prompt: FAIL (unexpected family defaults: $defaults)" >&2
+    return 1
+  fi
+
+  printf 'heuristic_family=generic\nresult_path_via_prompt=false\n' > "$tmp_dir/profile.conf"
+  profile_value="$(
+    HEURISTIC_FAMILY=codex
+    RESULT_PATH_VIA_PROMPT=''
+    _PROFILE_FILE_FLAG="$tmp_dir/profile.conf"
+    _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    [[ -n "$RESULT_PATH_VIA_PROMPT" ]] || RESULT_PATH_VIA_PROMPT="$(result_path_via_prompt_default)"
+    printf '%s' "$RESULT_PATH_VIA_PROMPT"
+  )"
+  if [[ "$profile_value" != false ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test result-path-prompt: FAIL (profile override expected false, got $profile_value)" >&2
+    return 1
+  fi
+
+  saved_cli_bin="$CLI_BIN"
+  saved_launch_flags="$LAUNCH_FLAGS"
+  saved_result_prompt="${RESULT_PATH_VIA_PROMPT-}"
+  saved_dir="${TMUX_AGENT_DIR-}"
+
+  {
+    CLI_BIN="$fake_cli"
+    LAUNCH_FLAGS=''
+    RESULT_PATH_VIA_PROMPT=true
+    export TMUX_AGENT_DIR="$tmp_dir/agents"
+
+    out1="$(start_session "st-rp" "$tmp_dir" "first prompt")"
+    out2="$(start_session "st-rp" "$tmp_dir" "second prompt")"
+    name1="$(printf '%s\n' "$out1" | while IFS= read -r line; do
+      case "$line" in
+        "agent: "*) printf '%s' "${line#agent: }"; break ;;
+      esac
+    done)"
+    name2="$(printf '%s\n' "$out2" | while IFS= read -r line; do
+      case "$line" in
+        "agent: "*) printf '%s' "${line#agent: }"; break ;;
+      esac
+    done)"
+    path1="$(result_path_session "$name1")"
+    path2="$(result_path_session "$name2")"
+
+    if [[ -z "$name1" || -z "$name2" || "$name1" == "$name2" || "$path1" == "$path2" ]]; then
+      echo "self-test result-path-prompt: FAIL (expected two distinct non-exact result paths)" >&2
+      return 1
+    fi
+
+    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
+    if [[ "$pane" != *"$path1"* ]]; then
+      echo "self-test result-path-prompt: FAIL (initial prompt missing $path1)" >&2
+      return 1
+    fi
+    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name2")" -p -S -200)"
+    if [[ "$pane" != *"$path2"* ]]; then
+      echo "self-test result-path-prompt: FAIL (initial prompt missing $path2)" >&2
+      return 1
+    fi
+
+    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
+    before_count="$(count_literal_occurrences "$pane" "$path1")"
+    send_wait_session "$name1" "follow-up prompt" 5
+    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
+    after_count="$(count_literal_occurrences "$pane" "$path1")"
+    if (( after_count <= before_count )); then
+      echo "self-test result-path-prompt: FAIL (send-wait prompt missing $path1)" >&2
+      return 1
+    fi
+  } always {
+    [[ -n "$name1" ]] && "$TMUX" kill-session -t "$(session_for_name "$name1")" 2>/dev/null || true
+    [[ -n "$name2" ]] && "$TMUX" kill-session -t "$(session_for_name "$name2")" 2>/dev/null || true
+    CLI_BIN="$saved_cli_bin"
+    LAUNCH_FLAGS="$saved_launch_flags"
+    RESULT_PATH_VIA_PROMPT="$saved_result_prompt"
+    if [[ -n "$saved_dir" ]]; then
+      export TMUX_AGENT_DIR="$saved_dir"
+    else
+      unset TMUX_AGENT_DIR
+    fi
+    rm -rf "$tmp_dir"
+  }
+
+  echo "self-test result-path-prompt: ok"
+}
+
+self_test_watch_count() {
+  require_tmux
+  require_jq
+  local tmp_dir saved_dir name1 name2 name3 session1 session2 session3 out rc writer_pid=""
+  tmp_dir="$(mktemp -d)"
+  saved_dir="${TMUX_AGENT_DIR-}"
+  export TMUX_AGENT_DIR="$tmp_dir/agents"
+  name1="st-watch-count-$$-1"
+  name2="st-watch-count-$$-2"
+  name3="st-watch-count-$$-3"
+  session1="$(session_for_name "$name1")"
+  session2="$(session_for_name "$name2")"
+  session3="$(session_for_name "$name3")"
+
+  {
+    "$TMUX" kill-session -t "$session1" 2>/dev/null || true
+    "$TMUX" kill-session -t "$session2" 2>/dev/null || true
+    "$TMUX" kill-session -t "$session3" 2>/dev/null || true
+    "$TMUX" new-session -d -s "$session1" "zsh -lc 'sleep 30'"
+    "$TMUX" new-session -d -s "$session2" "zsh -lc 'sleep 30'"
+    "$TMUX" new-session -d -s "$session3" "zsh -lc 'sleep 30'"
+    mkdir -p "$(agent_root_dir)/$name1" "$(agent_root_dir)/$name2" "$(agent_root_dir)/$name3"
+
+    if ( watch_session --any --count 1 "$name1" >/dev/null 2>&1 ); then
+      rc=0
+    else
+      rc=$?
+    fi
+    if (( rc != 2 )); then
+      echo "self-test watch-count: FAIL (mixed --any/--count expected rc=2, got $rc)" >&2
+      return 1
+    fi
+
+    (
+      sleep 1
+      printf '{"schema_version":1,"status":"success","summary":"one","artifacts":[],"errors":[]}\n' > "$(result_path_session "$name1")"
+      printf '{"schema_version":1,"status":"success","summary":"two","artifacts":[],"errors":[]}\n' > "$(result_path_session "$name2")"
+    ) &
+    writer_pid="$!"
+
+    out="$(watch_session --count 2 --timeout 5 --interval .1 --json "$name1" "$name2" "$name3")"
+    rc=$?
+    wait "$writer_pid" 2>/dev/null || true
+    writer_pid=""
+    if (( rc != 0 )); then
+      echo "self-test watch-count: FAIL (--count 2 returned $rc)" >&2
+      return 1
+    fi
+    if [[ "$("$JQ" -r '.mode' <<< "$out")" != count || "$("$JQ" -r '.required_count' <<< "$out")" != 2 || "$("$JQ" -r '.done_count' <<< "$out")" != 2 ]]; then
+      echo "self-test watch-count: FAIL (unexpected JSON: $out)" >&2
+      return 1
+    fi
+  } always {
+    [[ -n "$writer_pid" ]] && kill "$writer_pid" 2>/dev/null || true
+    "$TMUX" kill-session -t "$session1" 2>/dev/null || true
+    "$TMUX" kill-session -t "$session2" 2>/dev/null || true
+    "$TMUX" kill-session -t "$session3" 2>/dev/null || true
+    if [[ -n "$saved_dir" ]]; then
+      export TMUX_AGENT_DIR="$saved_dir"
+    else
+      unset TMUX_AGENT_DIR
+    fi
+    rm -rf "$tmp_dir"
+  }
+
+  echo "self-test watch-count: ok"
+}
+
+self_test_team_quorum() {
+  require_jq
+  local tmp_dir saved_dir team out rc
+  tmp_dir="$(mktemp -d)"
+  saved_dir="${TMUX_AGENT_DIR-}"
+  export TMUX_AGENT_DIR="$tmp_dir/agents"
+  team="st-quorum-$$"
+
+  {
+    mkdir -p "$(agent_root_dir)/$team-w1" "$(agent_root_dir)/$team-w2" "$(agent_root_dir)/$team-w3"
+    _team_write_state "$team" "$CLI" "$("$JQ" -cn \
+      --arg n1 "$team-w1" --arg n2 "$team-w2" --arg n3 "$team-w3" \
+      --arg rp1 "$(agent_root_dir)/$team-w1/custom-result.json" \
+      --arg rp2 "$(agent_root_dir)/$team-w2/custom-result.json" \
+      --arg rp3 "$(agent_root_dir)/$team-w3/custom-result.json" \
+      '[{name:$n1,role:"worker",cli:"codex",result_path:$rp1},
+        {name:$n2,role:"worker",cli:"codex",result_path:$rp2},
+        {name:$n3,role:"worker",cli:"codex",result_path:$rp3}]')"
+    printf '{"schema_version":1,"status":"success","summary":"one","artifacts":[],"errors":[]}\n' > "$(agent_root_dir)/$team-w1/custom-result.json"
+    printf '{"schema_version":1,"status":"success","summary":"two","artifacts":[],"errors":[]}\n' > "$(agent_root_dir)/$team-w2/custom-result.json"
+
+    out="$(_team_quorum "$team" --count 2 --field .status --value success --json)"
+    rc=$?
+    if (( rc != 0 )); then
+      echo "self-test team-quorum: FAIL (--count 2 returned $rc)" >&2
+      return 1
+    fi
+    if [[ "$("$JQ" -r '.met' <<< "$out")" != true || "$("$JQ" -r '.matched_count' <<< "$out")" != 2 ]]; then
+      echo "self-test team-quorum: FAIL (unexpected JSON: $out)" >&2
+      return 1
+    fi
+
+    if ( _team_quorum "$team" --count 2 --field .status --json >/dev/null 2>&1 ); then
+      rc=0
+    else
+      rc=$?
+    fi
+    if (( rc != 2 )); then
+      echo "self-test team-quorum: FAIL (missing --value expected rc=2, got $rc)" >&2
+      return 1
+    fi
+
+    out="$(_team_quorum "$team" --count 3 --field .status --value success --json)" && rc=0 || rc=$?
+    if (( rc == 0 )); then
+      echo "self-test team-quorum: FAIL (--count 3 unexpectedly met: $out)" >&2
+      return 1
+    fi
+  } always {
+    if [[ -n "$saved_dir" ]]; then
+      export TMUX_AGENT_DIR="$saved_dir"
+    else
+      unset TMUX_AGENT_DIR
+    fi
+    rm -rf "$tmp_dir"
+  }
+
+  echo "self-test team-quorum: ok"
+}
+
 status_session() {
   require_tmux
   local output_json=0
@@ -4992,89 +5279,10 @@ ping_session() {
   exit "$exit_code"
 }
 
-probe_session() {
-  require_tmux
-  local output_json=0
-  local metric=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --json) output_json=1; shift ;;
-      --metric)
-        if [[ -z "${2:-}" ]]; then
-          echo "Usage: agent-tmux probe --metric <metric> [--json] <name>" >&2
-          exit 2
-        fi
-        metric="$2"; shift 2 ;;
-      --metric=*) metric="${1#--metric=}"; shift ;;
-      --) shift; break ;;
-      -*) echo "Unknown flag: $1" >&2; exit 2 ;;
-      *) break ;;
-    esac
-  done
-  local name="${1:-}"
-  if [[ -z "$name" || -z "$metric" ]]; then
-    echo "Usage: agent-tmux probe --metric <metric> [--json] <name>" >&2
-    exit 2
-  fi
-  local _agt_metrics
-  if [[ "$HEURISTIC_FAMILY" == claude ]]; then
-    _agt_metrics="context_percent goal_active active_spinner"
-  else
-    _agt_metrics="progress tool_active approval_pending"
-  fi
-  case " $_agt_metrics " in
-    *" $metric "*) ;;
-    *)
-      echo "Unknown metric: $metric (supported: $_agt_metrics)" >&2
-      exit 2 ;;
-  esac
-
-  local session
-  session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
-    echo "Session does not exist: $session" >&2
-    exit 1
-  fi
-
-  local pane parsed_from value confidence
-  pane="$("$TMUX" capture-pane -J -t "$session" -p -S -120 2>/dev/null | strip_ansi_text)"
-  parsed_from=""
-  value="null"
-  confidence="low"
-  if [[ "$HEURISTIC_FAMILY" == claude ]]; then
-   case "$metric" in
-    context_percent)
-      parsed_from="$(printf '%s\n' "$pane" | grep -Eo 'Context[[:space:]]+[0-9]+%' | tail -1 || true)"
-      if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
-        value="${match[1]}"
-        confidence="high"
-      fi
-      ;;
-    goal_active)
-      if printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(active|in progress)|goal:'; then
-        value="true"
-        confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(active|in progress)|goal:' | tail -1 || true)"
-      elif printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(achieved|complete|completed)'; then
-        value="false"
-        confidence="high"
-        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(achieved|complete|completed)' | tail -1 || true)"
-      fi
-      ;;
-    active_spinner)
-      local _busy_re="${PROFILE_PATTERN_BUSY:-[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)}"
-      if printf '%s\n' "$pane" | grep -qE "$_busy_re"; then
-        value="true"
-        confidence="medium"
-        parsed_from="$(printf '%s\n' "$pane" | grep -E "$_busy_re" | tail -1 || true)"
-      else
-        value="false"
-        confidence="low"
-      fi
-      ;;
-   esac
-  else
-   case "$metric" in
+probe_generic_metric_parse() {
+  local metric="$1"
+  local pane="$2"
+  case "$metric" in
     progress)
       parsed_from="$(printf '%s\n' "$pane" | grep -Eo '([Pp]rogress|[Rr]unning|[Tt]hinking)[^0-9]{0,20}[0-9]+%' | tail -1 || true)"
       if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
@@ -5104,8 +5312,99 @@ probe_session() {
         confidence="low"
       fi
       ;;
-   esac
+  esac
+}
+
+probe_session() {
+  require_tmux
+  local output_json=0
+  local metric=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      --metric)
+        if [[ -z "${2:-}" ]]; then
+          echo "Usage: agent-tmux probe --metric <metric> [--json] <name>" >&2
+          exit 2
+        fi
+        metric="$2"; shift 2 ;;
+      --metric=*) metric="${1#--metric=}"; shift ;;
+      --) shift; break ;;
+      -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local name="${1:-}"
+  if [[ -z "$name" || -z "$metric" ]]; then
+    echo "Usage: agent-tmux probe --metric <metric> [--json] <name>" >&2
+    exit 2
   fi
+  local _agt_metrics
+  case "$HEURISTIC_FAMILY" in
+    claude)          _agt_metrics="context_percent goal_active active_spinner" ;;
+    codex)           _agt_metrics="progress tool_active approval_pending" ;;
+    generic|*)       _agt_metrics="progress tool_active approval_pending" ;;
+  esac
+  case " $_agt_metrics " in
+    *" $metric "*) ;;
+    *)
+      echo "Unknown metric: $metric (supported: $_agt_metrics)" >&2
+      exit 2 ;;
+  esac
+
+  local session
+  session="$(session_for_name "$name")"
+  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    echo "Session does not exist: $session" >&2
+    exit 1
+  fi
+
+  local pane parsed_from value confidence
+  pane="$("$TMUX" capture-pane -J -t "$session" -p -S -120 2>/dev/null | strip_ansi_text)"
+  parsed_from=""
+  value="null"
+  confidence="low"
+  case "$HEURISTIC_FAMILY" in
+   claude)
+    case "$metric" in
+    context_percent)
+      parsed_from="$(printf '%s\n' "$pane" | grep -Eo 'Context[[:space:]]+[0-9]+%' | tail -1 || true)"
+      if [[ "$parsed_from" =~ '([0-9]+)' ]]; then
+        value="${match[1]}"
+        confidence="high"
+      fi
+      ;;
+    goal_active)
+      if printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(active|in progress)|goal:'; then
+        value="true"
+        confidence="medium"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(active|in progress)|goal:' | tail -1 || true)"
+      elif printf '%s\n' "$pane" | grep -qiE 'goal[[:space:]-]*(achieved|complete|completed)'; then
+        value="false"
+        confidence="high"
+        parsed_from="$(printf '%s\n' "$pane" | grep -iE 'goal[[:space:]-]*(achieved|complete|completed)' | tail -1 || true)"
+      fi
+      ;;
+    active_spinner)
+      local _busy_re="${PROFILE_PATTERN_BUSY:-[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]|[|/\\-][[:space:]]*(Thinking|Working|Running)}"
+      if printf '%s\n' "$pane" | grep -qE "$_busy_re"; then
+        value="true"
+        confidence="medium"
+        parsed_from="$(printf '%s\n' "$pane" | grep -E "$_busy_re" | tail -1 || true)"
+      else
+        value="false"
+        confidence="low"
+      fi
+      ;;
+    esac
+    ;;
+   codex)
+    probe_generic_metric_parse "$metric" "$pane"
+    ;;
+   generic|*)
+    probe_generic_metric_parse "$metric" "$pane"
+    ;;
+  esac
 
   if (( output_json )); then
     require_jq
@@ -5125,11 +5424,22 @@ probe_session() {
 watch_session() {
   require_tmux
   zmodload zsh/stat 2>/dev/null || true
-  local mode=any timeout=600 interval=1 output_json=0
+  local mode=any timeout=600 interval=1 output_json=0 explicit_mode=0 required_count=0
   while (( $# > 0 )); do
     case "$1" in
-      --any) mode=any; shift ;;
-      --all) mode=all; shift ;;
+      --any)
+        (( explicit_mode )) && { echo "watch: --any/--all/--count are mutually exclusive" >&2; exit 2; }
+        mode=any; explicit_mode=1; shift ;;
+      --all)
+        (( explicit_mode )) && { echo "watch: --any/--all/--count are mutually exclusive" >&2; exit 2; }
+        mode=all; explicit_mode=1; shift ;;
+      --count)
+        (( explicit_mode )) && { echo "watch: --any/--all/--count are mutually exclusive" >&2; exit 2; }
+        [[ -n "${2:-}" ]] || { echo "watch: --count needs a value" >&2; exit 2; }
+        required_count="$2"; mode=count; explicit_mode=1; shift 2 ;;
+      --count=*)
+        (( explicit_mode )) && { echo "watch: --any/--all/--count are mutually exclusive" >&2; exit 2; }
+        required_count="${1#--count=}"; mode=count; explicit_mode=1; shift ;;
       --timeout)  [[ -n "${2:-}" ]] || { echo "watch: --timeout needs a value" >&2; exit 2; }; timeout="$2"; shift 2 ;;
       --interval) [[ -n "${2:-}" ]] || { echo "watch: --interval needs a value" >&2; exit 2; }; interval="$2"; shift 2 ;;
       --json) output_json=1; shift ;;
@@ -5139,8 +5449,18 @@ watch_session() {
     esac
   done
   if (( $# < 1 )); then
-    echo "Usage: agent-tmux watch [--any|--all] [--timeout <s>] [--interval <s>] [--json] <name...>" >&2
+    echo "Usage: agent-tmux watch [--any|--all|--count <n>] [--timeout <s>] [--interval <s>] [--json] <name...>" >&2
     exit 2
+  fi
+  if [[ "$mode" == count ]]; then
+    if [[ ! "$required_count" =~ ^[1-9][0-9]*$ ]]; then
+      echo "watch: --count must be a positive integer, got: $required_count" >&2
+      exit 2
+    fi
+    if (( required_count > $# )); then
+      echo "watch: --count cannot exceed number of names ($#), got: $required_count" >&2
+      exit 2
+    fi
   fi
   if [[ ! "$timeout" =~ ^[0-9]+$ ]] || (( timeout <= 0 )); then
     echo "watch: --timeout must be a positive integer (seconds), got: $timeout" >&2
@@ -5187,6 +5507,7 @@ watch_session() {
       fi
     done
     if [[ "$mode" == any ]] && (( ${#done_reason[@]} > 0 )); then break; fi
+    if [[ "$mode" == count ]] && (( ${#done_reason[@]} >= required_count )); then break; fi
     (( all_done )) && break
     (( SECONDS >= deadline )) && break
     sleep "$interval"
@@ -5194,6 +5515,8 @@ watch_session() {
   local met=0
   if [[ "$mode" == any ]]; then
     (( ${#done_reason[@]} > 0 )) && met=1
+  elif [[ "$mode" == count ]]; then
+    (( ${#done_reason[@]} >= required_count )) && met=1
   else
     (( all_done )) && met=1
   fi
@@ -5204,8 +5527,15 @@ watch_session() {
       items="$(print -r -- "$items" | "$JQ" -c --arg n "$name" --arg r "${done_reason[$name]:-}" \
         '. + [{name: $n, done: ($r != ""), reason: (if $r == "" then null else $r end)}]')"
     done
-    print -r -- "$items" | "$JQ" -c --arg mode "$mode" --argjson met "$met" \
-      '{schema_version: 1, mode: $mode, met: ($met == 1), agents: .}'
+    if [[ "$mode" == count ]]; then
+      print -r -- "$items" | "$JQ" -c --arg mode "$mode" --argjson met "$met" \
+        --argjson required_count "$required_count" --argjson done_count "${#done_reason[@]}" \
+        '{schema_version: 1, mode: $mode, met: ($met == 1),
+          required_count: $required_count, done_count: $done_count, agents: .}'
+    else
+      print -r -- "$items" | "$JQ" -c --arg mode "$mode" --argjson met "$met" \
+        '{schema_version: 1, mode: $mode, met: ($met == 1), agents: .}'
+    fi
   else
     for name in "${names[@]}"; do
       printf '%s %s\n' "$name" "${done_reason[$name]:-pending}"
@@ -5442,8 +5772,9 @@ cmd_team() {
     broadcast) _team_broadcast "$@" ;;
     send)      _team_send "$@" ;;
     wait)      _team_wait "$@" ;;
+    quorum)    _team_quorum "$@" ;;
     results)   _team_results "$@" ;;
-    *) echo "Usage: agent-tmux team <list|workers|lead|stop|rm|broadcast|send|wait|results> ..." >&2; return 2 ;;
+    *) echo "Usage: agent-tmux team <list|workers|lead|stop|rm|broadcast|send|wait|quorum|results> ..." >&2; return 2 ;;
   esac
 }
 
@@ -5572,17 +5903,111 @@ _team_wait() {
     sleep 2; waited=$((waited+2))
   done
 }
+_team_result_from_path() {
+  local rp="$1"
+  if [[ -z "$rp" || ! -f "$rp" ]]; then
+    "$JQ" -n --arg path "$rp" '{schema_version: 1, path: $path, present: false, valid: false, body: null}'
+    return 0
+  fi
+  local body
+  body="$(cat "$rp")"
+  if printf '%s' "$body" | "$JQ" -e . >/dev/null 2>&1; then
+    "$JQ" -n --arg path "$rp" --argjson body "$body" \
+      '{schema_version: 1, path: $path, present: true, valid: true, body: $body}'
+  else
+    "$JQ" -n --arg path "$rp" --arg raw "$body" \
+      '{schema_version: 1, path: $path, present: true, valid: false, body: $raw}'
+  fi
+}
+_team_quorum() {
+  local team="${1:-}"; (( $# )) && shift
+  local count="" field="" value="" as_json=0
+  while (( $# )); do
+    case "$1" in
+      --count)
+        [[ -n "${2:-}" ]] || { echo "team quorum: --count needs a value" >&2; return 2; }
+        count="$2"; shift 2 ;;
+      --count=*) count="${1#--count=}"; shift ;;
+      --field)
+        [[ -n "${2:-}" ]] || { echo "team quorum: --field needs a jq expression" >&2; return 2; }
+        field="$2"; shift 2 ;;
+      --field=*) field="${1#--field=}"; shift ;;
+      --value)
+        [[ -n "${2:-}" ]] || { echo "team quorum: --value needs a literal" >&2; return 2; }
+        value="$2"; shift 2 ;;
+      --value=*) value="${1#--value=}"; shift ;;
+      --json) as_json=1; shift ;;
+      --) shift; break ;;
+      -*) echo "Unknown flag: $1" >&2; return 2 ;;
+      *) echo "Unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+  [[ -z "$team" ]] && { echo "Usage: agent-tmux team quorum <team> --count N [--field <jq> --value <literal>] --json" >&2; return 2; }
+  if [[ ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "team quorum: --count must be a positive integer, got: ${count:-<empty>}" >&2
+    return 2
+  fi
+  if [[ -n "$field" && -z "$value" || -z "$field" && -n "$value" ]]; then
+    echo "team quorum: --field and --value must be provided together" >&2
+    return 2
+  fi
+  _team_state_or_die "$team" >/dev/null || return 1
+
+  local rows row agg='[]' matched_count=0 total_count=0
+  local name cli rp res present valid body matched field_value
+  rows="$(_team_worker_rows "$team")"
+  for row in ${(f)rows}; do
+    total_count=$((total_count + 1))
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"
+    cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
+    rp="$(printf '%s' "$row" | "$JQ" -r '.result_path // empty')"
+    res="$(_team_result_from_path "$rp")"
+    present="$(printf '%s' "$res" | "$JQ" -r '.present // false')"
+    valid="$(printf '%s' "$res" | "$JQ" -r '.valid // false')"
+    body="$(printf '%s' "$res" | "$JQ" -c '.body // null' 2>/dev/null || echo null)"
+    matched=false
+    if [[ "$present" == true && "$valid" == true ]]; then
+      if [[ -n "$field" ]]; then
+        field_value="$(printf '%s' "$body" | "$JQ" -er "$field" 2>/dev/null || true)"
+        [[ "$field_value" == "$value" ]] && matched=true
+      else
+        matched=true
+      fi
+    fi
+    [[ "$matched" == true ]] && matched_count=$((matched_count + 1))
+    agg="$(printf '%s' "$agg" | "$JQ" -c --arg n "$name" --arg c "$cli" --arg p "$rp" \
+      --argjson present "$present" --argjson valid "$valid" --argjson matched "$matched" \
+      '. + [{name:$n, cli:$c, path:$p, present:$present, valid:$valid, matched:$matched}]')"
+  done
+
+  local met=false rc=1
+  if (( matched_count >= count )); then
+    met=true
+    rc=0
+  fi
+  if (( as_json )); then
+    "$JQ" -n --arg team "$team" --argjson required_count "$count" \
+      --argjson matched_count "$matched_count" --argjson total_count "$total_count" \
+      --argjson met "$met" --argjson agents "$agg" \
+      '{schema_version: 1, team: $team, required_count: $required_count,
+        matched_count: $matched_count, total_count: $total_count,
+        met: $met, agents: $agents}'
+  else
+    printf 'team=%s matched=%s required=%s met=%s\n' "$team" "$matched_count" "$count" "$met"
+  fi
+  return "$rc"
+}
 _team_results() {
   local team="${1:-}"; (( $# )) && shift
   local as_json=0; [[ "${1:-}" == "--json" ]] && as_json=1
   [[ -z "$team" ]] && { echo "Usage: agent-tmux team results <team> [--json]" >&2; return 2; }
   _team_state_or_die "$team" >/dev/null || return 1
   local rows row agg='[]' rc=0 missing=""
-  local name cli res present valid body
+  local name cli rp res present valid body
   rows="$(_team_worker_rows "$team")"
   for row in ${(f)rows}; do
-    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"
-    res="$(_agt "$cli" result --json "$name" 2>/dev/null || echo '{}')"
+    name="$(printf '%s' "$row" | "$JQ" -r .name)"; cli="$(printf '%s' "$row" | "$JQ" -r .cli)"; rp="$(printf '%s' "$row" | "$JQ" -r '.result_path // empty')"
+    res="$(_team_result_from_path "$rp")"
     present="$(printf '%s' "$res" | "$JQ" -r '.present // false')"
     valid="$(printf '%s'   "$res" | "$JQ" -r '.valid // false')"
     body="$(printf '%s'    "$res" | "$JQ" -c '.body // null' 2>/dev/null || echo null)"
@@ -5744,6 +6169,9 @@ case "$command" in
     self_test_approval
     self_test_result_required_fields
     self_test_dry_run
+    self_test_result_path_prompt
+    self_test_watch_count
+    self_test_team_quorum
     self_test_session
     ;;
   list)
