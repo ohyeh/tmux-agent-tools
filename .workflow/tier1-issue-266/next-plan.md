@@ -8,7 +8,19 @@ Reduce manual lead supervision when several workers run the same packet: let the
 ## Why now (evidence, not speculation)
 After #266 workers can declare `result_required_fields` and dry-run launch, but the lead still hand-polls `team results --json` or over-waits on `team wait --require-result` (all-or-nothing). The "first 2 of 3 reviewers with valid result.json" pattern has no primitive.
 
-## Packet 0 — codex-family result-path contract (do FIRST; debated with codex)
+## Packet 0a — fix the family/default model (PREREQUISITE to 0b; root cause)
+The taxonomy is wrong: `HEURISTIC_FAMILY=codex` doubles as "codex" AND "default bucket for every non-claude CLI"; `*)` (`:30`) silently maps unknown CLIs to codex. Fix = **three peer families `claude | codex | generic`**, codex demoted from default to named peer, `*)` → `generic`.
+
+**Codex validation verdict: flawed-as-first-written — these corrections MUST be in or the bug survives:**
+1. **Provider-key leak is the worst branch (`:4401-4428` `cli_provider_env_keys`):** claude→Anthropic keys, **everything-else→OpenAI/Codex keys**. An unknown CLI silently inherits Codex/OpenAI credentials. `generic` must get an EXPLICIT branch that inherits NO provider keys by default (scrub deliberately, don't imply Codex).
+2. **All family branches must become explicit 3-way, not `claude` vs `else`:** `:4401-4428` (provider keys), `:5020-5024` (probe metric set), `:5044-5108` (probe parsers). `generic` should use the generic progress/tool_active/approval_pending parsers + `PROFILE_PATTERN_*` overrides — but named explicitly, never via `else`.
+3. **Do NOT delete `agy`/`cursor`/`grok`** (my earlier call was wrong): `delete_safe=false`. They have a shipped `agy-tmux` shim, `install-bin` step, stress-smoke ref, and bundled `agy/cursor/grok.conf` that set `heuristic_family=codex` and are loaded by `load_cli_profile()` BEFORE any fallback. Keep them as explicit named arms — being named ≠ being the silent default. The bug is the `*)` catch-all + docs, not the named arms.
+4. **Docs/examples recreate the bug via profiles:** `profiles/README.md` (only documents claude|codex), `SKILL.md:83` (self-contradictory), `gemini.conf.example:7-8` teach `heuristic_family=codex` for new CLIs. Must add `generic` and stop teaching codex-for-new-CLI, or profiles re-seed the default-bucket model.
+5. **Back-compat note required:** demoting `*)` codex→generic changes unlisted-CLI behavior (no `--yolo`, no provider-key inheritance, result-path-via-prompt on). Acceptable as a conservative safety correction but needs a migration/deprecation note.
+
+`generic` defaults (safest per axis, NOT copied from codex): `result_path_via_prompt=true`, no `--yolo`, no provider-key inheritance, generic probe parsers.
+
+## Packet 0b — result-path contract for env-strip CLIs (was "Packet 0"; rides 0a)
 **Why first:** a sandboxed codex worker cannot read the wrapper-injected `$TMUX_AGENT_RESULT`/`$TMUX_AGENT_NAME` (env set only as tmux session env `:2465-2472`; `contracts.md:75-83`/`SKILL.md:196` already admit this), and with non-exact random-suffix names it cannot derive the path either. So it can't reliably write `result.json` — which means watch/quorum (Packets A/B) would have nothing to consume. Correctness papercut, every codex participant.
 
 **Decision (codex debate):** rejected the cwd-sentinel idea (option A) — a single `<cwd>/.tmux-agent-result` clobbers when multiple workers share one repo cwd (pair/fanout/review norm); per-agent files reintroduce the in-sandbox name-locator problem. Chosen: **auto-append a result contract to every prompt-sending boundary** for codex-family CLIs: `Write final JSON to this exact path: <absolute result_path>`, computed from `agent_root_dir()/name/result.json`. No user flags; keep `result --path <name>` as the debug surface.
