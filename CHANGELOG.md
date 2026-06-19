@@ -10,6 +10,15 @@
 - Added `agent-tmux <cli> doctor --json` with independent named checks for tmux, agent CLI binary, git, and git worktree support.
 - Added `agent-tmux <cli> setup` as a combined JSON preflight for `doctor --json` plus `self-test`.
 - Added delegation-path eval coverage for trigger decisions and exact-call planning.
+- Added `scripts/test-supervision-stress-smoke`: adversarial supervision coverage (missing/stale marker, no/malformed result.json, unresponsive stall) across three presets — codex, claude, and agy.
+
+### Changed
+
+- Tightened SKILL.md + references supervision guidance so an agent never idle-waits or hangs: structured `status`/`result`/`watch` first with pane capture as diagnostic fallback only, mandatory timeouts on every blocking wait (no bare `wait`, shell `sleep`, or status-polling loops), `watch --any|--all` for multi-worker, `status --json` + `ping` for liveness, and an explicit bounded fallback when a worker stalls.
+
+### Fixed
+
+- `result wait-required` now reports every requested field in `missing_fields` when `result.json` is absent or malformed (previously returned an empty list), so a non-compliant worker can no longer be misclassified as complete.
 
 ## v0.18.1 - 2026-06-11
 
