@@ -150,4 +150,26 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
   not gated by CI (self-test dry-run/profile-key blocks ARE, via *-tmux self-test). Fix: wire those two smokes
   into ci.yml smoke job + release.yml validate job. (Broader 48-smoke suite unwired = pre-existing, out of scope.)
 - Release prep: bump version + CHANGELOG section for this increment, dispatched together to a codex worker.
-- Status: DISPATCHED (codex release-prep+CI worker)
+- Status: DONE + VERIFIED (codex relprep). CI+release.yml wire both smokes (yaml ok), CHANGELOG v0.21.0
+  section matches release regex, Formula → v0.21.0, smokes 58/0 + 28/0, zsh -n ok. Committed c69877b.
+
+## Push + PR + release
+- Pushed feat/v3-sessionid-268-oneshot → origin. PR #269 opened (base main), body Closes #268.
+- 6 commits: P1 96e1799 · P2 7b87900 · P3 3d020a1 · P4 8be0cc4 · fix bf7b2f3 · relprep c69877b.
+- PR CI (smoke job) = build validation; status: PENDING (watching).
+- Release publish (real v0.21.0 tag/GitHub release) = post-merge, runs from main, IRREVERSIBLE. The Release
+  workflow validates main, so a real dry-run only makes sense after merge — pre-merge gate is the PR CI.
+
+### CI was RED before us — pre-existing bug (this is the "CD CI 順便修一下")
+- PR #269 CI failed at `self-test dry-run: FAIL (invocation.session missing in output)`. Investigated:
+  **main's CI fails at the IDENTICAL assertion** (run 27881784183 @7c37057, and many prior commits) — CI has
+  been red on main independent of our work.
+- Root cause: `start_session()` calls `require_bins` (hard `exit 1` when CLI bin not executable) as its FIRST
+  line (~2819), BEFORE `--dry-run` is parsed. So `start --dry-run` aborts when the real CLI isn't installed.
+  Dev machines have codex/claude → passes locally; CI runners don't → empty dry-run output → the failure.
+  `--dry-run` is supposed to preview without the binary (run_dry_run_checks reports tmux + agent_cli_binary as
+  checks), so the early abort is the bug.
+- Fix: codex worker `fix2ci` — skip require_bins in dry-run (guard `(( dry_run )) || require_bins` after the
+  flag parse). This should turn main's long-red CI green after merge.
+- Note: PR #269's first CI red is NOT a regression from our code; we're fixing a standing failure.
+- Status: DISPATCHED (codex fix2ci)

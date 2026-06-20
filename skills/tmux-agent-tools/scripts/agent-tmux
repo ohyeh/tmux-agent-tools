@@ -2816,7 +2816,6 @@ apply_result_env_args() {
 }
 
 start_session() {
-  require_bins
   write_tmux_conf
   local should_attach=0
   local exact_name=0
@@ -2836,6 +2835,7 @@ start_session() {
     esac
     shift
   done
+  (( dry_run )) || require_bins
 
   local sentinel=""
   local on_exit_cmd=""
