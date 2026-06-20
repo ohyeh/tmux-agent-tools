@@ -74,7 +74,7 @@ If the worker stalls (`status --json` has `running:true` with high `idle_seconds
 
 ### Why the worker can't use `$TMUX_AGENT_RESULT`
 
-Agent CLIs run tool commands in a sandboxed environment that does not inherit the tmux session environment, so `$TMUX_AGENT_RESULT` is empty inside the worker. Orchestrators should get the literal absolute path with `result --path <name>`, embed that path in the worker prompt, and optionally run `result init <name>` first.
+Agent CLIs run tool commands in a sandboxed environment that does not inherit the tmux session environment, so `$TMUX_AGENT_RESULT` is empty inside the worker. For `result_path_via_prompt=true` families (Codex and generic by default), prompt sends automatically prepend `Write final JSON to this exact path: <absolute result_path>`. Use `result --path <name>` to debug or manually recover a stalled worker, and optionally run `result init <name>` first.
 
 Result helpers available in both wrappers:
 

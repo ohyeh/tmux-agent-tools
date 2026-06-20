@@ -29,12 +29,14 @@ take precedence over profile values.
 | `prefix` | tmux session prefix | `prefix=gemini-cli` |
 | `launch_flags` | flags appended at launch | `launch_flags=--yolo` |
 | `resume_keyword` | resume subcommand/flag | `resume_keyword=--resume` |
-| `heuristic_family` | `claude` or `codex` pane-heuristic baseline | `heuristic_family=codex` |
+| `heuristic_family` | `claude`, `codex`, or `generic` pane-heuristic baseline | `heuristic_family=generic` |
 | `usage_kind` | usage text label | `usage_kind=CLI` |
+| `result_path_via_prompt` | `true`/`false`; prepend the literal result path to prompt sends | `result_path_via_prompt=true` |
 | `pattern_busy` | ERE overriding busy detection (`active_spinner`/`tool_active`) | `pattern_busy=(thinking\|generating)` |
 | `pattern_permission_prompt` | ERE matched (case-insensitive) against pane text → `permission_prompt` | |
 | `pattern_approval_prompt` | ERE → `approval_prompt` | |
 | `pattern_login_prompt` | ERE → `login_prompt` | |
+| `session_id_pattern` | grep-compatible ERE to extract the CLI's internal session UUID from pane output; enables `resume` when matched. **Sensitive** — UUID is a resume capability; treat as non-shareable. Leave unset when the CLI output format is unknown or unstable; resume falls back to tmux supervision only. | `session_id_pattern=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}` |
 
 ## Examples
 
@@ -52,8 +54,10 @@ Add a brand-new CLI without touching code
 ```
 bin=gemini
 env_ns=GEMINI
-launch_flags=--yolo
+launch_flags=
 resume_keyword=resume
-heuristic_family=codex
+heuristic_family=generic
 pattern_approval_prompt=allow this action\?
 ```
+
+Migration note: unlisted CLIs now default to `generic` instead of Codex-family behavior. Generic means no provider-key inheritance, no `--yolo`, and `result_path_via_prompt=true`; set those fields explicitly if a custom CLI needs the old Codex-like behavior.

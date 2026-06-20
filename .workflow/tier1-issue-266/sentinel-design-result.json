@@ -1,0 +1,27 @@
+{
+  "diagnosis": "confirmed",
+  "recommended_option": "C-codex-family-prompt-contract",
+  "collision_verdict": "A single cwd file `.tmux-agent-result` is not acceptable as the canonical fix: multiple workers can and do share one repo cwd, while result paths are per-agent under `agent_root_dir()/name/result.json`. Last-start-wins clobbering would make a worker write another worker's result. `--workdir-fresh` avoids the collision only when explicitly used; it cannot be required for normal pair/fanout/review flows, resume, or start-ssh.",
+  "blocking_concerns": [
+    "Option A has a correctness blocker unless it is redesigned away from a single cwd filename. Per-agent files still need the agent name inside the sandbox, so they collapse back into a prompt/locator problem.",
+    "Option B is safer than A for local `start`, but codex-only initial-prompt injection is incomplete for codex-family profiles and later `send`/`send-wait` turns; `resume` currently launches the CLI without a new task prompt.",
+    "The real code has no env-independent result-path fallback today: `apply_result_env_args` only appends `TMUX_AGENT_NAME` and `TMUX_AGENT_RESULT` as tmux session env, and docs already warn sandboxed agent tools cannot expand `$TMUX_AGENT_RESULT`."
+  ],
+  "minimal_interface": "For local codex-family sessions, automatically append a short result contract to every user task boundary that sends prompt text (`start` initial text, `send`, `send-wait`, and `send-wait-literal`): `Write final JSON to this exact path: <absolute result_path>`. Compute that path from the existing `agent_root_dir()/name/result.json`; do not add user-facing flags. Keep `result --path <name>` as the manual/debug surface.",
+  "landing_points": [
+    "skills/tmux-agent-tools/scripts/agent-tmux:1227-1228 defines the canonical root; :2465-2472 computes and exports the same per-agent result path.",
+    "skills/tmux-agent-tools/scripts/agent-tmux:2743-2744 and :3041-3042 are the local `tmux new-session` launch sites that currently rely on pane env.",
+    "skills/tmux-agent-tools/scripts/agent-tmux:2768-2772 sends `start` initial text; :3238-3248 sends normal `send`; :3347-3351 and :3361-3363 send `send-wait`; :3410-3423 sends `send-wait-literal`.",
+    "skills/tmux-agent-tools/scripts/agent-tmux:3074-3127 is `start-ssh` and should stay out of the first landing because remote result/sentinel placement is already unresolved.",
+    "skills/tmux-agent-tools/references/contracts.md:75-83 and skills/tmux-agent-tools/SKILL.md:196 should be updated from manual workaround to automatic codex-family contract once code lands."
+  ],
+  "selfcheck": "Add one smoke using fake codex-family CLI plus shared cwd: start two non-exact workers in the same directory, have each prompt/body record the literal path it received, and assert each path is distinct and equals `codex-tmux result --path <actual-agent-name>`. Add a send-wait check that the augmented prompt includes the current agent's path without changing nonce matching.",
+  "sequence": "before_quorum",
+  "out_of_scope": [
+    "No cwd sentinel file as canonical state.",
+    "No start-ssh remote result-path redesign in this packet.",
+    "No new result schema or sentinel format.",
+    "No quorum/watch-count changes in the same patch."
+  ],
+  "notes": "Diagnosis evidence: the wrapper exports result env only through tmux session env at agent-tmux:2465-2472 and launches local sessions with that env at :2743-2744/:3041-3042; result paths are deterministic under agent_root_dir at :1227-1228 and :1670-1678. The docs explicitly state sandboxed agent tools cannot inherit `$TMUX_AGENT_RESULT` at references/contracts.md:75-83 and SKILL.md:196. Recommendation should land before quorum/watch-count because every codex participant can otherwise fail to produce the structured result that watch/quorum would consume."
+}

@@ -1,0 +1,55 @@
+{
+  "verdict": "flawed",
+  "branch_sites": [
+    {
+      "line": "skills/tmux-agent-tools/scripts/agent-tmux:25-30,114",
+      "gates": "preset/profile assignment of HEURISTIC_FAMILY. Current unknown *) and unverified agy/cursor/grok all become codex; profiles can also override heuristic_family.",
+      "generic_should": "Unknown *) should set HEURISTIC_FAMILY=generic. If agy/cursor/grok are being demoted, their bundled profiles must also be removed or changed; deleting only the case arms is not enough because load_cli_profile() will restore heuristic_family=codex from bundled profiles."
+    },
+    {
+      "line": "skills/tmux-agent-tools/scripts/agent-tmux:4401-4428",
+      "gates": "cli_provider_env_keys chooses Anthropic keys for claude and OpenAI/Codex keys for every non-claude family; apply_cli_env_args and env_doctor_print_map consume this list.",
+      "generic_should": "generic must be explicit and conservative, not fall through to codex provider keys. Safest behavior is no Codex/OpenAI inheritance by default; if CLEAR_ENV is intended as a scrubber, scrub known provider keys deliberately rather than implying the unknown CLI is Codex."
+    },
+    {
+      "line": "skills/tmux-agent-tools/scripts/agent-tmux:5020-5024",
+      "gates": "probe supported metric set is claude-only metrics vs non-claude progress/tool_active/approval_pending.",
+      "generic_should": "generic can support progress/tool_active/approval_pending, but it should be an explicit generic branch/list. Do not rely on else=codex, because adding a third family otherwise preserves the binary assumption."
+    },
+    {
+      "line": "skills/tmux-agent-tools/scripts/agent-tmux:5044-5108",
+      "gates": "probe parser chooses Claude-specific context/goal/spinner parsers vs non-claude progress/tool/approval regexes.",
+      "generic_should": "generic should use the generic progress/tool_active/approval_pending parsers with PROFILE_PATTERN_* overrides, explicitly. This behavior is acceptable for unknown CLIs only if it is named generic rather than inherited as codex."
+    }
+  ],
+  "other_binary_assumptions": [
+    "skills/tmux-agent-tools/scripts/profiles/README.md:32 documents heuristic_family as only claude or codex; it must include generic before generic profiles can be valid.",
+    "skills/tmux-agent-tools/SKILL.md:83 says unknown CLI names get generic defaults but then says codex-family heuristics and bundled agy/cursor/grok defaults; this conflicts with Packet 0a.",
+    "skills/tmux-agent-tools/scripts/profiles/gemini.conf.example:7-8 and profiles README example lines 56-58 teach heuristic_family=codex for a brand-new CLI; that would keep the old default-bucket model alive in examples.",
+    "RESUME_KEYWORD is profile/default driven and only used by resume launch at skills/tmux-agent-tools/scripts/agent-tmux:3042; it is not a family branch, but generic resume remains an unverified convention unless documented/profiled.",
+    "_USAGE_KIND is assigned by presets/profiles but has no runtime use in the inspected script, so it is not currently a family behavior gate.",
+    "PROFILE_PATTERN_BUSY/APPROVAL/PERMISSION/LOGIN are profile overrides and are already generic-capable, but the default regex choice at probe lines 5065,5086,5097 still needs explicit generic semantics."
+  ],
+  "delete_agycursorgrok_safe": false,
+  "refs_found": [
+    "skills/tmux-agent-tools/scripts/agent-tmux:11 help lists agy/cursor/grok as explicit CLI choices.",
+    "skills/tmux-agent-tools/scripts/agent-tmux:27-29 legacy preset arms hardcode agy/cursor/grok to HEURISTIC_FAMILY=codex.",
+    "skills/tmux-agent-tools/scripts/profiles/agy.conf:1-8, cursor.conf:1-8, grok.conf:1-8 bundled profiles mirror the legacy codex-family presets, so runtime still loads them before fallback.",
+    "skills/tmux-agent-tools/scripts/agy-tmux:1-3 is a shipped shim that delegates to agent-tmux agy.",
+    "skills/tmux-agent-tools/scripts/install-bin:8-11,17-21 installs and reports agy-tmux.",
+    "scripts/test-supervision-stress-smoke:247-258 conditionally runs the agy preset.",
+    "skills/tmux-agent-tools/SKILL.md:43,74,83,99 and skills/tmux-agent-tools/scripts/profiles/README.md:1-7,27,41-45 reference cursor/grok/agy or their profiles.",
+    "CHANGELOG.md:51,106-109 references bundled claude/codex/agy/cursor/grok defaults and the agy shim."
+  ],
+  "generic_prompt_default_safe": true,
+  "sequencing": "Packet 0a must land before 0b if 0b keys result_path_via_prompt by family, because otherwise generic cannot be selected independently and unknown CLIs keep codex behavior. Within 0b, append the result-path contract before the send-wait nonce instruction, not after it. start/send/send-wait/send-wait-literal can be changed together; start-ssh/resume can remain out of scope only if documented. Packet A/B quorum work is not a hard code dependency of 0a/0b.",
+  "backcompat": "Demoting *) from codex to generic intentionally changes unlisted CLI behavior: no --yolo, no Codex/OpenAI env inheritance by default, and generic prompt result-path contract should be on. That is acceptable as a conservative safety correction, but it needs a migration/deprecation note for users relying on unknown CLI names inheriting codex heuristics. agy is not merely unlisted because a shim, install step, bundled profile, and stress smoke still reference it.",
+  "blocking": [
+    "Deleting only agent-tmux:27-29 is insufficient: bundled profiles agy.conf/cursor.conf/grok.conf still set heuristic_family=codex and are loaded by load_cli_profile() before the legacy fallback.",
+    "cli_provider_env_keys remains a claude vs else branch; generic would still inherit or scrub OpenAI/Codex keys through apply_cli_env_args/env-doctor unless a generic branch is added.",
+    "Probe metric list/parser remain claude vs else; generic behavior may be acceptable, but it must be explicit to avoid preserving the exact binary-family bug Packet 0a is meant to remove.",
+    "Docs/examples still teach heuristic_family as claude|codex and recommend codex for new CLIs; this contradicts the proposed generic family and will recreate the bug via profiles.",
+    "result_path_via_prompt does not exist in the current code/profile parser, so 0b requires a new profile key plus prompt-boundary helper; implementation must preserve send-wait nonce last-line semantics."
+  ],
+  "notes": "The three-family direction is sound, and generic result_path_via_prompt=true is safe if appended as ordinary prompt text before any nonce/literal marker contract. The proposed packet is flawed as written because runtime profiles/docs/tests/shims still keep agy/cursor/grok and unknown/new CLI guidance tied to codex-family behavior."
+}

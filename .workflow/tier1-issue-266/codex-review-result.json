@@ -1,0 +1,34 @@
+{
+  "verdict": "changes_made",
+  "objections_remaining": 0,
+  "fixes_applied": [
+    {
+      "commit": "b5d6d60",
+      "summary": "Fixed invalid approval fallback, required-fields CSV normalization, resolved dry-run launch flags, and strengthened self-tests for #266."
+    }
+  ],
+  "findings": [
+    {
+      "severity": "med",
+      "where": "skills/tmux-agent-tools/scripts/agent-tmux:120",
+      "issue": "Invalid approval values warned but did not force PROFILE_APPROVAL back to prompt, so a prior approval=auto line in the same profile could survive an invalid value.",
+      "resolution": "fixed"
+    },
+    {
+      "severity": "med",
+      "where": "skills/tmux-agent-tools/scripts/agent-tmux:1777",
+      "issue": "result_required_fields CSV parsing trimmed spaces but kept empty entries from whitespace-only or trailing-comma values, causing empty field names to be treated as required fields.",
+      "resolution": "fixed"
+    },
+    {
+      "severity": "low",
+      "where": "skills/tmux-agent-tools/scripts/agent-tmux:1206",
+      "issue": "dry-run invocation.launch_flags showed the preset value instead of the resolved LAUNCH_FLAGS value, so env overrides were not reflected in the preview.",
+      "resolution": "fixed"
+    }
+  ],
+  "shellcheck_rc": 0,
+  "selftest_rc": 0,
+  "final_head": "b5d6d60ebbca6595fccd38158636962e9d2f94aa",
+  "notes": "Ran scripts/ci-shellcheck, skills/tmux-agent-tools/scripts/agent-tmux codex self-test, and skills/tmux-agent-tools/scripts/agent-tmux claude self-test after commit; all returned 0. No push performed."
+}

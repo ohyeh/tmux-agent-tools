@@ -65,6 +65,24 @@ agent-tmux <cli> start --exact <safe-name> <repo-dir> '<worker-prompt>'
 
 After start, use `Bash` to supervise with `status`, `wait`, `watch --any|--all`, and `result --wait --json`.
 
-## v1 Limitation
+## v2 Resume (capability, when available)
 
-`--resume` is intentionally NOT supported in v1. The wrapper `resume` path requires a CLI UUID that `start` does not emit yet; see v2 task 3A-V2 for the planned `result.json` UUID path.
+After a worker starts, the UUID may be captured into a sidecar file:
+
+```sh
+cat "$(agent-tmux <cli> result --path <name> | sed 's|result.json|session-meta.json|')"
+# or:
+jq -r .cli_session_id "$TMUX_AGENT_DIR/<name>/session-meta.json"
+```
+
+The `cli_session_id` field is `null` until the background capture succeeds (up to ~30s). If it is a valid UUID, resume is available:
+
+```sh
+agent-tmux <cli> resume --exact <new-name> <repo-dir> <cli_session_id>
+```
+
+If `cli_session_id` is `null` or absent, fall back to tmux supervision only (`wait`, `watch`, `capture`). **Never synthesize or guess a UUID.**
+
+**Sensitivity note:** The session UUID is a resume capability tied to an active CLI session. Treat it as non-shareable. Do not include it in logs, reports, or aggregate outputs.
+
+Bundled `claude.conf` and `codex.conf` ship `session_id_pattern` **UNSET** — resume is unsupported by default (no verified deterministic session-label format confirmed across CLI versions). To enable, set `session_id_pattern` to a label-anchored ERE in a user-local profile (`~/.config/agent-tmux/profiles/<cli>.conf`) once you know the exact label line your version prints, e.g. `session_id_pattern=Session ID:`. Capture is label-anchored + UUID-validated: finds the first line matching the pattern, extracts the RFC-4122 UUID from that line only — decoy UUIDs on non-matching lines are ignored.
