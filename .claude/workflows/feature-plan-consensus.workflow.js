@@ -60,7 +60,8 @@ const a = args || {}
 for (const k of ['repoPath', 'featureBrief']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 
 const repo = a.repoPath
-const model = a.model || 'sonnet'
+const model = a.model || 'sonnet'   // listed on every agent() below (escalation rungs override per-tier)
+const effort = a.effort || 'high'   // harness agents' reasoning effort (codexEffort below drives codex itself)
 const slug = a.slug || 'feature-plan'
 if (!/^[a-zA-Z0-9._-]+$/.test(slug) || slug.includes('..')) return { aborted: true, reason: `invalid slug '${slug}' (alnum/._- only, no path traversal)` }
 const outDir = `${repo}/.workflow/${slug}`
@@ -122,9 +123,9 @@ async function runEscalated(label, phaseName, makePrompt, opts = {}) {
   let last = null
   for (let i = 0; i < rungs.length; i++) {
     const r = rungs[i]
-    const o = { label: `${label}:${r.tier}#${i + 1}`, phase: phaseName }
+    const o = { label: `${label}:${r.tier}#${i + 1}`, phase: phaseName, effort }
     if (schema) o.schema = schema
-    if (r.model) o.model = r.model
+    if (r.model) o.model = r.model   // per-tier model (sonnet / self / codex-driven) — intentionally varies
     const p = makePrompt(feedback, r.tier)
     const res = await agent(r.driveCodex ? driveCodex(p, `/tmp/codex-${label.replace(/[^a-zA-Z0-9._-]/g, '_')}-${i + 1}.md`) : p, o)
     const v = verify ? await verify(res) : { ok: res != null, feedback: 'empty result' }
@@ -249,7 +250,7 @@ while (internalRound < maxInternal) {
       `${CONTEXT}\nAdversarially critique this v1 plan through ONE lens: ${lens}. ` +
       `VERIFY each "current state" claim against the actual code (rg/Read) — flag any claim that rests on docs/memory rather than code. Set verified_against_code honestly. ` +
       `Be skeptical; default consensus=false if you find a blocker. Each issue needs concrete evidence (file:line / log) and a fix. Skip nitpicks.\n\nPLAN:\n${plan}`,
-      { label: `critic:${String(lens).split(' ')[0]}#${internalRound}`, phase: 'InternalConsensus', model, schema: CRITIQUE_SCHEMA }
+      { label: `critic:${String(lens).split(' ')[0]}#${internalRound}`, phase: 'InternalConsensus', model, effort, schema: CRITIQUE_SCHEMA }
     )
   ))).filter(Boolean)
   if (!critiques.length) return { aborted: true, stage: 'internal-critics', needsUser: true, round: internalRound } // all critics died -> can't trust convergence
@@ -278,7 +279,7 @@ while (externalRound < maxExternal) {
       `Set verified_against_code + default consensus=false unless genuinely sound. Each issue needs evidence (file:line/log) + fix.\n\nPLAN:\n${plan}`,
       `/tmp/codex-extreview-${slug}-${externalRound}.md`
     ),
-    { label: `codex-review#${externalRound}`, phase: 'ExternalReview', schema: CRITIQUE_SCHEMA }
+    { label: `codex-review#${externalRound}`, phase: 'ExternalReview', model, effort, schema: CRITIQUE_SCHEMA }
   )
   if (!review) return { aborted: true, stage: 'external-review', needsUser: true, round: externalRound } // codex (top automated tier) died -> escalate to user
   const blocking = (review.blocking_issues || []).filter(i => i.severity !== 'minor')
@@ -314,7 +315,7 @@ const commit = await agent(
     ? `2) APPROVED: git add ONLY the artifacts under ${outDir} (verify with 'git status --porcelain' that nothing outside ${outDir} is staged; if anything else is staged, unstage it). Commit "docs(plan): ${slug} v1 implementation plan (internal+codex consensus)". ${wantPush ? 'Then push current branch.' : 'Do NOT push.'} Report the staged_files list and commit sha.`
     : `2) Do NOT git add/commit/push — ${bothConsensus ? 'commit not approved (args.commit!=true)' : 'consensus NOT reached; needs user decision'}. Just confirm files written (committed=false, pushed=false).`) +
   `\nReturn the schema honestly (committed/pushed reflect what you actually did).`,
-  { label: 'commit-plan', phase: 'Commit', model, schema: COMMIT_SCHEMA }
+  { label: 'commit-plan', phase: 'Commit', model, effort, schema: COMMIT_SCHEMA }
 )
 // commit agent died -> we have no trustworthy write/commit result; do not silently report false. Surface to user.
 if (!commit) return { aborted: true, stage: 'commit', needsUser: true, planPath, internal: { consensus: internalConsensus, rounds: internalRound }, external: { consensus: externalConsensus, rounds: externalRound } }

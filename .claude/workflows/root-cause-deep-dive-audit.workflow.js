@@ -27,6 +27,10 @@ const repo = a.repoPath
 const N = Math.max(1, a.hypotheses || 5)
 const VOTES = Math.max(1, a.verifyVotes || 2)
 const hints = (a.scopeHints || []).join(', ')
+// Knobs listed EXPLICITLY on every agent() call below (never omitted) so "no model/effort shown"
+// can't be misread as "unsupported". Defaults: sonnet / high.
+const model = a.model || 'sonnet'
+const effort = a.effort || 'high'
 
 const HYP = { type: 'object', additionalProperties: false, required: ['hypotheses'],
   properties: { hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false,
@@ -48,14 +52,14 @@ phase('Hypotheses')
 const hyp = await agent(
   `${COMMON}
 Enumerate up to ${N} DISTINCT candidate root causes (MECE where possible). For each: id (slug), claim (one sentence), where (files/area). Return structured.`,
-  { label: 'rca:hypotheses', phase: 'Hypotheses', model: 'sonnet', schema: HYP })
+  { label: 'rca:hypotheses', phase: 'Hypotheses', model, effort, schema: HYP })
 if (!hyp || !(hyp.hypotheses || []).length) return { aborted: true, stage: 'hypotheses', hyp }
 
 // Evidence per hypothesis, then adversarial verify for the supported ones — pipelined.
 const results = await pipeline(
   hyp.hypotheses,
   h => agent(`${COMMON}\nGather concrete evidence for hypothesis ${h.id}: "${h.claim}" (look in: ${h.where || hints}). Set supported true/false with file:line evidence + confidence 0..1.`,
-    { label: `rca:evidence:${h.id}`, phase: 'Evidence', model: 'sonnet', schema: EVID }),
+    { label: `rca:evidence:${h.id}`, phase: 'Evidence', model, effort, schema: EVID }),
   (ev, h) => {
     // Distinguish a FAILED evidence agent (null) from a genuinely-unsupported hypothesis.
     // A null is "couldn't evaluate" — exclude from survivors but surface it; do NOT silently
@@ -64,7 +68,7 @@ const results = await pipeline(
     if (!ev.supported) return { h, ev, refutes: VOTES, votes: VOTES, evaluable: true }
     return parallel(Array.from({ length: VOTES }, (_, i) => () =>
         agent(`${COMMON}\nAdversarially try to REFUTE root cause "${h.claim}". Evidence so far: ${ev.evidence}. Default refuted=true if the evidence is weak/circumstantial.`,
-          { label: `rca:verify:${h.id}#${i + 1}`, phase: 'Verify', model: 'sonnet', schema: VERD })))
+          { label: `rca:verify:${h.id}#${i + 1}`, phase: 'Verify', model, effort, schema: VERD })))
       .then(vs => {
         // FAIL CLOSED: a verifier thunk that failed returns null (parallel contract). Counting only
         // surviving non-refutes would let a hypothesis pass on absent verification — the worst case
@@ -86,5 +90,5 @@ const report = await agent(
   `${COMMON}
 Surviving root-cause candidates (passed adversarial verification): ${JSON.stringify(survivors.map(s => ({ id: s.h.id, claim: s.h.claim, evidence: s.ev.evidence, confidence: s.ev.confidence })))}.
 ${unevaluated.length ? `NOTE: these hypotheses could NOT be evaluated (evidence agent failed) and are neither confirmed nor refuted: ${JSON.stringify(unevaluated)}.\n` : ''}${verifyIncomplete.length ? `CAUTION: these survivors had INCOMPLETE adversarial verification (some verifier agents failed) — treat their survival as lower-confidence: ${JSON.stringify(verifyIncomplete)}.\n` : ''}Rank by likelihood, explain the causal chain for the top cause, and give the smallest fix that addresses the root (not the symptom). State what remains uncertain.`,
-  { label: 'rca:synthesize', phase: 'Synthesize', model: 'sonnet' })
+  { label: 'rca:synthesize', phase: 'Synthesize', model, effort })
 return { symptom: a.symptom, hypotheses: hyp.hypotheses.length, survivors: survivors.map(s => s.h.id), unevaluated, verify_incomplete: verifyIncomplete, report }

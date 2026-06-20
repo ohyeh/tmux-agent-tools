@@ -40,7 +40,8 @@ const a = args || {}
 for (const k of ['repoPath', 'spec']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 
 const repo = a.repoPath
-const model = a.model || 'sonnet'
+const model = a.model || 'sonnet'   // listed on every agent() below (never omitted)
+const effort = a.effort || 'high'   // the harness agents' reasoning effort (codexEffort below drives codex itself)
 // Second-model reviewer driven via tmux-agent-tools (agent-tmux <cli>), NOT a harness agentType:
 // the openai-codex plugin (codex:codex-rescue) is deprecated/disabled. agent-tmux works regardless
 // of plugin enablement and across repos. Mirrors plan-pipeline / codex-consensus-gate (file-polled).
@@ -75,7 +76,7 @@ const SPEC = `Repo: ${repo}.${target}\n\nSPEC:\n${a.spec}`
 phase('Implement')
 const impl = await agent(
   `You are implementing per the spec below. Use the Write/Edit tools to make the change in the repo, then make any produced script executable if applicable. Keep it minimal — no features beyond the spec, do not modify unrelated files.\n${SPEC}`,
-  { label: 'implement', phase: 'Implement', model }
+  { label: 'implement', phase: 'Implement', model, effort }
 )
 if (!impl) return { aborted: true, stage: 'implement', reason: 'implementation agent failed (returned null) — nothing to review' }
 log('implementation done, starting dual review')
@@ -85,8 +86,8 @@ const reviewPrompt = (who) =>
   `Review the change just implemented against the spec below. Focus (${who}): ${focus}. ` +
   `Return a concise list of CONCRETE issues with file/line references and suggested fixes. If none, say "no issues".\n${SPEC}`
 const reviews = await parallel([
-  () => agent(driveCodex(reviewPrompt('second-model deep pass'), `/tmp/codex-review-${codexSession}.md`), { label: 'review:codex', phase: 'Review', model }),
-  () => agent(reviewPrompt('claude reviewer'), { label: 'review:claude', phase: 'Review', model }),
+  () => agent(driveCodex(reviewPrompt('second-model deep pass'), `/tmp/codex-review-${codexSession}.md`), { label: 'review:codex', phase: 'Review', model, effort }),
+  () => agent(reviewPrompt('claude reviewer'), { label: 'review:claude', phase: 'Review', model, effort }),
 ])
 // Detect BOTH reviewers symmetrically — each parallel thunk can return null on failure.
 // Checking only codex would let a silent claude-side failure (or a total review loss) pass as success.
@@ -128,7 +129,7 @@ const fixed = await agent(
   `If ANY item is amendment-needed, do NOT edit through it: set amendment_needed=true, leave that contradiction unimplemented, and stop.\n` +
   `Report what you changed, paste verification outputs, and return the deviations honestly.\n\n` +
   `REVIEW A (${cli}):\n${reviews[0] ?? 'unavailable'}\n\nREVIEW B (claude):\n${reviews[1] ?? 'unavailable'}\n\n${SPEC}`,
-  { label: 'fix-and-verify', phase: 'Finalize', model, schema: FINALIZE_SCHEMA }
+  { label: 'fix-and-verify', phase: 'Finalize', model, effort, schema: FINALIZE_SCHEMA }
 )
 if (!fixed) return { aborted: true, stage: 'finalize', reason: 'finalize agent failed (returned null) — implementation not verified', impl, reviews, codex_available: codexAvailable, claude_available: claudeAvailable }
 // Gate on BOTH the boolean AND any amendment-needed deviation — a finalizer that sets the flag false
