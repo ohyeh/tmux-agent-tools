@@ -140,7 +140,20 @@ That fallback reuses `_team_quorum` and only changes it from an instantaneous ch
 
 <!-- ponytail: team needs is just quorum + send. No manifest engine, no scheduler, no semantic voting. -->
 
-## Orchestrator decision (brain)
-ACCEPT Packet C as primary, `team quorum --wait` recorded as fallback. Rationale: C composes the just-shipped quorum + `_team_result_from_path` + `_team_send` with the smallest new surface, and every claim is cited to the current tree. Agreed with fixed teammate codex.
+## Orchestrator decision (brain) — REVISED after independent adversarial consensus
 
-One refinement to fold into the operative spec at implementation time (not a blocker now): `team needs` mixes a *gate* with a *side-effecting send*. The self-test and impl must guarantee **single-send / idempotency** — re-running after quorum is already met must not double-send the downstream prompt (e.g. send-once semantics or a sent-marker check). Note also the alternative view that the Unix-composable form is gate-and-send-separate (the fallback); C is chosen for ergonomics, accepting the coupled side effect deliberately. This is the next branch's starting point.
+**Superseded my first call.** An independent fresh codex session (no authorship stake) reviewed this plan against the committed tree and returned **DISAGREE / premise_ok=false**. Its evidence held up:
+
+- `team needs` fuses a gate with a **side-effecting send**, and single-send/idempotency is the *hard* part — yet the plan kept dependency metadata / sent-marker state **out of scope**, contradicting its own refinement note that a re-run after quorum must not double-send.
+- The "just quorum + send, small surgical" framing understated the real surface (wait loop, `--from` resolution, target exclusion, exit-code + JSON contract, side-effect safety). The original brief (orchestrator-written) biased toward `team needs` as primary.
+- Citations spot-checked TRUE against HEAD (one minor line-range nit at the usage-list landing).
+
+**Revised decision — primary flips to the composable primitive:**
+
+### Packet C (revised) = `team quorum --wait [--interval <s>] [--timeout <s>]`
+Extend the existing one-shot `_team_quorum` (`agent-tmux:5922-5998`) into a bounded waiter: poll present+valid row results until `matched_count >= --count` or timeout. **No send, no side effect, no new state.** Compose deliberately: `agent-tmux team quorum <team> --count N --field .status --value success --wait 600 && agent-tmux team send <team> <target> -- "<prompt>"`. Reuses `_team_worker_rows` / `_team_result_from_path`; only adds the poll loop + `--wait`/`--interval` flags + `self_test_team_quorum_wait` (live tmux). Gates as before.
+
+### Deferred — `team needs` (send-once gate)
+Revisit only after a designed idempotency/state contract exists: key derivation, persisted sent-marker path, retry behavior, and a self-test that fires the same satisfied gate twice and proves exactly one prompt reaches the target. Not the next packet.
+
+This revised plan = the form the independent reviewer prescribed as acceptable. Consensus target: re-confirm AGREE on this revision before it becomes the next branch's starting point.
