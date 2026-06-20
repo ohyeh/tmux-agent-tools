@@ -16,10 +16,15 @@
 //       "./scripts/foo/bar.sh --help"
 //     ],
 //     model: "sonnet",                             // optional, default "sonnet" for implement/fix
-//     externalAgentType: "codex:codex-rescue"      // optional, second-model reviewer; if unavailable agent()->null degrades to single review (surfaced as codex_available:false)
+//     effort: "high", timeoutSec: 600,             // optional, codex reasoning effort + OUT-file poll timeout
+//     sessionName: "spec-c1",                       // optional, agent-tmux codex session label
 //   }})
+// Second-model reviewer is codex driven via tmux-agent-tools (agent-tmux codex). If codex/agent-tmux
+// are unavailable the driver agent() returns null and dual review degrades to single (codex_available:false).
 //
 // NOTE: workflow scripts have no FS/shell — only agents do. All file work happens inside agent() prompts.
+// NESTING: this is a mid-level stage — do NOT call workflow() here (1-level nesting cap). Drive the
+// second model via inline agent() + agent-tmux, never via workflow() or a harness agent type.
 
 export const meta = {
   name: 'spec-implement-dual-review-verify',
@@ -36,7 +41,28 @@ for (const k of ['repoPath', 'spec']) if (!a[k]) return { aborted: true, reason:
 
 const repo = a.repoPath
 const model = a.model || 'sonnet'
-const externalAgentType = a.externalAgentType || 'codex:codex-rescue' // second-model reviewer; if unavailable, agent() -> null and dual review degrades to single (surfaced in return)
+// Second-model reviewer driven via tmux-agent-tools (agent-tmux <cli>), NOT a harness agentType:
+// the openai-codex plugin (codex:codex-rescue) is deprecated/disabled. agent-tmux works regardless
+// of plugin enablement and across repos. Mirrors plan-pipeline / codex-consensus-gate (file-polled).
+const cli = a.cli === 'claude' ? 'claude' : 'codex'   // second-model CLI: codex (default) | claude
+const codexEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(a.effort) ? a.effort : 'high'  // enum — emitted into a shell env assignment
+const codexTimeout = Number.isInteger(a.timeoutSec) ? a.timeoutSec : 600
+// sanitize sessionName (emitted into a shell command, like slug) — fall back to a derived safe label
+const codexSession = (typeof a.sessionName === 'string' && /^[A-Za-z0-9._-]+$/.test(a.sessionName))
+  ? a.sessionName
+  : `spec-${cli}-${(a.slug || 'review').replace(/[^a-zA-Z0-9._-]/g, '_')}`
+const REVIEW_MARKER = '=== SECOND-MODEL REVIEW END ==='
+// codex takes --yolo + reasoning-effort; claude's profile already supplies its own launch flags.
+const launchEnv = cli === 'codex' ? `CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=${codexEffort}' ` : ''
+// POSIX-safe single-quote: wraps in '...' and renders embedded ' as '\'' so any repo path is safe.
+const shellQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
+const driveCodex = (taskForCodex, outHint) =>
+  `Get a genuine SECOND-MODEL (${cli}) review by driving a ${cli} session via tmux-agent-tools — do NOT use any harness agent type. ` +
+  `If agent-tmux/${cli}-tmux are not on PATH, run them from the tmux-agent-tools skill bundle scripts/ dir.\n` +
+  `1. Pick a unique OUT file (${outHint}); instruct ${cli} to WRITE its full review to OUT, ending the file with a final line exactly: ${REVIEW_MARKER}\n` +
+  `2. Start/reuse: ${launchEnv}agent-tmux ${cli} start --exact ${codexSession} ${shellQuote(repo)} "review task incoming; read fully before replying".\n` +
+  `3. Send via file: write the task below to a temp file, then agent-tmux ${cli} send --from-file <file> --enter-count 1 ${codexSession}.\n` +
+  `4. Wait by POLLING OUT (NOT the tmux pane — the marker echoes in the sent prompt), up to ${codexTimeout}s, until OUT exists AND contains "${REVIEW_MARKER}". Then read OUT and return ${cli}'s review (you are a conduit). Keep raw tmux scrollback out.\n\nTASK FOR ${cli.toUpperCase()}:\n${taskForCodex}`
 const target = a.targetFile ? `\nTarget file: ${a.targetFile}` : ''
 const focus = a.reviewFocus || 'correctness, error handling, edge cases, anything that could silently corrupt state or data'
 const verifyCommands = Array.isArray(a.verifyCommands) ? a.verifyCommands : []
@@ -59,26 +85,57 @@ const reviewPrompt = (who) =>
   `Review the change just implemented against the spec below. Focus (${who}): ${focus}. ` +
   `Return a concise list of CONCRETE issues with file/line references and suggested fixes. If none, say "no issues".\n${SPEC}`
 const reviews = await parallel([
-  () => agent(reviewPrompt('second-model deep pass'), { label: 'review:codex', phase: 'Review', agentType: externalAgentType }),
+  () => agent(driveCodex(reviewPrompt('second-model deep pass'), `/tmp/codex-review-${codexSession}.md`), { label: 'review:codex', phase: 'Review', model }),
   () => agent(reviewPrompt('claude reviewer'), { label: 'review:claude', phase: 'Review', model }),
 ])
 // Detect BOTH reviewers symmetrically — each parallel thunk can return null on failure.
 // Checking only codex would let a silent claude-side failure (or a total review loss) pass as success.
 const codexAvailable = reviews[0] != null
 const claudeAvailable = reviews[1] != null
-if (!codexAvailable) log(`WARNING: external reviewer (${externalAgentType}) returned null — dual review degraded.`)
+if (!codexAvailable) log(`WARNING: external reviewer (codex via agent-tmux) returned null — dual review degraded.`)
 if (!claudeAvailable) log(`WARNING: claude reviewer returned null — dual review degraded.`)
 if (!codexAvailable && !claudeAvailable) {
   return { aborted: true, stage: 'review', reason: 'both reviewers failed — no review coverage to finalize against', impl, reviews, codex_available: false, claude_available: false }
 }
 
 phase('Finalize')
+// P7 deviation→amendment gate: the finalizer must classify any change that touches the spec's
+// EXPLICIT frozen claims (SC-x / ADR Decision lines). within-spec = elaborates (ok); deviation =
+// small/reversible (log it, keep going); amendment-needed = CONTRADICTS a frozen line → HARD STOP,
+// escalate to an ADR amendment (re-freeze via plan-pipeline) instead of silently editing through.
+const FINALIZE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  required: ['summary', 'verified', 'amendment_needed', 'deviations'],
+  properties: {
+    summary: { type: 'string' },
+    verified: { type: 'boolean', description: 'verify commands ran and passed' },
+    amendment_needed: { type: 'boolean', description: 'true iff any change contradicts a frozen spec/ADR line' },
+    deviations: { type: 'array', items: {
+      type: 'object', additionalProperties: false, required: ['what', 'classification'],
+      properties: {
+        what: { type: 'string' },
+        classification: { type: 'string', enum: ['within-spec', 'deviation', 'amendment-needed'] },
+        frozen_ref: { type: 'string', description: 'the frozen SC-x / ADR Decision line it touches, if any' },
+        rationale: { type: 'string' },
+      },
+    } },
+  },
+}
 const fixed = await agent(
   `You are finalizing the change in ${repo}. Two reviews are below. Apply ONLY the fixes that are real and in-spec (ignore stylistic nitpicks and out-of-spec feature suggestions). ${verifyClause}\n` +
-  `Report what you changed and paste the verification command outputs.\n\n` +
-  `REVIEW A (codex):\n${reviews[0] ?? 'unavailable'}\n\nREVIEW B (claude):\n${reviews[1] ?? 'unavailable'}\n\n${SPEC}`,
-  { label: 'fix-and-verify', phase: 'Finalize', model }
+  `DEVIATION GATE: before finalizing, list every change that touches an EXPLICIT frozen claim in the spec (an SC-x success criterion or an ADR Decision/Consequence line). Classify each as ` +
+  `"within-spec" (only elaborates what the frozen line left open), "deviation" (small/reversible departure — record it, keep going), or "amendment-needed" (CONTRADICTS a frozen line). ` +
+  `If ANY item is amendment-needed, do NOT edit through it: set amendment_needed=true, leave that contradiction unimplemented, and stop.\n` +
+  `Report what you changed, paste verification outputs, and return the deviations honestly.\n\n` +
+  `REVIEW A (${cli}):\n${reviews[0] ?? 'unavailable'}\n\nREVIEW B (claude):\n${reviews[1] ?? 'unavailable'}\n\n${SPEC}`,
+  { label: 'fix-and-verify', phase: 'Finalize', model, schema: FINALIZE_SCHEMA }
 )
 if (!fixed) return { aborted: true, stage: 'finalize', reason: 'finalize agent failed (returned null) — implementation not verified', impl, reviews, codex_available: codexAvailable, claude_available: claudeAvailable }
+// Gate on BOTH the boolean AND any amendment-needed deviation — a finalizer that sets the flag false
+// while classifying a deviation as amendment-needed must NOT slip through (fail closed).
+const amendmentNeeded = fixed.amendment_needed === true || (fixed.deviations || []).some(d => d && d.classification === 'amendment-needed')
+if (amendmentNeeded) return { aborted: true, stage: 'finalize', reason: 'build contradicts a frozen spec/ADR line — escalate to an ADR amendment (re-freeze via plan-pipeline) before continuing; do not edit through', needsUser: true, deviations: fixed.deviations, impl, reviews, codex_available: codexAvailable, claude_available: claudeAvailable }
+// Fail closed on verification: a finalizer that did not get verify passing is not a success.
+if (fixed.verified !== true) return { aborted: true, stage: 'finalize', reason: 'verification did not pass (verified!=true) — not finalizing as success', needsUser: true, fixed, impl, reviews, codex_available: codexAvailable, claude_available: claudeAvailable }
 
-return { impl, reviews, fixed, codex_available: codexAvailable, claude_available: claudeAvailable }
+return { impl, reviews, fixed, deviations: fixed.deviations, amendment_needed: false, verified: true, codex_available: codexAvailable, claude_available: claudeAvailable }

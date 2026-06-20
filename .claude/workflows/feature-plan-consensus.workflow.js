@@ -54,6 +54,8 @@ export const meta = {
   ],
 }
 
+// NESTING: this is a mid-level stage — do NOT call workflow() here (1-level nesting cap). Drive the
+// second model via inline agent() + agent-tmux, never via workflow() or a harness agent type.
 const a = args || {}
 for (const k of ['repoPath', 'featureBrief']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 
@@ -72,6 +74,28 @@ const lenses = Array.isArray(a.internalLenses) && a.internalLenses.length
   ? a.internalLenses
   : ['completeness (missing areas/tasks/edge cases)', 'sequencing & dependencies', 'risk & blast-radius', 'effort realism']
 const designRefs = a.designRefs ? `\nDesign refs / decisions (LEADS to verify, not truth):\n${a.designRefs}` : ''
+
+// codex second-model reviewer is driven via tmux-agent-tools (agent-tmux codex), NOT a harness
+// agentType. The openai-codex plugin (codex:codex-rescue) is deprecated/disabled in settings;
+// agent-tmux works regardless of plugin enablement and across repos. Mirrors plan-pipeline /
+// codex-consensus-gate: completion is detected by POLLING an OUT file, never the tmux pane.
+const cli = a.cli === 'claude' ? 'claude' : 'codex'   // second-model CLI: codex (default) | claude
+const codexEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(a.effort) ? a.effort : 'high'  // enum — emitted into a shell env assignment
+const codexTimeout = Number.isInteger(a.timeoutSec) ? a.timeoutSec : 900
+const codexSession = `fpc-${cli}-${slug}`
+const REVIEW_MARKER = '=== SECOND-MODEL REVIEW END ==='
+// codex takes --yolo + reasoning-effort; claude's profile already supplies its own launch flags.
+const launchEnv = cli === 'codex' ? `CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=${codexEffort}' ` : ''
+// POSIX-safe single-quote: wraps in '...' and renders embedded ' as '\'' so any repo path is safe.
+const shellQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
+const driveCodex = (taskForCodex, outHint) =>
+  `Get a genuine SECOND-MODEL (${cli}) verdict by driving a ${cli} session via tmux-agent-tools — do NOT use any harness agent type. ` +
+  `If agent-tmux/${cli}-tmux are not on PATH, run them from the tmux-agent-tools skill bundle scripts/ dir.\n` +
+  `1. Pick a unique OUT file (${outHint}); instruct ${cli} to WRITE its full response to OUT, ending the file with a final line exactly: ${REVIEW_MARKER}\n` +
+  `2. Start/reuse: ${launchEnv}agent-tmux ${cli} start --exact ${codexSession} ${shellQuote(repo)} "review task incoming; read fully before replying".\n` +
+  `3. Send via file: write the task below to a temp file, then agent-tmux ${cli} send --from-file <file> --enter-count 1 ${codexSession}.\n` +
+  `4. Wait by POLLING OUT (NOT the tmux pane — the marker echoes in the sent prompt), up to ${codexTimeout}s, until OUT exists AND contains "${REVIEW_MARKER}". Then read OUT.\n` +
+  `Base your answer STRICTLY on ${cli}'s OUT content (you are a conduit, not the reviewer). Keep raw tmux scrollback out.\n\nTASK FOR ${cli.toUpperCase()}:\n${taskForCodex}`
 
 // Step 0 — the doctrine, injected into every worker/reviewer prompt.
 const EVIDENCE = `CORRECTNESS DOCTRINE (non-negotiable): truth = source code, logs, and real command output you observe THIS run. ` +
@@ -93,7 +117,7 @@ async function runEscalated(label, phaseName, makePrompt, opts = {}) {
     ...Array(sonnetTries).fill({ tier: 'sonnet', model: 'sonnet' }),
     ...Array(selfTries).fill({ tier: 'self', model: a.orchestratorModel }), // undefined -> inherit main-loop (you)
   ]
-  if (escalateToCodex) rungs.push({ tier: 'codex', agentType: 'codex:codex-rescue' })
+  if (escalateToCodex) rungs.push({ tier: 'codex', driveCodex: true })
   let feedback = ''
   let last = null
   for (let i = 0; i < rungs.length; i++) {
@@ -101,8 +125,8 @@ async function runEscalated(label, phaseName, makePrompt, opts = {}) {
     const o = { label: `${label}:${r.tier}#${i + 1}`, phase: phaseName }
     if (schema) o.schema = schema
     if (r.model) o.model = r.model
-    if (r.agentType) o.agentType = r.agentType
-    const res = await agent(makePrompt(feedback, r.tier), o)
+    const p = makePrompt(feedback, r.tier)
+    const res = await agent(r.driveCodex ? driveCodex(p, `/tmp/codex-${label.replace(/[^a-zA-Z0-9._-]/g, '_')}-${i + 1}.md`) : p, o)
     const v = verify ? await verify(res) : { ok: res != null, feedback: 'empty result' }
     if (v.ok) { log(`${label}: accepted via ${r.tier} (attempt ${i + 1})`); return { result: res, tier: r.tier, attempt: i + 1, ok: true, needsUser: false } }
     last = res
@@ -112,9 +136,26 @@ async function runEscalated(label, phaseName, makePrompt, opts = {}) {
   log(`${label}: escalation exhausted (codex could not satisfy monitor) — surfacing to user.`)
   return { result: last, tier: 'exhausted', attempt: rungs.length, ok: false, needsUser: true }
 }
-const planOk = (res) => (typeof res === 'string' && res.trim().length > 300 && /risk/i.test(res))
-  ? { ok: true }
-  : { ok: false, feedback: 'plan must be substantial markdown with the required sections incl. a risks/open-questions section, grounded in code (not docs).' }
+// P5 quality gate: enforce PLAN_SECTIONS as SECTION LINES (markdown headings / numbered / bold lead),
+// not loose body keywords — a plan that merely mentions the words in prose must NOT pass. Paired
+// concepts are checked CONJUNCTIVELY (Goal AND success, Scope AND non-goals, Risks AND open-questions).
+const sectionLines = (md) => md.split('\n').filter(l => /^\s{0,3}(#{1,6}\s|\d+[.)]\s|\*\*)/.test(l)).join('\n')
+const REQUIRED_SECTIONS = [
+  { name: 'Goal & success criteria', ok: h => /goal/i.test(h) && /success/i.test(h) },
+  { name: 'Scope / non-goals', ok: h => /scope/i.test(h) && /non-?goal/i.test(h) },
+  { name: 'Work breakdown (tasks/effort/files)', ok: h => /breakdown|work|task/i.test(h) },
+  { name: 'Risks & open questions', ok: h => /risk/i.test(h) && /open question/i.test(h) },
+  { name: 'Phased implementation sequence', ok: h => /sequence|phase/i.test(h) },
+]
+const planOk = (res) => {
+  if (typeof res !== 'string' || res.trim().length < 300)
+    return { ok: false, feedback: 'plan must be substantial markdown (>=300 chars), grounded in code (not docs).' }
+  const h = sectionLines(res)
+  const missing = REQUIRED_SECTIONS.filter(s => !s.ok(h)).map(s => s.name)
+  if (missing.length)
+    return { ok: false, feedback: `plan missing required SECTION(s) (must be markdown headings/numbered, with paired concepts together): ${missing.join('; ')}.` }
+  return { ok: true }
+}
 
 // ───────────────────────── schemas ─────────────────────────
 const DECOMPOSE_SCHEMA = {
@@ -231,10 +272,13 @@ let externalRound = 0, externalConsensus = false
 while (externalRound < maxExternal) {
   externalRound++
   const review = await agent(
-    `You are CODEX, a second-model adversarial reviewer for an implementation PLAN. Repo: ${repo}.\n${EVIDENCE}\n` +
-    `INDEPENDENTLY verify the plan's "current state" claims with rg/Read and logs/real runs — do not take the plan's or any doc's word for it. Then judge completeness, sequencing, effort realism, and unverified assumptions. ` +
-    `Set verified_against_code + default consensus=false unless genuinely sound. Each issue needs evidence (file:line/log) + fix.\n\nPLAN:\n${plan}`,
-    { label: `codex-review#${externalRound}`, phase: 'ExternalReview', agentType: 'codex:codex-rescue', schema: CRITIQUE_SCHEMA }
+    driveCodex(
+      `Act as a second-model adversarial reviewer for an implementation PLAN. Repo: ${repo}.\n${EVIDENCE}\n` +
+      `INDEPENDENTLY verify the plan's "current state" claims with rg/Read and logs/real runs — do not take the plan's or any doc's word for it. Then judge completeness, sequencing, effort realism, and unverified assumptions. ` +
+      `Set verified_against_code + default consensus=false unless genuinely sound. Each issue needs evidence (file:line/log) + fix.\n\nPLAN:\n${plan}`,
+      `/tmp/codex-extreview-${slug}-${externalRound}.md`
+    ),
+    { label: `codex-review#${externalRound}`, phase: 'ExternalReview', schema: CRITIQUE_SCHEMA }
   )
   if (!review) return { aborted: true, stage: 'external-review', needsUser: true, round: externalRound } // codex (top automated tier) died -> escalate to user
   const blocking = (review.blocking_issues || []).filter(i => i.severity !== 'minor')

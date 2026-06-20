@@ -64,7 +64,7 @@ const results = await pipeline(
     if (!ev.supported) return { h, ev, refutes: VOTES, votes: VOTES, evaluable: true }
     return parallel(Array.from({ length: VOTES }, (_, i) => () =>
         agent(`${COMMON}\nAdversarially try to REFUTE root cause "${h.claim}". Evidence so far: ${ev.evidence}. Default refuted=true if the evidence is weak/circumstantial.`,
-          { label: `rca:verify:${h.id}#${i + 1}`, phase: 'Verify', model: 'sonnet', schema: VERD }))
+          { label: `rca:verify:${h.id}#${i + 1}`, phase: 'Verify', model: 'sonnet', schema: VERD })))
       .then(vs => {
         // FAIL CLOSED: a verifier thunk that failed returns null (parallel contract). Counting only
         // surviving non-refutes would let a hypothesis pass on absent verification — the worst case
