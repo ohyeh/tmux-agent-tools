@@ -79,6 +79,7 @@ PROFILE_PATTERN_PERMISSION=''
 PROFILE_PATTERN_APPROVAL=''
 PROFILE_PATTERN_LOGIN=''
 RESULT_PATH_VIA_PROMPT=''
+SESSION_ID_PATTERN=''
 load_cli_profile() {
   local cli="$1" dir file='' line key value
   if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
@@ -112,6 +113,7 @@ load_cli_profile() {
       prefix)                    _PRESET_PREFIX="$value" ;;
       launch_flags)              _PRESET_FLAGS="$value" ;;
       resume_keyword)            RESUME_KEYWORD="$value" ;;
+      session_id_pattern)        SESSION_ID_PATTERN="$value" ;;
       heuristic_family)          HEURISTIC_FAMILY="$value" ;;
       usage_kind)                _USAGE_KIND="$value" ;;
       pattern_busy)              PROFILE_PATTERN_BUSY="$value" ;;
@@ -1673,6 +1675,81 @@ result_validate_lightweight() {
   [[ "$valid" == "true" ]] && return 0 || return 2
 }
 
+# Shared RFC-4122 UUID shape check — single canonical source for capture +
+# read path + session_meta_validate. Returns 0 if valid, 1 if not.
+_is_rfc4122_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+# Validate session-meta.json sidecar: accepts null or RFC-4122 UUID.
+# Emits a single line: "ok", "null", "malformed:<value>", or "missing".
+# ponytail: minimal — no JSON output, callers only need the verdict word.
+session_meta_validate() {
+  local meta_path="$1"
+  require_jq
+  if [[ ! -f "$meta_path" ]]; then
+    printf 'missing\n'
+    return 0
+  fi
+  local raw
+  raw="$("$JQ" -r '.cli_session_id // "null"' "$meta_path" 2>/dev/null)" || {
+    printf 'malformed:parse_error\n'
+    return 1
+  }
+  if [[ "$raw" == "null" ]]; then
+    printf 'null\n'
+    return 0
+  fi
+  # RFC-4122 UUID: 8-4-4-4-12 hex groups (case-insensitive)
+  if _is_rfc4122_uuid "$raw"; then
+    printf 'ok\n'
+    return 0
+  fi
+  printf 'malformed:%s\n' "$raw"
+  return 1
+}
+
+# Spawn a bounded background capture that extracts the CLI session UUID from
+# the tmux pane and atomically writes session-meta.json (single writer).
+# No-op when SESSION_ID_PATTERN is unset. Non-blocking; start stays fast.
+# ponytail: best-effort only — failures are silent (no stderr noise).
+#
+# Two-stage extraction (guardrail #2 — deterministic source preferred):
+#   Stage 1: find the FIRST pane line matching SESSION_ID_PATTERN (the
+#            CLI's session-label anchor, e.g. "Session ID:").
+#   Stage 2: from THAT line, extract the RFC-4122 UUID via a fixed sub-regex.
+# A decoy UUID on any non-matching line is ignored — shape alone is not enough.
+spawn_session_id_capture() {
+  local name="$1" session="$2" meta_path="$3"
+  [[ -n "$SESSION_ID_PATTERN" ]] || return 0
+  require_jq
+  local pattern="$SESSION_ID_PATTERN" jq_bin="$JQ" tmux_bin="$TMUX"
+  # Fixed RFC-4122 sub-regex for stage-2 extraction.
+  local _uuid_re='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+  # Run in a subshell so it doesn't block start_session.
+  (
+    local deadline=$(( $(date +%s) + 30 ))
+    while (( $(date +%s) < deadline )); do
+      sleep 2
+      local pane_text labeled_line uuid
+      pane_text="$("$tmux_bin" capture-pane -t "$session" -p 2>/dev/null)" || break
+      # Stage 1: find the first line that matches the label anchor.
+      labeled_line="$(printf '%s\n' "$pane_text" | grep -m1 -E "$pattern")" || true
+      [[ -n "$labeled_line" ]] || continue
+      # Stage 2: extract + validate UUID from that line only.
+      uuid="$(printf '%s\n' "$labeled_line" | grep -oE "$_uuid_re" | head -1)" || true
+      if [[ -n "$uuid" ]] && _is_rfc4122_uuid "$uuid"; then
+        local tmp
+        tmp="$(mktemp "${meta_path}.tmp.XXXXXX")" || break
+        "$jq_bin" -n --arg id "$uuid" \
+          '{schema_version: 1, cli_session_id: $id}' > "$tmp" && mv "$tmp" "$meta_path" || rm -f "$tmp"
+        break
+      fi
+    done
+  ) &
+  disown 2>/dev/null || true
+}
+
 result_init_session() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
@@ -1684,6 +1761,9 @@ result_init_session() {
   subdir="$(ensure_agent_dir "$name")"
   result_path="$subdir/result.json"
   "$JQ" -n '{schema_version: 1, status: "ok", summary: "", artifacts: [], errors: []}' > "$result_path"
+  # Seed sidecar with null so it is discoverable before capture runs (P1).
+  local meta_path="$subdir/session-meta.json"
+  "$JQ" -n '{schema_version: 1, cli_session_id: null}' > "$meta_path"
   printf '%s\n' "$result_path"
 }
 
@@ -2774,6 +2854,8 @@ start_session() {
     "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
+  # Best-effort background capture of CLI session UUID into sidecar (P2).
+  spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
   run_on_start_hook "$name" "$session"
 
   if [[ -n "$transcript_path" ]]; then
@@ -3067,10 +3149,19 @@ resume_session() {
     "$TMUX" kill-session -t "$session"
   fi
 
+  # Gate UUID display: full only when AGENT_TMUX_SHOW_SESSION_ID=1 (B3).
+  # ponytail: last-4 fingerprint is enough for operator identification.
+  local _sid_display
+  if [[ "${AGENT_TMUX_SHOW_SESSION_ID:-0}" == "1" ]]; then
+    _sid_display="$cli_session_id"
+  else
+    _sid_display="<redacted:${cli_session_id: -4}>"
+  fi
+
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'session id: $cli_session_id' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS} ${RESUME_KEYWORD} $(shell_quote "$cli_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'session id: ${_sid_display}' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS} ${RESUME_KEYWORD} $(shell_quote "$cli_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
@@ -3080,7 +3171,7 @@ resume_session() {
     start_line="$("$JQ" -c -n \
       --arg event start --arg tool "$CLI" --arg name "$name" \
       --arg session "$session" --arg cwd "$directory" \
-      --arg resume_id "$cli_session_id" \
+      --arg resume_id "$_sid_display" \
       --arg at "$(transcript_iso_now)" \
       '{schema_version: 1, event: $event, tool: $tool, name: $name,
         session: $session, cwd: $cwd, resume_id: $resume_id, at: $at}')"
@@ -3090,7 +3181,7 @@ resume_session() {
   echo "agent: $name"
   echo "Started $session"
   echo "cwd:  $directory"
-  echo "session id: $cli_session_id"
+  echo "session id: $_sid_display"
   echo "send: $SELF $CLI send $name <text>"
   echo "wait: $SELF $CLI wait $name 180"
   echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
@@ -3736,6 +3827,23 @@ result_session() {
     return $?
   fi
 
+  # cli_session_id lives ONLY in session-meta.json, never in result.json
+  # (schema is additionalProperties:false). Serve it directly — independent
+  # of whether result.json exists — so the read works during the post-start /
+  # pre-final-result window (the primary v2 resume use-case).
+  if [[ "$field" == ".cli_session_id" || "$field" == "cli_session_id" ]]; then
+    local meta_path
+    meta_path="$(dirname "$result_path")/session-meta.json"
+    local meta_val
+    meta_val="$("$JQ" -r '.cli_session_id // empty' "$meta_path" 2>/dev/null)" || true
+    if [[ -n "$meta_val" ]] && _is_rfc4122_uuid "$meta_val"; then
+      printf '%s\n' "$meta_val"
+      return 0
+    fi
+    echo "Field not found: cli_session_id (sidecar absent, null, or non-UUID)" >&2
+    exit 1
+  fi
+
   if (( wait_seconds > 0 )); then
     local elapsed=0
     while [[ ! -f "$result_path" && "$elapsed" -lt "$wait_seconds" ]]; do
@@ -3802,11 +3910,17 @@ result_session() {
   fi
 
   if [[ -n "$field" ]]; then
-    if ! printf '%s' "$body" | "$JQ" -e -r "$field"; then
-      echo "Field not found in result.json: $field" >&2
-      exit 1
+    # jq -e exits 1 for null/false values but still prints them; capture output
+    # so we can suppress it on failure and fall through to error.
+    # Note: .cli_session_id is intercepted before this point (sidecar path above).
+    local field_val field_ok=0
+    field_val="$(printf '%s' "$body" | "$JQ" -e -r "$field" 2>/dev/null)" || field_ok=$?
+    if (( field_ok == 0 )); then
+      printf '%s\n' "$field_val"
+      return 0
     fi
-    return 0
+    echo "Field not found in result.json: $field" >&2
+    exit 1
   fi
 
   printf '%s\n' "$body"

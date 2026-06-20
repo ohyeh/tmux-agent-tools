@@ -36,6 +36,7 @@ take precedence over profile values.
 | `pattern_permission_prompt` | ERE matched (case-insensitive) against pane text → `permission_prompt` | |
 | `pattern_approval_prompt` | ERE → `approval_prompt` | |
 | `pattern_login_prompt` | ERE → `login_prompt` | |
+| `session_id_pattern` | grep-compatible ERE to extract the CLI's internal session UUID from pane output; enables `resume` when matched. **Sensitive** — UUID is a resume capability; treat as non-shareable. Leave unset when the CLI output format is unknown or unstable; resume falls back to tmux supervision only. | `session_id_pattern=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}` |
 
 ## Examples
 
