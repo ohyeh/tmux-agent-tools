@@ -61,7 +61,7 @@ for (const k of ['repoPath', 'featureBrief']) if (!a[k]) return { aborted: true,
 
 const repo = a.repoPath
 const model = a.model || 'sonnet'   // listed on every agent() below (escalation rungs override per-tier)
-const effort = a.effort || 'high'   // harness agents' reasoning effort (codexEffort below drives codex itself)
+const effort = a.effort || 'high'   // harness agents' reasoning effort
 // Official agent() opts, listed on every call. Both default OFF:
 const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
 const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
@@ -83,23 +83,27 @@ const designRefs = a.designRefs ? `\nDesign refs / decisions (LEADS to verify, n
 // agentType. The openai-codex plugin (codex:codex-rescue) is deprecated/disabled in settings;
 // agent-tmux works regardless of plugin enablement and across repos. Mirrors plan-pipeline /
 // codex-consensus-gate: completion is detected by POLLING an OUT file, never the tmux pane.
-const cli = a.cli === 'claude' ? 'claude' : 'codex'   // second-model CLI: codex (default) | claude
-const codexEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(a.effort) ? a.effort : 'high'  // enum — emitted into a shell env assignment
-const codexTimeout = Number.isInteger(a.timeoutSec) ? a.timeoutSec : 900
-const codexSession = `fpc-${cli}-${slug}`
+// cli is REQUIRED and neutral — NO built-in default (codex/claude are just the common ones). Each CLI's
+// launch flags come from its own agent-tmux profile (codex→--yolo, claude→--dangerously-skip-permissions);
+// EXTRA flags pass raw via a.launchEnv. charset guard blocks shell injection (cli is interpolated into commands).
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(a.cli || '')) return { aborted: true, reason: "missing/invalid arg: cli ('codex' | 'claude' | any agent-tmux profile name)" }
+const cli = a.cli
+const cliTimeout = Number.isInteger(a.timeoutSec) ? a.timeoutSec : 900
+const cliSession = `fpc-${cli}-${slug}`
 const REVIEW_MARKER = '=== SECOND-MODEL REVIEW END ==='
-// codex takes --yolo + reasoning-effort; claude's profile already supplies its own launch flags.
-const launchEnv = cli === 'codex' ? `CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=${codexEffort}' ` : ''
+// Extra launch-flag env prefix — raw passthrough, caller-owned (profile already supplies each CLI's defaults).
+// e.g. a.launchEnv = "CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=high' "
+const launchEnv = typeof a.launchEnv === 'string' ? a.launchEnv : ''
 // POSIX-safe single-quote: wraps in '...' and renders embedded ' as '\'' so any repo path is safe.
 const shellQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
-const driveCodex = (taskForCodex, outHint) =>
+const driveCli = (taskForCli, outHint) =>
   `Get a genuine SECOND-MODEL (${cli}) verdict by driving a ${cli} session via tmux-agent-tools — do NOT use any harness agent type. ` +
   `If agent-tmux/${cli}-tmux are not on PATH, run them from the tmux-agent-tools skill bundle scripts/ dir.\n` +
   `1. Pick a unique OUT file (${outHint}); instruct ${cli} to WRITE its full response to OUT, ending the file with a final line exactly: ${REVIEW_MARKER}\n` +
-  `2. Start/reuse: ${launchEnv}agent-tmux ${cli} start --exact ${codexSession} ${shellQuote(repo)} "review task incoming; read fully before replying".\n` +
-  `3. Send via file: write the task below to a temp file, then agent-tmux ${cli} send --from-file <file> --enter-count 1 ${codexSession}.\n` +
-  `4. Wait by POLLING OUT (NOT the tmux pane — the marker echoes in the sent prompt), up to ${codexTimeout}s, until OUT exists AND contains "${REVIEW_MARKER}". Then read OUT.\n` +
-  `Base your answer STRICTLY on ${cli}'s OUT content (you are a conduit, not the reviewer). Keep raw tmux scrollback out.\n\nTASK FOR ${cli.toUpperCase()}:\n${taskForCodex}`
+  `2. Start/reuse: ${launchEnv}agent-tmux ${cli} start --exact ${cliSession} ${shellQuote(repo)} "review task incoming; read fully before replying".\n` +
+  `3. Send via file: write the task below to a temp file, then agent-tmux ${cli} send --from-file <file> --enter-count 1 ${cliSession}.\n` +
+  `4. Wait by POLLING OUT (NOT the tmux pane — the marker echoes in the sent prompt), up to ${cliTimeout}s, until OUT exists AND contains "${REVIEW_MARKER}". Then read OUT.\n` +
+  `Base your answer STRICTLY on ${cli}'s OUT content (you are a conduit, not the reviewer). Keep raw tmux scrollback out.\n\nTASK FOR ${cli.toUpperCase()}:\n${taskForCli}`
 
 // Step 0 — the doctrine, injected into every worker/reviewer prompt.
 const EVIDENCE = `CORRECTNESS DOCTRINE (non-negotiable): truth = source code, logs, and real command output you observe THIS run. ` +
@@ -109,7 +113,7 @@ const EVIDENCE = `CORRECTNESS DOCTRINE (non-negotiable): truth = source code, lo
 const CONTEXT = `Repo: ${repo}.\n${EVIDENCE}\n\nNEW FEATURE BRIEF (a goal to plan toward; verify all "current state" against code):\n${a.featureBrief}${designRefs}`
 
 phase('Orchestrate')
-log(`Step 0 doctrine active — ladder: sonnet→self→codex→user (budget: sonnet x${sonnetTries}, self x${selfTries}, codex ${escalateToCodex ? 'on' : 'off'}); truth = code/logs only.`)
+log(`Step 0 doctrine active — ladder: sonnet→self→${cli}→user (budget: sonnet x${sonnetTries}, self x${selfTries}, ${cli} ${escalateToCodex ? 'on' : 'off'}); truth = code/logs only.`)
 if (!a.orchestratorModel) log(`note: orchestratorModel unset — the "self" rung inherits the main-loop model; it is a real capability step above sonnet only if the main loop runs a model above sonnet (else it is a same-model retry).`)
 
 // ───────────────────────── escalation ladder ─────────────────────────
@@ -121,7 +125,7 @@ async function runEscalated(label, phaseName, makePrompt, opts = {}) {
     ...Array(sonnetTries).fill({ tier: 'sonnet', model: 'sonnet' }),
     ...Array(selfTries).fill({ tier: 'self', model: a.orchestratorModel }), // undefined -> inherit main-loop (you)
   ]
-  if (escalateToCodex) rungs.push({ tier: 'codex', driveCodex: true })
+  if (escalateToCodex) rungs.push({ tier: cli, driveCli: true })
   let feedback = ''
   let last = null
   for (let i = 0; i < rungs.length; i++) {
@@ -130,7 +134,7 @@ async function runEscalated(label, phaseName, makePrompt, opts = {}) {
     if (schema) o.schema = schema
     if (r.model) o.model = r.model   // per-tier model (sonnet / self / codex-driven) — intentionally varies
     const p = makePrompt(feedback, r.tier)
-    const res = await agent(r.driveCodex ? driveCodex(p, `/tmp/codex-${label.replace(/[^a-zA-Z0-9._-]/g, '_')}-${i + 1}.md`) : p, o)
+    const res = await agent(r.driveCli ? driveCli(p, `/tmp/${cli}-${label.replace(/[^a-zA-Z0-9._-]/g, '_')}-${i + 1}.md`) : p, o)
     const v = verify ? await verify(res) : { ok: res != null, feedback: 'empty result' }
     if (v.ok) { log(`${label}: accepted via ${r.tier} (attempt ${i + 1})`); return { result: res, tier: r.tier, attempt: i + 1, ok: true, needsUser: false } }
     last = res
@@ -276,13 +280,13 @@ let externalRound = 0, externalConsensus = false
 while (externalRound < maxExternal) {
   externalRound++
   const review = await agent(
-    driveCodex(
+    driveCli(
       `Act as a second-model adversarial reviewer for an implementation PLAN. Repo: ${repo}.\n${EVIDENCE}\n` +
       `INDEPENDENTLY verify the plan's "current state" claims with rg/Read and logs/real runs — do not take the plan's or any doc's word for it. Then judge completeness, sequencing, effort realism, and unverified assumptions. ` +
       `Set verified_against_code + default consensus=false unless genuinely sound. Each issue needs evidence (file:line/log) + fix.\n\nPLAN:\n${plan}`,
-      `/tmp/codex-extreview-${slug}-${externalRound}.md`
+      `/tmp/${cli}-extreview-${slug}-${externalRound}.md`
     ),
-    { label: `codex-review#${externalRound}`, phase: 'ExternalReview', model, effort, isolation, agentType, schema: CRITIQUE_SCHEMA }
+    { label: `${cli}-review#${externalRound}`, phase: 'ExternalReview', model, effort, isolation, agentType, schema: CRITIQUE_SCHEMA }
   )
   if (!review) return { aborted: true, stage: 'external-review', needsUser: true, round: externalRound } // codex (top automated tier) died -> escalate to user
   const blocking = (review.blocking_issues || []).filter(i => i.severity !== 'minor')

@@ -41,32 +41,36 @@ for (const k of ['repoPath', 'spec']) if (!a[k]) return { aborted: true, reason:
 
 const repo = a.repoPath
 const model = a.model || 'sonnet'   // listed on every agent() below (never omitted)
-const effort = a.effort || 'high'   // the harness agents' reasoning effort (codexEffort below drives codex itself)
+const effort = a.effort || 'high'   // the harness agents' reasoning effort
 // Official agent() opts, listed on every call. Both default OFF:
 const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
 const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
 // Second-model reviewer driven via tmux-agent-tools (agent-tmux <cli>), NOT a harness agentType:
 // the openai-codex plugin (codex:codex-rescue) is deprecated/disabled. agent-tmux works regardless
 // of plugin enablement and across repos. Mirrors plan-pipeline / codex-consensus-gate (file-polled).
-const cli = a.cli === 'claude' ? 'claude' : 'codex'   // second-model CLI: codex (default) | claude
-const codexEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(a.effort) ? a.effort : 'high'  // enum — emitted into a shell env assignment
-const codexTimeout = Number.isInteger(a.timeoutSec) ? a.timeoutSec : 600
+// cli is REQUIRED and neutral — NO built-in default (codex/claude are just the common ones). Each CLI's
+// launch flags come from its own agent-tmux profile (codex→--yolo, claude→--dangerously-skip-permissions);
+// EXTRA flags pass raw via a.launchEnv. charset guard blocks shell injection (cli is interpolated into commands).
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(a.cli || '')) return { aborted: true, reason: "missing/invalid arg: cli ('codex' | 'claude' | any agent-tmux profile name)" }
+const cli = a.cli
+const cliTimeout = Number.isInteger(a.timeoutSec) ? a.timeoutSec : 600
 // sanitize sessionName (emitted into a shell command, like slug) — fall back to a derived safe label
-const codexSession = (typeof a.sessionName === 'string' && /^[A-Za-z0-9._-]+$/.test(a.sessionName))
+const cliSession = (typeof a.sessionName === 'string' && /^[A-Za-z0-9._-]+$/.test(a.sessionName))
   ? a.sessionName
   : `spec-${cli}-${(a.slug || 'review').replace(/[^a-zA-Z0-9._-]/g, '_')}`
 const REVIEW_MARKER = '=== SECOND-MODEL REVIEW END ==='
-// codex takes --yolo + reasoning-effort; claude's profile already supplies its own launch flags.
-const launchEnv = cli === 'codex' ? `CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=${codexEffort}' ` : ''
+// Extra launch-flag env prefix — raw passthrough, caller-owned (profile already supplies each CLI's defaults).
+// e.g. a.launchEnv = "CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=high' "
+const launchEnv = typeof a.launchEnv === 'string' ? a.launchEnv : ''
 // POSIX-safe single-quote: wraps in '...' and renders embedded ' as '\'' so any repo path is safe.
 const shellQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
-const driveCodex = (taskForCodex, outHint) =>
+const driveCli = (taskForCli, outHint) =>
   `Get a genuine SECOND-MODEL (${cli}) review by driving a ${cli} session via tmux-agent-tools — do NOT use any harness agent type. ` +
   `If agent-tmux/${cli}-tmux are not on PATH, run them from the tmux-agent-tools skill bundle scripts/ dir.\n` +
   `1. Pick a unique OUT file (${outHint}); instruct ${cli} to WRITE its full review to OUT, ending the file with a final line exactly: ${REVIEW_MARKER}\n` +
-  `2. Start/reuse: ${launchEnv}agent-tmux ${cli} start --exact ${codexSession} ${shellQuote(repo)} "review task incoming; read fully before replying".\n` +
-  `3. Send via file: write the task below to a temp file, then agent-tmux ${cli} send --from-file <file> --enter-count 1 ${codexSession}.\n` +
-  `4. Wait by POLLING OUT (NOT the tmux pane — the marker echoes in the sent prompt), up to ${codexTimeout}s, until OUT exists AND contains "${REVIEW_MARKER}". Then read OUT and return ${cli}'s review (you are a conduit). Keep raw tmux scrollback out.\n\nTASK FOR ${cli.toUpperCase()}:\n${taskForCodex}`
+  `2. Start/reuse: ${launchEnv}agent-tmux ${cli} start --exact ${cliSession} ${shellQuote(repo)} "review task incoming; read fully before replying".\n` +
+  `3. Send via file: write the task below to a temp file, then agent-tmux ${cli} send --from-file <file> --enter-count 1 ${cliSession}.\n` +
+  `4. Wait by POLLING OUT (NOT the tmux pane — the marker echoes in the sent prompt), up to ${cliTimeout}s, until OUT exists AND contains "${REVIEW_MARKER}". Then read OUT and return ${cli}'s review (you are a conduit). Keep raw tmux scrollback out.\n\nTASK FOR ${cli.toUpperCase()}:\n${taskForCli}`
 const target = a.targetFile ? `\nTarget file: ${a.targetFile}` : ''
 const focus = a.reviewFocus || 'correctness, error handling, edge cases, anything that could silently corrupt state or data'
 const verifyCommands = Array.isArray(a.verifyCommands) ? a.verifyCommands : []
@@ -89,7 +93,7 @@ const reviewPrompt = (who) =>
   `Review the change just implemented against the spec below. Focus (${who}): ${focus}. ` +
   `Return a concise list of CONCRETE issues with file/line references and suggested fixes. If none, say "no issues".\n${SPEC}`
 const reviews = await parallel([
-  () => agent(driveCodex(reviewPrompt('second-model deep pass'), `/tmp/codex-review-${codexSession}.md`), { label: 'review:codex', phase: 'Review', model, effort, isolation, agentType }),
+  () => agent(driveCli(reviewPrompt('second-model deep pass'), `/tmp/${cli}-review-${cliSession}.md`), { label: `review:${cli}`, phase: 'Review', model, effort, isolation, agentType }),
   () => agent(reviewPrompt('claude reviewer'), { label: 'review:claude', phase: 'Review', model, effort, isolation, agentType }),
 ])
 // Detect BOTH reviewers symmetrically — each parallel thunk can return null on failure.
