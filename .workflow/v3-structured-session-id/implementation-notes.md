@@ -127,3 +127,27 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
 - Fix: codex worker `fix1` (brief fix1-brief.md). DONE + VERIFIED: dry-run now mirrors real-start —
   oneshot+paste→ok:false, oneshot+argv+empty→ok:false, oneshot+argv+prompt→ok:true, interactive→ok:true.
   oneshot-smoke 28/0, meta-smoke 58/0, self-test ok. Re-review dispatched (rvw2).
+
+### Adversarial review (round 2) — ACCEPT
+- Reviewer codex `rvw2` @bf7b2f3. Verdict: **ACCEPT, 0 blockers**. Confirmed blocker resolved + no new issues.
+- rvw2 evidence: dry-run paste→rc2/ok:false, empty→rc2/ok:false, happy→ok:true, interactive→ok:true; oneshot
+  ordering (cli_code + result write precede marker); meta-smoke 58/0; self-test; git diff --check; ci-shellcheck PASSED.
+- Codex 無異議 → review gate cleared. Proceeding to local+remote test → CI/CD fix → push → release.
+
+### Local + remote integration test (brain 復驗) — PASS
+- LOCAL live oneshot (real tmux, fake -p CLI): marker `__AGENT_TMUX_ONESHOT_EXIT__0` ✓, result.json
+  status:success/exit_code:0 ✓, status --json running:false/exit_detected:true/exit_code:0 ✓.
+- LOCAL live oneshot FAILURE (fake exits 3): marker `__..._3` ✓, result status:failed/exit_code:3 ✓ — proves
+  cli_code=$? captured before result synthesis (not masked).
+- REMOTE: ssh localhost reachable (REMOTE_OK + HAS_TMUX, after accept-new). start-ssh launches. The
+  start-ssh-localhost pane closes fast (read _ EOF over non-tty ssh) — PRE-EXISTING/ENV: diff hunks are all
+  ≤line ~3093 (globals/parser/shell_quote/run_dry_run_checks/session_meta/local start_session); start-ssh
+  remote_command (~3246) is UNTOUCHED, and #268 oneshot is local-only by design. Not a regression.
+
+### CI/CD fix
+- Finding: `.github/workflows/ci.yml` runs zsh -n + ci-shellcheck + `*-tmux self-test` + metadata, but does
+  NOT run the `scripts/test-*-smoke` suite. So test-session-meta-smoke (58) and test-oneshot-smoke (28) are
+  not gated by CI (self-test dry-run/profile-key blocks ARE, via *-tmux self-test). Fix: wire those two smokes
+  into ci.yml smoke job + release.yml validate job. (Broader 48-smoke suite unwired = pre-existing, out of scope.)
+- Release prep: bump version + CHANGELOG section for this increment, dispatched together to a codex worker.
+- Status: DISPATCHED (codex release-prep+CI worker)
