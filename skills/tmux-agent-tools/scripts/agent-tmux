@@ -1780,6 +1780,141 @@ session_meta_validate() {
   return 1
 }
 
+_file_mtime_epoch() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+session_id_capture_signal() {
+  local source="$1" reason="$2" count="${3:-0}"
+  require_jq
+  "$JQ" -c -n --arg event session_id_capture --arg source "$source" \
+    --arg status ambiguous --arg reason "$reason" --argjson candidate_count "$count" \
+    '{event:$event, source:$source, status:$status, reason:$reason, candidate_count:$candidate_count}' >&2
+}
+
+session_id_codex_snapshot() {
+  local sessions_root="$1" snapshot_path="$2" file
+  : > "$snapshot_path"
+  [[ -d "$sessions_root" ]] || return 0
+  for file in "$sessions_root"/**/rollout-*.jsonl(N); do
+    printf '%s\n' "$file" >> "$snapshot_path"
+  done
+}
+
+session_id_correlate_codex() {
+  local sessions_root="$1" launch_cwd="$2" since="$3" snapshot_path="${4:-}"
+  local uuid_re='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+  local -A seen
+  local line file base uuid mtime max_mtime=0
+  local -a candidates newest
+
+  if [[ -n "$snapshot_path" && -f "$snapshot_path" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      seen[$line]=1
+    done < "$snapshot_path"
+  fi
+  [[ -d "$sessions_root" ]] || { printf 'wait no_candidate 0\n'; return 1; }
+
+  for file in "$sessions_root"/**/rollout-*.jsonl(N); do
+    [[ -z "${seen[$file]:-}" ]] || continue
+    base="${file:t}"
+    [[ "$base" =~ "^rollout-.*-(${uuid_re})\\.jsonl$" ]] || continue
+    mtime="$(_file_mtime_epoch "$file")"
+    (( mtime >= since )) || continue
+    candidates+=("$file")
+    if (( mtime > max_mtime )); then
+      max_mtime="$mtime"
+      newest=("$file")
+    elif (( mtime == max_mtime )); then
+      newest+=("$file")
+    fi
+  done
+
+  (( ${#candidates[@]} > 0 )) || { printf 'wait no_candidate 0\n'; return 1; }
+  (( ${#newest[@]} == 1 )) || { printf 'bail mtime_tie %s\n' "${#newest[@]}"; return 2; }
+  (( ${#candidates[@]} == 1 )) || { printf 'bail multiple_candidates %s\n' "${#candidates[@]}"; return 2; }
+
+  file="${newest[1]}"
+  base="${file:t}"
+  [[ "$base" =~ "^rollout-.*-(${uuid_re})\\.jsonl$" ]] || { printf 'bail basename_mismatch 1\n'; return 2; }
+  uuid="${match[1]}"
+
+  local first verdict
+  IFS= read -r first < "$file" || { printf 'bail malformed_first_record 1\n'; return 2; }
+  verdict="$(printf '%s\n' "$first" | "$JQ" -r --arg id "$uuid" --arg cwd "$launch_cwd" '
+    if (.type != "session_meta") then "malformed"
+    elif (.payload.id // "") != $id then "id_mismatch"
+    elif (.payload.cwd // "") != $cwd then "cwd_mismatch"
+    else "ok" end
+  ' 2>/dev/null)" || { printf 'bail malformed_first_record 1\n'; return 2; }
+  case "$verdict" in
+    ok) printf 'ok %s\n' "$uuid"; return 0 ;;
+    id_mismatch) printf 'bail basename_payload_mismatch 1\n'; return 2 ;;
+    cwd_mismatch) printf 'bail cwd_mismatch 1\n'; return 2 ;;
+    *) printf 'bail malformed_first_record 1\n'; return 2 ;;
+  esac
+}
+
+session_id_correlate_agy() {
+  local gemini_root="$1" launch_cwd="$2" since="$3"
+  local uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  local cache="$gemini_root/cache/last_conversations.json" uuid db_path mtime
+  [[ -f "$cache" ]] || { printf 'bail missing_cwd_key 0\n'; return 2; }
+  uuid="$("$JQ" -r --arg cwd "$launch_cwd" '.[$cwd] // empty' "$cache" 2>/dev/null)" || {
+    printf 'bail malformed_cache 0\n'
+    return 2
+  }
+  [[ -n "$uuid" ]] || { printf 'bail missing_cwd_key 0\n'; return 2; }
+  [[ "$uuid" =~ "$uuid_re" ]] || { printf 'bail malformed_cache 1\n'; return 2; }
+  db_path="$gemini_root/conversations/$uuid.db"
+  [[ -f "$db_path" ]] || { printf 'bail missing_db 1\n'; return 2; }
+  mtime="$(_file_mtime_epoch "$db_path")"
+  (( mtime >= since )) || { printf 'bail stale_db 1\n'; return 2; }
+  printf 'ok %s\n' "$uuid"
+}
+
+spawn_transcript_session_id_capture() {
+  local cli="$1" name="$2" meta_path="$3" launch_cwd="$4" since="$5" snapshot_path="${6:-}"
+  local timeout="${AGENT_TMUX_SESSION_ID_CAPTURE_TIMEOUT:-30}"
+  local codex_root="${AGENT_TMUX_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}"
+  local agy_root="${AGENT_TMUX_AGY_ROOT:-$HOME/.gemini/antigravity-cli}"
+  (
+    local deadline=$(( $(date +%s) + timeout ))
+    local out capture_rc reason count id source
+    while (( $(date +%s) <= deadline )); do
+      capture_rc=0
+      case "$cli" in
+        codex)
+          source='codex_transcript'
+          out="$(session_id_correlate_codex "$codex_root" "$launch_cwd" "$since" "$snapshot_path")" || capture_rc=$?
+          ;;
+        agy)
+          source='agy_store'
+          out="$(session_id_correlate_agy "$agy_root" "$launch_cwd" "$since")" || capture_rc=$?
+          ;;
+        *)
+          source='unsupported_transcript'
+          session_id_capture_signal "$source" unsupported_cli 0
+          return 0
+          ;;
+      esac
+      if (( capture_rc == 0 )); then
+        id="${out#ok }"
+        write_session_meta_id "$meta_path" "$id"
+        return 0
+      fi
+      if (( capture_rc == 2 )); then
+        reason="${out#bail }"; count="${reason##* }"; reason="${reason% *}"
+        session_id_capture_signal "$source" "$reason" "$count"
+        return 0
+      fi
+      sleep 1
+    done
+    session_id_capture_signal "${source:-transcript}" no_candidate 0
+  ) &
+  disown 2>/dev/null || true
+}
+
 # Spawn a bounded background capture that extracts the CLI session UUID from
 # the tmux pane and atomically writes session-meta.json (single writer).
 # No-op when SESSION_ID_PATTERN is unset. Non-blocking; start stays fast.
@@ -2927,6 +3062,12 @@ start_session() {
 
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
+  local session_id_launch_since session_id_snapshot_path=""
+  session_id_launch_since="$(date +%s)"
+  if [[ "$SESSION_ID_CAPTURE" == "transcript" && "$CLI" == "codex" ]]; then
+    session_id_snapshot_path="$(agent_root_dir)/$name/session-id-codex-snapshot.txt"
+    session_id_codex_snapshot "${AGENT_TMUX_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}" "$session_id_snapshot_path"
+  fi
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
     "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
@@ -2935,7 +3076,7 @@ start_session() {
     supplied)
       ;;
     transcript)
-      # P3: structured transcript capturer writes session-meta.json here.
+      spawn_transcript_session_id_capture "$CLI" "$name" "$(agent_root_dir)/$name/session-meta.json" "$directory" "$session_id_launch_since" "$session_id_snapshot_path"
       ;;
     off)
       spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"

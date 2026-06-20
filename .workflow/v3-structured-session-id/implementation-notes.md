@@ -87,4 +87,20 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
   to fd/rg/jq. Flagged for the codex hard-tool-mapping rule; output unaffected.
 
 ### P3 — Codex/agy transcript correlation
-- Status: DISPATCHED (codex worker, fills the P2 transcript stub @2938)
+- Status: DONE + VERIFIED (codex worker p3tx). Diff: agent-tmux +143, test-session-meta-smoke +161.
+- New helpers: `session_id_capture_signal` (one non-secret bail signal), `session_id_codex_snapshot`,
+  `session_id_correlate_codex` (snapshot-exclusion + mtime floor + filename UUID + first-record session_meta +
+  payload.id match + launch cwd match; ok/wait/bail protocol), `session_id_correlate_agy`
+  (last_conversations.json[cwd] → UUID → conversations/<uuid>.db exists + mtime ≥ launch),
+  `spawn_transcript_session_id_capture` (background structured writer).
+- Precedence case @3076: supplied→noop · transcript→structured capturer · off→legacy pane
+  (`spawn_session_id_capture`, internally SESSION_ID_PATTERN-gated = original behavior). Pane never spawned in
+  transcript mode.
+- Brain verify (independent): zsh -n ✓ · test-session-meta-smoke 58/0 (was 27, +31) ✓ · codex self-test ok ✓ ·
+  default-off: no session_id_capture in bundled codex.conf/agy.conf ✓ · precedence case confirmed by eyeball.
+- Fixtures: codex {success, basename/payload mismatch, malformed first record, cwd mismatch, no candidates,
+  multiple candidates, mtime tie, decoy} + agy {success, missing cwd key, malformed cache UUID, stale db,
+  missing db, decoy} + asserts: exactly one bail signal, null sidecar on bail, transcript wiring.
+
+### P4 — #268 oneshot start_session branch
+- Status: DISPATCHED (codex worker)
