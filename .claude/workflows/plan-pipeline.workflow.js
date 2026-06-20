@@ -58,6 +58,13 @@ const model = a.model || 'sonnet'   // driving Claude agent's model (listed on e
 const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
 const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
 const timeout = a.timeoutSec || 1200
+// Second-model CLI is REQUIRED and neutral — NO built-in default (codex/claude are just the common ones).
+// Each CLI's launch flags come from its own agent-tmux profile; EXTRA flags pass raw via a.launchEnv.
+// charset guard blocks shell injection (cli is interpolated into commands).
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(a.cli || '')) return { aborted: true, reason: "missing/invalid arg: cli ('codex' | 'claude' | any agent-tmux profile name)" }
+const cli = a.cli
+// e.g. a.launchEnv = "CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=high' " — caller-owned passthrough.
+const launchEnv = typeof a.launchEnv === 'string' ? a.launchEnv : ''
 
 const FROZEN = { type: 'object', additionalProperties: false,
   required: ['ok', 'frozen', 'path', 'rounds', 'summary'],
@@ -76,12 +83,12 @@ const FROZEN = { type: 'object', additionalProperties: false,
 const STATUS = { type: 'object', additionalProperties: false,
   required: ['ok', 'summary'], properties: { ok: { type: 'boolean' }, summary: { type: 'string' }, detail: { type: 'string' } } }
 
-// Shared instruction: how to drive codex draft→adversarial-review→freeze, file-polled.
-const codexFreeze = (what, outPath, extra) =>
-  `Drive codex via agent-tmux to DRAFT then FREEZE ${what}. If agent-tmux/codex-tmux are not on PATH, run them from the tmux-agent-tools skill bundle scripts/ dir.\n` +
-  `1. Start codex: CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=${effort}' agent-tmux codex start --exact ${session} ${repo} "planning task incoming; read fully".\n` +
-  `2. Have codex write the artifact to ${outPath} (create parent dirs). Ground every claim in real code/files — do NOT trust memory or stale docs.\n` +
-  `3. FREEZE LOOP (max ${maxRounds} rounds): drive an ADVERSARIAL codex review of the artifact; codex writes its verdict to a unique OUT file ending with a last line exactly: === PLAN REVIEW END ===. Wait by POLLING that OUT file for the marker (NOT the tmux pane — it echoes in the sent prompt), up to ${timeout}s. If the verdict has any Critical/Major, apply the fix to ${outPath} and review again. Stop when CLEAN (0 Critical / 0 Major) or rounds exhausted.\n` +
+// Shared instruction: how to drive the second-model CLI draft→adversarial-review→freeze, file-polled.
+const cliFreeze = (what, outPath, extra) =>
+  `Drive ${cli} via agent-tmux to DRAFT then FREEZE ${what}. If agent-tmux/${cli}-tmux are not on PATH, run them from the tmux-agent-tools skill bundle scripts/ dir.\n` +
+  `1. Start ${cli}: ${launchEnv}agent-tmux ${cli} start --exact ${session} ${repo} "planning task incoming; read fully".\n` +
+  `2. Have ${cli} write the artifact to ${outPath} (create parent dirs). Ground every claim in real code/files — do NOT trust memory or stale docs.\n` +
+  `3. FREEZE LOOP (max ${maxRounds} rounds): drive an ADVERSARIAL ${cli} review of the artifact; ${cli} writes its verdict to a unique OUT file ending with a last line exactly: === PLAN REVIEW END ===. Wait by POLLING that OUT file for the marker (NOT the tmux pane — it echoes in the sent prompt), up to ${timeout}s. If the verdict has any Critical/Major, apply the fix to ${outPath} and review again. Stop when CLEAN (0 Critical / 0 Major) or rounds exhausted.\n` +
   `4. Return frozen=true iff it reached CLEAN; path=${outPath}; rounds=number of rounds used; summary; blockers=[] (or remaining issues if not frozen).${extra || ''}`
 
 const artifacts = []
@@ -91,7 +98,7 @@ let direction = { skipped: true, path: directionPath }
 if (a.skipDirection !== true) {
   phase('Direction')
   direction = await agent(
-    codexFreeze(
+    cliFreeze(
       `the DIRECTION goal_doc for "${slug}" at ${directionPath}. Topic/brief:\n<<<\n${brief}\n>>>\n` +
       `It must list candidate workstreams (goal / why-now / effort S·M·L / risk / readiness), a PRIORITIZED in-scope vs explicitly-deferred split (MECE) with one-line rationale each, the FIRST concrete step, and an "ADR vs direct build" flag per item`,
       directionPath
@@ -105,7 +112,7 @@ if (a.skipDirection !== true) {
 // ── ② Frozen plan ──
 phase('Plan')
 const plan = await agent(
-  codexFreeze(
+  cliFreeze(
     `the implementation PLAN at ${planPath}, derived from the direction doc ${directionPath}. ` +
     `Include: goal, success criteria, scope/non-goals, per-area work breakdown (tasks with effort + touched files + deps), risks/open-questions, phased sequence, and an explicit "ADR vs direct build" list`,
     planPath,
@@ -124,7 +131,7 @@ if (adrList.length) {
   for (const adr of adrList) {
     const adrPath = `${adrDir}/${adr.slug}.md`  // caller-provided slug should include the NNNN- prefix if their repo uses it
     const r = await agent(
-      codexFreeze(
+      cliFreeze(
         `the ADR "${adr.title || adr.slug}" at ${adrPath} (number it per the existing ${adrDir}/ convention if it uses NNNN- prefixes). ` +
         `Decision brief: ${adr.brief || adr.title || adr.slug}. It must follow the format of existing ADRs in ${adrDir}/ and ground every choice in real source line references. This is DESIGN ONLY — no product code`,
         adrPath

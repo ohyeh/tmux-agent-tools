@@ -27,6 +27,13 @@ const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: 
 const agentType = a.agentType || undefined  // off = default workflow agent. NEVER hardcode a custom one — a missing agentType is a HARD error (#20931), breaks portability
 const marker = a.marker || '=== CODEX VERDICT END ==='
 const timeout = a.timeoutSec || 600
+// Second-model CLI is REQUIRED and neutral — NO built-in default (this workflow is named for codex, but
+// the mechanism drives any agent-tmux profile). Launch flags come from the CLI's own profile; EXTRA flags
+// pass raw via a.launchEnv. charset guard blocks shell injection (cli is interpolated into commands).
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(a.cli || '')) return { aborted: true, reason: "missing/invalid arg: cli ('codex' | 'claude' | any agent-tmux profile name)" }
+const cli = a.cli
+// e.g. a.launchEnv = "CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=high' " — caller-owned passthrough.
+const launchEnv = typeof a.launchEnv === 'string' ? a.launchEnv : ''
 
 const SCHEMA = {
   type: 'object', additionalProperties: false,
@@ -41,17 +48,17 @@ const SCHEMA = {
 
 phase('Consult')
 const r = await agent(
-  `Drive a codex session via agent-tmux to get a high-effort architecture/decision consensus, then return its verdict.
-If the agent-tmux / codex-tmux wrappers are not on PATH, run them from the tmux-agent-tools skill bundle (its scripts/ dir).
+  `Drive a ${cli} session via agent-tmux to get a high-effort architecture/decision consensus, then return its verdict.
+If the agent-tmux / ${cli}-tmux wrappers are not on PATH, run them from the tmux-agent-tools skill bundle (its scripts/ dir).
 Steps:
 1. Ensure the proposal text is available. ${a.proposalFile ? `Proposal file: ${a.proposalFile}.` : `Proposal text:\n<<<\n${a.proposalText}\n>>>\n(write it to a temp file to send via --from-file).`}
-   Pick a unique output path OUT (e.g. /tmp/codex-consensus-${session}.md). Append an instruction to the proposal so codex, when done, WRITES its full verdict to OUT and ENDS that file with a line exactly: ${marker}
-2. Start (or reuse) a codex session: CODEX_TMUX_LAUNCH_FLAGS='--yolo -c model_reasoning_effort=${effort}' agent-tmux codex start --exact ${session} ${repo} "I will send a consensus request; read fully before replying."
-3. Send the proposal: agent-tmux codex send --from-file <file> --enter-count 1 ${session}
-4. Wait for completion by POLLING the output file OUT, NOT by matching the marker in the tmux pane. The marker also appears in the prompt you just sent, so a pane/wait-text match would false-trigger on the echo (a bug hit repeatedly in practice). Poll: every few seconds check that OUT exists AND contains "${marker}", up to ${timeout}s. Only then read OUT. (agent-tmux codex wait ${session} ${timeout} may be used as a secondary idle signal, but the file is the authoritative completion signal.)
+   Pick a unique output path OUT (e.g. /tmp/${cli}-consensus-${session}.md). Append an instruction to the proposal so ${cli}, when done, WRITES its full verdict to OUT and ENDS that file with a line exactly: ${marker}
+2. Start (or reuse) a ${cli} session: ${launchEnv}agent-tmux ${cli} start --exact ${session} ${repo} "I will send a consensus request; read fully before replying."
+3. Send the proposal: agent-tmux ${cli} send --from-file <file> --enter-count 1 ${session}
+4. Wait for completion by POLLING the output file OUT, NOT by matching the marker in the tmux pane. The marker also appears in the prompt you just sent, so a pane/wait-text match would false-trigger on the echo (a bug hit repeatedly in practice). Poll: every few seconds check that OUT exists AND contains "${marker}", up to ${timeout}s. Only then read OUT. (agent-tmux ${cli} wait ${session} ${timeout} may be used as a secondary idle signal, but the file is the authoritative completion signal.)
 5. Return: verdict = the verdict text read from OUT (trimmed, drop the trailing marker line); consensus = your classification (agree / agree_with_changes / disagree / unclear); notes = key objections or required changes.
 Keep raw tmux scrollback out of the final message; return only the structured fields.`,
-  { label: `codex:${session}`, phase: 'Consult', model, effort, isolation, agentType, schema: SCHEMA }
+  { label: `${cli}:${session}`, phase: 'Consult', model, effort, isolation, agentType, schema: SCHEMA }
 )
 // `passed` is a strict allow-list: only genuine consensus clears the gate.
 // agree_with_changes / unclear / disagree / missing all fall through to false;

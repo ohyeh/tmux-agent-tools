@@ -73,6 +73,10 @@ const effort = a.effort || 'high'
 // Official agent() opts, also forwarded to nested stages. Both default OFF:
 const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
 const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
+// Second-model CLI forwarded to every stage — REQUIRED, neutral (no codex default). Validated here so
+// the error surfaces at the shell, not deep in a child stage.
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(a.cli || '')) return { aborted: true, reason: "missing/invalid arg: cli ('codex' | 'claude' | any agent-tmux profile name)" }
+const cli = a.cli
 
 // ── Phase 1: PLAN — delegate to the chosen mid-level workflow ──────────────────
 phase('Plan')
@@ -90,7 +94,7 @@ if (mode === 'explore') {
 } else {
   plan = await workflow('plan-pipeline', {
     repoPath: a.repoPath, brief: a.brief, slug, planPath: a.planPath,
-    maxReviewRounds: a.maxReviewRounds, model, effort, isolation, agentType, timeoutSec: a.timeoutSec,   // model/effort/isolation/agentType explicit
+    maxReviewRounds: a.maxReviewRounds, cli, model, effort, isolation, agentType, timeoutSec: a.timeoutSec,   // cli/model/effort/isolation/agentType explicit
     commitPush: a.commit === true || a.push === true,
   })
   planClean = !!plan && plan.passed === true && plan.ready_for_build === true
