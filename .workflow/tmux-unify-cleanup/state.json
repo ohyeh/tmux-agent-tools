@@ -1,0 +1,37 @@
+{
+  "title": "Unify workflows on tmux-agent-tools and harden feature-lifecycle flow",
+  "slug": "tmux-unify-cleanup",
+  "created_at": "2026-06-20T07:48:27+00:00",
+  "status": "complete",
+  "orchestration": "single-context (no swarm, no goal mode) — small maintenance task executed in one pass",
+  "approval": {
+    "required": true,
+    "granted": true,
+    "notes": "User authorized full one-pass execution incl. P1. P1 live codex round was run isolated in a /tmp dir (trivial task, no repo writes)."
+  },
+  "packets": [
+    { "id": "P0", "title": "Remove codex:codex-rescue + fix root-cause paren bug", "owner": "feature-plan-consensus.js, spec-implement-dual-review-verify.js, root-cause-deep-dive-audit.js", "status": "done", "verified": "static: syntax + no live dead refs" },
+    { "id": "P1", "title": "Runtime smoke: agent-tmux callable from workflow env", "owner": "agent-tmux bundle, codex CLI", "status": "done", "verified": "agent-tmux self-test ok; live codex round wrote SMOKE_OK+marker, file-polled, session stopped clean" },
+    { "id": "P2", "title": "Parameterize cli codex|claude in driver workflows", "owner": "feature-plan-consensus.js, spec-implement-dual-review-verify.js", "status": "done", "verified": "cli arg + per-cli launchEnv; default codex unchanged; syntax green" },
+    { "id": "P3", "title": "Nesting-guard comment in stage workflows", "owner": "feature-plan-consensus.js, spec-implement-dual-review-verify.js, plan-pipeline.js", "status": "done", "verified": "3 stages carry NESTING note" },
+    { "id": "P4", "title": "Args channel hardening (concurrency warning)", "owner": "feature-lifecycle-auto.js", "status": "done", "verified": "logs warning when inputs come from shared global job file" },
+    { "id": "P5", "title": "Strengthen planOk quality gate (section completeness)", "owner": "feature-plan-consensus.js", "status": "done", "verified": "REQUIRED_SECTIONS check over PLAN_SECTIONS 5 sections" },
+    { "id": "P6", "title": "Budget/round guard in lifecycle shell", "owner": "feature-lifecycle-auto.js", "status": "done", "verified": "early-exit before BUILD when budget.remaining() < 80k" },
+    { "id": "P7", "title": "build->ADR deviation->amendment halt-gate", "type": "design->implementation", "owner": "spec-implement-dual-review-verify.js", "status": "done", "decision": "judgment-rule + halt-gate in build workflow; amendment reuses plan-pipeline (no new workflow)", "threshold": "contradicts a frozen SC-x / ADR Decision line => amendment; elaborates => deviation", "verified": "FINALIZE_SCHEMA deviations[] + amendment_needed hard-stop; syntax green" },
+    { "id": "P8", "title": "Reset stale v8 BUILTIN in deployed plan-pipeline + genericize doc", "owner": "plan-pipeline.js", "status": "done", "verified": "BUILTIN={}; no v8/huddle residue" }
+  ],
+  "verification": {
+    "status": "pass",
+    "checks": [
+      { "name": "no live codex:codex-rescue / agentType refs", "result": "pass" },
+      { "name": "all 6 workflows parse (AsyncFunction)", "result": "pass" },
+      { "name": "SAFE_LIB inline copy byte-identical", "result": "pass" },
+      { "name": "cli codex|claude parameterized in 2 drivers", "result": "pass" },
+      { "name": "nesting guard in 3 stages", "result": "pass" },
+      { "name": "plan-pipeline BUILTIN reset, no v8 residue", "result": "pass" },
+      { "name": "agent-tmux self-test", "result": "pass" },
+      { "name": "live codex round via agent-tmux (file-polled)", "result": "pass" },
+      { "name": "codex adversarial review of all edits (3 rounds)", "result": "pass", "detail": "BLOCK(4Maj+1Min) -> BLOCK(1Maj) -> CLEAN(0/0); see results/codex-review.md" }
+    ]
+  },
+  "codex_frozen": true}
