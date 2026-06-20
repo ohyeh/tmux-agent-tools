@@ -116,5 +116,14 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
 ## Build complete: P1–P4 all VERIFIED. Next: codex adversarial review (full diff main..HEAD) → local+remote
 ## test → CI/CD fix → push → release.
 
-### Adversarial review
-- Status: DISPATCHED (codex reviewer on full diff main..HEAD)
+### Adversarial review (round 1)
+- Reviewer codex `rvw1`. Verdict: ACCEPT_WITH_CHANGES, 1 major blocker.
+- Blocker (confirmed by brain): `run_dry_run_checks` (~1281) reports ok:true for exec_mode=oneshot configs
+  that real start rejects with exit 2 (prompt_via!=argv @3094-3098; empty prompt @3100-3102). Dry-run must
+  mirror real-start preconditions.
+- Reviewer also verified clean: hostile prompt quoting, supplied-id non-leakage, default-off, smoke 58/0,
+  self-test, help for all 5 CLIs. (Skipped test-oneshot-smoke as it would start tmux, which the review brief
+  forbade — brain runs it directly.)
+- Fix: codex worker `fix1` (brief fix1-brief.md). DONE + VERIFIED: dry-run now mirrors real-start —
+  oneshot+paste→ok:false, oneshot+argv+empty→ok:false, oneshot+argv+prompt→ok:true, interactive→ok:true.
+  oneshot-smoke 28/0, meta-smoke 58/0, self-test ok. Re-review dispatched (rvw2).

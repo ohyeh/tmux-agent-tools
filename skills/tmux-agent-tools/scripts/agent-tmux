@@ -1279,8 +1279,16 @@ run_dry_run_checks() {
     fi
   fi
   local invocation_json oneshot_command=""
-  if [[ "$EXEC_MODE" == "oneshot" && "$PROMPT_VIA" == "argv" && -n "$initial_text" ]]; then
-    oneshot_command="$(oneshot_invocation_command "$initial_text" "$invocation_flags")"
+  if [[ "$EXEC_MODE" == "oneshot" ]]; then
+    if [[ "$PROMPT_VIA" != "argv" ]]; then
+      add_check "oneshot_prompt_via" "fail" "exec_mode=oneshot requires prompt_via=argv"
+      ok=0
+    elif [[ -z "$initial_text" ]]; then
+      add_check "oneshot_prompt" "fail" "exec_mode=oneshot requires initial text"
+      ok=0
+    else
+      oneshot_command="$(oneshot_invocation_command "$initial_text" "$invocation_flags")"
+    fi
   fi
   invocation_json="$("$JQ" -c -n \
     --arg session  "$invocation_session" \
