@@ -116,3 +116,47 @@ proving its field semantics are stable across ≥2 versions. That is the L-phase
 shortcut to take now.
 
 Status: this increment ships no code. The goal doc + findings are the deliverable.
+
+## Phase-S REOPENED → conditional GO (2026-06-21, brain×codex design round)
+
+The STOP above was correct under its own "wrapper-owned only" source definition. A follow-up evidence pass
+(brain + codex `v3-design`, two-round design discussion — full design in `design-proposal.md`) reopened the
+gate by **widening the source definition to CLI-owned local transcripts, strictly correlated**. The safety
+bar is unchanged; only source ownership widened. Verdict: **GO**, with two proven mechanisms only
+(`supplied` + `transcript`) across three proven CLIs, and everything default-off until the L gate.
+
+Verified facts (with evidence):
+- Claude exposes `claude --session-id <uuid>` at creation → the wrapper can SUPPLY the id (race-free, known
+  pre-launch). Confirmed via `claude --help`.
+- Codex has NO creation-time id flag; it self-generates a UUIDv7 written to
+  `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`, first record `type:"session_meta"` with
+  `payload.id == filename uuid` and `payload.cwd`. Only transcript correlation is possible.
+- Investigated 80 local codex transcripts: no wrapper-controlled token lands in `session_meta.payload`, so
+  same-cwd concurrency genuinely bottoms out at null-on-ambiguity (with an observable signal, never silent).
+
+Agreed design (supersedes the STOP for these CLIs):
+
+| CLI | Mechanism | `session_id_capture` | Notes |
+| --- | --- | --- | --- |
+| claude | wrapper supplies UUID via `--session-id`, sidecar written **synchronously before launch** | `supplied` | no background capturer, no pane fallback, no transcript scan (dead code, deleted) |
+| codex | correlate Codex-owned transcript after start (snapshot → newest-new + `payload.id`/`cwd` equality) | `transcript` | null-on-ambiguity + observable bail signal |
+| agy | correlate agy-owned store after start (read `~/.gemini/antigravity-cli/cache/last_conversations.json[cwd]` → cross-check `conversations/<uuid>.db` exists + mtime after launch) | `transcript` | **source found** (brain follow-up); resume via `--conversation <uuid>`; null-on-ambiguity, default-off until live resume confirmed |
+| cursor/grok | none proven | `off` | binary unavailable locally; stay default-off |
+
+Key design decisions (resolved in discussion):
+1. **One writer per session via mutual exclusion, not locks**: if `session_id_capture != off`, the
+   structured/supplied path is the only writer; the legacy pane capturer (`session_id_pattern`) is spawned
+   ONLY when `session_id_capture=off`. Eliminates the two-writer TOCTOU race by construction.
+2. **New profile key `session_id_capture=off|supplied|transcript`** (mechanism-only; per-CLI transcript
+   mechanics live in a small internal table, not user-facing enum values; never inferred from
+   `heuristic_family`).
+3. **Unified Phase 1 with #268**: add #268 keys (`exec_mode`/`prompt_via`/`prompt_flag`) and `session_id_capture`
+   in ONE profile-key round (they don't collide), then land two independent `start_session` concerns —
+   execution-mode (#268, owns `result.json`) and session-id capture (v3, owns `session-meta.json`) — without
+   coupling their outputs.
+4. Default-off through P1–P4; default-on is the later L gate (≥2 version samples per CLI + tested ambiguity).
+
+Phases: P1 unified profile-key surface → P2 Claude supplied-id → P3 Codex transcript correlation →
+P4 #268 oneshot behavior → L per-CLI default enablement. Hard gates per phase in `design-proposal.md`.
+
+Status: **ready to implement, jointly with #268** (shared P1). No remaining design disagreement.

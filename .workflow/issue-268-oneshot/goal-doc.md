@@ -14,6 +14,8 @@ unanswerable OAuth prompt and hangs.
 
 - New profile keys parse + validate: `exec_mode=interactive|oneshot` (default `interactive`),
   `prompt_via=paste|argv` (default `paste`), `prompt_flag=<string>` (**optional, may be empty**).
+- Shared v3 Phase 1 ships the parser/default/docs round together with
+  `session_id_capture=off|supplied|transcript`; #268 still owns only oneshot behavior and `result.json`.
 - `exec_mode=oneshot` runs the CLI **once** inside the tmux pane:
   `<bin> <launch_flags> [prompt_flag] <prompt>`, prompt passed as a single shell-quoted argv (via existing
   `shell_quote`) — never pasted. When `prompt_flag` is empty it is skipped and the prompt is the bare
@@ -38,7 +40,8 @@ fake-fixture tests.
 
 Non-goals: do NOT solve general `launch_flags` shell-token parsing (stays a raw fragment); do NOT flip
 bundled `agy.conf` to oneshot until verified on a real environment (user-local opt-in first); no
-`prompt_via=argv` for interactive mode; no env-override parity for the new keys this increment.
+`prompt_via=argv` for interactive mode; no env-override parity for the new keys this increment; do NOT write
+or interpret v3 `session-meta.json` beyond sharing the Phase 1 parser/docs round.
 
 ## 4. Risks + Mitigations
 
@@ -53,9 +56,9 @@ bundled `agy.conf` to oneshot until verified on a real environment (user-local o
 
 ## 5. Phased Breakdown
 
-### Phase 1 — Profile surface only
-Add globals `EXEC_MODE=interactive`, `PROMPT_VIA=paste`, `PROMPT_FLAG=''`; parse/validate the three keys in
-`load_cli_profile`; update `scripts/profiles/README.md` key table; profile-parse self-test (no tmux).
+### Phase 1 — Unified profile surface only
+Add globals `EXEC_MODE=interactive`, `PROMPT_VIA=paste`, `PROMPT_FLAG=''`; in the shared v3/#268 round, also
+parse/validate `session_id_capture=off|supplied|transcript` for v3. Update `scripts/profiles/README.md` key table; profile-parse self-test (no tmux).
 Exit: unknown values fail/warn consistently; claude/codex/agy behavior unchanged.
 
 ### Phase 2 — Oneshot `start_session` branch
