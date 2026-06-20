@@ -11,7 +11,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 - **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>` → `codex-tmux ping --json --timeout 5 <n>` only if liveness is unclear. Pane capture is diagnostic fallback only.
 - **Multiple workers, need first/all/quorum completions?** One blocking call: `codex-tmux watch --any|--all|--count <n> --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner/quorum, then `codex-tmux result --json <winner>`.
 - **Want to auto-delegate a substantial task?** Use the `.claude/agents/tmux-delegate.md` subagent to decide inline vs worker, then run its exact wrapper command.
-- **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor` showing both the resolved binary and the `profile:` line.
+- **New or renamed CLI?** Write a profile (`~/.config/agent-tmux/profiles/<cli>.conf` with `bin=…`), then prove it with `agent-tmux <cli> doctor --json` / `agent-tmux <cli> setup` and a `start --dry-run` before starting a real session.
 
 ## Overview
 
@@ -26,6 +26,7 @@ Local and SSH sessions keep the pane open after the agent CLI exits, showing the
 The wrapper scripts are bundled at:
 
 - `scripts/agent-tmux` (engine; `agent-tmux <cli> <command>`)
+- `scripts/agy-tmux`
 - `scripts/claude-tmux`
 - `scripts/codex-tmux`
 - `scripts/profiles/` (built-in profile dir + README and examples)
@@ -41,6 +42,7 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 | Name | One-line purpose | When to reach for it |
 | --- | --- | --- |
 | `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets, `doctor --json`, `setup`, and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools), when scripting across multiple CLIs, or when running JSON preflight via `agent-tmux <cli> setup`. |
+| `agy-tmux` | Thin shim for the bundled `agy` profile over `agent-tmux agy`. | Use when supervising Antigravity/agy with the same wrapper contract as Claude and Codex. |
 | `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, ping, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
 | `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
 | `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
@@ -67,13 +69,13 @@ If the commands are not on `PATH`, resolve them from the skill directory and run
 
 Claude Code can use `.claude/agents/tmux-delegate.md` as the decision gate for substantial work. It delegates when the task is likely to take more than 30s, modifies 2 files or more, needs an independent context window, requires a multi-step read-plan-write cycle, or runs tests/builds/lint across the codebase. It handles inline for single-file reads/searches/formatting, one-liners with immediate output, explicit "quick"/"inline" requests, and marginal cases.
 
-`tmux-delegate` must include this literal worker constraint in every delegated prompt: "Do not spawn additional tmux sessions or delegate further." It uses a hardcoded wrapper command skeleton instead of interpolating raw task text into Bash. Resume (v2): after `start`, a background capture may populate `session-meta.json` with a `cli_session_id` UUID — read it with `jq -r .cli_session_id "$TMUX_AGENT_DIR/<name>/session-meta.json"` and use it with `resume` if non-null. Bundled `claude.conf` and `codex.conf` ship `session_id_pattern` UNSET — resume is unsupported by default (guardrail: no verified deterministic session-label format confirmed across versions). Operators opt in per-CLI by setting `session_id_pattern` to a label-anchored ERE (e.g. `session_id_pattern=Session ID:`) in a user-local profile once they know the exact label line their version prints. Capture is label-anchored + UUID-validated (decoy UUIDs on non-matching lines are ignored).
+`tmux-delegate` must include this literal worker constraint in every delegated prompt: "Do not spawn additional tmux sessions or delegate further." It uses a hardcoded wrapper command skeleton instead of interpolating raw task text into Bash. Resume (v2): after `start`, a background capture may populate `session-meta.json` with a `cli_session_id` UUID — read it with `jq -r .cli_session_id "$TMUX_AGENT_DIR/<name>/session-meta.json"` or `result --field .cli_session_id`, then use it with `resume` if non-null. Bundled `claude.conf` and `codex.conf` ship `session_id_pattern` UNSET — resume is unsupported by default (guardrail: no verified deterministic session-label format confirmed across versions). Operators opt in per-CLI by setting `session_id_pattern` to a label-anchored ERE (e.g. `session_id_pattern=Session ID:`) in a user-local profile once they know the exact label line their version prints. Capture is label-anchored + UUID-validated (decoy UUIDs on non-matching lines are ignored).
 
 ## Command Choice
 
-- `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI; `agent-tmux <cli>` for any other CLI (gemini, cursor, grok, custom binaries).
+- `claude-tmux` when the worker should run Claude Code; `codex-tmux` when it should run Codex CLI; `agy-tmux` for agy; `agent-tmux <cli>` for any other CLI (gemini, cursor, grok, custom binaries).
 - `start` for a local working directory; `start-ssh` when tmux stays local but the CLI runs over SSH.
-- `resume` (claude or codex) when an existing session ID should continue inside a managed tmux session.
+- `resume` when an existing CLI session UUID should continue inside a managed tmux session. v2 `cli_session_id` capture is opt-in and default-off unless the active profile sets a label-anchored `session_id_pattern`.
 - The subcommands `send`, `send-wait`, `capture`, `wait*`, `status`, `ping`, `attach`, `stop`, and `result` all take the **agent name** you chose, not the full tmux session name.
 - If you don't know which wrapper owns a session, use `tmux-agent-sessions resolve --name <partial-or-full-name> --json` before any `start`. It accepts a full tmux session name, wrapper-prefixed partial, or short agent name and returns the owning wrapper, short `agent_name`, full tmux session, cwd, result path, running state, and safe next commands for `status`, `wait-and-capture`, and `result`. Ambiguous or missing names exit non-zero and return JSON candidates/errors.
 - Use `tmux-agent-monitor --name <agent> --every <duration> --commands <manifest.json> --stop-on-change --summary-out <path> --json` when you need read-only periodic evidence checks against a managed session/repo. It polls manifest commands and emits JSONL observations plus a summary; it is distinct from `wait-and-capture`, which watches a tmux pane for a marker and captures pane output.
@@ -83,6 +85,14 @@ Claude Code can use `.claude/agents/tmux-delegate.md` as the decision gate for s
 `agent-tmux <cli>` works for any binary out of the box: unknown CLI names get generic defaults (binary = the CLI name, generic-family heuristics, no provider-key inheritance, no `--yolo`, result-path-via-prompt on, no launch flags). Profiles are the canonical per-CLI configuration: the bundled `scripts/profiles/` directory ships the defaults for claude/codex/agy/cursor/grok (the in-script preset table is a frozen legacy fallback), and new CLIs are added as profiles, not code. To customize, write a declarative profile at `~/.config/agent-tmux/profiles/<cli>.conf`, set `AGENT_TMUX_PROFILE_DIR`, or pass it at use time: `agent-tmux <cli> --profile-dir <your-managed-dir> …` / `--profile <file>`. Profiles are plain `key=value` files — never sourced, so they cannot execute code. Precedence: env vars (`<NS>_TMUX_*` > `AGENT_TMUX_*`) > `--profile`/`--profile-dir` > `$AGENT_TMUX_PROFILE_DIR` > user config dir > bundled defaults > legacy preset.
 
 Migration note: unlisted CLIs now use `generic` instead of Codex-family behavior. If a custom CLI intentionally needs Codex/OpenAI provider-key inheritance or `--yolo`, set those explicitly in its profile.
+
+Profile contract keys that affect safety and structured results:
+
+- `approval=prompt|auto` controls the profile approval mode; read the active value from `agent-tmux <cli> doctor --json`.
+- `result_required_fields=status,summary,...` becomes the default field list for `result wait-required` when `--fields` is omitted; explicit `--fields` still wins.
+- `session_id_pattern=<label-anchored ERE>` enables v2 `cli_session_id` capture. Leave it unset unless the CLI's session-label line is verified for that version.
+
+Use `agent-tmux <cli> setup` as the JSON preflight (`doctor --json` + `self-test`). Use `agent-tmux <cli> start --dry-run ...` to inspect the resolved invocation/profile without creating a tmux session.
 
 ```ini
 # ~/.config/agent-tmux/profiles/gemini.conf
@@ -94,6 +104,9 @@ heuristic_family=generic
 # Optional detection overrides (extended regex, case-insensitive):
 pattern_busy=(thinking|generating|esc to cancel)
 pattern_approval_prompt=allow this (command|action)\?
+approval=prompt
+result_required_fields=status,summary
+# session_id_pattern=Session ID:
 ```
 
 Common cases:
@@ -136,6 +149,8 @@ Only send after those checks show the teammate is idle, stalled, or explicitly b
 codex-tmux start --exact worker ~/github/project 'Read the repo and report the failing test. Write $TMUX_AGENT_RESULT when done.'
 claude-tmux resume --exact worker ~/github/project ee5aca88-a1af-48d3-af21-54f60d618f22
 ```
+
+Use `start --dry-run` first when validating a new profile, `--result-schema`, or launch flags; it prints the resolved invocation and exits without creating a tmux session.
 
 2. **Send** follow-up work without attaching:
 
@@ -194,11 +209,14 @@ Use `env-doctor [name]` before deeper debugging when an agent CLI uses the wrong
 
 ```bash
 codex-tmux result --field '.status' --wait 30 --json worker
+codex-tmux result --field '.cli_session_id' --wait 30 worker
 codex-tmux result validate worker --json
 codex-tmux result wait-required worker --fields status,summary --wait 60 --json
 ```
 
 Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. For `result_path_via_prompt=true` families (Codex and generic by default), prompt sends automatically include the literal path because sandboxed tool envs cannot expand `$TMUX_AGENT_RESULT`. Use `result --path <name>` as the debug surface. Parent branches on `.present` → `.valid` → `.body` in that order. See `references/contracts.md`.
+
+`cli_session_id` is not stored in `result.json`; `result --field .cli_session_id` reads the per-session `session-meta.json` sidecar so resume can work before the worker writes a final result. `--result-schema <abs.json>` on `start`/`resume` persists a schema path for `result validate`; profile `result_required_fields` supplies the default required-field contract for `result wait-required`.
 
 Stall fallback: if `status --json` reports `running:true` with high `idle_seconds` and `ping` times out, send one bounded recovery prompt with `send-wait`: "Write result.json now with status blocked and the current blocker." Then read `result wait-required worker --fields status,summary --wait 60 --json`. If that also times out, stop waiting and report stalled with structured status plus one diagnostic capture tail.
 
@@ -270,7 +288,7 @@ Always run `tmux-agent-dialogue validate-transcript --transcript <path>` before 
 
 - The wrappers run their CLIs with permissive flags by default (`--dangerously-skip-permissions` for Claude, `--yolo` for Codex; profiles may set their own `launch_flags`). Do not use them for destructive, privacy-sensitive, externally visible, payment, or irreversible operations without explicit user authorization.
 - `claude-tmux status <name>` reports a `diagnostic` when the pane looks like it is waiting for a first-run or permission confirmation. It does NOT auto-accept that prompt.
-- Prefer `doctor` and `self-test` before debugging agent behavior; they verify wrapper dependencies and tmux capture/wait without starting a real agent.
+- Prefer `doctor --json`, `setup`, and `self-test` before debugging agent behavior; they verify wrapper dependencies, active approval/profile state, and tmux capture/wait without starting a real agent.
 - For secret injection (`--secret KEY=URI`) and audit log enablement (`TMUX_AGENT_TOOLS_AUDIT_LOG`): see `references/security.md`. Missing secrets fail closed before the session is created.
 
 ## Session naming

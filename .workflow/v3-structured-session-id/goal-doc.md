@@ -87,3 +87,32 @@ Do v3 structured capture first; huddle dispatch becomes smaller and less specula
 
 Promote this goal doc to a frozen implementation plan via the planning pipeline (Phase S inventory first —
 it is a hard gate that can legitimately halt the increment at docs-only if no deterministic source exists).
+
+## Phase-S Outcome (2026-06-21) — STOP / docs-only
+
+Phase-S inventory was run (codex research worker `v3-research`, full findings in `research-findings.md`).
+The gate halted as a docs-only outcome.
+
+Verdict: **STOP the default M-phase extractor.** No wrapper-owned local artifact created during `start`
+contains a deterministic RFC-4122 session UUID in an explicit per-CLI field or label-matched event, for
+either bundled `claude` or `codex`:
+
+- `session-meta.json` `.cli_session_id` is the destination/read surface, not a source (seeded `null` by
+  `result init`; `agent-tmux:1753-1768`).
+- `usage.jsonl` start content is only `usage_init` metadata — no session-id field (`agent-tmux:1971-1994`).
+- Optional `--transcript` / audit events carry wrapper metadata (`session` = tmux session name), not a CLI
+  internal session UUID (`agent-tmux:2861-2869`, `2166-2183`).
+- Both bundled profiles ship `session_id_pattern` UNSET; the only documented near-structured source is
+  opt-in pane capture, which is pane text, not JSONL (`profiles/claude.conf:9-14`, `profiles/codex.conf:9-14`).
+
+Canonical source order is recorded (structured extractor → opt-in pane capture → leave null) but source 1
+stays empty for bundled claude/codex until a real structured source is proven.
+
+Open scope boundary (future L-phase, NOT this increment): the gate's "wrapper-owned + local" rule
+deliberately excluded **CLI-owned** transcripts the CLIs write themselves — Claude Code's
+`~/.claude/projects/<proj>/<uuid>.jsonl` and Codex's `~/.codex/sessions/` both contain real session UUIDs.
+Reopening v3 means deciding whether a CLI-owned (not wrapper-owned) artifact is an acceptable source and
+proving its field semantics are stable across ≥2 versions. That is the L-phase gate, not a heuristic
+shortcut to take now.
+
+Status: this increment ships no code. The goal doc + findings are the deliverable.
