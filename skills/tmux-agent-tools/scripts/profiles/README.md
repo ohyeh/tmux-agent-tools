@@ -37,6 +37,10 @@ take precedence over profile values.
 | `pattern_approval_prompt` | ERE → `approval_prompt` | |
 | `pattern_login_prompt` | ERE → `login_prompt` | |
 | `session_id_pattern` | grep-compatible ERE to extract the CLI's internal session UUID from pane output; enables `resume` when matched. **Sensitive** — UUID is a resume capability; treat as non-shareable. Leave unset when the CLI output format is unknown or unstable; resume falls back to tmux supervision only. | `session_id_pattern=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}` |
+| `exec_mode` | `interactive` (default) or `oneshot`. `interactive` starts the CLI in a tmux pane as usual. `oneshot` runs the CLI once headlessly and exits — **behavior not yet active; P4 implements the branch**. | `exec_mode=oneshot` |
+| `prompt_via` | `paste` (default) or `argv`. How the prompt is delivered in oneshot mode. `paste` sends via tmux send-keys; `argv` passes the prompt as a shell-quoted positional argument. Ignored in interactive mode. | `prompt_via=argv` |
+| `prompt_flag` | Optional string. Flag prepended to the prompt argv in oneshot mode (e.g. `-p`, `--print`). May be empty; when empty the prompt is the bare positional argument. Ignored in interactive mode. | `prompt_flag=-p` |
+| `session_id_capture` | Capture mechanism for the CLI's internal session ID. `off` (default) — no capture. `supplied` — caller supplies the ID at session creation. `transcript` — ID is extracted from the CLI's output transcript. This is a mechanism enum, **not** a per-CLI source list; bundled profiles leave this unset (defaults to `off`). | `session_id_capture=off` |
 
 ## Examples
 

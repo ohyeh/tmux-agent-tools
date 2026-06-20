@@ -80,6 +80,10 @@ PROFILE_PATTERN_APPROVAL=''
 PROFILE_PATTERN_LOGIN=''
 RESULT_PATH_VIA_PROMPT=''
 SESSION_ID_PATTERN=''
+EXEC_MODE='interactive'
+PROMPT_VIA='paste'
+PROMPT_FLAG=''
+SESSION_ID_CAPTURE='off'
 load_cli_profile() {
   local cli="$1" dir file='' line key value
   if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
@@ -136,6 +140,34 @@ load_cli_profile() {
           *)
             RESULT_PATH_VIA_PROMPT=''
             echo "agent-tmux: unknown result_path_via_prompt value '$value' in $file (expected true|false); using family default" >&2
+            ;;
+        esac
+        ;;
+      exec_mode)
+        case "$value" in
+          interactive|oneshot) EXEC_MODE="$value" ;;
+          *)
+            EXEC_MODE='interactive'
+            echo "agent-tmux: unknown exec_mode value '$value' in $file (expected interactive|oneshot); using interactive" >&2
+            ;;
+        esac
+        ;;
+      prompt_via)
+        case "$value" in
+          paste|argv) PROMPT_VIA="$value" ;;
+          *)
+            PROMPT_VIA='paste'
+            echo "agent-tmux: unknown prompt_via value '$value' in $file (expected paste|argv); using paste" >&2
+            ;;
+        esac
+        ;;
+      prompt_flag)             PROMPT_FLAG="$value" ;;
+      session_id_capture)
+        case "$value" in
+          off|supplied|transcript) SESSION_ID_CAPTURE="$value" ;;
+          *)
+            SESSION_ID_CAPTURE='off'
+            echo "agent-tmux: unknown session_id_capture value '$value' in $file (expected off|supplied|transcript); using off" >&2
             ;;
         esac
         ;;
@@ -4829,6 +4861,142 @@ self_test_approval() {
   echo "self-test approval: ok"
 }
 
+self_test_profile_keys() {
+  # P1 self-check: exec_mode, prompt_via, prompt_flag, session_id_capture
+  # parse and validate without starting any tmux session.
+  local tmp_dir tmp_conf result warn
+  tmp_dir="$(mktemp -d)"
+  tmp_conf="$tmp_dir/test-cli.conf"
+
+  # (a) defaults are interactive/paste/empty/off when no profile sets them.
+  printf 'bin=test\n' > "$tmp_conf"
+  result="$(
+    EXEC_MODE='interactive'; PROMPT_VIA='paste'; PROMPT_FLAG=''; SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s|%s|%s|%s' "$EXEC_MODE" "$PROMPT_VIA" "$PROMPT_FLAG" "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'interactive|paste||off' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (default check: expected 'interactive|paste||off', got '$result')" >&2
+    return 1
+  fi
+
+  # (b) valid values parse through.
+  printf 'exec_mode=oneshot\nprompt_via=argv\nprompt_flag=-p\nsession_id_capture=transcript\n' > "$tmp_conf"
+  result="$(
+    EXEC_MODE='interactive'; PROMPT_VIA='paste'; PROMPT_FLAG=''; SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s|%s|%s|%s' "$EXEC_MODE" "$PROMPT_VIA" "$PROMPT_FLAG" "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'oneshot|argv|-p|transcript' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (valid-value check: expected 'oneshot|argv|-p|transcript', got '$result')" >&2
+    return 1
+  fi
+
+  # (b2) session_id_capture=supplied also valid.
+  printf 'session_id_capture=supplied\n' > "$tmp_conf"
+  result="$(
+    SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'supplied' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (session_id_capture=supplied: expected 'supplied', got '$result')" >&2
+    return 1
+  fi
+
+  # (c) unknown value for exec_mode warns and falls back to interactive.
+  printf 'exec_mode=batch\n' > "$tmp_conf"
+  warn="$(
+    EXEC_MODE='interactive'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>&1 >/dev/null
+  )"
+  result="$(
+    EXEC_MODE='interactive'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$EXEC_MODE"
+  )"
+  if [[ "$result" != 'interactive' || "$warn" != *'unknown exec_mode'* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (exec_mode unknown-value: result='$result' warn='$warn')" >&2
+    return 1
+  fi
+
+  # (c) unknown value for prompt_via warns and falls back to paste.
+  printf 'prompt_via=stdin\n' > "$tmp_conf"
+  warn="$(
+    PROMPT_VIA='paste'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>&1 >/dev/null
+  )"
+  result="$(
+    PROMPT_VIA='paste'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$PROMPT_VIA"
+  )"
+  if [[ "$result" != 'paste' || "$warn" != *'unknown prompt_via'* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (prompt_via unknown-value: result='$result' warn='$warn')" >&2
+    return 1
+  fi
+
+  # (c) unknown value for session_id_capture warns and falls back to off.
+  printf 'session_id_capture=file\n' > "$tmp_conf"
+  warn="$(
+    SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>&1 >/dev/null
+  )"
+  result="$(
+    SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'off' || "$warn" != *'unknown session_id_capture'* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (session_id_capture unknown-value: result='$result' warn='$warn')" >&2
+    return 1
+  fi
+
+  # (d) prompt_flag accepts empty string and arbitrary string.
+  printf 'prompt_flag=\n' > "$tmp_conf"
+  result="$(
+    PROMPT_FLAG='nonempty'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$PROMPT_FLAG"
+  )"
+  if [[ "$result" != '' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (prompt_flag empty: expected '', got '$result')" >&2
+    return 1
+  fi
+  printf 'prompt_flag=--system-prompt\n' > "$tmp_conf"
+  result="$(
+    PROMPT_FLAG=''
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$PROMPT_FLAG"
+  )"
+  if [[ "$result" != '--system-prompt' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (prompt_flag string: expected '--system-prompt', got '$result')" >&2
+    return 1
+  fi
+
+  rm -rf "$tmp_dir"
+  echo "self-test profile-keys: ok"
+}
+
 self_test_result_required_fields() {
   # P2 self-check: result_required_fields profile key drives wait-required.
   require_jq
@@ -6281,6 +6449,7 @@ case "$command" in
     ;;
   self-test)
     self_test_approval
+    self_test_profile_keys
     self_test_result_required_fields
     self_test_dry_run
     self_test_result_path_prompt
