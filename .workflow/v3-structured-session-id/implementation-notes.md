@@ -172,4 +172,13 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
 - Fix: codex worker `fix2ci` — skip require_bins in dry-run (guard `(( dry_run )) || require_bins` after the
   flag parse). This should turn main's long-red CI green after merge.
 - Note: PR #269's first CI red is NOT a regression from our code; we're fixing a standing failure.
-- Status: DISPATCHED (codex fix2ci)
+- Status: DONE + VERIFIED (codex fix2ci, commit 3d950c8). missing-bin dry-run now emits JSON+ok:false;
+  real start still guards bins; CI-sim PATH (no codex/claude) → both CLIs self-test exit 0; smokes 58/0+28/0.
+
+## DONE — definition of done met
+- PR #269 CI **smoke: PASS (1m45s)** — first green CI in many commits (the pre-existing dry-run bug is fixed).
+- Shipped (default-off): P1 profile keys · P2 claude supplied-id · P3 codex/agy transcript correlation ·
+  P4 #268 oneshot · review-fix · relprep (v0.21.0) · CI dry-run fix. Commits 96e1799..3d950c8.
+- Adversarial review (codex) ACCEPT, no objections. Local+remote integration PASS.
+- REMAINING (user action, IRREVERSIBLE): merge PR #269, then run the Release workflow from main with
+  version=v0.21.0 to publish the tag/GitHub release. Not done autonomously (irreversible + needs main).
