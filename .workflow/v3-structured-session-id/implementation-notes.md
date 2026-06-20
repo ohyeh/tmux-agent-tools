@@ -45,6 +45,13 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
 | profiles/README.md key table | — | P1 |
 | profiles/{claude,codex,agy}.conf | — | P2/P3 |
 
+## Post-build scope (user-added mid-run)
+- After P1–P4: **local + remote combined testing** (`start` local + `start-ssh` remote path) for the new
+  exec_mode/session-id behavior.
+- **Fix CD/CI**: the release/CI workflow (ci-shellcheck + GitHub Actions Release). Sandbox here can't run
+  ci-shellcheck (`sed` PATH gap) — confirm GitHub CI green and fix anything the new code trips.
+- Sequence: P1–P4 build → codex adversarial review (until clean) → local+remote test → CI/CD fix → push → release.
+
 ## Phase log
 ### P1 — unified profile-key surface
 - Status: DONE + VERIFIED (sonnet worker p1-parser)
@@ -63,4 +70,21 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
   main (1722→1754, shifted by inserted lines above). No scope violation.
 
 ### P2 — Claude supplied-id path
-- Status: DISPATCHED (codex worker, per user priority codex>>>sonnet=agy)
+- Status: DONE + VERIFIED (codex worker p2sup). Diff: agent-tmux +83/-6.
+- New helpers: `supplied_session_id_flag()` (returns `--session-id` ONLY for claude → other CLIs can set
+  capture=supplied without an unsupported flag), `new_cli_session_id()` (lowercase uuidgen),
+  `write_session_meta_id()` (atomic tmp+mv).
+- Precedence (start_session ~2934): supplied → sync sidecar write pre-launch + `--session-id`, spawn nothing;
+  transcript → P3 no-op stub (`# P3:` marker @2938), spawn NO pane; off → legacy `spawn_session_id_capture`
+  only when SESSION_ID_PATTERN set; else null. One writer per session, no locks.
+- Supplied handled in BOTH dry-run preview (~1257) and real start (~2915) so the sidecar is written before
+  either launch path (reused by P4 oneshot).
+- Brain verify (independent): zsh -n ✓ · self-test profile-keys+dry-run ok · test-session-meta-smoke 27/0 ✓ ·
+  default-off dry-run has NO --session-id ✓ · supplied dry-run --session-id == sidecar cli_session_id (MATCH) ✓ ·
+  security: start banner omits UUID, resume display redacted to last4 unless AGENT_TMUX_SHOW_SESSION_ID=1 ✓.
+- Note: `scripts/test-session-meta-smoke` lives at REPO ROOT scripts/ (not skills/.../scripts) — pre-existing.
+- Worker deviation (self-reported, no product impact): used cat/sed early while reading brief before switching
+  to fd/rg/jq. Flagged for the codex hard-tool-mapping rule; output unaffected.
+
+### P3 — Codex/agy transcript correlation
+- Status: DISPATCHED (codex worker, fills the P2 transcript stub @2938)

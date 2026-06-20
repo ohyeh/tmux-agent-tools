@@ -1254,13 +1254,30 @@ run_dry_run_checks() {
   # Does NOT verify approval (use doctor --json for the approval readout).
   local invocation_session
   invocation_session="$(session_for_name "$req_name")"
+  local invocation_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag="" meta_path=""
+  if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
+    supplied_id="$(new_cli_session_id)"
+    meta_path="$(ensure_agent_dir "$req_name")/session-meta.json"
+    if write_session_meta_id "$meta_path" "$supplied_id"; then
+      invocation_flags="${invocation_flags:+$invocation_flags }${supplied_flag} $(shell_quote "$supplied_id")"
+      add_check "session_meta_sidecar" "pass" "$meta_path"
+    else
+      add_check "session_meta_sidecar" "fail" "could not write $meta_path"
+      ok=0
+      supplied_id=""
+      meta_path=""
+    fi
+  fi
   local invocation_json
   invocation_json="$("$JQ" -c -n \
     --arg session  "$invocation_session" \
-    --arg flags    "${LAUNCH_FLAGS:-}" \
+    --arg flags    "$invocation_flags" \
     --arg env_ns   "$_ENV_NS" \
     --arg cli_bin  "${CLI_BIN:-$CLI}" \
-    '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}')"
+    --arg sid      "$supplied_id" \
+    --arg meta     "$meta_path" \
+    '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}
+     + (if $sid == "" then {} else {cli_session_id: $sid, session_meta_path: $meta} end)')"
 
   local ok_bool
   if (( ok )); then ok_bool=true; else ok_bool=false; fi
@@ -1711,6 +1728,28 @@ result_validate_lightweight() {
 # read path + session_meta_validate. Returns 0 if valid, 1 if not.
 _is_rfc4122_uuid() {
   [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+new_cli_session_id() {
+  uuidgen | /usr/bin/tr 'A-F' 'a-f'
+}
+
+supplied_session_id_flag() {
+  case "$CLI" in
+    claude) printf '%s\n' '--session-id' ;;
+    *) return 1 ;;
+  esac
+}
+
+write_session_meta_id() {
+  local meta_path="$1" id="$2" tmp
+  require_jq
+  tmp="$(mktemp "${meta_path}.tmp.XXXXXX")" || return 1
+  "$JQ" -n --arg id "$id" \
+    '{schema_version: 1, cli_session_id: $id}' > "$tmp" && mv "$tmp" "$meta_path" || {
+      rm -f "$tmp"
+      return 1
+    }
 }
 
 # Validate session-meta.json sidecar: accepts null or RFC-4122 UUID.
@@ -2873,6 +2912,12 @@ start_session() {
   if [[ -n "$result_schema_path" ]]; then
     result_schema_record "$name" "$result_schema_path"
   fi
+  local start_launch_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag=""
+  if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
+    supplied_id="$(new_cli_session_id)"
+    write_session_meta_id "$(agent_root_dir)/$name/session-meta.json" "$supplied_id"
+    start_launch_flags="${start_launch_flags:+$start_launch_flags }${supplied_flag} $(shell_quote "$supplied_id")"
+  fi
   if true; then
     :
   fi
@@ -2883,11 +2928,19 @@ start_session() {
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
   "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
-  # Best-effort background capture of CLI session UUID into sidecar (P2).
-  spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
+  case "$SESSION_ID_CAPTURE" in
+    supplied)
+      ;;
+    transcript)
+      # P3: structured transcript capturer writes session-meta.json here.
+      ;;
+    off)
+      spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
+      ;;
+  esac
   run_on_start_hook "$name" "$session"
 
   if [[ -n "$transcript_path" ]]; then
@@ -5062,7 +5115,6 @@ self_test_dry_run() {
   LAUNCH_FLAGS='--self-test-flag'
   out="$(start_session --dry-run "st-dry-$$" "$tmp_dir" 2>/dev/null)" || true
   LAUNCH_FLAGS="$saved_launch_flags"
-  rm -rf "$tmp_dir"
 
   # Must contain an invocation key
   local inv_session
@@ -5085,6 +5137,31 @@ self_test_dry_run() {
     return 1
   fi
 
+  local default_profile supplied_profile supplied_out supplied_id supplied_meta sidecar_id
+  default_profile="$tmp_dir/default.conf"
+  supplied_profile="$tmp_dir/supplied.conf"
+  printf 'bin=/bin/echo\n' > "$default_profile"
+  out="$(TMUX_AGENT_DIR="$tmp_dir/default-state" "$SELF" claude --profile "$default_profile" start --dry-run --exact st-default "$tmp_dir" 2>/dev/null)" || true
+  invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$out" 2>/dev/null)"
+  if [[ "$invocation_flags" == *"--session-id"* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test dry-run: FAIL (default profile unexpectedly added --session-id)" >&2
+    return 1
+  fi
+
+  printf 'bin=/bin/echo\nsession_id_capture=supplied\n' > "$supplied_profile"
+  supplied_out="$(TMUX_AGENT_DIR="$tmp_dir/supplied-state" "$SELF" claude --profile "$supplied_profile" start --dry-run --exact st-supplied "$tmp_dir" 2>/dev/null)" || true
+  invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$supplied_out" 2>/dev/null)"
+  supplied_id="$("$JQ" -r '.invocation.cli_session_id // ""' <<< "$supplied_out" 2>/dev/null)"
+  supplied_meta="$("$JQ" -r '.invocation.session_meta_path // ""' <<< "$supplied_out" 2>/dev/null)"
+  sidecar_id="$("$JQ" -r '.cli_session_id // ""' "$supplied_meta" 2>/dev/null)"
+  if [[ "$invocation_flags" != *"--session-id $supplied_id"* || -z "$supplied_id" || "$sidecar_id" != "$supplied_id" ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test dry-run: FAIL (supplied --session-id/sidecar mismatch)" >&2
+    return 1
+  fi
+
+  rm -rf "$tmp_dir"
   echo "self-test dry-run: ok"
 }
 
