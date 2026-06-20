@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.20.0 - 2026-06-20
+
+### Added
+
+- Added opt-in v2 session resume: `agent-tmux <cli> resume` can reattach to a prior CLI session via a `cli_session_id` captured into a per-session `session-meta.json` sidecar. Capture is label-anchored then RFC-4122-validated; decoy UUIDs on non-matching lines are ignored.
+- Added `scripts/test-session-meta-smoke` (27 checks): null init, UUID validation, blank-pattern no-op, sidecar field reads, invalid-UUID rejection, and label-anchored decoy handling.
+
+### Changed
+
+- `result --field .cli_session_id` now reads the `session-meta.json` sidecar independently of `result.json`, so the post-start / pre-final-result resume window works without an initialized result file.
+- `tmux-delegate` subagent and SKILL.md document the v2 resume capability and its default-off guardrail.
+
+### Security
+
+- Bundled `claude.conf` / `codex.conf` ship `session_id_pattern` UNSET — resume is unsupported by default; operators opt in per-CLI with a label-anchored ERE. The session UUID is treated as a non-shareable resume capability (never logged, never synthesized).
+
 ## v0.19.0 - 2026-06-19
 
 ### Added
