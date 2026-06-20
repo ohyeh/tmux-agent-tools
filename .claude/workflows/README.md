@@ -99,9 +99,9 @@ silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）�
 
 ## 正本與同步
 
-此檔是**團隊用快照**。個人跨專案/跨機的正本維護在 `~/Desktop/workflows`（git 庫，
-含 `recipes/`、`manifest.json`、`install.sh`）。改動正本後若要更新本 repo 的快照，
-需手動複製過來（兩份是獨立副本，不會自動同步）。
+此目錄是 workflow 腳本的**團隊用快照**,供 clone 本 repo 的人直接 `/<name>` 叫用。
+它不是編輯起點:改動應發生在來源端,再由一條獨立的 SYNC 管道流入本目錄(管道規劃中;
+在它就緒前以手動複製對齊,兩份為獨立副本、不會自動同步)。因此請勿直接在此編輯作為改動源。
 
 ## 來源
 
