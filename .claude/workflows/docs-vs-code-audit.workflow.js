@@ -37,6 +37,9 @@ const repo = a.repoPath
 const docsRoot = a.docsRoot || 'docs/'
 const model = a.model || 'sonnet'   // listed on every agent() below (never omitted)
 const effort = a.effort || 'high'   // reasoning effort — "not shown" must not read as "unsupported"
+// Official agent() opts, listed on every call. Both default OFF:
+const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
+const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
 const groundTruth = a.groundTruth || '(no ground-truth facts supplied — verify every claim directly against the code.)'
 const banned = Array.isArray(a.bannedPatterns) ? a.bannedPatterns : []
 
@@ -104,7 +107,7 @@ const results = await pipeline(
     `and structural problems (duplicated sections, orphan headings). ` +
     `Do NOT report stylistic preferences as issues; 'wording' only for genuinely confusing or wrong statements. ` +
     `Return findings for every file in scope (verdict 'clean' with empty issues when fine).`,
-    { label: `audit:${g.key}`, phase: 'Audit', schema: FINDINGS_SCHEMA, model, effort }
+    { label: `audit:${g.key}`, phase: 'Audit', schema: FINDINGS_SCHEMA, model, effort, isolation, agentType }
   ),
   (findings, g) => {
     // Bind the group key into every return path so the final map never relies on
@@ -124,7 +127,7 @@ const results = await pipeline(
       `For 'delete-candidate' verdicts: do NOT delete; note it in your summary instead.\n` +
       `FINDINGS:\n${JSON.stringify(actionable, null, 2)}\n` +
       `Return the list of files you edited, findings you skipped (with reason), and a 2-3 sentence summary.`,
-      { label: `fix:${g.key}`, phase: 'Fix', schema: FIX_SCHEMA, model, effort }
+      { label: `fix:${g.key}`, phase: 'Fix', schema: FIX_SCHEMA, model, effort, isolation, agentType }
     ).then(r => r
       ? { ...r, group: g.key, failed: false, findings }
       : { group: g.key, edited: [], skipped: [], summary: `${g.key}: FIX FAILED (fixer returned null) — audited findings NOT applied`, failed: true, findings })
@@ -154,7 +157,7 @@ const consistency = await agent(
   `${banned.length ? '4' : '3'}) Index accuracy: the docs index (README / index.html) accurately lists what exists.\n` +
   `Group summaries from the fixers: ${JSON.stringify(results.filter(Boolean).map(r => r.summary))}\n` +
   `Return a summary of what you changed plus any remaining risks you could not resolve.`,
-  { label: 'consistency-sweep', phase: 'Consistency', model, effort }
+  { label: 'consistency-sweep', phase: 'Consistency', model, effort, isolation, agentType }
 )
 
 return {

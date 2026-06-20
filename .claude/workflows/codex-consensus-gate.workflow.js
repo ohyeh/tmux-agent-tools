@@ -22,6 +22,9 @@ const repo = a.repoPath || '.'
 const session = a.sessionName || 'consensus'
 const effort = a.effort || 'high'   // also the codex model_reasoning_effort (shell env below)
 const model = a.model || 'sonnet'   // the driving Claude agent's model
+// Official agent() opts, listed on every call so none reads as "unsupported". Both default OFF:
+const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit (NOT false/'none')
+const agentType = a.agentType || undefined  // off = default workflow agent. NEVER hardcode a custom one — a missing agentType is a HARD error (#20931), breaks portability
 const marker = a.marker || '=== CODEX VERDICT END ==='
 const timeout = a.timeoutSec || 600
 
@@ -48,7 +51,7 @@ Steps:
 4. Wait for completion by POLLING the output file OUT, NOT by matching the marker in the tmux pane. The marker also appears in the prompt you just sent, so a pane/wait-text match would false-trigger on the echo (a bug hit repeatedly in practice). Poll: every few seconds check that OUT exists AND contains "${marker}", up to ${timeout}s. Only then read OUT. (agent-tmux codex wait ${session} ${timeout} may be used as a secondary idle signal, but the file is the authoritative completion signal.)
 5. Return: verdict = the verdict text read from OUT (trimmed, drop the trailing marker line); consensus = your classification (agree / agree_with_changes / disagree / unclear); notes = key objections or required changes.
 Keep raw tmux scrollback out of the final message; return only the structured fields.`,
-  { label: `codex:${session}`, phase: 'Consult', model, effort, schema: SCHEMA }
+  { label: `codex:${session}`, phase: 'Consult', model, effort, isolation, agentType, schema: SCHEMA }
 )
 // `passed` is a strict allow-list: only genuine consensus clears the gate.
 // agree_with_changes / unclear / disagree / missing all fall through to false;

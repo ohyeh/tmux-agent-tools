@@ -53,7 +53,7 @@ if (!a.repoPath || !a.brief) {
     `If it is absent or unreadable, fall back to ${GLOBAL_JOB} (expand $HOME). ` +
     `Return the parsed object of whichever existed, with an added "_source":"project"|"global". ` +
     `If neither exists, return {}. Return ONLY the object — no prose.`,
-    { label: 'read-job', phase: 'Plan', model: 'sonnet', effort: 'high', schema: { type: 'object', additionalProperties: true } }   // bootstrap: literal defaults (config not read yet)
+    { label: 'read-job', phase: 'Plan', model: 'sonnet', effort: 'high', isolation: undefined, agentType: undefined, schema: { type: 'object', additionalProperties: true } }   // bootstrap: literal defaults (config not read yet)
   )
   const src = job && job._source; if (job) delete job._source
   a = { ...BUILTIN, ...(job || {}), ...a }
@@ -70,6 +70,9 @@ if (!/^[a-zA-Z0-9._-]+$/.test(slug) || slug.includes('..')) return { aborted: tr
 // omitted — "not shown" must not read as "unsupported"). Defaults: sonnet / high.
 const model = a.model || 'sonnet'
 const effort = a.effort || 'high'
+// Official agent() opts, also forwarded to nested stages. Both default OFF:
+const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
+const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
 
 // ── Phase 1: PLAN — delegate to the chosen mid-level workflow ──────────────────
 phase('Plan')
@@ -78,7 +81,7 @@ if (mode === 'explore') {
   plan = await workflow('feature-plan-consensus', {
     repoPath: a.repoPath, featureBrief: a.brief, slug,
     maxInternalRounds: a.maxInternalRounds, maxExternalRounds: a.maxExternalRounds,
-    cli: a.cli, model, effort, timeoutSec: a.timeoutSec,   // forward model+effort EXPLICITLY (resolved above)
+    cli: a.cli, model, effort, isolation, agentType, timeoutSec: a.timeoutSec,   // forward model/effort/isolation/agentType EXPLICITLY
     commit: a.commit === true, push: a.push === true,
   })
   // success path returns planPath + internal/external; any abort sets aborted/needsUser.
@@ -87,7 +90,7 @@ if (mode === 'explore') {
 } else {
   plan = await workflow('plan-pipeline', {
     repoPath: a.repoPath, brief: a.brief, slug, planPath: a.planPath,
-    maxReviewRounds: a.maxReviewRounds, model, effort, timeoutSec: a.timeoutSec,   // model+effort explicit
+    maxReviewRounds: a.maxReviewRounds, model, effort, isolation, agentType, timeoutSec: a.timeoutSec,   // model/effort/isolation/agentType explicit
     commitPush: a.commit === true || a.push === true,
   })
   planClean = !!plan && plan.passed === true && plan.ready_for_build === true
@@ -109,7 +112,7 @@ if (planClean && planPath) {
     `Under repo ${a.repoPath}, write this JSON to .claude/workflows/${slug}/job.json ` +
     `(mkdir -p the parent dir; overwrite if present), then confirm the written path. ` +
     `Do NOT git add/commit it. JSON:\n${JSON.stringify(execJob, null, 2)}`,
-    { label: `write-exec-job:${slug}`, phase: 'Plan', model, effort }
+    { label: `write-exec-job:${slug}`, phase: 'Plan', model, effort, isolation, agentType }
   )
   log(`Execution-side job recorded at <repo>/.claude/workflows/${slug}/job.json (planPath → ${planPath})`)
 }
@@ -137,7 +140,7 @@ const build = await workflow('spec-implement-dual-review-verify', {
   repoPath: a.repoPath,
   spec: `Implement the frozen plan at ${planPath}. Read it fully first; it is the authoritative spec (codex-frozen / consensus-passed). Follow its file targets, behavior, and verification steps. Truth = source code and real command output, not memory.`,
   targetFile: a.targetFile,
-  cli: a.cli, model, effort, timeoutSec: a.timeoutSec, slug,   // forward model+effort explicit + slug (session label)
+  cli: a.cli, model, effort, isolation, agentType, timeoutSec: a.timeoutSec, slug,   // forward model/effort/isolation/agentType + slug
 })
 const built = !!build && !build.aborted
 return { stage: 'build', mode, passed: built, needsUser: !built, planPath, plan, build }

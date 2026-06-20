@@ -54,6 +54,9 @@ const maxRounds = a.maxReviewRounds || 6
 const session = a.sessionName || `plan-${slug}`
 const effort = a.effort || 'high'   // codex model_reasoning_effort AND the driving agent's effort
 const model = a.model || 'sonnet'   // driving Claude agent's model (listed on every agent() below)
+// Official agent() opts, listed on every call. Both default OFF:
+const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: only 'worktree' enables; off = omit
+const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
 const timeout = a.timeoutSec || 1200
 
 const FROZEN = { type: 'object', additionalProperties: false,
@@ -93,7 +96,7 @@ if (a.skipDirection !== true) {
       `It must list candidate workstreams (goal / why-now / effort S·M·L / risk / readiness), a PRIORITIZED in-scope vs explicitly-deferred split (MECE) with one-line rationale each, the FIRST concrete step, and an "ADR vs direct build" flag per item`,
       directionPath
     ),
-    { label: `direction:${slug}`, phase: 'Direction', model, effort, schema: FROZEN }
+    { label: `direction:${slug}`, phase: 'Direction', model, effort, isolation, agentType, schema: FROZEN }
   )
   if (!direction || direction.ok !== true) return { stage: 'direction', passed: false, direction }
   artifacts.push(directionPath)
@@ -108,7 +111,7 @@ const plan = await agent(
     planPath,
     `\nAlso: in requiredAdrs[], list every design decision the plan says NEEDS an ADR (slug + title + one-line brief).`
   ),
-  { label: `plan:${slug}`, phase: 'Plan', model, effort, schema: FROZEN }
+  { label: `plan:${slug}`, phase: 'Plan', model, effort, isolation, agentType, schema: FROZEN }
 )
 if (!plan || plan.frozen !== true) return { stage: 'plan', passed: false, direction, plan, note: 'plan did not freeze CLEAN' }
 artifacts.push(planPath)
@@ -126,7 +129,7 @@ if (adrList.length) {
         `Decision brief: ${adr.brief || adr.title || adr.slug}. It must follow the format of existing ADRs in ${adrDir}/ and ground every choice in real source line references. This is DESIGN ONLY — no product code`,
         adrPath
       ),
-      { label: `adr:${adr.slug}`, phase: 'ADRs', model, effort, schema: FROZEN }
+      { label: `adr:${adr.slug}`, phase: 'ADRs', model, effort, isolation, agentType, schema: FROZEN }
     )
     adrResults.push(r || { ok: false, frozen: false, path: adrPath, summary: 'agent returned null' })
     if (r && r.frozen === true) artifacts.push(adrPath)
@@ -144,7 +147,7 @@ if (a.commitPush === true) {
     artifacts.map(p => `  - ${p}`).join('\n') + '\n' +
     `- Commit message: ${a.commitMessage ? JSON.stringify(a.commitMessage) : `"docs(plan): freeze ${slug} planning artifacts"`}. Match this repo's commit conventions (check recent git log; invent nothing it doesn't show).\n` +
     `- Do NOT add any source/test/build files — this is a planning-only commit. Do NOT deploy. Return ok=true with the pushed range in summary.`,
-    { label: 'commit-push-docs', phase: 'Integrate', model, effort, schema: STATUS }
+    { label: 'commit-push-docs', phase: 'Integrate', model, effort, isolation, agentType, schema: STATUS }
   )
   if (!integrate || integrate.ok !== true) return { stage: 'integrate', passed: false, direction, plan, adrResults, integrate }
 }
