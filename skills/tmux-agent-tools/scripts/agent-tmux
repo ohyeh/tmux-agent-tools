@@ -710,6 +710,15 @@ shell_quote() {
   printf "%q" "$1"
 }
 
+oneshot_invocation_command() {
+  local prompt="$1" launch_flags="$2"
+  local command="$(shell_quote "$CLI_BIN")"
+  [[ -n "$launch_flags" ]] && command+=" $launch_flags"
+  [[ -n "$PROMPT_FLAG" ]] && command+=" $(shell_quote "$PROMPT_FLAG")"
+  command+=" $(shell_quote "$prompt")"
+  printf '%s' "$command"
+}
+
 json_escape() {
   local s="$1"
   s="${s//$'\r'/ }"
@@ -1146,6 +1155,7 @@ run_dry_run_checks() {
   require_jq
   local tool="$1" req_name="$2" directory="$3" exact_name="$4"
   local sentinel="$5" on_exit_cmd="$6" transcript_path="$7"
+  local initial_text="${8:-}"
   local checks_json="[]"
 
   add_check() {
@@ -1268,7 +1278,10 @@ run_dry_run_checks() {
       meta_path=""
     fi
   fi
-  local invocation_json
+  local invocation_json oneshot_command=""
+  if [[ "$EXEC_MODE" == "oneshot" && "$PROMPT_VIA" == "argv" && -n "$initial_text" ]]; then
+    oneshot_command="$(oneshot_invocation_command "$initial_text" "$invocation_flags")"
+  fi
   invocation_json="$("$JQ" -c -n \
     --arg session  "$invocation_session" \
     --arg flags    "$invocation_flags" \
@@ -1276,7 +1289,13 @@ run_dry_run_checks() {
     --arg cli_bin  "${CLI_BIN:-$CLI}" \
     --arg sid      "$supplied_id" \
     --arg meta     "$meta_path" \
+    --arg exec_mode "$EXEC_MODE" \
+    --arg prompt_via "$PROMPT_VIA" \
+    --arg prompt_flag "$PROMPT_FLAG" \
+    --arg command "$oneshot_command" \
     '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}
+     + {exec_mode: $exec_mode, prompt_via: $prompt_via, prompt_flag: $prompt_flag}
+     + (if $command == "" then {} else {command: $command} end)
      + (if $sid == "" then {} else {cli_session_id: $sid, session_meta_path: $meta} end)')"
 
   local ok_bool
@@ -2960,7 +2979,7 @@ start_session() {
 
   if (( dry_run )); then
     run_dry_run_checks "${CLI}-tmux" "$requested_name" "$directory" "$exact_name" \
-      "$sentinel" "$on_exit_cmd" "$transcript_path"
+      "$sentinel" "$on_exit_cmd" "$transcript_path" "$initial_text"
     exit $?
   fi
 
@@ -3053,6 +3072,10 @@ start_session() {
     write_session_meta_id "$(agent_root_dir)/$name/session-meta.json" "$supplied_id"
     start_launch_flags="${start_launch_flags:+$start_launch_flags }${supplied_flag} $(shell_quote "$supplied_id")"
   fi
+  if [[ "$EXEC_MODE" == "oneshot" && "$SESSION_ID_CAPTURE" != "supplied" ]]; then
+    require_jq
+    "$JQ" -n '{schema_version: 1, cli_session_id: null}' > "$(agent_root_dir)/$name/session-meta.json"
+  fi
   if true; then
     :
   fi
@@ -3068,18 +3091,41 @@ start_session() {
     session_id_snapshot_path="$(agent_root_dir)/$name/session-id-codex-snapshot.txt"
     session_id_codex_snapshot "${AGENT_TMUX_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}" "$session_id_snapshot_path"
   fi
-  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  if [[ "$EXEC_MODE" == "oneshot" ]]; then
+    require_jq
+    if [[ "$PROMPT_VIA" != "argv" ]]; then
+      echo "exec_mode=oneshot requires prompt_via=argv" >&2
+      exit 2
+    fi
+    if [[ -z "$initial_text" ]]; then
+      echo "exec_mode=oneshot requires initial text" >&2
+      exit 2
+    fi
+    local stdout_path result_path oneshot_command
+    stdout_path="$(agent_root_dir)/$name/stdout.log"
+    result_path="$(agent_root_dir)/$name/result.json"
+    oneshot_command="$(oneshot_invocation_command "$initial_text" "$start_launch_flags")"
+    # ponytail: one generated pane command covers flag and subcommand forms.
+    "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: <oneshot argv>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}${oneshot_command} > $(shell_quote "$stdout_path") 2>&1; cli_code=\$?; result_status=failed; if [ \"\$cli_code\" -eq 0 ]; then result_status=success; fi; $(shell_quote "$JQ") -n --arg status \"\$result_status\" --arg stdout_path $(shell_quote "$stdout_path") --argjson exit_code \"\$cli_code\" '{schema_version:1,status:\$status,exit_code:\$exit_code,stdout_path:\$stdout_path}' > $(shell_quote "$result_path") || true; printf '%s%s\n' '__AGENT_TMUX_ONESHOT_EXIT__' \"\$cli_code\"; code=\"\$cli_code\"; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  else
+    "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  fi
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   case "$SESSION_ID_CAPTURE" in
     supplied)
       ;;
     transcript)
-      spawn_transcript_session_id_capture "$CLI" "$name" "$(agent_root_dir)/$name/session-meta.json" "$directory" "$session_id_launch_since" "$session_id_snapshot_path"
+      if [[ "$EXEC_MODE" == "oneshot" ]]; then
+        session_id_capture_signal "oneshot_transcript" "unproven_persistence" 0
+      else
+        spawn_transcript_session_id_capture "$CLI" "$name" "$(agent_root_dir)/$name/session-meta.json" "$directory" "$session_id_launch_since" "$session_id_snapshot_path"
+      fi
       ;;
     off)
-      spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
+      [[ "$EXEC_MODE" == "oneshot" ]] || spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
       ;;
   esac
   run_on_start_hook "$name" "$session"
@@ -3103,12 +3149,14 @@ start_session() {
   echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
   echo "wait-literal: $SELF $CLI wait-literal $name '<text>' 180"
   echo "capture: $SELF $CLI capture $name 120"
-  if [[ -n "$initial_text" ]]; then
+  if [[ -n "$initial_text" && "$EXEC_MODE" != "oneshot" ]]; then
     sleep 3
     local buffer_name="$session-init"
     initial_text="$(prompt_with_result_path "$name" "$initial_text")"
     paste_and_submit "$session" "$buffer_name" "$initial_text"
     echo "sent: $initial_text"
+  elif [[ "$EXEC_MODE" == "oneshot" ]]; then
+    echo "sent: <oneshot argv>"
   else
     echo "sent: <none>"
   fi

@@ -103,4 +103,18 @@ Spec (frozen): `.workflow/v3-structured-session-id/design-proposal.md`, `.workfl
   missing db, decoy} + asserts: exactly one bail signal, null sidecar on bail, transcript wiring.
 
 ### P4 — #268 oneshot start_session branch
-- Status: DISPATCHED (codex worker)
+- Status: DONE + VERIFIED (codex worker p4os). Diff: agent-tmux +55/-7, scripts/test-oneshot-smoke NEW.
+- Single argv code path: flag form `<bin> <flags> -p "<prompt>"` and subcommand form `<bin> exec "<prompt>"`
+  (empty prompt_flag omitted). Prompt is one shell_quoted argv (quotes preserved), never pasted. cli_code=$?
+  captured first, result.json synthesized best-effort BEFORE deterministic marker `__AGENT_TMUX_ONESHOT_EXIT__<code>`,
+  pane-open `read _` tail preserved, exits with true cli_code.
+- Brain verify (independent): zsh -n ✓ · test-oneshot-smoke 20/0 (incl. result-before-marker) ✓ ·
+  test-session-meta-smoke 58/0 no regression ✓ · self-test ok ✓ · flag-form dry-run quotes preserved ✓ ·
+  subcommand-form dry-run ✓ · interactive dry-run 0 oneshot mentions (unchanged) ✓ · bundled profiles not set
+  to oneshot ✓.
+
+## Build complete: P1–P4 all VERIFIED. Next: codex adversarial review (full diff main..HEAD) → local+remote
+## test → CI/CD fix → push → release.
+
+### Adversarial review
+- Status: DISPATCHED (codex reviewer on full diff main..HEAD)
