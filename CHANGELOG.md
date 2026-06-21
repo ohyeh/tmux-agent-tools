@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## v0.22.0 - 2026-06-22
+
+### Added
+
+- Added `scripts/profiles/profile.conf.example`: a canonical generic profile template documenting every supported profile key (bin/env_ns/launch_flags/heuristic_family/pattern_*/session_id_pattern/session_id_capture/exec_mode/prompt_via/prompt_flag) with inline guidance. New CLIs now start from one template instead of copy-pasting a CLI-specific example (#270).
+- `.gitignore` now blocks `scripts/profiles/*.conf` (personal/local profiles live in `~/.config` and must never ship in the repo) while whitelisting `*.conf.example` templates. Already-tracked bundled defaults (agy/claude/codex/cursor/grok.conf) are unaffected — gitignore does not untrack committed files (#270).
+
+### Changed
+
+- `scripts/profiles/README.md` points users to `profile.conf.example` as the single entry point and removed the redundant inline gemini example.
+
+### Fixed
+
+- `agy`, `cursor`, and `grok` bundled profiles (and the engine preset fallback) switched `heuristic_family` from `codex` to `generic`. The codex family's provider-inheritance gate (`cli_provider_env_keys`) was injecting the full `OPENAI_*`/`CODEX_*` credential set into these CLIs' tmux panes, which is wrong for them (notably agy, which is Anthropic-backed). Generic inherits zero provider keys; each CLI must receive credentials via its own env/cc-switch injection. Pane detection is unchanged because codex and generic share the same `probe_generic_metric_parse` path (#271).
+
+### Removed
+
+- Removed `scripts/profiles/gemini.conf.example`; the generic template supersedes it (#271).
+
 ## v0.21.0 - 2026-06-21
 
 ### Added
