@@ -510,3 +510,8 @@ jobs:
           edited_json="$(mktemp)"
           GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment --output-format json > "$edited_json"
           jq -e '.status == "edited" and .action == "edit" and .post_github_comment == true and .comment_id == "123" and .comment_url == "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-123" and (.gh_output | fromjson | .id == 123)' "$edited_json"
+
+      - name: Run session-id + oneshot smokes
+        run: |
+          scripts/test-session-meta-smoke
+          scripts/test-oneshot-smoke

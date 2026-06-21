@@ -80,6 +80,10 @@ PROFILE_PATTERN_APPROVAL=''
 PROFILE_PATTERN_LOGIN=''
 RESULT_PATH_VIA_PROMPT=''
 SESSION_ID_PATTERN=''
+EXEC_MODE='interactive'
+PROMPT_VIA='paste'
+PROMPT_FLAG=''
+SESSION_ID_CAPTURE='off'
 load_cli_profile() {
   local cli="$1" dir file='' line key value
   if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
@@ -136,6 +140,34 @@ load_cli_profile() {
           *)
             RESULT_PATH_VIA_PROMPT=''
             echo "agent-tmux: unknown result_path_via_prompt value '$value' in $file (expected true|false); using family default" >&2
+            ;;
+        esac
+        ;;
+      exec_mode)
+        case "$value" in
+          interactive|oneshot) EXEC_MODE="$value" ;;
+          *)
+            EXEC_MODE='interactive'
+            echo "agent-tmux: unknown exec_mode value '$value' in $file (expected interactive|oneshot); using interactive" >&2
+            ;;
+        esac
+        ;;
+      prompt_via)
+        case "$value" in
+          paste|argv) PROMPT_VIA="$value" ;;
+          *)
+            PROMPT_VIA='paste'
+            echo "agent-tmux: unknown prompt_via value '$value' in $file (expected paste|argv); using paste" >&2
+            ;;
+        esac
+        ;;
+      prompt_flag)             PROMPT_FLAG="$value" ;;
+      session_id_capture)
+        case "$value" in
+          off|supplied|transcript) SESSION_ID_CAPTURE="$value" ;;
+          *)
+            SESSION_ID_CAPTURE='off'
+            echo "agent-tmux: unknown session_id_capture value '$value' in $file (expected off|supplied|transcript); using off" >&2
             ;;
         esac
         ;;
@@ -678,6 +710,15 @@ shell_quote() {
   printf "%q" "$1"
 }
 
+oneshot_invocation_command() {
+  local prompt="$1" launch_flags="$2"
+  local command="$(shell_quote "$CLI_BIN")"
+  [[ -n "$launch_flags" ]] && command+=" $launch_flags"
+  [[ -n "$PROMPT_FLAG" ]] && command+=" $(shell_quote "$PROMPT_FLAG")"
+  command+=" $(shell_quote "$prompt")"
+  printf '%s' "$command"
+}
+
 json_escape() {
   local s="$1"
   s="${s//$'\r'/ }"
@@ -1114,6 +1155,7 @@ run_dry_run_checks() {
   require_jq
   local tool="$1" req_name="$2" directory="$3" exact_name="$4"
   local sentinel="$5" on_exit_cmd="$6" transcript_path="$7"
+  local initial_text="${8:-}"
   local checks_json="[]"
 
   add_check() {
@@ -1222,13 +1264,47 @@ run_dry_run_checks() {
   # Does NOT verify approval (use doctor --json for the approval readout).
   local invocation_session
   invocation_session="$(session_for_name "$req_name")"
-  local invocation_json
+  local invocation_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag="" meta_path=""
+  if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
+    supplied_id="$(new_cli_session_id)"
+    meta_path="$(ensure_agent_dir "$req_name")/session-meta.json"
+    if write_session_meta_id "$meta_path" "$supplied_id"; then
+      invocation_flags="${invocation_flags:+$invocation_flags }${supplied_flag} $(shell_quote "$supplied_id")"
+      add_check "session_meta_sidecar" "pass" "$meta_path"
+    else
+      add_check "session_meta_sidecar" "fail" "could not write $meta_path"
+      ok=0
+      supplied_id=""
+      meta_path=""
+    fi
+  fi
+  local invocation_json oneshot_command=""
+  if [[ "$EXEC_MODE" == "oneshot" ]]; then
+    if [[ "$PROMPT_VIA" != "argv" ]]; then
+      add_check "oneshot_prompt_via" "fail" "exec_mode=oneshot requires prompt_via=argv"
+      ok=0
+    elif [[ -z "$initial_text" ]]; then
+      add_check "oneshot_prompt" "fail" "exec_mode=oneshot requires initial text"
+      ok=0
+    else
+      oneshot_command="$(oneshot_invocation_command "$initial_text" "$invocation_flags")"
+    fi
+  fi
   invocation_json="$("$JQ" -c -n \
     --arg session  "$invocation_session" \
-    --arg flags    "${LAUNCH_FLAGS:-}" \
+    --arg flags    "$invocation_flags" \
     --arg env_ns   "$_ENV_NS" \
     --arg cli_bin  "${CLI_BIN:-$CLI}" \
-    '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}')"
+    --arg sid      "$supplied_id" \
+    --arg meta     "$meta_path" \
+    --arg exec_mode "$EXEC_MODE" \
+    --arg prompt_via "$PROMPT_VIA" \
+    --arg prompt_flag "$PROMPT_FLAG" \
+    --arg command "$oneshot_command" \
+    '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}
+     + {exec_mode: $exec_mode, prompt_via: $prompt_via, prompt_flag: $prompt_flag}
+     + (if $command == "" then {} else {command: $command} end)
+     + (if $sid == "" then {} else {cli_session_id: $sid, session_meta_path: $meta} end)')"
 
   local ok_bool
   if (( ok )); then ok_bool=true; else ok_bool=false; fi
@@ -1681,6 +1757,28 @@ _is_rfc4122_uuid() {
   [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
 }
 
+new_cli_session_id() {
+  uuidgen | /usr/bin/tr 'A-F' 'a-f'
+}
+
+supplied_session_id_flag() {
+  case "$CLI" in
+    claude) printf '%s\n' '--session-id' ;;
+    *) return 1 ;;
+  esac
+}
+
+write_session_meta_id() {
+  local meta_path="$1" id="$2" tmp
+  require_jq
+  tmp="$(mktemp "${meta_path}.tmp.XXXXXX")" || return 1
+  "$JQ" -n --arg id "$id" \
+    '{schema_version: 1, cli_session_id: $id}' > "$tmp" && mv "$tmp" "$meta_path" || {
+      rm -f "$tmp"
+      return 1
+    }
+}
+
 # Validate session-meta.json sidecar: accepts null or RFC-4122 UUID.
 # Emits a single line: "ok", "null", "malformed:<value>", or "missing".
 # ponytail: minimal — no JSON output, callers only need the verdict word.
@@ -1707,6 +1805,141 @@ session_meta_validate() {
   fi
   printf 'malformed:%s\n' "$raw"
   return 1
+}
+
+_file_mtime_epoch() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+session_id_capture_signal() {
+  local source="$1" reason="$2" count="${3:-0}"
+  require_jq
+  "$JQ" -c -n --arg event session_id_capture --arg source "$source" \
+    --arg status ambiguous --arg reason "$reason" --argjson candidate_count "$count" \
+    '{event:$event, source:$source, status:$status, reason:$reason, candidate_count:$candidate_count}' >&2
+}
+
+session_id_codex_snapshot() {
+  local sessions_root="$1" snapshot_path="$2" file
+  : > "$snapshot_path"
+  [[ -d "$sessions_root" ]] || return 0
+  for file in "$sessions_root"/**/rollout-*.jsonl(N); do
+    printf '%s\n' "$file" >> "$snapshot_path"
+  done
+}
+
+session_id_correlate_codex() {
+  local sessions_root="$1" launch_cwd="$2" since="$3" snapshot_path="${4:-}"
+  local uuid_re='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+  local -A seen
+  local line file base uuid mtime max_mtime=0
+  local -a candidates newest
+
+  if [[ -n "$snapshot_path" && -f "$snapshot_path" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      seen[$line]=1
+    done < "$snapshot_path"
+  fi
+  [[ -d "$sessions_root" ]] || { printf 'wait no_candidate 0\n'; return 1; }
+
+  for file in "$sessions_root"/**/rollout-*.jsonl(N); do
+    [[ -z "${seen[$file]:-}" ]] || continue
+    base="${file:t}"
+    [[ "$base" =~ "^rollout-.*-(${uuid_re})\\.jsonl$" ]] || continue
+    mtime="$(_file_mtime_epoch "$file")"
+    (( mtime >= since )) || continue
+    candidates+=("$file")
+    if (( mtime > max_mtime )); then
+      max_mtime="$mtime"
+      newest=("$file")
+    elif (( mtime == max_mtime )); then
+      newest+=("$file")
+    fi
+  done
+
+  (( ${#candidates[@]} > 0 )) || { printf 'wait no_candidate 0\n'; return 1; }
+  (( ${#newest[@]} == 1 )) || { printf 'bail mtime_tie %s\n' "${#newest[@]}"; return 2; }
+  (( ${#candidates[@]} == 1 )) || { printf 'bail multiple_candidates %s\n' "${#candidates[@]}"; return 2; }
+
+  file="${newest[1]}"
+  base="${file:t}"
+  [[ "$base" =~ "^rollout-.*-(${uuid_re})\\.jsonl$" ]] || { printf 'bail basename_mismatch 1\n'; return 2; }
+  uuid="${match[1]}"
+
+  local first verdict
+  IFS= read -r first < "$file" || { printf 'bail malformed_first_record 1\n'; return 2; }
+  verdict="$(printf '%s\n' "$first" | "$JQ" -r --arg id "$uuid" --arg cwd "$launch_cwd" '
+    if (.type != "session_meta") then "malformed"
+    elif (.payload.id // "") != $id then "id_mismatch"
+    elif (.payload.cwd // "") != $cwd then "cwd_mismatch"
+    else "ok" end
+  ' 2>/dev/null)" || { printf 'bail malformed_first_record 1\n'; return 2; }
+  case "$verdict" in
+    ok) printf 'ok %s\n' "$uuid"; return 0 ;;
+    id_mismatch) printf 'bail basename_payload_mismatch 1\n'; return 2 ;;
+    cwd_mismatch) printf 'bail cwd_mismatch 1\n'; return 2 ;;
+    *) printf 'bail malformed_first_record 1\n'; return 2 ;;
+  esac
+}
+
+session_id_correlate_agy() {
+  local gemini_root="$1" launch_cwd="$2" since="$3"
+  local uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  local cache="$gemini_root/cache/last_conversations.json" uuid db_path mtime
+  [[ -f "$cache" ]] || { printf 'bail missing_cwd_key 0\n'; return 2; }
+  uuid="$("$JQ" -r --arg cwd "$launch_cwd" '.[$cwd] // empty' "$cache" 2>/dev/null)" || {
+    printf 'bail malformed_cache 0\n'
+    return 2
+  }
+  [[ -n "$uuid" ]] || { printf 'bail missing_cwd_key 0\n'; return 2; }
+  [[ "$uuid" =~ "$uuid_re" ]] || { printf 'bail malformed_cache 1\n'; return 2; }
+  db_path="$gemini_root/conversations/$uuid.db"
+  [[ -f "$db_path" ]] || { printf 'bail missing_db 1\n'; return 2; }
+  mtime="$(_file_mtime_epoch "$db_path")"
+  (( mtime >= since )) || { printf 'bail stale_db 1\n'; return 2; }
+  printf 'ok %s\n' "$uuid"
+}
+
+spawn_transcript_session_id_capture() {
+  local cli="$1" name="$2" meta_path="$3" launch_cwd="$4" since="$5" snapshot_path="${6:-}"
+  local timeout="${AGENT_TMUX_SESSION_ID_CAPTURE_TIMEOUT:-30}"
+  local codex_root="${AGENT_TMUX_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}"
+  local agy_root="${AGENT_TMUX_AGY_ROOT:-$HOME/.gemini/antigravity-cli}"
+  (
+    local deadline=$(( $(date +%s) + timeout ))
+    local out capture_rc reason count id source
+    while (( $(date +%s) <= deadline )); do
+      capture_rc=0
+      case "$cli" in
+        codex)
+          source='codex_transcript'
+          out="$(session_id_correlate_codex "$codex_root" "$launch_cwd" "$since" "$snapshot_path")" || capture_rc=$?
+          ;;
+        agy)
+          source='agy_store'
+          out="$(session_id_correlate_agy "$agy_root" "$launch_cwd" "$since")" || capture_rc=$?
+          ;;
+        *)
+          source='unsupported_transcript'
+          session_id_capture_signal "$source" unsupported_cli 0
+          return 0
+          ;;
+      esac
+      if (( capture_rc == 0 )); then
+        id="${out#ok }"
+        write_session_meta_id "$meta_path" "$id"
+        return 0
+      fi
+      if (( capture_rc == 2 )); then
+        reason="${out#bail }"; count="${reason##* }"; reason="${reason% *}"
+        session_id_capture_signal "$source" "$reason" "$count"
+        return 0
+      fi
+      sleep 1
+    done
+    session_id_capture_signal "${source:-transcript}" no_candidate 0
+  ) &
+  disown 2>/dev/null || true
 }
 
 # Spawn a bounded background capture that extracts the CLI session UUID from
@@ -2583,7 +2816,6 @@ apply_result_env_args() {
 }
 
 start_session() {
-  require_bins
   write_tmux_conf
   local should_attach=0
   local exact_name=0
@@ -2603,6 +2835,7 @@ start_session() {
     esac
     shift
   done
+  (( dry_run )) || require_bins
 
   local sentinel=""
   local on_exit_cmd=""
@@ -2754,7 +2987,7 @@ start_session() {
 
   if (( dry_run )); then
     run_dry_run_checks "${CLI}-tmux" "$requested_name" "$directory" "$exact_name" \
-      "$sentinel" "$on_exit_cmd" "$transcript_path"
+      "$sentinel" "$on_exit_cmd" "$transcript_path" "$initial_text"
     exit $?
   fi
 
@@ -2841,6 +3074,16 @@ start_session() {
   if [[ -n "$result_schema_path" ]]; then
     result_schema_record "$name" "$result_schema_path"
   fi
+  local start_launch_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag=""
+  if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
+    supplied_id="$(new_cli_session_id)"
+    write_session_meta_id "$(agent_root_dir)/$name/session-meta.json" "$supplied_id"
+    start_launch_flags="${start_launch_flags:+$start_launch_flags }${supplied_flag} $(shell_quote "$supplied_id")"
+  fi
+  if [[ "$EXEC_MODE" == "oneshot" && "$SESSION_ID_CAPTURE" != "supplied" ]]; then
+    require_jq
+    "$JQ" -n '{schema_version: 1, cli_session_id: null}' > "$(agent_root_dir)/$name/session-meta.json"
+  fi
   if true; then
     :
   fi
@@ -2850,12 +3093,49 @@ start_session() {
 
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
-  "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  local session_id_launch_since session_id_snapshot_path=""
+  session_id_launch_since="$(date +%s)"
+  if [[ "$SESSION_ID_CAPTURE" == "transcript" && "$CLI" == "codex" ]]; then
+    session_id_snapshot_path="$(agent_root_dir)/$name/session-id-codex-snapshot.txt"
+    session_id_codex_snapshot "${AGENT_TMUX_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}" "$session_id_snapshot_path"
+  fi
+  if [[ "$EXEC_MODE" == "oneshot" ]]; then
+    require_jq
+    if [[ "$PROMPT_VIA" != "argv" ]]; then
+      echo "exec_mode=oneshot requires prompt_via=argv" >&2
+      exit 2
+    fi
+    if [[ -z "$initial_text" ]]; then
+      echo "exec_mode=oneshot requires initial text" >&2
+      exit 2
+    fi
+    local stdout_path result_path oneshot_command
+    stdout_path="$(agent_root_dir)/$name/stdout.log"
+    result_path="$(agent_root_dir)/$name/result.json"
+    oneshot_command="$(oneshot_invocation_command "$initial_text" "$start_launch_flags")"
+    # ponytail: one generated pane command covers flag and subcommand forms.
+    "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: <oneshot argv>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}${oneshot_command} > $(shell_quote "$stdout_path") 2>&1; cli_code=\$?; result_status=failed; if [ \"\$cli_code\" -eq 0 ]; then result_status=success; fi; $(shell_quote "$JQ") -n --arg status \"\$result_status\" --arg stdout_path $(shell_quote "$stdout_path") --argjson exit_code \"\$cli_code\" '{schema_version:1,status:\$status,exit_code:\$exit_code,stdout_path:\$stdout_path}' > $(shell_quote "$result_path") || true; printf '%s%s\n' '__AGENT_TMUX_ONESHOT_EXIT__' \"\$cli_code\"; code=\"\$cli_code\"; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  else
+    "$TMUX" -f "$TMUX_CONF" new-session "${session_env_args[@]}" -d -s "$session" -c "$directory" \
+      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  fi
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
-  # Best-effort background capture of CLI session UUID into sidecar (P2).
-  spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
+  case "$SESSION_ID_CAPTURE" in
+    supplied)
+      ;;
+    transcript)
+      if [[ "$EXEC_MODE" == "oneshot" ]]; then
+        session_id_capture_signal "oneshot_transcript" "unproven_persistence" 0
+      else
+        spawn_transcript_session_id_capture "$CLI" "$name" "$(agent_root_dir)/$name/session-meta.json" "$directory" "$session_id_launch_since" "$session_id_snapshot_path"
+      fi
+      ;;
+    off)
+      [[ "$EXEC_MODE" == "oneshot" ]] || spawn_session_id_capture "$name" "$session" "$(agent_root_dir)/$name/session-meta.json"
+      ;;
+  esac
   run_on_start_hook "$name" "$session"
 
   if [[ -n "$transcript_path" ]]; then
@@ -2877,12 +3157,14 @@ start_session() {
   echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
   echo "wait-literal: $SELF $CLI wait-literal $name '<text>' 180"
   echo "capture: $SELF $CLI capture $name 120"
-  if [[ -n "$initial_text" ]]; then
+  if [[ -n "$initial_text" && "$EXEC_MODE" != "oneshot" ]]; then
     sleep 3
     local buffer_name="$session-init"
     initial_text="$(prompt_with_result_path "$name" "$initial_text")"
     paste_and_submit "$session" "$buffer_name" "$initial_text"
     echo "sent: $initial_text"
+  elif [[ "$EXEC_MODE" == "oneshot" ]]; then
+    echo "sent: <oneshot argv>"
   else
     echo "sent: <none>"
   fi
@@ -4829,6 +5111,142 @@ self_test_approval() {
   echo "self-test approval: ok"
 }
 
+self_test_profile_keys() {
+  # P1 self-check: exec_mode, prompt_via, prompt_flag, session_id_capture
+  # parse and validate without starting any tmux session.
+  local tmp_dir tmp_conf result warn
+  tmp_dir="$(mktemp -d)"
+  tmp_conf="$tmp_dir/test-cli.conf"
+
+  # (a) defaults are interactive/paste/empty/off when no profile sets them.
+  printf 'bin=test\n' > "$tmp_conf"
+  result="$(
+    EXEC_MODE='interactive'; PROMPT_VIA='paste'; PROMPT_FLAG=''; SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s|%s|%s|%s' "$EXEC_MODE" "$PROMPT_VIA" "$PROMPT_FLAG" "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'interactive|paste||off' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (default check: expected 'interactive|paste||off', got '$result')" >&2
+    return 1
+  fi
+
+  # (b) valid values parse through.
+  printf 'exec_mode=oneshot\nprompt_via=argv\nprompt_flag=-p\nsession_id_capture=transcript\n' > "$tmp_conf"
+  result="$(
+    EXEC_MODE='interactive'; PROMPT_VIA='paste'; PROMPT_FLAG=''; SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s|%s|%s|%s' "$EXEC_MODE" "$PROMPT_VIA" "$PROMPT_FLAG" "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'oneshot|argv|-p|transcript' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (valid-value check: expected 'oneshot|argv|-p|transcript', got '$result')" >&2
+    return 1
+  fi
+
+  # (b2) session_id_capture=supplied also valid.
+  printf 'session_id_capture=supplied\n' > "$tmp_conf"
+  result="$(
+    SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'supplied' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (session_id_capture=supplied: expected 'supplied', got '$result')" >&2
+    return 1
+  fi
+
+  # (c) unknown value for exec_mode warns and falls back to interactive.
+  printf 'exec_mode=batch\n' > "$tmp_conf"
+  warn="$(
+    EXEC_MODE='interactive'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>&1 >/dev/null
+  )"
+  result="$(
+    EXEC_MODE='interactive'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$EXEC_MODE"
+  )"
+  if [[ "$result" != 'interactive' || "$warn" != *'unknown exec_mode'* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (exec_mode unknown-value: result='$result' warn='$warn')" >&2
+    return 1
+  fi
+
+  # (c) unknown value for prompt_via warns and falls back to paste.
+  printf 'prompt_via=stdin\n' > "$tmp_conf"
+  warn="$(
+    PROMPT_VIA='paste'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>&1 >/dev/null
+  )"
+  result="$(
+    PROMPT_VIA='paste'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$PROMPT_VIA"
+  )"
+  if [[ "$result" != 'paste' || "$warn" != *'unknown prompt_via'* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (prompt_via unknown-value: result='$result' warn='$warn')" >&2
+    return 1
+  fi
+
+  # (c) unknown value for session_id_capture warns and falls back to off.
+  printf 'session_id_capture=file\n' > "$tmp_conf"
+  warn="$(
+    SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>&1 >/dev/null
+  )"
+  result="$(
+    SESSION_ID_CAPTURE='off'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli 2>/dev/null
+    printf '%s' "$SESSION_ID_CAPTURE"
+  )"
+  if [[ "$result" != 'off' || "$warn" != *'unknown session_id_capture'* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (session_id_capture unknown-value: result='$result' warn='$warn')" >&2
+    return 1
+  fi
+
+  # (d) prompt_flag accepts empty string and arbitrary string.
+  printf 'prompt_flag=\n' > "$tmp_conf"
+  result="$(
+    PROMPT_FLAG='nonempty'
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$PROMPT_FLAG"
+  )"
+  if [[ "$result" != '' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (prompt_flag empty: expected '', got '$result')" >&2
+    return 1
+  fi
+  printf 'prompt_flag=--system-prompt\n' > "$tmp_conf"
+  result="$(
+    PROMPT_FLAG=''
+    _PROFILE_FILE_FLAG="$tmp_conf"; _PROFILE_DIR_FLAG=''
+    load_cli_profile test-cli
+    printf '%s' "$PROMPT_FLAG"
+  )"
+  if [[ "$result" != '--system-prompt' ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test profile-keys: FAIL (prompt_flag string: expected '--system-prompt', got '$result')" >&2
+    return 1
+  fi
+
+  rm -rf "$tmp_dir"
+  echo "self-test profile-keys: ok"
+}
+
 self_test_result_required_fields() {
   # P2 self-check: result_required_fields profile key drives wait-required.
   require_jq
@@ -4894,7 +5312,6 @@ self_test_dry_run() {
   LAUNCH_FLAGS='--self-test-flag'
   out="$(start_session --dry-run "st-dry-$$" "$tmp_dir" 2>/dev/null)" || true
   LAUNCH_FLAGS="$saved_launch_flags"
-  rm -rf "$tmp_dir"
 
   # Must contain an invocation key
   local inv_session
@@ -4917,6 +5334,31 @@ self_test_dry_run() {
     return 1
   fi
 
+  local default_profile supplied_profile supplied_out supplied_id supplied_meta sidecar_id
+  default_profile="$tmp_dir/default.conf"
+  supplied_profile="$tmp_dir/supplied.conf"
+  printf 'bin=/bin/echo\n' > "$default_profile"
+  out="$(TMUX_AGENT_DIR="$tmp_dir/default-state" "$SELF" claude --profile "$default_profile" start --dry-run --exact st-default "$tmp_dir" 2>/dev/null)" || true
+  invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$out" 2>/dev/null)"
+  if [[ "$invocation_flags" == *"--session-id"* ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test dry-run: FAIL (default profile unexpectedly added --session-id)" >&2
+    return 1
+  fi
+
+  printf 'bin=/bin/echo\nsession_id_capture=supplied\n' > "$supplied_profile"
+  supplied_out="$(TMUX_AGENT_DIR="$tmp_dir/supplied-state" "$SELF" claude --profile "$supplied_profile" start --dry-run --exact st-supplied "$tmp_dir" 2>/dev/null)" || true
+  invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$supplied_out" 2>/dev/null)"
+  supplied_id="$("$JQ" -r '.invocation.cli_session_id // ""' <<< "$supplied_out" 2>/dev/null)"
+  supplied_meta="$("$JQ" -r '.invocation.session_meta_path // ""' <<< "$supplied_out" 2>/dev/null)"
+  sidecar_id="$("$JQ" -r '.cli_session_id // ""' "$supplied_meta" 2>/dev/null)"
+  if [[ "$invocation_flags" != *"--session-id $supplied_id"* || -z "$supplied_id" || "$sidecar_id" != "$supplied_id" ]]; then
+    rm -rf "$tmp_dir"
+    echo "self-test dry-run: FAIL (supplied --session-id/sidecar mismatch)" >&2
+    return 1
+  fi
+
+  rm -rf "$tmp_dir"
   echo "self-test dry-run: ok"
 }
 
@@ -6281,6 +6723,7 @@ case "$command" in
     ;;
   self-test)
     self_test_approval
+    self_test_profile_keys
     self_test_result_required_fields
     self_test_dry_run
     self_test_result_path_prompt

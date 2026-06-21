@@ -1,0 +1,158 @@
+#!/usr/bin/env zsh
+# Smoke test for #268 exec_mode=oneshot local start behavior.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-oneshot-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'TMUX_AGENT_DIR="$TMUX_AGENT_DIR" "$AGENT" claude stop p4-one >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label unexpectedly contained=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+fake_cli="$WORK/fake-cli"
+cat > "$fake_cli" <<'EOF'
+#!/usr/bin/env zsh
+printf 'argc=%s\n' "$#"
+i=1
+for arg in "$@"; do
+  printf 'arg%s=%s\n' "$i" "$arg"
+  i=$((i + 1))
+done
+exit "${FAKE_EXIT:-7}"
+EOF
+chmod +x "$fake_cli"
+
+oneshot_profile="$WORK/oneshot.conf"
+cat > "$oneshot_profile" <<EOF
+bin=$fake_cli
+exec_mode=oneshot
+prompt_via=argv
+prompt_flag=-p
+session_id_capture=off
+EOF
+
+subcommand_profile="$WORK/subcommand.conf"
+cat > "$subcommand_profile" <<EOF
+bin=$fake_cli
+launch_flags=exec
+exec_mode=oneshot
+prompt_via=argv
+prompt_flag=
+session_id_capture=off
+EOF
+
+interactive_profile="$WORK/interactive.conf"
+cat > "$interactive_profile" <<EOF
+bin=$fake_cli
+exec_mode=interactive
+prompt_via=paste
+EOF
+
+paste_oneshot_profile="$WORK/paste-oneshot.conf"
+cat > "$paste_oneshot_profile" <<EOF
+bin=$fake_cli
+exec_mode=oneshot
+prompt_via=paste
+session_id_capture=off
+EOF
+
+echo "case: oneshot runtime result + marker"
+start_out="$("$AGENT" claude --profile "$oneshot_profile" start --exact p4-one "$WORK" 'a b "c"')"
+assert_contains "start output marks oneshot argv" "$start_out" "sent: <oneshot argv>"
+
+capture_json="$("$AGENT" claude --profile "$oneshot_profile" wait-and-capture --literal --marker __AGENT_TMUX_ONESHOT_EXIT__7 --timeout 10 --json p4-one)"
+assert "marker matched" "$(printf '%s' "$capture_json" | jq -r .matched)" "true"
+assert "marker value" "$(printf '%s' "$capture_json" | jq -r .marker)" "__AGENT_TMUX_ONESHOT_EXIT__7"
+
+result_path="$TMUX_AGENT_DIR/p4-one/result.json"
+stdout_path="$(jq -r .stdout_path "$result_path")"
+assert "result status failed" "$(jq -r .status "$result_path")" "failed"
+assert "result exit_code 7" "$(jq -r .exit_code "$result_path")" "7"
+assert "result stdout path" "$stdout_path" "$TMUX_AGENT_DIR/p4-one/stdout.log"
+stdout_body="$(< "$stdout_path")"
+assert_contains "prompt flag passed as argv" "$stdout_body" "arg2=-p"
+assert_contains "quoted prompt preserved as one argv" "$stdout_body" 'arg3=a b "c"'
+assert_not_contains "no pasted wrapper prompt" "$stdout_body" "Write final JSON to this exact path"
+assert "sidecar null with capture off" "$(jq -r '.cli_session_id // "null"' "$TMUX_AGENT_DIR/p4-one/session-meta.json")" "null"
+status_json="$("$AGENT" claude --profile "$oneshot_profile" status --json p4-one)"
+assert "status running false" "$(printf '%s' "$status_json" | jq -r .running)" "false"
+assert "status exit_detected true" "$(printf '%s' "$status_json" | jq -r .exit_detected)" "true"
+assert "status exit_code 7" "$(printf '%s' "$status_json" | jq -r .exit_code)" "7"
+"$AGENT" claude --profile "$oneshot_profile" stop p4-one >/dev/null 2>&1 || true
+
+echo "case: oneshot dry-run command assembly"
+dry_json="$("$AGENT" claude --profile "$subcommand_profile" start --dry-run --exact p4-dry "$WORK" 'x y "z"')"
+dry_command="$(printf '%s' "$dry_json" | jq -r '.invocation.command // ""')"
+assert_contains "subcommand form includes exec" "$dry_command" "$fake_cli exec"
+assert_not_contains "subcommand form omits empty prompt_flag" "$dry_command" " -p "
+assert "dry-run exec_mode oneshot" "$(printf '%s' "$dry_json" | jq -r '.invocation.exec_mode')" "oneshot"
+
+echo "case: interactive dry-run unchanged"
+interactive_json="$("$AGENT" claude --profile "$interactive_profile" start --dry-run --exact p4-int "$WORK" 'a b')"
+assert "interactive has no oneshot command" "$(printf '%s' "$interactive_json" | jq -r '.invocation.command // ""')" ""
+assert "interactive exec_mode" "$(printf '%s' "$interactive_json" | jq -r '.invocation.exec_mode')" "interactive"
+assert "interactive dry-run ok" "$(printf '%s' "$interactive_json" | jq -r .ok)" "true"
+
+echo "case: oneshot dry-run preconditions"
+set +e
+paste_dry_json="$("$AGENT" claude --profile "$paste_oneshot_profile" start --dry-run --exact p4-paste "$WORK" hi)"
+paste_dry_status=$?
+empty_dry_json="$("$AGENT" claude --profile "$oneshot_profile" start --dry-run --exact p4-empty "$WORK")"
+empty_dry_status=$?
+set -e
+happy_dry_json="$("$AGENT" claude --profile "$oneshot_profile" start --dry-run --exact p4-happy "$WORK" hi)"
+assert "oneshot paste dry-run exits 2" "$paste_dry_status" "2"
+assert "oneshot paste dry-run ok false" "$(printf '%s' "$paste_dry_json" | jq -r .ok)" "false"
+assert "oneshot paste dry-run check fails" "$(printf '%s' "$paste_dry_json" | jq -r '.checks[] | select(.name == "oneshot_prompt_via") | .status')" "fail"
+assert "oneshot empty dry-run exits 2" "$empty_dry_status" "2"
+assert "oneshot empty dry-run ok false" "$(printf '%s' "$empty_dry_json" | jq -r .ok)" "false"
+assert "oneshot empty dry-run check fails" "$(printf '%s' "$empty_dry_json" | jq -r '.checks[] | select(.name == "oneshot_prompt") | .status')" "fail"
+assert "oneshot happy dry-run ok" "$(printf '%s' "$happy_dry_json" | jq -r .ok)" "true"
+
+echo "case: source ordering result before marker"
+source_body="$(< "$AGENT")"
+before="${source_body%%__AGENT_TMUX_ONESHOT_EXIT__*}"
+assert_contains "cli_code captured before result synthesis" "$before" 'cli_code=\$?; result_status=failed'
+assert_contains "result write before marker" "$before" "result_path"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.21.0 - 2026-06-21
+
+### Added
+
+- Added `exec_mode=oneshot` (#268): run any CLI headless once in-pane via one argv path — flag form (`prompt_flag=-p` → `cli -p "<prompt>"`) and subcommand form (`launch_flags=exec`, empty prompt_flag → `cli exec "<prompt>"`). The prompt is passed as a single shell-quoted argv, `result.json` is synthesized, marker `__AGENT_TMUX_ONESHOT_EXIT__<code>` is printed, the pane stays open, and `status --json` reports `exit_detected` / `exit_code`. New profile keys: `exec_mode`, `prompt_via`, and `prompt_flag` (default `interactive` / `paste` / empty). Closes #268.
+- Added `session_id_capture=off|supplied|transcript` (v3): Claude supplies a race-free `--session-id` written to the sidecar before launch; Codex and Agy correlate a CLI-owned transcript/store after launch (null-on-ambiguity with one observable signal). A mutual-exclusion single writer protects the sidecar. Bundled profiles remain default-off until per-CLI L-phase enablement.
+
+### Changed
+
+- CI now runs `test-session-meta-smoke` and `test-oneshot-smoke`. Added `scripts/test-oneshot-smoke` (28 checks); `test-session-meta-smoke` expanded 27→58 checks for Codex/Agy correlation plus decoy and ambiguity fixtures.
+
 ## v0.20.0 - 2026-06-20
 
 ### Added
