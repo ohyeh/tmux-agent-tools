@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.23.0 - 2026-06-22
+
+### Added
+
+- Added a second skill, `using-tmux-agent-tools`: an on-demand meta-router (modeled on the using-superpowers pattern) that routes a tmux-agent task to the right wrapper via a task-shape → wrapper decision tree, then defers to the canonical capability table in `tmux-agent-tools/SKILL.md` (single source of truth, no duplication). Covers all 17 wrappers plus the inline-vs-worker delegate gate, and encodes the router-level gates (multi-agent authorization, cascade-spawn ban). Auto-discovered via the existing `skills/` plugin scan (#274, #275).
+
 ## v0.22.0 - 2026-06-22
 
 ### Added
