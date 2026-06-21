@@ -1,0 +1,50 @@
+# Generic profile template — copy to start a new CLI.
+#
+# Usage:
+#   cp skills/tmux-agent-tools/scripts/profiles/profile.conf.example \
+#      ~/.config/agent-tmux/profiles/<your-cli>.conf
+#   then edit <your-cli>.conf and run:
+#   agent-tmux <your-cli> doctor      # verify profile loads
+#   agent-tmux <your-cli> start --exact --dry-run <name> <dir> 'ping'  # inspect
+#
+# Files are plain key=value and are NEVER sourced (cannot execute code).
+# Env vars (<NS>_TMUX_* > AGENT_TMUX_*) > --profile > $AGENT_TMUX_PROFILE_DIR
+# > user config dir > bundled defaults > legacy preset.
+#
+# For a brand-new CLI you can also just run `agent-tmux <name> start ...`
+# with NO profile: unknown CLIs get generic defaults (bin=<name>, generic
+# heuristics, no flags, result_path_via_prompt=true). Write a profile only when
+# you need to customize flags, heuristics, or detection patterns.
+
+# --- REQUIRED-ish ---
+bin=REPLACE_WITH_BINARY_OR_ABS_PATH
+env_ns=REPLACE_WITH_UPPERCASE_NAMESPACE     # e.g. GEMINI; drives env-var override + provider inheritance gate
+
+# --- LAUNCH / RESUME ---
+prefix=REPLACE-cli                          # tmux session prefix
+launch_flags=                               # flags appended at launch, e.g. --yolo
+resume_keyword=resume                       # resume subcommand/flag, e.g. --resume
+
+# --- PANE DETECTION ---
+heuristic_family=generic                    # claude | codex | generic (detection baseline)
+# Optional detection overrides (extended regex, case-insensitive):
+# pattern_busy=(thinking|generating|esc to cancel)
+# pattern_permission_prompt=
+# pattern_approval_prompt=allow this (command|action)\?
+# pattern_login_prompt=sign in with google
+
+# --- SAFETY / STRUCTURED RESULTS ---
+approval=prompt                             # prompt | auto
+result_required_fields=status,summary       # default required fields for `result wait-required`
+# result_path_via_prompt=true               # prepend literal result path to prompt sends
+#                                           # (codex/generic default true; claude default false)
+
+# --- SESSION ID CAPTURE (resume support, default OFF) ---
+# Leave UNSET unless the CLI prints a deterministic session-label line you have
+# verified for your version. Sensitive: the UUID is a resume capability.
+# session_id_pattern=Session ID:
+
+# --- ONESHOT MODE (headless single run) ---
+# exec_mode=interactive                      # interactive (default) | oneshot
+# prompt_via=paste                           # paste (default) | argv   (oneshot only)
+# prompt_flag=-p                             # flag before prompt argv   (oneshot only)

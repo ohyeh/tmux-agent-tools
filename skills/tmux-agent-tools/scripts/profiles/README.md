@@ -44,6 +44,15 @@ take precedence over profile values.
 
 ## Examples
 
+Start from the generic template (`profile.conf.example` in this directory),
+which documents every supported key with inline guidance:
+
+```
+cp scripts/profiles/profile.conf.example ~/.config/agent-tmux/profiles/<cli>.conf
+agent-tmux <cli> doctor          # verify the profile loads
+agent-tmux <cli> start --exact --dry-run <name> <dir> 'ping'   # inspect invocation
+```
+
 Use a differently named binary on this machine only
 (`~/.config/agent-tmux/profiles/agy.conf`):
 
