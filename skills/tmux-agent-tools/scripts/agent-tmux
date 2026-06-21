@@ -24,9 +24,9 @@ preset_for_cli() {
   case "$1" in
     claude) _ENV_NS=CLAUDE; _bin=claude; _PRESET_PREFIX=claude-cli; _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='--resume'; HEURISTIC_FAMILY=claude; _USAGE_KIND='Code' ;;
     codex)  _ENV_NS=CODEX;  _bin=codex;  _PRESET_PREFIX=codex-cli;  _PRESET_FLAGS='--yolo';                          RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
-    agy)    _ENV_NS=AGY;    _bin=agy;    _PRESET_PREFIX=agy-cli;    _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
-    cursor) _ENV_NS=CURSOR; _bin=cursor; _PRESET_PREFIX=cursor-cli; _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
-    grok)   _ENV_NS=GROK;   _bin=grok;   _PRESET_PREFIX=grok-cli;   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
+    agy)    _ENV_NS=AGY;    _bin=agy;    _PRESET_PREFIX=agy-cli;    _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
+    cursor) _ENV_NS=CURSOR; _bin=cursor; _PRESET_PREFIX=cursor-cli; _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
+    grok)   _ENV_NS=GROK;   _bin=grok;   _PRESET_PREFIX=grok-cli;   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
     *)      _ENV_NS=AGENT;  _bin="$1";   _PRESET_PREFIX="$1-cli";   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
   esac
 }

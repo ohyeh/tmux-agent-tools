@@ -63,17 +63,4 @@ Use a differently named binary on this machine only
 bin=agy-local
 ```
 
-Add a brand-new CLI without touching code
-(`~/.config/agent-tmux/profiles/gemini.conf`), then run
-`agent-tmux gemini start ...`:
-
-```
-bin=gemini
-env_ns=GEMINI
-launch_flags=
-resume_keyword=resume
-heuristic_family=generic
-pattern_approval_prompt=allow this action\?
-```
-
 Migration note: unlisted CLIs now default to `generic` instead of Codex-family behavior. Generic means no provider-key inheritance, no `--yolo`, and `result_path_via_prompt=true`; set those fields explicitly if a custom CLI needs the old Codex-like behavior.
