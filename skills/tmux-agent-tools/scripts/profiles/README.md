@@ -31,6 +31,8 @@ take precedence over profile values.
 | `resume_keyword` | resume subcommand/flag | `resume_keyword=--resume` |
 | `heuristic_family` | `claude`, `codex`, or `generic` pane-heuristic baseline | `heuristic_family=generic` |
 | `usage_kind` | usage text label | `usage_kind=CLI` |
+| `approval` | `prompt` (default) or `auto`; controls profile-level approval behavior | `approval=prompt` |
+| `result_required_fields` | comma-separated default required fields for `result wait-required` | `result_required_fields=status,summary` |
 | `result_path_via_prompt` | `true`/`false`; prepend the literal result path to prompt sends | `result_path_via_prompt=true` |
 | `pattern_busy` | ERE overriding busy detection (`active_spinner`/`tool_active`) | `pattern_busy=(thinking\|generating)` |
 | `pattern_permission_prompt` | ERE matched (case-insensitive) against pane text → `permission_prompt` | |
@@ -48,7 +50,8 @@ Start from the generic template (`profile.conf.example` in this directory),
 which documents every supported key with inline guidance:
 
 ```
-cp scripts/profiles/profile.conf.example ~/.config/agent-tmux/profiles/<cli>.conf
+mkdir -p ~/.config/agent-tmux/profiles
+cp skills/tmux-agent-tools/scripts/profiles/profile.conf.example ~/.config/agent-tmux/profiles/<cli>.conf
 agent-tmux <cli> doctor          # verify the profile loads
 agent-tmux <cli> start --exact --dry-run <name> <dir> 'ping'   # inspect invocation
 ```

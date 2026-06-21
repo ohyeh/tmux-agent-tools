@@ -15,6 +15,9 @@ skills/tmux-agent-tools-workspace/
 
 # Personal agent-tmux profiles (live locally in ~/.config/agent-tmux/profiles/,
 # never in this repo). Belt-and-suspenders: if a filled-in profile is ever
-# copied here by mistake, ignore it. Only .conf.example templates are tracked.
+# copied here by mistake, ignore it. Note gitignore does not untrack files
+# already committed, so the bundled defaults (agy/claude/codex/cursor/grok.conf)
+# stay tracked; only NEW .conf files here are blocked. .conf.example templates
+# are whitelisted so they can be added.
 skills/tmux-agent-tools/scripts/profiles/*.conf
 !skills/tmux-agent-tools/scripts/profiles/*.conf.example

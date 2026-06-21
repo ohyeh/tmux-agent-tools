@@ -1,6 +1,7 @@
 # Generic profile template — copy to start a new CLI.
 #
 # Usage:
+#   mkdir -p ~/.config/agent-tmux/profiles
 #   cp skills/tmux-agent-tools/scripts/profiles/profile.conf.example \
 #      ~/.config/agent-tmux/profiles/<your-cli>.conf
 #   then edit <your-cli>.conf and run:
@@ -8,8 +9,10 @@
 #   agent-tmux <your-cli> start --exact --dry-run <name> <dir> 'ping'  # inspect
 #
 # Files are plain key=value and are NEVER sourced (cannot execute code).
-# Env vars (<NS>_TMUX_* > AGENT_TMUX_*) > --profile > $AGENT_TMUX_PROFILE_DIR
+# Resolution: --profile file, else --profile-dir > $AGENT_TMUX_PROFILE_DIR
 # > user config dir > bundled defaults > legacy preset.
+# Env vars (<NS>_TMUX_*, AGENT_TMUX_*, bare <NS> binary override) still
+# take precedence over profile values.
 #
 # For a brand-new CLI you can also just run `agent-tmux <name> start ...`
 # with NO profile: unknown CLIs get generic defaults (bin=<name>, generic
@@ -24,6 +27,7 @@ env_ns=REPLACE_WITH_UPPERCASE_NAMESPACE     # e.g. GEMINI; drives env-var overri
 prefix=REPLACE-cli                          # tmux session prefix
 launch_flags=                               # flags appended at launch, e.g. --yolo
 resume_keyword=resume                       # resume subcommand/flag, e.g. --resume
+usage_kind=CLI                              # usage text label
 
 # --- PANE DETECTION ---
 heuristic_family=generic                    # claude | codex | generic (detection baseline)
@@ -42,6 +46,7 @@ result_required_fields=status,summary       # default required fields for `resul
 # --- SESSION ID CAPTURE (resume support, default OFF) ---
 # Leave UNSET unless the CLI prints a deterministic session-label line you have
 # verified for your version. Sensitive: the UUID is a resume capability.
+# session_id_capture=off                     # off (default) | supplied | transcript
 # session_id_pattern=Session ID:
 
 # --- ONESHOT MODE (headless single run) ---
