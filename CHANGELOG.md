@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `tmux-agent-dialogue` now accepts any CLI that ships a single-token `<cli>-tmux` shim (claude, codex, agy, …) as a real participant, not just claude/codex. `wrapper_for_agent` resolves `$SCRIPT_DIR/<cli>-tmux` and the `--agent-a/--agent-b` and transcript validations use shim-existence as the single source of truth, matching how the rest of the suite generalized to any CLI. `fake` is unchanged. The transcript schema's `.agent` field relaxed from the `codex|claude|fake` enum to any non-empty string (backward compatible). Enables e.g. claude↔agy pair-review/critic/debate/handoff.
+
 ## v0.23.0 - 2026-06-22
 
 ### Added
