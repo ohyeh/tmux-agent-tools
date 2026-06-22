@@ -50,9 +50,10 @@ Behavior:
   - pair-review --swap reverses speaker order without changing participant definitions;
   - --on-blocked-trigger writes a local JSON artifact only when a participant appears blocked;
   - github-comment prints a dry-run body unless --post-github-comment is explicit;
-  - a real participant is any CLI with a single-token "<cli>-tmux" shim
-    (claude, codex, agy, ...); fake needs no shim. Add a new CLI by shipping
-    its shim, the same way new CLIs are added elsewhere in the suite;
+  - a real participant is any CLI agent-tmux can drive (claude, codex, agy,
+    gemini, cursor, grok, in-house CLIs, ...) — driven directly as
+    "agent-tmux <cli>", so new CLIs work with no per-CLI code; fake is the
+    in-process stub;
   - real participants can run locally or through the wrapper start-ssh mode;
   - optional participant profiles live at ~/.config/tmux-agent-tools/participants.json or TMUX_AGENT_TOOLS_PARTICIPANTS;
   - cleans up sessions it created;
@@ -330,16 +331,15 @@ start_fake_agent() {
   OWNED_SESSIONS+=("$session")
 }
 
-wrapper_for_agent() {
-  local agent="$1"
-  # A real agent is any CLI that ships a single-token "<cli>-tmux" shim over
-  # agent-tmux (claude-tmux, codex-tmux, agy-tmux, ...). This is the single
-  # source of truth for "is <agent> a valid real participant".
-  if [[ -x "$SCRIPT_DIR/${agent}-tmux" ]]; then
-    print -r -- "$SCRIPT_DIR/${agent}-tmux"
-  else
-    die "unsupported real agent: $agent (no $SCRIPT_DIR/${agent}-tmux shim)"
-  fi
+# Every real agent is driven through the engine as `agent-tmux <cli> ...`.
+# The claude-tmux/codex-tmux/agy-tmux shims are themselves just
+# `exec agent-tmux <cli> "$@"`, so going straight to the engine supports any
+# CLI — claude, codex, agy, and any future coding-agent CLI — with zero
+# per-CLI code, matching how the rest of the suite generalized. Returns the
+# command as two array elements (engine path + cli) for safe quoting.
+engine_cmd_for_agent() {
+  print -r -- "$SCRIPT_DIR/agent-tmux"
+  print -r -- "$1"
 }
 
 participant_ssh_target() {
@@ -393,24 +393,24 @@ start_real_agent() {
   local label="$1"
   local agent="$2"
   local session
-  local wrapper
+  local -a wrapper
   local ssh_target
   local agent_workdir
   local -a env_entries
   session="$(session_name "$label")"
-  wrapper="$(wrapper_for_agent "$agent")"
+  wrapper=("${(@f)$(engine_cmd_for_agent "$agent")}")
   ssh_target="$(participant_ssh_target "$label")"
   agent_workdir="$(participant_workdir "$label")"
   env_entries=("${(@f)$(participant_env_entries "$label")}")
   env_entries=("${(@)env_entries:#}")
-  "$wrapper" stop "$session" >/dev/null 2>&1 || true
+  "${wrapper[@]}" stop "$session" >/dev/null 2>&1 || true
   if [[ -n "$ssh_target" ]]; then
-    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "$wrapper" start-ssh --exact "$session" "$ssh_target" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "${wrapper[@]}" start-ssh --exact "$session" "$ssh_target" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
   else
-    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "$wrapper" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "${wrapper[@]}" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
   fi
   OWNED_WRAPPERS+=("$agent:$session")
-  "$wrapper" wait "$session" "$(participant_timeout "$label")" >/dev/null
+  "${wrapper[@]}" wait "$session" "$(participant_timeout "$label")" >/dev/null
 }
 
 send_to_agent() {
@@ -421,7 +421,7 @@ send_to_agent() {
   if [[ "$agent" == "fake" ]]; then
     "$TMUX" send-keys -t "$(session_name "$label")" -- "$message" C-m
   else
-    "$(wrapper_for_agent "$agent")" send "$(session_name "$label")" "$message"
+    "$SCRIPT_DIR/agent-tmux" "$agent" send "$(session_name "$label")" "$message"
   fi
 }
 
@@ -437,7 +437,7 @@ send_and_wait_for_marker() {
     return
   fi
 
-  "$(wrapper_for_agent "$agent")" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$(participant_timeout "$label")"
+  "$SCRIPT_DIR/agent-tmux" "$agent" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$(participant_timeout "$label")"
 }
 
 wait_for_marker() {
@@ -459,7 +459,7 @@ wait_for_marker() {
     return 1
   fi
 
-  "$(wrapper_for_agent "$agent")" wait-literal "$(session_name "$label")" "$marker" "$(participant_timeout "$label")"
+  "$SCRIPT_DIR/agent-tmux" "$agent" wait-literal "$(session_name "$label")" "$marker" "$(participant_timeout "$label")"
 }
 
 capture_agent() {
@@ -469,7 +469,7 @@ capture_agent() {
   if [[ "$agent" == "fake" ]]; then
     "$TMUX" capture-pane -J -t "$(session_name "$label")" -p -S -1000
   else
-    "$(wrapper_for_agent "$agent")" capture "$(session_name "$label")" 1000
+    "$SCRIPT_DIR/agent-tmux" "$agent" capture "$(session_name "$label")" 1000
   fi
 }
 
@@ -490,7 +490,7 @@ agent_session_exists() {
     return
   fi
 
-  "$(wrapper_for_agent "$agent")" status "$(session_name "$label")" >/dev/null 2>&1
+  "$SCRIPT_DIR/agent-tmux" "$agent" status "$(session_name "$label")" >/dev/null 2>&1
 }
 
 classify_failure_type() {
@@ -948,7 +948,7 @@ cleanup() {
     for item in "${OWNED_WRAPPERS[@]}"; do
       local agent="${item%%:*}"
       local session="${item#*:}"
-      "$(wrapper_for_agent "$agent")" stop "$session" >/dev/null 2>&1 || true
+      "$SCRIPT_DIR/agent-tmux" "$agent" stop "$session" >/dev/null 2>&1 || true
     done
   fi
 
@@ -1167,8 +1167,11 @@ fi
 apply_profile a "$AGENT_A_PROFILE" "$AGENT_A_SET" "$AGENT_A_SSH_SET" "$AGENT_A_WORKDIR_SET"
 apply_profile b "$AGENT_B_PROFILE" "$AGENT_B_SET" "$AGENT_B_SSH_SET" "$AGENT_B_WORKDIR_SET"
 
-[[ "$AGENT_A" == "fake" || -x "$SCRIPT_DIR/${AGENT_A}-tmux" ]] || die "--agent-a must be fake or a CLI with a <cli>-tmux shim (claude, codex, agy, ...)"
-[[ "$AGENT_B" == "fake" || -x "$SCRIPT_DIR/${AGENT_B}-tmux" ]] || die "--agent-b must be fake or a CLI with a <cli>-tmux shim (claude, codex, agy, ...)"
+# Any non-empty CLI name agent-tmux can drive (claude, codex, agy, gemini,
+# cursor, grok, future CLIs) is valid; an unknown CLI gets generic defaults and
+# fails clearly at launch if its binary is missing. fake is the in-process stub.
+[[ "$AGENT_A" == [!-]* ]] || die "--agent-a must be 'fake' or a CLI name agent-tmux can drive (claude, codex, agy, ...)"
+[[ "$AGENT_B" == [!-]* ]] || die "--agent-b must be 'fake' or a CLI name agent-tmux can drive (claude, codex, agy, ...)"
 [[ -z "$AGENT_A_SSH" || "$AGENT_A" != "fake" ]] || die "--agent-a-ssh cannot be used with --agent-a fake"
 [[ -z "$AGENT_B_SSH" || "$AGENT_B" != "fake" ]] || die "--agent-b-ssh cannot be used with --agent-b fake"
 [[ -z "$AGENT_A_SSH" || -n "$AGENT_A_WORKDIR" ]] || die "--agent-a-workdir is required when --agent-a-ssh is set"
