@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.25.0 - 2026-06-24
+
+### Changed
+
+- Hardened the tmux-agent skill guidance against two recurring failure modes: agents bypassing the engine with raw `tmux`, and prompts that look sent but never submit. `skills/tmux-agent-tools/SKILL.md`, `skills/using-tmux-agent-tools/SKILL.md`, and the `tmux-delegate` agent now carry three non-negotiable rules. (1) Engine-only: drive workers exclusively through `agent-tmux <cli>` subcommands — never raw `tmux send-keys`/`capture-pane`/`new-session`/`kill-session`. (2) Prefer the managed/Agent path over ad-hoc shell, dropping to shell only for genuine gaps. (3) A `send` is not confirmed until verified — default to `send-wait` (fresh nonce), treat a timeout as *unconfirmed* (check `status --json` + `probe --metric` for the busy signal, since `status`/`ping` expose none; resend only if idle), and raise `<NS>_TMUX_SUBMIT_DELAY` for slow TUIs. Also clarified the cascade-spawn ban covers further tmux/engine workers, not Claude Code's separate in-process `Agent`-tool nesting. Verified across 11 rounds of adversarial codex review against the agent-tmux implementation.
+
 ## v0.24.0 - 2026-06-22
 
 ### Changed

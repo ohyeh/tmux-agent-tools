@@ -36,9 +36,21 @@ agent-tmux <cli> setup
 
 Use `Bash` for wrapper commands, `Read` for exact prompt files or result files only when needed, `Glob` for file discovery, and `Grep` for text checks. S8 self-audit: every tool referenced here is listed in the frontmatter `tools:` field.
 
+## Engine-Only Rule
+
+Drive workers exclusively through `agent-tmux <cli>` (or the `claude-tmux` / `codex-tmux` shims) subcommands. NEVER hand-roll raw `tmux` — no `tmux new-session`, `tmux send-keys`, `tmux capture-pane`, or `tmux kill-session` — to start, message, read, or kill a worker. Raw tmux bypasses session naming, secret redaction, the result contract, and cleanup, and leaves no verified-send path (`send-wait`), a common cause of lost prompts and orphaned sessions. Plain shell is a last resort reserved for genuine gaps no subcommand covers; when you fall back, state explicitly why.
+
+## Send Must Be Verified
+
+A `send` is fire-and-forget and can silently fail to submit (the Enter lands before the TUI is ready, so the prompt sits unsent in the input box). Do not assume a send landed:
+
+- Prefer `send-wait` — it generates a fresh nonce and waits for it, so the marker only appears after the prompt is accepted and answered. (`send-wait-literal` instead waits for a *new* occurrence of your literal vs a pre-send count — existing pane text won't satisfy it, but pick a unique literal so unrelated later output can't false-positive.) No marker by timeout means submission is *unconfirmed*, not proven failed (the worker may be slow or stuck): check `status --json` (still running?) and `probe --metric tool_active <name>` (codex/generic; `--metric active_spinner` for claude) for the busy signal (`status`/`ping` expose none), and resend only if idle or not progressing (that liveness check, not the nonce, prevents double-running; the nonce only avoids stale-marker false matches).
+- If you used bare `send`, confirm with `capture --strip-ansi <name> 20` — prompt text gone from the input line means it submitted. (`status --json` exposes no busy field; `ping` only proves liveness (ok/timeout/dead), and `probe --metric <metric>` carries the busy signal.)
+- Never re-fire a raw `tmux send-keys Enter` to nudge it; resend through `send-wait`.
+
 ## Worker Prompt Rules
 
-Workers you spawn MUST NOT spawn further workers.
+Workers you spawn MUST NOT delegate further — no additional tmux workers, fanout, or dialogue. Anything a worker spawns is fan-out the parent engine cannot supervise. "Delegate further" here means more tmux/engine workers, not the worker's own in-process Claude Code `Agent` tool (a separate CLI-supervised, 5-level-capped mechanism that stays allowed).
 
 Include this sentence literally in every worker prompt:
 
