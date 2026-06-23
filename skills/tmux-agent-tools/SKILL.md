@@ -7,6 +7,7 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 
 ## Fast paths (read this first)
 
+- **STOP — never type raw `tmux` at a worker.** Every interaction goes through an `agent-tmux <cli>` subcommand. Do **not** reach for `tmux send-keys`, `tmux capture-pane`, `tmux new-session`, or `tmux kill-session` — that bypasses the wrappers, and a hand-rolled `tmux send-keys ... Enter` is exactly why prompts look sent but never submit (no submit-verification). To message a worker use `send-wait`; to read it use `capture`/`status`/`result`; to end it use `stop`. Raw tmux is a last resort for a genuine gap only, and you must say so when you use it.
 - **Wrapper not on PATH?** Run it from the skill bundle directly: `<skill-dir>/scripts/codex-tmux …` (this file's directory). Don't waste steps on `which`/`find`/`tmux ls` discovery.
 - **Supervising an existing worker?** `tmux-agent-sessions resolve --name <n> --json` → `codex-tmux status --json <n>` → `codex-tmux result --json --wait 30 <n>` → `codex-tmux ping --json --timeout 5 <n>` only if liveness is unclear. Pane capture is diagnostic fallback only.
 - **Multiple workers, need first/all/quorum completions?** One blocking call: `codex-tmux watch --any|--all|--count <n> --timeout <s> --json <n1> <n2> …` — do **not** write a shell polling loop. Parse the JSON `agents[].done/reason` for the winner/quorum, then `codex-tmux result --json <winner>`.
@@ -15,7 +16,13 @@ description: Use when running or supervising AI coding CLIs (Claude Code, Codex,
 
 ## Overview
 
-`agent-tmux <cli> <command>` is the single engine: it runs **any** AI coding CLI as a managed tmux worker. `claude-tmux` and `codex-tmux` are one-line shims for the two most common CLIs (`claude-tmux start … ` ≡ `agent-tmux claude start …`). Prefer these wrappers over hand-written `tmux send-keys` flows because they provide consistent session naming, capture, wait, status, secret injection, and cleanup.
+`agent-tmux <cli> <command>` is the single engine: it runs **any** AI coding CLI as a managed tmux worker. `claude-tmux` and `codex-tmux` are one-line shims for the two most common CLIs (`claude-tmux start … ` ≡ `agent-tmux claude start …`). These wrappers provide consistent session naming, capture, wait, status, secret injection, and cleanup.
+
+### Non-negotiable rules
+
+1. **Engine-only — never bypass with raw tmux.** Drive every worker through `agent-tmux <cli>` subcommands (`start`/`send`/`send-wait`/`wait*`/`status`/`result`/`stop`). Do **not** hand-roll `tmux new-session`, `tmux send-keys`, `tmux capture-pane`, or any raw `tmux` call to start, message, read, or kill a worker. Raw tmux skips session naming, secret redaction, result contracts, and cleanup, and leaves you no verified-send path (`send-wait`) — a common source of lost prompts, stale-pane misreads, and orphaned sessions. If a capability seems missing, it almost always exists as a subcommand; check the capability table before reaching for tmux. Raw `tmux` is a last resort for genuine gaps only, and when truly unavoidable, say so explicitly and explain why no subcommand covered it.
+2. **Prefer the managed/Agent path over shell.** When a managed subcommand or an Agent-tool delegation can do the job, use it instead of ad-hoc shell. Drop to plain shell only when no engine command covers the need — and call that out when you do.
+3. **A `send` is not done until submission is verified.** Bare `send` is fire-and-forget: it pastes then fires an Enter after `SUBMIT_DELAY` (a second Enter for multi-line prompts). If the CLI's TUI has not settled, that Enter inserts a newline or is dropped and **the prompt sits in the input box unsent** — the recurring "it never actually sent" failure. Never fire `send` and assume it landed. Default to `send-wait`, which generates a fresh nonce and waits for it (the marker only appears *after* the prompt is accepted); if the marker never arrives within the timeout, submission is unconfirmed — check liveness (`status --json` plus `probe --metric tool_active` for codex/generic or `--metric active_spinner` for claude — `ping` only proves the pane responds) and resend only if the worker is idle (that liveness check, not the nonce, guards against double-running). See **Sending so it actually submits** below.
 
 Any other CLI works without code changes: `agent-tmux gemini start …` uses generic defaults, and a declarative profile file (`~/.config/agent-tmux/profiles/<cli>.conf`) can customize the binary, launch flags, resume keyword, and busy/blocked detection patterns. See "Custom CLIs and profiles" below.
 
@@ -161,6 +168,18 @@ codex-tmux send-wait worker 'Summarize the current blocker in result.json.' 180
 
 Use `send-wait <name> <text> <timeout>` for marker-driven orchestration. It generates a fresh nonce, appends the instruction to end with that nonce, sends the text, and waits for that unique marker. Fresh nonce markers avoid both stale pane matches and prompt-echo matches.
 
+#### Sending so it actually submits
+
+Bare `send` pastes the text and fires an `Enter` after the submit delay — and a second `Enter` after another delay when the prompt contains a newline (`paste_and_submit`) — using `<NS>_TMUX_SUBMIT_DELAY` (e.g. `CODEX_TMUX_SUBMIT_DELAY`, falling back to `AGENT_TMUX_SUBMIT_DELAY`; default `0.2s`). On a busy or slow-rendering TUI that Enter can land before the input box is ready — it inserts a newline or is swallowed, and the prompt stays in the box **unsent**. This is the "I sent it but nothing happened" failure; it is silent unless you verify.
+
+Make submission verifiable, never assumed:
+
+- **Default to `send-wait`.** It generates a *fresh nonce*, appends "end with this nonce" to your prompt, sends, and waits for that unique marker — so the marker only appears once the prompt is accepted and the worker answers. Marker arrives → it submitted and ran. No marker by the timeout means submission is *unconfirmed* — not proven failed; the worker may simply be slow or stuck. Distinguish before resending: `status --json` (still `running`?) plus `probe --metric <metric> <name>` for the busy signal (`--metric tool_active` for codex/generic, `--metric active_spinner` for claude) — `status` and `ping` expose none. Resend the same `send-wait` only if it is idle or not progressing — that liveness check, not the nonce, is what keeps this safe (the fresh nonce only stops a stale marker from matching; it does not make the worker's action idempotent, so a resend after a prompt that *did* land would run it twice). If it is actively working, keep waiting.
+- **`send-wait-literal` needs a *unique* literal.** Unlike `send-wait`, it does not generate a marker — it records the literal's occurrence count before sending and waits for that count to rise, so existing pane content cannot satisfy it. The real caveat is a non-unique literal: if unrelated later output also emits it, that counts as the new occurrence and false-positives. Choose a literal unlikely to appear except in the worker's reply.
+- **If you must use bare `send`, verify with a capture.** `capture --strip-ansi <name> 20`: if your prompt text still sits on the input line, it was not submitted — resend. Note `status --json` has **no** busy/working field, and `ping` only proves the pane responds (`ok`/`timeout`/`dead`); for a positive "is it working" signal use `probe --metric <metric> <name>` (`--metric tool_active` for codex/generic, `--metric active_spinner` for claude).
+- **Tune the delay for heavy TUIs.** If non-submission keeps happening for a given CLI, raise its submit delay per that CLI's namespace or universally: `CODEX_TMUX_SUBMIT_DELAY=0.6` (or `CLAUDE_TMUX_SUBMIT_DELAY=0.6`, or `AGENT_TMUX_SUBMIT_DELAY=0.6` for all CLIs). Slower is more reliable; trade latency for landing the prompt.
+- **Never re-fire raw `tmux send-keys Enter` to "nudge" it.** That is the bypass rule #1 forbids and it desyncs the engine's view of the pane. Resend through `send-wait` instead.
+
 3. **Wait with a bounded wrapper call**. Every blocking wait needs a timeout; never write shell `sleep`, `while status ...`, or hand-rolled capture polling loops.
 
 ```bash
@@ -275,7 +294,7 @@ These tools are for **long-running supervised work**, not for unbounded agent sp
 
 1. **Ask the user up front: tool (claude or codex), model tier, and effort/reasoning level per worker.** Never assume defaults.
 2. **Declare an explicit worker upper bound** (e.g., "I will run at most 3 workers; if that is insufficient I will stop and report, not spawn helpers").
-3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write your result to <the literal path from `result --path <name>`> when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
+3. **Forbid cascade spawning** by writing a literal ban into each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH out. Reason only from provided context and write your result to <the literal path from `result --path <name>`> when done." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap. Here "delegate further" means spawning more tmux/engine workers (`agent-tmux`/`claude-tmux`/`codex-tmux`, `tmux-agent-fanout`, `tmux-agent-dialogue`) — it does **not** forbid the worker's own in-process Claude Code `Agent` tool, a separate mechanism the CLI supervises and depth-caps at 5 levels, which stays allowed.
 4. **Bound dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6).
 
 For credential-free smoke tests of any preset, use `--agent-a fake --agent-b fake`. Real `codex` / `claude` participants only after explicit user authorization.

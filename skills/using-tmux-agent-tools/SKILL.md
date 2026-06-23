@@ -71,7 +71,28 @@ router intentionally does not restate it — one source of truth, zero drift.
   `tmux-agent-dialogue` without explicit user authorization for worker count,
   tool, model, and effort. Multi-agent sprawl is the biggest risk here.
 - **No cascade spawning.** Every delegated worker prompt MUST carry the literal
-  ban: "Do not spawn additional tmux sessions or delegate further."
+  ban: "Do not spawn additional tmux sessions or delegate further." A delegated
+  worker that spawns its own workers creates fan-out the parent engine cannot
+  supervise. "Delegate further" here means more tmux/engine workers
+  (`agent-tmux`, fanout, dialogue) — not the worker's own in-process Claude Code
+  `Agent` tool, a separate CLI-supervised, depth-capped mechanism that stays
+  allowed.
+- **Engine-only, never raw tmux.** Drive workers exclusively through
+  `agent-tmux <cli>` subcommands. Never hand-roll `tmux send-keys` /
+  `capture-pane` / `new-session` to start, message, read, or kill a worker —
+  raw tmux skips session naming, redaction, and cleanup and leaves no
+  verified-send path (`send-wait`), a common cause of lost prompts and
+  orphaned sessions. Plain shell is a last resort for genuine gaps; say so when
+  you fall back.
+- **Verify every send.** Prefer `send-wait`, which generates a fresh nonce and
+  waits for it (`send-wait-literal` waits for a *new* occurrence of your literal
+  vs a pre-send count — pick a unique one, since unrelated later output emitting
+  the same literal would false-positive). A timeout means submission is
+  *unconfirmed* (unsent,
+  or the worker is slow/stuck) — check liveness (`status --json` for `running`,
+  `probe --metric tool_active <name>` (or `--metric active_spinner` for claude)
+  for the busy signal, since `status`/`ping` expose none) and resend only if
+  idle. Never "nudge" with a raw `tmux send-keys Enter`.
 
 For wait/supervise/marker mechanics, follow the Fast paths and Core Workflow in
 `skills/tmux-agent-tools/SKILL.md` — not duplicated here.
