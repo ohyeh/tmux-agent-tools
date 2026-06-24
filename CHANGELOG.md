@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.26.1 - 2026-06-24
+
+### Changed
+
+- Unified the version carriers (#286). The three plugin manifests (`.claude-plugin`, `.codex-plugin`, `.cursor-plugin` `plugin.json`) had drifted to `0.24.0`/`0.20.0` while releases were at `v0.26.0`; all three are now bumped in lockstep with the release. A new `scripts/test-version-sync-smoke` guard (wired into CI and the release validation) fails the build if any plugin manifest version diverges from the latest `CHANGELOG.md` `## vX.Y.Z`, so this drift cannot silently recur. The Homebrew formula is intentionally excluded from the guard since it is bumped in a separate post-release PR and lags the tag by design.
+
 ## v0.26.0 - 2026-06-24
 
 ### Fixed
