@@ -1,0 +1,61 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #283: `status --json` surfaces a plugin hook-trust prompt
+# as confirmation_detected=true / blocked_reason=hook_trust_prompt, and does NOT
+# false-trigger on ordinary "needs review" prose.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-hook-trust.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+# Positive: pane shows a hook-trust prompt and stays alive.
+cat > "$WORK/fake-trust.sh" <<'EOF'
+#!/bin/sh
+echo "1 hook needs review before this session can continue."
+echo "Press t to trust the ponytail@ponytail SubagentStart hook."
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-trust.sh"
+
+# Negative: ordinary prose containing "needs review" must NOT trigger.
+cat > "$WORK/fake-prose.sh" <<'EOF'
+#!/bin/sh
+echo "The submitted pull request still needs review by a maintainer."
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-prose.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+echo "case: hook-trust prompt detected"
+P="hook-trust"
+env CODEX="$WORK/fake-trust.sh" "$CODEX_TMUX" start --exact "$P" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$P")"
+assert "confirmation_detected true" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "true"
+assert "blocked_reason hook_trust_prompt" "$(printf '%s' "$st" | jq -r .blocked_reason)" "hook_trust_prompt"
+assert "diagnostic non-null" "$(printf '%s' "$st" | jq -r '.diagnostic | type')" "string"
+"$CODEX_TMUX" stop "$P" >/dev/null 2>&1 || true
+
+echo "case: ordinary 'needs review' prose is not a hook-trust prompt"
+N="prose-review"
+env CODEX="$WORK/fake-prose.sh" "$CODEX_TMUX" start --exact "$N" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$N")"
+assert "no false hook_trust" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+assert "no false confirmation" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "false"
+"$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
+
+echo "hook-trust-status smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

@@ -373,12 +373,21 @@ HELP_EOF
       ;;
     send)
       cat <<'HELP_EOF'
-agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
+agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
 
 Paste text into the agent CLI and submit. Use --from-file for first-class
 multi-line injection under the same send-lock, transcript, and audit surfaces.
 --enter-count defaults to 1 for --from-file. Tune delay with --enter-delay or
 CLAUDE_TMUX_SUBMIT_DELAY.
+
+--raw delivers the text as literal keystrokes with NO result-path/nonce prefix
+and NO trailing Enter (unless --enter-count N>0 is given). Use it to answer a
+TUI prompt with a single key, e.g. `send --raw <name> t` for a hook-trust
+prompt. Cannot be combined with --from-file.
+
+The result-path instruction (result_path_via_prompt=true profiles, e.g. codex)
+is injected only ONCE per session, on the first prompt-bearing start/send;
+follow-up sends and --raw keystrokes are never prefixed.
 HELP_EOF
       ;;
     send-wait)
@@ -857,6 +866,20 @@ paste_file_and_submit() {
   done
 }
 
+# Raw literal key delivery for answering TUI prompts (#283): sends keys verbatim
+# (e.g. a bare `t` for a hook-trust prompt) with NO result-path/nonce prefix and
+# NO trailing Enter unless enter_count > 0. Still runs under the send lock via
+# the caller, so it is wrapper-managed, not a raw-tmux bypass.
+send_keys_raw() {
+  local session="$1" keys="$2" enter_count="$3" enter_delay="$4"
+  "$TMUX" send-keys -t "$session" -l -- "$keys"
+  local i
+  for (( i = 0; i < enter_count; i++ )); do
+    sleep "$enter_delay"
+    "$TMUX" send-keys -t "$session" Enter
+  done
+}
+
 strip_ansi_text() {
   sed -E $'
     s/\x1b\\[[0-9;?]*[A-Za-z]//g
@@ -1156,6 +1179,7 @@ run_dry_run_checks() {
   local tool="$1" req_name="$2" directory="$3" exact_name="$4"
   local sentinel="$5" on_exit_cmd="$6" transcript_path="$7"
   local initial_text="${8:-}"
+  local model_flag="${9:-}"
   local checks_json="[]"
 
   add_check() {
@@ -1265,6 +1289,7 @@ run_dry_run_checks() {
   local invocation_session
   invocation_session="$(session_for_name "$req_name")"
   local invocation_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag="" meta_path=""
+  [[ -n "$model_flag" ]] && invocation_flags="${invocation_flags:+$invocation_flags }${model_flag}"
   if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
     supplied_id="$(new_cli_session_id)"
     meta_path="$(ensure_agent_dir "$req_name")/session-meta.json"
@@ -2011,14 +2036,33 @@ result_path_session() {
   printf '%s\n' "$subdir/result.json"
 }
 
-prompt_with_result_path() {
-  local name="$1"
-  local prompt_text="$2"
-  if [[ "$RESULT_PATH_VIA_PROMPT" == true ]]; then
-    printf 'Write final JSON to this exact path: %s\n%s' "$(agent_root_dir)/$name/result.json" "$prompt_text"
-  else
-    printf '%s' "$prompt_text"
-  fi
+# Result-path injection is ONCE-PER-SESSION (#283): the worker is told where to
+# write result.json on the first prompt-bearing contact (start OR send), then
+# follow-up sends and single-key answers stay clean. A persistent sentinel under
+# the agent dir records that the instruction was delivered.
+result_path_sentinel() {
+  printf '%s' "$(agent_root_dir)/$1/.result-path-injected"
+}
+
+# Should the result-path instruction be prepended to this prompt? Yes only when
+# result_path_via_prompt=true, the prompt is non-empty, and the sentinel is
+# absent. Returns 0/1 so callers test it in `if` (no subshell — a global set
+# inside $(...) would not survive command substitution).
+result_path_should_inject() {
+  local name="$1" prompt_text="$2"
+  [[ "$RESULT_PATH_VIA_PROMPT" == true && -n "$prompt_text" && ! -e "$(result_path_sentinel "$name")" ]]
+}
+
+# Prepend the result-path instruction to a prompt.
+result_path_prepend() {
+  printf 'Write final JSON to this exact path: %s\n%s' "$(agent_root_dir)/$1/result.json" "$2"
+}
+
+# Record that the result-path instruction has been delivered. Call ONLY after
+# the send has gone through, so a failed first send never leaves a worker that
+# silently never learned its result path (#283).
+result_path_mark_injected() {
+  : > "$(result_path_sentinel "$1")" 2>/dev/null || true
 }
 
 result_validate_session() {
@@ -2860,8 +2904,17 @@ start_session() {
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+  local model_flag=""
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" || "${1:-}" == "--model" ]]; do
     case "$1" in
+      --model)
+        if (( $# < 2 )); then
+          echo "--model requires a value (passed through to the CLI as --model <value>; not validated per-CLI)" >&2
+          exit 2
+        fi
+        model_flag="--model $(shell_quote "$2")"
+        shift 2
+        ;;
       --secret-redact|--secret-redact=true)
         SECRET_REDACT_DISABLE=0
         shift
@@ -2981,13 +3034,13 @@ start_session() {
   local initial_text="${*:-}"
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
+    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--model <model>] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
   if (( dry_run )); then
     run_dry_run_checks "${CLI}-tmux" "$requested_name" "$directory" "$exact_name" \
-      "$sentinel" "$on_exit_cmd" "$transcript_path" "$initial_text"
+      "$sentinel" "$on_exit_cmd" "$transcript_path" "$initial_text" "$model_flag"
     exit $?
   fi
 
@@ -3075,6 +3128,7 @@ start_session() {
     result_schema_record "$name" "$result_schema_path"
   fi
   local start_launch_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag=""
+  [[ -n "$model_flag" ]] && start_launch_flags="${start_launch_flags:+$start_launch_flags }${model_flag}"
   if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
     supplied_id="$(new_cli_session_id)"
     write_session_meta_id "$(agent_root_dir)/$name/session-meta.json" "$supplied_id"
@@ -3160,8 +3214,12 @@ start_session() {
   if [[ -n "$initial_text" && "$EXEC_MODE" != "oneshot" ]]; then
     sleep 3
     local buffer_name="$session-init"
-    initial_text="$(prompt_with_result_path "$name" "$initial_text")"
+    local _rp_inject=0
+    if result_path_should_inject "$name" "$initial_text"; then
+      initial_text="$(result_path_prepend "$name" "$initial_text")"; _rp_inject=1
+    fi
     paste_and_submit "$session" "$buffer_name" "$initial_text"
+    (( _rp_inject )) && result_path_mark_injected "$name"
     echo "sent: $initial_text"
   elif [[ "$EXEC_MODE" == "oneshot" ]]; then
     echo "sent: <oneshot argv>"
@@ -3575,23 +3633,26 @@ send_session() {
   require_tmux
   local from_file=""
   local enter_count=1
+  local enter_count_set=0
+  local raw=false
   local enter_delay="$SUBMIT_DELAY"
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --raw) raw=true; shift ;;
       --from-file)
         if [[ -z "${2:-}" ]]; then
-          echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+          echo "Usage: agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
           exit 2
         fi
         from_file="$2"; shift 2 ;;
       --from-file=*) from_file="${1#--from-file=}"; shift ;;
       --enter-count)
         if [[ -z "${2:-}" ]]; then
-          echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+          echo "Usage: agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
           exit 2
         fi
-        enter_count="$2"; shift 2 ;;
-      --enter-count=*) enter_count="${1#--enter-count=}"; shift ;;
+        enter_count="$2"; enter_count_set=1; shift 2 ;;
+      --enter-count=*) enter_count="${1#--enter-count=}"; enter_count_set=1; shift ;;
       --enter-delay)
         if [[ -z "${2:-}" ]]; then
           echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
@@ -3608,7 +3669,11 @@ send_session() {
   shift || true
 
   if [[ -z "$name" || ( -z "$from_file" && "$#" -eq 0 ) || ( -n "$from_file" && "$#" -ne 0 ) ]]; then
-    echo "Usage: agent-tmux send [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+    echo "Usage: agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
+    exit 2
+  fi
+  if [[ "$raw" == true && -n "$from_file" ]]; then
+    echo "send --raw cannot be combined with --from-file" >&2
     exit 2
   fi
   if ! [[ "$enter_count" =~ '^[0-9]+$' ]] || (( enter_count < 1 )); then
@@ -3637,13 +3702,22 @@ send_session() {
     prompt_text="$(cat "$from_file")"
     multiline=true
   fi
-  prompt_text="$(prompt_with_result_path "$name" "$prompt_text")"
+  local _rp_inject=0
+  if [[ "$raw" != true ]] && result_path_should_inject "$name" "$prompt_text"; then
+    prompt_text="$(result_path_prepend "$name" "$prompt_text")"; _rp_inject=1
+  fi
   if [[ -n "$from_file" ]]; then
     payload_file="$(mktemp -t agent-tmux-send.XXXXXX)"
     printf '%s' "$prompt_text" > "$payload_file"
   fi
   local buffer_name="$session-send"
-  if [[ -n "$from_file" ]]; then
+  if [[ "$raw" == true ]]; then
+    # raw default: deliver the keys with no trailing Enter unless asked (#283)
+    local raw_enter="$enter_count"
+    (( enter_count_set )) || raw_enter=0
+    send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+      send_keys_raw "$session" "$prompt_text" "$raw_enter" "$enter_delay" || return $?
+  elif [[ -n "$from_file" ]]; then
     send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
       paste_file_and_submit "$session" "$buffer_name" "$payload_file" "$enter_count" "$enter_delay"
     local send_rc=$?
@@ -3653,6 +3727,7 @@ send_session() {
     send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
       paste_and_submit "$session" "$buffer_name" "$prompt_text" || return $?
   fi
+  (( _rp_inject )) && result_path_mark_injected "$name"
 
   local transcript_path
   transcript_path="$(transcript_path_for "$name")"
@@ -3753,14 +3828,21 @@ send_wait_session() {
 
   local nonce
   nonce="$(marker_nonce)"
-  prompt_text="$(prompt_with_result_path "$name" "$prompt_text")"
+  local _rp_inject=0
+  if result_path_should_inject "$name" "$prompt_text"; then
+    prompt_text="$(result_path_prepend "$name" "$prompt_text")"; _rp_inject=1
+  fi
   local augmented_prompt="${prompt_text}"$'\n\n'"End your reply with this exact nonce on its own line: ${nonce}"
+  # Pass the inject flag INTO the locked helper; it marks the sentinel right
+  # after the paste so a wait-timeout still counts as delivered. Marking here
+  # after send_lock_around would be skipped by `set -e` on a non-zero return,
+  # and would wrongly mark on a lock-acquisition timeout (#283).
   send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
-    _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds"
+    _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds" "$_rp_inject"
 }
 
 _send_wait_nonce_locked() {
-  local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5"
+  local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5" inject_rp="${6:-0}"
 
   local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
   local before_count
@@ -3768,6 +3850,11 @@ _send_wait_nonce_locked() {
 
   local buffer_name="$session-send-wait"
   paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  # Mark the result-path sentinel here (inside the lock, right after the prompt
+  # reached the pane) so a later wait-timeout still counts it as delivered. Doing
+  # it in the caller after send_lock_around would be skipped by `set -e` on the
+  # helper's non-zero timeout return (#283).
+  (( inject_rp )) && result_path_mark_injected "$name"
   audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" --arg marker "$nonce" \
     '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber), marker:$marker}')"
 
@@ -3815,13 +3902,18 @@ send_wait_literal_session() {
     exit 1
   fi
 
-  prompt_text="$(prompt_with_result_path "$name" "$prompt_text")"
+  local _rp_inject=0
+  if result_path_should_inject "$name" "$prompt_text"; then
+    prompt_text="$(result_path_prepend "$name" "$prompt_text")"; _rp_inject=1
+  fi
+  # inject flag goes INTO the locked helper (marks after paste); see
+  # _send_wait_nonce_locked for why marking after send_lock_around is unsafe (#283).
   send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
-    _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds"
+    _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds" "$_rp_inject"
 }
 
 _send_wait_literal_locked() {
-  local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5"
+  local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5" inject_rp="${6:-0}"
 
   local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
   local before_count
@@ -3829,6 +3921,9 @@ _send_wait_literal_locked() {
 
   local buffer_name="$session-send-wait"
   paste_and_submit "$session" "$buffer_name" "$prompt_text"
+  # See _send_wait_nonce_locked: mark inside the lock so a wait-timeout still
+  # counts the prompt as delivered and the next send won't re-inject (#283).
+  (( inject_rp )) && result_path_mark_injected "$name"
   audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" \
     '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber)}')"
 
@@ -4996,6 +5091,12 @@ blocked_reason_for_text() {
   elif [[ -n "$PROFILE_PATTERN_LOGIN" ]] && print -r -- "$lowered" | grep -qiE "$PROFILE_PATTERN_LOGIN"; then
     print -r -- "login_prompt"; return 0
   fi
+  # Hook-trust prompts (e.g. a plugin SubagentStart hook: "1 hook needs review …
+  # Press t to trust"). Narrow, hook-anchored patterns only — never a bare
+  # "needs review", which would false-trigger on ordinary CLI prose (#283).
+  if [[ "$lowered" == *"press t to trust"* || "$lowered" == *"hook needs review"* || "$lowered" == *"hooks need review"* || "$lowered" == *"hook(s) need review"* ]]; then
+    print -r -- "hook_trust_prompt"; return 0
+  fi
   if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
     print -r -- "cli_exited"
   elif [[ "$lowered" == *"password:"* || "$lowered" == *"permission denied"* || "$lowered" == *"are you sure you want to continue connecting"* ]]; then
@@ -5025,6 +5126,9 @@ exit_code_for_text() {
 diagnostic_for_blocked_reason() {
   local reason="$1"
   case "$reason" in
+    hook_trust_prompt)
+      echo "session is blocked on a hook-trust prompt; inspect the hook and, only if you trust it, answer with a raw key (e.g. agent-tmux <cli> send --raw <name> t)"
+      ;;
     permission_prompt|approval_prompt|ssh_prompt|login_prompt)
       echo "session may be waiting for interactive confirmation; attach or capture the pane before sending prompts"
       ;;
@@ -5451,13 +5555,15 @@ FAKE_EOF
       return 1
     fi
 
+    # Once-per-session (#283): start already injected path1 and marked the
+    # sentinel, so a follow-up send-wait must NOT re-inject it.
     pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
     before_count="$(count_literal_occurrences "$pane" "$path1")"
     send_wait_session "$name1" "follow-up prompt" 5
     pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
     after_count="$(count_literal_occurrences "$pane" "$path1")"
-    if (( after_count <= before_count )); then
-      echo "self-test result-path-prompt: FAIL (send-wait prompt missing $path1)" >&2
+    if (( after_count != before_count )); then
+      echo "self-test result-path-prompt: FAIL (follow-up send-wait re-injected $path1; expected once-per-session)" >&2
       return 1
     fi
   } always {
@@ -5662,7 +5768,7 @@ status_session() {
     blocked_reason="$(blocked_reason_for_text "$lowered")"
     diagnostic="$(diagnostic_for_blocked_reason "$blocked_reason")"
     case "$blocked_reason" in
-      permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+      hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt)
         confirmation_detected=true
         ;;
     esac

@@ -1,0 +1,41 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #283 Gap 1: the tmux-delegate subagent is shipped at the
+# plugin-root agents/ dir (where Claude Code registers plugin subagents at
+# startup), has valid frontmatter + the no-cascade worker constraint, and does
+# not drift from the project-local .claude/agents/ copy used for repo dogfooding.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+PLUGIN_AGENT="$REPO_ROOT/agents/tmux-delegate.md"
+PROJECT_AGENT="$REPO_ROOT/.claude/agents/tmux-delegate.md"
+
+PASS=0
+FAIL=0
+ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
+bad()  { echo "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
+check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi }
+
+[[ -f "$PLUGIN_AGENT" ]]  && ok "plugin-root agents/tmux-delegate.md exists"      || bad "plugin-root agents/tmux-delegate.md missing"
+[[ -f "$PROJECT_AGENT" ]] && ok ".claude/agents/tmux-delegate.md exists"          || bad ".claude/agents/tmux-delegate.md missing"
+
+# Valid Claude Code subagent frontmatter: first line is '---', has name/description.
+head -1 "$PLUGIN_AGENT" | grep -q '^---$' && ok "frontmatter opens with ---"      || bad "frontmatter does not open with ---"
+grep -q '^name: tmux-delegate$' "$PLUGIN_AGENT" && ok "frontmatter name present"  || bad "frontmatter name missing"
+grep -q '^description: ' "$PLUGIN_AGENT" && ok "frontmatter description present"  || bad "frontmatter description missing"
+
+# The no-further-delegation worker constraint must be present.
+grep -qF 'Do not spawn additional tmux sessions or delegate further.' "$PLUGIN_AGENT" \
+  && ok "no-cascade worker constraint present" || bad "no-cascade worker constraint missing"
+
+# No drift between the shipped plugin agent and the project-local copy.
+if cmp -s "$PLUGIN_AGENT" "$PROJECT_AGENT"; then
+  ok "plugin and project subagent copies are identical"
+else
+  bad "plugin and project subagent copies have drifted (re-sync agents/tmux-delegate.md)"
+fi
+
+echo "agent-delegate-packaging smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

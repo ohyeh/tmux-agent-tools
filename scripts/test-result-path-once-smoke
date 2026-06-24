@@ -1,0 +1,129 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #283: result-path instruction is injected ONCE per
+# session (not on every send), and `send --raw` sends literal keys with no
+# result-path prefix and no trailing Enter unless asked.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-rp-once.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-live.sh" <<'EOF'
+#!/bin/sh
+echo "ready"
+while IFS= read -r line; do
+  echo "got:$line"
+done
+EOF
+chmod +x "$WORK/fake-live.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label missing '$needle'"; FAIL=$((FAIL + 1)); fi
+}
+
+count_occurrences() {
+  local haystack="$1" needle="$2" n=0
+  while [[ "$haystack" == *"$needle"* ]]; do haystack="${haystack#*"$needle"}"; n=$((n + 1)); done
+  echo "$n"
+}
+
+RP="Write final JSON to this exact path"
+
+# --- Case A: once-per-session injection (codex => result_path_via_prompt=true) ---
+echo "case: once-injection (codex)"
+A="rp-once"
+env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$A" "$WORK" >/dev/null
+sleep 1
+
+# First prompt-bearing contact is a `send` (start carried no text) -> must inject.
+"$CODEX_TMUX" send "$A" "first-task" >/dev/null
+sleep 1
+pane1="$(tmux capture-pane -J -t "codex-cli-$A" -p -S -200)"
+c1="$(count_occurrences "$pane1" "$RP")"
+
+# Second send -> must NOT inject again (count must not grow). Note: a pty echoes
+# pasted input AND the fake echoes it back, so one injection shows up more than
+# once; the invariant is "no NEW injection on the follow-up send".
+"$CODEX_TMUX" send "$A" "second-task" >/dev/null
+sleep 1
+pane2="$(tmux capture-pane -J -t "codex-cli-$A" -p -S -200)"
+c2="$(count_occurrences "$pane2" "$RP")"
+
+assert_contains "first task delivered" "$pane2" "got:first-task"
+assert_contains "second task delivered" "$pane2" "got:second-task"
+assert "result-path injected on first send" "$([[ "$c1" -ge 1 ]] && echo yes || echo no)" "yes"
+assert "follow-up send adds no new injection" "$c1" "$c2"
+
+sentinel="$(dirname "$("$CODEX_TMUX" result --path "$A")")/.result-path-injected"
+assert "sentinel present after first send" "$([[ -e "$sentinel" ]] && echo yes || echo no)" "yes"
+
+"$CODEX_TMUX" stop "$A" >/dev/null 2>&1 || true
+
+# --- Case B: send --raw never injects and presses no Enter by default ---
+echo "case: raw send (codex)"
+B="rp-raw"
+env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$B" "$WORK" >/dev/null
+sleep 1
+
+# Raw single key with no --enter-count: keys land but no line completes.
+"$CODEX_TMUX" send --raw "$B" "t" >/dev/null
+sleep 1
+raw_sentinel="$(dirname "$("$CODEX_TMUX" result --path "$B")")/.result-path-injected"
+assert "raw send does not mark sentinel" "$([[ -e "$raw_sentinel" ]] && echo yes || echo no)" "no"
+
+# Raw with --enter-count 1 submits the key -> fake echoes got:t, no result-path.
+"$CODEX_TMUX" send --raw --enter-count 1 "$B" "t" >/dev/null
+sleep 1
+pane="$(tmux capture-pane -J -t "codex-cli-$B" -p -S -200)"
+assert_contains "raw key submitted with explicit enter" "$pane" "got:t"
+assert "raw send injects no result-path" "$(count_occurrences "$pane" "$RP")" "0"
+
+# --raw + --from-file is rejected.
+rc=0
+"$CODEX_TMUX" send --raw --from-file /tmp/whatever "$B" >/dev/null 2>&1 || rc=$?
+assert "raw + from-file rejected" "$rc" "2"
+
+"$CODEX_TMUX" stop "$B" >/dev/null 2>&1 || true
+
+# --- Case C: a send-wait that TIMES OUT still marks the sentinel (#283 Gap 3d) ---
+# Regression guard: under `set -e`, marking after send_lock_around was skipped on
+# the helper's non-zero timeout return, so the next send re-injected. The mark now
+# lives inside the locked helper, right after the paste.
+echo "case: send-wait timeout still marks (codex)"
+C="rp-sw-timeout"
+env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$C" "$WORK" >/dev/null
+sleep 1
+# fake-live never emits the nonce, so send-wait times out (rc != 0).
+rc=0
+"$CODEX_TMUX" send-wait "$C" "first-task" 2 >/dev/null 2>&1 || rc=$?
+assert "send-wait timed out (rc!=0)" "$([[ "$rc" -ne 0 ]] && echo yes || echo no)" "yes"
+sw_sentinel="$(dirname "$("$CODEX_TMUX" result --path "$C")")/.result-path-injected"
+assert "sentinel marked despite timeout" "$([[ -e "$sw_sentinel" ]] && echo yes || echo no)" "yes"
+
+# A follow-up plain send must NOT re-inject (sentinel already set).
+pane_before="$(tmux capture-pane -J -t "codex-cli-$C" -p -S -200)"
+cbefore="$(count_occurrences "$pane_before" "$RP")"
+"$CODEX_TMUX" send "$C" "second-task" >/dev/null
+sleep 1
+pane_after="$(tmux capture-pane -J -t "codex-cli-$C" -p -S -200)"
+cafter="$(count_occurrences "$pane_after" "$RP")"
+assert "follow-up after timed-out send-wait does not re-inject" "$cbefore" "$cafter"
+"$CODEX_TMUX" stop "$C" >/dev/null 2>&1 || true
+
+echo "result-path-once smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

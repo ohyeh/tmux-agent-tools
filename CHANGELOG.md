@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.26.0 - 2026-06-24
+
+### Fixed
+
+- Result-path injection is now **once per session** instead of on every send (#283). For `result_path_via_prompt=true` CLIs (codex and generic), the `Write final JSON to this exact path: …` instruction was prepended to *every* `send`/`send-wait`, corrupting follow-up prompts and making it impossible to answer a TUI prompt with a single keystroke. The instruction is now injected only on the first prompt-bearing `start`/`send`, tracked by a per-session sentinel written **inside the send lock right after the prompt reaches the pane** — so a wait-timeout still counts as delivered (the next send won't re-inject), while a lock-acquisition timeout or paste failure correctly does not mark. Verified across two rounds of adversarial codex review, which caught a `set -e` control-flow bug in the first cut (caller-side marking was skipped on a non-zero wait return).
+
+### Added
+
+- `send --raw <name> <keys>` delivers literal keystrokes with no result-path/nonce prefix and no trailing Enter (unless `--enter-count N>0`), under the same send lock and wrapper session resolution (#283). Use it to answer a TUI prompt with a single key, e.g. `send --raw <name> t` for a hook-trust prompt.
+- `status --json` now surfaces plugin hook-trust prompts: a new `hook_trust_prompt` `blocked_reason` (with `confirmation_detected:true` and a diagnostic) fires on pane text like "N hooks need review … Press t to trust", using hook/trust-anchored patterns that do not false-trigger on ordinary "needs review" prose (#283).
+- `start --model <model>` pins a worker's model for that run, passed through to the CLI as `--model <model>` (shell-quoted, shown in `--dry-run`, not validated per-CLI since env vars like `ANTHROPIC_MODEL` are unreliable). For a durable per-CLI default, set `launch_flags` in the profile (#283).
+- The `tmux-delegate` subagent now ships at the plugin root `agents/tmux-delegate.md` so it is registered for installed-plugin users (previously only `.claude/agents/` existed, which only works in a checked-out repo). A smoke test keeps the two copies byte-for-byte in sync (#283).
+
 ## v0.25.0 - 2026-06-24
 
 ### Changed
