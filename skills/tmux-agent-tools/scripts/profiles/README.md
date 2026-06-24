@@ -27,7 +27,7 @@ take precedence over profile values.
 | `bin` | binary name or absolute path | `bin=agy-local` |
 | `env_ns` | env namespace (uppercased) | `env_ns=GEMINI` |
 | `prefix` | tmux session prefix | `prefix=gemini-cli` |
-| `launch_flags` | flags appended at launch | `launch_flags=--yolo` |
+| `launch_flags` | flags appended at launch; the durable per-CLI mechanism for a default model (e.g. `--model`). For a one-run override use `start --model <m>` instead. | `launch_flags=--yolo --model gpt-5-codex` |
 | `resume_keyword` | resume subcommand/flag | `resume_keyword=--resume` |
 | `heuristic_family` | `claude`, `codex`, or `generic` pane-heuristic baseline | `heuristic_family=generic` |
 | `usage_kind` | usage text label | `usage_kind=CLI` |

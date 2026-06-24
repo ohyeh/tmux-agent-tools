@@ -154,9 +154,39 @@ run_transcript_no_side_effect() {
   fi
 }
 
+run_model_passthrough() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-model (--model appended to launch flags) ($wrapper)"
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --model claude-sonnet-4-6 "$prefix-m" "$WORK" 2>&1)" || code=$?
+  assert "$prefix-model exit=0" "$code" "0"
+  local flags; flags="$(jq_val "$out" .invocation.launch_flags)"
+  if [[ "$flags" == *"--model claude-sonnet-4-6"* ]]; then
+    echo "  ok   $prefix-model launch_flags carries --model"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix-model launch_flags missing --model: $flags" >&2; FAIL=$((FAIL + 1))
+  fi
+  # value needing shell quoting must be preserved as one token
+  local out2 code2=0
+  out2="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --model "spaced model" "$prefix-m2" "$WORK" 2>&1)" || code2=$?
+  local flags2; flags2="$(jq_val "$out2" .invocation.launch_flags)"
+  if [[ "$flags2" == *"--model 'spaced model'"* || "$flags2" == *'--model "spaced model"'* || "$flags2" == *'--model spaced\ model'* ]]; then
+    echo "  ok   $prefix-model quotes spaced value"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix-model did not quote spaced value: $flags2" >&2; FAIL=$((FAIL + 1))
+  fi
+  # missing value is rejected (--model is the final token, nothing follows)
+  local code3=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run --model >/dev/null 2>&1 || code3=$?
+  assert "$prefix-model missing-value exit=2" "$code3" "2"
+}
+
 for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
   IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
   run_ok_case "$wrapper" "$env_var" "$prefix"
+  run_model_passthrough "$wrapper" "$env_var" "$prefix"
   run_bad_workdir "$wrapper" "$env_var" "$prefix"
   run_preexisting_sentinel "$wrapper" "$env_var" "$prefix"
   run_on_exit_without_sentinel "$wrapper" "$env_var" "$prefix"

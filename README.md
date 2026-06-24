@@ -428,8 +428,8 @@ Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, a
 | `local_or_remote` | string or null | diagnostic | Best-effort mode inferred from pane text; `null` when the session is missing. |
 | `diagnostic` | string or null | diagnostic | Optional readiness warning text; callers should not depend on exact wording. |
 | `last_capture_lines` | array of strings | diagnostic | Bounded pane tail for human diagnosis in JSON callers; empty when the session is missing. Defaults to 20 lines. |
-| `confirmation_detected` | boolean | diagnostic | `true` when the pane appears to be waiting for an interactive permission, approval, SSH, or login prompt. |
-| `blocked_reason` | string or null | diagnostic | Best-effort enum-like reason: `permission_prompt`, `approval_prompt`, `ssh_prompt`, `login_prompt`, or `cli_exited`. |
+| `confirmation_detected` | boolean | diagnostic | `true` when the pane appears to be waiting for an interactive permission, approval, SSH, login, or hook-trust prompt. |
+| `blocked_reason` | string or null | diagnostic | Best-effort enum-like reason: `permission_prompt`, `approval_prompt`, `ssh_prompt`, `login_prompt`, `hook_trust_prompt`, or `cli_exited`. `hook_trust_prompt` fires on a plugin hook-trust prompt (e.g. "1 hook needs review … Press t to trust"); answer it with a raw key via `send --raw <name> t`, only if you trust the hook. |
 
 `diagnostic`, `confirmation_detected`, and `blocked_reason` are best-effort hints from bounded pane text. They do not prove root cause and never auto-accept prompts. Tune the JSON tail with `CLAUDE_TMUX_STATUS_TAIL_LINES` or `CODEX_TMUX_STATUS_TAIL_LINES`; invalid values fall back to 20. The tail is diagnostic and bounded by the wrapper's 80-line status capture window.
 
