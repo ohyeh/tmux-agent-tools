@@ -1,0 +1,196 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #289: --from-file / --prompt-file / stdin (-) support
+# across start, send, send-wait, send-wait-literal.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-prompt-file-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Minimal fake CLI that exits 0 immediately.
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (needle not found)" >&2
+    echo "    needle:   $needle" >&2
+    echo "    haystack: ${haystack:0:300}" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+jq_val() { printf '%s' "$1" | jq -r "$2"; }
+
+# ── start --from-file / --prompt-file ────────────────────────────────────────
+
+run_start_from_file() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix start --from-file / --prompt-file"
+
+  # Write a prompt file
+  local pfile="$WORK/$prefix-prompt.txt"
+  printf 'Hello from file\n' > "$pfile"
+
+  # --from-file with --dry-run: the dry-run JSON should capture initial_text
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --from-file "$pfile" "${prefix}-ff" "$WORK" 2>&1)" || code=$?
+  assert "$prefix start --from-file exit=0" "$code" "0"
+  assert "$prefix start --from-file ok=true" "$(jq_val "$out" .ok)" "true"
+  assert "$prefix start --from-file initial_text" \
+    "$(jq_val "$out" .invocation.initial_text)" "Hello from file"
+
+  # --prompt-file alias
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --prompt-file "$pfile" "${prefix}-pf" "$WORK" 2>&1)" || code=$?
+  assert "$prefix start --prompt-file exit=0" "$code" "0"
+  assert "$prefix start --prompt-file initial_text" \
+    "$(jq_val "$out" .invocation.initial_text)" "Hello from file"
+
+  # --from-file and inline text together → must error
+  code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --from-file "$pfile" "${prefix}-mx" "$WORK" "also inline" >/dev/null 2>&1 || code=$?
+  assert "$prefix start mutual-exclusion exit≠0" "$code" "2"
+
+  # Non-existent file → error
+  code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --from-file "/no/such/file.txt" "${prefix}-ne" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix start nonexistent-file exit≠0" "$code" "2"
+
+  # Relative path → error
+  code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --from-file "relative.txt" "${prefix}-rel" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix start relative-path exit≠0" "$code" "2"
+
+  # stdin via -
+  code=0
+  out="$(printf 'stdin prompt\n' | env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --from-file - "${prefix}-stdin" "$WORK" 2>&1)" || code=$?
+  assert "$prefix start stdin exit=0" "$code" "0"
+  assert "$prefix start stdin initial_text" \
+    "$(jq_val "$out" .invocation.initial_text)" "stdin prompt"
+}
+
+# ── help text mentions --from-file ────────────────────────────────────────────
+
+run_help_from_file() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix help text includes --from-file"
+
+  local out
+  out="$("$wrapper" help start 2>&1)"
+  assert_contains "$prefix help start --from-file" "$out" "--from-file"
+  assert_contains "$prefix help start --prompt-file" "$out" "--prompt-file"
+
+  out="$("$wrapper" help send 2>&1)"
+  assert_contains "$prefix help send --from-file" "$out" "--from-file"
+  assert_contains "$prefix help send --prompt-file" "$out" "--prompt-file"
+
+  out="$("$wrapper" help send-wait 2>&1)"
+  assert_contains "$prefix help send-wait --from-file" "$out" "--from-file"
+
+  out="$("$wrapper" help send-wait-literal 2>&1)"
+  assert_contains "$prefix help send-wait-literal --from-file" "$out" "--from-file"
+}
+
+# ── send-wait / send-wait-literal flag parse (error paths only, no real tmux) ─
+
+run_send_wait_error_paths() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix send-wait / send-wait-literal error paths"
+
+  # send-wait: missing name → error
+  local code=0
+  "$wrapper" send-wait 2>/dev/null || code=$?
+  assert "$prefix send-wait no-args exit≠0" "$code" "2"
+
+  # send-wait: --from-file nonexistent file → error
+  code=0
+  "$wrapper" send-wait --from-file /no/such/file.txt myagent 2>/dev/null || code=$?
+  assert "$prefix send-wait nonexistent-file exit≠0" "$code" "2"
+
+  # send-wait: --from-file relative path → error
+  code=0
+  "$wrapper" send-wait --from-file relative.txt myagent 2>/dev/null || code=$?
+  assert "$prefix send-wait relative-path exit≠0" "$code" "2"
+
+  # send-wait-literal: --from-file nonexistent file → error
+  code=0
+  "$wrapper" send-wait-literal --from-file /no/such/file.txt myagent DONE 2>/dev/null || code=$?
+  assert "$prefix send-wait-literal nonexistent-file exit≠0" "$code" "2"
+
+  # send-wait-literal: --from-file missing marker → error
+  local pfile="$WORK/$prefix-sw-prompt.txt"
+  printf 'test prompt\n' > "$pfile"
+  code=0
+  "$wrapper" send-wait-literal --from-file "$pfile" 2>/dev/null || code=$?
+  # missing name and marker → exits 2 (needs at least name + literal)
+  # exit code may be 2 (usage) or 1 (no session), accept either non-zero
+  [[ "$code" -ne 0 ]] && { echo "  ok   $prefix send-wait-literal missing-args exit≠0"; PASS=$((PASS+1)); } || \
+    { echo "  FAIL $prefix send-wait-literal missing-args expected non-zero got 0" >&2; FAIL=$((FAIL+1)); }
+}
+
+# ── send --prompt-file alias (flag recognised, not "unknown flag") ────────────
+
+run_send_prompt_file_alias() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix send --prompt-file alias recognised"
+
+  # --prompt-file with missing value → usage error (exit 2), not "unknown flag"
+  local code=0 out=""
+  out="$("$wrapper" send --prompt-file 2>&1)" || code=$?
+  assert "$prefix send --prompt-file no-value exit=2" "$code" "2"
+  # must NOT say "Unknown flag"
+  if [[ "$out" == *"Unknown flag"* ]]; then
+    echo "  FAIL $prefix send --prompt-file unknown-flag leak" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix send --prompt-file no unknown-flag leak"
+    PASS=$((PASS + 1))
+  fi
+}
+
+# ── run all cases ─────────────────────────────────────────────────────────────
+
+for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
+  IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
+  run_start_from_file  "$wrapper" "$env_var" "$prefix"
+  run_help_from_file   "$wrapper" "$prefix"
+  run_send_wait_error_paths "$wrapper" "$prefix"
+  run_send_prompt_file_alias "$wrapper" "$prefix"
+done
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
