@@ -597,6 +597,7 @@ require_bins() {
       echo "Unset ${_ENV_NS} or set ${_ENV_NS}=$claude_lookup to use that install." >&2
     else
       echo "Current PATH does not resolve ${CLI}. Install ${CLI} or set ${_ENV_NS}=/path/to/${CLI}." >&2
+      echo "Hint: If wrappers/CLIs are not on PATH, run '${SELF:h}/install-bin' or add the bundle '${SELF:h}' directory to PATH." >&2
     fi
     exit 1
   fi
@@ -3279,6 +3280,7 @@ start_session() {
   echo "agent: $name"
   echo "Started $session"
   echo "cwd:  $directory"
+  echo "cli:  $CLI_BIN"
   echo "send: $SELF $CLI send $name <text>"
   echo "wait: $SELF $CLI wait $name 180"
   echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
@@ -4991,6 +4993,7 @@ doctor_session() {
     echo "${CLI}: $CLI_BIN"
   else
     echo "${CLI}: not found; start requires ${_ENV_NS}=/path/to/${CLI} or ${CLI} on PATH"
+    echo "Hint: If wrappers/CLIs are not on PATH, run '${SELF:h}/install-bin' or add the bundle '${SELF:h}' directory to PATH."
   fi
   echo "prefix: $PREFIX"
   echo "profile: ${CLI_PROFILE_FILE:-<none>}"
