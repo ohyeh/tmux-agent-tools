@@ -201,6 +201,39 @@ codex-tmux watch --count 2 --timeout 600 --json w1 w2 w3 # proceed on 2 done
 
 Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` and `reason` (`result_updated` | `exited`); `--count` also includes `required_count` and `done_count`. Polling happens inside the shell call, so the supervising agent spends one tool call instead of a status loop — this is the token-efficient pattern for fanout supervision.
 
+### Engine-Agnostic Resolution & Mixed Fleets
+
+The commands `watch`, `result`, and `status` resolve sessions by NAME.
+- **Result path resolution** is fully engine-independent; `result` paths are resolved as `$TMUX_AGENT_DIR/<name>/result.json` using the bare session name.
+- **Tmux session presence checks** (used in `status` and `watch` exited liveness checks) are prefix-dependent; they prepend the active wrapper CLI's prefix (e.g. `codex-cli-`, `claude-cli-`, `agy-cli-`).
+- Any `agent-tmux <cli> watch` command will successfully detect when a session's `result.json` is updated regardless of which wrapper/engine started it, but it will immediately report a session from a different wrapper/engine as `exited` if it is still running (due to mismatched tmux prefixes).
+- **Preferred neutral entrypoint:** For heterogeneous fleets (mixed codex+agy+claude workers), `tmux-agent-sessions` is the preferred engine-neutral inventory and supervision surface (resolve/list/watch by name across all wrappers).
+
+Example: Watching a mixed fleet containing a `codex` and an `agy` session (`ios-deliv` and `ios-native`):
+```bash
+agent-tmux codex watch --all --timeout 900 --json ios-deliv ios-native
+```
+Output JSON shape:
+```json
+{
+  "schema_version": 1,
+  "mode": "all",
+  "met": true,
+  "agents": [
+    {
+      "name": "ios-deliv",
+      "done": true,
+      "reason": "result_updated"
+    },
+    {
+      "name": "ios-native",
+      "done": true,
+      "reason": "exited"
+    }
+  ]
+}
+```
+
 For team state, `team quorum <team> --count N [--field <jq> --value <literal>] --json` counts present, valid worker results using each worker row's stored `result_path`. Use `--field .status --value success` to require a specific result value.
 
 If `watch` times out, run one structured liveness pass per worker: `status --json`, then `ping --json --timeout 5` for workers with `running:true` and high `idle_seconds`, then `result --json --wait 30`. If `diagnostic` shows an approval/permission prompt, attach and answer only with authorization. If ping fails and no result appears, report the worker as stalled with status JSON and one `capture --strip-ansi <name> 80` diagnostic tail.
