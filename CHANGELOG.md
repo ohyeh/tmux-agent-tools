@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.27.0 - 2026-06-25
+
+### Added
+- File/stdin prompt input for `start`, `start-ssh`, `send`, `send-wait`, `send-wait-literal` (#289): `--from-file <abs>` and its alias `--prompt-file <abs>` (aligns with `tmux-agent-fanout`/`tmux-agent-dialogue` naming), plus `-` to read the prompt from stdin. The file/stdin body becomes the prompt verbatim, so large multi-line packets with shell-special characters (`&`, quotes, `$`, backticks), URLs/deeplinks, and non-ASCII no longer need inline shell-quoting. Flags are position-independent (a shared prepass extracts them from anywhere in the argv), so the documented shapes `start --exact N DIR --prompt-file P` and `send-wait N --prompt-file P <timeout>` work. Verified across two rounds of adversarial codex review (which caught that the first cut only accepted the flag before the positionals).
+- `agy` is now a first-class tool in `tmux-agent-sessions` (#290): `--tool agy` is accepted by `list`/`watch`/`cleanup`/`resolve`, the `agy-cli-` prefix is recognized, and all usage/error strings enumerate `claude|codex|agy|dialogue`. This makes `tmux-agent-sessions` a genuine engine-neutral supervision surface for mixed codex+agy+claude fleets.
+
+### Changed
+- Documented engine-agnostic name resolution semantics for `watch`/`result`/`status` (#290): result paths resolve by bare session name (`$TMUX_AGENT_DIR/<name>/result.json`, fully engine-independent, so result-based `watch` triggers — `reason:result_updated` — are cross-engine), while `status`/`watch` tmux liveness checks are prefix-tied (a still-running foreign-engine session can read as a false `exited`). For mixed fleets, rely on result-based completion and/or `tmux-agent-sessions`. Added a mixed-fleet example to SKILL.md and references/cheatsheets.md.
+- When the wrappers/CLIs are not on `PATH`, the not-found diagnostic now points at `install-bin` (or adding the bundle `scripts/` dir to PATH), saving a discovery step (#290).
+
 ## v0.26.1 - 2026-06-24
 
 ### Changed

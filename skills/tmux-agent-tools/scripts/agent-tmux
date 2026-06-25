@@ -345,6 +345,8 @@ Launch claude inside a fresh tmux session.
 Flags (place BEFORE <name>):
   --attach                       Attach immediately after creating the session.
   --exact                        Use <name> verbatim (no random suffix).
+  --from-file <abs>|-            Read initial prompt from file or stdin (-).
+  --prompt-file <abs>|-          Alias for --from-file.
   --sentinel <abs-path>          Write CLI exit code to file when CLI exits (#95).
   --on-start <shell-cmd>         Run hook after `tmux new-session` returns (#101a).
   --on-exit  <shell-cmd>         Run hook after CLI exit; needs --sentinel.
@@ -353,6 +355,8 @@ Flags (place BEFORE <name>):
 
 Examples:
   agent-tmux start --exact worker ~/proj 'Run targeted tests.'
+  agent-tmux start --from-file /tmp/prompt.txt --exact worker ~/proj
+  echo 'Do the thing' | agent-tmux start --from-file - worker ~/proj
   agent-tmux start --sentinel /tmp/w.exit --on-exit 'curl -X POST $URL' \
                   --on-start 'date >> /tmp/start.log' worker ~/proj 'hi'
 
@@ -373,10 +377,11 @@ HELP_EOF
       ;;
     send)
       cat <<'HELP_EOF'
-agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
+agent-tmux send [--raw] [--from-file <abs-path>|--prompt-file <abs-path>|-] [--enter-count N] [--enter-delay S] <name> [text]
 
-Paste text into the agent CLI and submit. Use --from-file for first-class
-multi-line injection under the same send-lock, transcript, and audit surfaces.
+Paste text into the agent CLI and submit. Use --from-file (alias: --prompt-file)
+for first-class multi-line injection under the same send-lock, transcript, and
+audit surfaces. Pass - as path to read from stdin.
 --enter-count defaults to 1 for --from-file. Tune delay with --enter-delay or
 CLAUDE_TMUX_SUBMIT_DELAY.
 
@@ -392,20 +397,26 @@ HELP_EOF
       ;;
     send-wait)
       cat <<'HELP_EOF'
-agent-tmux send-wait <name> <text> [timeout]
+agent-tmux send-wait [--from-file <abs>|--prompt-file <abs>|-] <name> [<text>] [timeout]
 
 Send text with a fresh MARK-<hex> nonce instruction appended, then wait for
 that nonce to appear alone on a line. Use this for prompt/response turns where
 prompt echo or stale markers must not satisfy the wait.
+
+--from-file / --prompt-file (alias) reads text from file or stdin (-).
+When using --from-file, the positionals are: <name> [timeout_seconds].
 HELP_EOF
       ;;
     send-wait-literal)
       cat <<'HELP_EOF'
-agent-tmux send-wait-literal <name> <text> <literal> [timeout]
+agent-tmux send-wait-literal [--from-file <abs>|--prompt-file <abs>|-] <name> [<text>] <literal> [timeout]
 
 Send text then wait for a NEW occurrence of <literal> after the send. Use
 this over `send` + `wait-literal` when stale pane content may already
 contain the marker.
+
+--from-file / --prompt-file (alias) reads text from file or stdin (-).
+When using --from-file, the positionals are: <name> <literal> [timeout_seconds].
 HELP_EOF
       ;;
     wait)
@@ -586,6 +597,7 @@ require_bins() {
       echo "Unset ${_ENV_NS} or set ${_ENV_NS}=$claude_lookup to use that install." >&2
     else
       echo "Current PATH does not resolve ${CLI}. Install ${CLI} or set ${_ENV_NS}=/path/to/${CLI}." >&2
+      echo "Hint: If wrappers/CLIs are not on PATH, run '${SELF:h}/install-bin' or add the bundle '${SELF:h}' directory to PATH." >&2
     fi
     exit 1
   fi
@@ -1326,8 +1338,10 @@ run_dry_run_checks() {
     --arg prompt_via "$PROMPT_VIA" \
     --arg prompt_flag "$PROMPT_FLAG" \
     --arg command "$oneshot_command" \
+    --arg initial_text "$initial_text" \
     '{session: $session, launch_flags: $flags, env_namespace: $env_ns, cli_bin: $cli_bin}
      + {exec_mode: $exec_mode, prompt_via: $prompt_via, prompt_flag: $prompt_flag}
+     + (if $initial_text == "" then {} else {initial_text: $initial_text} end)
      + (if $command == "" then {} else {command: $command} end)
      + (if $sid == "" then {} else {cli_session_id: $sid, session_meta_path: $meta} end)')"
 
@@ -2859,6 +2873,53 @@ apply_result_env_args() {
   session_env_args+=("-e" "TMUX_AGENT_RESULT=$result_path")
 }
 
+# _resolve_prompt_file <src> → stdout
+# src=- reads stdin; src=<abs-path> reads file; relative/missing exits 2.
+# ponytail: single resolution path for --from-file / --prompt-file everywhere.
+_resolve_prompt_file() {
+  local src="$1"
+  if [[ "$src" == "-" ]]; then
+    cat
+  elif [[ "$src" != /* || ! -f "$src" ]]; then
+    echo "Invalid --from-file: $src (expect existing absolute path or -)" >&2
+    return 2
+  else
+    cat "$src"
+  fi
+}
+
+# _extract_prompt_file_prepass [args...]
+# Scans all args for --from-file / --prompt-file at ANY position (leading,
+# middle, or trailing).  Sets globals used by callers:
+#   _PPFF_VALUE    — the extracted value (empty when flag not present)
+#   _PPFF_REMAINING — array of every arg EXCEPT the flag+value tokens
+# Returns 2 when the flag is present but has no value.
+# ponytail: single pre-pass shared by start/start-ssh/send/send-wait/send-wait-literal.
+_extract_prompt_file_prepass() {
+  _PPFF_VALUE=""
+  _PPFF_REMAINING=()
+  local -i i=1
+  while (( i <= $# )); do
+    case "${@[i]}" in
+      --from-file|--prompt-file)
+        if (( i >= $# )); then
+          echo "${@[i]} requires a value (absolute path or -)" >&2; return 2
+        fi
+        _PPFF_VALUE="${@[i+1]}"
+        (( i += 2 ))
+        ;;
+      --from-file=*|--prompt-file=*)
+        _PPFF_VALUE="${@[i]#*=}"
+        (( i += 1 ))
+        ;;
+      *)
+        _PPFF_REMAINING+=("${@[i]}")
+        (( i += 1 ))
+        ;;
+    esac
+  done
+}
+
 start_session() {
   write_tmux_conf
   local should_attach=0
@@ -2892,6 +2953,11 @@ start_session() {
   local max_idle=""
   parse_max_fuse_flags "$@"
   set -- "${MAX_FUSE_PARSE_REMAINING[@]}"
+
+  local start_from_file=""
+  _extract_prompt_file_prepass "$@" || exit 2
+  start_from_file="$_PPFF_VALUE"
+  set -- "${_PPFF_REMAINING[@]}"
 
   local transcript_path=""
   local transcript_truncate=""
@@ -3033,8 +3099,16 @@ start_session() {
   shift 2 || true
   local initial_text="${*:-}"
 
+  if [[ -n "$start_from_file" ]]; then
+    if [[ -n "$initial_text" ]]; then
+      echo "start: --from-file and inline text are mutually exclusive" >&2
+      exit 2
+    fi
+    initial_text="$(_resolve_prompt_file "$start_from_file")" || exit 2
+  fi
+
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--model <model>] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
+    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--model <model>] [--from-file <abs>|--prompt-file <abs>|-] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
@@ -3206,6 +3280,7 @@ start_session() {
   echo "agent: $name"
   echo "Started $session"
   echo "cwd:  $directory"
+  echo "cli:  $CLI_BIN"
   echo "send: $SELF $CLI send $name <text>"
   echo "wait: $SELF $CLI wait $name 180"
   echo "wait-text: $SELF $CLI wait-text $name '<text>' 180"
@@ -3538,17 +3613,16 @@ start_ssh_session() {
   write_tmux_conf
   local should_attach=0
   local exact_name=0
+  local start_from_file=""
+  _extract_prompt_file_prepass "$@" || exit 2
+  start_from_file="$_PPFF_VALUE"
+  set -- "${_PPFF_REMAINING[@]}"
 
   while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" ]]; do
     case "$1" in
-      --attach)
-        should_attach=1
-        ;;
-      --exact)
-        exact_name=1
-        ;;
+      --attach) should_attach=1; shift ;;
+      --exact) exact_name=1; shift ;;
     esac
-    shift
   done
 
   local requested_name="${1:-}"
@@ -3556,12 +3630,20 @@ start_ssh_session() {
   local remote_directory="${3:-}"
 
   if [[ -z "$requested_name" || -z "$ssh_target" || -z "$remote_directory" ]]; then
-    echo "Usage: agent-tmux start-ssh [--attach] [--exact] <name> <ssh-target> <remote-directory> [initial text]" >&2
+    echo "Usage: agent-tmux start-ssh [--attach] [--exact] [--from-file <abs>|--prompt-file <abs>|-] <name> <ssh-target> <remote-directory> [initial text]" >&2
     exit 2
   fi
 
   shift 3
   local initial_text="${*:-}"
+
+  if [[ -n "$start_from_file" ]]; then
+    if [[ -n "$initial_text" ]]; then
+      echo "start-ssh: --from-file and inline text are mutually exclusive" >&2
+      exit 2
+    fi
+    initial_text="$(_resolve_prompt_file "$start_from_file")" || exit 2
+  fi
 
   local name="$requested_name"
   if (( ! exact_name )); then
@@ -3636,16 +3718,12 @@ send_session() {
   local enter_count_set=0
   local raw=false
   local enter_delay="$SUBMIT_DELAY"
+  _extract_prompt_file_prepass "$@" || exit 2
+  from_file="$_PPFF_VALUE"
+  set -- "${_PPFF_REMAINING[@]}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --raw) raw=true; shift ;;
-      --from-file)
-        if [[ -z "${2:-}" ]]; then
-          echo "Usage: agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
-          exit 2
-        fi
-        from_file="$2"; shift 2 ;;
-      --from-file=*) from_file="${1#--from-file=}"; shift ;;
       --enter-count)
         if [[ -z "${2:-}" ]]; then
           echo "Usage: agent-tmux send [--raw] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]" >&2
@@ -3695,11 +3773,7 @@ send_session() {
   local multiline=false
   local payload_file=""
   if [[ -n "$from_file" ]]; then
-    if [[ "$from_file" != /* || ! -f "$from_file" ]]; then
-      echo "Invalid --from-file: $from_file (expect existing absolute path)" >&2
-      exit 2
-    fi
-    prompt_text="$(cat "$from_file")"
+    prompt_text="$(_resolve_prompt_file "$from_file")" || exit 2
     multiline=true
   fi
   local _rp_inject=0
@@ -3806,12 +3880,37 @@ marker_nonce() {
 
 send_wait_session() {
   require_tmux
+  local from_file=""
+  _extract_prompt_file_prepass "$@" || exit 2
+  from_file="$_PPFF_VALUE"
+  set -- "${_PPFF_REMAINING[@]}"
+  while [[ $# -gt 0 && "${1:-}" == -* ]]; do
+    case "$1" in
+      --) shift; break ;;
+      *) echo "Unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
   local name="${1:-}"
-  local prompt_text="${2:-}"
-  local timeout_seconds="${3:-180}"
+  local prompt_text
+  local timeout_seconds
+
+  if [[ -n "$from_file" ]]; then
+    # positionals: <name> [timeout_seconds]  (text comes from file)
+    timeout_seconds="${2:-180}"
+    if [[ -n "${2:-}" && ! "${2:-}" =~ '^[0-9]+$' ]]; then
+      echo "send-wait: --from-file and inline text are mutually exclusive" >&2; exit 2
+    fi
+    [[ -n "${3:-}" ]] && { echo "send-wait: too many arguments with --from-file" >&2; exit 2; }
+    [[ -z "$name" ]] && { echo "Usage: agent-tmux send-wait [--from-file <abs>|--prompt-file <abs>|-] <name> [timeout_seconds]" >&2; exit 2; }
+    prompt_text="$(_resolve_prompt_file "$from_file")" || exit 2
+  else
+    prompt_text="${2:-}"
+    timeout_seconds="${3:-180}"
+  fi
 
   if [[ -z "$name" || -z "$prompt_text" ]]; then
-    echo "Usage: agent-tmux send-wait <name> <text> [timeout_seconds]" >&2
+    echo "Usage: agent-tmux send-wait [--from-file <abs>|--prompt-file <abs>|-] <name> <text> [timeout_seconds]" >&2
     exit 2
   fi
 
@@ -3881,14 +3980,38 @@ _send_wait_nonce_locked() {
 
 send_wait_literal_session() {
   require_tmux
-  local name="${1:-}"
-  local prompt_text="${2:-}"
-  local needle="${3:-}"
-  local timeout_seconds="${4:-180}"
+  local from_file=""
+  _extract_prompt_file_prepass "$@" || exit 2
+  from_file="$_PPFF_VALUE"
+  set -- "${_PPFF_REMAINING[@]}"
+  while [[ $# -gt 0 && "${1:-}" == -* ]]; do
+    case "$1" in
+      --) shift; break ;;
+      *) echo "Unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
 
-  if [[ -z "$name" || -z "$prompt_text" || -z "$needle" ]]; then
-    echo "Usage: agent-tmux send-wait-literal <name> <text> <literal> [timeout_seconds]" >&2
-    exit 2
+  local name="${1:-}"
+  local prompt_text
+  local needle
+  local timeout_seconds
+
+  if [[ -n "$from_file" ]]; then
+    # positionals: <name> <literal> [timeout_seconds]  (text comes from file)
+    needle="${2:-}"
+    timeout_seconds="${3:-180}"
+    [[ -n "${4:-}" ]] && { echo "send-wait-literal: too many arguments with --from-file" >&2; exit 2; }
+    if [[ -z "$name" || -z "$needle" ]]; then
+      echo "Usage: agent-tmux send-wait-literal [--from-file <abs>|--prompt-file <abs>|-] <name> <literal> [timeout_seconds]" >&2; exit 2
+    fi
+    prompt_text="$(_resolve_prompt_file "$from_file")" || exit 2
+  else
+    prompt_text="${2:-}"
+    needle="${3:-}"
+    timeout_seconds="${4:-180}"
+    if [[ -z "$name" || -z "$prompt_text" || -z "$needle" ]]; then
+      echo "Usage: agent-tmux send-wait-literal [--from-file <abs>|--prompt-file <abs>|-] <name> <text> <literal> [timeout_seconds]" >&2; exit 2
+    fi
   fi
 
   if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
@@ -4870,6 +4993,7 @@ doctor_session() {
     echo "${CLI}: $CLI_BIN"
   else
     echo "${CLI}: not found; start requires ${_ENV_NS}=/path/to/${CLI} or ${CLI} on PATH"
+    echo "Hint: If wrappers/CLIs are not on PATH, run '${SELF:h}/install-bin' or add the bundle '${SELF:h}' directory to PATH."
   fi
   echo "prefix: $PREFIX"
   echo "profile: ${CLI_PROFILE_FILE:-<none>}"

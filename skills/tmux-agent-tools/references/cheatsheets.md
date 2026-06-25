@@ -56,6 +56,38 @@ Default capture dumps raw scrollback — most of those tokens are ANSI escapes, 
 
 Bare waits, shell `sleep`, and `while status ...` polling loops are not orchestration patterns. Use one bounded wrapper call.
 
+## Engine-agnostic resolution & mixed fleets
+
+Result paths, status checks, and watches are resolved by session name:
+- **Result paths:** Resolved by BARE session name (`$TMUX_AGENT_DIR/<name>/result.json`), meaning `result` and result-based `watch` triggers are fully engine-agnostic.
+- **Tmux session checks:** Prefix-dependent (prepending `$PREFIX`, e.g., `codex-cli-`, `claude-cli-`, `agy-cli-`). Running `agent-tmux <cli> watch` against a different engine's session will immediately report `exited` if it is still running due to mismatched prefixes.
+- **Preferred neutral entrypoint:** For mixed fleets (heterogeneous Claude, Codex, and Agy workers), `tmux-agent-sessions` is the preferred engine-neutral inventory and supervision surface (resolve/list/watch by name across all wrappers).
+
+Example of watching a mixed fleet (`ios-deliv` started by codex, and `ios-native` started by agy):
+```bash
+agent-tmux codex watch --all --timeout 900 --json ios-deliv ios-native
+```
+JSON output shape:
+```json
+{
+  "schema_version": 1,
+  "mode": "all",
+  "met": true,
+  "agents": [
+    {
+      "name": "ios-deliv",
+      "done": true,
+      "reason": "result_updated"
+    },
+    {
+      "name": "ios-native",
+      "done": true,
+      "reason": "exited"
+    }
+  ]
+}
+```
+
 ## Marker pitfalls (very common cause of false completion)
 
 `wait-text` is literal-by-default. Add `--regex` only when you intentionally want regex matching.
