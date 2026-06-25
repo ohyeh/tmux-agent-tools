@@ -13,6 +13,7 @@ WORK="$(mktemp -d -t tmux-agent-sessions-resolve-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
 export CLAUDE_TMUX_PREFIX="claude-cli-smoke"
 export CODEX_TMUX_PREFIX="codex-cli-smoke"
+export AGY_TMUX_PREFIX="agy-cli-smoke"
 export TMUX="$WORK/fake-tmux"
 
 cleanup() {
@@ -84,17 +85,20 @@ cat > "$FAKE_TMUX_LS" <<EOF
 $CLAUDE_TMUX_PREFIX-trade-pine-c5b475: 1 windows
 $CLAUDE_TMUX_PREFIX-trade-pine-d9e010: 1 windows
 $CODEX_TMUX_PREFIX-build-bot: 1 windows
+$AGY_TMUX_PREFIX-worker1: 1 windows
 EOF
 cat > "$FAKE_TMUX_CWD" <<EOF
 $CLAUDE_TMUX_PREFIX-trade-pine-c5b475	$WORK/repo-a
 $CLAUDE_TMUX_PREFIX-trade-pine-d9e010	$WORK/repo-a
 $CODEX_TMUX_PREFIX-build-bot	$WORK/repo-b
+$AGY_TMUX_PREFIX-worker1	$WORK/repo-c
 EOF
 
-mkdir -p "$TMUX_AGENT_DIR/trade-pine-c5b475" "$TMUX_AGENT_DIR/trade-pine-d9e010" "$TMUX_AGENT_DIR/build-bot"
+mkdir -p "$TMUX_AGENT_DIR/trade-pine-c5b475" "$TMUX_AGENT_DIR/trade-pine-d9e010" "$TMUX_AGENT_DIR/build-bot" "$TMUX_AGENT_DIR/worker1"
 printf '%s\n' "2026-01-01T00:00:00Z" > "$TMUX_AGENT_DIR/trade-pine-c5b475/started_at"
 printf '%s\n' "2026-01-02T00:00:00Z" > "$TMUX_AGENT_DIR/trade-pine-d9e010/created_at"
 printf '%s\n' "2026-01-03T00:00:00Z" > "$TMUX_AGENT_DIR/build-bot/created_at"
+printf '%s\n' "2026-01-01T00:00:00Z" > "$TMUX_AGENT_DIR/worker1/created_at"
 cat > "$TMUX_AGENT_DIR/trade-pine-c5b475/worktree.json" <<EOF
 {"schema_version":1,"path":"$WORK/repo-a","dirty":true}
 EOF
@@ -160,6 +164,22 @@ assert_nonzero "dirty cleanup exits non-zero" "$code"
 assert_eq "dirty cleanup does not kill" "$(cat "$FAKE_TMUX_KILLS")" ""
 "$SESSIONS" cleanup --execute --name trade-pine-c5b475 --force >/dev/null
 assert_eq "force cleanup kills session" "$(cat "$FAKE_TMUX_KILLS")" "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475"
+
+echo "case: --tool agy accepted and session recognised"
+code=0
+"$SESSIONS" list --tool agy >/dev/null 2>&1 || code=$?
+assert_eq "--tool agy accepted (exit 0)" "$code" "0"
+agy_count="$("$SESSIONS" list --json --tool agy | jq -s 'map(select(.tool == "agy")) | length')"
+assert_eq "agy-cli-smoke-worker1 listed with --tool agy" "$agy_count" "1"
+unfiltered_agy="$("$SESSIONS" list --json | jq -s 'map(select(.tool == "agy" and .agent_name == "worker1")) | length')"
+assert_eq "agy-cli-smoke-worker1 in unfiltered list" "$unfiltered_agy" "1"
+
+echo "case: invalid --tool error enumerates agy"
+code=0
+"$SESSIONS" list --tool notreal >/dev/null 2>"$WORK/invalid-tool.err" || code=$?
+assert_nonzero "invalid --tool exits non-zero" "$code"
+agy_in_err=0; [[ "$(cat "$WORK/invalid-tool.err")" == *"agy"* ]] && agy_in_err=1
+assert_eq "invalid --tool error enumerates agy" "$agy_in_err" "1"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"
