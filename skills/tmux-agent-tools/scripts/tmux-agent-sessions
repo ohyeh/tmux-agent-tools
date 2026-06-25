@@ -551,7 +551,7 @@ watch_events() {
         FILTER_STATE="$(parse_state_arg "${1:-}")"
         ;;
       *)
-        die "Usage: tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]"
+        die "Usage: tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]"
         ;;
     esac
     shift
@@ -802,7 +802,7 @@ cleanup_sessions() {
         [[ -n "$FILTER_CWD" ]] || die "--cwd requires a value"
         ;;
       *)
-        die "Usage: tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] | cleanup --execute (--all | --tool <claude|codex|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>) [--force]"
+        die "Usage: tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] | cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>) [--force]"
         ;;
     esac
     shift
