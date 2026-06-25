@@ -1,0 +1,67 @@
+#!/usr/bin/env zsh
+# Smoke test: tmux-agent-sessions agy support.
+# Verifies --tool agy is accepted and agy-cli-* sessions are recognised/listed.
+# Uses a fake tmux binary (overrides TMUX env var) — no real tmux required.
+set -euo pipefail
+
+SELF="${0:t}"
+SCRIPT_DIR="${0:A:h}"
+SESSIONS="$SCRIPT_DIR/tmux-agent-sessions"
+
+fail() { print -r -- "FAIL[$SELF]: $*" >&2; exit 1; }
+pass() { print -r -- "PASS: $*"; }
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not found" >&2; exit 0; }
+}
+require_jq
+
+tmpdir="$(mktemp -d)"
+trap "rm -rf $tmpdir" EXIT
+
+# Fake tmux: handles ls (returns one agy session + one claude session) and
+# silently ignores everything else (capture-pane, display-message, etc.)
+cat > "$tmpdir/tmux" <<'EOF'
+#!/bin/sh
+if [ "$1" = "ls" ]; then
+  printf 'agy-cli-worker1: 1 windows (created Mon Jan  1 00:00:00 2024)\n'
+  printf 'claude-cli-alpha: 1 windows (created Mon Jan  1 00:00:00 2024)\n'
+fi
+EOF
+chmod +x "$tmpdir/tmux"
+
+export JQ="$(command -v jq)"
+
+# ── Test 1: --tool agy is accepted (parse_filter_arg must not die) ──────────
+out="$(TMUX="$tmpdir/tmux" "$SESSIONS" list --tool agy 2>&1)" \
+  || fail "--tool agy exited non-zero: $out"
+pass "--tool agy accepted (no error)"
+
+# ── Test 2: agy-cli-worker1 is listed with --tool agy --json ────────────────
+# list --json emits NDJSON (one object per line); slurp with -s before querying
+out="$(TMUX="$tmpdir/tmux" "$SESSIONS" list --json --tool agy 2>&1)"
+print -r -- "$out" | "$JQ" -se 'map(select(.tool == "agy")) | length > 0' >/dev/null \
+  || fail "no agy sessions in list --json --tool agy output: $out"
+print -r -- "$out" | "$JQ" -se 'map(select(.agent_name == "worker1")) | length > 0' >/dev/null \
+  || fail "worker1 not recognised in list --json output: $out"
+pass "agy-cli-worker1 recognised in --tool agy --json output"
+
+# ── Test 3: unfiltered list includes agy session ────────────────────────────
+out="$(TMUX="$tmpdir/tmux" "$SESSIONS" list --json 2>&1)"
+print -r -- "$out" | "$JQ" -se 'map(select(.tool == "agy" and .agent_name == "worker1")) | length > 0' >/dev/null \
+  || fail "agy-cli-worker1 missing from unfiltered list: $out"
+pass "agy-cli-worker1 in unfiltered list --json"
+
+# ── Test 4: --tool claude still works (no regression) ───────────────────────
+out="$(TMUX="$tmpdir/tmux" "$SESSIONS" list --json --tool claude 2>&1)"
+print -r -- "$out" | "$JQ" -se 'map(select(.tool == "claude" and .agent_name == "alpha")) | length > 0' >/dev/null \
+  || fail "claude-cli-alpha missing from --tool claude list: $out"
+pass "--tool claude still works (no regression)"
+
+# ── Test 5: invalid tool still errors ───────────────────────────────────────
+out="$(TMUX="$tmpdir/tmux" "$SESSIONS" list --tool notreal 2>&1)" && fail "invalid --tool should have errored" || true
+[[ "$out" == *"claude, codex, agy, dialogue"* ]] \
+  || fail "error message does not enumerate agy: $out"
+pass "invalid --tool error message enumerates agy"
+
+print -r -- "$SELF: all tests passed"
