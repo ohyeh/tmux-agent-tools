@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v0.28.0 - 2026-07-02
+
+### Added
+- Added `agents/codex-oneshot.md` and `agents/claude-oneshot.md` as thin one-shot forwarder agents, with matching `.claude/agents/` mirrors for Claude Code discovery (#293).
+- Added `mcp-adapter/`, a Node.js `codex-tmux-agent-adapter` MCP server exposing `spawn_tmux_agent`, `send_tmux_agent`, `wait_tmux_agent`, `read_tmux_agent`, and `close_tmux_agent` as an optional programmatic integration path. The primary integration remains native agent/skill discovery through `SKILL.md` and host-local conventions (#293).
+- Added Codex-native discovery mirrors: `.codex/agents/*.toml` custom-agent definitions converted from `agents/*.md`, plus a `.codex/skills/tmux-agent-tools` symlink to the canonical skill, so Codex can discover the same local content Claude Code reaches through `agents/` and `.claude/agents/` without MCP registration (#293).
+
+### Changed
+- Slimmed `skills/tmux-agent-tools/SKILL.md` from roughly 36KB to under 8KB by moving the full workflow and profile detail into `references/core-workflow.md` and `references/profiles.md`, keeping first-open guidance focused while preserving the deeper reference material (#293).
+- Hardened `agent-tmux` against live-worker friction: boot-time trust gates now surface structured `blocked` / `blocked_reason` status instead of hanging, worker prompts get a default task-scope project-config guard with `--allow-project-config` as the opt-out, nonce wait timeouts accept fresh authoritative `result.json` completion, and `send --key enter|up|down` provides explicit key delivery (#293).
+
+### Fixed
+- Fixed Codex login-prompt false positives in the boot trust gate by anchoring blocking checks to the pane's current prompt area instead of scanning unrelated scrollback, avoiding matches from old MCP login banners or commit-message text that merely mentioned login prompts (#293).
+
 ## v0.27.0 - 2026-06-25
 
 ### Added
