@@ -5350,7 +5350,7 @@ blocked_reason_for_text() {
     print -r -- "permission_prompt"
   elif [[ "$lowered" == *"approval"* || "$lowered" == *"approve"* || "$lowered" == *"[y/n]"* ]]; then
     print -r -- "approval_prompt"
-  elif [[ "$lowered" == *"please log in"* || "$lowered" == *"log in to"* || "$lowered" == *"sign in to"* || "$lowered" == *"not logged in"* ]]; then
+  elif [[ "$lowered" == *"codex login"* || "$lowered" == *"please log in to codex"* || "$lowered" == *"log in to codex"* || "$lowered" == *"sign in to codex"* || "$lowered" == *"not logged in to codex"* ]]; then
     print -r -- "login_prompt"
   fi
 }

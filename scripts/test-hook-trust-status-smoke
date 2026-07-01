@@ -30,6 +30,14 @@ while IFS= read -r line; do : ; done
 EOF
 chmod +x "$WORK/fake-prose.sh"
 
+cat > "$WORK/fake-mcp-login-warning.sh" <<'EOF'
+#!/bin/sh
+echo "The cloudflare-api MCP server is not logged in. Run codex mcp login cloudflare-api"
+echo "› Write a prompt"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-mcp-login-warning.sh"
+
 cat > "$WORK/fake-permission.sh" <<'EOF'
 #!/bin/sh
 echo "Do you trust the contents of this directory?"
@@ -63,6 +71,15 @@ st="$("$CODEX_TMUX" status --json "$N")"
 assert "no false hook_trust" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
 assert "no false confirmation" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "false"
 "$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
+
+echo "case: unrelated MCP login warning with ready prompt is not blocked"
+M="mcp-login-warning"
+env CODEX="$WORK/fake-mcp-login-warning.sh" "$CODEX_TMUX" start --exact "$M" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$M")"
+assert "no false login_prompt" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+assert "ready prompt not blocked" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "false"
+"$CODEX_TMUX" stop "$M" >/dev/null 2>&1 || true
 
 echo "case: start-time permission prompt blocks before initial prompt"
 S="start-permission"

@@ -8,7 +8,21 @@ Small MCP server exposing a Codex-shaped lifecycle over `tmux-agent-tools` worke
 - `read_tmux_agent`
 - `close_tmux_agent`
 
-This is a managed external-worker adapter with a sub-agent-like lifecycle. It is not a native Codex `spawn_agent` provider. Codex's host-owned `spawn_agent` / `wait_agent` / `send_input` / `close_agent` surface is separate, and this package does not register as one of those providers. As of this writing, there is no known Codex extension point that lets this package become a host-native provider.
+## Installation
+
+Install dependencies, then register the adapter with each host:
+
+```sh
+npm install
+codex mcp add tmux-agent-adapter -- node <repo>/mcp-adapter/src/server.js
+claude mcp add tmux-agent-adapter node <repo>/mcp-adapter/src/server.js
+```
+
+Substitute `<repo>/mcp-adapter/src/server.js` with the real absolute path on your machine because MCP registration is stored in the host CLI config and must resolve from any working directory.
+
+## Why this is the real native extension point
+
+This is a managed external-worker adapter with a sub-agent-like lifecycle. It is not a native Codex `spawn_agent` provider. In `codex-cli 0.142.5`, `codex app-server generate-json-schema` has no `spawn_agent`, `wait_agent`, `send_input`, `close_agent`, or `multi_agent` protocol surface. The concrete extension mechanisms supported by the installed hosts are `codex mcp add <name> -- <command>` and `claude mcp add <name> <command>`, so this package is shaped as an MCP server instead of a nonexistent host-native agent provider.
 
 ## Integration Depth
 

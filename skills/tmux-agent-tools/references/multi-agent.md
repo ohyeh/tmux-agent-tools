@@ -12,6 +12,16 @@ These tools are for **long-running supervised tasks**, not for unbounded agent s
 4. **Bound the dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6). Unbounded debate is a smell.
 5. **Stop and report instead of spawning more workers.** If a task is not making progress, surface that to the user. Do not "try with more workers".
 
+## Cross-CLI native integration
+
+The primary integration path is native skill + agent discovery, not MCP. Claude Code reads the repo-root `skills/` bundle and `.claude/agents/*.md` mirrors. Codex CLI 0.142.5 was verified to load project-local skills from `.codex/skills/<name>/SKILL.md` (and also `.agents/skills/<name>/SKILL.md`); this repo exposes `tmux-agent-tools` to Codex through the symlink `.codex/skills/tmux-agent-tools -> ../../skills/tmux-agent-tools`.
+
+Codex subagent definitions are mirrored as validated custom-agent TOML files under `.codex/agents/*.toml`, converted from the existing Claude agent Markdown. The TOML files preserve the same instructions in `developer_instructions`. In local verification, the files pass Codex's official migrated-target validator, but `codex exec` 0.142.5 did not expose those custom names as `spawn_agent` `agent_type` values in a headless session; treat runtime custom-agent spawning as version/host dependent until the host lists the agent type.
+
+`skills/tmux-agent-tools/agents/openai.yaml` exists, but `codex debug prompt-input` verified that a real Codex session's model-visible prompt contained zero references to `display_name`, `openai.yaml`, or `default_prompt`; do not rely on that YAML as an observable Codex integration mechanism.
+
+`mcp-adapter/` remains a secondary option for hosts that explicitly want programmatic MCP tool-calling. It is not required for Claude Code or Codex skill discovery.
+
 ## Dialogue presets
 
 All presets share the same local transcript flow. None of them post comments, merge PRs, or publish externally on their own.
