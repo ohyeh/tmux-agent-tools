@@ -5327,6 +5327,18 @@ status_pane_text() {
   "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
 }
 
+current_prompt_area_for_text() {
+  local current="$1"
+  awk '
+    /^[[:space:]]*›/ || /^[[:space:]]*[─-]+ Worked for / { boundary = NR }
+    { lines[NR] = $0 }
+    END {
+      start = boundary ? boundary : 1
+      for (i = start; i <= NR; i++) print lines[i]
+    }
+  ' <<< "$current"
+}
+
 blocked_reason_for_text() {
   local lowered="$1"
   if [[ -n "$PROFILE_PATTERN_PERMISSION" ]] && print -r -- "$lowered" | grep -qiE "$PROFILE_PATTERN_PERMISSION"; then
@@ -6010,7 +6022,10 @@ status_session() {
     else
       local_or_remote="local"
     fi
-    blocked_reason="$(blocked_reason_for_text "$lowered")"
+    local prompt_area lowered_prompt_area
+    prompt_area="$(current_prompt_area_for_text "$current")"
+    lowered_prompt_area="${prompt_area:l}"
+    blocked_reason="$(blocked_reason_for_text "$lowered_prompt_area")"
     diagnostic="$(diagnostic_for_blocked_reason "$blocked_reason")"
     case "$blocked_reason" in
       hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt)

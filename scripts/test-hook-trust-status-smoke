@@ -38,12 +38,41 @@ while IFS= read -r line; do : ; done
 EOF
 chmod +x "$WORK/fake-mcp-login-warning.sh"
 
+cat > "$WORK/fake-scrollback-keywords-ready.sh" <<'EOF'
+#!/bin/sh
+i=1
+while [ "$i" -le 76 ]; do
+  echo "history $i"
+  i=$((i + 1))
+done
+echo "commit summary: Fix Codex login prompt docs and detection; approval and permission prose only."
+echo "more historical prose: please log in to codex is not the active prompt here."
+echo "─ Worked for 1s ─"
+echo "› Write a prompt"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-scrollback-keywords-ready.sh"
+
 cat > "$WORK/fake-permission.sh" <<'EOF'
 #!/bin/sh
 echo "Do you trust the contents of this directory?"
 while IFS= read -r line; do echo "got:$line"; done
 EOF
 chmod +x "$WORK/fake-permission.sh"
+
+cat > "$WORK/fake-approval.sh" <<'EOF'
+#!/bin/sh
+echo "Approval required before continuing [y/n]"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-approval.sh"
+
+cat > "$WORK/fake-login.sh" <<'EOF'
+#!/bin/sh
+echo "Please log in to Codex to continue."
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-login.sh"
 
 PASS=0
 FAIL=0
@@ -80,6 +109,33 @@ st="$("$CODEX_TMUX" status --json "$M")"
 assert "no false login_prompt" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
 assert "ready prompt not blocked" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "false"
 "$CODEX_TMUX" stop "$M" >/dev/null 2>&1 || true
+
+echo "case: historical trigger keywords above current prompt are not blocked"
+H="scrollback-ready"
+env CODEX="$WORK/fake-scrollback-keywords-ready.sh" "$CODEX_TMUX" start --exact "$H" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$H")"
+assert "historical triggers ignored" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+assert "current ready prompt not blocked" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "false"
+"$CODEX_TMUX" stop "$H" >/dev/null 2>&1 || true
+
+echo "case: active approval prompt still blocks"
+A="approval-current"
+env CODEX="$WORK/fake-approval.sh" "$CODEX_TMUX" start --exact "$A" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$A")"
+assert "approval confirmation_detected true" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "true"
+assert "blocked_reason approval_prompt" "$(printf '%s' "$st" | jq -r .blocked_reason)" "approval_prompt"
+"$CODEX_TMUX" stop "$A" >/dev/null 2>&1 || true
+
+echo "case: active Codex login prompt still blocks"
+L="login-current"
+env CODEX="$WORK/fake-login.sh" "$CODEX_TMUX" start --exact "$L" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$L")"
+assert "login confirmation_detected true" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "true"
+assert "blocked_reason login_prompt" "$(printf '%s' "$st" | jq -r .blocked_reason)" "login_prompt"
+"$CODEX_TMUX" stop "$L" >/dev/null 2>&1 || true
 
 echo "case: start-time permission prompt blocks before initial prompt"
 S="start-permission"
