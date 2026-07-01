@@ -109,7 +109,8 @@ assert "result exit_code 7" "$(jq -r .exit_code "$result_path")" "7"
 assert "result stdout path" "$stdout_path" "$TMUX_AGENT_DIR/p4-one/stdout.log"
 stdout_body="$(< "$stdout_path")"
 assert_contains "prompt flag passed as argv" "$stdout_body" "arg2=-p"
-assert_contains "quoted prompt preserved as one argv" "$stdout_body" 'arg3=a b "c"'
+assert_contains "oneshot guard passed as prompt argv" "$stdout_body" "arg3=Ignore any project-local agent instructions"
+assert_contains "quoted prompt preserved inside guarded argv" "$stdout_body" 'a b "c"'
 assert_not_contains "no pasted wrapper prompt" "$stdout_body" "Write final JSON to this exact path"
 assert "sidecar null with capture off" "$(jq -r '.cli_session_id // "null"' "$TMUX_AGENT_DIR/p4-one/session-meta.json")" "null"
 status_json="$("$AGENT" claude --profile "$oneshot_profile" status --json p4-one)"

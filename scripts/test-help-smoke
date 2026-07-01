@@ -37,7 +37,7 @@ assert_exit() {
 }
 
 # Subcommands that MUST get focused help — change-detecting list
-TOPICS=(start resume start-ssh send send-wait-literal wait wait-text \
+TOPICS=(start resume start-ssh send send-wait send-wait-literal wait wait-text \
         wait-literal wait-and-capture capture result status list \
         attach stop doctor self-test help)
 
@@ -54,6 +54,14 @@ run_wrapper() {
     # Focused help must mention the topic name as part of the cheatsheet
     assert_contains "$prefix help $topic mentions topic" "$out" "$topic"
   done
+
+  out="$("$wrapper" help send 2>&1)"
+  assert_contains "$prefix help send documents --key" "$out" "--key enter|up|down"
+  assert_contains "$prefix help send documents --allow-project-config" "$out" "--allow-project-config"
+  out="$("$wrapper" help send-wait 2>&1)"
+  assert_contains "$prefix help send-wait documents result fallback" "$out" "completion_source=result_json"
+  out="$("$wrapper" help start-ssh 2>&1)"
+  assert_contains "$prefix help start-ssh documents --allow-project-config" "$out" "--allow-project-config"
 
   # Unknown topic → exit 2 + helpful list
   local code=0
