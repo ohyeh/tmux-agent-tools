@@ -23,6 +23,28 @@ done
 EOF
 chmod +x "$WORK/fake-live.sh"
 
+cat > "$WORK/fake-result-no-nonce.sh" <<'EOF'
+#!/bin/sh
+echo "ready"
+result_path=""
+while IFS= read -r line; do
+  echo "got:$line"
+  case "$line" in
+    "Write final JSON to this exact path: "*)
+      result_path="${line#Write final JSON to this exact path: }"
+      ;;
+    first-task)
+      if [ -n "$result_path" ]; then
+        sleep 2
+        mkdir -p "$(dirname "$result_path")"
+        printf '%s\n' '{"schema_version":1,"status":"ok","summary":"done","artifacts":[],"errors":[]}' > "$result_path"
+      fi
+      ;;
+  esac
+done
+EOF
+chmod +x "$WORK/fake-result-no-nonce.sh"
+
 PASS=0
 FAIL=0
 assert() {
@@ -93,6 +115,18 @@ pane="$(tmux capture-pane -J -t "codex-cli-$B" -p -S -200)"
 assert_contains "raw key submitted with explicit enter" "$pane" "got:t"
 assert "raw send injects no result-path" "$(count_occurrences "$pane" "$RP")" "0"
 
+"$CODEX_TMUX" send --key enter "$B" >/dev/null
+sleep 1
+pane_key="$(tmux capture-pane -J -t "codex-cli-$B" -p -S -200)"
+assert_contains "send --key enter submits an empty line" "$pane_key" "got:"
+if [[ "$pane_key" == *"got:Enter"* ]]; then
+  echo "  FAIL send --key enter typed literal Enter" >&2
+  FAIL=$((FAIL + 1))
+else
+  echo "  ok   send --key enter did not type literal Enter"
+  PASS=$((PASS + 1))
+fi
+
 # --raw + --from-file is rejected.
 rc=0
 "$CODEX_TMUX" send --raw --from-file /tmp/whatever "$B" >/dev/null 2>&1 || rc=$?
@@ -124,6 +158,30 @@ pane_after="$(tmux capture-pane -J -t "codex-cli-$C" -p -S -200)"
 cafter="$(count_occurrences "$pane_after" "$RP")"
 assert "follow-up after timed-out send-wait does not re-inject" "$cbefore" "$cafter"
 "$CODEX_TMUX" stop "$C" >/dev/null 2>&1 || true
+
+# --- Case D: nonce timeout falls back to fresh valid result.json (#293) ---
+echo "case: send-wait timeout accepts fresh valid result.json (codex)"
+D="rp-sw-result"
+env CODEX="$WORK/fake-result-no-nonce.sh" "$CODEX_TMUX" start --exact "$D" "$WORK" >/dev/null
+sleep 1
+rc=0
+out="$("$CODEX_TMUX" send-wait "$D" "first-task" 5 2>&1)" || rc=$?
+assert "send-wait result fallback exit=0" "$rc" "0"
+assert "send-wait result fallback completion_source" "$(printf '%s' "$out" | jq -r .completion_source)" "result_json"
+assert "send-wait result fallback submitted" "$(printf '%s' "$out" | jq -r .submitted)" "true"
+"$CODEX_TMUX" stop "$D" >/dev/null 2>&1 || true
+
+echo "case: stale result.json does not satisfy nonce timeout (codex)"
+E="rp-sw-stale"
+env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$E" "$WORK" >/dev/null
+sleep 1
+mkdir -p "$TMUX_AGENT_DIR/$E"
+printf '%s\n' '{"schema_version":1,"status":"ok","summary":"stale","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/$E/result.json"
+sleep 2
+rc=0
+"$CODEX_TMUX" send-wait "$E" "first-task" 2 >/dev/null 2>&1 || rc=$?
+assert "stale result does not turn timeout into success" "$([[ "$rc" -ne 0 ]] && echo yes || echo no)" "yes"
+"$CODEX_TMUX" stop "$E" >/dev/null 2>&1 || true
 
 echo "result-path-once smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
