@@ -50,6 +50,8 @@ Every spawned worker prompt appends the literal wrapper result path and:
 
 ```text
 Do not spawn additional tmux sessions or delegate further.
+Do not start background jobs unless explicitly requested.
+Do not create external side effects unless explicitly authorized.
 ```
 
 Completion is based on `result.json` via `result wait-required`, not pane scraping.

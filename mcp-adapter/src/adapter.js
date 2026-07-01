@@ -5,6 +5,8 @@ const REQUIRED_RESULT_LINE =
   "Result JSON must include schema_version, status, summary, artifacts, and errors.";
 const REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
 const NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
+const NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";
+const NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unless explicitly authorized.";
 
 const sessions = new Map();
 
@@ -56,7 +58,9 @@ function buildWorkerPrompt(task, resultPath) {
 
 Write final JSON to this exact path: ${resultPath}
 ${REQUIRED_RESULT_LINE}
-${NO_CASCADE_GUARD}`;
+${NO_CASCADE_GUARD}
+${NO_BACKGROUND_JOBS_GUARD}
+${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
 }
 
 function recordFor(agentId) {
@@ -220,7 +224,9 @@ async function closeTmuxAgent(agentId) {
 }
 
 module.exports = {
+  NO_BACKGROUND_JOBS_GUARD,
   NO_CASCADE_GUARD,
+  NO_EXTERNAL_SIDE_EFFECTS_GUARD,
   REQUIRED_RESULT_LINE,
   buildWorkerPrompt,
   closeTmuxAgent,

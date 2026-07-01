@@ -7,7 +7,9 @@ const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
 
 const {
+  NO_BACKGROUND_JOBS_GUARD,
   NO_CASCADE_GUARD,
+  NO_EXTERNAL_SIDE_EFFECTS_GUARD,
   closeTmuxAgent,
   readTmuxAgent,
   sendTmuxAgent,
@@ -56,6 +58,8 @@ async function main() {
   assert.match(prompt, /Write final JSON to this exact path:/);
   assert.match(prompt, /Result JSON must include schema_version, status, summary, artifacts, and errors\./);
   assert.ok(prompt.includes(NO_CASCADE_GUARD));
+  assert.ok(prompt.includes(NO_BACKGROUND_JOBS_GUARD));
+  assert.ok(prompt.includes(NO_EXTERNAL_SIDE_EFFECTS_GUARD));
 
   process.env.FAKE_SEND_RESULT_JSON = "1";
   const sent = await sendTmuxAgent("adapter-smoke", "finish now");
