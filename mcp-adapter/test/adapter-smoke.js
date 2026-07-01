@@ -69,6 +69,18 @@ async function main() {
   const read = await readTmuxAgent("adapter-smoke");
   assert.equal(read.status, "done");
 
+  const incomplete = await spawnTmuxAgent({
+    cli: "fake",
+    repoPath: repo,
+    task: "write an incomplete result",
+    name: "adapter-incomplete",
+  });
+  fs.writeFileSync(incomplete.result_path, JSON.stringify({ schema_version: 1, status: "done" }));
+  const incompleteWaited = await waitTmuxAgent(incomplete.agent_id, 1);
+  assert.equal(incompleteWaited.status, "failed");
+  assert.equal(incompleteWaited.reason, "invalid_result");
+  assert.deepEqual(incompleteWaited.detail.missing_fields, ["summary", "artifacts", "errors"]);
+
   const closed = await closeTmuxAgent("adapter-smoke");
   assert.deepEqual(closed, { closed: true });
 

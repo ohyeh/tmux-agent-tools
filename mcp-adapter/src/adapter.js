@@ -3,6 +3,7 @@ const { randomBytes } = require("node:crypto");
 
 const REQUIRED_RESULT_LINE =
   "Result JSON must include schema_version, status, summary, artifacts, and errors.";
+const REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
 const NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
 
 const sessions = new Map();
@@ -86,6 +87,11 @@ function isDeadStatus(json) {
   return text.includes("dead") || text.includes("no such session") || text.includes("can't find session");
 }
 
+function missingResultFields(body) {
+  if (!body || typeof body !== "object") return REQUIRED_RESULT_FIELDS;
+  return REQUIRED_RESULT_FIELDS.filter((field) => !Object.prototype.hasOwnProperty.call(body, field));
+}
+
 async function spawnTmuxAgent(request) {
   const cli = String(request.cli || "").trim();
   const repoPath = String(request.repoPath || "").trim();
@@ -147,7 +153,7 @@ async function waitTmuxAgent(agentId, timeoutSec = 600) {
     "wait-required",
     name,
     "--fields",
-    "status",
+    REQUIRED_RESULT_FIELDS.join(","),
     "--wait",
     String(timeoutSec),
     "--json",
@@ -159,6 +165,10 @@ async function waitTmuxAgent(agentId, timeoutSec = 600) {
   const blocked = classifyBlocked(wait.json);
   if (blocked) return blocked;
   if (wait.ok && wait.json?.body) {
+    const missingFields = missingResultFields(wait.json.body);
+    if (missingFields.length > 0) {
+      return { status: "failed", reason: "invalid_result", detail: { ...wait.json, missing_fields: missingFields } };
+    }
     return { status: "completed", body: wait.json.body };
   }
 
