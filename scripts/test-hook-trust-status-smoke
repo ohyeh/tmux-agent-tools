@@ -60,6 +60,17 @@ while IFS= read -r line; do echo "got:$line"; done
 EOF
 chmod +x "$WORK/fake-permission.sh"
 
+cat > "$WORK/fake-permission-clears.sh" <<'EOF'
+#!/bin/sh
+echo "Do you trust the contents of this directory?"
+if IFS= read -r answer; then
+  echo "trusted:$answer"
+fi
+echo "› Write a prompt"
+while IFS= read -r line; do echo "got:$line"; done
+EOF
+chmod +x "$WORK/fake-permission-clears.sh"
+
 cat > "$WORK/fake-approval.sh" <<'EOF'
 #!/bin/sh
 echo "Approval required before continuing [y/n]"
@@ -80,6 +91,27 @@ assert() {
   local label="$1" actual="$2" expected="$3"
   if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
   else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+assert_blocked_send_guard() {
+  local label="$1" name="$2" marker="$3"
+  shift 3
+  local code=0 out json_line pane
+  out="$("$@" 2>&1)" || code=$?
+  json_line="${out##*$'\n'}"
+  assert "$label blocked exit=1" "$code" "1"
+  assert "$label blocked=true" "$(printf '%s' "$json_line" | jq -r .blocked)" "true"
+  assert "$label submitted=false" "$(printf '%s' "$json_line" | jq -r .submitted)" "false"
+  assert "$label blocked_reason permission_prompt" "$(printf '%s' "$json_line" | jq -r .blocked_reason)" "permission_prompt"
+  assert "$label diagnostic non-null" "$(printf '%s' "$json_line" | jq -r '.diagnostic | type')" "string"
+  pane="$(tmux capture-pane -J -t "codex-cli-$name" -p -S -80)"
+  if [[ "$pane" == *"$marker"* ]]; then
+    echo "  FAIL $label pasted text despite permission prompt" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $label did not paste text before trust gate cleared"
+    PASS=$((PASS + 1))
+  fi
 }
 
 echo "case: hook-trust prompt detected"
@@ -154,6 +186,49 @@ else
   PASS=$((PASS + 1))
 fi
 "$CODEX_TMUX" stop "$S" >/dev/null 2>&1 || true
+
+echo "case: send paths block active permission prompt after no-initial-text start"
+B1="send-permission"
+M1="must-not-send-plain"
+env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B1" "$WORK" >/dev/null
+sleep 1
+assert_blocked_send_guard "send" "$B1" "$M1" "$CODEX_TMUX" send "$B1" "$M1"
+"$CODEX_TMUX" stop "$B1" >/dev/null 2>&1 || true
+
+B2="send-wait-permission"
+M2="must-not-send-wait"
+env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B2" "$WORK" >/dev/null
+sleep 1
+assert_blocked_send_guard "send-wait" "$B2" "$M2" "$CODEX_TMUX" send-wait "$B2" "$M2" 1
+"$CODEX_TMUX" stop "$B2" >/dev/null 2>&1 || true
+
+B3="send-wait-literal-permission"
+M3="must-not-send-literal"
+env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B3" "$WORK" >/dev/null
+sleep 1
+assert_blocked_send_guard "send-wait-literal" "$B3" "$M3" "$CODEX_TMUX" send-wait-literal "$B3" "$M3" "never-seen" 1
+"$CODEX_TMUX" stop "$B3" >/dev/null 2>&1 || true
+
+echo "case: send works after permission prompt is cleared"
+C="send-permission-cleared"
+CM="send-after-clear-marker"
+env CODEX="$WORK/fake-permission-clears.sh" "$CODEX_TMUX" start --exact "$C" "$WORK" >/dev/null
+sleep 1
+"$CODEX_TMUX" send --raw --enter-count 1 "$C" "y" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$C")"
+assert "cleared prompt not blocked" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+"$CODEX_TMUX" send "$C" "$CM" >/dev/null
+sleep 1
+pane="$(tmux capture-pane -J -t "codex-cli-$C" -p -S -80)"
+if [[ "$pane" == *"$CM"* ]]; then
+  echo "  ok   send works after trust gate cleared"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL send did not work after trust gate cleared" >&2
+  FAIL=$((FAIL + 1))
+fi
+"$CODEX_TMUX" stop "$C" >/dev/null 2>&1 || true
 
 echo "hook-trust-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

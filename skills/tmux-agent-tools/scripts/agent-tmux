@@ -1550,6 +1550,35 @@ send_lock_around() {
   return $rc
 }
 
+send_blocked_guard() {
+  local name="$1" session="$2"
+  local st reason diagnostic
+  st="$(status_session --json "$name")" || st=""
+  reason="$("$JQ" -r '.blocked_reason // empty' <<< "$st" 2>/dev/null || true)"
+  case "$reason" in
+    hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+      diagnostic="$("$JQ" -r '.diagnostic // empty' <<< "$st" 2>/dev/null || true)"
+      "$JQ" -cn --arg tool "$CLI" --arg name "$name" --arg session "$session" \
+        --arg blocked_reason "$reason" --arg diagnostic "$diagnostic" \
+        '{schema_version:1,submitted:false,blocked:true,blocked_reason:$blocked_reason,diagnostic:$diagnostic,tool:$tool,name:$name,session:$session}'
+      return 1
+      ;;
+  esac
+}
+
+_send_guarded_locked() {
+  local name="$1" session="$2"
+  shift 2
+  send_blocked_guard "$name" "$session" || return $?
+  "$@"
+}
+
+send_guarded_lock_around() {
+  local name="$1" session="$2" timeout_seconds="$3"
+  shift 3
+  send_lock_around "$name" "$timeout_seconds" _send_guarded_locked "$name" "$session" "$@"
+}
+
 # --- Single-agent transcript helpers (issue #100) -------------------------
 # A transcript captures wrapper-level events (start / send / capture / stop)
 # as JSONL. Path is configured at `start --transcript <abs>` and remembered
@@ -3895,13 +3924,13 @@ send_session() {
     send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
       send_keys_raw "$session" "$prompt_text" "$raw_enter" "$enter_delay" || return $?
   elif [[ -n "$from_file" ]]; then
-    send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
       paste_file_and_submit "$session" "$buffer_name" "$payload_file" "$enter_count" "$enter_delay"
     local send_rc=$?
     rm -f "$payload_file" 2>/dev/null || true
     (( send_rc == 0 )) || return "$send_rc"
   else
-    send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+    send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
       paste_and_submit "$session" "$buffer_name" "$prompt_text" || return $?
   fi
   (( _rp_inject )) && result_path_mark_injected "$name"
@@ -4042,7 +4071,7 @@ send_wait_session() {
   # after the paste so a wait-timeout still counts as delivered. Marking here
   # after send_lock_around would be skipped by `set -e` on a non-zero return,
   # and would wrongly mark on a lock-acquisition timeout (#283).
-  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+  send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
     _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds" "$_rp_inject"
 }
 
@@ -4152,7 +4181,7 @@ send_wait_literal_session() {
   fi
   # inject flag goes INTO the locked helper (marks after paste); see
   # _send_wait_nonce_locked for why marking after send_lock_around is unsafe (#283).
-  send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+  send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
     _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds" "$_rp_inject"
 }
 
