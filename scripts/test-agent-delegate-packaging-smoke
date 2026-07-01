@@ -20,9 +20,11 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi }
 for agent in "${AGENTS[@]}"; do
   PLUGIN_AGENT="$REPO_ROOT/agents/$agent.md"
   PROJECT_AGENT="$REPO_ROOT/.claude/agents/$agent.md"
+  CODEX_AGENT="$REPO_ROOT/.codex/agents/$agent.toml"
 
   [[ -f "$PLUGIN_AGENT" ]]  && ok "plugin-root agents/$agent.md exists"      || bad "plugin-root agents/$agent.md missing"
   [[ -f "$PROJECT_AGENT" ]] && ok ".claude/agents/$agent.md exists"          || bad ".claude/agents/$agent.md missing"
+  [[ -f "$CODEX_AGENT" ]]   && ok ".codex/agents/$agent.toml exists"         || bad ".codex/agents/$agent.toml missing"
 
   # Valid Claude Code subagent frontmatter: first line is '---', has name/description.
   head -1 "$PLUGIN_AGENT" | grep -q '^---$' && ok "$agent frontmatter opens with ---"      || bad "$agent frontmatter does not open with ---"
@@ -39,7 +41,29 @@ for agent in "${AGENTS[@]}"; do
   else
     bad "$agent plugin and project subagent copies have drifted (re-sync agents/$agent.md)"
   fi
+
+  if python3 - "$CODEX_AGENT" "$agent" <<'PY'
+import sys
+import tomllib
+path, expected = sys.argv[1:]
+with open(path, "rb") as fh:
+    doc = tomllib.load(fh)
+body = doc.get("developer_instructions", "")
+assert doc.get("name") == expected
+assert doc.get("description")
+assert "Do not spawn additional tmux sessions or delegate further." in body
+PY
+  then
+    ok "$agent Codex custom-agent TOML is valid"
+  else
+    bad "$agent Codex custom-agent TOML invalid"
+  fi
 done
+
+CODEX_SKILL="$REPO_ROOT/.codex/skills/tmux-agent-tools"
+[[ -L "$CODEX_SKILL" ]] && ok ".codex/skills/tmux-agent-tools is a symlink" || bad ".codex/skills/tmux-agent-tools symlink missing"
+[[ "$(readlink "$CODEX_SKILL" 2>/dev/null)" == "../../skills/tmux-agent-tools" ]] \
+  && ok ".codex/skills/tmux-agent-tools points at canonical skill" || bad ".codex/skills/tmux-agent-tools points at wrong target"
 
 echo "agent-delegate-packaging smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
