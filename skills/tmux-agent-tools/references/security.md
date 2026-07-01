@@ -6,6 +6,8 @@ Read this when injecting secrets into a worker session, enabling the audit log, 
 
 Both wrappers launch agent CLIs with permissive flags: Claude uses `--dangerously-skip-permissions`; Codex uses `--yolo`. These are intentional for managed long-running tasks but they remove every interactive safety prompt. Always confirm with the user before destructive, externally visible, payment, or irreversible work.
 
+`status --json` sets `confirmation_detected:true` with a `blocked_reason` (`permission_prompt`, `approval_prompt`, `login_prompt`, `hook_trust_prompt`, …) when the pane looks like it is waiting for confirmation — including a plugin hook-trust prompt ("N hooks need review … Press t to trust"). It does NOT auto-accept. Answer a trusted single-key prompt with `send --raw <name> t` only after you trust it.
+
 ## Secret injection (`--secret KEY=URI`)
 
 `claude-tmux start` and `codex-tmux start` accept `--secret KEY=URI` to inject a value into the tmux session env. Backends:

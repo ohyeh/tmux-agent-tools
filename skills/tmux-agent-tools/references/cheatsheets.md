@@ -2,6 +2,28 @@
 
 Read this when picking a subcommand for a specific scenario, choosing the right wait/capture pattern, or diagnosing an unexpected wrapper behavior.
 
+## Full script capability table
+
+| Name | One-line purpose | When to reach for it |
+| --- | --- | --- |
+| `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets, `doctor --json`, `setup`, and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools), when scripting across multiple CLIs, or when running JSON preflight via `agent-tmux <cli> setup`. |
+| `agy-tmux` | Thin shim for the bundled `agy` profile over `agent-tmux agy`. | Use when supervising Antigravity/agy with the same wrapper contract as Claude and Codex. |
+| `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, ping, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
+| `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
+| `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
+| `tmux-agent-audit` | Query and verify wrapper audit logs. | Use when you need an operator-facing record of wrapper events, secret use, approvals, or posting actions. |
+| `tmux-agent-cron` | Run scheduled/periodic tmux-agent-tool jobs from a manifest. | Use for repeatable local automation where a manifest should drive wrapper invocations. |
+| `tmux-agent-dag` | Execute a dependency-ordered task manifest and summarize per-task results. | Use when tasks have explicit dependencies and later tasks should wait for prerequisite results. |
+| `tmux-agent-dashboard` | Render a terminal dashboard for managed sessions. | Use when you need a live overview instead of inspecting each worker one at a time. |
+| `tmux-agent-dialogue` | Run bounded two-party dialogues and presets such as `pair-review`, `critic`, `debate`, and `handoff`. | Use when two participants should exchange a fixed number of turns with a JSONL transcript. |
+| `tmux-agent-fanout` | Spawn one prompt across multiple Claude/Codex workers and collect per-agent `result.json` files. | Use for parallel one-to-many work after the user has authorized worker count, tool, model, and effort. |
+| `tmux-agent-history` | Inspect stored wrapper/session history. | Use when you need prior local run metadata rather than current tmux state. |
+| `tmux-agent-monitor` | Poll read-only evidence commands for a managed agent or repo and emit JSONL observations plus a summary. | Use when you need periodic evidence checks; it does not send prompts unless the manifest commands do so. |
+| `tmux-agent-notify` | Send local notifications for wrapper-related events. | Use to alert an operator when a watched condition or job state changes. |
+| `tmux-agent-replay` | Replay or diff transcript/audit JSONL runs. | Use to compare runs, debug marker sequences, or inspect previously recorded wrapper events. |
+| `tmux-agent-sessions` | Inventory, resolve, diff, and clean up sessions across Claude, Codex, and dialogue wrappers. | Use before adopting an existing worker, after accidental starts, or before any cleanup. |
+| `tmux-agent-worktrees` | Manage worktrees created for agent work and apply cleanup policy. | Use when agent runs create isolated git worktrees that need listing or pruning. |
+
 ## Scenario → command
 
 Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focused per-subcommand cheatsheet instead of dumping the full usage.
@@ -30,7 +52,7 @@ Default capture dumps raw scrollback — most of those tokens are ANSI escapes, 
 
 | Pattern | Why it saves tokens |
 | --- | --- |
-| Agent writes `$TMUX_AGENT_RESULT` (a JSON file), parent reads with `result --wait` | Parent never reads pane scrollback. Token cost = result body, not pane history. |
+| Agent writes the wrapper-injected literal result path, parent reads with `result --wait` | Parent never reads pane scrollback. Token cost = result body, not pane history. |
 | `watch --any|--all --timeout 600 --json w1 w2` | One blocking call supervises many workers; no orchestrator polling loop. |
 | `status --json` + `ping --json --timeout 5` | Passive + active liveness without reading pane history. |
 | `send-wait worker '...' 300` | Generates a fresh nonce marker and waits for it, so old pane text cannot satisfy the new turn. |
@@ -177,6 +199,6 @@ Do NOT race two wait calls in parallel and pick the first to return. Wrapper sta
 | `status --json` says `running:true` but no progress | CLI sitting on a permission prompt or stalled | check `diagnostic`; if high `idle_seconds`, run `ping --json --timeout 5`; attach only for approval/input |
 | `ping` times out while `status --json` says `running:true` | pane is alive but not responsive to benign input | send one bounded `send-wait` asking it to write blocked result; then `result wait-required <name> --fields status,summary --wait 60 --json`; otherwise report stalled |
 | `--on-exit` hook never logged | `--on-exit` set without `--sentinel` | the wrapper warns and ignores; add `--sentinel <path>` |
-| `result.json` missing after agent says "done" | agent never wrote `$TMUX_AGENT_RESULT` | re-prompt with explicit "write $TMUX_AGENT_RESULT before signaling done" |
+| `result.json` missing after agent says "done" | agent never wrote the wrapper result file | re-prompt with the literal path from `result --path <name>` before signaling done |
 | Pane shows exit code marker but session lingers | normal — wrapper keeps the pane open for inspection | `stop <name>` to clean up |
 | Multiline prompt sits in CLI input box, never submits | submit delay too short for the host | raise `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY` |
