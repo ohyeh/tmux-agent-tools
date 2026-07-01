@@ -26,6 +26,10 @@ Handle inline when any of these are true:
 - The caller says "quick" or "inline".
 - The case is marginal or unclear; trivial is the safe default.
 
+## Wrapper Resolution
+
+Never assume `agent-tmux` / `claude-tmux` / `codex-tmux` are on PATH. Resolve a scripts dir once and prefix every wrapper command with it: probe, in order, `<repo-dir>/skills/tmux-agent-tools/scripts`, `~/.agents/skills/tmux-agent-tools/scripts`, `~/.claude/skills/tmux-agent-tools/scripts`, `~/.codex/skills/tmux-agent-tools/scripts`; fall back to bare names on PATH only when no bundle exists.
+
 ## Required Preflight
 
 Use `Bash` to run:

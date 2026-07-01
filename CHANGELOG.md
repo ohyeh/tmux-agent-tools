@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- `codex-oneshot`, `claude-oneshot`, and `tmux-delegate` agents no longer assume `agent-tmux`/`claude-tmux`/`codex-tmux` are on PATH. Wrappers are now resolved from a skill bundle first — probing `<repo-dir>/skills`, `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills` in order — with PATH lookup as last-resort fallback, so `npx skills add`-style installs work without `install-bin`/Homebrew. `.claude/agents/*.md` and `.codex/agents/*.toml` mirrors regenerated in sync. Verified end-to-end with a clean PATH: template execution against a real codex worker, plus a haiku-model forwarder run against a real claude worker.
+
 ## v0.28.0 - 2026-07-02
 
 ### Added
