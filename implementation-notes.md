@@ -596,3 +596,90 @@ identically both before and after this session's changes (5 pre-existing failure
 passed on isolated retry). None are new regressions from this session's work. Recording the full
 list here rather than silently dropping them — these are legitimate, separate follow-up items for
 this repo, out of scope for issue #293.
+
+## Fresh adversarial gate BLOCKED the pre-push review — two real defects found and dispatched for fix
+Ran a genuinely fresh codex-consensus-gate (not the same session that did the work) over the
+cumulative diff before push, per the standing requirement. Verdict: DISAGREE/BLOCK, with two
+concrete, live-reproduced defects (not nitpicks):
+1. `send`/`send-wait`/`send-wait-literal` in `agent-tmux` paste/submit text without checking
+   blocked_reason first — only `start` (with initial text) consults the boot trust-gate. Reproduced:
+   text got pasted into an active permission prompt with exit 0. Directly contradicts what `9badec1`'s
+   own commit message claimed to cover.
+2. `mcp-adapter`'s `wait_tmux_agent()` only requires the `status` field via `--fields status`, not the
+   full contract (`schema_version,status,summary,artifacts,errors`) it documents — an incomplete
+   result gets reported as `completed`. Reproduced with a 2-field-only fake result body.
+Everything else the user asked to scrutinize came back clean: SKILL.md still <8KB, the prompt-area
+boundary awk logic was probed for off-by-one/empty-input/multi-marker cases with no bug found,
+mcp-adapter honestly documented as secondary, no commit scope creep.
+Dispatched two PARALLEL codex workers (disjoint files, no worktree needed): `sendguard293` (shared
+pre-send blocked-status guard + regression test) and `adapterfield293` (full-field result validation
++ adapter test case). Will re-verify each independently, then run one more fresh gate before push —
+not pushing on a single pass given how much this first pass caught.
+
+## Fix 2 verified: mcp-adapter full-field result validation (commit `c2e3e73`)
+Independently re-verified `adapterfield293`'s work: `git show c2e3e73` adds `REQUIRED_RESULT_FIELDS`
+and `missingResultFields()`, changes `waitTmuxAgent()`'s `--fields status` to request the full
+`schema_version,status,summary,artifacts,errors` set, and returns `{status:"failed",
+reason:"invalid_result", detail:{...,missing_fields}}` instead of `completed` when any are missing.
+Re-ran `cd mcp-adapter && npm test` myself: passes, including the new incomplete-result case that
+reproduces the reviewer's exact repro (2-field-only body → asserts `status===failed`,
+`reason===invalid_result`, `missing_fields===[summary,artifacts,errors]`). Scope clean: only
+`adapter.js` and `adapter-smoke.js` touched. `sendguard293` (the other parallel fix) still in
+progress, actively wiring a shared `send_guarded_lock_around` guard.
+
+## Fix 1 verified: send-path blocked-status guard (commit `3ad929a`)
+Independently re-verified `sendguard293`'s work: `git show 3ad929a` adds a shared `send_blocked_guard()`
+(checks `status_session --json`'s `blocked_reason`, returns structured `{blocked:true,...}` + exit 1)
+wired through `_send_guarded_locked`/`send_guarded_lock_around`, applied to all 3 vulnerable call
+sites (`send` normal + from-file, `send-wait`, `send-wait-literal`). Noted the `--raw`/`--key`
+send paths were deliberately left unguarded — initially flagged this as a possible gap myself, then
+found the worker's own new positive test (`send --raw --enter-count 1 ... "y"`) uses exactly that
+unguarded path to answer/clear the permission prompt, confirming this is intentional: `--raw`/`--key`
+are the designated mechanism for responding to a detected prompt, so guarding them would create a
+deadlock (blocked prompt, no way to ever answer it via agent-tmux). Correct design, not an oversight.
+
+Re-ran `zsh scripts/test-hook-trust-status-smoke` myself: **37/37 passed** (20 new assertions:
+3 blocked-send-path cases x 6 assertions each + 2 for the post-clear positive case). Then manually
+reproduced the ORIGINAL exploit myself end-to-end (fresh fixture, `send` into an active permission
+prompt) — confirmed rejected with `blocked:true`/exit 1 and the marker text is absent from the pane,
+where before the fix it would have been pasted with exit 0.
+
+One earlier `wait-required` background poll hit a transient `command not found: _log_verify`
+(exit 127) — traced this to my own polling process invoking the `agent-tmux` script from disk at
+the exact moment the worker was mid-editing that same file (both processes touching main, not a
+worktree, since these were disjoint-file parallel fixes). Confirmed harmless: the error came from a
+stale in-flight read during the edit window, not from the final committed file (`zsh -n` syntax
+check and the full re-run above are both clean on the post-commit file). Lesson for next time:
+poll via a separate fixed copy of the wrapper, or just poll git log instead of invoking the file
+under edit, when running verification alongside an in-repo (non-worktree) worker.
+
+Both reviewer-reported defects are now fixed and independently verified. Proceeding to one more
+fresh adversarial gate before push, per the standing requirement — not skipping it just because
+the first round's fixes look solid.
+
+## Second gate: both prior fixes confirmed with live reproduction, but one new real gap found
+Second fresh adversarial gate (`final293gate2`, independent session) confirmed BOTH round-1 fixes
+with its own live reproduction (not just reading diffs): send-guard correctly rejects into a fake
+permission-prompt session (rc=1, blocked_reason=permission_prompt, marker never pasted); adapter
+correctly reports an incomplete result as failed/invalid_result. It also explicitly validated that
+leaving `--raw`/`--key` unguarded is sound design (the adapter's own `send_tmux_agent` only exposes
+`send-wait`, so programmatic callers can't route around the guard via raw/key anyway).
+
+New finding (spot-checked against the real issue text via `gh issue view 293` myself, not just
+trusted): the issue explicitly lists, alongside the already-implemented result-path/required-fields/
+no-cascade lines, two more isolation lines the adapter should inject: a no-background-jobs rule and
+a no-external-side-effects rule. `buildWorkerPrompt()` was missing both — confirmed by reading the
+actual current implementation. This is a real, spec-traceable gap, not a reviewer preference.
+Dispatched `adaptersafety293` to add both constants + wire them into buildWorkerPrompt() + assert in
+adapter-smoke.js. Verdict was `agree_with_changes` (not a full re-block), consistent with everything
+else being solid — proceeding to fix this one item, then a third gate before push.
+
+## Third fix verified: mcp-adapter isolation guards (commit `1f45cc3`)
+Independently verified: `git show 1f45cc3` adds `NO_BACKGROUND_JOBS_GUARD` and
+`NO_EXTERNAL_SIDE_EFFECTS_GUARD` constants (worded to match the issue text: "Do not start background
+jobs unless explicitly requested." / "Do not create external side effects unless explicitly
+authorized."), injects both into `buildWorkerPrompt()` alongside the existing lines, exports them,
+and asserts their presence in the constructed prompt in `adapter-smoke.js`. Also updated
+`README.md`'s documented prompt contract for accuracy. Re-ran `npm test` myself: passes. Scope
+exactly as requested (adapter.js, adapter-smoke.js, README.md only). Proceeding to a third fresh
+adversarial gate before push.
