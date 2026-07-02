@@ -63,6 +63,28 @@ tmux-agent-dialogue pair-review --workdir ~/repo \
   --agent-a fake --agent-b fake   # use real claude/claude for real run
 ```
 
+## Commander loop (shrinking fleet)
+
+When workers finish at different times, do not sleep/poll. Before each watch, check `result --json <name>` for every remaining worker; `watch` reports `result_updated` only for results written after it was armed, so workers that finished before re-arming must be collected before the next watch. Then arm one bounded `watch --any --timeout <s> --json` for the still-absent names; repeat until none remain.
+
+```bash
+remaining=(w1 w2 w3)
+while (( ${#remaining[@]} )); do
+  absent=()
+  for n in "${remaining[@]}"; do
+    if codex-tmux result --json "$n" | jq -e '.present' >/dev/null; then
+      codex-tmux result --json "$n" > "/tmp/$n.result.json"
+      codex-tmux stop "$n"
+    else
+      absent+=("$n")
+    fi
+  done
+  (( ${#absent[@]} == 0 )) && break
+  codex-tmux watch --any --timeout 600 --json "${absent[@]}"
+  remaining=("${absent[@]}")
+done
+```
+
 ## Marker contract for real-agent dialogue
 
 Real dialogue prompts use a split marker. The participant must end each turn with one standalone final line containing only the joined marker. Keep the literal out of the sent prompt or split it in the prompt instructions so the prompt echo cannot satisfy the wait.

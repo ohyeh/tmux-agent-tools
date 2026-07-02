@@ -9,7 +9,7 @@ description: Use when running or supervising AI coding CLIs as managed tmux work
 
 Non-negotiable rules:
 
-1. **Engine-only — never type raw `tmux` at a worker.** Drive every worker through `agent-tmux <cli>` subcommands (`send-wait`, `status`, `result`, `capture`, `stop`). Raw `tmux` bypasses naming, redaction, result contracts, and cleanup. Before concluding the engine lacks a command, check the capability table below; plain shell is a last resort for genuine gaps — say why.
+1. **Engine-only — never type raw `tmux` at a worker.** Drive every worker through `agent-tmux <cli>` subcommands (`send-wait`, `status`, `result`, `capture`, `stop`); read-only inventory is `tmux-agent-sessions list`, not raw `tmux ls`. Raw `tmux` bypasses naming, redaction, result contracts, and cleanup. Before concluding the engine lacks a command, check the capability table below; plain shell is a last resort for genuine gaps — say why.
 2. **A `send` is not done until submission is verified.** Bare `send` can leave text unsent in the input box. Default to `send-wait`: it appends a fresh nonce and waits for it, confirming the prompt landed.
 3. **Every blocking wait takes a timeout — never hand-roll `sleep`/polling loops.** Multiple workers: one bounded `watch --any|--all|--count <n> --timeout <s> --json …`. Mixed-engine fleets: trust `reason:result_updated` or resolve with `tmux-agent-sessions`.
 
@@ -38,11 +38,13 @@ Fast answers:
 | Any other CLI (gemini, cursor, grok, custom) | `agent-tmux <cli>` (+ optional profile) |
 | Local working directory | `start` |
 | Repo on another host, tmux stays local | `start-ssh` |
-| Pin a model for one run | `start --model <m>` |
+| Pin a model for one run | `start --model <m> <name> <dir> '<prompt>'` |
 | Continue an existing CLI session UUID | `resume` (opt-in, off by default) |
 | Don't know which wrapper owns a session | `tmux-agent-sessions resolve --name <n> --json` first |
 | Two-party exchange / one-to-many work | `tmux-agent-dialogue` / `tmux-agent-fanout` |
 | Read-only inventory or evidence polling | `tmux-agent-sessions` / `tmux-agent-monitor` |
+
+Start flags precede positionals: `start --exact --model <m> <name> <dir>`; a misplaced flag exits 2.
 
 Full capability table (every subcommand + when to use it): `references/cheatsheets.md`.
 

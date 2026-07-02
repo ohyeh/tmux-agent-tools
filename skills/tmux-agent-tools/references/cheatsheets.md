@@ -199,6 +199,7 @@ Do NOT race two wait calls in parallel and pick the first to return. Wrapper sta
 | `status --json` says `running:true` but no progress | CLI sitting on a permission prompt or stalled | check `diagnostic`; if high `idle_seconds`, run `ping --json --timeout 5`; attach only for approval/input |
 | `ping` times out while `status --json` says `running:true` | pane is alive but not responsive to benign input | send one bounded `send-wait` asking it to write blocked result; then `result wait-required <name> --fields status,summary --wait 60 --json`; otherwise report stalled |
 | `--on-exit` hook never logged | `--on-exit` set without `--sentinel` | the wrapper warns and ignores; add `--sentinel <path>` |
+| historically `Directory not found: --flag`; now `unknown or misplaced flag: --flag` | a `start` flag was placed after `<name>`/`<directory>` | move all `start` flags before positionals, e.g. `start --exact --model <m> <name> <dir>` |
 | `result.json` missing after agent says "done" | agent never wrote the wrapper result file | re-prompt with the literal path from `result --path <name>` before signaling done |
 | Pane shows exit code marker but session lingers | normal — wrapper keeps the pane open for inspection | `stop <name>` to clean up |
 | Multiline prompt sits in CLI input box, never submits | submit delay too short for the host | raise `CLAUDE_TMUX_SUBMIT_DELAY` or `CODEX_TMUX_SUBMIT_DELAY` |
