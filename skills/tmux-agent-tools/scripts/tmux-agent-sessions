@@ -745,9 +745,9 @@ worktree_dirty_reason() {
     [[ "$meta_dirty" == "dirty" ]] && { print -r -- "worktree metadata is dirty"; return 0; }
   fi
   if [[ -n "$wt_path" && -d "$wt_path/.git" ]] && command -v git >/dev/null 2>&1; then
-    local status
-    status="$(cd "$wt_path" && git status --porcelain 2>/dev/null || true)"
-    [[ -n "$status" ]] && { print -r -- "worktree has uncommitted changes"; return 0; }
+    local check_status
+    check_status="$(cd "$wt_path" && git status --porcelain 2>/dev/null || true)"
+    [[ -n "$check_status" ]] && { print -r -- "worktree has uncommitted changes"; return 0; }
   fi
   return 1
 }
