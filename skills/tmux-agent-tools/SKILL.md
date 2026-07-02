@@ -7,9 +7,15 @@ description: Use when running or supervising AI coding CLIs as managed tmux work
 
 ## Fast paths (read this first)
 
-- **STOP — never type raw `tmux` at a worker.** Use wrapper subcommands: `send-wait`, `status`, `result`, `capture`, `stop`. Raw `tmux` bypasses naming, redaction, result contracts, and cleanup. Last resort only, and say why.
+Non-negotiable rules:
+
+1. **Engine-only — never type raw `tmux` at a worker.** Drive every worker through `agent-tmux <cli>` subcommands (`send-wait`, `status`, `result`, `capture`, `stop`). Raw `tmux` bypasses naming, redaction, result contracts, and cleanup. Before concluding the engine lacks a command, check the capability table below; plain shell is a last resort for genuine gaps — say why.
+2. **A `send` is not done until submission is verified.** Bare `send` can leave text unsent in the input box. Default to `send-wait`: it appends a fresh nonce and waits for it, confirming the prompt landed.
+3. **Every blocking wait takes a timeout — never hand-roll `sleep`/polling loops.** Multiple workers: one bounded `watch --any|--all|--count <n> --timeout <s> --json …`. Mixed-engine fleets: trust `reason:result_updated` or resolve with `tmux-agent-sessions`.
+
+Fast answers:
+
 - **Wrapper not on PATH?** Run it from this bundle: `<skill-dir>/scripts/codex-tmux …`.
-- **Multiple workers?** Use one bounded `watch --any|--all|--count <n> --timeout <s> --json …`; never write a polling loop. Mixed-engine fleets: trust `reason:result_updated` or resolve with `tmux-agent-sessions`.
 - **Auto-delegate substantial work?** Use `tmux-delegate`; details live in `references/core-workflow.md`.
 - **New or renamed CLI?** Add a profile with `bin=…`, then prove it with `doctor --json` and `start --dry-run`; see `references/profiles.md`.
 
@@ -23,14 +29,6 @@ description: Use when running or supervising AI coding CLIs as managed tmux work
 - A worker must write structured `result.json` for a parent agent or wrapper.
 - You need verified follow-up sends, liveness/status checks, bounded waits, or cleanup.
 - Multiple workers need first/all/N completion via one wrapper `watch` call.
-
-Non-negotiable rules:
-
-1. **Engine-only — never bypass with raw tmux.** Drive every worker through `agent-tmux <cli>` subcommands. Check the capability table below before reaching for raw tmux.
-2. **Prefer the managed/Agent path over shell.** Drop to plain shell only when no engine command covers the need — and say so.
-3. **A `send` is not done until submission is verified.** Bare `send` can leave text unsent in the input box. Default to `send-wait` (fresh nonce, waits for it).
-
-If scripts are not on `PATH`, run them from `skills/tmux-agent-tools/scripts/`.
 
 ## Command choice
 
@@ -50,8 +48,7 @@ Full capability table (every subcommand + when to use it): `references/cheatshee
 
 ## When not to use
 
-- One-off non-interactive shell commands — run them directly.
-- A simple file read, search, test, or build command — don't spawn a tmux agent for it.
+- A one-off shell command or a simple file read, search, test, or build — run it directly instead of spawning a worker.
 - Externally visible, destructive, or privacy-sensitive work unless the user has already authorized it.
 
 ## The 6 commands you need most
@@ -68,7 +65,7 @@ codex-tmux stop worker
 codex-tmux watch --any --timeout 600 --json w1 w2 w3
 ```
 
-`send-wait` appends a fresh nonce and waits for it, confirming the prompt landed. Every blocking wait takes a timeout — never hand-roll `sleep`/polling loops. Full walkthrough: `references/core-workflow.md`.
+Full walkthrough: `references/core-workflow.md`.
 
 ## result.json completion contract
 

@@ -13,7 +13,7 @@ then defer to it.
 
 Before spawning any tmux agent, delegating work, or answering a "how do I run
 / supervise / review / clean up agents" question: run the decision tree, pick
-the wrapper, then read its real entry in `skills/tmux-agent-tools/SKILL.md`.
+the wrapper, then read its row in the canonical capability table (see below).
 Never paraphrase that capability table from memory.
 
 ## Decision tree — task shape → wrapper
@@ -61,9 +61,10 @@ What does the task need?
 ## Canonical capability table
 
 The authoritative per-wrapper "when to reach for it" table lives in
-`skills/tmux-agent-tools/SKILL.md` → section **Script capability table**. Once
-the tree points you at a wrapper, read that row for its exact contract. This
-router intentionally does not restate it — one source of truth, zero drift.
+`skills/tmux-agent-tools/references/cheatsheets.md` → section **Full script
+capability table** (linked from SKILL.md → `Command choice`). Once the tree
+points you at a wrapper, read that row for its exact contract. This router
+intentionally does not restate it — one source of truth, zero drift.
 
 ## Router-level gates (do not skip)
 
@@ -94,8 +95,9 @@ router intentionally does not restate it — one source of truth, zero drift.
   for the busy signal, since `status`/`ping` expose none) and resend only if
   idle. Never "nudge" with a raw `tmux send-keys Enter`.
 
-For wait/supervise/marker mechanics, follow the Fast paths and Core Workflow in
-`skills/tmux-agent-tools/SKILL.md` — not duplicated here.
+For wait/supervise/marker mechanics, follow the Fast paths in
+`skills/tmux-agent-tools/SKILL.md` and its `references/core-workflow.md` — not
+duplicated here.
 
 ## When NOT to route here
 
@@ -107,7 +109,7 @@ For wait/supervise/marker mechanics, follow the Fast paths and Core Workflow in
 
 ## Reference
 
-- `skills/tmux-agent-tools/SKILL.md` — wrapper contracts, the capability table,
-  the core workflow (supervise-before-send, wait patterns, approval gates),
-  the profile system, the multi-agent playbook, and cheatsheets / multi-agent
-  / contracts / security references.
+- `skills/tmux-agent-tools/SKILL.md` — the hub: fast-path rules, command
+  choice, the result.json contract, safety, plus links into `references/`
+  (core-workflow, cheatsheets incl. the capability table, profiles,
+  multi-agent, contracts, security).
