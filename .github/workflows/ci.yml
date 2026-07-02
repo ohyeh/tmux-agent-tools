@@ -25,6 +25,8 @@ jobs:
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
           brew list shellcheck >/dev/null 2>&1 || brew install shellcheck
           brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
       - name: Validate shell scripts
         run: |
