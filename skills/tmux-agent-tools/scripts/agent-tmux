@@ -802,10 +802,35 @@ session_env_value_for_key() {
   return 1
 }
 
+append_session_env_entry() {
+  local entry="$1"
+  local value
+  if [[ "$entry" != *"="* ]]; then
+    session_env_args+=("-e" "$entry")
+    if (( ${+parameters[$entry]} )); then
+      value="$(session_env_value_for_key "$entry")"
+      session_env_args[-1]="$entry=$value"
+    fi
+    # If zsh has no value here, leave the bare tmux -e KEY behavior explicit.
+    return 0
+  fi
+  session_env_args+=("-e" "$entry")
+}
+
 apply_cli_env_args() {
   local key value
   if [[ "$INHERIT_ENV" != "1" ]]; then
-    [[ "$CLEAR_ENV" == "1" ]] || return 0
+    if [[ "$CLEAR_ENV" != "1" ]]; then
+      while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        (( ${+parameters[$key]} )) || continue
+        session_env_has_key "$key" && continue
+        value="${(P)key}"
+        [[ -n "$value" ]] || continue
+        session_env_args+=("-e" "$key=$value")
+      done < <(cli_provider_env_keys)
+      return 0
+    fi
     while IFS= read -r key; do
       [[ -n "$key" ]] || continue
       session_env_has_key "$key" && continue
@@ -3272,7 +3297,7 @@ start_session() {
   session_env_args=()
   while IFS= read -r session_env_entry; do
     [[ -n "$session_env_entry" ]] || continue
-    session_env_args+=("-e" "$session_env_entry")
+    append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_cli_env_args
   apply_color_env_args
@@ -3655,7 +3680,7 @@ resume_session() {
   session_env_args=()
   while IFS= read -r session_env_entry; do
     [[ -n "$session_env_entry" ]] || continue
-    session_env_args+=("-e" "$session_env_entry")
+    append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_cli_env_args
   apply_color_env_args
@@ -3787,7 +3812,7 @@ start_ssh_session() {
   session_env_args=()
   while IFS= read -r session_env_entry; do
     [[ -n "$session_env_entry" ]] || continue
-    session_env_args+=("-e" "$session_env_entry")
+    append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_color_env_args
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
