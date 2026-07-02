@@ -194,6 +194,50 @@ run_model_passthrough() {
   assert "$prefix-model missing-value exit=2" "$code3" "2"
 }
 
+run_extra_launch_flags() {
+  local wrapper="$1" cli_env="$2" prefix="$3" default_flags="$4"
+  echo "case: $prefix-extra-launch-flags ($wrapper)"
+
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "${cli_env}_TMUX_EXTRA_LAUNCH_FLAGS=-c added=true" \
+    "$wrapper" start --exact --dry-run "$prefix-extra" "$WORK" 2>&1)" || code=$?
+  assert "$prefix-extra exit=0" "$code" "0"
+  assert "$prefix-extra after default" "$(jq_val "$out" .invocation.launch_flags)" "$default_flags -c added=true"
+
+  local out2 code2=0
+  out2="$(env "$cli_env=$WORK/fake.sh" "${cli_env}_TMUX_LAUNCH_FLAGS=--override" \
+    "${cli_env}_TMUX_EXTRA_LAUNCH_FLAGS=-c added=true" \
+    "$wrapper" start --exact --dry-run "$prefix-extra-override" "$WORK" 2>&1)" || code2=$?
+  assert "$prefix-extra-override exit=0" "$code2" "0"
+  assert "$prefix-extra after override" "$(jq_val "$out2" .invocation.launch_flags)" "--override -c added=true"
+}
+
+run_effort_passthrough() {
+  echo "case: cd-effort (--effort expands codex effort_flags)"
+  local out code=0
+  out="$(env CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --dry-run \
+    --effort high cd-eff "$WORK" 2>&1)" || code=$?
+  assert "cd-effort exit=0" "$code" "0"
+  assert "cd-effort launch_flags" "$(jq_val "$out" .invocation.launch_flags)" "--yolo -c model_reasoning_effort=high"
+
+  local out2 code2=0
+  out2="$(env CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --dry-run \
+    --model gpt-5 --effort high cd-model-eff "$WORK" 2>&1)" || code2=$?
+  assert "cd-model-effort exit=0" "$code2" "0"
+  local flags; flags="$(jq_val "$out2" .invocation.launch_flags)"
+  assert_contains "cd-model-effort has model" "$flags" "--model gpt-5"
+  assert_contains "cd-model-effort has effort" "$flags" "-c model_reasoning_effort=high"
+}
+
+run_effort_rejected_without_profile_key() {
+  echo "case: cl-effort-unsupported (--effort rejected without effort_flags)"
+  local out code=0
+  out="$(env CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact --dry-run \
+    --effort high cl-eff "$WORK" 2>&1)" || code=$?
+  assert "cl-effort-unsupported exit=2" "$code" "2"
+  assert_contains "cl-effort-unsupported message" "$out" "--effort not supported by profile 'claude' (set effort_flags in the profile)"
+}
+
 run_misplaced_flag_rejections() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-misplaced-flags ($wrapper)"
@@ -239,10 +283,11 @@ run_project_config_guard() {
   assert "$prefix-allow-project-config no effective override" "$(jq_val "$opt_out" '.invocation.effective_initial_text // "none"')" "none"
 }
 
-for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
-  IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
+for wrapper_pair in "$CODEX_TMUX|CODEX|cd|--yolo" "$CLAUDE_TMUX|CLAUDE|cl|--dangerously-skip-permissions"; do
+  IFS='|' read -r wrapper env_var prefix default_flags <<< "$wrapper_pair"
   run_ok_case "$wrapper" "$env_var" "$prefix"
   run_model_passthrough "$wrapper" "$env_var" "$prefix"
+  run_extra_launch_flags "$wrapper" "$env_var" "$prefix" "$default_flags"
   run_misplaced_flag_rejections "$wrapper" "$env_var" "$prefix"
   run_project_config_guard "$wrapper" "$env_var" "$prefix"
   run_bad_workdir "$wrapper" "$env_var" "$prefix"
@@ -252,6 +297,9 @@ for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
   run_transcript_no_side_effect "$wrapper" "$env_var" "$prefix"
   run_no_side_effects "$wrapper" "$env_var" "$prefix"
 done
+
+run_effort_passthrough
+run_effort_rejected_without_profile_key
 
 run_wrong_env_var_does_not_cross_fallback "$CODEX_TMUX"  "CLAUDE" "xcd"
 run_wrong_env_var_does_not_cross_fallback "$CLAUDE_TMUX" "CODEX"  "xcl"
