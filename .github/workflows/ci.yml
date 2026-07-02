@@ -12,7 +12,7 @@ permissions:
 jobs:
   smoke:
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -24,9 +24,13 @@ jobs:
           brew list jq >/dev/null 2>&1 || brew install jq
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
           brew list shellcheck >/dev/null 2>&1 || brew install shellcheck
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
       - name: Validate shell scripts
         run: |
+          scripts/lint-no-path-tied-locals
           zsh -n skills/tmux-agent-tools/scripts/agent-tmux
           zsh -n skills/tmux-agent-tools/scripts/claude-tmux
           zsh -n skills/tmux-agent-tools/scripts/codex-tmux
@@ -511,6 +515,18 @@ jobs:
           edited_json="$(mktemp)"
           GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment --output-format json > "$edited_json"
           jq -e '.status == "edited" and .action == "edit" and .post_github_comment == true and .comment_id == "123" and .comment_url == "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-123" and (.gh_output | fromjson | .id == 123)' "$edited_json"
+
+      - name: Install smoke CLI stubs
+        run: |
+          stub_cli_dir="$RUNNER_TEMP/tmux-agent-tools-cli-stubs"
+          mkdir -p "$stub_cli_dir"
+          printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/claude"
+          printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/codex"
+          chmod +x "$stub_cli_dir/claude" "$stub_cli_dir/codex"
+          echo "$stub_cli_dir" >> "$GITHUB_PATH"
+
+      - name: Run full smoke suite
+        run: scripts/run-all-smokes
 
       - name: Run session-id + oneshot smokes
         run: |
