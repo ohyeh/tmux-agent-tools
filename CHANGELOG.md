@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.29.0 - 2026-07-02
 
 ### Added
 - `<NS>_TMUX_EXTRA_LAUNCH_FLAGS` / `AGENT_TMUX_EXTRA_LAUNCH_FLAGS` append to the effective launch flags (existing `*_LAUNCH_FLAGS` stays full-replacement), and `start --effort <v>` expands a new profile `effort_flags` template with the shell-quoted value (`codex.conf` ships `-c model_reasoning_effort=%s`; profiles without the key reject `--effort` with exit 2). Both surface in `start --dry-run` JSON. Launch-flag env vars are documented as operator-controlled raw shell fragments, not a sanitized argv API (#302).
