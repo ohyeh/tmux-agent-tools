@@ -6,6 +6,7 @@
 - writing-great-skills pass over the skill docs: repointed three stale `using-tmux-agent-tools` references that still aimed at SKILL.md's removed "Script capability table" section (the table moved to `references/cheatsheets.md` → "Full script capability table" in v0.28.0), and deduplicated `tmux-agent-tools/SKILL.md` so each rule lives in one place (engine-only ban, PATH fallback, send-wait nonce mechanism, no-polling rule — previously each stated twice). Net −1 line; CI skill-metadata validation still passes and the body stays under the 8KB gate.
 
 ### Fixed
+- `start`/`resume`/`start-ssh` and the send family now reject flag-looking tokens that land in positional slots with `unknown or misplaced flag: <tok> (flags must precede positionals; see usage)` and exit 2, instead of silently consuming them as `<name>`/`<directory>` and failing with a misleading `Directory not found: --flag` (#299).
 - `codex-oneshot`, `claude-oneshot`, and `tmux-delegate` agents no longer assume `agent-tmux`/`claude-tmux`/`codex-tmux` are on PATH. Wrappers are now resolved from a skill bundle first — probing `<repo-dir>/skills`, `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills` in order — with PATH lookup as last-resort fallback, so `npx skills add`-style installs work without `install-bin`/Homebrew. `.claude/agents/*.md` and `.codex/agents/*.toml` mirrors regenerated in sync. Verified end-to-end with a clean PATH: template execution against a real codex worker, plus a haiku-model forwarder run against a real claude worker.
 
 ## v0.28.0 - 2026-07-02

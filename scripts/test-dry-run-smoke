@@ -32,6 +32,17 @@ assert() {
   fi
 }
 
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing '$needle' in: $haystack" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 jq_val() { printf '%s' "$1" | jq -r "$2"; }
 
 run_ok_case() {
@@ -183,6 +194,29 @@ run_model_passthrough() {
   assert "$prefix-model missing-value exit=2" "$code3" "2"
 }
 
+run_misplaced_flag_rejections() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-misplaced-flags ($wrapper)"
+
+  local out code=0
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    "$prefix-mf" --model haiku "$WORK" 2>&1)" || code=$?
+  assert "$prefix-misplaced-start exit=2" "$code" "2"
+  assert_contains "$prefix-misplaced-start names token" "$out" "unknown or misplaced flag: --model"
+
+  local ok_out ok_code=0
+  ok_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+    --model haiku "$prefix-order" "$WORK" 2>&1)" || ok_code=$?
+  assert "$prefix-documented-order exit=0" "$ok_code" "0"
+  assert "$prefix-documented-order ok=true" "$(jq_val "$ok_out" .ok)" "true"
+
+  local ssh_out ssh_code=0
+  ssh_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start-ssh --exact \
+    "$prefix-ssh" --model example-host /tmp 2>&1)" || ssh_code=$?
+  assert "$prefix-misplaced-start-ssh exit=2" "$ssh_code" "2"
+  assert_contains "$prefix-misplaced-start-ssh names token" "$ssh_out" "unknown or misplaced flag: --model"
+}
+
 run_project_config_guard() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-project-config-guard ($wrapper)"
@@ -209,6 +243,7 @@ for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
   IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
   run_ok_case "$wrapper" "$env_var" "$prefix"
   run_model_passthrough "$wrapper" "$env_var" "$prefix"
+  run_misplaced_flag_rejections "$wrapper" "$env_var" "$prefix"
   run_project_config_guard "$wrapper" "$env_var" "$prefix"
   run_bad_workdir "$wrapper" "$env_var" "$prefix"
   run_preexisting_sentinel "$wrapper" "$env_var" "$prefix"
