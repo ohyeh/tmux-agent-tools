@@ -84,6 +84,7 @@ EXEC_MODE='interactive'
 PROMPT_VIA='paste'
 PROMPT_FLAG=''
 SESSION_ID_CAPTURE='off'
+EFFORT_FLAGS=''
 load_cli_profile() {
   local cli="$1" dir file='' line key value
   if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
@@ -120,6 +121,7 @@ load_cli_profile() {
       session_id_pattern)        SESSION_ID_PATTERN="$value" ;;
       heuristic_family)          HEURISTIC_FAMILY="$value" ;;
       usage_kind)                _USAGE_KIND="$value" ;;
+      effort_flags)              EFFORT_FLAGS="$value" ;;
       pattern_busy)              PROFILE_PATTERN_BUSY="$value" ;;
       pattern_permission_prompt) PROFILE_PATTERN_PERMISSION="$value" ;;
       pattern_approval_prompt)   PROFILE_PATTERN_APPROVAL="$value" ;;
@@ -223,6 +225,8 @@ TMUX_MOUSE="$(_pref MOUSE on)"
 TMUX_CLIPBOARD="$(_pref CLIPBOARD auto)"
 STATUS_TAIL_LINES="$(_pref STATUS_TAIL_LINES 20)"
 LAUNCH_FLAGS="$(_pref_set LAUNCH_FLAGS "$_PRESET_FLAGS")"
+EXTRA_LAUNCH_FLAGS="$(_pref_set EXTRA_LAUNCH_FLAGS "")"
+[[ -n "$EXTRA_LAUNCH_FLAGS" ]] && LAUNCH_FLAGS="${LAUNCH_FLAGS:+$LAUNCH_FLAGS }$EXTRA_LAUNCH_FLAGS"
 
 # Per-CLI env inheritance flags. Legacy names <NS>_TMUX_INHERIT_<NS>_ENV /
 # <NS>_TMUX_CLEAR_<NS>_ENV (kept for back-compat) > AGENT_TMUX_* > preset default.
@@ -248,7 +252,7 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
-  agent-tmux start [--attach] [--exact] [--allow-project-config] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
+  agent-tmux start [--attach] [--exact] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   agent-tmux start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
   agent-tmux attach <name>
@@ -3125,7 +3129,8 @@ start_session() {
   local -a pending_tags
   pending_tags=()
   local model_flag=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" || "${1:-}" == "--model" ]]; do
+  local effort_flag=""
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" || "${1:-}" == "--model" || "${1:-}" == "--effort" ]]; do
     case "$1" in
       --model)
         if (( $# < 2 )); then
@@ -3133,6 +3138,20 @@ start_session() {
           exit 2
         fi
         model_flag="--model $(shell_quote "$2")"
+        shift 2
+        ;;
+      --effort)
+        if (( $# < 2 )); then
+          echo "--effort requires a value" >&2
+          exit 2
+        fi
+        if [[ -z "$EFFORT_FLAGS" ]]; then
+          echo "--effort not supported by profile '$CLI' (set effort_flags in the profile)" >&2
+          exit 2
+        fi
+        local quoted_effort
+        quoted_effort="$(shell_quote "$2")"
+        effort_flag="${EFFORT_FLAGS//\%s/$quoted_effort}"
         shift 2
         ;;
       --secret-redact|--secret-redact=true)
@@ -3264,13 +3283,15 @@ start_session() {
   fi
 
   if [[ -z "$requested_name" || -z "$directory" ]]; then
-    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--allow-project-config] [--model <model>] [--from-file <abs>|--prompt-file <abs>|-] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
+    echo "Usage: agent-tmux start [--attach] [--exact] [--dry-run] [--allow-project-config] [--model <model>] [--effort <v>] [--from-file <abs>|--prompt-file <abs>|-] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--max-runtime <seconds>] [--max-idle <seconds>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]" >&2
     exit 2
   fi
 
+  local start_extra_flags="${model_flag:-}"
+  [[ -n "$effort_flag" ]] && start_extra_flags="${start_extra_flags:+$start_extra_flags }${effort_flag}"
   if (( dry_run )); then
     run_dry_run_checks "${CLI}-tmux" "$requested_name" "$directory" "$exact_name" \
-      "$sentinel" "$on_exit_cmd" "$transcript_path" "$initial_text" "$model_flag" "$allow_project_config"
+      "$sentinel" "$on_exit_cmd" "$transcript_path" "$initial_text" "$start_extra_flags" "$allow_project_config"
     exit $?
   fi
 
@@ -3358,7 +3379,7 @@ start_session() {
     result_schema_record "$name" "$result_schema_path"
   fi
   local start_launch_flags="${LAUNCH_FLAGS:-}" supplied_id="" supplied_flag=""
-  [[ -n "$model_flag" ]] && start_launch_flags="${start_launch_flags:+$start_launch_flags }${model_flag}"
+  [[ -n "$start_extra_flags" ]] && start_launch_flags="${start_launch_flags:+$start_launch_flags }${start_extra_flags}"
   if [[ "$SESSION_ID_CAPTURE" == "supplied" ]] && supplied_flag="$(supplied_session_id_flag)"; then
     supplied_id="$(new_cli_session_id)"
     write_session_meta_id "$(agent_root_dir)/$name/session-meta.json" "$supplied_id"

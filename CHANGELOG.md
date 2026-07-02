@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- `<NS>_TMUX_EXTRA_LAUNCH_FLAGS` / `AGENT_TMUX_EXTRA_LAUNCH_FLAGS` append to the effective launch flags (existing `*_LAUNCH_FLAGS` stays full-replacement), and `start --effort <v>` expands a new profile `effort_flags` template with the shell-quoted value (`codex.conf` ships `-c model_reasoning_effort=%s`; profiles without the key reject `--effort` with exit 2). Both surface in `start --dry-run` JSON. Launch-flag env vars are documented as operator-controlled raw shell fragments, not a sanitized argv API (#302).
+
 ### Changed
 - Skill docs hardened with this round's observed operational traps: the flag-order rule (flags precede positionals), `tmux ls` replaced with `tmux-agent-sessions list`, a cheatsheet triage row, and the commander shrinking-fleet watch loop including the check-`result --json .present`-before-re-arming-`watch --any` nuance (#301).
 - writing-great-skills pass over the skill docs: repointed three stale `using-tmux-agent-tools` references that still aimed at SKILL.md's removed "Script capability table" section (the table moved to `references/cheatsheets.md` → "Full script capability table" in v0.28.0), and deduplicated `tmux-agent-tools/SKILL.md` so each rule lives in one place (engine-only ban, PATH fallback, send-wait nonce mechanism, no-polling rule — previously each stated twice). Net −1 line; CI skill-metadata validation still passes and the body stays under the 8KB gate.

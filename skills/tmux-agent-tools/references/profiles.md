@@ -11,10 +11,13 @@ Profile contract keys that affect safety and structured results:
 - `approval=prompt|auto` controls the profile approval mode; read the active value from `agent-tmux <cli> doctor --json`.
 - `result_required_fields=status,summary,...` becomes the default field list for `result wait-required` when `--fields` is omitted; explicit `--fields` still wins.
 - `session_id_pattern=<label-anchored ERE>` enables v2 `cli_session_id` capture. Leave it unset unless the CLI's session-label line is verified for that version.
+- `effort_flags=<template>` enables `start --effort <v>` for profiles that support it; `%s` is replaced by the shell-quoted value, and profiles without it reject `--effort` with exit 2.
 
 Use `agent-tmux <cli> setup` as the JSON preflight (`doctor --json` + `self-test`). Use `agent-tmux <cli> start --dry-run ...` to inspect the resolved invocation/profile without creating a tmux session.
 
-`start --model <m>` pins a worker's model for that run (passed through as `--model <m>`; not validated per-CLI, since `ANTHROPIC_MODEL`/env are unreliable). For a durable per-CLI default set `launch_flags` in the profile instead.
+`start --model <m>` pins a worker's model for that run (passed through as `--model <m>`; not validated per-CLI, since `ANTHROPIC_MODEL`/env are unreliable). `start --effort <v>` expands the profile's `effort_flags` template; Codex uses `-c model_reasoning_effort=%s`. For a durable per-CLI default set `launch_flags` in the profile instead.
+
+`<NS>_TMUX_LAUNCH_FLAGS` / `AGENT_TMUX_LAUNCH_FLAGS` replace profile `launch_flags` wholesale. `<NS>_TMUX_EXTRA_LAUNCH_FLAGS` / `AGENT_TMUX_EXTRA_LAUNCH_FLAGS` append after the effective launch flags, so callers can add one option without restating profile defaults. Both are operator-controlled raw shell fragments executed by the pane shell (same trust class as profile `launch_flags`), not a sanitized argv API — never populate them from untrusted input.
 
 ```ini
 # ~/.config/agent-tmux/profiles/gemini.conf
