@@ -328,6 +328,14 @@ Environment:
 EOF
 }
 
+reject_misplaced_positional_flag() {
+  local token="${1:-}"
+  if [[ "$token" == --* ]]; then
+    echo "unknown or misplaced flag: $token (flags must precede positionals; see usage)" >&2
+    exit 2
+  fi
+}
+
 help_for_subcommand() {
   # Per-subcommand cheatsheet for issue #106 discoverability.
   # Falls through to the full `usage` when no topic matches.
@@ -3173,6 +3181,8 @@ start_session() {
 
   local requested_name="${1:-}"
   local directory="${2:-}"
+  reject_misplaced_positional_flag "$requested_name"
+  reject_misplaced_positional_flag "$directory"
   shift 2 || true
   local initial_text="${*:-}"
 
@@ -3558,6 +3568,8 @@ resume_session() {
   local requested_name="${1:-}"
   local directory="${2:-}"
   local cli_session_id="${3:-}"
+  reject_misplaced_positional_flag "$requested_name"
+  reject_misplaced_positional_flag "$directory"
 
   if [[ -z "$requested_name" || -z "$directory" || -z "$cli_session_id" ]]; then
     echo "Usage: agent-tmux resume [--attach] [--exact] [--sentinel <path>] [--on-start <cmd>] [--on-exit <cmd>] [--sentinel-keep] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>" >&2
@@ -3725,6 +3737,9 @@ start_ssh_session() {
   local requested_name="${1:-}"
   local ssh_target="${2:-}"
   local remote_directory="${3:-}"
+  reject_misplaced_positional_flag "$requested_name"
+  reject_misplaced_positional_flag "$ssh_target"
+  reject_misplaced_positional_flag "$remote_directory"
 
   if [[ -z "$requested_name" || -z "$ssh_target" || -z "$remote_directory" ]]; then
     echo "Usage: agent-tmux start-ssh [--attach] [--exact] [--from-file <abs>|--prompt-file <abs>|-] <name> <ssh-target> <remote-directory> [initial text]" >&2
@@ -3852,6 +3867,7 @@ send_session() {
     esac
   done
   local name="${1:-}"
+  reject_misplaced_positional_flag "$name"
   shift || true
 
   if [[ -n "$key_name" ]]; then
@@ -4026,6 +4042,7 @@ send_wait_session() {
   done
 
   local name="${1:-}"
+  reject_misplaced_positional_flag "$name"
   local prompt_text
   local timeout_seconds
 
@@ -4141,6 +4158,7 @@ send_wait_literal_session() {
   done
 
   local name="${1:-}"
+  reject_misplaced_positional_flag "$name"
   local prompt_text
   local needle
   local timeout_seconds
