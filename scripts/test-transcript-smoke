@@ -12,6 +12,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
 CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+unset CLAUDE
 
 WORK="$(mktemp -d -t tmux-agent-transcript-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -187,7 +188,7 @@ run_wait_events() {
   "$wrapper" wait-literal "$prefix-we" "ready" 5 >/dev/null
 
   # wait-text regex that succeeds
-  "$wrapper" wait-text "$prefix-we" "rea.*" 5 >/dev/null
+  "$wrapper" wait-text --regex "$prefix-we" "rea.*" 5 >/dev/null
 
   # wait-literal that times out
   "$wrapper" wait-literal "$prefix-we" "MISS-MARKER" 2 >/dev/null 2>&1 || true

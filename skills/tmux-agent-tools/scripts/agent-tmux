@@ -802,10 +802,35 @@ session_env_value_for_key() {
   return 1
 }
 
+append_session_env_entry() {
+  local entry="$1"
+  local value
+  if [[ "$entry" != *"="* ]]; then
+    session_env_args+=("-e" "$entry")
+    if (( ${+parameters[$entry]} )); then
+      value="$(session_env_value_for_key "$entry")"
+      session_env_args[-1]="$entry=$value"
+    fi
+    # If zsh has no value here, leave the bare tmux -e KEY behavior explicit.
+    return 0
+  fi
+  session_env_args+=("-e" "$entry")
+}
+
 apply_cli_env_args() {
   local key value
   if [[ "$INHERIT_ENV" != "1" ]]; then
-    [[ "$CLEAR_ENV" == "1" ]] || return 0
+    if [[ "$CLEAR_ENV" != "1" ]]; then
+      while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        (( ${+parameters[$key]} )) || continue
+        session_env_has_key "$key" && continue
+        value="${(P)key}"
+        [[ -n "$value" ]] || continue
+        session_env_args+=("-e" "$key=$value")
+      done < <(cli_provider_env_keys)
+      return 0
+    fi
     while IFS= read -r key; do
       [[ -n "$key" ]] || continue
       session_env_has_key "$key" && continue
@@ -1536,7 +1561,13 @@ send_lock_around() {
     fi
     if [[ -z "$holder_pid" ]]; then
       sleep 0.2
-      [[ -f "$lock_dir/pid" ]] || { rm -rf "$lock_dir" 2>/dev/null || true; continue; }
+      if [[ ! -f "$lock_dir/pid" ]]; then
+        if [[ ! -d "$lock_dir" || ! -w "$subdir" ]]; then
+          echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
+          return 75
+        fi
+        rm -rf "$lock_dir" 2>/dev/null || true
+      fi
     fi
     now_epoch="${EPOCHSECONDS:-$(date +%s)}"
     if (( now_epoch >= end )); then
@@ -1681,6 +1712,31 @@ transcript_emit_wait_event() {
       timeout_seconds: (if $timeout == "" then null else ($timeout | tonumber) end),
       at: $at}')"
   transcript_append "$transcript_path" "$line"
+}
+
+transcript_emit_send_event() {
+  local name="$1" text="$2" multiline="$3"
+  local transcript_path
+  transcript_path="$(transcript_path_for "$name")"
+  [[ -n "$transcript_path" ]] || return 0
+
+  # #300: transcript send events describe the caller payload, not the guarded
+  # wire text that may include task-scope/result-path/nonce instructions.
+  local text_obj send_line text_sha
+  text_obj="$(transcript_truncate_text "$name" "$text")"
+  text_sha="$(printf '%s' "$text" | sha256_text)"
+  send_line="$("$JQ" -c -n \
+    --argjson text_obj "$text_obj" \
+    --arg event send --arg name "$name" \
+    --arg text_sha256 "$text_sha" \
+    --argjson multiline "$multiline" \
+    --arg at "$(transcript_iso_now)" \
+    '{schema_version: 1, event: $event, name: $name,
+      text: $text_obj.text,
+      text_sha256: (if $multiline then $text_sha256 else $text_obj.text_sha256 end),
+      text_bytes: $text_obj.text_bytes, bytes: $text_obj.text_bytes,
+      multiline: $multiline, at: $at}')"
+  transcript_append "$transcript_path" "$send_line"
 }
 
 result_schema_record() {
@@ -3272,7 +3328,7 @@ start_session() {
   session_env_args=()
   while IFS= read -r session_env_entry; do
     [[ -n "$session_env_entry" ]] || continue
-    session_env_args+=("-e" "$session_env_entry")
+    append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_cli_env_args
   apply_color_env_args
@@ -3655,7 +3711,7 @@ resume_session() {
   session_env_args=()
   while IFS= read -r session_env_entry; do
     [[ -n "$session_env_entry" ]] || continue
-    session_env_args+=("-e" "$session_env_entry")
+    append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_cli_env_args
   apply_color_env_args
@@ -3787,7 +3843,7 @@ start_ssh_session() {
   session_env_args=()
   while IFS= read -r session_env_entry; do
     [[ -n "$session_env_entry" ]] || continue
-    session_env_args+=("-e" "$session_env_entry")
+    append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_color_env_args
   if "$TMUX" has-session -t "$session" 2>/dev/null; then
@@ -3945,6 +4001,7 @@ send_session() {
     prompt_text="$(_resolve_prompt_file "$from_file")" || exit 2
     multiline=true
   fi
+  local transcript_text="$prompt_text"
   local _rp_inject=0 _scope_guard_inject=0
   if [[ "$raw" != true && "$allow_project_config" != 1 ]] && task_scope_guard_should_inject "$name" "$prompt_text"; then
     prompt_text="$(task_scope_guard_prepend "$prompt_text")"; _scope_guard_inject=1
@@ -3976,27 +4033,7 @@ send_session() {
   (( _scope_guard_inject )) && task_scope_guard_mark_injected "$name"
   (( _rp_inject )) && result_path_mark_injected "$name"
 
-  local transcript_path
-  transcript_path="$(transcript_path_for "$name")"
-  if [[ -n "$transcript_path" ]]; then
-    # #140: apply optional --transcript-text-truncate to keep long send
-    # payloads out of the transcript while preserving an integrity hash.
-    local text_obj send_line text_sha
-    text_obj="$(transcript_truncate_text "$name" "$prompt_text")"
-    text_sha="$(printf '%s' "$prompt_text" | sha256_text)"
-    send_line="$("$JQ" -c -n \
-      --argjson text_obj "$text_obj" \
-      --arg event send --arg name "$name" \
-      --arg text_sha256 "$text_sha" \
-      --argjson multiline "$multiline" \
-      --arg at "$(transcript_iso_now)" \
-      '{schema_version: 1, event: $event, name: $name,
-        text: $text_obj.text,
-        text_sha256: (if $multiline then $text_sha256 else $text_obj.text_sha256 end),
-        text_bytes: $text_obj.text_bytes, bytes: $text_obj.text_bytes,
-        multiline: $multiline, at: $at}')"
-    transcript_append "$transcript_path" "$send_line"
-  fi
+  transcript_emit_send_event "$name" "$transcript_text" "$multiline"
   if [[ -n "$from_file" ]]; then
     local audit_line text_sha
     text_sha="$(printf '%s' "$prompt_text" | sha256_text)"
@@ -4089,6 +4126,9 @@ send_wait_session() {
     echo "Usage: agent-tmux send-wait [--from-file <abs>|--prompt-file <abs>|-] <name> <text> [timeout_seconds]" >&2
     exit 2
   fi
+  local transcript_text="$prompt_text"
+  local transcript_multiline=false
+  [[ -n "$from_file" ]] && transcript_multiline=true
 
   if [[ ! "$timeout_seconds" =~ '^[0-9]+$' || "$timeout_seconds" -lt 1 ]]; then
     echo "Invalid timeout_seconds: $timeout_seconds" >&2
@@ -4116,11 +4156,11 @@ send_wait_session() {
   # after send_lock_around would be skipped by `set -e` on a non-zero return,
   # and would wrongly mark on a lock-acquisition timeout (#283).
   send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
-    _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds" "$_rp_inject" "$_scope_guard_inject"
+    _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds" "$_rp_inject" "$_scope_guard_inject" "$transcript_text" "$transcript_multiline"
 }
 
 _send_wait_nonce_locked() {
-  local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5" inject_rp="${6:-0}" inject_scope_guard="${7:-0}"
+  local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5" inject_rp="${6:-0}" inject_scope_guard="${7:-0}" transcript_text="${8:-$3}" transcript_multiline="${9:-false}"
 
   local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
   local before_count
@@ -4136,6 +4176,7 @@ _send_wait_nonce_locked() {
   # helper's non-zero timeout return (#283).
   (( inject_scope_guard )) && task_scope_guard_mark_injected "$name"
   (( inject_rp )) && result_path_mark_injected "$name"
+  transcript_emit_send_event "$name" "$transcript_text" "$transcript_multiline"
   audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" --arg marker "$nonce" \
     '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber), marker:$marker}')"
 
@@ -4213,6 +4254,9 @@ send_wait_literal_session() {
     echo "Invalid timeout_seconds: $timeout_seconds" >&2
     exit 2
   fi
+  local transcript_text="$prompt_text"
+  local transcript_multiline=false
+  [[ -n "$from_file" ]] && transcript_multiline=true
 
   local session="$(session_for_name "$name")"
   if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
@@ -4230,11 +4274,11 @@ send_wait_literal_session() {
   # inject flag goes INTO the locked helper (marks after paste); see
   # _send_wait_nonce_locked for why marking after send_lock_around is unsafe (#283).
   send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
-    _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds" "$_rp_inject" "$_scope_guard_inject"
+    _send_wait_literal_locked "$name" "$session" "$prompt_text" "$needle" "$timeout_seconds" "$_rp_inject" "$_scope_guard_inject" "$transcript_text" "$transcript_multiline"
 }
 
 _send_wait_literal_locked() {
-  local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5" inject_rp="${6:-0}" inject_scope_guard="${7:-0}"
+  local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5" inject_rp="${6:-0}" inject_scope_guard="${7:-0}" transcript_text="${8:-$3}" transcript_multiline="${9:-false}"
 
   local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
   local before_count
@@ -4246,6 +4290,7 @@ _send_wait_literal_locked() {
   # counts the prompt as delivered and the next send won't re-inject (#283).
   (( inject_scope_guard )) && task_scope_guard_mark_injected "$name"
   (( inject_rp )) && result_path_mark_injected "$name"
+  transcript_emit_send_event "$name" "$transcript_text" "$transcript_multiline"
   audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" \
     '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber)}')"
 
@@ -4375,7 +4420,7 @@ capture_session() {
     "$JQ" -n \
       --arg name "$name" \
       --arg session "$session" \
-      --argjson lines_requested "$lines" \
+      --argjson lines_requested "$tail_count" \
       --argjson marker_found "$marker_found" \
       --argjson stripped_ansi "$strip_ansi" \
       --arg body "$raw" \
@@ -4393,7 +4438,7 @@ capture_session() {
     local capture_line
     capture_line="$("$JQ" -c -n \
       --arg event capture --arg name "$name" \
-      --argjson lines_requested "$lines" \
+      --argjson lines_requested "$tail_count" \
       --argjson strip_ansi "$strip_ansi" \
       --arg since_marker "$since_marker" \
       --argjson marker_found "$marker_found" \

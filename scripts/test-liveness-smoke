@@ -139,7 +139,7 @@ run_invariants() {
   # Now verify wait-text (regex) does NOT add to marker_seen.
   # Pattern matches the literal "ready-marker" in the pane via regex,
   # so the wait succeeds — but the result should NOT enter marker_seen.
-  "$wrapper" wait-text "$prefix" 'ready-mark.*' 5 >/dev/null
+  "$wrapper" wait-text --regex "$prefix" 'ready-mark.*' 5 >/dev/null
   payload="$("$wrapper" status --json "$prefix")"
   local count_after
   count_after="$(printf '%s' "$payload" | jq -r '.marker_seen | length')"
