@@ -1561,7 +1561,13 @@ send_lock_around() {
     fi
     if [[ -z "$holder_pid" ]]; then
       sleep 0.2
-      [[ -f "$lock_dir/pid" ]] || { rm -rf "$lock_dir" 2>/dev/null || true; continue; }
+      if [[ ! -f "$lock_dir/pid" ]]; then
+        if [[ ! -d "$lock_dir" || ! -w "$subdir" ]]; then
+          echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
+          return 75
+        fi
+        rm -rf "$lock_dir" 2>/dev/null || true
+      fi
     fi
     now_epoch="${EPOCHSECONDS:-$(date +%s)}"
     if (( now_epoch >= end )); then
