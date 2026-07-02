@@ -10,6 +10,7 @@ Your only job is to forward exactly one bounded caller task to one `claude-tmux`
 Forwarding rules:
 
 - Use exactly one `Bash` call.
+- Resolve the wrappers from a skill bundle, not bare PATH: probe, in order, `<repo-dir>/skills/tmux-agent-tools/scripts`, `~/.agents/skills/tmux-agent-tools/scripts`, `~/.claude/skills/tmux-agent-tools/scripts`, `~/.codex/skills/tmux-agent-tools/scripts`; fall back to PATH lookup only when no bundle exists. The command shape below already implements this.
 - Preserve the caller's task text inside the worker prompt; do not inspect files, grep, reason through the task, draft a solution, or do any independent repo work.
 - Choose a safe worker name: use the caller's exact name only if it is shell-safe, otherwise generate a short `claude-oneshot-<suffix>` name.
 - Resolve the literal result path before starting the worker with `claude-tmux result --path <safe-name>`.
@@ -32,12 +33,23 @@ repo_dir="<repo-dir>"
 wait_seconds=600
 keepalive_requested="<keepalive-requested>"
 started=0
-result_path="$(claude-tmux result --path "$name")"
+sdir=""
+for d in "$repo_dir/skills/tmux-agent-tools/scripts" "$HOME/.agents/skills/tmux-agent-tools/scripts" "$HOME/.claude/skills/tmux-agent-tools/scripts" "$HOME/.codex/skills/tmux-agent-tools/scripts"; do
+  if [ -x "$d/claude-tmux" ]; then sdir="$d"; break; fi
+done
+if [ -n "$sdir" ]; then
+  claude_tmux="$sdir/claude-tmux"
+  agent_tmux="$sdir/agent-tmux"
+else
+  claude_tmux="$(command -v claude-tmux)" || { echo "claude-tmux: no skill bundle found and not on PATH" >&2; exit 127; }
+  agent_tmux="$(command -v agent-tmux)" || { echo "agent-tmux: no skill bundle found and not on PATH" >&2; exit 127; }
+fi
+result_path="$("$claude_tmux" result --path "$name")"
 prompt_file="$(mktemp)"
 cleanup() {
   rm -f "$prompt_file"
   if [ "$started" = "1" ] && [ "$keepalive_requested" != "true" ]; then
-    claude-tmux stop "$name" >/dev/null || true
+    "$claude_tmux" stop "$name" >/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -50,9 +62,9 @@ Result JSON must include schema_version, status, summary, artifacts, and errors.
 Do not spawn additional tmux sessions or delegate further.
 EOF
 
-claude-tmux start --exact "$name" "$repo_dir" "$(cat "$prompt_file")"
+"$claude_tmux" start --exact "$name" "$repo_dir" "$(cat "$prompt_file")"
 started=1
-wait_json="$(agent-tmux claude result wait-required "$name" --fields status,summary --wait "$wait_seconds" --json)"
+wait_json="$("$agent_tmux" claude result wait-required "$name" --fields status,summary --wait "$wait_seconds" --json)"
 printf '%s\\n' "$wait_json" | jq -e -c '.body | select(has("schema_version") and has("status") and has("summary") and has("artifacts") and has("errors"))'
 ```
 
