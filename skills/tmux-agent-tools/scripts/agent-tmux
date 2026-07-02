@@ -4375,7 +4375,7 @@ capture_session() {
     "$JQ" -n \
       --arg name "$name" \
       --arg session "$session" \
-      --argjson lines_requested "$lines" \
+      --argjson lines_requested "$tail_count" \
       --argjson marker_found "$marker_found" \
       --argjson stripped_ansi "$strip_ansi" \
       --arg body "$raw" \
@@ -4393,7 +4393,7 @@ capture_session() {
     local capture_line
     capture_line="$("$JQ" -c -n \
       --arg event capture --arg name "$name" \
-      --argjson lines_requested "$lines" \
+      --argjson lines_requested "$tail_count" \
       --argjson strip_ansi "$strip_ansi" \
       --arg since_marker "$since_marker" \
       --argjson marker_found "$marker_found" \
