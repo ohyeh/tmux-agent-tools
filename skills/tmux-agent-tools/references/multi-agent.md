@@ -12,6 +12,26 @@ These tools are for **long-running supervised tasks**, not for unbounded agent s
 4. **Bound the dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6). Unbounded debate is a smell.
 5. **Stop and report instead of spawning more workers.** If a task is not making progress, surface that to the user. Do not "try with more workers".
 
+## Persistent teammates (worker reuse)
+
+A fresh worker per task re-pays CLI boot plus repo-context ingestion every time. For sequential same-repo tasks (review -> fix -> re-review chains), reuse one named worker instead.
+
+**Reuse when:** same repo, same domain, sequential bounded tasks, worker's context is still clean (no error/confusion to shed).
+
+**Start fresh when:** different repo or domain, worker context got contaminated by an error or dead end, or the next task needs a different engine (claude vs codex).
+
+**CRITICAL: reset the result before every reused send.** `send-wait` does not clear the previous `result.json`. If you skip the reset, `result wait-required` on the next task returns instantly with the STALE prior result — a false completion, not a timeout.
+
+Reuse loop:
+
+```bash
+agent-tmux claude result init worker            # clears result.json to an empty-summary skeleton
+agent-tmux claude send-wait worker 'Next task. Write final JSON to the result path when done.'
+agent-tmux claude result wait-required worker --fields status,summary --wait 120 --json
+```
+
+Use `start --exact <name>` with a stable name up front so the worker stays addressable across the whole chain. Only `stop` the worker at the end of the entire engagement, not between tasks.
+
 ## Cross-CLI native integration
 
 The primary integration path is native skill + agent discovery, not MCP. Claude Code reads the repo-root `skills/` bundle and `.claude/agents/*.md` mirrors. Codex CLI 0.142.5 was verified to load project-local skills from `.codex/skills/<name>/SKILL.md` (and also `.agents/skills/<name>/SKILL.md`); this repo exposes `tmux-agent-tools` to Codex through the symlink `.codex/skills/tmux-agent-tools -> ../../skills/tmux-agent-tools`.

@@ -12,6 +12,7 @@ Non-negotiable rules:
 1. **Engine-only — never type raw `tmux` at a worker.** Drive every worker through `agent-tmux <cli>` subcommands (`send-wait`, `status`, `result`, `capture`, `stop`); read-only inventory is `tmux-agent-sessions list`, not raw `tmux ls`. Raw `tmux` bypasses naming, redaction, result contracts, and cleanup. Before concluding the engine lacks a command, check the capability table below; plain shell is a last resort for genuine gaps — say why.
 2. **A `send` is not done until submission is verified.** Bare `send` can leave text unsent in the input box. Default to `send-wait`: it appends a fresh nonce and waits for it, confirming the prompt landed.
 3. **Every blocking wait takes a timeout — never hand-roll `sleep`/polling loops.** Multiple workers: one bounded `watch --any|--all|--count <n> --timeout <s> --json …`. Mixed-engine fleets: trust `reason:result_updated` or resolve with `tmux-agent-sessions`.
+4. **Reusing a worker for a follow-up task?** `result init` first, then `send-wait`, then `result wait-required` — never reuse without `result init`, or the wait returns the stale prior result. Details: `references/multi-agent.md#persistent-teammates-worker-reuse`.
 
 Fast answers:
 
@@ -97,3 +98,11 @@ Load these only when you hit the relevant scenario — they are not needed for r
 - `references/multi-agent.md` — dialogue/fanout rules, bridge pattern, SSH participants, github-comment behavior.
 - `references/contracts.md` — `status --json`/`result.json` schemas, approval exit codes, concurrency, inventory/cleanup.
 - `references/security.md` — secret injection, audit log, environment overrides, pre-flight checks.
+- `references/troubleshooting.md` — failure modes and fixes for stuck/unsent/stale-marker scenarios.
+- `references/recipes.md` — copy-pasteable workflows (approval gate, fanout, DAG).
+
+## Bundled agents and schemas
+
+`agents/` ships `tmux-delegate.md` (inline-vs-worker gate) plus `claude-oneshot.md` / `codex-oneshot.md` (thin one-shot forwarders). Install by copying `agents/*.md` into `~/.claude/agents/`.
+
+`schemas/` ships `result-status-summary.schema.json` and `fanout-summary.schema.json` — the offline fallback the scripts already resolve for `result.json` validation when no other copy is found on disk.

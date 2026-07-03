@@ -5,24 +5,18 @@ target_dir="${1:-$HOME/.local/bin}"
 script_dir="${0:A:h}"
 
 mkdir -p "$target_dir"
-ln -sf "$script_dir/agent-tmux" "$target_dir/agent-tmux"
-ln -sf "$script_dir/claude-tmux" "$target_dir/claude-tmux"
-ln -sf "$script_dir/codex-tmux" "$target_dir/codex-tmux"
-ln -sf "$script_dir/agy-tmux" "$target_dir/agy-tmux"
-ln -sf "$script_dir/tmux-agent-dialogue" "$target_dir/tmux-agent-dialogue"
-ln -sf "$script_dir/tmux-agent-sessions" "$target_dir/tmux-agent-sessions"
-ln -sf "$script_dir/tmux-agent-worktrees" "$target_dir/tmux-agent-worktrees"
-ln -sf "$script_dir/tmux-agent-audit" "$target_dir/tmux-agent-audit"
+
+wrappers=()
+for f in "$script_dir"/*(N.x); do
+  [[ "${f:t}" == "install-bin" ]] && continue
+  wrappers+=("${f:t}")
+done
 
 echo "Installed:"
-echo "  $target_dir/agent-tmux -> $script_dir/agent-tmux"
-echo "  $target_dir/claude-tmux -> $script_dir/claude-tmux"
-echo "  $target_dir/codex-tmux -> $script_dir/codex-tmux"
-echo "  $target_dir/agy-tmux -> $script_dir/agy-tmux"
-echo "  $target_dir/tmux-agent-dialogue -> $script_dir/tmux-agent-dialogue"
-echo "  $target_dir/tmux-agent-sessions -> $script_dir/tmux-agent-sessions"
-echo "  $target_dir/tmux-agent-worktrees -> $script_dir/tmux-agent-worktrees"
-echo "  $target_dir/tmux-agent-audit -> $script_dir/tmux-agent-audit"
+for name in "${wrappers[@]}"; do
+  ln -sf "$script_dir/$name" "$target_dir/$name"
+  echo "  $target_dir/$name -> $script_dir/$name"
+done
 echo
 echo "Make sure this is on PATH:"
 echo "  $target_dir"
