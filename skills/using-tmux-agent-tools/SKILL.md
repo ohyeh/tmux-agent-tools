@@ -112,4 +112,4 @@ duplicated here.
 - `skills/tmux-agent-tools/SKILL.md` — the hub: fast-path rules, command
   choice, the result.json contract, safety, plus links into `references/`
   (core-workflow, cheatsheets incl. the capability table, profiles,
-  multi-agent, contracts, security).
+  multi-agent, contracts, security, troubleshooting, recipes).

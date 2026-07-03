@@ -14,6 +14,7 @@ Delegate when ANY of these are true:
 - The task needs an independent context window.
 - The task requires a multi-step read-plan-write cycle.
 - The task runs tests, builds, or lint across the codebase.
+- It is a follow-up task in the same repo/domain as an existing worker with clean context: prefer sending to that worker (after `result init`) over starting a new one.
 
 Handle inline when any of these are true:
 

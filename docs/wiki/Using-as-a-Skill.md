@@ -102,6 +102,10 @@ In your prompt, be explicit: **"Write `$TMUX_AGENT_RESULT` before signaling done
 | Dependency-ordered pipeline | `tmux-agent-dag <manifest.json>` ([DAG recipe](Recipes#dag)) |
 | Two-agent critique | `tmux-agent-dialogue critic ...` |
 
+## Skill payload contents
+
+The installable skill directory (`skills/tmux-agent-tools/`) bundles more than the scripts: `agents/` holds the `tmux-delegate` gate plus `claude-oneshot`/`codex-oneshot` forwarders (copy `agents/*.md` into `~/.claude/agents/` to install them), and `schemas/` holds the `result.json`/fanout-summary JSON Schemas the scripts fall back to offline. `references/troubleshooting.md` and `references/recipes.md` are packaged copies of this wiki's [Troubleshooting](Troubleshooting) and [Recipes](Recipes) pages for offline/skill-context use.
+
 ## What to read next
 
 - [Recipes](Recipes) — concrete copy-pasteable workflows

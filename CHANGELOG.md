@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Skill payload now ships the delegation policy layer, not just the scripts: `agents/` (tmux-delegate gate + claude/codex one-shot forwarders, installable by copying into `~/.claude/agents/`), `schemas/` (offline `result.json`/fanout validation fallback already resolved by the scripts), `references/troubleshooting.md` and `references/recipes.md` (packaged copies of the wiki pages), and a CI-mode exit-code table in `references/contracts.md`.
+- Persistent-teammate worker-reuse policy: new `references/multi-agent.md` section documenting when to reuse one named worker across sequential same-repo tasks vs start fresh, the `result init -> send-wait -> result wait-required` reuse loop, and the stale-`result.json` false-completion trap; mirrored as SKILL.md non-negotiable rule 4 and a Decision Rules line in all four tmux-delegate copies.
+
+### Changed
+- `install-bin` links every executable wrapper in `scripts/` via a loop instead of a hand-maintained list, fixing 8 missing symlinks (fanout, dag, cron, monitor, notify, replay, history, dashboard).
+- Dev-only eval fixtures moved out of the installable skill payload to `skills/tmux-agent-tools-workspace/evals-archive/`.
+- `test-agent-delegate-packaging-smoke` extended: skill-packaged agent/schema/doc copies drift-checked against repo canonicals, CI exit-code table coverage guarded, and evals excluded from the payload (46 checks).
+
 ## v0.29.0 - 2026-07-02
 
 ### Added

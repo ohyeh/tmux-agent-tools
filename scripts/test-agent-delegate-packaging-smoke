@@ -21,6 +21,14 @@ for agent in "${AGENTS[@]}"; do
   PLUGIN_AGENT="$REPO_ROOT/agents/$agent.md"
   PROJECT_AGENT="$REPO_ROOT/.claude/agents/$agent.md"
   CODEX_AGENT="$REPO_ROOT/.codex/agents/$agent.toml"
+  SKILL_AGENT="$REPO_ROOT/skills/tmux-agent-tools/agents/$agent.md"
+
+  # The skill package must carry the delegation policy, not just the scripts.
+  if cmp -s "$PLUGIN_AGENT" "$SKILL_AGENT"; then
+    ok "$agent skill-packaged copy is identical"
+  else
+    bad "$agent skill copy missing or drifted (re-sync skills/tmux-agent-tools/agents/$agent.md)"
+  fi
 
   [[ -f "$PLUGIN_AGENT" ]]  && ok "plugin-root agents/$agent.md exists"      || bad "plugin-root agents/$agent.md missing"
   [[ -f "$PROJECT_AGENT" ]] && ok ".claude/agents/$agent.md exists"          || bad ".claude/agents/$agent.md missing"
@@ -60,10 +68,43 @@ PY
   fi
 done
 
+# Skill-packaged doc/schema copies must not drift from their repo canonicals.
+SKILL_DIR="$REPO_ROOT/skills/tmux-agent-tools"
+typeset -A DOC_PAIRS=(
+  ["schemas/result-status-summary.schema.json"]="schemas/result-status-summary.schema.json"
+  ["schemas/fanout-summary.schema.json"]="schemas/fanout-summary.schema.json"
+  ["docs/wiki/Troubleshooting.md"]="references/troubleshooting.md"
+  ["docs/wiki/Recipes.md"]="references/recipes.md"
+)
+for src in "${(k)DOC_PAIRS[@]}"; do
+  dst="$SKILL_DIR/${DOC_PAIRS[$src]}"
+  if cmp -s "$REPO_ROOT/$src" "$dst"; then
+    ok "skill copy of $src is identical"
+  else
+    bad "skill copy of $src missing or drifted (re-sync ${DOC_PAIRS[$src]})"
+  fi
+done
+
+# Dev-only eval fixtures must not ship inside the installable skill payload.
+[[ ! -e "$SKILL_DIR/evals" ]] && ok "skill payload carries no evals/ dir" || bad "skill payload still contains evals/ (dev-only; move to workspace)"
+
 CODEX_SKILL="$REPO_ROOT/.codex/skills/tmux-agent-tools"
 [[ -L "$CODEX_SKILL" ]] && ok ".codex/skills/tmux-agent-tools is a symlink" || bad ".codex/skills/tmux-agent-tools symlink missing"
 [[ "$(readlink "$CODEX_SKILL" 2>/dev/null)" == "../../skills/tmux-agent-tools" ]] \
   && ok ".codex/skills/tmux-agent-tools points at canonical skill" || bad ".codex/skills/tmux-agent-tools points at wrong target"
+
+# CI-mode exit code tables in the source contract and the skill-packaged
+# reference must carry the same set of codes (issue: contracts.md silently
+# dropped reserved codes 4/5 that docs/ci-mode-exit-codes.md documents).
+DOC_CODES=("${(@f)$(grep -E '^\| [0-9]+ \|' "$REPO_ROOT/docs/ci-mode-exit-codes.md" | awk -F'|' '{gsub(/ /,"",$2); print $2}')}")
+CONTRACTS_CODES="$(grep -E '^\| [0-9]+ \|' "$SKILL_DIR/references/contracts.md" | awk -F'|' '{gsub(/ /,"",$2); print $2}')"
+for code in "${DOC_CODES[@]}"; do
+  if grep -qx "$code" <<< "$CONTRACTS_CODES"; then
+    ok "contracts.md carries CI exit code $code"
+  else
+    bad "contracts.md missing CI exit code $code (present in docs/ci-mode-exit-codes.md)"
+  fi
+done
 
 echo "agent-delegate-packaging smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
