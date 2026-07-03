@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.30.0 - 2026-07-04
 
 ### Added
 - Skill payload now ships the delegation policy layer, not just the scripts: `agents/` (tmux-delegate gate + claude/codex one-shot forwarders, installable by copying into `~/.claude/agents/`), `schemas/` (offline `result.json`/fanout validation fallback already resolved by the scripts), `references/troubleshooting.md` and `references/recipes.md` (packaged copies of the wiki pages), and a CI-mode exit-code table in `references/contracts.md`.
