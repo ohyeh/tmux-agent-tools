@@ -46,7 +46,7 @@ export const meta = {
 const PROJECT_JOB = '.claude/workflows/feature-lifecycle-auto.job.json'
 const GLOBAL_JOB = '$HOME/.claude/workflows/.feature-lifecycle-auto.job.json'
 const BUILTIN = {}
-let a = { ...(args || {}) }
+let a = { ...(typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})) }
 if (!a.repoPath || !a.brief) {
   const job = await agent(
     `Read a job JSON object. PREFER ${PROJECT_JOB} (relative to your current working directory). ` +

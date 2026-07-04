@@ -19,7 +19,7 @@ export const meta = {
     { title: 'Synthesize', detail: 'rank + report', model: 'sonnet' },
   ],
 }
-const a = args || {}
+const a = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})
 for (const k of ['repoPath', 'symptom']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 const repo = a.repoPath
 // Clamp to >=1: a 0/negative count would make parallel([]) report 0 refutes OR silently drop

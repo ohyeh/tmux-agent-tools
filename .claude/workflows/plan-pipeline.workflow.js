@@ -42,7 +42,7 @@ export const meta = {
 // (documented gotcha — see .claude handoffs). Keep this {} in the committed/generic copy; to run a
 // specific job either fix the arg channel or TEMPORARILY fill BUILTIN, run, then revert to {}.
 const BUILTIN = {}
-const a = { ...BUILTIN, ...(args || {}) }
+const a = { ...BUILTIN, ...(typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})) }
 const repo = a.repoPath || '.'
 const slug = a.slug || 'next'
 const brief = a.brief || ''

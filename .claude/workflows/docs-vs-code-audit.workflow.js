@@ -29,7 +29,7 @@ export const meta = {
   ],
 }
 
-const a = args || {}
+const a = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})
 for (const k of ['repoPath', 'groups']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 if (!Array.isArray(a.groups) || !a.groups.length) return { aborted: true, reason: 'args.groups must be a non-empty array of {key, scope}' }
 

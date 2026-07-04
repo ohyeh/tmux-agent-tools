@@ -36,7 +36,7 @@ export const meta = {
   ],
 }
 
-const a = args || {}
+const a = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})
 for (const k of ['repoPath', 'spec']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 
 const repo = a.repoPath

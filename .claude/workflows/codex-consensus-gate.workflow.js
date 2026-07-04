@@ -16,7 +16,7 @@ export const meta = {
   description: 'Get high-effort codex consensus on a proposal; returns the captured verdict',
   phases: [{ title: 'Consult', detail: 'drive codex via agent-tmux, capture verdict', model: 'sonnet' }],
 }
-const a = args || {}
+const a = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})
 if (!a.proposalFile && !a.proposalText) return { aborted: true, reason: 'need proposalFile or proposalText' }
 const repo = a.repoPath || '.'
 const session = a.sessionName || 'consensus'

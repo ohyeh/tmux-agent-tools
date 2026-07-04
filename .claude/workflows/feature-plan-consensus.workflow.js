@@ -56,7 +56,7 @@ export const meta = {
 
 // NESTING: this is a mid-level stage — do NOT call workflow() here (1-level nesting cap). Drive the
 // second model via inline agent() + agent-tmux, never via workflow() or a harness agent type.
-const a = args || {}
+const a = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})
 for (const k of ['repoPath', 'featureBrief']) if (!a[k]) return { aborted: true, reason: `missing arg: ${k}` }
 
 const repo = a.repoPath

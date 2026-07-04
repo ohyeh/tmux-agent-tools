@@ -88,13 +88,31 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   pass）；證據 agent 失敗標 `unevaluated`、部分驗證標 `verify_incomplete`，都上呈不靜默。
   codex review 2 輪至 AGREE。**args 範例見檔頭。**
 
+- **`design-consensus.workflow.js`** — 設計共識 judge panel（域無關）：N 個獨立設計者
+  各從一個指定 angle 提案 → 互相 adversarial cross-attack（找真實使用情境下的失效點，
+  並點名值得留下的部分）→ judge 合成一份「會真的出貨」的共識 spec（明列被否決者與原因）。
+  領域細節全放 `args.context`（必填：背景＋任務＋硬限制）；`angles`／`outputLanguage`／
+  `synthesisSpec` 可覆寫。proposer 掛掉降級續跑（<2 存活即 abort）、attacker 掛掉該提案
+  標記「未受審」讓 judge 提高懷疑權重、synthesis 掛掉 abort 不以半成品充數。
+  收成自 aurora-reader-homepage-consensus 一次性 run。**args 範例見檔頭。**
+
+- **`project-direction-review.workflow.js`** — 專案方向盤點（域無關）：Understand（5 個
+  並行 readers 掃 plans／pending decisions／runtime health／constraints-lessons／
+  consumer-gaps，預設用探索式 prompt、可用 `args.readers` 換成專案特化版）→ Design
+  （每個 lens 一份方向提案，預設 quality-first／consumer-first／automation-first）→
+  Synthesize（合成單一 prioritized roadmap：P0/P1/P2、gate 標註、風險與里程碑）。
+  reader 掛掉標記「證據 PARTIAL」注入下游 prompt（不當作沒事）、全掛才 abort。
+  與 `plan-pipeline`（凍結計畫）互補：這支產「往哪走」，那支產「怎麼做」。
+  收成自 aurora-future-direction-plan 一次性 run。**args 範例見檔頭。**
+
 ## 共用 helper：`_lib/safe.js`
 
 silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）的**正本**在 `_lib/safe.js`。
 因 workflow script 為 self-contained（runtime 不支援 import），各 recipe 以 `// ── SAFE_LIB ──`
 標記**逐字內嵌**同一份；正本改動後用 `grep -rl SAFE_LIB .claude/workflows` 找出所有副本同步。
 目前內嵌者：`root-cause-deep-dive-audit`（failClosedRefutes）、`docs-vs-code-audit`
-（coalesceNull＋nullIndices）。詳見
+（coalesceNull＋nullIndices）、`design-consensus`／`project-direction-review`
+（nullIndices）。詳見
 `.claude/memory/lessons.md` L1。
 
 ## 正本與同步
