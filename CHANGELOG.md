@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.31.0 - 2026-07-04
+
+### Added
+- `.claude/workflows/` — 13 saved dynamic-workflow recipes shipped as a team snapshot, `/name`-callable by anyone who clones the repo: drift audits (`docs-vs-code-audit`, `design-vs-code-audit`, `root-cause-deep-dive-audit`), adversarial consensus (`consensus-gate`, `design-consensus`, `feature-plan-consensus`), plan/build pipelines (`plan-pipeline`, `feature-lifecycle-auto`, `spec-implement-dual-review-verify`), `project-direction-review`, the `findings-triage` loop connector (clusters confirmed findings by root cause into mini-PRD briefs / a partitioned-fix list / human intent questions — fail-closed, no finding is ever dropped), and the self-regenerating `workflow-manifest` fleet snapshot; plus shared `_lib/` (fail-closed helpers, findings schema, worker doctrine). Second-model review is neutral throughout: `args.cli` accepts any agent-tmux profile — nothing is hardcoded to codex.
+- `skills/using-workflows/` — meta-router skill: routes a described situation to the right recipe via a decision tree with live recipe discovery (never a memorized list), auto-fills args (`cli`/`context`/paths), and chains the closed loop (audit → findings-triage → briefs/direct fixes → re-run the same audit until zero confirmed findings). Optionally co-fires with the `codex-dynamic-workflows` skill (if installed) for `.workflow/<slug>/` run records. Bundles the full recipe set under `workflows/` with `scripts/install.sh` for one-command deployment to `~/.claude/workflows/` or a repo's `.claude/workflows/` (refuses to overwrite files whose content differs unless `--force`).
+- `docs/workflow-usage-guide.md` — day-to-day tutorial: 30-second mental model (scheduler / control-flow / executor layers), scenario-to-recipe cheat sheet, zero-install onboarding for new repos, and the feedback loop (wording edits go direct; behavior edits pass `consensus-gate` first).
+
+### Changed
+- `codex-consensus-gate` renamed to `consensus-gate` (reviewer = any `args.cli` profile; behavior byte-identical). The old name remains as a deprecated top-level-only forwarding shim. `plan-pipeline` / `feature-plan-consensus` / `spec-implement-dual-review-verify` wording neutralized from codex-specific to second-model-via-`args.cli`.
+
 ## v0.30.0 - 2026-07-04
 
 ### Added
