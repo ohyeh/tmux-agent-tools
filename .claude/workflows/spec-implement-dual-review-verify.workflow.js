@@ -41,11 +41,11 @@
 
 export const meta = {
   name: 'spec-implement-dual-review-verify',
-  description: 'Implement a spec, dual-review (codex + claude), apply in-spec fixes, verify (param via args)',
+  description: 'Implement a spec, dual-review (second model via args.cli + claude), apply in-spec fixes, verify (param via args)',
   whenToUse: 'When a written spec must become code with independent dual review and command-verified evidence — the main build pipeline. When a consensus-frozen plan.md already exists, pass a plan POINTER as the spec (see the frozen-plan preset in the header).',
   phases: [
     { title: 'Implement', detail: 'write/edit the target per spec', model: 'sonnet' },
-    { title: 'Review', detail: 'codex teammate + claude reviewer in parallel' },
+    { title: 'Review', detail: 'second-model teammate (args.cli) + claude reviewer in parallel' },
     { title: 'Finalize', detail: 'apply real in-spec fixes then run verify commands' },
   ],
 }
@@ -61,7 +61,7 @@ const isolation = a.isolation === 'worktree' ? 'worktree' : undefined  // spec: 
 const agentType = a.agentType || undefined  // off = default workflow agent (portable; missing custom agentType = HARD error #20931)
 // Second-model reviewer driven via tmux-agent-tools (agent-tmux <cli>), NOT a harness agentType:
 // the openai-codex plugin (codex:codex-rescue) is deprecated/disabled. agent-tmux works regardless
-// of plugin enablement and across repos. Mirrors plan-pipeline / codex-consensus-gate (file-polled).
+// of plugin enablement and across repos. Mirrors plan-pipeline / consensus-gate (file-polled).
 // cli is REQUIRED and neutral — NO built-in default (codex/claude are just the common ones). Each CLI's
 // launch flags come from its own agent-tmux profile (codex→--yolo, claude→--dangerously-skip-permissions);
 // EXTRA flags pass raw via a.launchEnv. charset guard blocks shell injection (cli is interpolated into commands).

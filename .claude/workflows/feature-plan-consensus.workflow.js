@@ -42,15 +42,15 @@
 
 export const meta = {
   name: 'feature-plan-consensus',
-  description: 'Supervised orchestration: new-feature brief -> v1 plan via escalation ladder + evidence doctrine + internal/codex consensus, then gated commit',
-  whenToUse: 'When a NEW-feature brief must become a v1 implementation plan whose claims are code-verified and double-gated (internal adversarial critics + external codex loop), with an escalation ladder that surfaces needsUser instead of force-proceeding. Exploratory counterpart of plan-pipeline.',
+  description: 'Supervised orchestration: new-feature brief -> v1 plan via escalation ladder + evidence doctrine + internal/second-model consensus, then gated commit',
+  whenToUse: 'When a NEW-feature brief must become a v1 implementation plan whose claims are code-verified and double-gated (internal adversarial critics + an external second-model loop via args.cli), with an escalation ladder that surfaces needsUser instead of force-proceeding. Exploratory counterpart of plan-pipeline.',
   phases: [
     { title: 'Orchestrate', detail: 'Step 0: establish supervision doctrine + escalation ladder' },
     { title: 'Decompose', detail: 'split the feature into disjoint discovery areas', model: 'sonnet' },
     { title: 'Discover', detail: 'parallel read-only Explore per area (code/logs are truth)' },
     { title: 'Synthesize', detail: 'merge findings into a v1 plan draft', model: 'sonnet' },
     { title: 'InternalConsensus', detail: 'adversarial claude critics, revise until consensus', model: 'sonnet' },
-    { title: 'ExternalReview', detail: 'codex second-model adversarial review, revise until consensus' },
+    { title: 'ExternalReview', detail: 'second-model adversarial review (args.cli), revise until consensus' },
     { title: 'Commit', detail: 'write plan; commit/push only when consensus + approved' },
   ],
 }
@@ -80,10 +80,10 @@ const lenses = Array.isArray(a.internalLenses) && a.internalLenses.length
   : ['completeness (missing areas/tasks/edge cases)', 'sequencing & dependencies', 'risk & blast-radius', 'effort realism']
 const designRefs = a.designRefs ? `\nDesign refs / decisions (LEADS to verify, not truth):\n${a.designRefs}` : ''
 
-// codex second-model reviewer is driven via tmux-agent-tools (agent-tmux codex), NOT a harness
+// The second-model reviewer is driven via tmux-agent-tools (agent-tmux <cli>), NOT a harness
 // agentType. The openai-codex plugin (codex:codex-rescue) is deprecated/disabled in settings;
 // agent-tmux works regardless of plugin enablement and across repos. Mirrors plan-pipeline /
-// codex-consensus-gate: completion is detected by POLLING an OUT file, never the tmux pane.
+// consensus-gate: completion is detected by POLLING an OUT file, never the tmux pane.
 // cli is REQUIRED and neutral — NO built-in default (codex/claude are just the common ones). Each CLI's
 // launch flags come from its own agent-tmux profile (codex→--yolo, claude→--dangerously-skip-permissions);
 // EXTRA flags pass raw via a.launchEnv. charset guard blocks shell injection (cli is interpolated into commands).

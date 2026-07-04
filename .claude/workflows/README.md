@@ -73,20 +73,25 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   停下讓人先讀 plan。已在頂層用掉唯一一層 workflow() nesting，不可再被嵌套。
   檔頭記錄了 top-level args 掉失的 harness bug 與 JOB FILE 替代通道。**args 範例見檔頭。**
 
-- **`codex-consensus-gate.workflow.js`** — 最小可複用 primitive：把「丟提案 → 驅動 codex
-  拿高 effort 共識 → 回傳結構化裁決」收成單一呼叫。透過 agent-tmux 驅動 codex，回傳
+- **`consensus-gate.workflow.js`**（原名 `codex-consensus-gate`）— 最小可複用 primitive：
+  把「丟提案 → 驅動第二模型拿高 effort 共識 → 回傳結構化裁決」收成單一呼叫。reviewer
+  由 `args.cli` 指定（codex／claude／agy／任何 `~/.config/agent-tmux/profiles` 條目——
+  異質 reviewer 是設定檔的事，不是 recipe 的事），透過 agent-tmux 驅動，回傳
   `{ ok, verdict, consensus(agree/agree_with_changes/disagree/unclear), notes }` 與
   `passed` 旗標。**完成訊號用「輪詢輸出檔（含 marker）」而非比中 pane**——避免 marker
-  在送出 prompt 裡被 echo 誤判（本專案實戰踩過兩次的坑）。其他 workflow 的外部 rung
-  可改呼叫它以收斂重複寫法。**args 範例見檔頭。**
+  在送出 prompt 裡被 echo 誤判（本專案實戰踩過兩次的坑）。**args 範例見檔頭。**
+
+- **`codex-consensus-gate.workflow.js`** — Q2 preset shim（≤20 行、零 agent、純
+  `workflow()` 轉發到 `consensus-gate`）：28 次歷史 run 的肌肉記憶別名。**僅限頂層呼叫**
+  ——它花掉唯一一層 nesting，其他 workflow 一律直呼 `consensus-gate`。
 
 - **`spec-implement-dual-review-verify.workflow.js`** — 功能開發主力管線：實作 spec →
-  codex＋claude **平行雙審** → 只採真實且 in-spec 的修正 → 跑 `verifyCommands` 驗證並貼
-  輸出。三階段（Implement／Review／Finalize），實作 agent 回 null 即早退。外部審查者
-  以 `externalAgentType` 參數化（預設 `codex:codex-rescue`）。兩個 reviewer 對稱偵測：
-  各自回 null 都 log 降級、return 帶 `codex_available`／`claude_available`，兩個都掛則
-  在 Finalize 前 abort；finalize agent 回 null 也 abort（不把未驗證實作報成完成）。
-  codex 補審 2 輪至 AGREE。**args 範例見檔頭。**
+  第二模型（`args.cli`，REQUIRED）＋claude **平行雙審** → 只採真實且 in-spec 的修正 →
+  跑 `verifyCommands` 驗證並貼輸出。三階段（Implement／Review／Finalize），實作 agent
+  回 null 即早退。第二模型經 agent-tmux 驅動（輪詢輸出檔偵測完成）。兩個 reviewer
+  對稱偵測：各自回 null 都 log 降級、return 帶 `codex_available`／`claude_available`，
+  兩個都掛則在 Finalize 前 abort；finalize agent 回 null 也 abort（不把未驗證實作報成
+  完成）。第二模型補審 2 輪至 AGREE。**args 範例見檔頭。**
 
 - **`docs-vs-code-audit.workflow.js`** — 文件維運：拿 `docs/` 每份文件對**程式碼真相**
   逐條查核（唯讀稽核員回 FINDINGS_SCHEMA）→ 同 scope 修補員就地改（修前再驗一次、可
@@ -141,6 +146,16 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   payload abort。**發佈在 recipe 外**：script 無 Artifact tool，回傳 `publishHint`
   由主迴圈一行接手。收成自本 repo 的手工 manifest 產程。**args 範例見檔頭。**
 
+- **`findings-triage.workflow.js`** — 閉環接頭①：把稽核 recipe 的 confirmed findings
+  自動路由成下一輪的輸入。路由表＝`_lib/findings-schema.js` 的 action 語意：
+  `ask-user` 呈給人（機器不代決意圖）、`no-op` 記錄、`auto-fix` 依**根因分群**——
+  同根因 ≥`clusterMin`（預設 2）條合寫一份迷你 PRD（問題/為什麼現在/範圍/不碰什麼/
+  完成判準）直餵 `feature-lifecycle-auto`，單發 finding 進 directFix 清單走
+  partitioned-fix 直修。fail-closed 底線是「一條不丟」：clusterer 死 → 全部降級
+  directFix（失路由精度不失資料）；brief writer 死 → cluster 進 `unbriefedClusters`；
+  `maxBriefs` 溢出進 directFix。接頭②（re-audit 停止條件）在呼叫端：修完用**同參數**
+  重跑原稽核，confirmed 歸零＝收斂。**args 範例見檔頭。**
+
 ## 共用 helper：`_lib/safe.js`
 
 silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）的**正本**在 `_lib/safe.js`。
@@ -148,7 +163,8 @@ silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）�
 標記**逐字內嵌**同一份；正本改動後用 `grep -rl SAFE_LIB .claude/workflows` 找出所有副本同步。
 目前內嵌者：`root-cause-deep-dive-audit`（failClosedRefutes）、`docs-vs-code-audit`
 （coalesceNull＋nullIndices）、`design-consensus`／`project-direction-review`／
-`design-vs-code-audit`（nullIndices）、`workflow-manifest`（coalesceNull＋nullIndices）。詳見
+`design-vs-code-audit`（nullIndices）、`workflow-manifest`／`findings-triage`
+（coalesceNull＋nullIndices）。詳見
 `.claude/memory/lessons.md` L1。
 
 另有 **`_lib/worker-doctrine.md`**：multi-agent 實作型 workflow 的 COMMON preamble
