@@ -42,6 +42,10 @@ CLEAN 才凍結。`codex`、`claude-fable-gate-glm`、`agy`……都只是 `args
 
 ## 2. 怎麼呼叫（在任何 repo 的 Claude Code 裡）
 
+> 最懶的路：裝 [`using-workflows`](../skills/using-workflows/SKILL.md) skill
+> （meta-router，同 `/using-tmux-agent-tools` 定位）——描述情境它就自動選 recipe、
+> 填 args、串閉環；若另裝 `codex-dynamic-workflows` 會加掛 `.workflow/<slug>/` run 紀錄。
+
 ```text
 # A. 自然語言（最常用）——名字＋參數講清楚就行
 「跑 docs-vs-code-audit，repoPath 用當前 repo，cli 用 codex」
