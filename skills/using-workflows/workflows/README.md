@@ -186,10 +186,6 @@ silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）�
 它不是編輯起點:改動應發生在來源端,再由一條獨立的 SYNC 管道流入本目錄(管道規劃中;
 在它就緒前以手動複製對齊,兩份為獨立副本、不會自動同步)。因此請勿直接在此編輯作為改動源。
 
-另有一份**部署快照**在 `skills/using-workflows/workflows/`(供 skill 單獨散佈時
-一鍵安裝用,`scripts/install.sh`)。本目錄更新後記得 `cp -R .claude/workflows/.
-skills/using-workflows/workflows/` 對齊。
-
 ## 來源
 
 - Claude Code Docs — Orchestrate subagents at scale with dynamic workflows：

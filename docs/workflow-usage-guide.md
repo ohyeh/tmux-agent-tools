@@ -38,7 +38,8 @@ CLEAN 才凍結。`codex`、`claude-fable-gate-glm`、`agy`……都只是 `args
 
 三台（hub／mbp14／25006931Paul）已由本 repo 分發對齊；新機器照
 [`docs/wiki/Getting-Started.md`](wiki/Getting-Started.md) 裝 tmux-agent-tools 後，
-把本 repo `.claude/workflows/` 整包 cp 到 `~/.claude/workflows/` 即可。
+跑 `bash skills/using-workflows/scripts/install.sh` 一鍵部署（recipe 整包
+bundle 在 skill 裡；同內容檔直接裝、內容不同會拒絕並要求 `--force`）。
 
 ## 2. 怎麼呼叫（在任何 repo 的 Claude Code 裡）
 

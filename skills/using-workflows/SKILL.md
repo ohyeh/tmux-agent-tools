@@ -10,6 +10,21 @@ layer, usable from ANY repo) and/or the current repo's `.claude/workflows/`.
 You are not a recipe yourself — you pick **which** recipe the situation needs,
 fill its args, run it, and keep the closed loop moving.
 
+## Install / Deploy (first run on a new machine)
+
+This skill bundles the full recipe set under `workflows/` so it deploys
+standalone — no other checkout needed:
+
+```bash
+bash <skill-dir>/scripts/install.sh            # → ~/.claude/workflows/
+bash <skill-dir>/scripts/install.sh /path/to/repo/.claude/workflows   # repo layer, shared with the team
+```
+
+The script refuses to overwrite files whose content differs (pass `--force`
+after reviewing the diff it prints). Canonical source of truth is
+`.claude/workflows/` in the tmux-agent-tools repo; the bundle here is a
+deployment snapshot — sync it from there, never edit it in place.
+
 ## The Rule
 
 1. **Discover live, never recite from memory.** The installed recipe set changes;
@@ -28,7 +43,8 @@ fill its args, run it, and keep the closed loop moving.
 
    Project layer shadows personal layer on name collisions. Before running a
    candidate, **read its header comment** — that comment block is the args
-   contract; never guess args.
+   contract; never guess args. If nothing is installed, run the install script
+   above first.
 
 2. **Route by situation**, using the decision tree below as the prior — but the
    live `description`/`whenToUse` fields win if they disagree (recipes evolve).
@@ -41,19 +57,19 @@ fill its args, run it, and keep the closed loop moving.
 ```
 What is the user actually facing?
 │
-├─ "X 跟 code 對不上 / 漂移了"                → docs-vs-code-audit | design-vs-code-audit
-├─ 詭異 bug、要挖根因                          → root-cause-deep-dive-audit
-├─ audit 剛回一堆 confirmed findings          → findings-triage      (接頭① — offer this AUTOMATICALLY)
-├─ 有 brief（迷你 PRD），想全自動做到好         → feature-lifecycle-auto
-├─ 只要凍結規劃文件，刻意不建置                 → plan-pipeline
-├─ 需求 → 實作計畫（監督式雙關共識）            → feature-plan-consensus
-├─ 一個設計方案要對抗共識                       → design-consensus
-├─ 任意產物要過「第二模型同意」這一關            → consensus-gate       (codex-consensus-gate = 舊名 shim，僅限頂層)
-├─ 照 spec 建置＋雙模型 review＋驗證            → spec-implement-dual-review-verify
-├─ 「這專案下一步做什麼」                       → project-direction-review
-├─ 盤點/快照整個 recipe 艦隊、查三台漂移         → workflow-manifest
+├─ "docs/design and code disagree / drifted"   → docs-vs-code-audit | design-vs-code-audit
+├─ weird bug, needs root-cause digging          → root-cause-deep-dive-audit
+├─ an audit just returned confirmed findings    → findings-triage      (connector ① — offer this AUTOMATICALLY)
+├─ has a brief (mini-PRD), wants it fully built → feature-lifecycle-auto
+├─ freeze planning docs only, deliberately no build → plan-pipeline
+├─ requirement → implementation plan (supervised, dual consensus) → feature-plan-consensus
+├─ one design proposal needs adversarial consensus → design-consensus
+├─ ANY artifact needs a "second model agrees" gate → consensus-gate    (codex-consensus-gate = legacy shim, top-level only)
+├─ build from spec + dual-model review + verify → spec-implement-dual-review-verify
+├─ "what should this project do next"           → project-direction-review
+├─ inventory/snapshot the recipe fleet, check machine drift → workflow-manifest
 │
-└─ 只是「一個有邊界的任務丟後台」——不是多階段控制流
+└─ just ONE bounded task to run in the background — no multi-stage control flow
     → NOT a workflow. Defer to the using-tmux-agent-tools skill
       (tmux-delegate gate → claude-oneshot / codex-oneshot).
 ```
@@ -69,7 +85,7 @@ Fill these WITHOUT asking when derivable; ask only what's genuinely the user's c
 - `context`: compose yourself — one line with the repo abs path + stack +
   anything the user just said about scope. Quality of findings tracks this line.
 - `repoPath` / paths: current repo unless told otherwise.
-- `outputLanguage`: leave default (Traditional Chinese) unless asked.
+- `outputLanguage`: leave the recipe's default unless asked.
 - Prefer **name invocation** over `scriptPath`: some environments drop `args`
   on scriptPath runs (symptom: `aborted: missing arg`). If stuck with
   scriptPath, temporarily fill the recipe's `BUILTIN = {}` and revert after.
@@ -82,7 +98,7 @@ audit → confirmed findings?
   │        ├─ askUser[]   → surface to the human verbatim; NEVER auto-decide intent
   │        ├─ briefs[]    → one feature-lifecycle-auto call per brief (plan gate pauses for the human ✋)
   │        └─ directFix[] → one partitioned fix run (disjoint files, SKIP+report on missing assets)
-  └─ after fixes/build → re-run the ORIGINATING audit with the SAME args (接頭②)
+  └─ after fixes/build → re-run the ORIGINATING audit with the SAME args (connector ②)
          confirmed == 0  → loop converged; report and stop
          confirmed  > 0  → back to findings-triage
 ```
@@ -118,12 +134,12 @@ conventions in the TARGET repo simultaneously:
   `.claude/workflows/` = the recipes themselves (discovered, `/name`-callable).
 - Multi-recipe chains (audit → triage → lifecycle → re-audit) = one slug, one
   `.workflow/<slug>/` dir; each recipe's return value lands in `results/`,
-  loop convergence (接頭② confirmed==0) goes in `final-report.md`.
+  loop convergence (connector ② confirmed==0) goes in `final-report.md`.
 
 ## Canonical references (never paraphrase these from memory)
 
-- Per-recipe reference + args details: `.claude/workflows/README.md`
-  (tmux-agent-tools repo).
+- Per-recipe reference + args details: `workflows/README.md` in this bundle
+  (canonical: `.claude/workflows/README.md` in the tmux-agent-tools repo).
 - Tutorial (scenarios, onboarding a new repo, feedback loop):
   `docs/workflow-usage-guide.md` (same repo).
 - Worker mechanics (agent-tmux/profiles/send-wait): the `tmux-agent-tools`
