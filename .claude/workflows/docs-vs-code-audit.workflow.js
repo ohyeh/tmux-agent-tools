@@ -22,6 +22,7 @@
 export const meta = {
   name: 'docs-vs-code-audit',
   description: 'Audit docs/ against code reality, fix in place, cross-check consistency (param via args)',
+  whenToUse: 'When docs/ may have drifted from the code: per-group read-only audit against code truth, in-place fixes, then a cross-doc consistency/banned-residue sweep. Truth = code, never old docs. Sister of design-vs-code-audit (there the design is the target; here the code is).',
   phases: [
     { title: 'Audit', detail: 'one read-only auditor per docs group', model: 'sonnet' },
     { title: 'Fix', detail: 'same-scope fixers apply audited corrections', model: 'sonnet' },

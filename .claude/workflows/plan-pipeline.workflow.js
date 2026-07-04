@@ -27,6 +27,7 @@
 export const meta = {
   name: 'plan-pipeline',
   description: 'Planning-only pipeline: direction → frozen plan → ADRs (codex-frozen) → commit/push docs. No build.',
+  whenToUse: 'When you need FROZEN planning artifacts (goal_doc → plan-<slug>.md → ADRs), each codex-reviewed to CLEAN, committed but deliberately NOT built. Complements project-direction-review (that answers "where next"; this freezes "how"). Build afterwards via spec-implement-dual-review-verify.',
   phases: [
     { title: 'Direction', detail: '① draft/refine goal_doc; codex review → ACCEPT', model: 'sonnet' },
     { title: 'Plan', detail: '② draft plan-<slug>.md; codex multi-round review → FROZEN', model: 'sonnet' },

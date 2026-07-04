@@ -12,6 +12,7 @@
 export const meta = {
   name: 'root-cause-deep-dive-audit',
   description: 'Evidence-driven multi-agent root-cause audit; returns ranked causes + report',
+  whenToUse: 'When a bug symptom needs a verified root cause rather than a symptom patch: MECE hypothesis fan-out → evidence per hypothesis (file:line) → fail-closed adversarial verification votes → ranked causal chain with minimal fixes. Tune args.hypotheses/verifyVotes to the stakes.',
   phases: [
     { title: 'Hypotheses', detail: 'enumerate candidate root causes', model: 'sonnet' },
     { title: 'Evidence', detail: 'gather evidence per hypothesis', model: 'sonnet' },

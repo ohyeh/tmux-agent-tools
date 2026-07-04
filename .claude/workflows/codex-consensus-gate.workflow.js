@@ -26,6 +26,7 @@
 export const meta = {
   name: 'codex-consensus-gate',
   description: 'Get high-effort codex consensus on a proposal; returns the captured verdict',
+  whenToUse: 'When a decision, diff, or proposal needs an independent second-model verdict before acting — the reusable gate primitive other recipes call. args.cli is REQUIRED (codex/claude/any agent-tmux profile). For push gates, see the multi-round preset in the header.',
   phases: [{ title: 'Consult', detail: 'drive codex via agent-tmux, capture verdict', model: 'sonnet' }],
 }
 const a = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args || {})

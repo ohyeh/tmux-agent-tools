@@ -42,6 +42,7 @@
 export const meta = {
   name: 'spec-implement-dual-review-verify',
   description: 'Implement a spec, dual-review (codex + claude), apply in-spec fixes, verify (param via args)',
+  whenToUse: 'When a written spec must become code with independent dual review and command-verified evidence — the main build pipeline. When a consensus-frozen plan.md already exists, pass a plan POINTER as the spec (see the frozen-plan preset in the header).',
   phases: [
     { title: 'Implement', detail: 'write/edit the target per spec', model: 'sonnet' },
     { title: 'Review', detail: 'codex teammate + claude reviewer in parallel' },

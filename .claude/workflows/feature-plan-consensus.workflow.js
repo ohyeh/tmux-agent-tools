@@ -43,6 +43,7 @@
 export const meta = {
   name: 'feature-plan-consensus',
   description: 'Supervised orchestration: new-feature brief -> v1 plan via escalation ladder + evidence doctrine + internal/codex consensus, then gated commit',
+  whenToUse: 'When a NEW-feature brief must become a v1 implementation plan whose claims are code-verified and double-gated (internal adversarial critics + external codex loop), with an escalation ladder that surfaces needsUser instead of force-proceeding. Exploratory counterpart of plan-pipeline.',
   phases: [
     { title: 'Orchestrate', detail: 'Step 0: establish supervision doctrine + escalation ladder' },
     { title: 'Decompose', detail: 'split the feature into disjoint discovery areas', model: 'sonnet' },

@@ -46,7 +46,9 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   迴圈後再經 codex 外部對抗 review，兩關都共識且經授權才寫出 plan 並 commit。
   設計已經 codex 多輪對抗 review 至 AGREE。
 
-- **`pr-review-triage-resolve.workflow.js`** — 一次性 PR review 處理流程：⓪ 大腦先獨立
+- **`pr-review-triage-resolve`**（⚠️ 設計存檔——**檔案尚未落地**：git 史、個人層、三台
+  harvest 皆查無此檔；本條目是完成度高的設計 spec，落地前不可 `/name` 叫用）
+  — 一次性 PR review 處理流程：⓪ 大腦先獨立
   讀 diff＋ledger 建 code 真相 → ① 用 `scripts/pr/trigger-codex-review.sh` 召 review
   bot 並 detached-poll 等回（minGrace 先硬等、以 baseline thread-id 快照判新留言）→
   ② 只收 bot 的、未 resolved 的新 thread（人類留言一律不碰）→ ③ TRIAGE 每條對撞
@@ -57,6 +59,19 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   過濾＋ledger 稽核。設計已經 codex 對抗 review（含實打 PR API 驗證）收斂。
   搭配腳本：**`scripts/pr/trigger-codex-review.sh`**（帳號守門＋嚴格 review rubric，
   可被 workflow 呼叫，也能 CLI 單獨手跑）。**本 repo 可直接跑的 args 範例見檔頭。**
+
+- **`plan-pipeline.workflow.js`** — 規劃專用管線（刻意**不含 build**）：① direction
+  （goal_doc）→ ② frozen plan（plan-<slug>.md）→ ③ ADRs——每份 artifact 由 codex 起草、
+  經 codex 對抗 review 至 CLEAN（0 Critical/0 Major）才凍結 → commit/push 文件。
+  全參數化（slug/brief/輸出路徑/review 輪數），完成訊號一律輪詢輸出檔。與
+  `project-direction-review` 互補（那支回答「往哪走」、這支凍結「怎麼做」）；
+  後續 build 交給 `spec-implement-dual-review-verify`。**args 範例見檔頭。**
+
+- **`feature-lifecycle-auto.workflow.js`** — 頂層薄殼（零業務邏輯）：PLAN（explore＝
+  feature-plan-consensus｜frozen＝plan-pipeline）→ gate（plan 沒過共識/凍結就停）→
+  BUILD（可選，spec-implement-dual-review-verify）。`autoBuild` 預設 false——閘門處
+  停下讓人先讀 plan。已在頂層用掉唯一一層 workflow() nesting，不可再被嵌套。
+  檔頭記錄了 top-level args 掉失的 harness bug 與 JOB FILE 替代通道。**args 範例見檔頭。**
 
 - **`codex-consensus-gate.workflow.js`** — 最小可複用 primitive：把「丟提案 → 驅動 codex
   拿高 effort 共識 → 回傳結構化裁決」收成單一呼叫。透過 agent-tmux 驅動 codex，回傳
@@ -131,6 +146,11 @@ silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）�
 正本（anchoring／hard tool mapping／語言 traps／scope fence／report contract 含
 `DECISIONS-NOT-IN-SPEC` schema／verify 收尾）。prompt 片段用複製的，不是 import；
 收成自 room-* 家族實戰 run。
+
+與 **`_lib/findings-schema.js`**：**新**稽核/review recipe 的 finding/verdict 標準形
+（severity: error/warning/info ＋ action: no-op/auto-fix/ask-user ＋ risk_level，
+形狀借鑑 no-mistakes review step；ask-user 保留給「挑戰作者意圖」的 finding）。
+既有 recipe 維持已過 review 的 schema，不追溯改——要 retrofit 得先過 review gate。
 
 ## 正本與同步
 

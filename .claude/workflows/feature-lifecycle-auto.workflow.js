@@ -24,6 +24,7 @@
 export const meta = {
   name: 'feature-lifecycle-auto',
   description: 'Thin all-in-one shell: chains a plan-maker → (gate) → spec-implement build by calling existing workflows',
+  whenToUse: 'When you want brief → plan → gate → (optional) build end-to-end in ONE call: mode explore=feature-plan-consensus, frozen=plan-pipeline, build=spec-implement-dual-review-verify. autoBuild defaults false so the human reads the plan at the gate. Top-level shell — do not nest it.',
   phases: [
     { title: 'Plan', detail: 'run plan-maker (explore=feature-plan-consensus | frozen=plan-pipeline)' },
     { title: 'Gate', detail: 'stop unless the plan stage cleared consensus/freeze' },
