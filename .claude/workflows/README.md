@@ -105,15 +105,32 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   與 `plan-pipeline`（凍結計畫）互補：這支產「往哪走」，那支產「怎麼做」。
   收成自 aurora-future-direction-plan 一次性 run。**args 範例見檔頭。**
 
+- **`design-vs-code-audit.workflow.js`** — 設計稿 vs 程式碼 drift 稽核（域無關）：
+  `docs-vs-code-audit` 的姊妹篇——那支的真相是 code、對象是舊文件；這支的目標是設計稿
+  （Figma／mockup／凍結 spec）、對象是現行 code。按 `sections` 分區，每區一個 finder
+  （七類 drift taxonomy：MISSING/HALF_DONE/STATE_MACHINE/OVERLAP/ORDER/TEXT/STYLE）→
+  每條 finding 逐一 adversarial verify（isReal／isDesignWip／severity／fixHint）。
+  **design-WIP 三態**（`wip: false/'partial'/true`）：設計稿本身未完成時，缺元件不算
+  code bug——這是文件稽核沒有的維度。fail-closed：finder 掛掉該區標 UNAUDITED（不是
+  clean）、verifier 掛掉該條進 `unverified` bucket 上呈（不靜默丟棄）。audit-only
+  （scout）；後續修復走檔頭註記的 partitioned-fix 模式（所有權互斥、SKIP+report、
+  缺 asset/欄位不發明）或餵 `spec-implement-dual-review-verify`。
+  收成自 25006931Paul 機的 health-coin figma 五支家族。**args 範例見檔頭。**
+
 ## 共用 helper：`_lib/safe.js`
 
 silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）的**正本**在 `_lib/safe.js`。
 因 workflow script 為 self-contained（runtime 不支援 import），各 recipe 以 `// ── SAFE_LIB ──`
 標記**逐字內嵌**同一份；正本改動後用 `grep -rl SAFE_LIB .claude/workflows` 找出所有副本同步。
 目前內嵌者：`root-cause-deep-dive-audit`（failClosedRefutes）、`docs-vs-code-audit`
-（coalesceNull＋nullIndices）、`design-consensus`／`project-direction-review`
-（nullIndices）。詳見
+（coalesceNull＋nullIndices）、`design-consensus`／`project-direction-review`／
+`design-vs-code-audit`（nullIndices）。詳見
 `.claude/memory/lessons.md` L1。
+
+另有 **`_lib/worker-doctrine.md`**：multi-agent 實作型 workflow 的 COMMON preamble
+正本（anchoring／hard tool mapping／語言 traps／scope fence／report contract 含
+`DECISIONS-NOT-IN-SPEC` schema／verify 收尾）。prompt 片段用複製的，不是 import；
+收成自 room-* 家族實戰 run。
 
 ## 正本與同步
 

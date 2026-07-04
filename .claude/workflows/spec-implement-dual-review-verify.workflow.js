@@ -19,6 +19,19 @@
 //     effort: "high", timeoutSec: 600,             // optional, codex reasoning effort + OUT-file poll timeout
 //     sessionName: "spec-c1",                       // optional, agent-tmux codex session label
 //   }})
+//
+// PRESET — build from a frozen consensus plan (proven: build-smcs1498-from-frozen-plan).
+// When a plan.md already passed consensus (e.g. via plan-pipeline / feature-plan-consensus),
+// the spec arg is a PLAN POINTER, not a rewrite:
+//   spec: `Implement the frozen plan at ${planPath}. Read it FULLY first; it is the
+//          authoritative, consensus-passed spec. Follow its exact file targets, behavior,
+//          and verification steps. Key invariants: <top 3-6 restated inline as a drift
+//          guard>. Truth = source code and real command output, not memory. Do not modify
+//          unrelated files.`
+//   verifyCommands: exactly the plan's own verification steps (e.g. analyzer + targeted tests).
+// Restating the key invariants inline matters: it protects against the implementer skimming
+// the plan file, at ~10 lines' cost. Wrapper shape: an 18-line thin workflow that just calls
+// this recipe — no need to save those shells; write them ad hoc.
 // Second-model reviewer is codex driven via tmux-agent-tools (agent-tmux codex). If codex/agent-tmux
 // are unavailable the driver agent() returns null and dual review degrades to single (codex_available:false).
 //

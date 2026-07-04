@@ -11,6 +11,18 @@
 //     marker: "=== CODEX VERDICT END ===",
 //     timeoutSec: 600
 //   }})
+//
+// PRESET — multi-round push gate (proven: issue-293 final-gate ×3 rounds to AGREE).
+// One fresh gate per fix round; the proposalText pattern that made it work:
+//   - name the commit range and PRIOR ROUNDS' findings+fixes up front, then order the reviewer
+//     to re-derive everything itself: "run `git log --oneline <base>..HEAD` and `git show <sha>`
+//     yourself for every commit — do not trust this description; read the issue text yourself".
+//   - require LIVE reproduction of each fix (real construction path / real command output),
+//     "not just that a unit test asserts a string constant".
+//   - demand a genuinely fresh cumulative pass "as if you have not seen the prior reviews'
+//     conclusions", and close with the stake: "only agree if you would be comfortable with
+//     this being pushed with no further changes".
+//   - unique sessionName per round (gate1/gate2/gate3); loop rounds until consensus=agree.
 export const meta = {
   name: 'codex-consensus-gate',
   description: 'Get high-effort codex consensus on a proposal; returns the captured verdict',
