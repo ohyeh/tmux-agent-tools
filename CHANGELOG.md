@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.31.1 - 2026-07-04
+
+### Fixed
+- Bumped the three plugin manifests to match the release train so `scripts/test-version-sync-smoke` stays green after the `v0.31.0` workflow bundle release.
+- Updated README and wiki first-run docs to prefer the skill-first `send-wait` / wrapper-provided result-path flow instead of steering users toward bare `send` or `$TMUX_AGENT_RESULT` as the primary structured-result path.
+
 ## v0.31.0 - 2026-07-04
 
 ### Added

@@ -60,6 +60,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `start-ssh`
 - `attach`
 - `send`
+- `send-wait`
 - `send-wait-literal`
 - `wait`
 - `wait-text`
@@ -176,7 +177,7 @@ brew style ohyeh/tmux-agent-tools/tmux-agent-tools
 
 ```bash
 codex-tmux start --exact worker ~/github/project 'Read the repo and report status.'
-codex-tmux send worker 'Run the targeted tests.'
+codex-tmux send-wait worker 'Run the targeted tests.' 180
 codex-tmux send --from-file /tmp/large-prompt.md --enter-count 3 worker
 codex-tmux send-wait-literal worker 'Reply with the marker described in this prompt.' '[CODEX-01]' 180
 codex-tmux wait worker 180
@@ -187,6 +188,8 @@ codex-tmux capture worker 120
 codex-tmux status --json worker
 codex-tmux stop worker
 ```
+
+Default to `send-wait` for follow-up work: it sends the prompt, injects a fresh nonce, and waits for that nonce so stale pane text cannot satisfy the new turn. Bare `send` is a paste-and-submit helper for cases where you will verify submission another way.
 
 Use regex `wait-text` for alternatives such as `Done|Need approval`. Use `wait-text --literal` or `wait-literal` for exact markers that contain regex metacharacters such as `[CODEX-01]`. Use `send-wait-literal` when a prompt should only count a marker that appears after the send operation; the dialogue runner uses this to avoid stale marker matches.
 
@@ -346,7 +349,9 @@ audit event respectively. See `docs/design-issue-185-approval-gate.md`.
 
 ### Result-file convention (`result` subcommand)
 
-`start` and `resume` export two env vars into the pane shell so the agent CLI can write its structured result without inventing a path:
+Each worker has a structured result file at `$TMUX_AGENT_DIR/<short-name>/result.json`. For Codex and generic profiles, the wrapper prepends the literal result path to the first prompt-bearing `start` or `send`, because tool commands launched by the agent CLI may not inherit pane shell environment variables.
+
+The pane shell still receives these low-level env vars:
 
 ```
 TMUX_AGENT_NAME=<short-name>
@@ -355,22 +360,12 @@ TMUX_AGENT_RESULT=$TMUX_AGENT_DIR/<short-name>/result.json
 
 `TMUX_AGENT_DIR` defaults to `$XDG_STATE_HOME/tmux-agent-tools` (or `~/.local/state/tmux-agent-tools` when XDG is unset). The wrapper creates the per-agent subdirectory at start and clears any stale `result.json` to prevent false positives.
 
-Recommended prompt snippet (also tracked in SKILL.md):
+Recommended prompt wording:
 
-> When this skill exits, the agent MUST write its final structured
-> result via **atomic rename** so a `result --wait` reader never sees a
-> partial file:
->
-> ```sh
-> cat > "$TMUX_AGENT_RESULT.tmp" <<'JSON'
-> {"status": "ok", "summary": "...", "errors": [], "artifacts": []}
-> JSON
-> mv -f "$TMUX_AGENT_RESULT.tmp" "$TMUX_AGENT_RESULT"
-> ```
->
-> Do NOT write directly to `$TMUX_AGENT_RESULT`. The wrapper's
-> `result --wait` polls at 1Hz and could otherwise observe partial
-> content during the agent's final write.
+> Write final JSON to the wrapper-provided result path. The JSON must include
+> `schema_version`, `status`, `summary`, `artifacts`, and `errors`. Use an
+> atomic rename if you write from shell so a `result --wait` reader never sees
+> partial content.
 
 Read the result with the new `result` subcommand:
 
