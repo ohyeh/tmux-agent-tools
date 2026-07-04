@@ -34,10 +34,10 @@ If `doctor` flags anything, fix it before continuing — every later step assume
 ## Hello, agent
 
 ```bash
-codex-tmux start --exact hello ~ 'echo HELLO from your first agent and write your reply to $TMUX_AGENT_RESULT as {"status":"ok","summary":"hi"}'
+codex-tmux start --exact hello ~ 'Print HELLO from your first agent, then write final JSON to the wrapper-provided result path: {"schema_version":1,"status":"ok","summary":"hello complete","artifacts":[],"errors":[]}'
 codex-tmux wait-text hello 'HELLO' 60
 codex-tmux capture hello 30
-codex-tmux result --field '.status' --wait 10 --json hello
+codex-tmux result wait-required hello --fields status,summary --wait 60 --json
 codex-tmux stop hello
 ```
 
@@ -46,14 +46,14 @@ What just happened:
 1. `start --exact hello ~ '<prompt>'` — created tmux session `codex-cli-hello` rooted at `~`, fed Codex CLI the prompt.
 2. `wait-text` — blocked until the visible pane matched `HELLO` (60s budget).
 3. `capture` — read the last 30 lines of pane.
-4. `result --field '.status'` — read the structured result file the agent wrote. Token cost = result body, not scrollback.
+4. `result wait-required` — waited for the structured result fields the agent wrote. Token cost = result body, not scrollback.
 5. `stop` — kill the tmux session.
 
 ## What just got created on disk
 
 | Path | What |
 | --- | --- |
-| `$TMUX_AGENT_DIR/hello/` | Per-agent state (default `$HOME/.tmux-agent/<name>/`) |
+| `$TMUX_AGENT_DIR/hello/` | Per-agent state (default `$XDG_STATE_HOME/tmux-agent-tools/<name>` or `~/.local/state/tmux-agent-tools/<name>`) |
 | `$TMUX_AGENT_DIR/hello/result.json` | The structured result the agent wrote |
 | `$TMUX_AGENT_DIR/hello/transcript.jsonl` | If you passed `--transcript` |
 | tmux session `codex-cli-hello` | Killed by `stop` |
@@ -63,7 +63,7 @@ Look around the state directory to understand what the wrapper persists.
 ## Common next steps
 
 - **A longer agent run that signals completion across processes** — pass `start --sentinel /tmp/x.exit` and watch the sentinel file from another shell.
-- **A reusable structured result** — make the agent write `$TMUX_AGENT_RESULT` (a JSON file the wrapper sets) and read it via `result --json --wait 30 <name>`. See [Recipes](Recipes).
+- **A reusable structured result** — make the agent write the wrapper-provided literal result path and read it via `result --json --wait 30 <name>` or `result wait-required <name> --fields status,summary --wait 60 --json`. See [Recipes](Recipes).
 - **Inject a secret without leaking it into the command line** — `--secret KEY=op://Vault/Item/field`. See [Observability and Secrets](Observability-and-Secrets).
 - **Run two agents in parallel on the same prompt** — `tmux-agent-fanout run --agent claude:r --agent codex:r --workdir . ...`. See [Recipes](Recipes).
 
