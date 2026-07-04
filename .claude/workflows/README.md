@@ -132,6 +132,15 @@ Workflow({ scriptPath: "<abs path>/feature-plan-consensus.workflow.js", args: {.
   缺 asset/欄位不發明）或餵 `spec-implement-dual-review-verify`。
   收成自 25006931Paul 機的 health-coin figma 五支家族。**args 範例見檔頭。**
 
+- **`workflow-manifest.workflow.js`** — 艦隊 workflow 快照產生器（Phase 7「再生」）：
+  Scan（每台機器一個 agent，遠端走 ssh BatchMode：recipes＋`_lib`＋agents＋排氣 base
+  names）→ Classify（Q1–Q5 五路判定樹**內嵌於 recipe**，每次重跑同一把尺；
+  `priorJudgments` 讓已定案標籤不被翻案）→ Render（讀 `templatePath` 逐字繼承設計
+  token 系統，寫出六節 Workflow Manifest HTML 到 `outPath`）。fail-closed：掃描死
+  標 `unscanned`（不是乾淨）、判定死該台排氣渲染為 UNTAGGED（不隱藏）、渲染死帶完整
+  payload abort。**發佈在 recipe 外**：script 無 Artifact tool，回傳 `publishHint`
+  由主迴圈一行接手。收成自本 repo 的手工 manifest 產程。**args 範例見檔頭。**
+
 ## 共用 helper：`_lib/safe.js`
 
 silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）的**正本**在 `_lib/safe.js`。
@@ -139,7 +148,7 @@ silent-failure 三招（`coalesceNull`／`nullIndices`／`failClosedRefutes`）�
 標記**逐字內嵌**同一份；正本改動後用 `grep -rl SAFE_LIB .claude/workflows` 找出所有副本同步。
 目前內嵌者：`root-cause-deep-dive-audit`（failClosedRefutes）、`docs-vs-code-audit`
 （coalesceNull＋nullIndices）、`design-consensus`／`project-direction-review`／
-`design-vs-code-audit`（nullIndices）。詳見
+`design-vs-code-audit`（nullIndices）、`workflow-manifest`（coalesceNull＋nullIndices）。詳見
 `.claude/memory/lessons.md` L1。
 
 另有 **`_lib/worker-doctrine.md`**：multi-agent 實作型 workflow 的 COMMON preamble
