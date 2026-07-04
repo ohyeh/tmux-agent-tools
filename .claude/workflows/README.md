@@ -3,6 +3,9 @@
 本目錄是 **Claude Code 原生探索 saved dynamic workflows 的位置**。放在這裡的
 workflow 腳本，clone 此 repo 的人都能直接以 `/<name>` 叫用。
 
+> 新手先看：[日常使用教學](../../docs/workflow-usage-guide.md)（場景速查、
+> 新 repo 導入、反饋迴路）。本檔是每支 recipe 的參考手冊。
+
 > 需求：Claude Code **v2.1.154 以上**。dynamic workflows 在 Pro 需到 `/config` 開啟，
 > Max/Team/Enterprise 與 API 預設開啟。
 
