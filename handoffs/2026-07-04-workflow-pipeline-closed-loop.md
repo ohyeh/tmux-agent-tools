@@ -39,6 +39,20 @@
 - fastlane-uat-distribute → healthgo 專案層收成（域特定，不進公開 repo）。
 - 低優先：smoke-* 與 552 orphan state dirs 實體清理；pr-review-triage-resolve 落地另議。
 
+## 追加（v0.31.0 之後；靈感源 Anthropic《unreasonable effectiveness of HTML》＋《Know your unknowns》）
+
+- 已出貨：`using-workflows` meta-router skill（英文 SKILL.md＋recipe bundle＋
+  `scripts/install.sh` 拒改覆寫）、`docs/workflow-usage-guide.md` 教學、
+  **v0.31.0 release**（tag＋GitHub release＋Formula bump）。階梯頂層「畢業進產品面」
+  第一步已踏出。注意第三份副本：`skills/using-workflows/workflows/` 是部署快照，
+  `.claude/workflows/` 更新後要 cp 對齊（README 已記）。
+- **⑥ 人機閘門 artifact 化**（渲染器新檔＝免閘；掛進既有 recipe＝過閘）：
+  三個人肉節點升級成互動 HTML＋export 回寫——接頭① triage 板（accept/reject
+  chips 組回覆）、plan 閘 tweakable plan（按易改機率排序）、接頭②收斂後
+  merge quiz 驗收。核心 pattern＝「export 按鈕把 UI 操作轉回可餵 agent 的文字」。
+- **⑦ unknown 挖掘 recipe**（免閘新增）：blindspot pass＋interview（按 blast
+  radius 排序提問）→ 產 brief 前置，接 feature-lifecycle-auto 之前。
+
 ## 不變式提醒
 
 - `.claude/harvest/` 含工作專案 transcript，gitignore 白名單外——永不入公開 repo。
