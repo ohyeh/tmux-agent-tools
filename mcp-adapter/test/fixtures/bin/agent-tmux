@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+
+const [, , cli, command, ...args] = process.argv;
+const root = process.env.FAKE_AGENT_TMUX_ROOT || path.join(process.cwd(), "test/tmp/fake-state");
+fs.mkdirSync(root, { recursive: true });
+
+function statePath(name, file) {
+  return path.join(root, name, file);
+}
+
+function ensure(name) {
+  fs.mkdirSync(path.join(root, name), { recursive: true });
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+if (cli === "fake" && command === "doctor" && args[0] === "--json") {
+  console.log(JSON.stringify({ ok: true, checks: [] }));
+  process.exit(0);
+}
+
+if (command === "start" && args[0] === "--dry-run") {
+  console.log(JSON.stringify({ ok: true, dry_run: true, cli }));
+  process.exit(0);
+}
+
+if (command === "result" && args[0] === "--path") {
+  const name = args[1];
+  console.log(statePath(name, "result.json"));
+  process.exit(0);
+}
+
+if (command === "start") {
+  const exact = args[0];
+  const name = args[1];
+  const repoPath = args[2];
+  const prompt = args[3] || "";
+  if (exact !== "--exact") process.exit(2);
+  ensure(name);
+  fs.writeFileSync(statePath(name, "prompt.txt"), prompt);
+  fs.writeFileSync(statePath(name, "repo.txt"), repoPath);
+  console.log(`agent: ${name}`);
+  process.exit(0);
+}
+
+if (command === "send-wait") {
+  const [name, message] = args;
+  ensure(name);
+  fs.writeFileSync(statePath(name, "message.txt"), message || "");
+  if (process.env.FAKE_SEND_BLOCKED === "1") {
+    console.log(JSON.stringify({ schema_version: 1, submitted: false, blocked: true, blocked_reason: "login_prompt" }));
+    process.exit(1);
+  }
+  if (process.env.FAKE_SEND_RESULT_JSON === "1") {
+    const body = { schema_version: 1, status: "done", summary: "ok", artifacts: [], errors: [] };
+    fs.writeFileSync(statePath(name, "result.json"), JSON.stringify(body));
+    console.log(JSON.stringify({ schema_version: 1, submitted: true, nonce_seen: false, completion_source: "result_json", result: { body } }));
+    process.exit(0);
+  }
+  console.log("matched nonce: MARK-fake");
+  process.exit(0);
+}
+
+if (command === "result" && args[0] === "wait-required") {
+  const name = args[1];
+  const resultPath = statePath(name, "result.json");
+  if (process.env.FAKE_INVALID_RESULT === "1") {
+    console.log(JSON.stringify({ schema_version: 1, path: resultPath, present: true, valid: false, timeout: true, errors: [{ message: "invalid" }] }));
+    process.exit(1);
+  }
+  if (fs.existsSync(resultPath)) {
+    console.log(JSON.stringify({ schema_version: 1, present: true, valid: true, body: readJson(resultPath) }));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({ schema_version: 1, path: resultPath, present: false, valid: false, timeout: true, missing_fields: ["status"] }));
+  process.exit(1);
+}
+
+if (command === "result" && args[0] === "--json") {
+  const name = args[1];
+  const resultPath = statePath(name, "result.json");
+  console.log(JSON.stringify({ schema_version: 1, present: fs.existsSync(resultPath), valid: fs.existsSync(resultPath), body: fs.existsSync(resultPath) ? readJson(resultPath) : null }));
+  process.exit(fs.existsSync(resultPath) ? 0 : 1);
+}
+
+if (command === "status" && args[0] === "--json") {
+  const name = args[1];
+  if (process.env.FAKE_DEAD_SESSION === "1") {
+    console.log(JSON.stringify({ schema_version: 1, name, running: false }));
+    process.exit(1);
+  }
+  if (process.env.FAKE_STATUS_BLOCKED === "1") {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      name,
+      running: true,
+      confirmation_detected: true,
+      blocked_reason: process.env.FAKE_STATUS_BLOCKED_REASON || "permission_prompt",
+      diagnostic: "session may be waiting for interactive confirmation",
+    }));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({ schema_version: 1, name, running: true }));
+  process.exit(0);
+}
+
+if (command === "stop") {
+  const name = args[0];
+  fs.writeFileSync(statePath(name, "stopped"), "1");
+  console.log(`Stopped ${name}`);
+  process.exit(0);
+}
+
+console.error(`unexpected fake agent-tmux call: ${process.argv.slice(2).join(" ")}`);
+process.exit(2);

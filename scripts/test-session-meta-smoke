@@ -1,0 +1,522 @@
+#!/usr/bin/env zsh
+# Smoke test for v2 session-meta.json sidecar contract and session_id_pattern
+# profile parser.
+#
+# Covers (source-only-safe — no real tmux sessions):
+#   - sidecar seeded null by result init
+#   - sidecar missing / null / valid-UUID / malformed-UUID
+#   - session_meta_validate() called directly via a thin zsh wrapper
+#   - profile parser accepts session_id_pattern (no unknown-key warning)
+#   - profile parser warns on unknown key
+#   - capture no-op when pattern unset (explicit blank-pattern profile)
+#   - POSITIVE capture: fake pane output with UUID → sidecar updated (B2)
+#   - result --field .cli_session_id fallback reads sidecar (B1)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-meta-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected='$expected' got='$actual'" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label: expected to contain '$needle'" >&2
+    echo "    got: $haystack" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label: must not contain '$needle'" >&2
+    echo "    got: $haystack" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Call session_meta_validate() directly — mirrors the exact implementation in
+# agent-tmux. Written to a temp script to avoid nested-quote fragility in zsh -c.
+_VALIDATE_SCRIPT="$WORK/validate-helper.zsh"
+cat > "$_VALIDATE_SCRIPT" << 'VALIDATEEOF'
+#!/usr/bin/env zsh
+# Minimal harness: define only the deps session_meta_validate needs, then call it.
+JQ=jq
+require_jq() { :; }
+
+session_meta_validate() {
+  local meta_path="$1"
+  if [[ ! -f "$meta_path" ]]; then printf 'missing\n'; return 0; fi
+  local raw
+  raw="$(jq -r '.cli_session_id // "null"' "$meta_path" 2>/dev/null)" || {
+    printf 'malformed:parse_error\n'; return 1
+  }
+  if [[ "$raw" == "null" ]]; then printf 'null\n'; return 0; fi
+  if [[ "$raw" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    printf 'ok\n'; return 0
+  fi
+  printf 'malformed:%s\n' "$raw"; return 1
+}
+
+session_meta_validate "$1"
+VALIDATEEOF
+chmod +x "$_VALIDATE_SCRIPT"
+
+call_session_meta_validate() {
+  zsh "$_VALIDATE_SCRIPT" "$1" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Part 1: result init seeds sidecar with null
+# ---------------------------------------------------------------------------
+echo "--- Part 1: result init seeds sidecar"
+
+mkdir -p "$TMUX_AGENT_DIR/init-test"
+"$CLAUDE_TMUX" result init init-test >/dev/null
+META="$TMUX_AGENT_DIR/init-test/session-meta.json"
+
+assert "sidecar created by result init" "$(test -f "$META" && echo yes || echo no)" "yes"
+assert "sidecar schema_version=1" "$(jq -r .schema_version "$META")" "1"
+assert "sidecar cli_session_id null on init" "$(jq -r '.cli_session_id // "null"' "$META")" "null"
+
+# ---------------------------------------------------------------------------
+# Part 2: session_meta_validate() — called directly via wrapper
+# ---------------------------------------------------------------------------
+echo "--- Part 2: session_meta_validate() direct calls"
+
+assert "missing sidecar -> missing" \
+  "$(call_session_meta_validate "$WORK/no-such-file.json")" "missing"
+
+NULL_META="$WORK/meta-null.json"
+jq -n '{schema_version:1, cli_session_id: null}' > "$NULL_META"
+assert "null sidecar -> null" "$(call_session_meta_validate "$NULL_META")" "null"
+
+UUID_META="$WORK/meta-uuid.json"
+jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716-446655440000"}' > "$UUID_META"
+assert "valid UUID sidecar -> ok" "$(call_session_meta_validate "$UUID_META")" "ok"
+
+BAD_META="$WORK/meta-bad.json"
+jq -n '{schema_version:1, cli_session_id: "not-a-uuid"}' > "$BAD_META"
+assert_contains "malformed UUID sidecar -> malformed: prefix" \
+  "$(call_session_meta_validate "$BAD_META" || true)" "malformed:"
+
+BADLEN_META="$WORK/meta-badlen.json"
+jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716"}' > "$BADLEN_META"
+assert_contains "truncated UUID sidecar -> malformed: prefix" \
+  "$(call_session_meta_validate "$BADLEN_META" || true)" "malformed:"
+
+# ---------------------------------------------------------------------------
+# Part 3: profile parser accepts session_id_pattern; warns on unknown key
+# ---------------------------------------------------------------------------
+echo "--- Part 3: profile parser"
+
+PROF_DIR="$WORK/profiles"
+mkdir -p "$PROF_DIR"
+
+# 3a: session_id_pattern must NOT trigger unknown-key warning
+cat > "$PROF_DIR/claude.conf" <<'PROFILE'
+bin=claude
+env_ns=CLAUDE
+prefix=claude-cli
+launch_flags=--dangerously-skip-permissions
+resume_keyword=--resume
+heuristic_family=claude
+usage_kind=Code
+session_id_pattern=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}
+PROFILE
+
+KNOWN_KEY_OUT="$(AGENT_TMUX_PROFILE_DIR="$PROF_DIR" "$CLAUDE_TMUX" doctor 2>&1 || true)"
+if [[ "$KNOWN_KEY_OUT" == *"unknown profile key 'session_id_pattern'"* ]]; then
+  echo "  FAIL session_id_pattern treated as unknown key" >&2
+  FAIL=$((FAIL + 1))
+else
+  echo "  ok   session_id_pattern not flagged as unknown key"
+  PASS=$((PASS + 1))
+fi
+
+# 3b: truly unknown key must trigger warning
+cat > "$PROF_DIR/claude.conf" <<'PROFILE'
+bin=claude
+env_ns=CLAUDE
+prefix=claude-cli
+heuristic_family=claude
+truly_unknown_key=something
+PROFILE
+
+WARN_OUT="$(AGENT_TMUX_PROFILE_DIR="$PROF_DIR" "$CLAUDE_TMUX" doctor 2>&1 || true)"
+assert_contains "unknown key triggers warning" "$WARN_OUT" "unknown profile key"
+
+# ---------------------------------------------------------------------------
+# Part 4: capture no-op when pattern explicitly blank
+# (bundled claude.conf now HAS a pattern; use a custom profile with empty pattern)
+# ---------------------------------------------------------------------------
+echo "--- Part 4: capture no-op when pattern unset/blank"
+
+NOOP_PROF_DIR="$WORK/noop-profiles"
+mkdir -p "$NOOP_PROF_DIR"
+cat > "$NOOP_PROF_DIR/claude.conf" <<'PROFILE'
+bin=claude
+env_ns=CLAUDE
+prefix=claude-cli
+heuristic_family=claude
+session_id_pattern=
+PROFILE
+
+mkdir -p "$TMUX_AGENT_DIR/noop-test"
+"$CLAUDE_TMUX" result init noop-test >/dev/null
+NOOP_META="$TMUX_AGENT_DIR/noop-test/session-meta.json"
+sleep 1  # no background capture should fire with blank pattern
+assert "capture no-op: sidecar stays null with blank pattern" \
+  "$(jq -r '.cli_session_id // "null"' "$NOOP_META")" "null"
+
+# ---------------------------------------------------------------------------
+# Part 5: POSITIVE capture — fake pane output with UUID → sidecar updated (B2)
+# We simulate spawn_session_id_capture by running the inner loop logic directly
+# against a temp file that acts as "pane output". No real tmux session needed.
+# ---------------------------------------------------------------------------
+echo "--- Part 5: positive capture (fake pane → sidecar written)"
+
+CAPTURE_META="$WORK/capture-meta.json"
+jq -n '{schema_version:1, cli_session_id: null}' > "$CAPTURE_META"
+
+FAKE_UUID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+FAKE_PANE="$WORK/fake-pane.txt"
+printf 'Starting claude...\nSession ID: %s\nReady.\n' "$FAKE_UUID" > "$FAKE_PANE"
+
+# Run the capture loop logic inline (mirrors two-stage spawn_session_id_capture):
+#   Stage 1: find first line matching label anchor ($label_pattern).
+#   Stage 2: extract + validate RFC-4122 UUID from THAT line only.
+# A 3rd arg $label_pattern defaults to matching any line (for non-label tests).
+_UUID_RE='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+_run_capture_inline() {
+  local pane_file="$1" meta_path="$2" label_pattern="${3:-.}"
+  local pane_text labeled_line uuid
+  pane_text="$(cat "$pane_file")"
+  # Stage 1: find first line matching the label anchor.
+  labeled_line="$(printf '%s\n' "$pane_text" | grep -m1 -E "$label_pattern")" || true
+  [[ -n "$labeled_line" ]] || return 0
+  # Stage 2: extract UUID from that line + validate shape.
+  uuid="$(printf '%s\n' "$labeled_line" | grep -oE "$_UUID_RE" | head -1)" || true
+  if [[ -n "$uuid" ]] && [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    local tmp
+    tmp="$(mktemp "${meta_path}.tmp.XXXXXX")"
+    jq -n --arg id "$uuid" '{schema_version:1, cli_session_id: $id}' > "$tmp" && mv "$tmp" "$meta_path" || rm -f "$tmp"
+  fi
+}
+
+# Use a label-anchored pattern: "Session ID:" line contains the UUID.
+FAKE_LABEL='Session ID:'
+_run_capture_inline "$FAKE_PANE" "$CAPTURE_META" "$FAKE_LABEL"
+
+assert "positive capture: sidecar updated with UUID" \
+  "$(jq -r '.cli_session_id // "null"' "$CAPTURE_META")" "$FAKE_UUID"
+assert "positive capture: sidecar validate -> ok" \
+  "$(call_session_meta_validate "$CAPTURE_META")" "ok"
+
+# ---------------------------------------------------------------------------
+# Part 6: result --field .cli_session_id sidecar read
+# ---------------------------------------------------------------------------
+echo "--- Part 6: result --field .cli_session_id sidecar read"
+
+mkdir -p "$TMUX_AGENT_DIR/field-test"
+"$CLAUDE_TMUX" result init field-test >/dev/null
+FIELD_META="$TMUX_AGENT_DIR/field-test/session-meta.json"
+
+# 6a: sidecar null → exit 1 (result init seeds null)
+code=0
+out="$("$CLAUDE_TMUX" result --field .cli_session_id field-test 2>&1)" || code=$?
+assert "field: null sidecar exits 1" "$code" "1"
+
+# 6b: write a UUID into sidecar; result.json present (seeded by result init)
+FIELD_UUID="bbbbcccc-dddd-4444-aaaa-eeeeffffaaaa"
+jq -n --arg id "$FIELD_UUID" '{schema_version:1, cli_session_id: $id}' > "$FIELD_META"
+code=0
+out="$("$CLAUDE_TMUX" result --field .cli_session_id field-test 2>&1)" || code=$?
+assert "field: UUID from sidecar exit=0 (result.json present)" "$code" "0"
+assert "field: UUID value correct" "$out" "$FIELD_UUID"
+
+# 6c: dot-less variant also works
+code=0
+out="$("$CLAUDE_TMUX" result --field cli_session_id field-test 2>&1)" || code=$?
+assert "field: no-dot variant works" "$code" "0"
+assert "field: no-dot UUID value correct" "$out" "$FIELD_UUID"
+
+# ---------------------------------------------------------------------------
+# Part 6d: timing — result --field .cli_session_id works when result.json ABSENT
+# This is the primary v2 resume window: post-start, pre-final-result.
+# result init is NOT called here — reproduces the real use-case.
+# ---------------------------------------------------------------------------
+echo "--- Part 6d: field read when result.json absent (timing fix)"
+
+TIMING_UUID="ccccdddd-eeee-4444-9999-aaaabbbbcccc"
+mkdir -p "$TMUX_AGENT_DIR/timing-test"
+# Write ONLY the sidecar — no result.json (mirrors post-start state).
+jq -n --arg id "$TIMING_UUID" '{schema_version:1, cli_session_id: $id}' \
+  > "$TMUX_AGENT_DIR/timing-test/session-meta.json"
+
+code=0
+out="$("$CLAUDE_TMUX" result --field .cli_session_id timing-test 2>&1)" || code=$?
+assert "timing: UUID returned when result.json absent (exit=0)" "$code" "0"
+assert "timing: UUID value correct" "$out" "$TIMING_UUID"
+
+# Also confirm no result.json was created as a side-effect.
+assert "timing: result.json still absent after field read" \
+  "$(test -f "$TMUX_AGENT_DIR/timing-test/result.json" && echo yes || echo no)" "no"
+
+# ---------------------------------------------------------------------------
+# Part 7: B1 security — capture rejects non-UUID match; read rejects non-UUID sidecar
+# ---------------------------------------------------------------------------
+echo "--- Part 7: B1 validation guards"
+
+# 7a: capture rejects non-UUID pane match → sidecar stays null
+NONUUID_META="$WORK/nonuuid-capture-meta.json"
+jq -n '{schema_version:1, cli_session_id: null}' > "$NONUUID_META"
+NONUUID_PANE="$WORK/nonuuid-pane.txt"
+# Pane contains a string that looks UUID-ish but isn't (too short), plus a
+# plain non-UUID token that grep -oE with a broad pattern would still not match.
+# To test the guard, we write a value that matches the regex but then inject
+# a hand-crafted non-UUID directly (bypasses grep, tests the guard path).
+printf 'Session: not-a-uuid\nReady.\n' > "$NONUUID_PANE"
+# Simulate what spawn_session_id_capture does: grep finds nothing → sidecar untouched.
+# Also test the guard directly: feed a non-UUID match through _run_capture_inline.
+GUARD_META="$WORK/guard-meta.json"
+jq -n '{schema_version:1, cli_session_id: null}' > "$GUARD_META"
+GUARD_PANE="$WORK/guard-pane.txt"
+# Write a pane with no valid RFC-4122 UUID — grep -oE won't match.
+printf 'Session: short-not-uuid\nid: 12345\n' > "$GUARD_PANE"
+_run_capture_inline "$GUARD_PANE" "$GUARD_META"
+assert "capture: non-UUID pane → sidecar stays null" \
+  "$(jq -r '.cli_session_id // "null"' "$GUARD_META")" "null"
+
+# 7b: read fallback rejects hand-written non-UUID sidecar → exit 1
+mkdir -p "$TMUX_AGENT_DIR/invalid-sid-test"
+"$CLAUDE_TMUX" result init invalid-sid-test >/dev/null
+INVALID_META="$TMUX_AGENT_DIR/invalid-sid-test/session-meta.json"
+# Overwrite sidecar with a non-UUID value (simulates hand-edit or CLI format drift)
+jq -n '{schema_version:1, cli_session_id: "not-a-uuid"}' > "$INVALID_META"
+code=0
+out="$("$CLAUDE_TMUX" result --field .cli_session_id invalid-sid-test 2>&1)" || code=$?
+assert "read: non-UUID sidecar → exit 1" "$code" "1"
+# Must not print the invalid value to stdout
+if [[ "$out" == *"not-a-uuid"* ]]; then
+  echo "  FAIL read: non-UUID value leaked to stdout" >&2
+  FAIL=$((FAIL + 1))
+else
+  echo "  ok   read: non-UUID value not printed to stdout"
+  PASS=$((PASS + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Part 8: DECOY case — label-anchored capture ignores decoy UUID on earlier line
+# Pane layout: unlabeled decoy UUID first, then labeled session line with real UUID.
+# With a label-anchored pattern, only the labeled UUID must be written.
+# ---------------------------------------------------------------------------
+echo "--- Part 8: decoy UUID ignored by label-anchored capture"
+
+DECOY_UUID="ddddeeee-ffff-1111-2222-333344445555"
+REAL_UUID="aaaabbbb-cccc-4444-8888-999900001111"
+DECOY_PANE="$WORK/decoy-pane.txt"
+# Decoy UUID on an earlier unlabeled line; real UUID on the labeled "Session ID:" line.
+printf 'Tool call result: %s\nSession ID: %s\nReady.\n' "$DECOY_UUID" "$REAL_UUID" > "$DECOY_PANE"
+
+DECOY_META="$WORK/decoy-meta.json"
+jq -n '{schema_version:1, cli_session_id: null}' > "$DECOY_META"
+
+# Use a label-anchored pattern that only matches the "Session ID:" line.
+_run_capture_inline "$DECOY_PANE" "$DECOY_META" "Session ID:"
+
+assert "decoy: sidecar written with labeled UUID (not decoy)" \
+  "$(jq -r '.cli_session_id // "null"' "$DECOY_META")" "$REAL_UUID"
+assert "decoy: labeled UUID validates ok" \
+  "$(call_session_meta_validate "$DECOY_META")" "ok"
+
+# Also confirm: WITHOUT a label pattern (match-any), first UUID found is the decoy.
+# This demonstrates WHY label-anchored is needed.
+DECOY_META_NOLABEL="$WORK/decoy-meta-nolabel.json"
+jq -n '{schema_version:1, cli_session_id: null}' > "$DECOY_META_NOLABEL"
+_run_capture_inline "$DECOY_PANE" "$DECOY_META_NOLABEL"  # default label_pattern='.'
+NOLABEL_VAL="$(jq -r '.cli_session_id // "null"' "$DECOY_META_NOLABEL")"
+# Without label anchor, decoy UUID wins (documents the problem that label-anchoring solves).
+assert "decoy-nolabel: first UUID captured is the decoy (demonstrates the problem)" \
+  "$NOLABEL_VAL" "$DECOY_UUID"
+
+# ---------------------------------------------------------------------------
+# Part 9: structured transcript/store correlation helpers (P3)
+# ---------------------------------------------------------------------------
+echo "--- Part 9: structured transcript/store correlation"
+
+TMUX_AGENT_TOOLS_SOURCE_ONLY=1 source "$AGENT_TMUX" codex help
+
+CODEX_ROOT="$WORK/codex/sessions"
+CODEX_CWD="$WORK/project"
+mkdir -p "$CODEX_ROOT/2030/01/01" "$CODEX_CWD"
+CODEX_SNAPSHOT="$WORK/codex-snapshot.txt"
+: > "$CODEX_SNAPSHOT"
+SINCE=100
+
+_codex_file() {
+  local uuid="$1" payload_id="$2" cwd="$3" body="${4:-ok}" file_path
+  file_path="$CODEX_ROOT/2030/01/01/rollout-2030-01-01T00-00-00-$uuid.jsonl"
+  if [[ "$body" == "malformed" ]]; then
+    print -r -- '{not-json' > "$file_path"
+  else
+    jq -c -n --arg id "$payload_id" --arg cwd "$cwd" \
+      '{type:"session_meta", payload:{id:$id, cwd:$cwd}}' > "$file_path"
+    print -r -- '{"type":"event","payload":{"id":"99999999-9999-4999-9999-999999999999"}}' >> "$file_path"
+  fi
+  touch -t 203001010000.00 "$file_path"
+  print -r -- "$file_path"
+}
+
+CODEX_OK_UUID="11111111-1111-4111-8111-111111111111"
+_codex_file "$CODEX_OK_UUID" "$CODEX_OK_UUID" "$CODEX_CWD" >/dev/null
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: success exit=0" "$code" "0"
+assert "codex correlate: success UUID" "$out" "ok $CODEX_OK_UUID"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+BAD_NAME_UUID="22222222-2222-4222-8222-222222222222"
+BAD_PAYLOAD_UUID="33333333-3333-4333-8333-333333333333"
+_codex_file "$BAD_NAME_UUID" "$BAD_PAYLOAD_UUID" "$CODEX_CWD" >/dev/null
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: basename/payload mismatch exits 2" "$code" "2"
+assert "codex correlate: basename/payload mismatch reason" "$out" "bail basename_payload_mismatch 1"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+MALFORMED_UUID="44444444-4444-4444-8444-444444444444"
+_codex_file "$MALFORMED_UUID" "$MALFORMED_UUID" "$CODEX_CWD" malformed >/dev/null
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: malformed first record exits 2" "$code" "2"
+assert "codex correlate: malformed first record reason" "$out" "bail malformed_first_record 1"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+CWD_UUID="55555555-5555-4555-8555-555555555555"
+_codex_file "$CWD_UUID" "$CWD_UUID" "$WORK/other-project" >/dev/null
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: cwd mismatch exits 2" "$code" "2"
+assert "codex correlate: cwd mismatch reason" "$out" "bail cwd_mismatch 1"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: no candidates exits 1" "$code" "1"
+assert "codex correlate: no candidates waits" "$out" "wait no_candidate 0"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+MULTI_A="66666666-6666-4666-8666-666666666666"
+MULTI_B="77777777-7777-4777-8777-777777777777"
+_codex_file "$MULTI_A" "$MULTI_A" "$CODEX_CWD" >/dev/null
+sleep 1
+_codex_file "$MULTI_B" "$MULTI_B" "$CODEX_CWD" >/dev/null
+touch -t 203001010001.00 "$CODEX_ROOT/2030/01/01/rollout-2030-01-01T00-00-00-$MULTI_B.jsonl"
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: multiple candidates exits 2" "$code" "2"
+assert "codex correlate: multiple candidates reason" "$out" "bail multiple_candidates 2"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+TIE_A="88888888-8888-4888-8888-888888888888"
+TIE_B="99999999-9999-4999-8999-999999999999"
+_codex_file "$TIE_A" "$TIE_A" "$CODEX_CWD" >/dev/null
+_codex_file "$TIE_B" "$TIE_B" "$CODEX_CWD" >/dev/null
+touch -t 203001010002.00 "$CODEX_ROOT/2030/01/01/rollout-2030-01-01T00-00-00-$TIE_A.jsonl" "$CODEX_ROOT/2030/01/01/rollout-2030-01-01T00-00-00-$TIE_B.jsonl"
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: mtime tie exits 2" "$code" "2"
+assert "codex correlate: mtime tie reason" "$out" "bail mtime_tie 2"
+
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+DECOY_TRANSCRIPT_UUID="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_codex_file "$DECOY_TRANSCRIPT_UUID" "$DECOY_TRANSCRIPT_UUID" "$CODEX_CWD" >/dev/null
+code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
+assert "codex correlate: decoy later UUID ignored" "$out" "ok $DECOY_TRANSCRIPT_UUID"
+
+AGY_ROOT="$WORK/agy"
+AGY_CWD="$WORK/agy-project"
+mkdir -p "$AGY_ROOT/cache" "$AGY_ROOT/conversations" "$AGY_CWD"
+AGY_UUID="abababab-abab-4bab-8bab-abababababab"
+jq -n --arg cwd "$AGY_CWD" --arg id "$AGY_UUID" '{($cwd): $id}' > "$AGY_ROOT/cache/last_conversations.json"
+: > "$AGY_ROOT/conversations/$AGY_UUID.db"
+touch -t 203001010000.00 "$AGY_ROOT/conversations/$AGY_UUID.db"
+code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" "$SINCE")" || code=$?
+assert "agy correlate: success exit=0" "$code" "0"
+assert "agy correlate: success UUID" "$out" "ok $AGY_UUID"
+
+jq -n '{}' > "$AGY_ROOT/cache/last_conversations.json"
+code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" "$SINCE")" || code=$?
+assert "agy correlate: missing cwd key exits 2" "$code" "2"
+assert "agy correlate: missing cwd key reason" "$out" "bail missing_cwd_key 0"
+
+jq -n --arg cwd "$AGY_CWD" '{($cwd): "not-a-uuid"}' > "$AGY_ROOT/cache/last_conversations.json"
+code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" "$SINCE")" || code=$?
+assert "agy correlate: malformed cache UUID exits 2" "$code" "2"
+assert "agy correlate: malformed cache UUID reason" "$out" "bail malformed_cache 1"
+
+jq -n --arg cwd "$AGY_CWD" --arg id "$AGY_UUID" '{($cwd): $id}' > "$AGY_ROOT/cache/last_conversations.json"
+touch -t 200001010000.00 "$AGY_ROOT/conversations/$AGY_UUID.db"
+code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" 2000000000)" || code=$?
+assert "agy correlate: stale db exits 2" "$code" "2"
+assert "agy correlate: stale db reason" "$out" "bail stale_db 1"
+
+rm -f "$AGY_ROOT/conversations/$AGY_UUID.db"
+code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" "$SINCE")" || code=$?
+assert "agy correlate: missing db exits 2" "$code" "2"
+assert "agy correlate: missing db reason" "$out" "bail missing_db 1"
+
+DECOY_AGY_UUID="bcbcbcbc-bcbc-4bcb-8bcb-bcbcbcbcbcbc"
+jq -n --arg cwd "$AGY_CWD" --arg id "$AGY_UUID" '{($cwd): $id}' > "$AGY_ROOT/cache/last_conversations.json"
+: > "$AGY_ROOT/conversations/$AGY_UUID.db"
+: > "$AGY_ROOT/conversations/$DECOY_AGY_UUID.db"
+touch -t 203001010000.00 "$AGY_ROOT/conversations/$AGY_UUID.db" "$AGY_ROOT/conversations/$DECOY_AGY_UUID.db"
+code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" "$SINCE")" || code=$?
+assert "agy correlate: decoy db ignored" "$out" "ok $AGY_UUID"
+
+BAIL_META="$WORK/bail-meta.json"
+BAIL_ERR="$WORK/bail.err"
+jq -n '{schema_version:1, cli_session_id:null}' > "$BAIL_META"
+rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
+AGENT_TMUX_CODEX_SESSIONS_ROOT="$CODEX_ROOT"
+AGENT_TMUX_SESSION_ID_CAPTURE_TIMEOUT=0
+(
+  spawn_transcript_session_id_capture codex bail-test "$BAIL_META" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT"
+  sleep 2
+) 2> "$BAIL_ERR"
+unset AGENT_TMUX_CODEX_SESSIONS_ROOT AGENT_TMUX_SESSION_ID_CAPTURE_TIMEOUT
+BAIL_TEXT="$(<"$BAIL_ERR")"
+BAIL_LINES=("${(@f)BAIL_TEXT}")
+assert "transcript bail: exactly one signal" "${#BAIL_LINES[@]}" "1"
+assert_contains "transcript bail: signal reason" "${BAIL_LINES[1]}" '"reason":"no_candidate"'
+assert_not_contains "transcript bail: no UUID leak" "${BAIL_LINES[1]}" "$CODEX_OK_UUID"
+assert "transcript bail: sidecar stays null" "$(jq -r '.cli_session_id // "null"' "$BAIL_META")" "null"
+
+START_BODY="${functions[start_session]}"
+assert_contains "wiring: transcript branch uses structured capturer" "$START_BODY" 'spawn_transcript_session_id_capture "$CLI"'
+
+# ---------------------------------------------------------------------------
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

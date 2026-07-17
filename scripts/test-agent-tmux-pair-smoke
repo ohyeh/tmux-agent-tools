@@ -1,0 +1,89 @@
+#!/usr/bin/env zsh
+# Smoke test for `agent-tmux pair` (PR B): first pair (start), idempotent
+# resume, reconcile after a manual kill, conservative scale-down (orphan).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-pair-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+mkdir -p "$WORK/work"
+trap 'for s in $("${REPO_ROOT}/skills/tmux-agent-tools/scripts/agent-tmux" codex list 2>/dev/null | sed -n "s/ -> .*//p"); do tmux kill-session -t "codex-cli-$s" 2>/dev/null || true; done; rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 60
+EOF
+chmod +x "$WORK/fake.sh"
+export CODEX="$WORK/fake.sh"
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS+1))
+  else echo "  FAIL $label expected=$expected got=$actual" >&2; FAIL=$((FAIL+1)); fi
+}
+contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then echo "  ok   $label"; PASS=$((PASS+1))
+  else echo "  FAIL $label: '$needle' not in output" >&2; FAIL=$((FAIL+1)); fi
+}
+
+echo "case: first pair → both workers started"
+out="$("$AGENT" pair codex demo "$WORK/work" --workers 2)"; code=$?
+assert "first pair exit=0" "$code" "0"
+contains "w1 started" "$out" "demo-w1  codex  started"
+contains "w2 started" "$out" "demo-w2  codex  started"
+/bin/sleep 1
+
+echo "case: state file shape"
+sf="$TMUX_AGENT_DIR/teams/demo.json"
+assert "schema_version" "$(jq -r .schema_version "$sf")" "1"
+assert "lead_cli" "$(jq -r .lead_cli "$sf")" "codex"
+assert "member count" "$(jq -r '.members | length' "$sf")" "3"
+assert "w1 cli" "$(jq -r '.members[] | select(.name=="demo-w1") | .cli' "$sf")" "codex"
+assert "w1 role" "$(jq -r '.members[] | select(.name=="demo-w1") | .role' "$sf")" "worker"
+assert "lead role" "$(jq -r '.members[] | select(.name=="demo") | .role' "$sf")" "lead"
+
+echo "case: workers are live + role tag written"
+assert "w1 running" "$("$AGENT" codex status --json demo-w1 | jq -r .running)" "true"
+assert "w1 role tag" "$("$AGENT" codex tags demo-w1 | jq -r .role)" "worker"
+
+echo "case: second pair → idempotent resume"
+out="$("$AGENT" pair codex demo "$WORK/work" --workers 2)"
+contains "w1 resumed" "$out" "demo-w1  codex  resumed"
+contains "w2 resumed" "$out" "demo-w2  codex  resumed"
+
+echo "case: reconcile after manual kill of w1"
+tmux kill-session -t codex-cli-demo-w1 2>/dev/null || true
+/bin/sleep 1
+out="$("$AGENT" pair codex demo "$WORK/work" --workers 2)"
+contains "w1 restarted" "$out" "demo-w1  codex  started"
+contains "w2 still resumed" "$out" "demo-w2  codex  resumed"
+
+echo "case: conservative scale-down → w2 orphan, retained in state, not stopped"
+out="$("$AGENT" pair codex demo "$WORK/work" --workers 1)"
+contains "w2 orphan-warned" "$out" "demo-w2  codex  orphan"
+assert "w2 still running (not auto-stopped)" "$("$AGENT" codex status --json demo-w2 | jq -r .running)" "true"
+sf="$TMUX_AGENT_DIR/teams/demo.json"
+assert "w2 retained in state (deterministic for team stop/results)" \
+  "$(jq -r '[.members[].name] | index("demo-w2") != null' "$sf")" "true"
+assert "w2 keeps stored cli in state" "$(jq -r '.members[]|select(.name=="demo-w2")|.cli' "$sf")" "codex"
+
+echo "case: reconcile uses STORED member cli, not the new --worker-cli"
+out="$("$AGENT" pair codex demo "$WORK/work" --workers 1 --worker-cli claude)"
+contains "w1 reconciled as codex (stored), not claude" "$out" "demo-w1  codex  resumed"
+assert "w1 cli unchanged in state" "$(jq -r '.members[]|select(.name=="demo-w1")|.cli' "$sf")" "codex"
+
+echo "case: pair rejects bad --workers"
+code=0; "$AGENT" pair codex demo "$WORK/work" --workers 0 >/dev/null 2>&1 || code=$?
+assert "workers=0 exit=2" "$code" "2"
+
+"$AGENT" team stop demo >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

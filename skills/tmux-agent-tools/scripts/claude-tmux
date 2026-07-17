@@ -1,0 +1,3 @@
+#!/usr/bin/env zsh
+# claude-tmux — thin preset shim over agent-tmux. See docs/agent-tmux-design.md.
+exec "${0:A:h}/agent-tmux" claude "$@"

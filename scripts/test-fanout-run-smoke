@@ -1,0 +1,271 @@
+#!/usr/bin/env zsh
+# Smoke for tmux-agent-fanout run (issue #184).
+# Uses a fake wrapper to avoid real tmux sessions.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FANOUT="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-fanout"
+SCHEMA="$REPO_ROOT/schemas/fanout-summary.schema.json"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+assert_file_exists() {
+  local label="$1" target="$2"
+  if [[ -f "$target" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$target" >&2; FAIL=$((FAIL + 1))
+  fi
+}
+
+TMP="$(mktemp -d -t fanout-smoke.XXXXXX)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Per-agent policy file. Fake wrapper reads $TMP/policy/<workdir-basename>.
+mkdir -p "$TMP/policy"
+
+# Fake wrapper. Argv: start --exact <name> <workdir> <prompt>
+cat >"$TMP/fake-wrapper" <<'EOF'
+#!/usr/bin/env zsh
+# Minimal stub: writes result.json based on policy.
+set -euo pipefail
+# Args: start --exact <name> <workdir> <prompt>
+[[ "${1:-}" == "start" ]] || exit 0
+shift
+[[ "${1:-}" == "--exact" ]] && shift
+a_name="$1"; workdir="$2"
+policy_file="${FAKE_POLICY_DIR:-/tmp}/$(basename "$workdir")"
+result_status="ok"
+if [[ -f "$policy_file" ]]; then
+  result_status="$(cat "$policy_file")"
+fi
+out="${TMUX_AGENT_RESULT:-}"
+if [[ -z "$out" ]]; then
+  exit 0
+fi
+mkdir -p "$(dirname "$out")"
+cat >"$out" <<JSON
+{"schema_version":1,"status":"$result_status","summary":"fake $a_name"}
+JSON
+EOF
+chmod +x "$TMP/fake-wrapper"
+
+# Prompt file
+echo "test prompt" >"$TMP/prompt.txt"
+
+# Three workdirs
+mkdir -p "$TMP/wd-a" "$TMP/wd-b" "$TMP/wd-c"
+
+run_fanout() {
+  TMUX_AGENT_FANOUT_FAKE_WRAPPER="$TMP/fake-wrapper" \
+    FAKE_POLICY_DIR="$TMP/policy" \
+    "$FANOUT" "$@"
+}
+
+# -------- Case 1: 3 agents all succeed, mode=all --------
+echo "case: 3 agents all succeed, mode=all"
+echo "ok" >"$TMP/policy/wd-a"
+echo "ok" >"$TMP/policy/wd-b"
+echo "ok" >"$TMP/policy/wd-c"
+RD="$TMP/run1"
+out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
+    --agent claude:a --agent codex:b --agent claude:c \
+    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
+    --result-dir "$RD" --timeout 5 2>/dev/null)"
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case1 ok=true" "$ok" "true"
+sv="$(echo "$out" | jq -r '.schema_version')"
+assert "case1 schema_version=1" "$sv" "1"
+n="$(echo "$out" | jq -r '.agents | length')"
+assert "case1 agents.length=3" "$n" "3"
+assert_file_exists "case1 wd-a result.json" "$RD/a-1/result.json"
+assert_file_exists "case1 wd-b result.json" "$RD/b-2/result.json"
+assert_file_exists "case1 wd-c result.json" "$RD/c-3/result.json"
+
+# -------- Case 2: 1 fails, mode=all → ok=false; other results still on disk --------
+echo "case: 1 fails, mode=all"
+echo "ok"     >"$TMP/policy/wd-a"
+echo "failed" >"$TMP/policy/wd-b"
+echo "ok"     >"$TMP/policy/wd-c"
+RD="$TMP/run2"
+set +e
+out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
+    --agent claude:a --agent codex:b --agent claude:c \
+    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
+    --result-dir "$RD" --merge-mode all --timeout 5 2>/dev/null)"
+rc=$?
+set -e
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case2 ok=false" "$ok" "false"
+assert "case2 exit nonzero" "$rc" "1"
+assert_file_exists "case2 wd-a result.json preserved" "$RD/a-1/result.json"
+assert_file_exists "case2 wd-b result.json preserved" "$RD/b-2/result.json"
+assert_file_exists "case2 wd-c result.json preserved" "$RD/c-3/result.json"
+status_b="$(jq -r '.agents[] | select(.name=="b") | .status' <<<"$out")"
+assert "case2 b.status=failed" "$status_b" "failed"
+
+# -------- Case 3: 1 fails, mode=first-success → ok=true --------
+echo "case: 1 fails, mode=first-success"
+echo "ok"     >"$TMP/policy/wd-a"
+echo "failed" >"$TMP/policy/wd-b"
+echo "ok"     >"$TMP/policy/wd-c"
+RD="$TMP/run3"
+out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
+    --agent claude:a --agent codex:b --agent claude:c \
+    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
+    --result-dir "$RD" --merge-mode first-success --timeout 5 2>/dev/null)"
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case3 ok=true" "$ok" "true"
+mode="$(echo "$out" | jq -r '.mode')"
+assert "case3 mode=first-success" "$mode" "first-success"
+
+# -------- Case 4: all fail --------
+echo "case: all fail"
+echo "failed" >"$TMP/policy/wd-a"
+echo "failed" >"$TMP/policy/wd-b"
+echo "failed" >"$TMP/policy/wd-c"
+RD="$TMP/run4"
+set +e
+out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
+    --agent claude:a --agent codex:b --agent claude:c \
+    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
+    --result-dir "$RD" --merge-mode first-success --timeout 5 2>/dev/null)"
+rc=$?
+set -e
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case4 ok=false" "$ok" "false"
+assert "case4 exit nonzero" "$rc" "1"
+
+# -------- Case 5: --summary-out written --------
+echo "case: --summary-out"
+echo "ok" >"$TMP/policy/wd-a"
+RD="$TMP/run5"
+SO="$TMP/summary.json"
+run_fanout run --prompt-file "$TMP/prompt.txt" \
+    --agent claude:a --workdir "$TMP/wd-a" \
+    --result-dir "$RD" --summary-out "$SO" --timeout 5 >/dev/null 2>&1
+assert_file_exists "case5 summary-out written" "$SO"
+
+# -------- Case 6: legacy back-compat (no --agent, no run) --------
+echo "case: legacy back-compat"
+echo "ok" >"$TMP/policy/wd-a"
+echo "ok" >"$TMP/policy/wd-b"
+RD="$TMP/run6"
+out="$(run_fanout --prompt-file "$TMP/prompt.txt" \
+    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" \
+    --result-dir "$RD" --timeout 5 2>/dev/null)"
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case6 legacy form ok=true" "$ok" "true"
+n="$(echo "$out" | jq -r '.agents | length')"
+assert "case6 legacy agents=2" "$n" "2"
+t1="$(echo "$out" | jq -r '.agents[0].tool')"
+assert "case6 legacy default tool=claude" "$t1" "claude"
+
+# -------- Case 7: shape validation against schema (manual, since no ajv) --------
+echo "case: summary shape"
+required_keys="$(echo "$out" | jq -r 'keys | join(",")')"
+assert "case7 top-level keys" "$required_keys" "agents,mode,ok,run_id,schema_version"
+agent_keys="$(echo "$out" | jq -r '.agents[0] | keys | join(",")')"
+assert "case7 agent keys" "$agent_keys" "error,name,result_path,status,tool"
+
+# Confirm schema file exists.
+assert_file_exists "case7 schema file present" "$SCHEMA"
+
+# -------- Case 8: wrapper exec failure → fail fast (no 10-min hang) --------
+# Regression for HIGH bot finding (PR #191): when the wrapper itself exits
+# non-zero before it can write result.json, fanout used to hang for the full
+# --timeout. After the fix, the synthetic error result.json is written
+# immediately and the agent is marked failed within seconds.
+echo "case: wrapper exec failure fail-fast"
+cat >"$TMP/fake-wrapper-fail" <<'EOF'
+#!/usr/bin/env zsh
+# Always exit non-zero without writing TMUX_AGENT_RESULT.
+exit 99
+EOF
+chmod +x "$TMP/fake-wrapper-fail"
+
+RD="$TMP/run8"
+start_ts=$(date +%s)
+set +e
+out="$(TMUX_AGENT_FANOUT_FAKE_WRAPPER="$TMP/fake-wrapper-fail" \
+    FAKE_POLICY_DIR="$TMP/policy" \
+    "$FANOUT" run --prompt-file "$TMP/prompt.txt" \
+      --agent claude:a --workdir "$TMP/wd-a" \
+      --result-dir "$RD" --timeout 600 2>/dev/null)"
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - start_ts ))
+
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case8 ok=false" "$ok" "false"
+assert "case8 exit nonzero" "$rc" "1"
+status_a="$(jq -r '.agents[] | select(.name=="a") | .status' <<<"$out")"
+assert "case8 agent.status=failed" "$status_a" "failed"
+assert_file_exists "case8 synthetic result.json written" "$RD/a-1/result.json"
+syn_status="$(jq -r '.status' "$RD/a-1/result.json")"
+assert "case8 synthetic status=error" "$syn_status" "error"
+if (( elapsed < 10 )); then
+  echo "  ok   case8 returns fast (<10s): elapsed=${elapsed}s"; PASS=$((PASS + 1))
+else
+  echo "  FAIL case8 returns fast: elapsed=${elapsed}s (timeout was 600)" >&2; FAIL=$((FAIL + 1))
+fi
+
+# -------- Case 9: mode=first-success with one fast-failer + one slow-success --------
+# The exec-failing agent must NOT block the slow-success agent from being
+# observed. Slow agent uses a 3s delay; failer exits 99 immediately.
+echo "case: first-success not blocked by fast-failer"
+cat >"$TMP/fake-wrapper-mixed" <<'EOF'
+#!/usr/bin/env zsh
+set -euo pipefail
+[[ "${1:-}" == "start" ]] || exit 0
+shift
+[[ "${1:-}" == "--exact" ]] && shift
+a_name="$1"; workdir="$2"
+case "$(basename "$workdir")" in
+  wd-fail) exit 99 ;;
+  wd-slow)
+    /bin/sleep 2
+    out="${TMUX_AGENT_RESULT:-}"
+    [[ -z "$out" ]] && exit 0
+    mkdir -p "$(dirname "$out")"
+    printf '{"schema_version":1,"status":"ok","summary":"slow ok"}\n' >"$out"
+    ;;
+esac
+EOF
+chmod +x "$TMP/fake-wrapper-mixed"
+mkdir -p "$TMP/wd-fail" "$TMP/wd-slow"
+
+RD="$TMP/run9"
+start_ts=$(date +%s)
+out="$(TMUX_AGENT_FANOUT_FAKE_WRAPPER="$TMP/fake-wrapper-mixed" \
+    "$FANOUT" run --prompt-file "$TMP/prompt.txt" \
+      --agent claude:failer --agent claude:slow \
+      --workdir "$TMP/wd-fail" --workdir "$TMP/wd-slow" \
+      --result-dir "$RD" --merge-mode first-success --timeout 30 2>/dev/null)"
+elapsed=$(( $(date +%s) - start_ts ))
+ok="$(echo "$out" | jq -r '.ok')"
+assert "case9 ok=true (slow succeeded)" "$ok" "true"
+status_fail="$(jq -r '.agents[] | select(.name=="failer") | .status' <<<"$out")"
+assert "case9 failer.status=failed" "$status_fail" "failed"
+status_slow="$(jq -r '.agents[] | select(.name=="slow") | .status' <<<"$out")"
+assert "case9 slow.status=ok" "$status_slow" "ok"
+if (( elapsed < 15 )); then
+  echo "  ok   case9 returns within slow-window: elapsed=${elapsed}s"; PASS=$((PASS + 1))
+else
+  echo "  FAIL case9 too slow: elapsed=${elapsed}s" >&2; FAIL=$((FAIL + 1))
+fi
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

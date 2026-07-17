@@ -1,0 +1,3 @@
+#!/usr/bin/env zsh
+# codex-tmux — thin preset shim over agent-tmux. See docs/agent-tmux-design.md.
+exec "${0:A:h}/agent-tmux" codex "$@"

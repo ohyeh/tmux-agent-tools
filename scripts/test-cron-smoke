@@ -1,0 +1,69 @@
+#!/usr/bin/env zsh
+# Smoke for issue #122 v1 cron catalog.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CRON="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-cron"
+
+WORK="$(mktemp -d -t tmux-agent-cron-smoke.XXXXXX)"
+export TMUX_AGENT_CRON_DIR="$WORK/cron"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: empty list"
+out="$("$CRON" list 2>&1)"
+assert "empty list returns []" "$(printf '%s' "$out" | jq -r 'length')" "0"
+
+echo "case: add + list"
+"$CRON" add daily-summary --schedule '0 9 * * *' --command 'echo hi' --tag project=parking >/dev/null
+out="$("$CRON" list 2>&1)"
+assert "list length=1" "$(printf '%s' "$out" | jq -r 'length')" "1"
+assert "name preserved" "$(printf '%s' "$out" | jq -r '.[0].name')" "daily-summary"
+assert "schedule preserved" "$(printf '%s' "$out" | jq -r '.[0].schedule')" "0 9 * * *"
+assert "tag preserved" "$(printf '%s' "$out" | jq -r '.[0].tags.project')" "parking"
+
+echo "case: show"
+out="$("$CRON" show daily-summary 2>&1)"
+assert "show name" "$(printf '%s' "$out" | jq -r .name)" "daily-summary"
+assert "show command" "$(printf '%s' "$out" | jq -r .command)" "echo hi"
+
+echo "case: duplicate add rejected"
+code=0
+"$CRON" add daily-summary --schedule '*' --command 'x' >/dev/null 2>&1 || code=$?
+assert "duplicate exit=1" "$code" "1"
+
+echo "case: remove"
+"$CRON" remove daily-summary >/dev/null
+out="$("$CRON" list 2>&1)"
+assert "list empty after remove" "$(printf '%s' "$out" | jq -r 'length')" "0"
+
+echo "case: remove unknown"
+code=0
+"$CRON" remove unknown >/dev/null 2>&1 || code=$?
+assert "remove unknown exit=1" "$code" "1"
+
+echo "case: add without --command rejected"
+code=0
+"$CRON" add x --schedule '*' >/dev/null 2>&1 || code=$?
+assert "missing --command exit=2" "$code" "2"
+
+echo "case: history empty"
+"$CRON" add daily --schedule '*' --command 'x' >/dev/null
+out="$("$CRON" history daily 2>&1)"
+assert "history empty" "$(printf '%s' "$out" | jq -r 'length')" "0"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

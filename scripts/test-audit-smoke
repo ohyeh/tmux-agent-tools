@@ -1,0 +1,84 @@
+#!/usr/bin/env zsh
+# Smoke for #119 audit log.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-audit-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_audit() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  local audit_log="$WORK/$prefix-audit.jsonl"
+  echo "case: $prefix audit log append + verify"
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit_log" env "$cli_env=$WORK/fake.sh" \
+    "$wrapper" start --exact "$prefix-a" "$WORK" >/dev/null
+  /bin/sleep 1
+  assert "$prefix audit log created" "$(test -s "$audit_log" && echo yes)" "yes"
+  local first_line
+  first_line="$(head -1 "$audit_log")"
+  assert "$prefix has schema_version" "$(printf '%s' "$first_line" | jq -r .schema_version)" "1"
+  assert "$prefix has chain_hash" "$(printf '%s' "$first_line" | jq -r '.chain_hash | length')" "64"
+  assert "$prefix has prev_chain_hash" "$(printf '%s' "$first_line" | jq -r '.prev_chain_hash | length')" "64"
+
+  local verify_out code=0
+  verify_out="$("$wrapper" audit-verify "$audit_log" 2>&1)" || code=$?
+  assert "$prefix verify exit=0 on clean" "$code" "0"
+  assert "$prefix verify ok=true" "$(printf '%s' "$verify_out" | jq -r .ok)" "true"
+
+  # Tamper with the log: change first event then verify should fail.
+  sed -i.bak 's/"event":"wrapper.start"/"event":"tampered"/' "$audit_log"
+  rm -f "$audit_log.bak"
+  code=0
+  "$wrapper" audit-verify "$audit_log" >/dev/null 2>&1 || code=$?
+  assert "$prefix verify exit=2 on tamper" "$code" "2"
+
+  "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
+}
+
+run_no_env_no_log() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix without env → no audit log written"
+  unset TMUX_AGENT_TOOLS_AUDIT_LOG
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-noenv" "$WORK" >/dev/null
+  /bin/sleep 1
+  if [[ -f "$WORK/audit.jsonl" ]]; then
+    echo "  FAIL $prefix audit log unexpectedly created" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix no audit log without env"
+    PASS=$((PASS + 1))
+  fi
+  "$wrapper" stop "$prefix-noenv" >/dev/null 2>&1 || true
+}
+
+run_audit "$CODEX_TMUX"  "CODEX"  "a-codex"
+run_audit "$CLAUDE_TMUX" "CLAUDE" "a-claude"
+run_no_env_no_log "$CODEX_TMUX"  "CODEX"  "n-codex"
+run_no_env_no_log "$CLAUDE_TMUX" "CLAUDE" "n-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

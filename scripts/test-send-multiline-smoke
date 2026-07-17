@@ -1,0 +1,118 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #202 first-class multi-line / paste injection.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-send-multiline.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-live.sh" <<'EOF'
+#!/bin/sh
+echo "ready"
+while IFS= read -r line; do
+  echo "got:$line"
+done
+EOF
+chmod +x "$WORK/fake-live.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing '$needle'" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_one() {
+  local wrapper="$1" cli_env="$2" session_prefix="$3" prefix="$4"
+  echo "case: $prefix ($wrapper)"
+
+  local transcript="$WORK/$prefix.transcript.jsonl"
+  local audit="$WORK/$prefix.audit.jsonl"
+  local payload="$WORK/$prefix.payload.txt"
+  {
+    printf 'alpha\n'
+    printf 'beta: with colon\n'
+    perl -e 'print "x" x 17000'
+  } > "$payload"
+
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix" "$WORK" >/dev/null
+  sleep 1
+
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit" "$wrapper" send \
+    --from-file "$payload" --enter-count 3 --enter-delay 0.05 "$prefix" >/dev/null
+  sleep 1
+
+  local pane send_line audit_line
+  pane="$(tmux capture-pane -J -t "$session_prefix-$prefix" -p -S -120)"
+  assert_contains "$prefix pane got first line" "$pane" "got:alpha"
+  assert_contains "$prefix pane got second line" "$pane" "got:beta: with colon"
+
+  send_line="$(grep '"event":"send"' "$transcript" | tail -1)"
+  assert "$prefix transcript multiline=true" "$(printf '%s' "$send_line" | jq -r .multiline)" "true"
+  assert "$prefix transcript schema_version=1" "$(printf '%s' "$send_line" | jq -r .schema_version)" "1"
+  assert "$prefix transcript has sha" "$(printf '%s' "$send_line" | jq -r '.text_sha256 | type')" "string"
+  assert "$prefix transcript bytes > 16k" "$(printf '%s' "$send_line" | jq -r '.text_bytes > 16000')" "true"
+
+  audit_line="$(grep '"event":"send.multiline"' "$audit" | tail -1)"
+  assert "$prefix audit multiline event" "$(printf '%s' "$audit_line" | jq -r .event)" "send.multiline"
+  assert "$prefix audit omits body" "$(printf '%s' "$audit_line" | jq -r 'has("text")')" "false"
+  assert "$prefix audit enter_count" "$(printf '%s' "$audit_line" | jq -r .enter_count)" "3"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+
+  # Concurrent multi-line + single-line sends should both pass through the
+  # same per-agent send-lock without interleaving failure. Use a fresh pane so
+  # the 17KB payload above cannot hide the short markers in capture history.
+  local lock_prefix="$prefix-lock"
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    "$lock_prefix" "$WORK" >/dev/null
+  sleep 1
+  local small="$WORK/$prefix.small.txt"
+  printf 'multi-concurrent\n' > "$small"
+  "$wrapper" send --from-file "$small" --enter-delay 0.05 "$lock_prefix" >/dev/null &
+  local p1=$!
+  "$wrapper" send "$lock_prefix" "single-concurrent" >/dev/null &
+  local p2=$!
+  wait "$p1"
+  wait "$p2"
+  sleep 1
+  pane="$(tmux capture-pane -J -t "$session_prefix-$lock_prefix" -p -S -120)"
+  assert_contains "$prefix concurrent multi delivered" "$pane" "got:multi-concurrent"
+  assert_contains "$prefix concurrent single delivered" "$pane" "got:single-concurrent"
+
+  "$wrapper" stop "$lock_prefix" >/dev/null 2>&1 || true
+}
+
+run_one "$CLAUDE_TMUX" CLAUDE "claude-cli" "claude-sendml"
+run_one "$CODEX_TMUX" CODEX "codex-cli" "codex-sendml"
+
+echo "send-multiline smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

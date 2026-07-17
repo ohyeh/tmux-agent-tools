@@ -1,0 +1,876 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:t}"
+SCRIPT_DIR="${0:A:h}"
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
+    print -r -- "$TMUX"
+    return
+  fi
+  command -v tmux 2>/dev/null || true
+}
+
+TMUX_BIN="$(resolve_tmux_bin)"
+unset TMUX
+TMUX="$TMUX_BIN"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+CLAUDE_PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
+CODEX_PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
+AGY_PREFIX="${AGY_TMUX_PREFIX:-agy-cli}"
+DIALOGUE_PREFIX="tmux-agent-dialogue"
+FILTER_TOOL=""
+FILTER_NAME=""
+FILTER_STATE=""
+FILTER_CWD=""
+FILTER_CREATED_AFTER_EPOCH=""
+SORT_FIELD=""
+typeset -a FILTER_TAGS
+FILTER_TAGS=()
+TMUX_AGENT_DIR="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}"
+
+tags_for_session() {
+  # Returns the tags.json content for an agent, or {} when missing.
+  local name="$1"
+  local tags_file="$TMUX_AGENT_DIR/$name/tags.json"
+  if [[ -f "$tags_file" ]]; then
+    cat "$tags_file"
+  else
+    printf '{}'
+  fi
+}
+
+matches_tag_filters() {
+  # All --tag k=v filters must match (AND). Returns 0 on match.
+  local name="$1"
+  (( ${#FILTER_TAGS[@]} == 0 )) && return 0
+  local tags
+  tags="$(tags_for_session "$name")"
+  local kv k v actual
+  for kv in "${FILTER_TAGS[@]}"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    actual="$(printf '%s' "$tags" | "$JQ" -r --arg k "$k" '.[$k] // "__missing__"')"
+    [[ "$actual" == "$v" ]] || return 1
+  done
+  return 0
+}
+
+usage() {
+  cat <<'EOF'
+tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
+
+Usage:
+  tmux-agent-sessions list [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions resolve --name <partial-or-full-name> --json
+  tmux-agent-sessions diff --since <timestamp> --json
+  tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]
+  tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>]
+  tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>) [--force]
+
+Behavior:
+  - list is read-only;
+  - list --watch is bounded by --count and emits one JSON array snapshot per poll;
+  - watch polls inventory and emits one JSONL event per state transition (session_added, session_state_changed, session_removed); bounded by --count (0 = unlimited);
+  - cleanup --preview is read-only;
+  - cleanup --execute requires --all or a filter before stopping sessions;
+  - cleanup --execute refuses dirty managed worktrees unless --force is passed;
+  - cleanup --execute only stops matching sessions owned by claude-tmux, codex-tmux, agy-tmux, or tmux-agent-dialogue;
+  - sessions outside known tmux-agent-tools prefixes are never stopped.
+EOF
+}
+
+die() {
+  echo "$SELF: $*" >&2
+  exit 1
+}
+
+require_tmux() {
+  [[ -x "$TMUX" ]] || die "tmux not found"
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
+}
+
+wrapper_for_tool() {
+  local tool="$1"
+  case "$tool" in
+    claude) print -r -- "$SCRIPT_DIR/claude-tmux" ;;
+    codex) print -r -- "$SCRIPT_DIR/codex-tmux" ;;
+    agy) print -r -- "$SCRIPT_DIR/agy-tmux" ;;
+    *) die "unsupported wrapper tool: $tool" ;;
+  esac
+}
+
+emit_session_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  require_jq
+  local prefix=""
+  case "$tool" in
+    claude) prefix="$CLAUDE_PREFIX" ;;
+    codex) prefix="$CODEX_PREFIX" ;;
+    agy) prefix="$AGY_PREFIX" ;;
+    dialogue) prefix="$DIALOGUE_PREFIX" ;;
+  esac
+  "$JQ" -cn \
+    --arg tool "$tool" \
+    --arg name "$name" \
+    --arg session "$session" \
+    --arg prefix "$prefix" \
+    --arg state "running" \
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,state:$state,running:true,exit_detected:false,exit_code:null,local_or_remote:null,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}'
+}
+
+add_state_field() {
+  require_jq
+  "$JQ" -c '. + {
+    state: (
+      if (.exists | not) then "missing"
+      elif .exit_detected then "exited"
+      elif .running then "running"
+      else "stopped"
+      end
+    )
+  }'
+}
+
+exit_code_for_text() {
+  local current="$1"
+  local line
+  local code=""
+  local exit_re='(local|remote) command exited with code ([0-9]+)'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $exit_re ]]; then
+      code="${match[2]}"
+    fi
+  done <<< "$current"
+  print -r -- "$code"
+}
+
+fallback_status_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local prefix="$4"
+  local current lowered
+  current="$("$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true)"
+  lowered="${current:l}"
+
+  local running=true
+  local exit_detected=false
+  local exit_code=""
+  local local_or_remote="local"
+  if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
+    running=false
+    exit_detected=true
+    exit_code="$(exit_code_for_text "$current")"
+  fi
+  if [[ "$lowered" == *"local mode: ssh"* || "$lowered" == *"remote command exited with code"* ]]; then
+    local_or_remote="remote"
+  fi
+
+  require_jq
+  "$JQ" -cn \
+    --arg tool "$tool" \
+    --arg name "$name" \
+    --arg session "$session" \
+    --arg prefix "$prefix" \
+    --arg local_or_remote "$local_or_remote" \
+    --arg exit_code "$exit_code" \
+    --argjson running "$running" \
+    --argjson exit_detected "$exit_detected" \
+    '{tool:$tool,name:$name,session:$session,prefix:$prefix,exists:true,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:$local_or_remote,diagnostic:null,last_capture_lines:[],confirmation_detected:false,blocked_reason:null}' \
+    | add_state_field
+}
+
+emit_wrapper_session_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local wrapper output prefix
+  wrapper="$(wrapper_for_tool "$tool")"
+  case "$tool" in
+    claude) prefix="$CLAUDE_PREFIX" ;;
+    codex) prefix="$CODEX_PREFIX" ;;
+    agy) prefix="$AGY_PREFIX" ;;
+  esac
+  if output="$("$wrapper" status --json "$name" 2>/dev/null)"; then
+    print -r -- "$output" | add_state_field
+    return
+  fi
+  fallback_status_json "$tool" "$name" "$session" "$prefix"
+}
+
+emit_inventory_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  case "$tool" in
+    claude|codex|agy)
+      emit_wrapper_session_json "$tool" "$name" "$session" | augment_session_json "$tool" "$name" "$session"
+      ;;
+    dialogue)
+      emit_session_json "$tool" "$name" "$session" | augment_session_json "$tool" "$name" "$session"
+      ;;
+  esac
+}
+
+emit_inventory_text() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local json state
+  require_jq
+  json="$(emit_inventory_json "$tool" "$name" "$session")"
+  state="$(print -r -- "$json" | "$JQ" -r '.state')"
+  print -r -- "$tool	$name	$session	$state"
+}
+
+parse_filter_arg() {
+  case "$1" in
+    claude|codex|agy|dialogue)
+      print -r -- "$1"
+      ;;
+    *)
+      die "--tool must be one of: claude, codex, agy, dialogue"
+      ;;
+  esac
+}
+
+parse_state_arg() {
+  case "$1" in
+    running|exited|stopped|missing)
+      print -r -- "$1"
+      ;;
+    *)
+      die "--state must be one of: running, exited, stopped, missing"
+      ;;
+  esac
+}
+
+parse_sort_arg() {
+  case "$1" in
+    tool|name|session|state)
+      print -r -- "$1"
+      ;;
+    *)
+      die "--sort must be one of: tool, name, session, state"
+      ;;
+  esac
+}
+
+parse_nonnegative_integer_arg() {
+  local flag="$1"
+  local value="$2"
+  local integer_re='^[0-9]+$'
+  [[ "$value" =~ $integer_re ]] || die "$flag requires a non-negative integer"
+  print -r -- "$value"
+}
+
+parse_timestamp_epoch() {
+  local value="$1"
+  [[ -n "$value" ]] || die "timestamp requires a value"
+  local epoch_re='^[0-9]+$'
+  if [[ "$value" =~ $epoch_re ]]; then
+    print -r -- "$value"
+    return
+  fi
+  local epoch=""
+  epoch="$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$value" +%s 2>/dev/null || true)"
+  [[ -n "$epoch" ]] || epoch="$(date -u -j -f "%Y-%m-%dT%H:%M:%S%z" "$value" +%s 2>/dev/null || true)"
+  [[ -n "$epoch" ]] || epoch="$(date -u -d "$value" +%s 2>/dev/null || true)"
+  [[ -n "$epoch" ]] || die "invalid timestamp: $value"
+  print -r -- "$epoch"
+}
+
+iso_to_epoch_or_empty() {
+  local value="$1"
+  [[ -n "$value" ]] || return 0
+  parse_timestamp_epoch "$value" 2>/dev/null || true
+}
+
+created_at_for_name() {
+  local name="$1"
+  local agent_dir="$TMUX_AGENT_DIR/$name"
+  local file
+  for file in "$agent_dir/created_at" "$agent_dir/started_at"; do
+    if [[ -f "$file" ]]; then
+      head -n 1 "$file"
+      return
+    fi
+  done
+  if [[ -f "$agent_dir/worktree.json" ]]; then
+    "$JQ" -r '.created_at // empty' "$agent_dir/worktree.json" 2>/dev/null || true
+  fi
+}
+
+result_path_for_name() {
+  local name="$1"
+  print -r -- "$TMUX_AGENT_DIR/$name/result.json"
+}
+
+cwd_for_session() {
+  local name="$1"
+  local session="$2"
+  local agent_dir="$TMUX_AGENT_DIR/$name"
+  if [[ -f "$agent_dir/worktree.json" ]]; then
+    local wt_path
+    wt_path="$("$JQ" -r '.path // empty' "$agent_dir/worktree.json" 2>/dev/null || true)"
+    if [[ -n "$wt_path" ]]; then
+      print -r -- "$wt_path"
+      return
+    fi
+  fi
+  "$TMUX" display-message -p -t "$session" "#{pane_current_path}" 2>/dev/null || true
+}
+
+wrapper_name_for_tool() {
+  case "$1" in
+    claude) print -r -- "claude-tmux" ;;
+    codex) print -r -- "codex-tmux" ;;
+    agy) print -r -- "agy-tmux" ;;
+    dialogue) print -r -- "tmux-agent-dialogue" ;;
+  esac
+}
+
+augment_session_json() {
+  local tool="$1"
+  local name="$2"
+  local session="$3"
+  local created_at created_epoch cwd result_path wrapper age_seconds
+  require_jq
+  created_at="$(created_at_for_name "$name")"
+  created_epoch="$(iso_to_epoch_or_empty "$created_at")"
+  cwd="$(cwd_for_session "$name" "$session")"
+  result_path="$(result_path_for_name "$name")"
+  wrapper="$(wrapper_name_for_tool "$tool")"
+  age_seconds=""
+  if [[ -n "$created_epoch" ]]; then
+    age_seconds=$(( $(date -u +%s) - created_epoch ))
+  fi
+  "$JQ" -c \
+    --arg wrapper "$wrapper" \
+    --arg agent_name "$name" \
+    --arg tmux_session "$session" \
+    --arg cwd "$cwd" \
+    --arg result_path "$result_path" \
+    --arg created_at "$created_at" \
+    --arg created_epoch "$created_epoch" \
+    --arg age_seconds "$age_seconds" \
+    '. + {
+      wrapper:$wrapper,
+      agent_name:$agent_name,
+      tmux_session:$tmux_session,
+      cwd:(if $cwd == "" then null else $cwd end),
+      result_path:$result_path,
+      created_at:(if $created_at == "" then null else $created_at end),
+      created_epoch:(if $created_epoch == "" then null else ($created_epoch | tonumber) end),
+      age_seconds:(if $age_seconds == "" then null else ($age_seconds | tonumber) end),
+      age:(if $age_seconds == "" then null else ($age_seconds + "s") end)
+    }'
+}
+
+matches_filters() {
+  local tool="$1"
+  local name="$2"
+  [[ -z "$FILTER_TOOL" || "$tool" == "$FILTER_TOOL" ]] || return 1
+  [[ -z "$FILTER_NAME" || "$name" == "$FILTER_NAME" ]] || return 1
+  matches_tag_filters "$name" || return 1
+  return 0
+}
+
+filter_sort_inventory_json() {
+  require_jq
+  "$JQ" -cs \
+    --arg state "$FILTER_STATE" \
+    --arg cwd "$FILTER_CWD" \
+    --arg created_after "$FILTER_CREATED_AFTER_EPOCH" \
+    --arg sort_field "$SORT_FIELD" \
+    'map(select($state == "" or .state == $state)
+         | select($cwd == "" or (.cwd // "") == $cwd)
+         | select($created_after == "" or ((.created_epoch // 0) > ($created_after | tonumber))))
+     | if $sort_field == "" then .
+       elif $sort_field == "tool" then sort_by(.tool, .name, .session)
+       elif $sort_field == "name" then sort_by(.name, .tool, .session)
+       elif $sort_field == "session" then sort_by(.session, .tool, .name)
+       elif $sort_field == "state" then sort_by(.state, .tool, .name, .session)
+       else .
+       end'
+}
+
+inventory_json_array() {
+  list_owned_sessions | while IFS=$'\t' read -r tool name session; do
+    emit_inventory_json "$tool" "$name" "$session"
+  done | filter_sort_inventory_json
+}
+
+list_owned_sessions() {
+  require_tmux
+  "$TMUX" ls 2>/dev/null | while IFS= read -r line; do
+    local session="${line%%:*}"
+    local tool=""
+    local name=""
+    case "$session" in
+      "$CLAUDE_PREFIX"-*)
+        tool="claude"
+        name="${session#$CLAUDE_PREFIX-}"
+        ;;
+      "$CODEX_PREFIX"-*)
+        tool="codex"
+        name="${session#$CODEX_PREFIX-}"
+        ;;
+      "$AGY_PREFIX"-*)
+        tool="agy"
+        name="${session#$AGY_PREFIX-}"
+        ;;
+      "$DIALOGUE_PREFIX"-*)
+        tool="dialogue"
+        name="${session#$DIALOGUE_PREFIX-}"
+        ;;
+    esac
+    if [[ -n "$tool" ]] && matches_filters "$tool" "$name"; then
+      print -r -- "$tool	$name	$session"
+    fi
+  done
+}
+
+list_sessions() {
+  local output_json=0
+  local watch=0
+  local watch_count=""
+  local watch_interval=1
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --json)
+        output_json=1
+        ;;
+      --watch)
+        watch=1
+        ;;
+      --count)
+        shift
+        watch_count="$(parse_nonnegative_integer_arg --count "${1:-}")"
+        ;;
+      --interval)
+        shift
+        watch_interval="$(parse_nonnegative_integer_arg --interval "${1:-}")"
+        ;;
+      --tool)
+        shift
+        FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --tag)
+        shift
+        [[ "${1:-}" == *=* ]] || die "--tag must be key=value: ${1:-}"
+        FILTER_TAGS+=("$1")
+        ;;
+      --name)
+        shift
+        FILTER_NAME="${1:-}"
+        [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
+        ;;
+      --state)
+        shift
+        FILTER_STATE="$(parse_state_arg "${1:-}")"
+        ;;
+      --created-after)
+        shift
+        FILTER_CREATED_AFTER_EPOCH="$(parse_timestamp_epoch "${1:-}")"
+        ;;
+      --cwd)
+        shift
+        FILTER_CWD="${1:-}"
+        [[ -n "$FILTER_CWD" ]] || die "--cwd requires a value"
+        ;;
+      --sort)
+        shift
+        SORT_FIELD="$(parse_sort_arg "${1:-}")"
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>] | list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]"
+        ;;
+    esac
+    shift
+  done
+
+  if (( watch )); then
+    (( output_json )) || die "list --watch requires --json"
+    [[ -n "$watch_count" ]] || die "list --watch requires --count"
+    require_jq
+    local i=0
+    while (( i < watch_count )); do
+      inventory_json_array
+      i=$((i + 1))
+      if (( i < watch_count )); then
+        sleep "$watch_interval"
+      fi
+    done
+    return
+  fi
+
+  if (( output_json )); then
+    inventory_json_array | "$JQ" -c '.[]'
+  else
+    inventory_json_array | "$JQ" -r '.[] | [.tool, .name, .session, .state] | @tsv'
+  fi
+}
+
+watch_events() {
+  local watch_count=0
+  local watch_interval=2
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --count)
+        shift
+        watch_count="$(parse_nonnegative_integer_arg --count "${1:-}")"
+        ;;
+      --interval)
+        shift
+        watch_interval="$(parse_nonnegative_integer_arg --interval "${1:-}")"
+        ;;
+      --tool)
+        shift
+        FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --tag)
+        shift
+        [[ "${1:-}" == *=* ]] || die "--tag must be key=value: ${1:-}"
+        FILTER_TAGS+=("$1")
+        ;;
+      --name)
+        shift
+        FILTER_NAME="${1:-}"
+        [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
+        ;;
+      --state)
+        shift
+        FILTER_STATE="$(parse_state_arg "${1:-}")"
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]"
+        ;;
+    esac
+    shift
+  done
+
+  require_jq
+
+  # Previous and current snapshots keyed by tool|name|session -> state.
+  # Pre-declare scalars outside the loop so `local` re-declaration does not
+  # echo existing values on subsequent iterations (zsh `local foo` reprints).
+  typeset -A prev_state curr_state
+  local first=1
+  local i=0
+  local snapshot="" now="" key="" tool="" sname="" session="" state="" rest="" cur="" old=""
+  while (( watch_count == 0 || i < watch_count )); do
+    snapshot="$(inventory_json_array)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    # Rebuild current map from snapshot lines: tool\tname\tsession\tstate.
+    curr_state=()
+    while IFS=$'\t' read -r tool sname session state; do
+      [[ -z "$tool" ]] && continue
+      key="$tool|$sname|$session"
+      curr_state[$key]="$state"
+    done < <(print -r -- "$snapshot" | "$JQ" -r '.[] | [.tool, .name, .session, .state] | @tsv')
+
+    if (( ! first )); then
+      # Added or state_changed.
+      for key in "${(@k)curr_state}"; do
+        cur="${curr_state[$key]}"
+        old="${prev_state[$key]-}"
+        tool="${key%%|*}"
+        rest="${key#*|}"
+        sname="${rest%|*}"
+        session="${rest##*|}"
+        if [[ -z "$old" ]]; then
+          "$JQ" -cn \
+            --argjson schema_version 1 \
+            --arg event "session_added" \
+            --arg tool "$tool" \
+            --arg name "$sname" \
+            --arg session "$session" \
+            --arg state "$cur" \
+            --arg at "$now" \
+            '{schema_version:$schema_version,event:$event,tool:$tool,name:$name,session:$session,state:$state,at:$at}'
+        elif [[ "$old" != "$cur" ]]; then
+          "$JQ" -cn \
+            --argjson schema_version 1 \
+            --arg event "session_state_changed" \
+            --arg tool "$tool" \
+            --arg name "$sname" \
+            --arg session "$session" \
+            --arg from "$old" \
+            --arg to "$cur" \
+            --arg at "$now" \
+            '{schema_version:$schema_version,event:$event,tool:$tool,name:$name,session:$session,from:$from,to:$to,at:$at}'
+        fi
+      done
+      # Removed.
+      for key in "${(@k)prev_state}"; do
+        if [[ -z "${curr_state[$key]-}" ]]; then
+          tool="${key%%|*}"
+          rest="${key#*|}"
+          sname="${rest%|*}"
+          session="${rest##*|}"
+          "$JQ" -cn \
+            --argjson schema_version 1 \
+            --arg event "session_removed" \
+            --arg tool "$tool" \
+            --arg name "$sname" \
+            --arg session "$session" \
+            --arg at "$now" \
+            '{schema_version:$schema_version,event:$event,tool:$tool,name:$name,session:$session,at:$at}'
+        fi
+      done
+    fi
+
+    prev_state=()
+    for key in "${(@k)curr_state}"; do
+      prev_state[$key]="${curr_state[$key]}"
+    done
+    first=0
+
+    i=$((i + 1))
+    if (( watch_count == 0 || i < watch_count )); then
+      sleep "$watch_interval"
+    fi
+  done
+}
+
+resolve_session() {
+  local input_name=""
+  local output_json=0
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --name)
+        shift
+        input_name="${1:-}"
+        [[ -n "$input_name" ]] || die "--name requires a value"
+        ;;
+      --json)
+        output_json=1
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions resolve --name <partial-or-full-name> --json"
+        ;;
+    esac
+    shift
+  done
+  [[ -n "$input_name" ]] || die "resolve requires --name"
+  (( output_json )) || die "resolve requires --json"
+  require_jq
+
+  local matches
+  matches="$(list_owned_sessions | while IFS=$'\t' read -r tool name session; do
+    if [[ "$name" == "$input_name" || "$session" == "$input_name" || "$name" == *"$input_name"* || "$session" == *"$input_name"* ]]; then
+      emit_inventory_json "$tool" "$name" "$session"
+    fi
+  done | "$JQ" -cs '.')"
+
+  local count
+  count="$(print -r -- "$matches" | "$JQ" 'length')"
+  if (( count == 0 )); then
+    "$JQ" -cn --arg input_name "$input_name" \
+      '{schema_version:1,error:"no_match",input_name:$input_name,candidates:[]}' >&2
+    return 1
+  fi
+  if (( count > 1 )); then
+    print -r -- "$matches" | "$JQ" -c --arg input_name "$input_name" \
+      '{schema_version:1,error:"ambiguous_match",input_name:$input_name,candidates:map({wrapper,agent_name,tmux_session,cwd,result_path,running})}' >&2
+    return 1
+  fi
+
+  print -r -- "$matches" | "$JQ" -c --arg input_name "$input_name" '
+    .[0] as $s
+    | {
+        schema_version:1,
+        input_name:$input_name,
+        wrapper:$s.wrapper,
+        agent_name:$s.agent_name,
+        tmux_session:$s.tmux_session,
+        running:$s.running,
+        cwd:$s.cwd,
+        result_path:$s.result_path,
+        recommended_next_commands:[
+          ($s.wrapper + " status --json " + $s.agent_name),
+          ($s.wrapper + " wait-and-capture --json " + $s.agent_name + " 180"),
+          ($s.wrapper + " result --json " + $s.agent_name)
+        ]
+      }'
+}
+
+diff_sessions() {
+  local since=""
+  local output_json=0
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --since)
+        shift
+        since="$(parse_timestamp_epoch "${1:-}")"
+        ;;
+      --json)
+        output_json=1
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions diff --since <timestamp> --json"
+        ;;
+    esac
+    shift
+  done
+  [[ -n "$since" ]] || die "diff requires --since"
+  (( output_json )) || die "diff requires --json"
+  FILTER_CREATED_AFTER_EPOCH="$since"
+  inventory_json_array
+}
+
+worktree_dirty_reason() {
+  local name="$1"
+  local agent_dir="$TMUX_AGENT_DIR/$name"
+  local wt_json="$agent_dir/worktree.json"
+  local wt_path=""
+  if [[ -f "$wt_json" ]]; then
+    local dirty
+    dirty="$("$JQ" -r 'if (.dirty == true or .worktree_dirty == true or .status == "dirty" or .clean == false) then "dirty" else "" end' "$wt_json" 2>/dev/null || true)"
+    [[ "$dirty" == "dirty" ]] && { print -r -- "worktree metadata is dirty"; return 0; }
+    wt_path="$("$JQ" -r '.path // empty' "$wt_json" 2>/dev/null || true)"
+  fi
+  if [[ -n "$wt_path" && -f "$wt_path/.tmux-agent-worktree/meta.json" ]]; then
+    local meta_dirty
+    meta_dirty="$("$JQ" -r 'if (.dirty == true or .worktree_dirty == true or .status == "dirty" or .clean == false) then "dirty" else "" end' "$wt_path/.tmux-agent-worktree/meta.json" 2>/dev/null || true)"
+    [[ "$meta_dirty" == "dirty" ]] && { print -r -- "worktree metadata is dirty"; return 0; }
+  fi
+  if [[ -n "$wt_path" && -d "$wt_path/.git" ]] && command -v git >/dev/null 2>&1; then
+    local check_status
+    check_status="$(cd "$wt_path" && git status --porcelain 2>/dev/null || true)"
+    [[ -n "$check_status" ]] && { print -r -- "worktree has uncommitted changes"; return 0; }
+  fi
+  return 1
+}
+
+cleanup_sessions() {
+  local mode=""
+  local output_json=0
+  local all=0
+  local force=0
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --preview)
+        mode="preview"
+        ;;
+      --execute)
+        mode="execute"
+        ;;
+      --json)
+        output_json=1
+        ;;
+      --all)
+        all=1
+        ;;
+      --force)
+        force=1
+        ;;
+      --tool)
+        shift
+        FILTER_TOOL="$(parse_filter_arg "${1:-}")"
+        ;;
+      --tag)
+        shift
+        [[ "${1:-}" == *=* ]] || die "--tag must be key=value: ${1:-}"
+        FILTER_TAGS+=("$1")
+        ;;
+      --name)
+        shift
+        FILTER_NAME="${1:-}"
+        [[ -n "$FILTER_NAME" ]] || die "--name requires a value"
+        ;;
+      --state)
+        shift
+        FILTER_STATE="$(parse_state_arg "${1:-}")"
+        ;;
+      --created-after)
+        shift
+        FILTER_CREATED_AFTER_EPOCH="$(parse_timestamp_epoch "${1:-}")"
+        ;;
+      --cwd)
+        shift
+        FILTER_CWD="${1:-}"
+        [[ -n "$FILTER_CWD" ]] || die "--cwd requires a value"
+        ;;
+      *)
+        die "Usage: tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] | cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>) [--force]"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$mode" ]] || die "cleanup requires --preview or --execute"
+  [[ "$mode" != "execute" || "$output_json" -eq 0 ]] || die "--json is only supported with cleanup --preview"
+  if [[ "$mode" == "execute" && "$all" -eq 0 && -z "$FILTER_TOOL" && -z "$FILTER_NAME" && -z "$FILTER_STATE" && -z "$FILTER_CREATED_AFTER_EPOCH" && -z "$FILTER_CWD" ]]; then
+    die "cleanup --execute requires --all, --tool, --name, --state, --created-after, or --cwd"
+  fi
+
+  local rows tool name session dirty_reason
+  rows="$(inventory_json_array | "$JQ" -r '.[] | [.tool, .name, .session] | @tsv')"
+  while IFS=$'\t' read -r tool name session; do
+    [[ -z "$tool" ]] && continue
+    if [[ "$mode" == "preview" ]]; then
+      if (( output_json )); then
+        emit_inventory_json "$tool" "$name" "$session"
+      else
+        print -r -- "would stop: $(emit_inventory_text "$tool" "$name" "$session")"
+      fi
+      continue
+    fi
+
+    if (( ! force )) && dirty_reason="$(worktree_dirty_reason "$name")"; then
+      print -r -- "$SELF: refusing to stop $session: $dirty_reason (pass --force to override)" >&2
+      return 1
+    fi
+
+    case "$tool" in
+      claude|codex)
+        "$TMUX" kill-session -t "$session"
+        print -r -- "Stopped $session"
+        ;;
+      dialogue)
+        "$TMUX" kill-session -t "$session"
+        print -r -- "Stopped $session"
+        ;;
+    esac
+  done <<< "$rows"
+}
+
+command="${1:-help}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  list)
+    list_sessions "$@"
+    ;;
+  resolve)
+    resolve_session "$@"
+    ;;
+  diff)
+    diff_sessions "$@"
+    ;;
+  cleanup)
+    cleanup_sessions "$@"
+    ;;
+  watch)
+    watch_events "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

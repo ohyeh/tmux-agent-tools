@@ -1,0 +1,146 @@
+#!/usr/bin/env zsh
+# Smoke test for `start --headless` (first-class headless one-shot mode).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-headless-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+cleanup() {
+  local n
+  for n in hl-synth hl-self; do
+    TMUX_AGENT_DIR="$TMUX_AGENT_DIR" "$AGENT" claude stop "$n" >/dev/null 2>&1 || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: preset dry-run command assembly (claude/codex built-ins)"
+set +e
+claude_dry="$("$AGENT" claude start --headless --dry-run --exact hl-c "$WORK" 'do the task')"
+codex_dry="$("$AGENT" codex start --headless --dry-run --exact hl-x "$WORK" 'do the task')"
+set -e
+claude_cmd="$(printf '%s' "$claude_dry" | jq -r '.invocation.command // ""')"
+codex_cmd="$(printf '%s' "$codex_dry" | jq -r '.invocation.command // ""')"
+assert "claude dry-run exec_mode oneshot" "$(printf '%s' "$claude_dry" | jq -r '.invocation.exec_mode')" "oneshot"
+assert_contains "claude headless flags" "$claude_cmd" "--dangerously-skip-permissions"
+assert_contains "claude prompt flag" "$claude_cmd" " -p "
+assert "codex dry-run exec_mode oneshot" "$(printf '%s' "$codex_dry" | jq -r '.invocation.exec_mode')" "oneshot"
+assert_contains "codex exec subcommand" "$codex_cmd" "codex exec --dangerously-bypass-approvals-and-sandbox"
+
+echo "case: unsupported CLI exits 2"
+set +e
+grok_out="$("$AGENT" grok start --headless --dry-run --exact hl-g "$WORK" 'x' 2>&1)"
+grok_status=$?
+set -e
+assert "grok --headless exits 2" "$grok_status" "2"
+assert_contains "grok --headless error names profile keys" "$grok_out" "headless_flags"
+
+fake_cli="$WORK/fake-cli"
+cat > "$fake_cli" <<'EOF'
+#!/usr/bin/env zsh
+printf 'headless run: %s\n' "$*"
+exit 0
+EOF
+chmod +x "$fake_cli"
+
+# Same CLI but writes its own result.json (worker-authored result path).
+fake_cli_self="$WORK/fake-cli-self"
+cat > "$fake_cli_self" <<'EOF'
+#!/usr/bin/env zsh
+printf 'headless run: %s\n' "$*"
+[[ -n "${TMUX_AGENT_RESULT:-}" ]] || { echo 'TMUX_AGENT_RESULT unset' >&2; exit 3; }
+printf '{"schema_version":1,"status":"success","summary":"self-written","artifacts":[],"errors":[]}' > "$TMUX_AGENT_RESULT"
+exit 0
+EOF
+chmod +x "$fake_cli_self"
+
+fake_profile="$WORK/fake.conf"
+cat > "$fake_profile" <<EOF
+bin=$fake_cli
+headless_flags=exec
+headless_prompt_flag=-p
+session_id_capture=off
+EOF
+
+fake_self_profile="$WORK/fake-self.conf"
+cat > "$fake_self_profile" <<EOF
+bin=$fake_cli_self
+headless_flags=exec
+headless_prompt_flag=-p
+session_id_capture=off
+EOF
+
+echo "case: synthesized result carries the wait-required contract"
+"$AGENT" claude --profile "$fake_profile" start --exact --headless hl-synth "$WORK" 'bounded task' >/dev/null
+wait_json="$("$AGENT" claude --profile "$fake_profile" result wait-required hl-synth --fields status,summary --wait 15 --json)"
+assert "wait-required valid" "$(printf '%s' "$wait_json" | jq -r .valid)" "true"
+assert "synthesized status success" "$(printf '%s' "$wait_json" | jq -r .body.status)" "success"
+assert_contains "synthesized summary from stdout tail" "$(printf '%s' "$wait_json" | jq -r .body.summary)" "headless run:"
+assert "synthesized exit_code 0" "$(printf '%s' "$wait_json" | jq -r .body.exit_code)" "0"
+"$AGENT" claude --profile "$fake_profile" stop hl-synth >/dev/null 2>&1 || true
+
+echo "case: worker-authored result is preserved (no clobber)"
+"$AGENT" claude --profile "$fake_self_profile" start --exact --headless hl-self "$WORK" 'bounded task' >/dev/null
+self_json="$("$AGENT" claude --profile "$fake_self_profile" result wait-required hl-self --fields status,summary --wait 15 --json)"
+assert "self-written summary preserved" "$(printf '%s' "$self_json" | jq -r .body.summary)" "self-written"
+assert "no synthesized exit_code on self-written result" "$(printf '%s' "$self_json" | jq -r '.body.exit_code // "absent"')" "absent"
+"$AGENT" claude --profile "$fake_profile" stop hl-self >/dev/null 2>&1 || true
+
+echo "case: #P1 TMUX_AGENT_TOOLS_HEADLESS_FLAGS env override (dry-run launch_flags)"
+# Baseline: preset flags present when the env var is unset.
+base_lf="$(env -u TMUX_AGENT_TOOLS_HEADLESS_FLAGS "$AGENT" claude start --headless --dry-run --exact hl-env "$WORK" 'x' | jq -r '.invocation.launch_flags // ""')"
+assert "baseline uses preset headless flags" "$base_lf" "--dangerously-skip-permissions"
+
+# Set (non-empty): wholesale replacement of the preset flags.
+over_lf="$(TMUX_AGENT_TOOLS_HEADLESS_FLAGS='--model opus --verbose' "$AGENT" claude start --headless --dry-run --exact hl-env "$WORK" 'x' | jq -r '.invocation.launch_flags // ""')"
+assert "env override replaces preset flags" "$over_lf" "--model opus --verbose"
+
+# Empty string = clear (claude still has a prompt flag so --headless stays valid).
+empty_lf="$(TMUX_AGENT_TOOLS_HEADLESS_FLAGS='' "$AGENT" claude start --headless --dry-run --exact hl-env "$WORK" 'x' | jq -r '.invocation.launch_flags // ""')"
+assert "empty env override clears flags" "$empty_lf" ""
+
+# Special characters (quotes/spaces/equals) survive verbatim into launch_flags.
+special='--sys="a b" --x=1'
+special_lf="$(TMUX_AGENT_TOOLS_HEADLESS_FLAGS="$special" "$AGENT" claude start --headless --dry-run --exact hl-env "$WORK" 'x' | jq -r '.invocation.launch_flags // ""')"
+assert "special chars preserved in override" "$special_lf" "$special"
+
+# codex's preset carries the exec subcommand INSIDE headless_flags — an empty
+# override leaves no runnable invocation and must refuse, naming the env var
+# as the cause (review F5).
+codex_empty_rc=0
+codex_empty_err="$(TMUX_AGENT_TOOLS_HEADLESS_FLAGS='' "$AGENT" codex start --headless --dry-run --exact hl-env-cx "$WORK" 'x' 2>&1 >/dev/null)" || codex_empty_rc=$?
+assert "codex empty override exits 2" "$codex_empty_rc" "2"
+assert_contains "codex empty override names the env var" "$codex_empty_err" "TMUX_AGENT_TOOLS_HEADLESS_FLAGS"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

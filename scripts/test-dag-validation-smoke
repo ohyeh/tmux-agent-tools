@@ -1,0 +1,253 @@
+#!/usr/bin/env zsh
+# Smoke for tmux-agent-dag DAG validation + topological execution (#186).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DAG="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-dag"
+
+TMPROOT="$(mktemp -d)"
+trap 'rm -rf "$TMPROOT"' EXIT
+
+PASS=0
+FAIL=0
+
+pass() { echo "  ok   $1"; PASS=$((PASS + 1)); }
+fail() { echo "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
+
+assert_eq() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    pass "$label"
+  else
+    fail "$label expected=$expected got=$actual"
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    pass "$label"
+  else
+    fail "$label (needle: $needle)"
+    echo "    haystack: $haystack" >&2
+  fi
+}
+
+mk_result_ok() {
+  # $1 = path
+  mkdir -p "$(dirname "$1")"
+  printf '{"status":"ok"}\n' > "$1"
+}
+
+# -------- case 1: valid out-of-order manifest executes in topo order --------
+echo "case: valid out-of-order manifest"
+T1="$TMPROOT/case1"; mkdir -p "$T1"
+cat > "$T1/manifest.json" <<EOF
+{
+  "schema_version": 1,
+  "fail_fast": true,
+  "tasks": [
+    {"name":"c","depends_on":["b"],"command":"echo c >> $T1/order && printf '{\"status\":\"ok\"}' > $T1/c.json","result_path":"$T1/c.json"},
+    {"name":"a","depends_on":[],"command":"echo a >> $T1/order && printf '{\"status\":\"ok\"}' > $T1/a.json","result_path":"$T1/a.json"},
+    {"name":"b","depends_on":["a"],"command":"echo b >> $T1/order && printf '{\"status\":\"ok\"}' > $T1/b.json","result_path":"$T1/b.json"}
+  ]
+}
+EOF
+code=0
+summary="$("$DAG" "$T1/manifest.json" 2>&1)" || code=$?
+assert_eq "case1 exit=0" "$code" "0"
+order_actual="$(tr '\n' ' ' < "$T1/order" | sed 's/ $//')"
+assert_eq "case1 execution order = a b c" "$order_actual" "a b c"
+assert_contains "case1 ok=true" "$summary" '"ok": true'
+assert_contains "case1 ordered_tasks contains a,b,c" "$summary" '"a"'
+
+# -------- case 2: missing dependency --------
+echo "case: missing dependency"
+T2="$TMPROOT/case2"; mkdir -p "$T2"
+cat > "$T2/manifest.json" <<EOF
+{"schema_version":1,"tasks":[
+  {"name":"a","depends_on":["ghost"],"command":"true"}
+]}
+EOF
+code=0
+out="$("$DAG" "$T2/manifest.json" 2>&1)" || code=$?
+assert_eq "case2 exit!=0" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+assert_contains "case2 mentions missing dep" "$out" "missing dependency"
+# Must fail BEFORE execution — no side effect would have run anyway, but
+# ensure the error path is the validator (no "ok" task results).
+assert_contains "case2 ok=false" "$out" '"ok": false'
+
+# -------- case 3: cycle --------
+echo "case: cycle detection"
+T3="$TMPROOT/case3"; mkdir -p "$T3"
+cat > "$T3/manifest.json" <<EOF
+{"schema_version":1,"tasks":[
+  {"name":"a","depends_on":["c"],"command":"echo should-not-run > $T3/a"},
+  {"name":"b","depends_on":["a"],"command":"echo should-not-run > $T3/b"},
+  {"name":"c","depends_on":["b"],"command":"echo should-not-run > $T3/c"}
+]}
+EOF
+code=0
+out="$("$DAG" "$T3/manifest.json" 2>&1)" || code=$?
+assert_eq "case3 exit!=0" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+assert_contains "case3 cycle reported" "$out" "cycle detected"
+# Confirm no command ran.
+if [[ -e "$T3/a" || -e "$T3/b" || -e "$T3/c" ]]; then
+  fail "case3 commands ran before validation"
+else
+  pass "case3 no commands executed"
+fi
+
+# -------- case 4: duplicate task name --------
+echo "case: duplicate task name"
+T4="$TMPROOT/case4"; mkdir -p "$T4"
+cat > "$T4/manifest.json" <<EOF
+{"schema_version":1,"tasks":[
+  {"name":"a","depends_on":[],"command":"true"},
+  {"name":"a","depends_on":[],"command":"true"}
+]}
+EOF
+code=0
+out="$("$DAG" "$T4/manifest.json" 2>&1)" || code=$?
+assert_eq "case4 exit!=0" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+assert_contains "case4 mentions duplicate" "$out" "duplicate task name"
+
+# -------- case 5: self-dependency --------
+echo "case: self-dependency"
+T5="$TMPROOT/case5"; mkdir -p "$T5"
+cat > "$T5/manifest.json" <<EOF
+{"schema_version":1,"tasks":[
+  {"name":"a","depends_on":["a"],"command":"true"}
+]}
+EOF
+code=0
+out="$("$DAG" "$T5/manifest.json" 2>&1)" || code=$?
+assert_eq "case5 exit!=0" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+assert_contains "case5 mentions self-dependency" "$out" "self-dependency"
+
+# -------- case 6: failed dep skips downstream (fail_fast=true) --------
+echo "case: fail_fast=true skips downstream"
+T6="$TMPROOT/case6"; mkdir -p "$T6"
+cat > "$T6/manifest.json" <<EOF
+{
+  "schema_version":1,
+  "fail_fast": true,
+  "tasks":[
+    {"name":"a","depends_on":[],"command":"printf '{\"status\":\"ok\"}' > $T6/a.json","result_path":"$T6/a.json"},
+    {"name":"b","depends_on":["a"],"command":"exit 7","result_path":"$T6/b.json"},
+    {"name":"c","depends_on":["b"],"command":"echo ran-c > $T6/c.txt && printf '{\"status\":\"ok\"}' > $T6/c.json","result_path":"$T6/c.json"},
+    {"name":"d","depends_on":[],"command":"echo ran-d > $T6/d.txt && printf '{\"status\":\"ok\"}' > $T6/d.json","result_path":"$T6/d.json"}
+  ]
+}
+EOF
+code=0
+out="$("$DAG" "$T6/manifest.json" --summary-out "$T6/summary.json" 2>&1)" || code=$?
+assert_eq "case6 exit!=0" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+# c must be skipped (depends on failed b).
+c_status="$(jq -r '.results[] | select(.name=="c") | .status' "$T6/summary.json")"
+assert_eq "case6 c skipped" "$c_status" "skipped"
+b_status="$(jq -r '.results[] | select(.name=="b") | .status' "$T6/summary.json")"
+assert_eq "case6 b failed" "$b_status" "failed"
+# d order in fail_fast=true: if d topologically comes after b, it is skipped;
+# if it comes before b, it ran. With manifest order tiebreak, order is
+# a,b,c,d -> d skipped.
+d_status="$(jq -r '.results[] | select(.name=="d") | .status' "$T6/summary.json")"
+assert_eq "case6 d skipped under fail_fast=true (topo placement)" "$d_status" "skipped"
+
+# -------- case 7: failed dep continues independent branch (fail_fast=false) --
+echo "case: fail_fast=false runs independent branches"
+T7="$TMPROOT/case7"; mkdir -p "$T7"
+cat > "$T7/manifest.json" <<EOF
+{
+  "schema_version":1,
+  "fail_fast": false,
+  "tasks":[
+    {"name":"a","depends_on":[],"command":"printf '{\"status\":\"ok\"}' > $T7/a.json","result_path":"$T7/a.json"},
+    {"name":"b","depends_on":["a"],"command":"exit 7","result_path":"$T7/b.json"},
+    {"name":"c","depends_on":["b"],"command":"echo ran-c > $T7/c.txt && printf '{\"status\":\"ok\"}' > $T7/c.json","result_path":"$T7/c.json"},
+    {"name":"d","depends_on":[],"command":"echo ran-d > $T7/d.txt && printf '{\"status\":\"ok\"}' > $T7/d.json","result_path":"$T7/d.json"},
+    {"name":"e","depends_on":["d"],"command":"echo ran-e > $T7/e.txt && printf '{\"status\":\"ok\"}' > $T7/e.json","result_path":"$T7/e.json"}
+  ]
+}
+EOF
+code=0
+out="$("$DAG" "$T7/manifest.json" --summary-out "$T7/summary.json" 2>&1)" || code=$?
+assert_eq "case7 exit!=0 (b failed)" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+c_status="$(jq -r '.results[] | select(.name=="c") | .status' "$T7/summary.json")"
+assert_eq "case7 c skipped (depends on failed b)" "$c_status" "skipped"
+d_status="$(jq -r '.results[] | select(.name=="d") | .status' "$T7/summary.json")"
+assert_eq "case7 d ok (independent branch)" "$d_status" "ok"
+e_status="$(jq -r '.results[] | select(.name=="e") | .status' "$T7/summary.json")"
+assert_eq "case7 e ok (independent branch)" "$e_status" "ok"
+if [[ -f "$T7/d.txt" && -f "$T7/e.txt" ]]; then
+  pass "case7 independent branch commands ran"
+else
+  fail "case7 expected d.txt and e.txt to exist"
+fi
+if [[ -e "$T7/c.txt" ]]; then
+  fail "case7 c command must not have run"
+else
+  pass "case7 c command did not run"
+fi
+
+# -------- case 8: task name with space executes correctly --------
+echo "case: task name containing space"
+T8="$TMPROOT/case8"; mkdir -p "$T8"
+cat > "$T8/manifest.json" <<EOF
+{
+  "schema_version":1,
+  "fail_fast": true,
+  "tasks":[
+    {"name":"task one","depends_on":[],"command":"echo one >> $T8/order && printf '{\"status\":\"ok\"}' > '$T8/one.json'","result_path":"$T8/one.json"},
+    {"name":"task two","depends_on":["task one"],"command":"echo two >> $T8/order && printf '{\"status\":\"ok\"}' > '$T8/two.json'","result_path":"$T8/two.json"}
+  ]
+}
+EOF
+code=0
+out="$("$DAG" "$T8/manifest.json" --summary-out "$T8/summary.json" 2>&1)" || code=$?
+assert_eq "case8 exit=0" "$code" "0"
+order_actual="$(tr '\n' ' ' < "$T8/order" | sed 's/ $//')"
+assert_eq "case8 order = one two" "$order_actual" "one two"
+two_status="$(jq -r '.results[] | select(.name=="task two") | .status' "$T8/summary.json")"
+assert_eq "case8 'task two' ok" "$two_status" "ok"
+
+# -------- case 9: duplicate dep within a task -> validation error --------
+echo "case: duplicate dependency within task"
+T9="$TMPROOT/case9"; mkdir -p "$T9"
+cat > "$T9/manifest.json" <<EOF
+{"schema_version":1,"tasks":[
+  {"name":"a","depends_on":[],"command":"true"},
+  {"name":"b","depends_on":["a","a"],"command":"true"}
+]}
+EOF
+code=0
+out="$("$DAG" "$T9/manifest.json" 2>&1)" || code=$?
+assert_eq "case9 exit!=0" "$([[ $code -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+assert_contains "case9 mentions duplicate dependency" "$out" "duplicate dependency"
+
+# -------- case 10: task names with special chars (/, -, _) --------
+echo "case: task names with special characters"
+T10="$TMPROOT/case10"; mkdir -p "$T10"
+cat > "$T10/manifest.json" <<EOF
+{
+  "schema_version":1,
+  "fail_fast": true,
+  "tasks":[
+    {"name":"build/step-1","depends_on":[],"command":"echo s1 >> $T10/order && printf '{\"status\":\"ok\"}' > '$T10/s1.json'","result_path":"$T10/s1.json"},
+    {"name":"deploy_prod","depends_on":["build/step-1"],"command":"echo s2 >> $T10/order && printf '{\"status\":\"ok\"}' > '$T10/s2.json'","result_path":"$T10/s2.json"}
+  ]
+}
+EOF
+code=0
+out="$("$DAG" "$T10/manifest.json" --summary-out "$T10/summary.json" 2>&1)" || code=$?
+assert_eq "case10 exit=0" "$code" "0"
+order_actual="$(tr '\n' ' ' < "$T10/order" | sed 's/ $//')"
+assert_eq "case10 order = s1 s2" "$order_actual" "s1 s2"
+s2_status="$(jq -r '.results[] | select(.name=="deploy_prod") | .status' "$T10/summary.json")"
+assert_eq "case10 deploy_prod ok" "$s2_status" "ok"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

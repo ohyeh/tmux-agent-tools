@@ -1,0 +1,22 @@
+{
+  "name": "tmux-agent-tools",
+  "version": "0.35.0",
+  "description": "Tmux wrappers, tmux-delegate, and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent pair/team orchestration.",
+  "author": {
+    "name": "PaulYeh",
+    "url": "https://github.com/ohyeh"
+  },
+  "homepage": "https://github.com/ohyeh/tmux-agent-tools#readme",
+  "repository": "https://github.com/ohyeh/tmux-agent-tools",
+  "keywords": [
+    "tmux",
+    "claude-code",
+    "codex",
+    "agent",
+    "orchestration",
+    "multi-agent",
+    "session",
+    "supervision"
+  ],
+  "skills": "./skills/"
+}

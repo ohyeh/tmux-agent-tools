@@ -1,0 +1,534 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install runtime tools
+        run: |
+          brew list tmux >/dev/null 2>&1 || brew install tmux
+          brew list jq >/dev/null 2>&1 || brew install jq
+          brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
+          brew list shellcheck >/dev/null 2>&1 || brew install shellcheck
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+
+      - name: Validate shell scripts
+        run: |
+          scripts/lint-no-path-tied-locals
+          zsh -n skills/tmux-agent-tools/scripts/agent-tmux
+          zsh -n skills/tmux-agent-tools/scripts/claude-tmux
+          zsh -n skills/tmux-agent-tools/scripts/codex-tmux
+          zsh -n skills/tmux-agent-tools/scripts/agy-tmux
+          zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
+          zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
+          zsh -n skills/tmux-agent-tools/scripts/install-bin
+          scripts/ci-shellcheck
+
+      - name: Validate skill metadata
+        run: |
+          ruby -e '
+            require "yaml"
+            path = "skills/tmux-agent-tools/SKILL.md"
+            text = File.read(path)
+            abort("#{path}: missing frontmatter") unless text.start_with?("---\n")
+            _, frontmatter, body = text.split(/^---\s*$/, 3)
+            data = YAML.safe_load(frontmatter)
+            abort("#{path}: missing name") unless data["name"] == "tmux-agent-tools"
+            abort("#{path}: missing description") unless data["description"].to_s.length > 20
+            abort("#{path}: missing body") unless body.to_s.include?("claude-tmux") && body.to_s.include?("codex-tmux")
+          '
+
+      - name: Validate Homebrew formula
+        run: |
+          ruby -c Formula/tmux-agent-tools.rb
+          brew style Formula/tmux-agent-tools.rb
+
+      - name: Run wrapper self-tests
+        run: |
+          skills/tmux-agent-tools/scripts/codex-tmux self-test
+          skills/tmux-agent-tools/scripts/claude-tmux self-test
+          scripts/test-version-sync-smoke
+          scripts/test-color-env-smoke
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 0'
+          watch_zero_output="$(skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 0)"
+          test -z "$watch_zero_output"
+          watch_bad_count_output="$(mktemp)"
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count nope >"$watch_bad_count_output" 2>&1; then
+            echo "watch --count must reject non-integers" >&2
+            exit 1
+          fi
+          rg -n -- "--count requires a non-negative integer" "$watch_bad_count_output"
+          skills/tmux-agent-tools/scripts/claude-tmux status --json missing-ci-status | jq -e '.tool == "claude" and .name == "missing-ci-status" and .exists == false and .running == false and .exit_detected == false and .exit_code == null and .local_or_remote == null and .diagnostic == null and .last_capture_lines == [] and .confirmation_detected == false and .blocked_reason == null'
+          skills/tmux-agent-tools/scripts/codex-tmux status --json missing-ci-status | jq -e '.tool == "codex" and .name == "missing-ci-status" and .exists == false and .running == false and .exit_detected == false and .exit_code == null and .local_or_remote == null and .diagnostic == null and .last_capture_lines == [] and .confirmation_detected == false and .blocked_reason == null'
+          fake_cli_dir="$(mktemp -d)"
+          printf '%s\n' '#!/bin/sh' 'sleep 1' > "$fake_cli_dir/claude"
+          printf '%s\n' '#!/bin/sh' 'sleep 1' > "$fake_cli_dir/codex"
+          chmod +x "$fake_cli_dir/claude" "$fake_cli_dir/codex"
+          claude_clipboard_conf="$(mktemp)"
+          codex_clipboard_conf="$(mktemp)"
+          CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CONF="$claude_clipboard_conf" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/claude-tmux start --exact ci-clipboard . >/tmp/claude-clipboard.out
+          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CONF="$codex_clipboard_conf" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/codex-tmux start --exact ci-clipboard . >/tmp/codex-clipboard.out
+          rg -n 'set -g mouse "on"' "$claude_clipboard_conf"
+          rg -n 'copy-selection-and-cancel' "$claude_clipboard_conf"
+          rg -n 'MouseDragEnd1Pane send -X copy-selection-and-cancel' "$claude_clipboard_conf"
+          rg -n 'copy-pipe-and-cancel "sh -c \\"cat >/tmp/tmux-agent-tools-ci-copy\\""' "$codex_clipboard_conf"
+          rg -n 'MouseDragEnd1Pane send -X copy-pipe-and-cancel "sh -c \\"cat >/tmp/tmux-agent-tools-ci-copy\\""' "$codex_clipboard_conf"
+          CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/claude-tmux doctor | rg -n 'clipboard: internal'
+          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/codex-tmux doctor | rg -n 'clipboard: sh -c "cat >/tmp/tmux-agent-tools-ci-copy"'
+          skills/tmux-agent-tools/scripts/claude-tmux stop ci-clipboard
+          skills/tmux-agent-tools/scripts/codex-tmux stop ci-clipboard
+          tmux new-session -d -s claude-cli-ci-hygiene 'sleep 300'
+          tmux new-session -d -s codex-cli-ci-hygiene 'sleep 300'
+          tmux new-session -d -s tmux-agent-dialogue-ci-hygiene-a 'sleep 300'
+          tmux new-session -d -s unrelated-ci-hygiene 'sleep 300'
+          skills/tmux-agent-tools/scripts/claude-tmux status --json ci-hygiene | jq -e '.tool == "claude" and .name == "ci-hygiene" and .session == "claude-cli-ci-hygiene" and .prefix == "claude-cli" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local" and (.last_capture_lines | type == "array" and length <= 20) and .confirmation_detected == false and .blocked_reason == null'
+          skills/tmux-agent-tools/scripts/codex-tmux status --json ci-hygiene | jq -e '.tool == "codex" and .name == "ci-hygiene" and .session == "codex-cli-ci-hygiene" and .prefix == "codex-cli" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local" and (.last_capture_lines | type == "array" and length <= 20) and .confirmation_detected == false and .blocked_reason == null'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and (map(select(.tool == "claude" or .tool == "codex")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local")) and (map(select(.tool == "dialogue")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == null))'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --sort name | jq -s -e '[.[].name] == ["ci-hygiene","ci-hygiene","ci-hygiene-a"]'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --sort session | jq -s -e '[.[].session] == ["claude-cli-ci-hygiene","codex-cli-ci-hygiene","tmux-agent-dialogue-ci-hygiene-a"]'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --state running --sort tool | jq -s -e 'length == 3 and [.[].tool] == ["claude","codex","dialogue"] and all(.state == "running")'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --state exited | jq -s -e 'length == 0'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 1 --interval 0 --state running --sort name | jq -s -e 'length == 1 and (.[0] | length == 3 and [.[].name] == ["ci-hygiene","ci-hygiene","ci-hygiene-a"])'
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --sort nope >/tmp/session-sort-bad.out 2>&1; then
+            echo "list --sort must reject unknown fields" >&2
+            exit 1
+          fi
+          rg -n -- "--sort must be one of: tool, name, session, state" /tmp/session-sort-bad.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --state unknown >/tmp/session-state-bad.out 2>&1; then
+            echo "list --state must reject unknown states" >&2
+            exit 1
+          fi
+          rg -n -- "--state must be one of: running, exited, stopped, missing" /tmp/session-state-bad.out
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 2 --interval 0 | jq -s 'length == 2 and all(type == "array" and length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and (map(select(.tool == "claude" or .tool == "codex")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == "local")) and (map(select(.tool == "dialogue")) | all(.state == "running" and .exists == true and .running == true and .exit_detected == false and .exit_code == null and .local_or_remote == null)))'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n "claude-cli-ci-hygiene|codex-cli-ci-hygiene|tmux-agent-dialogue-ci-hygiene-a"
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview | rg -n $'would stop: (claude|codex|dialogue)\\tci-hygiene(-a)?\\t(claude-cli|codex-cli|tmux-agent-dialogue)-ci-hygiene(-a)?\\trunning'
+          cleanup_preview_all="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json > "$cleanup_preview_all"
+          jq -s -e 'length == 3 and ([.[].tool] | sort == ["claude","codex","dialogue"]) and ([.[].session] | all(. != "unrelated-ci-hygiene")) and (all(.state == "running" and .exists == true and .running == true))' "$cleanup_preview_all"
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --tool claude | jq -s -e 'length == 1 and .[0].tool == "claude" and .[0].name == "ci-hygiene" and .[0].session == "claude-cli-ci-hygiene"'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --tool dialogue | jq -s -e 'length == 1 and .[0].tool == "dialogue" and .[0].name == "ci-hygiene-a" and .[0].session == "tmux-agent-dialogue-ci-hygiene-a"'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --name ci-hygiene | jq -s -e 'length == 2 and ([.[].tool] | sort == ["claude","codex"]) and all(.name == "ci-hygiene")'
+          tmux has-session -t claude-cli-ci-hygiene
+          tmux has-session -t codex-cli-ci-hygiene
+          tmux has-session -t tmux-agent-dialogue-ci-hygiene-a
+          if skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --json --name ci-hygiene >/tmp/cleanup-execute-json.out 2>&1; then
+            echo "cleanup --execute must reject --json" >&2
+            exit 1
+          fi
+          rg -n -- "--json is only supported with cleanup --preview" /tmp/cleanup-execute-json.out
+          tmux has-session -t unrelated-ci-hygiene
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --name ci-hygiene
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --execute --tool dialogue --name ci-hygiene-a
+          if tmux has-session -t claude-cli-ci-hygiene 2>/dev/null || tmux has-session -t codex-cli-ci-hygiene 2>/dev/null || tmux has-session -t tmux-agent-dialogue-ci-hygiene-a 2>/dev/null; then
+            echo "owned hygiene sessions should have been stopped" >&2
+            exit 1
+          fi
+          tmux has-session -t unrelated-ci-hygiene
+          tmux kill-session -t unrelated-ci-hygiene
+          tmux new-session -d -s claude-cli-ci-status-exited 'printf "local command exited with code 7\n"; sleep 300'
+          tmux new-session -d -s codex-cli-ci-status-exited 'printf "remote command exited with code 2\n"; sleep 300'
+          sleep 0.2
+          CLAUDE_TMUX_STATUS_TAIL_LINES=1 skills/tmux-agent-tools/scripts/claude-tmux status --json ci-status-exited | jq -e '.tool == "claude" and .exists == true and .running == false and .exit_detected == true and .exit_code == 7 and .local_or_remote == "local" and (.last_capture_lines | length == 1 and .[0] == "local command exited with code 7") and .confirmation_detected == false and .blocked_reason == "cli_exited"'
+          CODEX_TMUX_STATUS_TAIL_LINES=1 skills/tmux-agent-tools/scripts/codex-tmux status --json ci-status-exited | jq -e '.tool == "codex" and .exists == true and .running == false and .exit_detected == true and .exit_code == 2 and .local_or_remote == "remote" and (.last_capture_lines | length == 1 and .[0] == "remote command exited with code 2") and .confirmation_detected == false and .blocked_reason == "cli_exited"'
+          tmux new-session -d -s claude-cli-ci-status-prompt 'printf "Do you want to proceed?\\n"; sleep 300'
+          tmux new-session -d -s codex-cli-ci-status-prompt 'printf "approval required [y/n]\\n"; sleep 300'
+          sleep 0.2
+          skills/tmux-agent-tools/scripts/claude-tmux status --json ci-status-prompt | jq -e '.tool == "claude" and .exists == true and .running == true and .confirmation_detected == true and .blocked_reason == "permission_prompt" and (.diagnostic | type == "string")'
+          skills/tmux-agent-tools/scripts/codex-tmux status --json ci-status-prompt | jq -e '.tool == "codex" and .exists == true and .running == true and .confirmation_detected == true and .blocked_reason == "approval_prompt" and (.diagnostic | type == "string")'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --name ci-status-prompt | jq -s 'length == 2 and any(.tool == "claude" and .confirmation_detected == true and .blocked_reason == "permission_prompt") and any(.tool == "codex" and .confirmation_detected == true and .blocked_reason == "approval_prompt")'
+          tmux kill-session -t claude-cli-ci-status-prompt
+          tmux kill-session -t codex-cli-ci-status-prompt
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json --name ci-status-exited | jq -s 'length == 2 and any(.tool == "claude" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .exit_code == 7 and .local_or_remote == "local") and any(.tool == "codex" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .exit_code == 2 and .local_or_remote == "remote")'
+          skills/tmux-agent-tools/scripts/tmux-agent-sessions cleanup --preview --json --name ci-status-exited | jq -s 'length == 2 and any(.tool == "claude" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .exit_code == 7 and .local_or_remote == "local") and any(.tool == "codex" and .state == "exited" and .exists == true and .running == false and .exit_detected == true and .exit_code == 2 and .local_or_remote == "remote")'
+          tmux kill-session -t claude-cli-ci-status-exited
+          tmux kill-session -t codex-cli-ci-status-exited
+          long_marker="WRAPSTART_$(printf '%120s' '' | tr ' ' x)_WRAPEND"
+          tmux new-session -d -x 40 -y 10 -s claude-cli-ci-wrap "printf '%s\n' '$long_marker'; sleep 300"
+          tmux new-session -d -x 40 -y 10 -s codex-cli-ci-wrap "printf '%s\n' '$long_marker'; sleep 300"
+          sleep 0.2
+          skills/tmux-agent-tools/scripts/claude-tmux capture ci-wrap 5 | rg -n "$long_marker"
+          skills/tmux-agent-tools/scripts/codex-tmux capture ci-wrap 5 | rg -n "$long_marker"
+          tmux kill-session -t claude-cli-ci-wrap
+          tmux kill-session -t codex-cli-ci-wrap
+          prompt_file="$(mktemp)"
+          transcript_file="$(mktemp)"
+          printf '%s\n' 'Discuss the smoke test.' > "$prompt_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 4 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$transcript_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --schema-version 1 --transcript "$transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --schema-version 2 >/tmp/unsupported-schema-version.out 2>&1; then
+            echo "unsupported transcript schema versions must fail" >&2
+            exit 1
+          fi
+          rg -n "unsupported transcript schema version: 2" /tmp/unsupported-schema-version.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --schema-version "" --transcript "$transcript_file" >/tmp/empty-schema-version.out 2>&1; then
+            echo "empty transcript schema versions must fail" >&2
+            exit 1
+          fi
+          rg -n -- "--schema-version must be 1" /tmp/empty-schema-version.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --schema-version 1 --transcript "$transcript_file" >/tmp/schema-version-summary.out 2>&1; then
+            echo "--schema-version must be scoped to validate-transcript" >&2
+            exit 1
+          fi
+          rg -n -- "--schema-version is only supported with validate-transcript" /tmp/schema-version-summary.out
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$transcript_file"
+          participants_config="$(mktemp)"
+          jq -n --arg workdir "$PWD" '{local_fake:{agent:"fake",workdir:$workdir}, local_codex:{agent:"codex",workdir:$workdir}, env_codex:{agent:"codex",workdir:$workdir,env:{TMUX_AGENT_TOOLS_PROFILE_ENV:"profile-ok"}}, short_timeout:{agent:"fake",workdir:$workdir,timeout:"1"}, needs_override:{agent:"fake",workdir:"/definitely/missing/tmux-agent-tools-profile"}, bad_fake:{agent:"fake",ssh:"example",workdir:"/tmp"}, bad_extra:{agent:"fake",extra:"nope"}, bad_type:{agent:true}, bad_timeout:{agent:"fake",timeout:"nope"}, bad_timeout_zero:{agent:"fake",timeout:"0"}, bad_env_key:{agent:"fake",env:{"BAD-NAME":"nope"}}, bad_env_type:{agent:"fake",env:{TMUX_AGENT_TOOLS_PROFILE_ENV:true}}, bad_env_newline:{agent:"fake",env:{TMUX_AGENT_TOOLS_PROFILE_ENV:"bad\nvalue"}}}' > "$participants_config"
+          profile_transcript_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 2 --workdir . --agent-a-profile local_fake --agent-b-profile local_fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$profile_transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$profile_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .agent == "fake" and .speaker == "agent-a")' "$profile_transcript_file"
+          override_transcript_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 2 --workdir . --agent-a-profile needs_override --agent-a-workdir . --agent-b-profile local_fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$override_transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$override_transcript_file"
+          env_fake_cli_dir="$(mktemp -d)"
+          printf '%s\n' \
+            '#!/usr/bin/env zsh' \
+            'part_a=""' \
+            'while IFS= read -r line; do' \
+            '  case "$line" in' \
+            '    "PART_A: "*) part_a="${line#PART_A: }" ;;' \
+            '    "PART_B: "*) print -r -- "profile-env:${TMUX_AGENT_TOOLS_PROFILE_ENV-unset}"; print -r -- "${part_a}${line#PART_B: }" ;;' \
+            '  esac' \
+            'done' > "$env_fake_cli_dir/codex"
+          chmod +x "$env_fake_cli_dir/codex"
+          no_env_profile_transcript_file="$(mktemp)"
+          CODEX="$env_fake_cli_dir/codex" skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile local_codex --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$no_env_profile_transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$no_env_profile_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .agent == "codex" and (.text | contains("profile-env:unset")))' "$no_env_profile_transcript_file"
+          env_profile_transcript_file="$(mktemp)"
+          CODEX="$env_fake_cli_dir/codex" skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile env_codex --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$env_profile_transcript_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$env_profile_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .agent == "codex" and (.text | contains("profile-env:profile-ok")))' "$env_profile_transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile missing --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/missing-profile.jsonl --timeout 1 >/tmp/missing-profile.out 2>&1; then
+            echo "missing profiles must fail" >&2
+            exit 1
+          fi
+          rg -n "participant profile not found: missing|available: .*local_fake" /tmp/missing-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_extra --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-extra-profile.jsonl --timeout 1 >/tmp/bad-extra-profile.out 2>&1; then
+            echo "participant profiles with unknown keys must fail" >&2
+            exit 1
+          fi
+          rg -n "may only contain agent, ssh, workdir, timeout, and env" /tmp/bad-extra-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_type --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-type-profile.jsonl --timeout 1 >/tmp/bad-type-profile.out 2>&1; then
+            echo "participant profiles with non-string values must fail" >&2
+            exit 1
+          fi
+          rg -n "values must be strings, except env must be an object" /tmp/bad-type-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_timeout --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-timeout-profile.jsonl >/tmp/bad-timeout-profile.out 2>&1; then
+            echo "participant profile timeout values must be positive integer strings" >&2
+            exit 1
+          fi
+          rg -n "timeout must be a positive integer string" /tmp/bad-timeout-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_timeout_zero --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-timeout-zero-profile.jsonl >/tmp/bad-timeout-zero-profile.out 2>&1; then
+            echo "participant profile timeout values must reject zero" >&2
+            exit 1
+          fi
+          rg -n "timeout must be a positive integer string" /tmp/bad-timeout-zero-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_env_key --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-env-key-profile.jsonl --timeout 1 >/tmp/bad-env-key-profile.out 2>&1; then
+            echo "participant profile env keys must be shell environment names" >&2
+            exit 1
+          fi
+          rg -n "env must be an object of newline-free string values keyed by shell environment names" /tmp/bad-env-key-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_env_type --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-env-type-profile.jsonl --timeout 1 >/tmp/bad-env-type-profile.out 2>&1; then
+            echo "participant profile env values must be strings" >&2
+            exit 1
+          fi
+          rg -n "env must be an object of newline-free string values keyed by shell environment names" /tmp/bad-env-type-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_env_newline --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-env-newline-profile.jsonl --timeout 1 >/tmp/bad-env-newline-profile.out 2>&1; then
+            echo "participant profile env values must be newline-free" >&2
+            exit 1
+          fi
+          rg -n "env must be an object of newline-free string values keyed by shell environment names" /tmp/bad-env-newline-profile.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile bad_fake --agent-b fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript /tmp/bad-fake-profile.jsonl --timeout 1 >/tmp/bad-fake-profile.out 2>&1; then
+            echo "fake profile SSH must fail" >&2
+            exit 1
+          fi
+          rg -n -- "--agent-a-ssh cannot be used with --agent-a fake" /tmp/bad-fake-profile.out
+          profile_timeout_transcript_file="$(mktemp)"
+          if TMUX_AGENT_DIALOGUE_TEST_TIMEOUT_FAKE_TURN=1 skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a-profile short_timeout --agent-b-profile local_fake --participants-config "$participants_config" --prompt-file "$prompt_file" --transcript "$profile_timeout_transcript_file"; then
+            echo "profile timeout test should fail" >&2
+            exit 1
+          fi
+          jq -e 'select(.event == "failure" and .failure_type == "marker_timeout")' "$profile_timeout_transcript_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$profile_timeout_transcript_file"
+          timeout_transcript_file="$(mktemp)"
+          if TMUX_AGENT_DIALOGUE_TEST_TIMEOUT_FAKE_TURN=1 skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$timeout_transcript_file" --timeout 1; then
+            echo "timeout test should fail" >&2
+            exit 1
+          fi
+          jq -e 'select(.event == "failure" and .failure_type == "marker_timeout")' "$timeout_transcript_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$timeout_transcript_file"
+          missing_session_transcript_file="$(mktemp)"
+          if TMUX_AGENT_DIALOGUE_TEST_KILL_FAKE_TURN=1 skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$missing_session_transcript_file" --timeout 1; then
+            echo "missing session test should fail" >&2
+            exit 1
+          fi
+          jq -e 'select(.event == "failure" and .failure_type == "session_missing")' "$missing_session_transcript_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$missing_session_transcript_file"
+          blocked_transcript_file="$(mktemp)"
+          blocked_trigger_file="$(mktemp)"
+          rm -f "$blocked_trigger_file"
+          if TMUX_AGENT_DIALOGUE_TEST_BLOCKED_FAKE_TURN=1 skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$blocked_transcript_file" --on-blocked-trigger "$blocked_trigger_file" --timeout 1; then
+            echo "blocked fake turn should fail" >&2
+            exit 1
+          fi
+          jq -e 'select(.event == "failure" and .failure_type == "permission_prompt")' "$blocked_transcript_file"
+          jq -e '.event == "blocked" and .participant == "agent-a" and .agent == "fake" and .blocked_reason == "permission_prompt" and (.timestamp | type == "string" and length > 0)' "$blocked_trigger_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$blocked_transcript_file"
+          invalid_transcript_file="$(mktemp)"
+          printf '%s\n' '{"event":"turn"}' > "$invalid_transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$invalid_transcript_file" >/tmp/invalid-transcript.out 2>&1; then
+            echo "invalid transcripts must fail validation" >&2
+            exit 1
+          fi
+          rg -n "turn must be|speaker must be|agent must be|marker must be|timestamp must be|text must be" /tmp/invalid-transcript.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$invalid_transcript_file" >/tmp/invalid-summary.out 2>&1; then
+            echo "summarize must reject invalid transcripts" >&2
+            exit 1
+          fi
+          rg -n "turn must be|speaker must be" /tmp/invalid-summary.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$invalid_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools >/tmp/invalid-comment.out 2>&1; then
+            echo "github-comment must reject invalid transcripts" >&2
+            exit 1
+          fi
+          rg -n "turn must be|speaker must be" /tmp/invalid-comment.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a fake --agent-a-ssh example --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/invalid-remote-fake.jsonl --timeout 1; then
+            echo "fake participants must not accept SSH mode" >&2
+            exit 1
+          fi
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a codex --agent-a-ssh example --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/invalid-remote-workdir.jsonl --timeout 1; then
+            echo "remote participants must require an explicit remote workdir" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2088
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --turns 1 --workdir . --agent-a codex --agent-a-ssh example --agent-a-workdir '~/project' --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/invalid-relative-remote-workdir.jsonl --timeout 1; then
+            echo "remote participant workdirs must be absolute paths" >&2
+            exit 1
+          fi
+          pair_transcript_file="$(mktemp)"
+          pair_summary_file="$(mktemp)"
+          pair_trigger_file="$(mktemp)"
+          rm -f "$pair_trigger_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_transcript_file" --summary-file "$pair_summary_file" --on-blocked-trigger "$pair_trigger_file" --timeout 10
+          test ! -e "$pair_trigger_file"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$pair_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$pair_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$pair_transcript_file"
+          rg -n "tmux-agent-tools pair-review|agent-a|agent-b" "$pair_summary_file"
+          pair_swap_transcript_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue pair-review --swap --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$pair_swap_transcript_file" --timeout 10
+          jq -s -e 'map(select(.event == "turn")) as $turns | ($turns | length) == 2 and $turns[0].turn == 1 and $turns[0].speaker == "agent-b" and ($turns[0].text | contains("fake-b: turn 1 received")) and $turns[1].turn == 2 and $turns[1].speaker == "agent-a" and ($turns[1].text | contains("fake-a: turn 2 received"))' "$pair_swap_transcript_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue critic --swap --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/critic-swap.jsonl >/tmp/critic-swap.out 2>&1; then
+            echo "swap must only be accepted by pair-review" >&2
+            exit 1
+          fi
+          rg -n -- "--swap is only supported with pair-review" /tmp/critic-swap.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue --swap pair-review --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/pair-swap-before-subcommand.jsonl >/tmp/pair-swap-before-subcommand.out 2>&1; then
+            echo "swap must be placed after the pair-review subcommand" >&2
+            exit 1
+          fi
+          rg -n -- "--swap is only supported after the pair-review subcommand" /tmp/pair-swap-before-subcommand.out
+          handoff_transcript_file="$(mktemp)"
+          handoff_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue handoff --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$handoff_transcript_file" --summary-file "$handoff_summary_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$handoff_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$handoff_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$handoff_transcript_file"
+          rg -n "tmux-agent-tools handoff|agent-a|agent-b" "$handoff_summary_file"
+          rg -n "fake-a: turn 1 received|fake-b: turn 2 received" "$handoff_summary_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue handoff --turns 3 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/handoff-three-turns.jsonl --timeout 1 >/tmp/handoff-three-turns.out 2>&1; then
+            echo "handoff must reject non-two-turn flows" >&2
+            exit 1
+          fi
+          rg -n "handoff runs exactly two turns" /tmp/handoff-three-turns.out
+          critic_transcript_file="$(mktemp)"
+          critic_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue critic --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$critic_transcript_file" --summary-file "$critic_summary_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$critic_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$critic_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$critic_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$critic_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$critic_transcript_file"
+          rg -n "tmux-agent-tools critic|agent-a|agent-b" "$critic_summary_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue critic --turns 3 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/critic-odd-turns.jsonl --timeout 1 >/tmp/critic-odd-turns.out 2>&1; then
+            echo "critic must reject odd turn counts" >&2
+            exit 1
+          fi
+          rg -n "critic --turns must be a positive even integer" /tmp/critic-odd-turns.out
+          debate_transcript_file="$(mktemp)"
+          debate_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue debate --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript "$debate_transcript_file" --summary-file "$debate_summary_file" --timeout 10
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue validate-transcript --transcript "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 1 and .speaker == "agent-a" and (.text | contains("fake-a: turn 1 received")))' "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 2 and .speaker == "agent-b" and (.text | contains("fake-b: turn 2 received")))' "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 3 and .speaker == "agent-a" and (.text | contains("fake-a: turn 3 received")))' "$debate_transcript_file"
+          jq -e 'select(.event == "turn" and .turn == 4 and .speaker == "agent-b" and (.text | contains("fake-b: turn 4 received")))' "$debate_transcript_file"
+          rg -n "tmux-agent-tools debate|agent-a|agent-b" "$debate_summary_file"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue debate --turns 3 --workdir . --agent-a fake --agent-b fake --prompt-file "$prompt_file" --transcript /tmp/debate-odd-turns.jsonl --timeout 1 >/tmp/debate-odd-turns.out 2>&1; then
+            echo "debate must reject odd turn counts" >&2
+            exit 1
+          fi
+          rg -n "debate --turns must be a positive even integer" /tmp/debate-odd-turns.out
+          summary_stdout="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" > "$summary_stdout"
+          rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$summary_stdout"
+          explicit_markdown_summary="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format markdown > "$explicit_markdown_summary"
+          cmp "$summary_stdout" "$explicit_markdown_summary"
+          summary_file_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --summary-file "$summary_file_body"
+          cmp "$summary_stdout" "$summary_file_body"
+          limited_summary="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --max-lines 8 > "$limited_summary"
+          rg -n "truncated at 8 lines" "$limited_summary"
+          bytes_summary="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --max-bytes 200 > "$bytes_summary"
+          rg -n "truncated at 200 bytes" "$bytes_summary"
+          json_summary="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format json --max-lines 12 --redact-pattern 'fake-[ab]' > "$json_summary"
+          jq -e '.schema_version == "1" and .format == "json" and .label == "transcript" and (.turns | length) == 2 and (.failures | length) == 0 and .metadata.output_format == "json" and .metadata.truncated_by_lines == true and .metadata.redacted == true and .metadata.redaction_pattern_count == 1 and ([.turns[].tail_lines[]] | any(contains("[REDACTED]"))) and ([.turns[].tail_lines[]] | all(contains("fake-") | not)) and (.rendered_markdown | contains("[REDACTED]") and contains("truncated at 12 lines"))' "$json_summary"
+          json_summary_file="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format json --summary-file "$json_summary_file"
+          jq -e '.schema_version == "1" and .format == "json" and (.turns | length) == 2 and (.rendered_markdown | contains("tmux-agent-tools transcript"))' "$json_summary_file"
+          github_comment_json="$(mktemp)"
+          github_comment_json_stderr="$(mktemp)"
+          GH=/tmp/gh-must-not-run skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --output-format json > "$github_comment_json" 2> "$github_comment_json_stderr"
+          jq -e '.schema_version == "1" and .mode == "github-comment" and .status == "dry_run" and .action == "post" and .post_github_comment == false and .github_repo == "ohyeh/tmux-agent-tools" and .github_pr == "1" and .edit_existing == null and (.body | contains("tmux-agent-tools transcript")) and .gh_output == null' "$github_comment_json"
+          [[ ! -s "$github_comment_json_stderr" ]] || { echo "github-comment JSON dry-run should not print prose stderr" >&2; exit 1; }
+          github_comment_edit_json="$(mktemp)"
+          GH=/tmp/gh-must-not-run skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --output-format json > "$github_comment_edit_json"
+          jq -e '.status == "dry_run" and .action == "edit" and .edit_existing == "123" and .github_pr == null and (.body | contains("tmux-agent-tools transcript"))' "$github_comment_edit_json"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue summarize --transcript "$pair_transcript_file" --output-format xml >/tmp/bad-output-format.out 2>&1; then
+            echo "summarize must reject unknown output formats" >&2
+            exit 1
+          fi
+          rg -n -- "--output-format must be markdown or json" /tmp/bad-output-format.out
+          comment_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$comment_body"
+          rg -n "tmux-agent-tools transcript|agent-a|agent-b" "$comment_body"
+          summary_file_comment_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$summary_file_comment_body"
+          cmp "$comment_body" "$summary_file_comment_body"
+          summary_file_limited_comment="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --max-lines 8 > "$summary_file_limited_comment"
+          rg -n "truncated at 8 lines" "$summary_file_limited_comment"
+          summary_file_bytes_comment="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --max-bytes 200 > "$summary_file_bytes_comment"
+          rg -n "truncated at 200 bytes" "$summary_file_bytes_comment"
+          empty_summary_file="$(mktemp)"
+          empty_summary_comment="$(mktemp)"
+          empty_summary_stderr="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$empty_summary_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools > "$empty_summary_comment" 2> "$empty_summary_stderr"
+          [[ "$(LC_ALL=C wc -c < "$empty_summary_comment" | tr -d ' ')" -le 1 ]] || { echo "empty summary-file should render an empty dry-run body" >&2; exit 1; }
+          rg -n "dry-run: add --post-github-comment to post to GitHub" "$empty_summary_stderr"
+          redacted_comment_body="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --redact-pattern 'TMUX_AGENT_DIALOGUE_[^]]+' > "$redacted_comment_body"
+          rg -n "\\[REDACTED\\]|redact patterns were applied" "$redacted_comment_body"
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --summary-file "$summary_file_body" --github-pr 1 --github-repo ohyeh/tmux-agent-tools >/tmp/github-comment-both-inputs.out 2>&1; then
+            echo "github-comment must reject both transcript and summary-file inputs" >&2
+            exit 1
+          fi
+          rg -n "exactly one of --transcript or --summary-file" /tmp/github-comment-both-inputs.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --github-pr 1 --github-repo ohyeh/tmux-agent-tools >/tmp/github-comment-missing-input.out 2>&1; then
+            echo "github-comment must reject missing transcript/summary-file input" >&2
+            exit 1
+          fi
+          rg -n "exactly one of --transcript or --summary-file" /tmp/github-comment-missing-input.out
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --post-github-comment; then
+            echo "GitHub comment posting must require --github-pr" >&2
+            exit 1
+          fi
+          if skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing abc >/tmp/github-comment-bad-edit.out 2>&1; then
+            echo "GitHub comment edit id must be numeric" >&2
+            exit 1
+          fi
+          rg -n -- "--edit-existing must be a GitHub comment id" /tmp/github-comment-bad-edit.out
+          edit_dry_run_body="$(mktemp)"
+          edit_dry_run_stderr="$(mktemp)"
+          skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --summary-file "$summary_file_body" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 > "$edit_dry_run_body" 2> "$edit_dry_run_stderr"
+          cmp "$comment_body" "$edit_dry_run_body"
+          rg -n "dry-run: add --post-github-comment to update GitHub comment 123" "$edit_dry_run_stderr"
+          fake_bin="$(mktemp -d)"
+          fake_args="$(mktemp)"
+          {
+            printf '%s\n' '#!/usr/bin/env zsh'
+            # shellcheck disable=SC2016
+            printf '%s\n' '# shellcheck disable=SC2016'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "$@" > "$GH_FAKE_ARGS"'
+            # shellcheck disable=SC2016
+            printf '%s\n' '[[ "$1" == "pr" && "$2" == "comment" ]] || exit 2'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'body_file="${@: -1}"'
+            # shellcheck disable=SC2016
+            printf '%s\n' '[[ -s "$body_file" ]] || exit 3'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-456"'
+          } > "$fake_bin/gh"
+          chmod +x "$fake_bin/gh"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --post-github-comment
+          rg -n "pr|comment|1|--repo|ohyeh/tmux-agent-tools|--body-file" "$fake_args"
+          posted_json="$(mktemp)"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_args" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-pr 1 --github-repo ohyeh/tmux-agent-tools --redact-pattern 'fake-[ab]' --post-github-comment --output-format json > "$posted_json"
+          jq -e '.status == "posted" and .action == "post" and .post_github_comment == true and .comment_url == "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-456" and (.gh_output | contains("issuecomment-456"))' "$posted_json"
+          fake_edit_args="$(mktemp)"
+          fake_edit_body="$(mktemp)"
+          {
+            printf '%s\n' '#!/usr/bin/env zsh'
+            # shellcheck disable=SC2016
+            printf '%s\n' '# shellcheck disable=SC2016'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "$@" > "$GH_FAKE_ARGS"'
+            # shellcheck disable=SC2016
+            printf '%s\n' '[[ "$1" == "api" && "$2" == "--method" && "$3" == "PATCH" && "$4" == "repos/ohyeh/tmux-agent-tools/issues/comments/123" && "$5" == "--input" ]] || exit 2'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'jq -e ".body | contains(\"tmux-agent-tools transcript\")" "$6" >/dev/null || exit 3'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'cp "$6" "$GH_FAKE_BODY"'
+            # shellcheck disable=SC2016
+            printf '%s\n' 'printf "%s\n" "{\"id\":123,\"html_url\":\"https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-123\"}"'
+          } > "$fake_bin/gh"
+          chmod +x "$fake_bin/gh"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment
+          rg -n "api|PATCH|repos/ohyeh/tmux-agent-tools/issues/comments/123|--input" "$fake_edit_args"
+          jq -e '.body | contains("tmux-agent-tools transcript")' "$fake_edit_body"
+          edited_json="$(mktemp)"
+          GH="$fake_bin/gh" GH_FAKE_ARGS="$fake_edit_args" GH_FAKE_BODY="$fake_edit_body" skills/tmux-agent-tools/scripts/tmux-agent-dialogue github-comment --transcript "$pair_transcript_file" --github-repo ohyeh/tmux-agent-tools --edit-existing 123 --post-github-comment --output-format json > "$edited_json"
+          jq -e '.status == "edited" and .action == "edit" and .post_github_comment == true and .comment_id == "123" and .comment_url == "https://github.com/ohyeh/tmux-agent-tools/pull/1#issuecomment-123" and (.gh_output | fromjson | .id == 123)' "$edited_json"
+
+      - name: Install smoke CLI stubs
+        run: |
+          stub_cli_dir="$RUNNER_TEMP/tmux-agent-tools-cli-stubs"
+          mkdir -p "$stub_cli_dir"
+          printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/claude"
+          printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/codex"
+          chmod +x "$stub_cli_dir/claude" "$stub_cli_dir/codex"
+          echo "$stub_cli_dir" >> "$GITHUB_PATH"
+
+      - name: Run full smoke suite
+        run: scripts/run-all-smokes
+
+      - name: Run session-id + oneshot smokes
+        run: |
+          scripts/test-session-meta-smoke
+          scripts/test-oneshot-smoke

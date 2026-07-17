@@ -1,0 +1,103 @@
+#!/usr/bin/env zsh
+# Smoke test for Claude/Anthropic env inheritance into claude-tmux sessions.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-claude-env.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-claude.sh" <<'EOF'
+#!/bin/sh
+echo "fake claude ready"
+echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}"
+echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}"
+echo "ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}"
+echo "API_TIMEOUT_MS=${API_TIMEOUT_MS:-}"
+sleep 30
+EOF
+chmod +x "$WORK/fake-claude.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+pane_env_value() {
+  local session="$1" key="$2"
+  tmux capture-pane -J -t "$session" -p -S -80 2>/dev/null | awk -F= -v k="$key" '$1 == k {print substr($0, length(k) + 2)}' | tail -1
+}
+
+echo "case: clears caller Claude env by default"
+env CLAUDE="$WORK/fake-claude.sh" \
+  ANTHROPIC_BASE_URL="http://localhost:8317" \
+  ANTHROPIC_AUTH_TOKEN="tok-inherited" \
+  ANTHROPIC_MODEL="claude-opus-4-7" \
+  API_TIMEOUT_MS="3000000" \
+  "$CLAUDE_TMUX" start --exact env-inherit "$WORK" >/dev/null
+sleep 1
+assert "base url cleared by default" "$(pane_env_value claude-cli-env-inherit ANTHROPIC_BASE_URL)" ""
+assert "auth token cleared by default" "$(pane_env_value claude-cli-env-inherit ANTHROPIC_AUTH_TOKEN)" ""
+assert "model cleared by default" "$(pane_env_value claude-cli-env-inherit ANTHROPIC_MODEL)" ""
+assert "timeout cleared by default" "$(pane_env_value claude-cli-env-inherit API_TIMEOUT_MS)" ""
+"$CLAUDE_TMUX" stop env-inherit >/dev/null 2>&1 || true
+
+echo "case: explicit inheritance opt-in"
+env CLAUDE="$WORK/fake-claude.sh" \
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=1 \
+  ANTHROPIC_BASE_URL="http://localhost:8317" \
+  ANTHROPIC_AUTH_TOKEN="tok-inherited" \
+  ANTHROPIC_MODEL="claude-opus-4-7" \
+  API_TIMEOUT_MS="3000000" \
+  "$CLAUDE_TMUX" start --exact env-optin "$WORK" >/dev/null
+sleep 1
+assert "base url inherited on opt-in" "$(pane_env_value claude-cli-env-optin ANTHROPIC_BASE_URL)" "http://localhost:8317"
+assert "auth token inherited on opt-in" "$(pane_env_value claude-cli-env-optin ANTHROPIC_AUTH_TOKEN)" "tok-inherited"
+assert "model inherited on opt-in" "$(pane_env_value claude-cli-env-optin ANTHROPIC_MODEL)" "claude-opus-4-7"
+assert "timeout inherited on opt-in" "$(pane_env_value claude-cli-env-optin API_TIMEOUT_MS)" "3000000"
+"$CLAUDE_TMUX" stop env-optin >/dev/null 2>&1 || true
+
+echo "case: explicit TMUX_AGENT_TOOLS_SESSION_ENV wins"
+env CLAUDE="$WORK/fake-claude.sh" \
+  ANTHROPIC_BASE_URL="http://caller.example" \
+  TMUX_AGENT_TOOLS_SESSION_ENV=$'ANTHROPIC_BASE_URL=http://explicit.example\nANTHROPIC_MODEL=explicit-model' \
+  "$CLAUDE_TMUX" start --exact env-explicit "$WORK" >/dev/null
+sleep 1
+assert "explicit base url preserved" "$(pane_env_value claude-cli-env-explicit ANTHROPIC_BASE_URL)" "http://explicit.example"
+assert "explicit model preserved" "$(pane_env_value claude-cli-env-explicit ANTHROPIC_MODEL)" "explicit-model"
+"$CLAUDE_TMUX" stop env-explicit >/dev/null 2>&1 || true
+
+echo "case: bare TMUX_AGENT_TOOLS_SESSION_ENV key wins"
+env CLAUDE="$WORK/fake-claude.sh" \
+  ANTHROPIC_BASE_URL="http://bare-key.example" \
+  TMUX_AGENT_TOOLS_SESSION_ENV='ANTHROPIC_BASE_URL' \
+  "$CLAUDE_TMUX" start --exact env-explicit-bare "$WORK" >/dev/null
+sleep 1
+assert "bare explicit base url preserved" "$(pane_env_value claude-cli-env-explicit-bare ANTHROPIC_BASE_URL)" "http://bare-key.example"
+"$CLAUDE_TMUX" stop env-explicit-bare >/dev/null 2>&1 || true
+
+echo "case: clear opt-out leaves caller env alone"
+env CLAUDE="$WORK/fake-claude.sh" \
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=0 \
+  CLAUDE_TMUX_CLEAR_CLAUDE_ENV=0 \
+  ANTHROPIC_BASE_URL="http://should-not-inherit.example" \
+  "$CLAUDE_TMUX" start --exact env-optout "$WORK" >/dev/null
+sleep 1
+assert "base url falls through when clear disabled" "$(pane_env_value claude-cli-env-optout ANTHROPIC_BASE_URL)" "http://should-not-inherit.example"
+"$CLAUDE_TMUX" stop env-optout >/dev/null 2>&1 || true
+
+echo "claude-env-inherit smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

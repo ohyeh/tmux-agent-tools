@@ -1,0 +1,108 @@
+#!/usr/bin/env zsh
+# Smoke for issue #144 graceful degrade on liveness-state write failures.
+# Locks the partner R8 followup: status --json must remain readable when
+# the per-agent metadata dir is read-only.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-degrade-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+echo "ready-marker"
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_readonly_dir_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-readonly-dir ($wrapper, chmod 555 on agent dir → degraded but readable)"
+
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix" "$WORK" >/dev/null
+  /bin/sleep 2
+
+  # Wait for marker so wait-literal sets marker_seen
+  "$wrapper" wait-literal "$prefix" "ready-marker" 5 >/dev/null
+
+  # Make the per-agent metadata dir read-only. Subsequent writes (marker_seen
+  # extension, pane hash update) must NOT fail status --json.
+  local agent_dir="$TMUX_AGENT_DIR/$prefix"
+  chmod 555 "$agent_dir"
+
+  # Force pane state to advance so update_pane_hash would try to write.
+  "$wrapper" send "$prefix" "echo trigger-pane-change" >/dev/null 2>&1 || true
+  /bin/sleep 2
+
+  local out code=0
+  out="$("$wrapper" status --json "$prefix" 2>&1)" || code=$?
+  assert "$prefix status --json exit=0 under readonly dir" "$code" "0"
+
+  # JSON must still parse
+  if printf '%s' "$out" | jq . >/dev/null 2>&1; then
+    echo "  ok   $prefix status --json still parses under readonly dir"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix status --json broken under readonly dir" >&2
+    echo "    raw: ${out:0:200}" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  # Restore for cleanup
+  chmod u+w "$agent_dir"
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_started_at_degrade() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-started-at-degrade ($wrapper, parent dir readonly at start)"
+  # Make $TMUX_AGENT_DIR readonly so ensure_agent_dir cannot create subdir.
+  # start_session must NOT crash on the record_started_at line.
+  local saved_mode
+  saved_mode="$(stat -f '%p' "$TMUX_AGENT_DIR" 2>/dev/null || stat -c '%a' "$TMUX_AGENT_DIR")"
+  mkdir -p "$TMUX_AGENT_DIR"
+  chmod 555 "$TMUX_AGENT_DIR"
+
+  local code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix" "$WORK" >/dev/null 2>&1 || code=$?
+  # start may or may not exit non-zero depending on subdir creation flow,
+  # but we want to ensure the wrapper itself doesn't crash with set -e.
+  if [[ "$code" -le 1 ]]; then
+    echo "  ok   $prefix start tolerates readonly TMUX_AGENT_DIR (exit=$code)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix start crashed with exit=$code under readonly dir" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  chmod u+w "$TMUX_AGENT_DIR"
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_readonly_dir_case "$CODEX_TMUX"  "CODEX"  "deg-codex"
+run_readonly_dir_case "$CLAUDE_TMUX" "CLAUDE" "deg-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

@@ -1,0 +1,176 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #101a --on-start lifecycle hook.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-on-start-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-agent.sh" <<'EOF'
+#!/bin/sh
+echo "fake-agent ready"
+sleep 30
+EOF
+chmod +x "$WORK/fake-agent.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    needle:   $needle" >&2
+    echo "    haystack: $haystack" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+wait_for_file() {
+  # zsh `local path=` would tie-clobber $PATH (issue #100 lesson) — use `target`.
+  local target="$1" max="${2:-10}" i=0 needle="${3:-}"
+  while (( i < max )); do
+    if [[ -s "$target" ]]; then
+      if [[ -z "$needle" || "$(cat "$target" 2>/dev/null)" == *"$needle"* ]]; then
+        return 0
+      fi
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+run_basic_hook() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-basic ($wrapper)"
+  local probe="$WORK/$prefix-probe"
+  env "$cli_env=$WORK/fake-agent.sh" "$wrapper" start --exact \
+    --on-start "printf '%s|%s\n' \"\$TMUX_AGENT_NAME\" \"\$TMUX_AGENT_SESSION\" > $probe" \
+    "$prefix" "$WORK" >/dev/null
+
+  if wait_for_file "$probe" 10; then
+    local body
+    body="$(cat "$probe")"
+    assert_contains "$prefix on-start hook ran" "$body" "$prefix|"
+    assert_contains "$prefix on-start session env" "$body" "$prefix"
+  else
+    echo "  FAIL $prefix on-start did not produce probe file within 10s" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  local log_path="$TMUX_AGENT_DIR/$prefix/hook.log"
+  if [[ -s "$log_path" ]]; then
+    assert_contains "$prefix hook.log has [on-start] header" "$(cat "$log_path")" "[on-start"
+    assert_contains "$prefix hook.log has exit=0" "$(cat "$log_path")" "[on-start exit] 0"
+  else
+    echo "  FAIL $prefix hook.log missing at $log_path" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_no_hook_default() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-no-hook ($wrapper, no flag → no log file)"
+  env "$cli_env=$WORK/fake-agent.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+  local log_path="$TMUX_AGENT_DIR/$prefix/hook.log"
+  if [[ -e "$log_path" ]]; then
+    echo "  FAIL $prefix hook.log should not exist without --on-start" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix no hook.log without flag"
+    PASS=$((PASS + 1))
+  fi
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_non_zero_hook_logged() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-fail-hook ($wrapper, exit 7 logged but not fatal)"
+  env "$cli_env=$WORK/fake-agent.sh" "$wrapper" start --exact \
+    --on-start "exit 7" \
+    "$prefix" "$WORK" >/dev/null
+  local log_path="$TMUX_AGENT_DIR/$prefix/hook.log"
+  if wait_for_file "$log_path" 10 "[on-start exit] 7"; then
+    assert_contains "$prefix non-zero exit captured" "$(cat "$log_path")" "[on-start exit] 7"
+  else
+    echo "  FAIL $prefix hook.log missing for failing hook" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  # Agent session should still exist regardless
+  if "$wrapper" status "$prefix" >/dev/null 2>&1; then
+    echo "  ok   $prefix session survives failing hook"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix session torn down by failing hook" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_missing_value() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing-value ($wrapper, --on-start without value → exit 2)"
+  local code=0
+  "$wrapper" start --exact --on-start 2>/dev/null || code=$?
+  assert "$prefix --on-start missing value exit=2" "$code" "2"
+}
+
+run_with_sentinel_log_path() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-sentinel-log ($wrapper, --sentinel routes hook log to sentinel.hook.log)"
+  local sentinel="$WORK/$prefix-sent"
+  env "$cli_env=$WORK/fake-agent.sh" "$wrapper" start --exact \
+    --sentinel "$sentinel" \
+    --on-start "echo ran-with-sentinel" \
+    "$prefix" "$WORK" >/dev/null
+  if wait_for_file "$sentinel.hook.log" 10; then
+    assert_contains "$prefix sentinel hook log captured stdout" "$(cat "$sentinel.hook.log")" "ran-with-sentinel"
+  else
+    echo "  FAIL $prefix $sentinel.hook.log missing" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_basic_hook "$CODEX_TMUX"  "CODEX"  "os-codex"
+run_basic_hook "$CLAUDE_TMUX" "CLAUDE" "os-claude"
+run_no_hook_default "$CODEX_TMUX"  "CODEX"  "nh-codex"
+run_no_hook_default "$CLAUDE_TMUX" "CLAUDE" "nh-claude"
+run_non_zero_hook_logged "$CODEX_TMUX"  "CODEX"  "fail-codex"
+run_non_zero_hook_logged "$CLAUDE_TMUX" "CLAUDE" "fail-claude"
+run_missing_value "$CODEX_TMUX"  "mv-codex"
+run_missing_value "$CLAUDE_TMUX" "mv-claude"
+run_with_sentinel_log_path "$CODEX_TMUX"  "CODEX"  "sl-codex"
+run_with_sentinel_log_path "$CLAUDE_TMUX" "CLAUDE" "sl-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

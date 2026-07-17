@@ -1,0 +1,232 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #100 single-agent JSONL transcript.
+#
+# Verifies that --transcript on start (and resume in spirit, via the same
+# helpers) wires up subsequent send / capture / stop to append wrapper
+# events to a single JSONL file.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+unset CLAUDE
+
+WORK="$(mktemp -d -t tmux-agent-transcript-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-quiet.sh" <<'EOF'
+#!/bin/sh
+echo "ready"
+sleep 30
+EOF
+chmod +x "$WORK/fake-quiet.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_transcript() {
+  local wrapper="$1" cli_env="$2" prefix="$3" expected_tool="$4"
+  echo "case: $prefix ($wrapper)"
+  local transcript="$WORK/$prefix.jsonl"
+  rm -f "$transcript"
+
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix" "$WORK" >/dev/null
+  sleep 2
+  "$wrapper" send "$prefix" "hello agent" >/dev/null
+  sleep 1
+  "$wrapper" capture "$prefix" 10 >/dev/null
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+
+  # Transcript should have 4 lines: start, send, capture, stop.
+  local line_count
+  line_count="$(wc -l < "$transcript" | tr -d ' ')"
+  assert "$prefix transcript has 4 events" "$line_count" "4"
+
+  # Every line: valid JSON with schema_version=1.
+  local invalid_count
+  invalid_count="$(awk 'NR' "$transcript" | while read -r line; do
+    printf '%s' "$line" | jq -e '.schema_version == 1' >/dev/null 2>&1 || echo "BAD"
+  done | wc -l | tr -d ' ')"
+  assert "$prefix every line schema_version=1" "$invalid_count" "0"
+
+  # Each expected event present.
+  for evt in start send capture stop; do
+    local found
+    found="$(grep -c "\"event\":\"$evt\"" "$transcript" || true)"
+    assert "$prefix transcript has $evt event" "$found" "1"
+  done
+
+  # start event tool field
+  local tool_in_start
+  tool_in_start="$(head -1 "$transcript" | jq -r .tool)"
+  assert "$prefix start event tool=$expected_tool" "$tool_in_start" "$expected_tool"
+
+  # send event preserves text
+  local send_text
+  send_text="$(grep '"event":"send"' "$transcript" | jq -r .text)"
+  assert "$prefix send event preserves text" "$send_text" "hello agent"
+}
+
+run_stale_reject() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-stale ($wrapper, pre-existing transcript should be rejected)"
+  local transcript="$WORK/$prefix-stale.jsonl"
+  printf 'stale\n' > "$transcript"
+  local rc=0
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix-stale" "$WORK" >/dev/null 2>&1 || rc=$?
+  assert "$prefix-stale rejected" "$rc" "1"
+  rm -f "$transcript"
+}
+
+run_missing_value_reject() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing-value ($wrapper)"
+  local rc=0
+  "$wrapper" start --exact --transcript 2>/dev/null || rc=$?
+  assert "$prefix-missing-value rejected" "$rc" "2"
+}
+
+run_unwritable_reject() {
+  # Partner R7 critique: best-effort `|| true` writes hide a real
+  # operator misconfiguration (unwritable transcript path → empty audit
+  # trail with no warning). The wrapper now write-probes at start and
+  # exits 1 if the path cannot be created/truncated.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-unwritable ($wrapper, unwritable transcript should be rejected at start)"
+  local dir="$WORK/$prefix-noperm"
+  mkdir -p "$dir"
+  chmod 555 "$dir"
+  local rc=0
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$dir/transcript.jsonl" "$prefix-unwritable" "$WORK" >/dev/null 2>&1 || rc=$?
+  chmod 755 "$dir"
+  assert "$prefix-unwritable rejected at start" "$rc" "1"
+}
+
+run_truncate() {
+  # #140 opt-in transcript-text-truncate: long send payloads get a hash +
+  # byte-count placeholder; short ones pass through verbatim.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-truncate ($wrapper, --transcript-text-truncate 20)"
+  local transcript="$WORK/$prefix-truncate.jsonl"
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" --transcript-text-truncate 20 \
+    "$prefix-trc" "$WORK" >/dev/null
+  /bin/sleep 1
+  "$wrapper" send "$prefix-trc" "short" >/dev/null
+  "$wrapper" send "$prefix-trc" "this is a long prompt past twenty bytes" >/dev/null
+  /bin/sleep 1
+
+  local short_line long_line
+  short_line="$(jq -c 'select(.event=="send") | {t: .text, h: .text_sha256, b: .text_bytes}' "$transcript" | head -1)"
+  long_line="$(jq -c 'select(.event=="send") | {t: .text, h: .text_sha256, b: .text_bytes}' "$transcript" | tail -1)"
+
+  assert "$prefix-trc short text passthrough" "$(printf '%s' "$short_line" | jq -r .t)" "short"
+  assert "$prefix-trc short sha=null" "$(printf '%s' "$short_line" | jq -r .h)" "null"
+  assert "$prefix-trc short bytes=5" "$(printf '%s' "$short_line" | jq -r .b)" "5"
+
+  assert "$prefix-trc long text replaced" "$(printf '%s' "$long_line" | jq -r .t | head -c 10)" "[truncated"
+  local long_sha
+  long_sha="$(printf '%s' "$long_line" | jq -r .h)"
+  if [[ "$long_sha" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "  ok   $prefix-trc long sha is 64-char hex"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix-trc long sha not 64-char hex: $long_sha" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  assert "$prefix-trc long bytes>20" "$(( $(printf '%s' "$long_line" | jq -r .b) > 20 ))" "1"
+
+  "$wrapper" stop "$prefix-trc" >/dev/null 2>&1 || true
+}
+
+run_truncate_invalid() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-truncate-invalid ($wrapper, non-integer / zero rejected)"
+  local code=0
+  "$wrapper" start --exact --transcript /tmp/$$-tinv.jsonl --transcript-text-truncate notanumber \
+    "$prefix-tinv" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix-tinv exit=2 on non-integer" "$code" "2"
+
+  code=0
+  "$wrapper" start --exact --transcript /tmp/$$-tinv2.jsonl --transcript-text-truncate 0 \
+    "$prefix-tinv2" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix-tinv2 exit=2 on zero" "$code" "2"
+}
+
+run_wait_events() {
+  # #141: wait/wait-text/wait-literal/send-wait-literal/wait-and-capture
+  # must each emit a transcript event with outcome=matched|timeout and
+  # the needle/timeout metadata when a transcript is configured.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-wait-events ($wrapper)"
+  local transcript="$WORK/$prefix-wait.jsonl"
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    --transcript "$transcript" "$prefix-we" "$WORK" >/dev/null
+  /bin/sleep 2
+
+  # wait-literal that succeeds (fake-quiet emits "ready")
+  "$wrapper" wait-literal "$prefix-we" "ready" 5 >/dev/null
+
+  # wait-text regex that succeeds
+  "$wrapper" wait-text --regex "$prefix-we" "rea.*" 5 >/dev/null
+
+  # wait-literal that times out
+  "$wrapper" wait-literal "$prefix-we" "MISS-MARKER" 2 >/dev/null 2>&1 || true
+
+  /bin/sleep 1
+  local n
+  n="$(jq -c 'select(.event=="wait_literal" and .outcome=="matched") | .needle' "$transcript" | head -1)"
+  assert "$prefix wait_literal matched event recorded" "$n" '"ready"'
+
+  n="$(jq -c 'select(.event=="wait_text" and .outcome=="matched") | .needle' "$transcript" | head -1)"
+  assert "$prefix wait_text matched event recorded" "$n" '"rea.*"'
+
+  n="$(jq -c 'select(.event=="wait_literal" and .outcome=="timeout") | .needle' "$transcript" | head -1)"
+  assert "$prefix wait_literal timeout event recorded" "$n" '"MISS-MARKER"'
+
+  # Every event must carry schema_version: 1 + at timestamp
+  local missing_sv
+  missing_sv="$(jq -c 'select(.event | startswith("wait")) | select(.schema_version != 1) | .event' "$transcript" | head -1)"
+  assert "$prefix every wait event has schema_version=1" "$missing_sv" ""
+
+  "$wrapper" stop "$prefix-we" >/dev/null 2>&1 || true
+}
+
+run_transcript        "$CODEX_TMUX"  "CODEX"  "tr-codex"  "codex"
+run_transcript        "$CLAUDE_TMUX" "CLAUDE" "tr-claude" "claude"
+run_stale_reject      "$CODEX_TMUX"  "CODEX"  "codex"
+run_stale_reject      "$CLAUDE_TMUX" "CLAUDE" "claude"
+run_unwritable_reject "$CODEX_TMUX"  "CODEX"  "codex"
+run_unwritable_reject "$CLAUDE_TMUX" "CLAUDE" "claude"
+run_truncate          "$CODEX_TMUX"  "CODEX"  "trc-codex"
+run_truncate          "$CLAUDE_TMUX" "CLAUDE" "trc-claude"
+run_truncate_invalid  "$CODEX_TMUX"  "tic-codex"
+run_truncate_invalid  "$CLAUDE_TMUX" "tic-claude"
+run_wait_events       "$CODEX_TMUX"  "CODEX"  "we-codex"
+run_wait_events       "$CLAUDE_TMUX" "CLAUDE" "we-claude"
+run_missing_value_reject "$CODEX_TMUX"  "codex"
+run_missing_value_reject "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
