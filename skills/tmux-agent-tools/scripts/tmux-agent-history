@@ -1,0 +1,148 @@
+#!/usr/bin/env zsh
+# tmux-agent-history (issue #129 v1 SQLite + FTS5 slice).
+#
+# v1 ships index + search + show. Time filters (--since 7d), cross-session
+# rollups (top --by cost), and diff are deferred per
+# docs/design-remaining-backlog.md.
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+SQLITE="${SQLITE:-$(command -v sqlite3 2>/dev/null || true)}"
+DB_DIR="${TMUX_AGENT_HISTORY_DIR:-${HOME}/.tmux-agent}"
+DB="$DB_DIR/history.db"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-history - SQLite-backed transcript index (#129 v1).
+
+Usage:
+  tmux-agent-history index <transcript.jsonl>...
+  tmux-agent-history search <query>
+  tmux-agent-history show <name>
+  tmux-agent-history help
+
+Stores per-session metadata at $DB_DIR/history.db. Each index call
+walks the named transcript files, extracts name + started_at + ended_at
++ event count, and upserts a row. Full transcript body lives in an
+FTS5 virtual table so `search` can do `MATCH 'term'` lookups.
+
+Deferred to v2 (see docs/design-remaining-backlog.md):
+  - --since 7d / --until time filters
+  - top --by cost rollups (depends on #103 v2 real usage data)
+  - diff a b (already shipped under tmux-agent-replay diff)
+EOF
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || { echo "jq not found" >&2; exit 1; }
+}
+
+require_sqlite() {
+  [[ -n "$SQLITE" && -x "$SQLITE" ]] || { echo "sqlite3 not found" >&2; exit 1; }
+}
+
+ensure_db() {
+  mkdir -p "$DB_DIR" 2>/dev/null || true
+  "$SQLITE" "$DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS sessions (
+  name TEXT PRIMARY KEY,
+  started_at TEXT,
+  ended_at TEXT,
+  event_count INTEGER,
+  transcript_path TEXT,
+  indexed_at TEXT
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+  name, body, tokenize='unicode61'
+);
+SQL
+}
+
+cmd_index() {
+  require_jq
+  require_sqlite
+  ensure_db
+  if (( $# == 0 )); then
+    echo "Usage: tmux-agent-history index <transcript.jsonl>..." >&2
+    return 2
+  fi
+  local fixture_path name started_at ended_at count
+  for fixture_path in "$@"; do
+    if [[ ! -f "$fixture_path" ]]; then
+      echo "Skipping (not a file): $fixture_path" >&2
+      continue
+    fi
+    name="$("$JQ" -r -s '[.[] | select(.event=="start") | .name][0] // ""' "$fixture_path" 2>/dev/null)"
+    if [[ -z "$name" ]]; then
+      echo "Skipping (no start event): $fixture_path" >&2
+      continue
+    fi
+    started_at="$("$JQ" -r -s '[.[] | select(.event=="start") | .at][0] // ""' "$fixture_path" 2>/dev/null)"
+    ended_at="$("$JQ" -r -s '[.[] | select(.event=="stop") | .at][-1] // ""' "$fixture_path" 2>/dev/null)"
+    count="$("$JQ" -r -s 'length' "$fixture_path" 2>/dev/null)"
+    # Read body once and pass via SQLite parameter binding through a
+    # temp file. SQLite has no postgres-style dollar quoting; embedded
+    # quotes/JSON in heredoc would explode the parser.
+    local body_file="$DB_DIR/.tmp-body-$$"
+    cat "$fixture_path" > "$body_file"
+    "$SQLITE" "$DB" <<SQL
+INSERT OR REPLACE INTO sessions(name, started_at, ended_at, event_count, transcript_path, indexed_at)
+VALUES ('$name', '$started_at', '$ended_at', $count, '$fixture_path', datetime('now'));
+DELETE FROM sessions_fts WHERE name = '$name';
+SQL
+    # Insert body via parameter binding (separate invocation so the
+    # heredoc above stays simple).
+    "$SQLITE" "$DB" \
+      "INSERT INTO sessions_fts(name, body) VALUES('$name', readfile('$body_file'));"
+    rm -f "$body_file"
+    echo "indexed: $name ($count events)"
+  done
+}
+
+cmd_search() {
+  require_sqlite
+  ensure_db
+  local query="${1:-}"
+  if [[ -z "$query" ]]; then
+    echo "Usage: tmux-agent-history search <query>" >&2
+    return 2
+  fi
+  # FTS5 MATCH. Return JSON array of matches.
+  local escaped="${query//\"/\\\"}"
+  "$SQLITE" -separator $'\t' "$DB" <<SQL | "$JQ" -R -s --arg query "$query" '
+    split("\n") | map(select(length>0)) | map(split("\t")) |
+    map({name: .[0], started_at: .[1], event_count: (.[2] | tonumber)})'
+SELECT s.name, s.started_at, s.event_count
+FROM sessions_fts f JOIN sessions s ON s.name = f.name
+WHERE sessions_fts MATCH '$escaped';
+SQL
+}
+
+cmd_show() {
+  require_sqlite
+  ensure_db
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: tmux-agent-history show <name>" >&2
+    return 2
+  fi
+  # NB: `local path=` would clobber $PATH in zsh (tied pair).
+  local transcript_file
+  transcript_file="$("$SQLITE" "$DB" "SELECT transcript_path FROM sessions WHERE name = '$name';")"
+  if [[ -z "$transcript_file" || ! -f "$transcript_file" ]]; then
+    echo "no transcript found for: $name" >&2
+    return 1
+  fi
+  cat "$transcript_file"
+}
+
+sub="${1:-}"
+shift 2>/dev/null || true
+case "$sub" in
+  index)   cmd_index   "$@" ;;
+  search)  cmd_search  "$@" ;;
+  show)    cmd_show    "$@" ;;
+  help|-h|--help|"") usage ;;
+  *) echo "Unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2317
+# tmux-agent-audit — operator surface for the audit log (#188).
+# Subcommands:
+#   verify [--log PATH]
+#   query  [--since ISO] [--until ISO] [--tenant T] [--agent A]
+#          [--tool T] [--event E] [--log PATH]
+#   path   — print effective default log path
+#   rotate [--log PATH] — force-rotate (mainly for tests)
+#
+# Default log path resolution (when --log absent and TMUX_AGENT_TOOLS_AUDIT_LOG unset):
+#   ${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl
+#
+# Rotation: when log size exceeds TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES
+# (default 10485760 = 10MB), the active file is moved to <log>.1
+# (existing .1..N rotated by suffix; retain TMUX_AGENT_TOOLS_AUDIT_RETAIN, default 5).
+# A "rotation" HEAD-link event is appended to the fresh log carrying
+# prev_chain_hash = last hash of the rotated-out file, preserving the chain.
+#
+# Chain key + hash algorithm match the wrappers' audit_log_append /
+# audit_log_verify (#119): SHA-256 over (chain_key || prev_hash || line_without_chain_hash).
+set -euo pipefail
+
+SELF="$(basename "$0")"
+
+die() { echo "$SELF: $*" >&2; exit 2; }
+
+require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    die "jq required"
+  fi
+  JQ="$(command -v jq)"
+}
+
+sha_cmd() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "sha256sum"
+  else
+    echo "shasum -a 256"
+  fi
+}
+
+audit_chain_key() {
+  if [[ -f /etc/machine-id ]]; then
+    cat /etc/machine-id
+  elif command -v ioreg >/dev/null 2>&1; then
+    ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+      | awk -F\" '/IOPlatformUUID/{print $4; exit}' || echo "$HOME"
+  else
+    echo "$HOME"
+  fi
+}
+
+default_log_path() {
+  local base="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools"
+  printf '%s/audit.jsonl\n' "$base"
+}
+
+resolve_log() {
+  # Arg: optional --log value (may be empty). Honors TMUX_AGENT_TOOLS_AUDIT_LOG.
+  local explicit="${1:-}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"; return 0
+  fi
+  if [[ -n "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" ]]; then
+    printf '%s\n' "$TMUX_AGENT_TOOLS_AUDIT_LOG"; return 0
+  fi
+  default_log_path
+}
+
+# ---- verify ---------------------------------------------------------------
+
+cmd_verify() {
+  local log=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --log) log="${2:-}"; shift 2;;
+      -h|--help) echo "Usage: $SELF verify [--log PATH]"; return 0;;
+      *) die "verify: unknown arg $1";;
+    esac
+  done
+  log="$(resolve_log "$log")"
+  [[ -f "$log" ]] || die "no such log: $log"
+  require_jq
+  local key
+  key="$(audit_chain_key)"
+  local hcmd
+  hcmd="$(sha_cmd)"
+  local expected_prev="0000000000000000000000000000000000000000000000000000000000000000"
+  local lineno=0 bad=0
+  # If the log starts with an audit.rotation HEAD-link, seed expected_prev
+  # from its prev_chain_hash so chains continue across rotated files.
+  local _first_event _first_prev
+  _first_event="$(head -1 "$log" 2>/dev/null | "$JQ" -r '.event // empty' 2>/dev/null || true)"
+  if [[ "$_first_event" == "audit.rotation" ]]; then
+    _first_prev="$(head -1 "$log" | "$JQ" -r '.prev_chain_hash')"
+    [[ -n "$_first_prev" && "$_first_prev" != "null" ]] && expected_prev="$_first_prev"
+  fi
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    local pv hv stripped recomputed
+    pv="$(printf '%s' "$line" | "$JQ" -r .prev_chain_hash)"
+    hv="$(printf '%s' "$line" | "$JQ" -r .chain_hash)"
+    stripped="$(printf '%s' "$line" | "$JQ" -c 'del(.chain_hash)')"
+    recomputed="$(printf '%s%s%s' "$key" "$expected_prev" "$stripped" | eval "$hcmd" | awk '{print $1}')"
+    if [[ "$pv" != "$expected_prev" ]]; then
+      echo "line $lineno: prev_chain_hash mismatch (expected $expected_prev, got $pv)" >&2
+      bad=$((bad + 1))
+    elif [[ "$recomputed" != "$hv" ]]; then
+      echo "line $lineno: chain_hash mismatch (expected $recomputed, got $hv)" >&2
+      bad=$((bad + 1))
+    fi
+    expected_prev="$hv"
+  done < "$log"
+  if (( bad == 0 )); then
+    "$JQ" -n --arg path "$log" --argjson lines "$lineno" \
+      '{schema_version: 1, audit_log: $path, lines: $lines, ok: true}'
+    return 0
+  fi
+  "$JQ" -n --arg path "$log" --argjson lines "$lineno" --argjson bad "$bad" \
+    '{schema_version: 1, audit_log: $path, lines: $lines, bad_lines: $bad, ok: false}'
+  return 2
+}
+
+# ---- query ----------------------------------------------------------------
+
+cmd_query() {
+  local log="" since="" until_="" tenant="" agent="" tool_="" event=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --log) log="${2:-}"; shift 2;;
+      --since) since="${2:-}"; shift 2;;
+      --until) until_="${2:-}"; shift 2;;
+      --tenant) tenant="${2:-}"; shift 2;;
+      --agent) agent="${2:-}"; shift 2;;
+      --tool) tool_="${2:-}"; shift 2;;
+      --event) event="${2:-}"; shift 2;;
+      -h|--help)
+        echo "Usage: $SELF query [--since ISO] [--until ISO] [--tenant T] [--agent A] [--tool T] [--event E] [--log PATH]"
+        return 0;;
+      *) die "query: unknown arg $1";;
+    esac
+  done
+  log="$(resolve_log "$log")"
+  [[ -f "$log" ]] || return 0
+  require_jq
+  "$JQ" -c \
+    --arg since "$since" --arg until "$until_" --arg tenant "$tenant" \
+    --arg agent "$agent" --arg tool "$tool_" --arg event "$event" \
+    'select(
+       ($since == "" or (.at // "") >= $since)
+       and ($until == "" or (.at // "") <= $until)
+       and ($tenant == "" or (.tenant // "") == $tenant)
+       and ($agent == "" or (.name // .agent // "") == $agent)
+       and ($tool == "" or (.tool // "") == $tool)
+       and ($event == "" or (.event // "") == $event)
+     )' "$log"
+}
+
+# ---- rotate ---------------------------------------------------------------
+
+file_size_bytes() {
+  local f="$1"
+  if [[ ! -f "$f" ]]; then echo 0; return; fi
+  if stat -f%z "$f" >/dev/null 2>&1; then
+    stat -f%z "$f"
+  else
+    stat -c%s "$f"
+  fi
+}
+
+cmd_rotate() {
+  local log=""
+  local force=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --log) log="${2:-}"; shift 2;;
+      --force) force=1; shift;;
+      -h|--help) echo "Usage: $SELF rotate [--log PATH] [--force]"; return 0;;
+      *) die "rotate: unknown arg $1";;
+    esac
+  done
+  log="$(resolve_log "$log")"
+  if [[ -n "${TMUX_AGENT_AUDIT_NO_LOCK:-}" ]]; then
+    audit_rotate_if_needed "$log" "$force"
+  else
+    audit_lock_around "$log" 30 audit_rotate_if_needed "$log" "$force"
+  fi
+}
+
+# audit_lock_around — serialize rotate + chain-append on the same log file.
+# Lock file: <log>.lock. Uses flock(1) when available; mkdir fallback otherwise.
+# Returns 75 on timeout, otherwise the inner command's rc.
+# Without serialization two concurrent agents can race between size-check,
+# rename, and HEAD-link write — producing duplicate audit.rotation records or
+# a prev_chain_hash read off the wrong file, breaking verify.
+audit_lock_around() {
+  local log_path="$1" timeout_seconds="$2"
+  shift 2
+  local lock_file="$log_path.lock"
+  mkdir -p "$(dirname "$lock_file")" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    : > "$lock_file" 2>/dev/null || true
+    (
+      flock -w "$timeout_seconds" -x 9 || {
+        echo "$SELF: audit lock contended on $log_path after ${timeout_seconds}s" >&2
+        exit 75
+      }
+      "$@"
+    ) 9>"$lock_file"
+    return $?
+  fi
+  # mkdir fallback with PID-stamped stale-holder recovery.
+  # Run "$@" in the current shell (NOT a subshell) so the lock is reliably
+  # held across the critical section — wrapping in `( ... )` with an EXIT
+  # trap proved racy under stress (subshell EXIT trap can interleave with
+  # contending mkdir attempts and break serialization).
+  zmodload zsh/datetime 2>/dev/null || true
+  local lock_dir="$lock_file.d"
+  local now_epoch end
+  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+  end=$(( now_epoch + timeout_seconds ))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder_pid=""
+    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if (( now_epoch >= end )); then
+      echo "$SELF: audit lock contended on $log_path after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
+      return 75
+    fi
+    sleep 0.05
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lock_dir' 2>/dev/null || true" INT TERM
+  "$@"
+  local rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  trap - INT TERM
+  return $rc
+}
+
+# Shared rotation routine (also invoked by wrappers via this script).
+# Returns 0 if no rotation, 0 if rotated. Writes a HEAD-link record to fresh log.
+audit_rotate_if_needed() {
+  local log="$1" force="${2:-0}"
+  local max="${TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES:-10485760}"
+  local retain="${TMUX_AGENT_TOOLS_AUDIT_RETAIN:-5}"
+  [[ -f "$log" ]] || return 0
+  local size
+  size="$(file_size_bytes "$log")"
+  if (( force == 0 )) && (( size < max )); then
+    return 0
+  fi
+  require_jq
+  # Capture last hash to preserve chain.
+  local last_hash
+  last_hash="$(tail -1 "$log" 2>/dev/null | "$JQ" -r '.chain_hash // empty' 2>/dev/null || true)"
+  [[ -z "$last_hash" ]] && last_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  # Shift suffixes: .N..1 down, then mv current → .1
+  local i
+  if [[ -f "$log.$retain" ]]; then rm -f "$log.$retain"; fi
+  i=$((retain - 1))
+  while (( i >= 1 )); do
+    if [[ -f "$log.$i" ]]; then mv "$log.$i" "$log.$((i + 1))"; fi
+    i=$((i - 1))
+  done
+  mv "$log" "$log.1"
+  # Write HEAD-link record on the new (empty) log, chained from last_hash.
+  local key hcmd at
+  key="$(audit_chain_key)"
+  hcmd="$(sha_cmd)"
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local with_meta
+  with_meta="$("$JQ" -c -n --arg pv "$last_hash" --arg at "$at" --arg prev_file "$log.1" \
+    '{schema_version: 1, event: "audit.rotation", rotated_from: $prev_file, prev_chain_hash: $pv, at: $at}')"
+  local new_hash
+  new_hash="$(printf '%s%s%s' "$key" "$last_hash" "$with_meta" | eval "$hcmd" | awk '{print $1}')"
+  local final_line
+  final_line="$("$JQ" -c -n --argjson e "$with_meta" --arg h "$new_hash" '$e + {chain_hash: $h}')"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || true
+  printf '%s\n' "$final_line" >> "$log"
+}
+
+# ---- path -----------------------------------------------------------------
+
+cmd_path() {
+  resolve_log ""
+}
+
+# ---- usage ----------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Usage: $SELF <subcommand> [args]
+
+Subcommands:
+  verify [--log PATH]
+  query  [--since ISO] [--until ISO] [--tenant T] [--agent A]
+         [--tool T] [--event E] [--log PATH]
+  rotate [--log PATH] [--force]
+  path
+
+Env:
+  TMUX_AGENT_TOOLS_AUDIT_LOG       active log path (overridden by --log)
+  TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES rotation threshold, default 10485760
+  TMUX_AGENT_TOOLS_AUDIT_RETAIN    rotated files retained, default 5
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    verify) cmd_verify "$@";;
+    query)  cmd_query "$@";;
+    rotate) cmd_rotate "$@";;
+    path)   cmd_path "$@";;
+    ""|-h|--help|help) usage;;
+    *) die "unknown subcommand: $cmd";;
+  esac
+}
+
+# Allow sourcing for shared rotate function.
+if [[ -n "${TMUX_AGENT_AUDIT_SOURCE_ONLY:-}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+main "$@"

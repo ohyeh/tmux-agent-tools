@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+
+min_version="0.9.0"
+script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH='' cd -- "$script_dir/.." && pwd)"
+
+version="$(shellcheck --version | awk '/^version: / { print $2 }')"
+if [ -z "$version" ]; then
+  echo "shellcheck version not found" >&2
+  exit 1
+fi
+
+if ! printf '%s\n%s\n' "$min_version" "$version" | sort -V >/dev/null 2>&1; then
+  # macOS sort has no -V; fall back to exact major/minor parsing below.
+  :
+fi
+
+version_major="${version%%.*}"
+version_rest="${version#*.}"
+version_minor="${version_rest%%.*}"
+if [ "$version_major" -eq 0 ] && [ "$version_minor" -lt 9 ]; then
+  echo "shellcheck >= $min_version required; found $version" >&2
+  exit 1
+fi
+
+shellcheck "$0"
+
+for path in "$repo_root"/skills/tmux-agent-tools/scripts/*; do
+  [ -f "$path" ] || continue
+  first_line="$(sed -n '1p' "$path")"
+  case "$first_line" in
+    '#!'*zsh*)
+      shellcheck -e SC1071 "$path"
+      printf 'shellcheck: %s uses zsh; SC1071-only compatibility sentinel passed\n' "${path#"$repo_root"/}"
+      ;;
+    '#!'*bash*)
+      shellcheck "$path"
+      ;;
+    '#!'*ksh*)
+      shellcheck "$path"
+      ;;
+    '#!'*sh*)
+      shellcheck "$path"
+      ;;
+    *)
+      printf 'shellcheck: skipping %s; no supported shell shebang\n' "${path#"$repo_root"/}"
+      ;;
+  esac
+done

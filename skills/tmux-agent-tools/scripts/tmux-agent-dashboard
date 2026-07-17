@@ -1,0 +1,88 @@
+#!/usr/bin/env zsh
+# tmux-agent-dashboard (issue #123 v1 JSON-snapshot slice).
+#
+# v1 ships a JSON snapshot of all live agent sessions. Consumers render
+# their own UI (htop-style, tmux statusbar widget, web). The ncurses TUI
+# half is intentionally deferred per docs/design-remaining-backlog.md.
+
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+SESSIONS="$SCRIPT_DIR/tmux-agent-sessions"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-dashboard - JSON snapshot of all live agent sessions (#123 v1).
+
+Usage:
+  tmux-agent-dashboard [--watch [--interval <seconds>] [--count <n>]]
+
+Emits a single JSON object per snapshot:
+  {
+    "schema_version": 1,
+    "at": "<ISO-8601 UTC>",
+    "sessions": [<status --json per session>],
+    "totals": {"running": N, "exited": M, "stopped": K}
+  }
+
+Flags:
+  --watch              re-emit every interval (bounded foreground loop).
+  --interval <s>       seconds between snapshots when --watch (default 2).
+  --count <n>          exit after n snapshots when --watch (default unlimited).
+EOF
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || { echo "jq not found" >&2; exit 1; }
+}
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+emit_snapshot() {
+  require_jq
+  local sessions_json totals_json
+  # `set -e + pipefail` would kill the script if either side of the pipe
+  # exits non-zero (e.g. no sessions present). Force success with `|| true`.
+  sessions_json="$( ( "$SESSIONS" list --json 2>/dev/null || true ) | "$JQ" -c -s '.' 2>/dev/null || echo '[]')"
+  if [[ -z "$sessions_json" ]]; then
+    sessions_json='[]'
+  fi
+  totals_json="$("$JQ" -c -n --argjson s "$sessions_json" '
+    {
+      running: ($s | map(select(.state=="running")) | length),
+      exited:  ($s | map(select(.state=="exited"))  | length),
+      stopped: ($s | map(select(.state=="stopped")) | length),
+      total:   ($s | length)
+    }')"
+  "$JQ" -c -n --argjson sessions "$sessions_json" --argjson totals "$totals_json" \
+    --arg at "$(iso_now)" \
+    '{schema_version: 1, at: $at, totals: $totals, sessions: $sessions}'
+}
+
+# argv parse
+watch=0
+interval=2
+count=0
+while (( $# )); do
+  case "$1" in
+    --watch)    watch=1; shift ;;
+    --interval) interval="${2:-2}"; shift 2 || true ;;
+    --count)    count="${2:-0}"; shift 2 || true ;;
+    -h|--help|help) usage; exit 0 ;;
+    *)          echo "Unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+if (( ! watch )); then
+  emit_snapshot
+  exit 0
+fi
+
+i=0
+while (( count == 0 || i < count )); do
+  emit_snapshot
+  i=$((i + 1))
+  (( count > 0 && i >= count )) && break
+  /bin/sleep "$interval"
+done

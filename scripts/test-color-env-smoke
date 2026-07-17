@@ -1,0 +1,118 @@
+#!/usr/bin/env zsh
+# Smoke test for managed tmux color environment normalization.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-color-env.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-cli.sh" <<'EOF'
+#!/bin/sh
+if [ "${NO_COLOR+x}" = x ]; then
+  echo "NO_COLOR_SET=1"
+  echo "NO_COLOR_VALUE=$NO_COLOR"
+else
+  echo "NO_COLOR_SET=0"
+  echo "NO_COLOR_VALUE="
+fi
+echo "COLORTERM=${COLORTERM:-}"
+echo "FORCE_COLOR=${FORCE_COLOR:-}"
+echo "CLICOLOR_FORCE=${CLICOLOR_FORCE:-}"
+sleep 30
+EOF
+chmod +x "$WORK/fake-cli.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+pane_env_value() {
+  local session="$1" key="$2"
+  tmux capture-pane -J -t "$session" -p -S -80 2>/dev/null | awk -F= -v k="$key" '$1 == k {print substr($0, length(k) + 2)}' | tail -1
+}
+
+run_local_color_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+
+  echo "case: $prefix local default color env"
+  env "$cli_env=$WORK/fake-cli.sh" \
+    NO_COLOR=1 COLORTERM= FORCE_COLOR= CLICOLOR_FORCE= \
+    "$wrapper" start --exact "$prefix-default" "$WORK" >/dev/null
+  sleep 1
+  assert "$prefix default unsets NO_COLOR" "$(pane_env_value "$prefix-cli-$prefix-default" NO_COLOR_SET)" "0"
+  assert "$prefix default sets COLORTERM" "$(pane_env_value "$prefix-cli-$prefix-default" COLORTERM)" "truecolor"
+  assert "$prefix default sets FORCE_COLOR" "$(pane_env_value "$prefix-cli-$prefix-default" FORCE_COLOR)" "3"
+  assert "$prefix default sets CLICOLOR_FORCE" "$(pane_env_value "$prefix-cli-$prefix-default" CLICOLOR_FORCE)" "1"
+  "$wrapper" stop "$prefix-default" >/dev/null 2>&1 || true
+
+  echo "case: $prefix explicit color env override"
+  env "$cli_env=$WORK/fake-cli.sh" \
+    NO_COLOR=1 COLORTERM=caller FORCE_COLOR=0 CLICOLOR_FORCE=0 \
+    TMUX_AGENT_TOOLS_SESSION_ENV=$'NO_COLOR=1\nCOLORTERM=explicit\nFORCE_COLOR=2\nCLICOLOR_FORCE=0' \
+    "$wrapper" start --exact "$prefix-explicit" "$WORK" >/dev/null
+  sleep 1
+  assert "$prefix explicit keeps NO_COLOR set" "$(pane_env_value "$prefix-cli-$prefix-explicit" NO_COLOR_SET)" "1"
+  assert "$prefix explicit keeps NO_COLOR value" "$(pane_env_value "$prefix-cli-$prefix-explicit" NO_COLOR_VALUE)" "1"
+  assert "$prefix explicit keeps COLORTERM" "$(pane_env_value "$prefix-cli-$prefix-explicit" COLORTERM)" "explicit"
+  assert "$prefix explicit keeps FORCE_COLOR" "$(pane_env_value "$prefix-cli-$prefix-explicit" FORCE_COLOR)" "2"
+  assert "$prefix explicit keeps CLICOLOR_FORCE" "$(pane_env_value "$prefix-cli-$prefix-explicit" CLICOLOR_FORCE)" "0"
+  "$wrapper" stop "$prefix-explicit" >/dev/null 2>&1 || true
+}
+
+run_remote_color_toggle_case() {
+  local wrapper="$1" cli_env="$2" color_env="$3" prefix="$4"
+  local fake_tmux="$WORK/$prefix-tmux"
+  local tmux_log="$WORK/$prefix-tmux.log"
+  cat > "$fake_tmux" <<EOF
+#!/bin/sh
+case "\$*" in
+  *" new-session "*)
+    printf '%s\n' "\$*" > "$tmux_log"
+    ;;
+esac
+case "\$*" in
+  *" has-session "*) exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_tmux"
+
+  echo "case: $prefix remote color toggle"
+  env TMUX="$fake_tmux" "$cli_env=$WORK/fake-cli.sh" "$color_env=0" \
+    "$wrapper" start-ssh --exact "$prefix-remote" example.invalid /tmp >/dev/null
+  "$wrapper" stop "$prefix-remote" >/dev/null 2>&1 || true
+
+  local remote_command
+  remote_command="$(cat "$tmux_log")"
+  if [[ "$remote_command" == *"NO_COLOR"* || "$remote_command" == *"FORCE_COLOR"* || "$remote_command" == *"CLICOLOR_FORCE"* || "$remote_command" == *"COLORTERM=truecolor"* ]]; then
+    echo "  FAIL $prefix remote color toggle leaked color env: $remote_command" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix remote color toggle omits color env"
+    PASS=$((PASS + 1))
+  fi
+}
+
+run_local_color_case "$CLAUDE_TMUX" "CLAUDE" "claude"
+run_local_color_case "$CODEX_TMUX" "CODEX" "codex"
+run_remote_color_toggle_case "$CLAUDE_TMUX" "CLAUDE" "CLAUDE_TMUX_COLOR_ENV" "claude"
+run_remote_color_toggle_case "$CODEX_TMUX" "CODEX" "CODEX_TMUX_COLOR_ENV" "codex"
+
+echo "color-env smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

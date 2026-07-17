@@ -1,0 +1,56 @@
+#!/usr/bin/env zsh
+# Smoke for #118 multi-tenant prefix.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: default prefix (no tenant)"
+assert "codex default" "$("$CODEX_TMUX" tenant)" "codex-cli"
+assert "claude default" "$("$CLAUDE_TMUX" tenant)" "claude-cli"
+
+echo "case: tenant suffix"
+assert "codex alice" "$(TMUX_AGENT_TOOLS_TENANT=alice "$CODEX_TMUX" tenant)" "codex-cli-alice"
+assert "claude bob" "$(TMUX_AGENT_TOOLS_TENANT=bob "$CLAUDE_TMUX" tenant)" "claude-cli-bob"
+
+echo "case: empty tenant treated as unset"
+assert "codex empty=default" "$(TMUX_AGENT_TOOLS_TENANT= "$CODEX_TMUX" tenant)" "codex-cli"
+
+echo "case: tenant prefix isolates session names"
+WORK=$(mktemp -d)
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+TMUX_AGENT_DIR="$WORK/state-a" TMUX_AGENT_TOOLS_TENANT=alice CODEX="$WORK/fake.sh" \
+  "$CODEX_TMUX" start --exact tt-test "$WORK" >/dev/null
+/bin/sleep 1
+session_a="$(tmux ls 2>/dev/null | grep tt-test | head -1)"
+if [[ "$session_a" == codex-cli-alice-tt-test* ]]; then
+  echo "  ok   tenant prefix used for session name"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL tenant prefix not applied: $session_a" >&2
+  FAIL=$((FAIL + 1))
+fi
+TMUX_AGENT_DIR="$WORK/state-a" TMUX_AGENT_TOOLS_TENANT=alice "$CODEX_TMUX" stop tt-test >/dev/null 2>&1 || true
+rm -rf "$WORK"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

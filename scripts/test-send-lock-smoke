@@ -1,0 +1,130 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #102 advisory send lock.
+#
+# Validates that `send_lock_around` in claude-tmux and codex-tmux:
+#   - serializes concurrent acquirers on the same agent name
+#   - recovers from a stale PID written into the lock dir
+#   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
+#   - exits with the inner command's return code
+#
+# The helper is sourced from the actual wrapper file via
+# TMUX_AGENT_TOOLS_SOURCE_ONLY so we exercise the real implementation,
+# not a copy.
+#
+# Exits non-zero on the first failure.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-send-lock-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+# Each case is a zsh body written to a temp file. The wrapper is sourced
+# by the harness so $send_lock_around / $ensure_agent_dir are in scope.
+run_case() {
+  local wrapper="$1" label="$2" body_file="$3"
+  echo "[$label] $(basename "$wrapper")"
+  local state_dir="$WORK/$label"
+  mkdir -p "$state_dir"
+  TMUX_AGENT_DIR="$state_dir" \
+    TMUX_AGENT_TOOLS_SOURCE_ONLY=1 \
+    WRAPPER="$wrapper" \
+    BODY="$body_file" \
+    zsh -c '
+      set -euo pipefail
+      source "$WRAPPER"
+      source "$BODY"
+    ' || fail "$label on $(basename "$wrapper")"
+}
+
+# Case bodies -------------------------------------------------------------
+
+cat > "$WORK/case-basic.zsh" <<'BODY'
+sentinel="$TMUX_AGENT_DIR/basic-out"
+send_lock_around basic 5 sh -c "echo ok > '$sentinel'"
+[[ "$(cat "$sentinel")" == ok ]] || { echo "sentinel mismatch" >&2; exit 1; }
+if [[ -d "$TMUX_AGENT_DIR/basic/send.lock.d" ]]; then
+  echo "lock dir not cleaned up after success" >&2; exit 1
+fi
+BODY
+
+cat > "$WORK/case-concurrent.zsh" <<'BODY'
+out="$TMUX_AGENT_DIR/order.log"
+: > "$out"
+( send_lock_around concur 10 sh -c "echo A-start >> '$out'; sleep 1; echo A-end >> '$out'" ) &
+pid_a=$!
+sleep 0.2
+( send_lock_around concur 10 sh -c "echo B-start >> '$out'; echo B-end >> '$out'" ) &
+pid_b=$!
+wait "$pid_a"
+wait "$pid_b"
+expected=$'A-start\nA-end\nB-start\nB-end'
+actual="$(cat "$out")"
+if [[ "$actual" != "$expected" ]]; then
+  echo "order mismatch:" >&2
+  echo "expected:" >&2; echo "$expected" >&2
+  echo "actual:"   >&2; echo "$actual"   >&2
+  exit 1
+fi
+BODY
+
+cat > "$WORK/case-stale-pid.zsh" <<'BODY'
+zmodload zsh/datetime 2>/dev/null || true
+name=stale
+mkdir -p "$TMUX_AGENT_DIR/$name"
+lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
+mkdir "$lock_dir"
+# Pick a PID essentially guaranteed dead (above MAX_PID on Linux/macOS).
+dead_pid=2147483646
+echo "$dead_pid" > "$lock_dir/pid"
+# Force the mkdir fallback path by intercepting `command -v flock`.
+command() {
+  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+start="${EPOCHSECONDS:-$(date +%s)}"
+send_lock_around "$name" 5 true
+now="${EPOCHSECONDS:-$(date +%s)}"
+elapsed=$(( now - start ))
+if (( elapsed >= 3 )); then
+  echo "stale lock recovery too slow: ${elapsed}s" >&2; exit 1
+fi
+BODY
+
+cat > "$WORK/case-missing-dir.zsh" <<'BODY'
+name=brand-new
+[[ ! -e "$TMUX_AGENT_DIR/$name" ]] || { echo "precondition: dir should not exist" >&2; exit 1; }
+send_lock_around "$name" 5 true
+[[ -d "$TMUX_AGENT_DIR/$name" ]] || { echo "expected $name dir created" >&2; exit 1; }
+BODY
+
+cat > "$WORK/case-rc.zsh" <<'BODY'
+set +e
+send_lock_around rc 5 sh -c "exit 7"
+rc=$?
+set -e
+[[ "$rc" -eq 7 ]] || { echo "expected rc=7 got $rc" >&2; exit 1; }
+BODY
+
+for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
+  tool="$(basename "$wrapper")"
+  run_case "$wrapper" "$tool-basic"        "$WORK/case-basic.zsh"
+  run_case "$wrapper" "$tool-concurrent"   "$WORK/case-concurrent.zsh"
+  run_case "$wrapper" "$tool-stale-pid"    "$WORK/case-stale-pid.zsh"
+  run_case "$wrapper" "$tool-missing-dir"  "$WORK/case-missing-dir.zsh"
+  run_case "$wrapper" "$tool-rc"           "$WORK/case-rc.zsh"
+done
+
+echo "OK: send-lock smoke passed for claude-tmux and codex-tmux."

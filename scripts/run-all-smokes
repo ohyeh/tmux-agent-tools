@@ -1,0 +1,122 @@
+#!/usr/bin/env zsh
+set -u
+
+script_dir="${0:A:h}"
+repo_root="${script_dir:h}"
+timeout_seconds=180
+kill_after_seconds=15
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout_bin="$(command -v timeout)"
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_bin="$(command -v gtimeout)"
+else
+  echo "run-all-smokes: timeout or gtimeout is required" >&2
+  exit 127
+fi
+
+typeset -a test_files
+if (( $# > 0 )); then
+  for arg in "$@"; do
+    if [[ "$arg" == /* ]]; then
+      candidate_file="$arg"
+    elif [[ "$arg" == */* ]]; then
+      candidate_file="$repo_root/$arg"
+    else
+      candidate_file="$script_dir/$arg"
+    fi
+    if [[ ! -f "$candidate_file" ]]; then
+      echo "run-all-smokes: missing test: $arg" >&2
+      exit 2
+    fi
+    test_files+=("${candidate_file:A}")
+  done
+else
+  test_files=("$script_dir"/test-*-smoke(N))
+fi
+
+if (( ${#test_files[@]} == 0 )); then
+  echo "run-all-smokes: no smoke tests found" >&2
+  exit 2
+fi
+
+typeset -a result_names result_labels result_codes result_durations result_attempts
+typeset -i attempt_exit_code=0
+typeset -i attempt_duration=0
+
+is_timeout_code() {
+  local exit_code="$1"
+  [[ "$exit_code" == "124" || "$exit_code" == "137" ]]
+}
+
+run_attempt() {
+  local test_file="$1"
+  local started_at ended_at
+
+  started_at="$(date +%s)"
+  "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file"
+  attempt_exit_code=$?
+  ended_at="$(date +%s)"
+  attempt_duration=$(( ended_at - started_at ))
+}
+
+cd "$repo_root" || exit 1
+
+overall_failed=0
+
+for test_file in "${test_files[@]}"; do
+  test_name="${test_file:t}"
+  echo
+  echo "==> $test_name (attempt 1)"
+  run_attempt "$test_file"
+  first_code=$attempt_exit_code
+  total_duration=$attempt_duration
+
+  if (( first_code == 0 )); then
+    result_label="PASS"
+    final_code=0
+    attempts=1
+  else
+    if is_timeout_code "$first_code"; then
+      echo "retry: $test_name timed out with exit $first_code"
+    else
+      echo "retry: $test_name failed with exit $first_code"
+    fi
+    echo
+    echo "==> $test_name (attempt 2)"
+    run_attempt "$test_file"
+    final_code=$attempt_exit_code
+    total_duration=$(( total_duration + attempt_duration ))
+    attempts=2
+
+    if (( final_code == 0 )); then
+      result_label="FLAKY-PASS"
+    elif is_timeout_code "$final_code"; then
+      result_label="TIMEOUT"
+      overall_failed=1
+    else
+      result_label="FAIL"
+      overall_failed=1
+    fi
+  fi
+
+  result_names+=("$test_name")
+  result_labels+=("$result_label")
+  result_codes+=("$final_code")
+  result_durations+=("$total_duration")
+  result_attempts+=("$attempts")
+done
+
+echo
+printf '%-42s %-11s %8s %8s %8s\n' "TEST" "RESULT" "ATTEMPTS" "EXIT" "SECONDS"
+printf '%-42s %-11s %8s %8s %8s\n' "----" "------" "--------" "----" "-------"
+for idx in {1..${#result_names[@]}}; do
+  printf '%-42s %-11s %8s %8s %8s\n' \
+    "${result_names[$idx]}" \
+    "${result_labels[$idx]}" \
+    "${result_attempts[$idx]}" \
+    "${result_codes[$idx]}" \
+    "${result_durations[$idx]}"
+done
+
+exit "$overall_failed"

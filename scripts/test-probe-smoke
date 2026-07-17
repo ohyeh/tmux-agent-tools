@@ -1,0 +1,93 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #203 CLI-aware progress probes.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-probe.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-claude.sh" <<'EOF'
+#!/bin/sh
+echo "Claude footer: Context 73%"
+echo "Goal active: rotate session"
+echo "⠋ Thinking"
+exec sleep 600
+EOF
+chmod +x "$WORK/fake-claude.sh"
+
+cat > "$WORK/fake-codex.sh" <<'EOF'
+#!/bin/sh
+echo "Codex progress 42%"
+echo "running shell command"
+echo "approval pending: allow command?"
+exec sleep 600
+EOF
+chmod +x "$WORK/fake-codex.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_exit() {
+  local label="$1" actual="$2" expected="$3"
+  assert "$label" "$actual" "$expected"
+}
+
+env CLAUDE="$WORK/fake-claude.sh" "$CLAUDE_TMUX" start --exact probe-claude "$WORK" >/dev/null
+env CODEX="$WORK/fake-codex.sh" "$CODEX_TMUX" start --exact probe-codex "$WORK" >/dev/null
+sleep 1
+
+payload="$("$CLAUDE_TMUX" probe --json --metric context_percent probe-claude)"
+assert "claude context schema" "$(printf '%s' "$payload" | jq -r .schema_version)" "1"
+assert "claude context value" "$(printf '%s' "$payload" | jq -r .value)" "73"
+assert "claude context confidence" "$(printf '%s' "$payload" | jq -r .confidence)" "high"
+
+payload="$("$CLAUDE_TMUX" probe --json --metric goal_active probe-claude)"
+assert "claude goal active" "$(printf '%s' "$payload" | jq -r .value)" "true"
+
+set +e
+"$CLAUDE_TMUX" probe --metric nope probe-claude >/dev/null 2>&1
+rc=$?
+set -e
+assert_exit "claude unknown metric exits 2" "$rc" "2"
+
+payload="$("$CODEX_TMUX" probe --json --metric progress probe-codex)"
+assert "codex progress schema" "$(printf '%s' "$payload" | jq -r .schema_version)" "1"
+assert "codex progress value" "$(printf '%s' "$payload" | jq -r .value)" "42"
+
+payload="$("$CODEX_TMUX" probe --json --metric tool_active probe-codex)"
+assert "codex tool active" "$(printf '%s' "$payload" | jq -r .value)" "true"
+
+payload="$("$CODEX_TMUX" probe --json --metric approval_pending probe-codex)"
+assert "codex approval pending" "$(printf '%s' "$payload" | jq -r .value)" "true"
+
+set +e
+"$CODEX_TMUX" probe --json --metric progress missing-probe >/dev/null 2>&1
+rc=$?
+set -e
+assert_exit "codex missing session exits 1" "$rc" "1"
+
+"$CLAUDE_TMUX" stop probe-claude >/dev/null 2>&1 || true
+"$CODEX_TMUX" stop probe-codex >/dev/null 2>&1 || true
+
+echo "probe smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

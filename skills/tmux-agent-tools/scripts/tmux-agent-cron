@@ -1,0 +1,145 @@
+#!/usr/bin/env zsh
+# tmux-agent-cron (issue #122 v1 catalog slice).
+#
+# v1 ships ONLY the catalog half — register schedules in a JSONL file
+# the operator's own scheduler (launchd / systemd-timer / crontab) reads.
+# Actual platform integration is deferred per docs/design-remaining-backlog.md.
+#
+# Subcommands: add, list, remove, history, show.
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+CATALOG_DIR="${TMUX_AGENT_CRON_DIR:-${HOME}/.tmux-agent/cron}"
+CATALOG_FILE="$CATALOG_DIR/schedules.jsonl"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-cron - schedule catalog for tmux-agent-tools (#122 v1).
+
+Usage:
+  tmux-agent-cron add <name> --schedule <cron-expr> --command <cmd> [--tag k=v]...
+  tmux-agent-cron list
+  tmux-agent-cron remove <name>
+  tmux-agent-cron history <name>
+  tmux-agent-cron show <name>
+  tmux-agent-cron help
+
+The catalog is stored at $CATALOG_DIR/schedules.jsonl (one JSON
+object per line). v1 does NOT wire to launchd / systemd-timer /
+crontab — the operator reads this catalog from their own scheduler.
+
+Schema (per line):
+  {"schema_version":1,"name":"...","schedule":"<cron-expr>","command":"...","tags":{...},"created_at":"<iso>"}
+EOF
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || { echo "jq not found" >&2; exit 1; }
+}
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+ensure_catalog_dir() {
+  mkdir -p "$CATALOG_DIR" 2>/dev/null || true
+  [[ -f "$CATALOG_FILE" ]] || ( : > "$CATALOG_FILE" )
+}
+
+cmd_add() {
+  require_jq
+  ensure_catalog_dir
+  local name="" schedule="" command="" tags='{}'
+  while (( $# )); do
+    case "$1" in
+      --schedule) schedule="${2:-}"; shift 2 || true ;;
+      --command)  command="${2:-}";  shift 2 || true ;;
+      --tag)
+        [[ "${2:-}" == *=* ]] || { echo "--tag must be key=value: ${2:-}" >&2; return 2; }
+        local k="${2%%=*}" v="${2#*=}"
+        tags="$("$JQ" -c -n --argjson cur "$tags" --arg k "$k" --arg v "$v" '$cur + {($k): $v}')"
+        shift 2 || true
+        ;;
+      -h|--help) usage; return 0 ;;
+      *)
+        if [[ -z "$name" ]]; then name="$1"; shift
+        else echo "Extra positional: $1" >&2; return 2; fi
+        ;;
+    esac
+  done
+  if [[ -z "$name" || -z "$schedule" || -z "$command" ]]; then
+    echo "Usage: tmux-agent-cron add <name> --schedule <cron> --command <cmd>" >&2
+    return 2
+  fi
+  # Reject duplicate name.
+  if "$JQ" -c -s --arg n "$name" 'map(select(.name==$n)) | length' "$CATALOG_FILE" 2>/dev/null \
+       | grep -q '^[1-9]'; then
+    echo "schedule already exists: $name" >&2
+    return 1
+  fi
+  local line
+  line="$("$JQ" -c -n --arg n "$name" --arg s "$schedule" --arg c "$command" \
+    --argjson tags "$tags" --arg at "$(iso_now)" \
+    '{schema_version:1, name:$n, schedule:$s, command:$c, tags:$tags, created_at:$at}')"
+  printf '%s\n' "$line" >> "$CATALOG_FILE"
+  echo "added: $name"
+}
+
+cmd_list() {
+  ensure_catalog_dir
+  require_jq
+  if [[ ! -s "$CATALOG_FILE" ]]; then
+    "$JQ" -n '[]'
+    return 0
+  fi
+  "$JQ" -c -s '.' "$CATALOG_FILE"
+}
+
+cmd_show() {
+  require_jq
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then echo "Usage: tmux-agent-cron show <name>" >&2; return 2; fi
+  ensure_catalog_dir
+  "$JQ" -c -s --arg n "$name" 'map(select(.name==$n)) | if length == 0 then null else .[0] end' \
+    "$CATALOG_FILE"
+}
+
+cmd_remove() {
+  require_jq
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then echo "Usage: tmux-agent-cron remove <name>" >&2; return 2; fi
+  ensure_catalog_dir
+  local count
+  count="$("$JQ" -c -s --arg n "$name" 'map(select(.name==$n)) | length' "$CATALOG_FILE")"
+  if [[ "$count" == "0" ]]; then
+    echo "no schedule named: $name" >&2
+    return 1
+  fi
+  local tmp="$CATALOG_FILE.tmp"
+  "$JQ" -c -s --arg n "$name" '.[] | select(.name != $n)' "$CATALOG_FILE" > "$tmp"
+  mv -f "$tmp" "$CATALOG_FILE"
+  echo "removed: $name"
+}
+
+cmd_history() {
+  require_jq
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then echo "Usage: tmux-agent-cron history <name>" >&2; return 2; fi
+  local runs_file="$CATALOG_DIR/$name/runs.jsonl"
+  if [[ ! -s "$runs_file" ]]; then
+    "$JQ" -n '[]'
+    return 0
+  fi
+  "$JQ" -c -s '.' "$runs_file"
+}
+
+sub="${1:-}"
+shift 2>/dev/null || true
+case "$sub" in
+  add)      cmd_add     "$@" ;;
+  list)     cmd_list    "$@" ;;
+  show)     cmd_show    "$@" ;;
+  remove)   cmd_remove  "$@" ;;
+  history)  cmd_history "$@" ;;
+  help|-h|--help|"") usage ;;
+  *) echo "Unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
+esac

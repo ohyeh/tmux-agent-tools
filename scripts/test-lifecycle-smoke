@@ -1,0 +1,242 @@
+#!/usr/bin/env zsh
+# Smoke test for the wrapper-owned terminal envelope + append-only launch
+# ledger (agent-tmux-lifecycle spec). Covers the happy path AND the failure
+# paths the spec calls out: stop with no result, ledger-less state dirs, and
+# dry-run. Style mirrors scripts/test-stats-smoke (assert/mkfake/trap).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-lifecycle-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+cleanup() {
+  local n
+  for n in linit lexit; do
+    TMUX_AGENT_DIR="$TMUX_AGENT_DIR" "$AGENT" claude stop "$n" >/dev/null 2>&1 || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Fabricate a worker dir with a launch-meta (carrying launch_id) + a matching
+# usage_init ledger line, so stats' launches block stays self-consistent.
+mkfake_launch() {
+  local name="$1" lid="$2" started="$3"
+  local d="$TMUX_AGENT_DIR/$name"
+  mkdir -p "$d"
+  printf '%s' "$started" > "$d/started_at"
+  jq -n --arg lid "$lid" \
+    '{schema_version:1,cli:"claude",exec_mode:"headless",launch_id:$lid}' > "$d/launch-meta.json"
+  jq -c -n --arg name "$name" --arg lid "$lid" --arg at "$started" \
+    '{schema_version:1,event:"usage_init",name:$name,at:$at,launch_id:$lid}' > "$d/usage.jsonl"
+}
+
+poll_result() {
+  # Wait (up to ~10s) for result.json to carry a terminal_reason (the in-pane
+  # envelope runs asynchronously after the wrapper returns).
+  local name="$1" i rp="$TMUX_AGENT_DIR/$1/result.json"
+  for i in {1..50}; do
+    if [[ -s "$rp" ]] && [[ "$(jq -r '.terminal_reason // ""' "$rp" 2>/dev/null)" != "" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+# --- Fake oneshot CLIs (exit 0 / exit 3) + profile ------------------------
+fake_ok="$WORK/fake-ok"
+cat > "$fake_ok" <<'EOF'
+#!/usr/bin/env zsh
+exit 0
+EOF
+fake_fail="$WORK/fake-fail"
+cat > "$fake_fail" <<'EOF'
+#!/usr/bin/env zsh
+exit 3
+EOF
+chmod +x "$fake_ok" "$fake_fail"
+
+profile_for() {
+  local bin="$1" out="$2"
+  cat > "$out" <<EOF
+bin=$bin
+exec_mode=oneshot
+prompt_via=argv
+prompt_flag=-p
+session_id_capture=off
+EOF
+}
+prof_ok="$WORK/ok.conf";   profile_for "$fake_ok" "$prof_ok"
+prof_fail="$WORK/fail.conf"; profile_for "$fake_fail" "$prof_fail"
+
+echo "case: start writes launch_id to launch-meta + ledger init event"
+"$AGENT" claude --profile "$prof_ok" start --exact linit "$WORK" 'task one' >/dev/null 2>&1 || true
+lm="$TMUX_AGENT_DIR/linit/launch-meta.json"
+assert "launch-meta has launch_id" \
+  "$([[ -n "$(jq -r '.launch_id // ""' "$lm" 2>/dev/null)" ]] && echo yes || echo no)" "yes"
+assert "usage_init count is 1" "$(grep -c usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl")" "1"
+assert "usage_init carries launch_id" \
+  "$(grep usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl" | jq -r '.launch_id // ""')" \
+  "$(jq -r .launch_id "$lm")"
+
+echo "case: same-name restart appends a second init with a distinct launch_id"
+"$AGENT" claude --profile "$prof_ok" start --exact linit "$WORK" 'task two' >/dev/null 2>&1 || true
+assert "two usage_init events" "$(grep -c usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl")" "2"
+assert "two distinct launch_ids" \
+  "$(grep usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl" | jq -r .launch_id | sort -u | wc -l | tr -d ' ')" "2"
+
+echo "case: stop MERGES lifecycle into an agent-written result (fields intact)"
+mkfake_launch lsr 'lsr-x-aaaa' '2026-07-10T00:00:00Z'
+jq -n '{schema_version:1,status:"success",summary:"MINE",artifacts:["a"],errors:["e"]}' \
+  > "$TMUX_AGENT_DIR/lsr/result.json"
+"$AGENT" claude stop lsr >/dev/null 2>&1 || true
+rj="$TMUX_AGENT_DIR/lsr/result.json"
+assert "agent status preserved" "$(jq -r .status "$rj")" "success"
+assert "agent summary preserved" "$(jq -r .summary "$rj")" "MINE"
+assert "agent artifacts preserved" "$(jq -c .artifacts "$rj")" '["a"]'
+assert "agent errors preserved" "$(jq -c .errors "$rj")" '["e"]'
+assert "lifecycle launch_id added" "$(jq -r .launch_id "$rj")" "lsr-x-aaaa"
+assert "lifecycle terminal_reason=stopped" "$(jq -r .terminal_reason "$rj")" "stopped"
+assert "lifecycle finished_at present" \
+  "$([[ -n "$(jq -r '.finished_at // ""' "$rj")" ]] && echo yes || echo no)" "yes"
+
+echo "case: stop with NO result synthesizes a skeleton (terminal_reason=stopped)"
+mkfake_launch lsn 'lsn-x-bbbb' '2026-07-10T00:00:00Z'
+"$AGENT" claude stop lsn >/dev/null 2>&1 || true
+sj="$TMUX_AGENT_DIR/lsn/result.json"
+assert "skeleton exists" "$([[ -f "$sj" ]] && echo yes || echo no)" "yes"
+assert "skeleton status unknown" "$(jq -r .status "$sj")" "unknown"
+assert "skeleton terminal_reason=stopped" "$(jq -r .terminal_reason "$sj")" "stopped"
+assert "skeleton launch_id" "$(jq -r .launch_id "$sj")" "lsn-x-bbbb"
+assert "launch_end result_present false" \
+  "$(grep launch_end "$TMUX_AGENT_DIR/lsn/usage.jsonl" | jq -r .result_present)" "false"
+
+echo "case: headless/oneshot process exit stamps process-exit + exit code"
+"$AGENT" claude --profile "$prof_fail" start --exact lexit "$WORK" 'bound task' >/dev/null 2>&1 || true
+if poll_result lexit; then
+  ej="$TMUX_AGENT_DIR/lexit/result.json"
+  assert "process-exit terminal_reason" "$(jq -r .terminal_reason "$ej")" "process-exit"
+  assert "process_exit_code=3" "$(jq -r .process_exit_code "$ej")" "3"
+  assert "process-exit launch_end logged" \
+    "$(grep -c '"terminal_reason":"process-exit"' "$TMUX_AGENT_DIR/lexit/usage.jsonl")" "1"
+else
+  assert "process-exit result landed" "timeout" "landed"
+fi
+
+echo "case: stop after process-exit is idempotent (no clobber, no dup launch_end)"
+# regression: re-finalizing an already-finalized launch overwrote the true
+# terminal_reason (process-exit → stopped) and pushed end coverage past 100%
+"$AGENT" claude stop lexit >/dev/null 2>&1 || true
+"$AGENT" claude stop lexit >/dev/null 2>&1 || true
+assert "terminal_reason survives stop" \
+  "$(jq -r .terminal_reason "$TMUX_AGENT_DIR/lexit/result.json")" "process-exit"
+assert "still exactly one launch_end" \
+  "$(grep -c '"event":"launch_end"' "$TMUX_AGENT_DIR/lexit/usage.jsonl")" "1"
+
+echo "case: stats --json launches block is self-consistent"
+sjson="$("$AGENT" claude stats --json)"
+# total = every usage_init carrying a launch_id: linit(2)+lsr(1)+lsn(1)+lexit(1)
+assert "launches.total counts inits" "$(printf '%s' "$sjson" | jq -r .launches.total)" "5"
+assert "by_terminal_reason.stopped=2" \
+  "$(printf '%s' "$sjson" | jq -r '.launches.by_terminal_reason.stopped')" "2"
+assert "name_reuse=1 (linit restarted)" "$(printf '%s' "$sjson" | jq -r .launches.name_reuse)" "1"
+assert "ended >= 2" \
+  "$([[ "$(printf '%s' "$sjson" | jq -r .launches.ended)" -ge 2 ]] && echo yes || echo no)" "yes"
+
+echo "case: text stats renders a launches line"
+stext="$("$AGENT" claude stats)"
+assert_contains "text launches line" "$stext" "launches: 5 total"
+
+echo "case: empty/ledger-less state dir → zero launches block (no error)"
+empty_json="$(TMUX_AGENT_DIR="$WORK/empty" "$AGENT" claude stats --json)"
+assert "empty launches.total 0" "$(printf '%s' "$empty_json" | jq -r .launches.total)" "0"
+assert "empty launches.ended 0" "$(printf '%s' "$empty_json" | jq -r .launches.ended)" "0"
+assert "empty end_coverage_pct 0" "$(printf '%s' "$empty_json" | jq -r .launches.end_coverage_pct)" "0"
+assert "empty name_reuse 0" "$(printf '%s' "$empty_json" | jq -r .launches.name_reuse)" "0"
+
+echo "case: stop on INVALID agent JSON preserves bytes + writes parseable skeleton"
+# reviewer finding 2: unparseable agent bytes have nothing to merge into; the
+# wrapper guarantee still requires a parseable result with lifecycle fields
+IDIR="$WORK/inv"
+mkdir -p "$IDIR/winv"
+printf '%s' '2026-07-10T00:00:00Z' > "$IDIR/winv/started_at"
+jq -n '{schema_version:1,cli:"claude",exec_mode:"headless",launch_id:"winv-x-cccc"}' > "$IDIR/winv/launch-meta.json"
+jq -c -n '{schema_version:1,event:"usage_init",name:"winv",at:"2026-07-10T00:00:00Z",launch_id:"winv-x-cccc"}' > "$IDIR/winv/usage.jsonl"
+printf '{not json' > "$IDIR/winv/result.json"
+TMUX_AGENT_DIR="$IDIR" "$AGENT" claude stop winv >/dev/null 2>&1 || true
+assert "invalid bytes preserved" \
+  "$([[ -f "$IDIR/winv/result.json.invalid" ]] && echo yes || echo no)" "yes"
+assert "skeleton parses (status unknown)" "$(jq -r .status "$IDIR/winv/result.json" 2>/dev/null)" "unknown"
+assert "skeleton terminal_reason=stopped" "$(jq -r .terminal_reason "$IDIR/winv/result.json")" "stopped"
+assert "invalid-json launch_end logged once" \
+  "$(grep -c '"event":"launch_end"' "$IDIR/winv/usage.jsonl")" "1"
+
+echo "case: heal-on-read refolds envelope after a late agent writer clobbered it"
+# reviewer finding 1: a CLI background child can rewrite result.json after the
+# in-pane envelope ran; the next `result` read must fold the fields back in
+HDIR="$WORK/heal"
+mkdir -p "$HDIR/wrace"
+printf '%s' '2026-07-10T00:00:00Z' > "$HDIR/wrace/started_at"
+jq -n '{schema_version:1,cli:"claude",exec_mode:"headless",launch_id:"wrace-x-dddd"}' > "$HDIR/wrace/launch-meta.json"
+{ jq -c -n '{schema_version:1,event:"usage_init",name:"wrace",at:"2026-07-10T00:00:00Z",launch_id:"wrace-x-dddd"}'
+  jq -c -n '{schema_version:1,event:"launch_end",launch_id:"wrace-x-dddd",finished_at:"2026-07-10T00:01:00Z",terminal_reason:"process-exit",exit_code:0,result_present:true}'
+} > "$HDIR/wrace/usage.jsonl"
+jq -n '{schema_version:1,status:"success",summary:"late writer",artifacts:[],errors:[]}' > "$HDIR/wrace/result.json"
+TMUX_AGENT_DIR="$HDIR" "$AGENT" claude result wrace --json >/dev/null 2>&1 || true
+assert "healed terminal_reason" "$(jq -r .terminal_reason "$HDIR/wrace/result.json")" "process-exit"
+assert "healed process_exit_code" "$(jq -r .process_exit_code "$HDIR/wrace/result.json")" "0"
+assert "agent summary kept through heal" "$(jq -r .summary "$HDIR/wrace/result.json")" "late writer"
+assert "heal appends no duplicate launch_end" \
+  "$(grep -c '"event":"launch_end"' "$HDIR/wrace/usage.jsonl")" "1"
+
+echo "case: one corrupt ledger line must not zero out other workers' launches"
+# reviewer finding 4: a crash can leave a half-written tail line; stats must
+# stay line-tolerant instead of silently reporting zero launches fleet-wide
+mkdir -p "$HDIR/wgood" "$HDIR/wbad"
+printf '%s' '2026-07-10T00:00:00Z' > "$HDIR/wgood/started_at"
+printf '%s' '2026-07-10T00:00:00Z' > "$HDIR/wbad/started_at"
+jq -c -n '{schema_version:1,event:"usage_init",name:"wgood",at:"2026-07-10T00:00:00Z",launch_id:"wgood-x-eeee"}' > "$HDIR/wgood/usage.jsonl"
+printf '{broken\n' > "$HDIR/wbad/usage.jsonl"
+cjson="$(TMUX_AGENT_DIR="$HDIR" "$AGENT" claude stats --json)"
+assert "corrupt line tolerated: total=2" "$(printf '%s' "$cjson" | jq -r .launches.total)" "2"
+assert "corrupt line tolerated: ended=1" "$(printf '%s' "$cjson" | jq -r .launches.ended)" "1"
+
+echo "case: dry-run writes no launch-meta and no ledger"
+"$AGENT" claude --profile "$prof_ok" start --dry-run --exact ldry "$WORK" 'x' >/dev/null 2>&1 || true
+assert "dry-run no launch-meta" \
+  "$([[ -f "$TMUX_AGENT_DIR/ldry/launch-meta.json" ]] && echo yes || echo no)" "no"
+assert "dry-run no usage.jsonl" \
+  "$([[ -f "$TMUX_AGENT_DIR/ldry/usage.jsonl" ]] && echo yes || echo no)" "no"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

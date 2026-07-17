@@ -1,0 +1,122 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #125 result schema validation (lightweight).
+#
+# Exercises the v1 validator: type / required / additionalProperties.
+# Each case writes a result.json directly under TMUX_AGENT_DIR (no
+# actual tmux session needed for the validator path).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+SCHEMA="$REPO_ROOT/schemas/result-status-summary.schema.json"
+
+WORK="$(mktemp -d -t tmux-agent-schema-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    needle: $needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Set up agent dir + schema marker without invoking start (the validator
+# only reads filesystem state).
+setup_agent() {
+  local prefix="$1"
+  mkdir -p "$TMUX_AGENT_DIR/$prefix"
+  printf '%s\n' "$SCHEMA" > "$TMUX_AGENT_DIR/$prefix/result-schema-path"
+}
+
+run_validator_cases() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix valid result"
+  setup_agent "$prefix-ok"
+  printf '%s\n' '{"schema_version":1,"status":"ok","summary":"all good"}' > "$TMUX_AGENT_DIR/$prefix-ok/result.json"
+  local out code=0
+  out="$("$wrapper" result --validate "$prefix-ok" 2>&1)" || code=$?
+  assert "$prefix-ok exit=0" "$code" "0"
+  assert "$prefix-ok valid=true" "$(printf '%s' "$out" | jq -r .valid)" "true"
+  assert "$prefix-ok errors empty" "$(printf '%s' "$out" | jq '.errors | length')" "0"
+  assert "$prefix-ok schema_version=1" "$(printf '%s' "$out" | jq -r .schema_version)" "1"
+
+  echo "case: $prefix missing required key"
+  setup_agent "$prefix-missing"
+  printf '%s\n' '{"schema_version":1,"status":"ok"}' > "$TMUX_AGENT_DIR/$prefix-missing/result.json"
+  code=0
+  out="$("$wrapper" result --validate "$prefix-missing" 2>&1)" || code=$?
+  assert "$prefix-missing exit=2" "$code" "2"
+  assert "$prefix-missing valid=false" "$(printf '%s' "$out" | jq -r .valid)" "false"
+  assert_contains "$prefix-missing names the key" "$out" "summary"
+
+  echo "case: $prefix extra key (additionalProperties:false)"
+  setup_agent "$prefix-extra"
+  printf '%s\n' '{"schema_version":1,"status":"ok","summary":"x","extra":1}' > "$TMUX_AGENT_DIR/$prefix-extra/result.json"
+  code=0
+  out="$("$wrapper" result --validate "$prefix-extra" 2>&1)" || code=$?
+  assert "$prefix-extra exit=2" "$code" "2"
+  assert "$prefix-extra valid=false" "$(printf '%s' "$out" | jq -r .valid)" "false"
+  assert_contains "$prefix-extra error mentions extra" "$out" "extra"
+
+  echo "case: $prefix non-JSON result"
+  setup_agent "$prefix-bad"
+  printf '%s' 'not-json-at-all' > "$TMUX_AGENT_DIR/$prefix-bad/result.json"
+  code=0
+  out="$("$wrapper" result --validate "$prefix-bad" 2>&1)" || code=$?
+  assert "$prefix-bad valid=false on parse fail" "$(printf '%s' "$out" | jq -r .valid)" "false"
+  assert_contains "$prefix-bad error mentions parse" "$out" "parse_error"
+
+  echo "case: $prefix missing result file"
+  setup_agent "$prefix-noresult"
+  # no result.json written
+  code=0
+  out="$("$wrapper" result --validate "$prefix-noresult" 2>&1)" || code=$?
+  assert "$prefix-noresult present=false" "$(printf '%s' "$out" | jq -r .present)" "false"
+  assert "$prefix-noresult valid=false" "$(printf '%s' "$out" | jq -r .valid)" "false"
+}
+
+run_flag_rejections() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix start --result-schema relative path rejected"
+  local code=0
+  "$wrapper" start --exact --result-schema "relative.json" "$prefix-rel" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix-rel exit=2 on relative" "$code" "2"
+
+  echo "case: $prefix start --result-schema non-existent file rejected"
+  code=0
+  "$wrapper" start --exact --result-schema "/no/such/schema.json" "$prefix-nox" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix-nox exit=1 on missing" "$code" "1"
+}
+
+run_validator_cases "$CODEX_TMUX"  "rs-codex"
+run_validator_cases "$CLAUDE_TMUX" "rs-claude"
+run_flag_rejections "$CODEX_TMUX"  "fr-codex"
+run_flag_rejections "$CLAUDE_TMUX" "fr-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

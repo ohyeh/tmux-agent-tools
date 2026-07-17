@@ -1,0 +1,92 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #103 v1 usage.jsonl skeleton.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-usage-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2; FAIL=$((FAIL + 1))
+  fi
+}
+
+run_default_path() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix default usage.jsonl created"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-u" "$WORK" >/dev/null
+  /bin/sleep 1
+  local usage_file="$TMUX_AGENT_DIR/$prefix-u/usage.jsonl"
+  assert "$prefix default file exists" "$(test -s "$usage_file" && echo yes)" "yes"
+  assert_contains "$prefix has usage_init event" "$(cat "$usage_file")" '"event":"usage_init"'
+  assert_contains "$prefix has schema_version" "$(cat "$usage_file")" '"schema_version":1'
+  "$wrapper" stop "$prefix-u" >/dev/null 2>&1 || true
+}
+
+run_custom_path() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix --usage custom path"
+  local custom="$WORK/$prefix-custom.jsonl"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --usage "$custom" "$prefix-c" "$WORK" >/dev/null
+  /bin/sleep 1
+  assert "$prefix custom file exists" "$(test -s "$custom" && echo yes)" "yes"
+  "$wrapper" stop "$prefix-c" >/dev/null 2>&1 || true
+}
+
+run_aggregate() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix status --usage aggregates"
+  local out
+  out="$("$wrapper" status --usage "$prefix-u" 2>&1)"
+  assert "$prefix schema_version=1" "$(printf '%s' "$out" | jq -r .schema_version)" "1"
+  assert "$prefix turns=0 (skeleton)" "$(printf '%s' "$out" | jq -r .turns)" "0"
+  assert_contains "$prefix note mentions deferred" "$out" "deferred per #103 v1"
+}
+
+run_relative_rejected() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix --usage relative path rejected"
+  local code=0
+  "$wrapper" start --exact --usage "rel.jsonl" "$prefix-rel" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix relative usage exit=2" "$code" "2"
+}
+
+run_default_path "$CODEX_TMUX"  "CODEX"  "u-codex"
+run_default_path "$CLAUDE_TMUX" "CLAUDE" "u-claude"
+run_aggregate    "$CODEX_TMUX"  "u-codex"
+run_aggregate    "$CLAUDE_TMUX" "u-claude"
+run_custom_path  "$CODEX_TMUX"  "CODEX"  "uc-codex"
+run_custom_path  "$CLAUDE_TMUX" "CLAUDE" "uc-claude"
+run_relative_rejected "$CODEX_TMUX"  "ur-codex"
+run_relative_rejected "$CLAUDE_TMUX" "ur-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

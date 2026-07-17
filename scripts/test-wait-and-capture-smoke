@@ -1,0 +1,179 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #99 wait-and-capture combined subcommand.
+#
+# Covers:
+#   - --literal match returns body sliced after the marker
+#   - --regex match returns body matching a zsh ERE
+#   - timeout case exits 1 in default mode
+#   - timeout case exits 0 under --no-timeout-error
+#   - --json emits schema_version=1 + reason field (matched/timeout/session_gone)
+#   - --since-marker overrides default (which is == marker)
+#   - --strip-ansi removes CSI/SGR
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-wait-capture-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Fake CLI that emits a marker mid-stream so wait-and-capture has something
+# to match. Echoes ANSI-coloured noise before/after for --strip-ansi tests.
+cat > "$WORK/fake-mark.sh" <<'EOF'
+#!/bin/sh
+printf '\033[31mpre-noise\033[0m\n'
+sleep 1
+printf 'MARKER-99\n'
+printf 'after-1\n'
+printf 'after-2\n'
+sleep 30
+EOF
+chmod +x "$WORK/fake-mark.sh"
+
+# Fake CLI that emits text containing letters D/O/N/E BEFORE the literal
+# `[DONE]` marker. Used to verify the default --literal style does not
+# false-positive on the ERE character class `[DONE]` (partner R6 critique
+# on PR #137 — original default of --regex would have matched the first
+# `D` of `Doing` and ended the wait long before `[DONE]` arrived).
+cat > "$WORK/fake-ere-trap.sh" <<'EOF'
+#!/bin/sh
+printf 'Doing some work first\n'
+sleep 2
+printf '[DONE]\n'
+printf 'tail-line\n'
+sleep 30
+EOF
+chmod +x "$WORK/fake-ere-trap.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (missing '$needle')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_cases() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix ($wrapper)"
+  env "$cli_env=$WORK/fake-mark.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  local body json_payload
+  body="$("$wrapper" wait-and-capture --literal --marker MARKER-99 --timeout 10 "$prefix" 2>&1)"
+  assert_contains "$prefix literal match body has after-1" "$body" "after-1"
+  assert_contains "$prefix literal match body has after-2" "$body" "after-2"
+
+  json_payload="$("$wrapper" wait-and-capture --literal --marker MARKER-99 --json "$prefix" 2>&1)"
+  assert "$prefix --json schema_version" "$(printf '%s' "$json_payload" | jq -r .schema_version)" "1"
+  assert "$prefix --json matched=true" "$(printf '%s' "$json_payload" | jq -r .matched)" "true"
+  assert "$prefix --json reason=matched" "$(printf '%s' "$json_payload" | jq -r .reason)" "matched"
+  assert "$prefix --json since_marker default" "$(printf '%s' "$json_payload" | jq -r .since_marker)" "MARKER-99"
+
+  # Timeout default (exits 1)
+  local rc=0
+  "$wrapper" wait-and-capture --literal --marker NOPE-9999 --timeout 2 "$prefix" >/dev/null 2>&1 || rc=$?
+  assert "$prefix timeout default exit=1" "$rc" "1"
+
+  # Timeout with --no-timeout-error (exits 0)
+  rc=0
+  "$wrapper" wait-and-capture --literal --marker NOPE-9999 --timeout 2 --no-timeout-error "$prefix" >/dev/null 2>&1 || rc=$?
+  assert "$prefix --no-timeout-error exit=0" "$rc" "0"
+
+  # Timeout JSON reason
+  json_payload="$("$wrapper" wait-and-capture --literal --marker NOPE-9999 --timeout 2 --json --no-timeout-error "$prefix" 2>&1)"
+  assert "$prefix --json reason=timeout" "$(printf '%s' "$json_payload" | jq -r .reason)" "timeout"
+  assert "$prefix --json matched=false on timeout" "$(printf '%s' "$json_payload" | jq -r .matched)" "false"
+
+  # session_gone reason
+  "$wrapper" stop "$prefix" >/dev/null 2>&1
+  json_payload="$("$wrapper" wait-and-capture --literal --marker MARKER-99 --timeout 1 --json --no-timeout-error "$prefix" 2>&1 || true)"
+  assert "$prefix --json reason=session_gone" "$(printf '%s' "$json_payload" | jq -r .reason)" "session_gone"
+
+  # session_gone is a HARD failure: --no-timeout-error must NOT suppress
+  # the exit code (gemini-code-assist on PR #137 R6).
+  rc=0
+  "$wrapper" wait-and-capture --literal --marker MARKER-99 --timeout 1 --json --no-timeout-error "$prefix" >/dev/null 2>&1 || rc=$?
+  assert "$prefix session_gone exit=1 despite --no-timeout-error" "$rc" "1"
+}
+
+run_ere_class_default_literal() {
+  # Regression test for partner R6: with the (new) default match style of
+  # --literal, a marker that looks like an ERE character class such as
+  # `[DONE]` matches the literal text and does NOT prematurely match the
+  # letter `D` of `Doing` printed earlier in the pane.
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix-ere-class ($wrapper, default --literal must not false-positive on [DONE])"
+  env "$cli_env=$WORK/fake-ere-trap.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 1
+
+  local started ended elapsed body
+  started=$(date +%s)
+  body="$("$wrapper" wait-and-capture --marker '[DONE]' --timeout 10 "$prefix" 2>&1)"
+  ended=$(date +%s)
+  elapsed=$((ended - started))
+
+  # The fake sleeps 2s before printing [DONE]; default --literal should
+  # take ~2s. The pre-existing `Doing` text MUST NOT have satisfied the
+  # wait — that would have returned immediately. Require elapsed >= 1.
+  if (( elapsed >= 1 )); then
+    echo "  ok   $prefix-ere-class waited >=1s (saw [DONE] not Doing)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix-ere-class returned in ${elapsed}s — default style may have matched Doing as ERE class" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  assert_contains "$prefix-ere-class body contains tail-line" "$body" "tail-line"
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_missing_value_reject() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix-missing-value ($wrapper)"
+  local rc=0
+  "$wrapper" wait-and-capture --marker 2>/dev/null || rc=$?
+  assert "$prefix --marker missing value rejected" "$rc" "2"
+  rc=0
+  "$wrapper" wait-and-capture --literal --marker X --timeout 2>/dev/null || rc=$?
+  assert "$prefix --timeout missing value rejected" "$rc" "2"
+  rc=0
+  "$wrapper" wait-and-capture --since-marker 2>/dev/null || rc=$?
+  assert "$prefix --since-marker missing value rejected" "$rc" "2"
+}
+
+run_cases "$CODEX_TMUX"  "CODEX"  "wc-codex"
+run_cases "$CLAUDE_TMUX" "CLAUDE" "wc-claude"
+run_ere_class_default_literal "$CODEX_TMUX"  "CODEX"  "wc-ere-codex"
+run_ere_class_default_literal "$CLAUDE_TMUX" "CLAUDE" "wc-ere-claude"
+run_missing_value_reject "$CODEX_TMUX"  "codex"
+run_missing_value_reject "$CLAUDE_TMUX" "claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

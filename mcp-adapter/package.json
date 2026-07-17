@@ -1,0 +1,23 @@
+{
+  "name": "codex-tmux-agent-adapter",
+  "version": "1.0.0",
+  "description": "MCP lifecycle adapter for tmux-agent-tools workers.",
+  "main": "src/server.js",
+  "bin": {
+    "codex-tmux-agent-adapter": "src/server.js"
+  },
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node test/adapter-smoke.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}

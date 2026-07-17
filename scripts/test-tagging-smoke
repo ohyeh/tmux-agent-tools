@@ -1,0 +1,91 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #124 tagging (--tag flag + tags subcommand
+# + tmux-agent-sessions list --tag filter).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
+
+WORK="$(mktemp -d -t tmux-agent-tag-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_basic() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix --tag persist + read"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --tag project=parking --tag owner=paul \
+    "$prefix-tg" "$WORK" >/dev/null
+
+  /bin/sleep 1
+
+  local tags_json
+  tags_json="$("$wrapper" tags "$prefix-tg")"
+  assert "$prefix tag project" "$(printf '%s' "$tags_json" | jq -r .project)" "parking"
+  assert "$prefix tag owner" "$(printf '%s' "$tags_json" | jq -r .owner)" "paul"
+
+  "$wrapper" stop "$prefix-tg" >/dev/null 2>&1 || true
+}
+
+run_invalid_format() {
+  local wrapper="$1" prefix="$2"
+  echo "case: $prefix --tag without = rejected"
+  local code=0
+  "$wrapper" start --exact --tag noequals "$prefix-bad" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix --tag without = exit=2" "$code" "2"
+}
+
+run_sessions_filter() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix sessions list --tag filter"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --tag project=alpha "$prefix-a" "$WORK" >/dev/null
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --tag project=beta "$prefix-b" "$WORK" >/dev/null
+  /bin/sleep 1
+
+  local alpha_count beta_count
+  alpha_count="$("$SESSIONS" list --json --tag project=alpha 2>/dev/null | jq -rs 'map(select(.name=="'"$prefix-a"'" or .name=="'"$prefix-b"'")) | length')"
+  beta_count="$("$SESSIONS" list --json --tag project=beta 2>/dev/null | jq -rs 'map(select(.name=="'"$prefix-a"'" or .name=="'"$prefix-b"'")) | length')"
+  assert "$prefix filter alpha returns 1" "$alpha_count" "1"
+  assert "$prefix filter beta returns 1" "$beta_count" "1"
+
+  "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
+  "$wrapper" stop "$prefix-b" >/dev/null 2>&1 || true
+}
+
+run_basic "$CODEX_TMUX"  "CODEX"  "tg-codex"
+run_basic "$CLAUDE_TMUX" "CLAUDE" "tg-claude"
+run_invalid_format "$CODEX_TMUX"  "if-codex"
+run_invalid_format "$CLAUDE_TMUX" "if-claude"
+run_sessions_filter "$CODEX_TMUX"  "CODEX"  "sf-codex"
+run_sessions_filter "$CLAUDE_TMUX" "CLAUDE" "sf-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

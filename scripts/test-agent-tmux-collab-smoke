@@ -1,0 +1,99 @@
+#!/usr/bin/env zsh
+# Smoke test for `agent-tmux team` collaboration primitives (PR B):
+# broadcast (per-member dispatch), send (resolve by suffix), wait (timeout +
+# all-idle), results (missing-result reporting + gather present/valid).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-collab-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+mkdir -p "$WORK/work"
+# Ownership-based cleanup — kill-server would murder unrelated live workers
+# on the shared tmux server (including a worker running this very suite), and
+# a fixed-prefix pattern breaks under TMUX_AGENT_TOOLS_TENANT (session names
+# become <cli>-cli-<tenant>-<name>). Only kill sessions that (a) did not
+# exist when this smoke started AND (b) carry this smoke's team name.
+SESSIONS_BEFORE="$(tmux list-sessions -F '#S' 2>/dev/null || true)"
+cleanup() {
+  local s
+  for s in $(tmux list-sessions -F '#S' 2>/dev/null | grep -E -- '-c1-'); do
+    printf '%s\n' "$SESSIONS_BEFORE" | grep -qx -- "$s" && continue
+    tmux kill-session -t "$s" 2>/dev/null || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# echo-fake: prints every line it reads, so sent text is visible in the pane.
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+while IFS= read -r line; do printf 'ECHO:%s\n' "$line"; done
+EOF
+chmod +x "$WORK/fake.sh"
+export CODEX="$WORK/fake.sh"
+
+PASS=0; FAIL=0
+assert() { local l="$1" a="$2" e="$3"; if [[ "$a" == "$e" ]]; then echo "  ok   $l"; PASS=$((PASS+1)); else echo "  FAIL $l expected=$e got=$a" >&2; FAIL=$((FAIL+1)); fi; }
+contains() { local l="$1" h="$2" n="$3"; if [[ "$h" == *"$n"* ]]; then echo "  ok   $l"; PASS=$((PASS+1)); else echo "  FAIL $l: '$n' missing" >&2; FAIL=$((FAIL+1)); fi; }
+
+echo "case: setup team (2 codex workers)"
+"$AGENT" pair codex c1 "$WORK/work" --workers 2 >/dev/null
+/bin/sleep 1
+
+echo "case: broadcast dispatches to every worker"
+code=0; "$AGENT" team broadcast c1 'BCAST-MARKER-42' >/dev/null 2>&1 || code=$?
+assert "broadcast exit=0" "$code" "0"
+/bin/sleep 1
+contains "w1 pane got broadcast" "$("$AGENT" codex capture --strip-ansi c1-w1 60)" "BCAST-MARKER-42"
+contains "w2 pane got broadcast" "$("$AGENT" codex capture --strip-ansi c1-w2 60)" "BCAST-MARKER-42"
+
+echo "case: send resolves worker by short suffix"
+code=0; "$AGENT" team send c1 w1 'SEND-ONLY-W1' >/dev/null 2>&1 || code=$?
+assert "send exit=0" "$code" "0"
+/bin/sleep 1
+contains "w1 got targeted send" "$("$AGENT" codex capture --strip-ansi c1-w1 80)" "SEND-ONLY-W1"
+
+echo "case: send to non-member rejected"
+code=0; "$AGENT" team send c1 w9 'nope' >/dev/null 2>&1 || code=$?
+assert "send bogus exit=1" "$code" "1"
+
+echo "case: wait times out while workers are busy"
+code=0; "$AGENT" team wait c1 2 >/dev/null 2>&1 || code=$?
+assert "wait timeout exit=8" "$code" "8"
+
+echo "case: results reports missing result files"
+out_err="$("$AGENT" team results c1 2>&1 1>/dev/null)" || true
+results_json="$("$AGENT" team results c1 --json 2>/dev/null || true)"
+assert "missing present=false" "$(printf '%s' "$results_json" | jq -r '[.[].present] | all(. == false)')" "true"
+contains "missing names on stderr" "$out_err" "missing/invalid"
+code=0; "$AGENT" team results c1 >/dev/null 2>&1 || code=$?
+assert "results-missing exit=1" "$code" "1"
+
+echo "case: results gathers present+valid bodies"
+for w in c1-w1 c1-w2; do
+  mkdir -p "$TMUX_AGENT_DIR/$w"
+  printf '%s\n' '{"schema_version":1,"status":"done","summary":"ok-'"$w"'","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/$w/result.json"
+done
+code=0; "$AGENT" team results c1 >/dev/null 2>&1 || code=$?
+assert "results-present exit=0" "$code" "0"
+results_json="$("$AGENT" team results c1 --json)"
+assert "all present" "$(printf '%s' "$results_json" | jq -r '[.[].present] | all')" "true"
+assert "all valid" "$(printf '%s' "$results_json" | jq -r '[.[].valid] | all')" "true"
+assert "w1 body summary" "$(printf '%s' "$results_json" | jq -r '.[] | select(.name=="c1-w1") | .body.summary')" "ok-c1-w1"
+
+echo "case: wait returns 0 once all workers idle"
+# resolve by suffix, not fixed prefix — tenant mode prefixes the session name
+for _s in $(tmux list-sessions -F '#S' 2>/dev/null | grep -E -- '-c1-w[12]$'); do
+  tmux kill-session -t "$_s" 2>/dev/null || true
+done
+/bin/sleep 1
+code=0; "$AGENT" team wait c1 6 >/dev/null 2>&1 || code=$?
+assert "wait all-idle exit=0" "$code" "0"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

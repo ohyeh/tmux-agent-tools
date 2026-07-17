@@ -1,0 +1,132 @@
+#!/usr/bin/env zsh
+# Smoke test for the #P1 batch:
+#   - version surface: `--version`, per-cli `version`, `doctor` version line
+#     (all must agree with the latest CHANGELOG release).
+#   - wrong-engine guard: status/watch hint when a same-name session lives
+#     under another CLI's prefix (false "exited" trap).
+# No real Claude / Codex required (fake sleeping CLI). Never kill-server;
+# sessions are stopped by name under a unique tenant to avoid interference.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-p1-batch-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+# Unique tenant isolates our tmux session names from any other tmux activity.
+export TMUX_AGENT_TOOLS_TENANT="p1b$$"
+
+FAKE_CLI="$WORK/fake-sleep"
+cat > "$FAKE_CLI" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$FAKE_CLI"
+
+cleanup() {
+  local n
+  for n in we-live we-absent; do
+    CLAUDE="$FAKE_CLI" CODEX="$FAKE_CLI" "$AGENT" claude stop "$n" >/dev/null 2>&1 || true
+    CLAUDE="$FAKE_CLI" CODEX="$FAKE_CLI" "$AGENT" codex  stop "$n" >/dev/null 2>&1 || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label unexpected=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: version surface agrees with CHANGELOG"
+changelog_version="$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' "$REPO_ROOT/CHANGELOG.md" | sed 's/^## v//')"
+[[ -n "$changelog_version" ]] || { echo "could not parse CHANGELOG version" >&2; exit 1; }
+ver_top="$("$AGENT" --version)"
+ver_cli="$("$AGENT" claude version)"
+assert "top-level --version matches CHANGELOG" "$ver_top" "$changelog_version"
+assert "per-cli version matches top-level" "$ver_cli" "$ver_top"
+doctor_text="$(CLAUDE="$FAKE_CLI" "$AGENT" claude doctor 2>&1)"
+assert_contains "doctor text prints version line" "$doctor_text" "version: $changelog_version"
+assert_contains "doctor text prints engine path" "$doctor_text" "engine: $AGENT"
+doctor_ver="$(CLAUDE="$FAKE_CLI" "$AGENT" claude doctor --json 2>/dev/null | jq -r '.checks[] | select(.name=="version") | .detail')"
+assert_contains "doctor --json version check present" "$doctor_ver" "$changelog_version"
+
+echo "case: wrong-engine hint fires cross-CLI (session under claude, queried via codex)"
+CLAUDE="$FAKE_CLI" "$AGENT" claude start --exact we-live "$WORK" >/dev/null
+sleep 1
+# Sanity: claude sees it running, no hint on the owning engine.
+own_json="$(CLAUDE="$FAKE_CLI" "$AGENT" claude status --json we-live 2>/dev/null)"
+assert "owning engine reports running" "$(printf '%s' "$own_json" | jq -r .running)" "true"
+assert "owning engine has no wrong_engine_hint" "$(printf '%s' "$own_json" | jq -r '.wrong_engine_hint // "absent"')" "absent"
+
+# codex status: same name absent under codex prefix but present under claude.
+codex_err="$(CODEX="$FAKE_CLI" "$AGENT" codex status we-live 2>&1 >/dev/null)"
+assert_contains "codex status stderr hint" "$codex_err" "hint: session exists under claude prefix — wrong engine?"
+codex_status_rc=0
+CODEX="$FAKE_CLI" "$AGENT" codex status we-live >/dev/null 2>&1 || codex_status_rc=$?
+assert "codex status exit code unchanged (0)" "$codex_status_rc" "0"
+codex_json="$(CODEX="$FAKE_CLI" "$AGENT" codex status --json we-live 2>/dev/null)"
+assert "codex --json wrong_engine_hint field" "$(printf '%s' "$codex_json" | jq -r '.wrong_engine_hint // "absent"')" "session exists under claude prefix — wrong engine?"
+
+echo "case: wrong-engine hint in watch"
+watch_err="$(CODEX="$FAKE_CLI" "$AGENT" codex watch --any --timeout 2 --interval 1 we-live 2>&1 >/dev/null || true)"
+assert_contains "codex watch stderr hint" "$watch_err" "hint: session exists under claude prefix — wrong engine?"
+
+echo "case: no false hint when session is absent under EVERY CLI"
+absent_err="$(CODEX="$FAKE_CLI" "$AGENT" codex status we-absent 2>&1 >/dev/null)"
+assert_not_contains "no hint for globally-absent name" "$absent_err" "wrong engine"
+absent_json="$(CODEX="$FAKE_CLI" "$AGENT" codex status --json we-absent 2>/dev/null)"
+assert "absent name omits wrong_engine_hint" "$(printf '%s' "$absent_json" | jq -r '.wrong_engine_hint // "absent"')" "absent"
+
+echo "case: watch --json carries per-agent wrong_engine_hint (review F1)"
+watch_json="$(CODEX="$FAKE_CLI" "$AGENT" codex watch --json --any --timeout 2 --interval 1 we-live 2>/dev/null || true)"
+assert "watch json wrong_engine_hint" \
+  "$(printf '%s' "$watch_json" | jq -r '.agents[0].wrong_engine_hint // "absent"')" \
+  "session exists under claude prefix — wrong engine?"
+
+echo "case: tenant namespace isolation — no hint across namespaces (review F2)"
+# we-live exists under the DEFAULT-namespace claude prefix; a tenant-scoped
+# codex query must not see it, or hints would leak between tenants.
+ten_err="$(TMUX_AGENT_TOOLS_TENANT=p1t CODEX="$FAKE_CLI" "$AGENT" codex status we-live 2>&1 >/dev/null)"
+assert_not_contains "tenant query ignores default namespace" "$ten_err" "wrong engine"
+ten_json="$(TMUX_AGENT_TOOLS_TENANT=p1t CODEX="$FAKE_CLI" "$AGENT" codex status --json we-live 2>/dev/null)"
+assert "tenant json omits wrong_engine_hint" "$(printf '%s' "$ten_json" | jq -r '.wrong_engine_hint // "absent"')" "absent"
+
+CLAUDE="$FAKE_CLI" "$AGENT" claude stop we-live >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

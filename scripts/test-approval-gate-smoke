@@ -1,0 +1,210 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #185 approval gate.
+#
+# Covers:
+#   - pause-until-file with "approve\n" → resume + exit 0
+#   - pause-until-file with "reject reason..." → exit 7
+#   - pause-timeout fires when no file is written → exit 8
+#   - status file records `awaiting_approval` while blocked
+#   - transcript event has kind: "approval" with decision
+#   - audit log records `approval.approve` / `approval.reject` events
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-approval-smoke.XXXXXX)"
+TMUX_AGENT_DIR="$WORK/state"
+export TMUX_AGENT_DIR
+trap '
+  "$CODEX_TMUX"  stop ag-approve >/dev/null 2>&1 || true
+  "$CODEX_TMUX"  stop ag-reject  >/dev/null 2>&1 || true
+  "$CODEX_TMUX"  stop ag-timeout >/dev/null 2>&1 || true
+  "$CLAUDE_TMUX" stop ag-cl-approve >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+' EXIT
+
+# Fake CLI that emits a marker quickly then idles long enough to keep the
+# session alive while the approval gate polls.
+cat > "$WORK/fake-mark.sh" <<'EOF'
+#!/bin/sh
+sleep 1
+printf 'AG-MARKER\n'
+sleep 60
+EOF
+chmod +x "$WORK/fake-mark.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (missing '$needle')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_approve_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix approve ($wrapper)"
+  local marker="$WORK/$prefix.approve"
+  local transcript="$WORK/$prefix.transcript.jsonl"
+  local audit="$WORK/$prefix.audit.jsonl"
+  rm -f "$marker" "$transcript" "$audit"
+
+  env "$cli_env=$WORK/fake-mark.sh" "$wrapper" start --exact \
+    --transcript "$transcript" \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  # Background the wait-and-capture so we can write the marker mid-flight.
+  local rc_file="$WORK/$prefix.rc"
+  (
+    set +e
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$audit" \
+    "$wrapper" wait-and-capture --literal --marker AG-MARKER \
+      --timeout 30 --pause-until-file "$marker" "$prefix" >/dev/null 2>&1
+    echo $? > "$rc_file"
+  ) &
+  local bg_pid=$!
+
+  # Wait for the wrapper to reach the awaiting_approval state.
+  local status_path="$TMUX_AGENT_DIR/$prefix/approval-status.json"
+  local waited=0
+  while (( waited < 15 )); do
+    if [[ -f "$status_path" ]] && \
+       [[ "$(jq -r .state "$status_path" 2>/dev/null)" == "awaiting_approval" ]]; then
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  assert "$prefix status file shows awaiting_approval while blocked" \
+    "$(jq -r .state "$status_path" 2>/dev/null)" "awaiting_approval"
+
+  # Write approval marker.
+  printf 'approve\n' > "$marker"
+  wait "$bg_pid" 2>/dev/null || true
+  local rc
+  rc="$(cat "$rc_file" 2>/dev/null || echo 99)"
+  assert "$prefix approve exit=0" "$rc" "0"
+
+  assert "$prefix status file resolved=approve" \
+    "$(jq -r .decision "$status_path" 2>/dev/null)" "approve"
+
+  # Transcript should contain a kind: "approval" event.
+  if [[ -f "$transcript" ]]; then
+    local approval_line
+    approval_line="$(grep '"kind":"approval"' "$transcript" || true)"
+    assert_contains "$prefix transcript has approval event" "$approval_line" '"decision":"approve"'
+    assert_contains "$prefix transcript event has marker_path" "$approval_line" '"marker_path"'
+    assert_contains "$prefix transcript event has decided_at" "$approval_line" '"decided_at"'
+  else
+    echo "  FAIL $prefix transcript missing" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  # Audit log should record approval.approve.
+  if [[ -f "$audit" ]]; then
+    local audit_line
+    audit_line="$(grep '"event":"approval.approve"' "$audit" || true)"
+    assert_contains "$prefix audit has approval.approve" "$audit_line" '"event":"approval.approve"'
+    assert_contains "$prefix audit event has marker_path" "$audit_line" '"marker_path"'
+  else
+    echo "  FAIL $prefix audit log missing" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_reject_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix reject ($wrapper)"
+  local marker="$WORK/$prefix.reject"
+  local audit="$WORK/$prefix.audit.jsonl"
+  rm -f "$marker" "$audit"
+
+  env "$cli_env=$WORK/fake-mark.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  local rc_file="$WORK/$prefix.rc"
+  (
+    set +e
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$audit" \
+    "$wrapper" wait-and-capture --literal --marker AG-MARKER \
+      --timeout 30 --pause-until-file "$marker" "$prefix" >/dev/null 2>&1
+    echo $? > "$rc_file"
+  ) &
+  local bg_pid=$!
+
+  sleep 3
+  printf 'reject not-safe\n' > "$marker"
+  wait "$bg_pid" 2>/dev/null || true
+  local rc
+  rc="$(cat "$rc_file" 2>/dev/null || echo 99)"
+  assert "$prefix reject exit=7" "$rc" "7"
+
+  local audit_line
+  audit_line="$(grep '"event":"approval.reject"' "$audit" || true)"
+  assert_contains "$prefix audit has approval.reject" "$audit_line" '"event":"approval.reject"'
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_timeout_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix pause-timeout ($wrapper)"
+  local marker="$WORK/$prefix.timeout"
+  local audit="$WORK/$prefix.audit.jsonl"
+  rm -f "$marker" "$audit"
+
+  env "$cli_env=$WORK/fake-mark.sh" "$wrapper" start --exact \
+    "$prefix" "$WORK" >/dev/null
+  sleep 2
+
+  local rc=0
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit" \
+  "$wrapper" wait-and-capture --literal --marker AG-MARKER \
+    --timeout 30 --pause-until-file "$marker" --pause-timeout 2 \
+    "$prefix" >/dev/null 2>&1 || rc=$?
+  assert "$prefix pause-timeout exit=8" "$rc" "8"
+
+  local audit_line
+  audit_line="$(grep '"event":"approval.timeout"' "$audit" || true)"
+  assert_contains "$prefix audit has approval.timeout" "$audit_line" '"event":"approval.timeout"'
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_approve_case  "$CODEX_TMUX"  "CODEX"  "ag-approve"
+run_reject_case   "$CODEX_TMUX"  "CODEX"  "ag-reject"
+run_timeout_case  "$CODEX_TMUX"  "CODEX"  "ag-timeout"
+# Cross-wrapper sanity: claude-tmux approve path.
+run_approve_case  "$CLAUDE_TMUX" "CLAUDE" "ag-cl-approve"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

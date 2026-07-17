@@ -1,0 +1,38 @@
+#!/usr/bin/env zsh
+# Standardization guard (#286): the three plugin manifests must agree with each
+# other AND with the latest released version in CHANGELOG.md. This makes version
+# drift a CI failure instead of something noticed releases later.
+#
+# Formula/tmux-agent-tools.rb is intentionally NOT checked here: it is bumped in a
+# separate post-release PR (the `release(formula): ...` pattern), so it lags the
+# tag by design in the window between release and formula bump.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label ($actual)"; PASS=$((PASS + 1))
+  else echo "  FAIL $label: expected '$expected', got '$actual'" >&2; FAIL=$((FAIL + 1)); fi
+}
+
+# Latest released version from CHANGELOG (first `## vX.Y.Z`, skipping `## Unreleased`).
+changelog_version="$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | sed 's/^## v//')"
+if [[ -z "$changelog_version" ]]; then
+  echo "  FAIL could not parse latest version from CHANGELOG.md" >&2
+  exit 1
+fi
+echo "latest CHANGELOG version: $changelog_version"
+
+for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json .cursor-plugin/plugin.json; do
+  v="$(jq -r '.version' "$manifest")"
+  assert "$manifest matches CHANGELOG" "$v" "$changelog_version"
+done
+
+echo "version-sync smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

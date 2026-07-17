@@ -1,0 +1,213 @@
+#!/usr/bin/env zsh
+# tmux-agent-worktrees — manage --workdir-fresh worktrees (issue #187).
+#
+# Subcommands:
+#   list [--json]                  Show managed worktrees + dirty state.
+#   prune [--dry-run] [--force]    Apply cleanup_policy per meta.json.
+#
+# Discovery: iterates $XDG_STATE_HOME/tmux-agent-tools/worktrees/*/.tmux-agent-worktree/meta.json
+# Default cleanup: no-change-cleanup removes worktrees whose tmux session is
+# dead AND that have no dirty/untracked changes. has-change-keep keeps if dirty.
+# always-keep is never auto-removed.
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+# Use TMUX_BIN, not TMUX — TMUX is the tmux client socket env var; shadowing it
+# breaks tmux server targeting (HIGH finding on PR #194).
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
+GIT="${GIT:-$(command -v git 2>/dev/null || true)}"
+
+if [[ -z "$JQ" ]]; then
+  echo "tmux-agent-worktrees: jq not found (set JQ=)" >&2
+  exit 2
+fi
+if [[ -z "$GIT" ]]; then
+  echo "tmux-agent-worktrees: git not found (set GIT=)" >&2
+  exit 2
+fi
+
+worktrees_root() {
+  printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/worktrees"
+}
+
+iter_meta_paths() {
+  local root
+  root="$(worktrees_root)"
+  [[ -d "$root" ]] || return 0
+  local d
+  for d in "$root"/*(/N); do
+    [[ -f "$d/.tmux-agent-worktree/meta.json" ]] || continue
+    printf '%s\n' "$d/.tmux-agent-worktree/meta.json"
+  done
+}
+
+is_dirty() {
+  local wt="$1"
+  if [[ ! -d "$wt" ]]; then
+    print -r -- "missing"
+    return 0
+  fi
+  local out=""
+  out="$("$GIT" -C "$wt" status --porcelain 2>/dev/null || true)"
+  if [[ -n "$out" ]]; then
+    print -r -- "dirty"
+  else
+    print -r -- "clean"
+  fi
+}
+
+session_alive() {
+  # Best-effort: check if any tmux session name contains the agent name.
+  local agent="$1"
+  [[ -n "$TMUX_BIN" ]] || return 1
+  local sessions
+  sessions="$("$TMUX_BIN" ls -F '#S' 2>/dev/null)" || return 1
+  [[ "$sessions" == *"$agent"* ]]
+}
+
+augment_meta() {
+  # Stdin: meta.json. Stdout: meta + dirty + session.
+  local meta_path="$1"
+  # NB: `local path=` would clobber $PATH in zsh (tied pair). Use wt_path.
+  local wt_path agent dirty alive
+  wt_path="$("$JQ" -r '.path' "$meta_path")"
+  agent="$("$JQ" -r '.agent_name' "$meta_path")"
+  dirty="$(is_dirty "$wt_path")"
+  if session_alive "$agent"; then alive="alive"; else alive="dead"; fi
+  "$JQ" --arg dirty "$dirty" --arg session "$alive" \
+    '. + {dirty:$dirty, session:$session}' "$meta_path"
+}
+
+cmd_list() {
+  local json=0
+  while [[ "${1:-}" == "--json" ]]; do json=1; shift; done
+  local meta
+  local -a items
+  items=()
+  while IFS= read -r meta; do
+    items+=("$(augment_meta "$meta")")
+  done < <(iter_meta_paths)
+  if (( json )); then
+    if (( ${#items[@]} == 0 )); then
+      echo '[]'
+    else
+      printf '%s\n' "${items[@]}" | "$JQ" -s '.'
+    fi
+    return 0
+  fi
+  if (( ${#items[@]} == 0 )); then
+    echo "(no managed worktrees)"
+    return 0
+  fi
+  printf '%-30s  %-8s  %-6s  %-18s  %s\n' AGENT TOOL DIRTY POLICY PATH
+  local row
+  for row in "${items[@]}"; do
+    local a t d p pa
+    a="$(printf '%s' "$row" | "$JQ" -r '.agent_name')"
+    t="$(printf '%s' "$row" | "$JQ" -r '.tool')"
+    d="$(printf '%s' "$row" | "$JQ" -r '.dirty')"
+    p="$(printf '%s' "$row" | "$JQ" -r '.cleanup_policy')"
+    pa="$(printf '%s' "$row" | "$JQ" -r '.path')"
+    printf '%-30s  %-8s  %-6s  %-18s  %s\n' "$a" "$t" "$d" "$p" "$pa"
+  done
+}
+
+should_remove() {
+  # Args: dirty session policy. Echoes "yes" or "no".
+  local dirty="$1" session="$2" policy="$3"
+  case "$policy" in
+    always-keep) print -r -- "no"; return ;;
+    has-change-keep)
+      if [[ "$dirty" == "dirty" ]]; then print -r -- "no"; else
+        if [[ "$session" == "alive" ]]; then print -r -- "no"; else print -r -- "yes"; fi
+      fi
+      ;;
+    no-change-cleanup|*)
+      if [[ "$dirty" == "dirty" ]]; then print -r -- "no"
+      elif [[ "$session" == "alive" ]]; then print -r -- "no"
+      else print -r -- "yes"
+      fi
+      ;;
+  esac
+}
+
+remove_worktree() {
+  local wt="$1" branch="$2" source_repo="$3"
+  if [[ -n "$source_repo" && -d "$source_repo" ]]; then
+    ( cd "$source_repo" && "$GIT" worktree remove --force "$wt" >/dev/null 2>&1 ) || true
+  fi
+  if [[ -d "$wt" ]]; then
+    rm -rf -- "$wt"
+  fi
+  if [[ -n "$source_repo" && -d "$source_repo" && -n "$branch" ]]; then
+    ( cd "$source_repo" && "$GIT" branch -D "$branch" >/dev/null 2>&1 ) || true
+  fi
+}
+
+cmd_prune() {
+  local dry=0 force=0
+  while [[ "${1:-}" == "--dry-run" || "${1:-}" == "--force" ]]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --force) force=1 ;;
+    esac
+    shift
+  done
+  local meta
+  local removed=0 kept=0
+  while IFS= read -r meta; do
+    local row wt branch src dirty session policy verdict agent
+    row="$(augment_meta "$meta")"
+    wt="$(printf '%s' "$row" | "$JQ" -r '.path')"
+    branch="$(printf '%s' "$row" | "$JQ" -r '.branch')"
+    src="$(printf '%s' "$row" | "$JQ" -r '.source_repo')"
+    dirty="$(printf '%s' "$row" | "$JQ" -r '.dirty')"
+    session="$(printf '%s' "$row" | "$JQ" -r '.session')"
+    policy="$(printf '%s' "$row" | "$JQ" -r '.cleanup_policy')"
+    agent="$(printf '%s' "$row" | "$JQ" -r '.agent_name')"
+    if (( force )); then
+      verdict="yes"
+    else
+      verdict="$(should_remove "$dirty" "$session" "$policy")"
+    fi
+    if [[ "$verdict" == "yes" ]]; then
+      if (( dry )); then
+        echo "would remove: $agent ($wt) [policy=$policy dirty=$dirty session=$session]"
+      else
+        echo "remove: $agent ($wt)"
+        remove_worktree "$wt" "$branch" "$src"
+      fi
+      removed=$((removed + 1))
+    else
+      if (( dry )); then
+        echo "keep: $agent ($wt) [policy=$policy dirty=$dirty session=$session]"
+      fi
+      kept=$((kept + 1))
+    fi
+  done < <(iter_meta_paths)
+  echo "summary: removed=$removed kept=$kept dry_run=$dry force=$force"
+}
+
+usage() {
+  cat <<'EOF'
+tmux-agent-worktrees — manage --workdir-fresh worktrees
+
+Usage:
+  tmux-agent-worktrees list [--json]
+  tmux-agent-worktrees prune [--dry-run] [--force]
+EOF
+}
+
+main() {
+  local sub="${1:-}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    list) cmd_list "$@" ;;
+    prune) cmd_prune "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

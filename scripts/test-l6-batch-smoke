@@ -1,0 +1,103 @@
+#!/usr/bin/env zsh
+# Smoke for L6 batch: #115 --on-exit-allow, #116 --secret, #117 --workdir-fresh.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-l6-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_hook_allow() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix #115 hook allowlist rejects non-match"
+  local code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --sentinel "$WORK/$prefix.exit" \
+    --on-exit "rm -rf /" \
+    --on-exit-allow '^curl ' "$prefix-ha" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix non-match exit=3" "$code" "3"
+
+  code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --sentinel "$WORK/$prefix-ok.exit" \
+    --on-exit "curl http://x" \
+    --on-exit-allow '^curl ' "$prefix-hb" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix match exit=0" "$code" "0"
+  "$wrapper" stop "$prefix-hb" >/dev/null 2>&1 || true
+}
+
+run_secret() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix #116 --secret injects file content into env"
+  echo "supersecret-456" > "$WORK/$prefix-sec"
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --secret "API_TOKEN=$WORK/$prefix-sec" "$prefix-s" "$WORK" >/dev/null
+  /bin/sleep 1
+  local session="${${wrapper:t}%-tmux}-cli-$prefix-s"
+  local actual
+  actual="$(tmux show-environment -t "$session" 2>/dev/null | grep '^API_TOKEN=' | cut -d= -f2-)"
+  assert "$prefix env injected" "$actual" "supersecret-456"
+  "$wrapper" stop "$prefix-s" >/dev/null 2>&1 || true
+
+  echo "case: $prefix #116 --secret missing file rejected"
+  local code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact \
+    --secret "X=/no/such" "$prefix-sm" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix missing-file exit=4" "$code" "4"
+}
+
+run_workdir_fresh() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix #117 --workdir-fresh creates worktree"
+  git init "$WORK/$prefix-repo" >/dev/null 2>&1
+  ( cd "$WORK/$prefix-repo" && git commit --allow-empty -m init >/dev/null 2>&1 )
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --workdir-fresh \
+    "$prefix-w" "$WORK/$prefix-repo" >/dev/null
+  /bin/sleep 1
+  local marker="$TMUX_AGENT_DIR/$prefix-w/fresh-worktree"
+  assert "$prefix worktree marker exists" "$(test -f "$marker" && echo yes)" "yes"
+  local worktree_path
+  worktree_path="$(cat "$marker")"
+  assert "$prefix worktree path is a dir" "$(test -d "$worktree_path" && echo yes)" "yes"
+  "$wrapper" stop "$prefix-w" >/dev/null 2>&1 || true
+
+  echo "case: $prefix #117 --workdir-fresh rejects non-git"
+  local code=0
+  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --workdir-fresh \
+    "$prefix-wnogit" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "$prefix non-git exit=1" "$code" "1"
+}
+
+run_hook_allow    "$CODEX_TMUX"  "CODEX"  "h-codex"
+run_hook_allow    "$CLAUDE_TMUX" "CLAUDE" "h-claude"
+run_secret        "$CODEX_TMUX"  "CODEX"  "s-codex"
+run_secret        "$CLAUDE_TMUX" "CLAUDE" "s-claude"
+run_workdir_fresh "$CODEX_TMUX"  "CODEX"  "w-codex"
+run_workdir_fresh "$CLAUDE_TMUX" "CLAUDE" "w-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

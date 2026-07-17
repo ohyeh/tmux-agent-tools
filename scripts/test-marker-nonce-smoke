@@ -1,0 +1,110 @@
+#!/usr/bin/env zsh
+# Smoke test for Wave 1 send-wait nonce behavior.
+#
+# Covers both wrappers with a fake CLI:
+#   - send-wait generates a fresh MARK-<hex> nonce per call
+#   - the sent text includes the appended nonce instruction
+#   - the wrapper waits for that exact nonce on its own line
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-marker-nonce-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-nonce-agent.sh" <<'EOF'
+#!/bin/sh
+printf 'fake nonce agent ready\n'
+while IFS= read -r line; do
+  printf 'saw:%s\n' "$line"
+  nonce="$(printf '%s\n' "$line" | sed -nE 's/.*(MARK-[0-9a-fA-F]{6}).*/\1/p' | tail -1)"
+  if [ -n "$nonce" ]; then
+    printf '%s\n' "$nonce"
+  fi
+done
+EOF
+chmod +x "$WORK/fake-nonce-agent.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (missing '$needle')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_matches() {
+  local label="$1" value="$2" pattern="$3"
+  if [[ "$value" =~ $pattern ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (value '$value' did not match $pattern)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_case() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix ($wrapper)"
+  env "$cli_env=$WORK/fake-nonce-agent.sh" "$wrapper" start --exact "$prefix" "$WORK" >/dev/null
+  "$wrapper" wait-text "$prefix" "fake nonce agent ready" 5 >/dev/null
+
+  local out1 out2 nonce1 nonce2 pane
+  out1="$("$wrapper" send-wait "$prefix" "first request" 5 2>&1)"
+  out2="$("$wrapper" send-wait "$prefix" "second request" 5 2>&1)"
+
+  nonce1="$(printf '%s\n' "$out1" | sed -nE 's/^matched nonce: (MARK-[0-9a-fA-F]{6})$/\1/p' | tail -1)"
+  nonce2="$(printf '%s\n' "$out2" | sed -nE 's/^matched nonce: (MARK-[0-9a-fA-F]{6})$/\1/p' | tail -1)"
+
+  assert_matches "$prefix first nonce shape" "$nonce1" '^MARK-[0-9a-fA-F]{6}$'
+  assert_matches "$prefix second nonce shape" "$nonce2" '^MARK-[0-9a-fA-F]{6}$'
+  if [[ "$nonce1" != "$nonce2" ]]; then
+    echo "  ok   $prefix nonces differ"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix nonces differ" >&2
+    FAIL=$((FAIL + 1))
+  fi
+
+  pane="$("$wrapper" capture "$prefix" 120 2>&1)"
+  assert_contains "$prefix first original text sent" "$pane" "first request"
+  assert_contains "$prefix second original text sent" "$pane" "second request"
+  assert_contains "$prefix first instruction appended" "$pane" "End your reply with this exact nonce on its own line: $nonce1"
+  assert_contains "$prefix second instruction appended" "$pane" "End your reply with this exact nonce on its own line: $nonce2"
+  assert_contains "$prefix waited for first exact nonce" "$pane" $'\n'"$nonce1"$'\n'
+  assert_contains "$prefix waited for second exact nonce" "$pane" $'\n'"$nonce2"$'\n'
+
+  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+}
+
+run_case "$CODEX_TMUX"  "CODEX"  "nonce-codex"
+run_case "$CLAUDE_TMUX" "CLAUDE" "nonce-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

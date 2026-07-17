@@ -1,0 +1,161 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #128 active health-check ping.
+#
+# Covers:
+#   - Active session responds → exit 0 + result=ok
+#   - Sleeping fake (no echo) → exit 1 + result=timeout
+#   - Missing session         → exit 2 + result=dead
+#   - rtt_ms is a non-negative integer
+#   - --timeout 1 is honored (no 10-second waits)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-ping-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+# Active fake: prints prompt, then a `read` loop that echoes each input line.
+# Any C-u (clears input line) sent via tmux send-keys forces the terminal to
+# redraw the input line → pane bytes change → ping should see "ok".
+cat > "$WORK/fake-live.sh" <<'EOF'
+#!/bin/sh
+echo "ready-marker"
+echo "prompt> "
+while IFS= read -r line; do
+  echo "echo: $line"
+done
+EOF
+chmod +x "$WORK/fake-live.sh"
+
+# Quiet fake: pure sleep. tmux session stays alive but the child produces no
+# output regardless of input → ping should time out.
+cat > "$WORK/fake-quiet.sh" <<'EOF'
+#!/bin/sh
+exec sleep 600
+EOF
+chmod +x "$WORK/fake-quiet.sh"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_int_ge() {
+  local label="$1" actual="$2" floor="$3"
+  if [[ "$actual" =~ ^[0-9]+$ ]] && (( actual >= floor )); then
+    echo "  ok   $label ($actual >= $floor)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (got '$actual', expected integer >= $floor)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_lt() {
+  local label="$1" actual="$2" ceiling="$3"
+  if (( actual < ceiling )); then
+    echo "  ok   $label ($actual < $ceiling)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label ($actual >= $ceiling)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_one() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix ($wrapper)"
+
+  # Case 1: missing session → dead
+  local payload result rtt rc
+  set +e
+  payload="$("$wrapper" ping --json --timeout 1 "$prefix-missing-$$")"
+  rc=$?
+  set -e
+  result="$(printf '%s' "$payload" | jq -r .result)"
+  rtt="$(printf '%s' "$payload" | jq -r .rtt_ms)"
+  assert "$prefix missing schema_version=1" "$(printf '%s' "$payload" | jq -r .schema_version)" "1"
+  assert "$prefix missing result=dead" "$result" "dead"
+  assert "$prefix missing exit_code=2" "$rc" "2"
+  assert_int_ge "$prefix missing rtt_ms non-negative int" "$rtt" "0"
+
+  # Case 2: active session → ok
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    "$prefix-live" "$WORK" >/dev/null
+  sleep 1
+  set +e
+  payload="$("$wrapper" ping --json --timeout 5 "$prefix-live")"
+  rc=$?
+  set -e
+  result="$(printf '%s' "$payload" | jq -r .result)"
+  rtt="$(printf '%s' "$payload" | jq -r .rtt_ms)"
+  assert "$prefix live schema_version=1" "$(printf '%s' "$payload" | jq -r .schema_version)" "1"
+  assert "$prefix live result=ok" "$result" "ok"
+  assert "$prefix live exit_code=0" "$rc" "0"
+  assert_int_ge "$prefix live rtt_ms non-negative int" "$rtt" "0"
+  "$wrapper" stop "$prefix-live" >/dev/null 2>&1 || true
+
+  # Case 3: quiet session → timeout. Also asserts --timeout=1 honored
+  # (entire ping must return in well under 10s).
+  env "$cli_env=$WORK/fake-quiet.sh" "$wrapper" start --exact \
+    "$prefix-quiet" "$WORK" >/dev/null
+  sleep 1
+  local t0 t1 elapsed_s
+  t0=$(date +%s)
+  set +e
+  payload="$("$wrapper" ping --json --timeout 1 "$prefix-quiet")"
+  rc=$?
+  set -e
+  t1=$(date +%s)
+  elapsed_s=$(( t1 - t0 ))
+  result="$(printf '%s' "$payload" | jq -r .result)"
+  rtt="$(printf '%s' "$payload" | jq -r .rtt_ms)"
+  assert "$prefix quiet result=timeout" "$result" "timeout"
+  assert "$prefix quiet exit_code=1" "$rc" "1"
+  assert_int_ge "$prefix quiet rtt_ms >= 1000ms" "$rtt" "1000"
+  assert_lt "$prefix --timeout 1 honored (wall <= 4s)" "$elapsed_s" "4"
+  "$wrapper" stop "$prefix-quiet" >/dev/null 2>&1 || true
+
+  # Case 4: human-readable default output sanity
+  env "$cli_env=$WORK/fake-live.sh" "$wrapper" start --exact \
+    "$prefix-human" "$WORK" >/dev/null
+  sleep 1
+  local human
+  set +e
+  human="$("$wrapper" ping --timeout 5 "$prefix-human")"
+  rc=$?
+  set -e
+  if [[ "$human" == "ping ok: $prefix-human"* ]]; then
+    echo "  ok   $prefix human output starts with 'ping ok'"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix human output unexpected: $human" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  assert "$prefix human exit_code=0" "$rc" "0"
+  "$wrapper" stop "$prefix-human" >/dev/null 2>&1 || true
+}
+
+run_one "$CODEX_TMUX"  "CODEX"  "ping-codex"
+run_one "$CLAUDE_TMUX" "CLAUDE" "ping-claude"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

@@ -1,0 +1,265 @@
+#!/usr/bin/env zsh
+# Stress smoke for bounded supervision fallbacks with adversarial fake workers.
+
+[[ "${ZSH_EVAL_CONTEXT:-}" == *:file ]] && return 0 2>/dev/null || true
+
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+if [[ -z "${TMUX_AGENT_STRESS_WATCHDOG:-}" ]]; then
+  export TMUX_AGENT_STRESS_WATCHDOG=1
+  exec perl -e 'alarm shift; exec @ARGV' 75 "$0" "$@"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-supervision-stress.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+PASS=0
+FAIL=0
+FINDING=""
+CREATED=()
+RUN_OUT=""
+RUN_RC=0
+RUN_ELAPSED=0
+
+cleanup() {
+  local item cli name
+  for item in "${CREATED[@]}"; do
+    cli="${item%%:*}"
+    name="${item#*:}"
+    "$AGENT_TMUX" "$cli" stop "$name" >/dev/null 2>&1 || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+now_ms() {
+  perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+}
+
+make_fake() {
+  local fake_path="$1" payload="$2"
+  {
+    print -r -- '#!/bin/sh'
+    print -r -- "exec zsh -c '$payload'"
+  } > "$fake_path"
+  chmod +x "$fake_path"
+}
+
+record_pass() {
+  echo "PASS $1"
+  PASS=$((PASS + 1))
+}
+
+record_fail() {
+  echo "FAIL $1: $2" >&2
+  FAIL=$((FAIL + 1))
+  [[ -n "$FINDING" ]] || FINDING="$1: $2"
+}
+
+run_bounded() {
+  local max_ms="$1"
+  shift
+  local t0 t1 out rc
+  t0="$(now_ms)"
+  set +e
+  out="$("$@" 2>&1)"
+  rc=$?
+  set -e
+  t1="$(now_ms)"
+  RUN_OUT="$out"
+  RUN_RC="$rc"
+  RUN_ELAPSED=$((t1 - t0))
+  (( t1 - t0 <= max_ms ))
+}
+
+assert_json() {
+  local label="$1" json="$2" filter="$3" expected="$4" actual
+  actual="$(printf '%s' "$json" | jq -r "$filter")"
+  if [[ "$actual" == "$expected" ]]; then
+    return 0
+  fi
+  record_fail "$label" "$filter expected $expected got $actual"
+  return 1
+}
+
+assert_json_nonempty_array() {
+  local label="$1" json="$2" filter="$3" length
+  length="$(printf '%s' "$json" | jq -r "$filter | length")"
+  if [[ "$length" =~ ^[1-9][0-9]*$ ]]; then
+    return 0
+  fi
+  record_fail "$label" "$filter expected non-empty array got length=$length"
+  return 1
+}
+
+assert_json_expr() {
+  local label="$1" json="$2" expr="$3"
+  if printf '%s' "$json" | jq -e "$expr" >/dev/null; then
+    return 0
+  fi
+  record_fail "$label" "jq expression failed: $expr; payload=$json"
+  return 1
+}
+
+start_fake() {
+  local cli="$1" env_key="$2" name="$3" fake="$4"
+  env "$env_key=$fake" "$AGENT_TMUX" "$cli" start --exact "$name" "$WORK" >/dev/null
+  CREATED+=("$cli:$name")
+  sleep 1
+}
+
+case_never_marker() {
+  local cli="$1" env_key="$2"
+  local name="stress-$cli-never-marker"
+  local fake="$WORK/$name.sh"
+  make_fake "$fake" 'sleep 600'
+  start_fake "$cli" "$env_key" "$name" "$fake"
+  if run_bounded 5000 "$AGENT_TMUX" "$cli" wait-text --literal "$name" MARK 2; then
+    if [[ "$RUN_RC" == 1 ]]; then
+      record_pass "$cli never-marker bounded timeout"
+    else
+      record_fail "$cli never-marker" "exit $RUN_RC, expected 1"
+    fi
+  else
+    record_fail "$cli never-marker" "exceeded wall bound (${RUN_ELAPSED}ms)"
+  fi
+}
+
+case_stale_marker() {
+  local cli="$1" env_key="$2" raw_rc
+  local name="stress-$cli-stale-marker"
+  local fake="$WORK/$name.sh"
+  make_fake "$fake" 'printf "[DONE]\n"; sleep 600'
+  start_fake "$cli" "$env_key" "$name" "$fake"
+  set +e
+  "$AGENT_TMUX" "$cli" wait-text --literal "$name" "[DONE]" 2 >/dev/null 2>&1
+  raw_rc=$?
+  set -e
+  if [[ "$raw_rc" != 0 ]]; then
+    record_fail "$cli stale-marker raw wait" "exit $raw_rc, expected 0"
+    return
+  fi
+  if run_bounded 5000 "$AGENT_TMUX" "$cli" send-wait "$name" "do real work" 2; then
+    if [[ "$RUN_RC" == 1 ]]; then
+      record_pass "$cli stale-marker nonce timeout"
+    else
+      record_fail "$cli stale-marker nonce" "exit $RUN_RC, expected 1"
+    fi
+  else
+    record_fail "$cli stale-marker nonce" "exceeded wall bound (${RUN_ELAPSED}ms)"
+  fi
+}
+
+case_no_result() {
+  local cli="$1" env_key="$2" status_json
+  local name="stress-$cli-no-result"
+  local fake="$WORK/$name.sh"
+  make_fake "$fake" 'exit 0'
+  start_fake "$cli" "$env_key" "$name" "$fake"
+  if run_bounded 5000 "$AGENT_TMUX" "$cli" result wait-required "$name" --fields status,summary --wait 2 --json; then
+    if [[ "$RUN_RC" == 1 ]] &&
+       assert_json_expr "$cli no-result payload" "$RUN_OUT" '.missing_fields==["status","summary"] and .present==false and .timeout==true'; then
+      status_json="$("$AGENT_TMUX" "$cli" status --json "$name")"
+      if assert_json "$cli no-result status running" "$status_json" ".running" "false"; then
+        record_pass "$cli no-result correctly classified"
+      fi
+    else
+      if [[ "$RUN_RC" != 1 ]]; then
+        record_fail "$cli no-result" "exit $RUN_RC, expected 1"
+      fi
+    fi
+  else
+    record_fail "$cli no-result" "exceeded wall bound (${RUN_ELAPSED}ms)"
+  fi
+}
+
+case_malformed_result() {
+  local cli="$1" env_key="$2"
+  local name="stress-$cli-malformed-result"
+  local fake="$WORK/$name.sh"
+  make_fake "$fake" 'printf "{\"status\":" > "$TMUX_AGENT_RESULT"; sleep 1; exit 0'
+  start_fake "$cli" "$env_key" "$name" "$fake"
+  if run_bounded 5000 "$AGENT_TMUX" "$cli" result validate "$name" --json; then
+    if [[ "$RUN_RC" == 2 ]] &&
+       assert_json "$cli malformed valid" "$RUN_OUT" ".valid" "false" &&
+       assert_json_nonempty_array "$cli malformed errors" "$RUN_OUT" ".errors"; then
+      record_pass "$cli malformed-result correctly rejected"
+    else
+      record_fail "$cli malformed-result" "exit $RUN_RC, expected 2"
+    fi
+  else
+    record_fail "$cli malformed-result" "exceeded wall bound (${RUN_ELAPSED}ms)"
+  fi
+}
+
+case_malformed_wait_required() {
+  local cli="$1" env_key="$2"
+  local name="stress-$cli-malformed-wait-required"
+  local fake="$WORK/$name.sh"
+  make_fake "$fake" 'printf "{\"status\":" > "$TMUX_AGENT_RESULT"; sleep 1; exit 0'
+  start_fake "$cli" "$env_key" "$name" "$fake"
+  if run_bounded 5000 "$AGENT_TMUX" "$cli" result wait-required "$name" --fields status,summary --wait 2 --json; then
+    if [[ "$RUN_RC" == 1 ]] &&
+       assert_json_expr "$cli malformed wait-required payload" "$RUN_OUT" '.missing_fields==["status","summary"] and .present==true and .timeout==true'; then
+      record_pass "$cli malformed wait-required correctly classified"
+    else
+      if [[ "$RUN_RC" != 1 ]]; then
+        record_fail "$cli malformed wait-required" "exit $RUN_RC, expected 1"
+      fi
+    fi
+  else
+    record_fail "$cli malformed wait-required" "exceeded wall bound (${RUN_ELAPSED}ms)"
+  fi
+}
+
+case_ping_stall() {
+  local cli="$1" env_key="$2"
+  local name="stress-$cli-ping-stall"
+  local fake="$WORK/$name.sh"
+  make_fake "$fake" 'sleep 600'
+  start_fake "$cli" "$env_key" "$name" "$fake"
+  if run_bounded 5000 "$AGENT_TMUX" "$cli" ping --json --timeout 2 "$name"; then
+    if [[ "$RUN_RC" == 1 ]] &&
+       assert_json "$cli ping-stall result" "$RUN_OUT" ".result" "timeout"; then
+      record_pass "$cli ping-stall correctly timed out"
+    else
+      record_fail "$cli ping-stall" "exit $RUN_RC, expected 1"
+    fi
+  else
+    record_fail "$cli ping-stall" "exceeded wall bound (${RUN_ELAPSED}ms)"
+  fi
+}
+
+run_preset() {
+  local cli="$1" env_key="$2"
+  case_never_marker "$cli" "$env_key"
+  case_stale_marker "$cli" "$env_key"
+  case_no_result "$cli" "$env_key"
+  case_malformed_result "$cli" "$env_key"
+  case_malformed_wait_required "$cli" "$env_key"
+  case_ping_stall "$cli" "$env_key"
+}
+
+run_preset codex CODEX
+
+if "$AGENT_TMUX" claude doctor --json | jq -e '.ok == true' >/dev/null 2>&1; then
+  run_preset claude CLAUDE
+else
+  echo "SKIP claude: claude unavailable or doctor failed"
+fi
+
+if "$AGENT_TMUX" agy doctor --json | jq -e '.ok == true' >/dev/null 2>&1; then
+  run_preset agy AGY
+else
+  echo "SKIP agy: agy-local unavailable or doctor failed"
+fi
+
+echo "summary: $PASS passed, $FAIL failed"
+if [[ -n "$FINDING" ]]; then
+  echo "FINDING: $FINDING" >&2
+fi
+[[ $FAIL -eq 0 ]]

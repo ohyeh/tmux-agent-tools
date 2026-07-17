@@ -1,0 +1,201 @@
+#!/usr/bin/env zsh
+# Smoke test for `stats` aggregation, `result validate` status_bucket, and the
+# launch-meta.json written at start (usage-survey rec 1+7).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-stats-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+cleanup() {
+  local n
+  for n in os-w dr-w; do
+    TMUX_AGENT_DIR="$TMUX_AGENT_DIR" "$AGENT" claude stop "$n" >/dev/null 2>&1 || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# --- Fabricate three worker dirs directly (no CLI launch needed) -----------
+mkfake() {
+  local name="$1" started="$2"
+  local d="$TMUX_AGENT_DIR/$name"
+  mkdir -p "$d"
+  printf '%s' "$started" > "$d/started_at"
+  print -r -- "$d"
+}
+
+# w1: June, headless/claude, result success, task_shape bounded
+d1="$(mkfake w1 '2026-06-01T10:00:00Z')"
+printf '{"schema_version":1,"cli":"claude","exec_mode":"headless","task_shape":"bounded"}' > "$d1/launch-meta.json"
+printf '{"schema_version":1,"status":"success","summary":"ok","artifacts":[],"errors":[]}' > "$d1/result.json"
+
+# w2: June, oneshot/codex, result SHOULD_FIX (→ review bucket)
+d2="$(mkfake w2 '2026-06-15T10:00:00Z')"
+printf '{"schema_version":1,"cli":"codex","exec_mode":"oneshot"}' > "$d2/launch-meta.json"
+printf '{"schema_version":1,"status":"SHOULD_FIX","summary":"nit","artifacts":[],"errors":[]}' > "$d2/result.json"
+
+# w3: July, no launch-meta (legacy unknown), no result
+mkfake w3 '2026-07-02T10:00:00Z' >/dev/null
+
+# noise dir without started_at must be ignored
+mkdir -p "$TMUX_AGENT_DIR/worktrees/junk"
+printf 'x' > "$TMUX_AGENT_DIR/worktrees/junk/note.txt"
+
+echo "case: stats --json aggregates every field"
+sjson="$("$AGENT" claude stats --json)"
+assert "total is 3" "$(printf '%s' "$sjson" | jq -r .total)" "3"
+assert "by_month 2026-06" "$(printf '%s' "$sjson" | jq -r '.by_month["2026-06"]')" "2"
+assert "by_month 2026-07" "$(printf '%s' "$sjson" | jq -r '.by_month["2026-07"]')" "1"
+assert "exec_mode headless" "$(printf '%s' "$sjson" | jq -r '.by_exec_mode.headless')" "1"
+assert "exec_mode oneshot" "$(printf '%s' "$sjson" | jq -r '.by_exec_mode.oneshot')" "1"
+assert "exec_mode unknown" "$(printf '%s' "$sjson" | jq -r '.by_exec_mode.unknown')" "1"
+assert "exec_mode tui zero" "$(printf '%s' "$sjson" | jq -r '.by_exec_mode.tui')" "0"
+assert "cli claude" "$(printf '%s' "$sjson" | jq -r '.by_cli.claude')" "1"
+assert "cli codex" "$(printf '%s' "$sjson" | jq -r '.by_cli.codex')" "1"
+assert "cli unknown" "$(printf '%s' "$sjson" | jq -r '.by_cli.unknown')" "1"
+assert "coverage with_result" "$(printf '%s' "$sjson" | jq -r '.result_coverage.with_result')" "2"
+assert "coverage without_result" "$(printf '%s' "$sjson" | jq -r '.result_coverage.without_result')" "1"
+assert "coverage pct" "$(printf '%s' "$sjson" | jq -r '.result_coverage.pct')" "66.6"
+assert "bucket success" "$(printf '%s' "$sjson" | jq -r '.status_buckets.success')" "1"
+assert "bucket review (SHOULD_FIX)" "$(printf '%s' "$sjson" | jq -r '.status_buckets.review')" "1"
+assert "bucket no_result" "$(printf '%s' "$sjson" | jq -r '.status_buckets.no_result')" "1"
+assert "bucket failure zero" "$(printf '%s' "$sjson" | jq -r '.status_buckets.failure')" "0"
+assert "raw_top has 2 values" "$(printf '%s' "$sjson" | jq -r '.status_raw_top | length')" "2"
+assert "raw_top success count" "$(printf '%s' "$sjson" | jq -r '.status_raw_top[] | select(.status=="success") | .count')" "1"
+assert "task_shape bounded" "$(printf '%s' "$sjson" | jq -r '.by_task_shape.bounded')" "1"
+assert "task_shape unspecified (missing field + missing meta)" "$(printf '%s' "$sjson" | jq -r '.by_task_shape.unspecified')" "2"
+assert "task_shape series zero" "$(printf '%s' "$sjson" | jq -r '.by_task_shape.series')" "0"
+assert "task_shape coverage with" "$(printf '%s' "$sjson" | jq -r '.task_shape_coverage.with')" "1"
+assert "task_shape coverage without" "$(printf '%s' "$sjson" | jq -r '.task_shape_coverage.without')" "2"
+assert "task_shape coverage pct" "$(printf '%s' "$sjson" | jq -r '.task_shape_coverage.pct')" "33.3"
+
+echo "case: stats text table renders"
+stext="$("$AGENT" claude stats)"
+assert_contains "text total line" "$stext" "total workers: 3"
+assert_contains "text coverage line" "$stext" "2 with / 1 without"
+
+echo "case: --since filters by started_at (inclusive)"
+since_jul="$("$AGENT" claude stats --json --since 2026-07-01)"
+assert "--since 2026-07-01 keeps 1" "$(printf '%s' "$since_jul" | jq -r .total)" "1"
+since_mid="$("$AGENT" claude stats --json --since 2026-06-15)"
+assert "--since 2026-06-15 keeps 2 (inclusive)" "$(printf '%s' "$since_mid" | jq -r .total)" "2"
+
+echo "case: --exclude-selftest filters known self-test worker names only"
+mkfake wc-claude '2026-07-03T10:00:00Z' >/dev/null
+mkfake codex-smoke '2026-07-03T10:30:00Z' >/dev/null
+# CLI-anchored patterns must NOT sweep up legitimate workers that merely
+# resemble self-test names (prior wide globs mis-excluded these shapes).
+mkfake wc-fake '2026-07-03T11:00:00Z' >/dev/null
+mkfake probe-smoke '2026-07-03T11:30:00Z' >/dev/null
+sall="$("$AGENT" claude stats --json)"
+assert "self-test dirs counted without the flag" "$(printf '%s' "$sall" | jq -r .total)" "7"
+sexcl="$("$AGENT" claude stats --json --exclude-selftest)"
+assert "--exclude-selftest total keeps lookalikes" "$(printf '%s' "$sexcl" | jq -r .total)" "5"
+assert "--exclude-selftest excluded count" "$(printf '%s' "$sexcl" | jq -r .excluded_selftest)" "2"
+sexcl_text="$("$AGENT" claude stats --exclude-selftest)"
+assert_contains "text notes excluded count" "$sexcl_text" "excluded 2 self-test workers"
+
+echo "case: start --task-shape validates the enum"
+set +e
+"$AGENT" claude start --dry-run --exact --task-shape bogus ts-w "$WORK" 'x' 2>"$WORK/shape.err"
+ts_rc=$?
+set -e
+assert "invalid --task-shape exits 2" "$ts_rc" "2"
+assert_contains "invalid --task-shape names the enum" "$(cat "$WORK/shape.err")" "bounded|series|review-loop|exploratory"
+
+echo "case: start-ssh path writes launch metadata (static)"
+ssh_fn="$(awk '/^start_ssh_session\(\)/,/^\}/' "$AGENT")"
+assert_contains "start-ssh calls write_launch_meta" "$ssh_fn" "write_launch_meta"
+assert_contains "start-ssh calls record_started_at" "$ssh_fn" "record_started_at"
+assert_contains "start-ssh calls usage_init_event" "$ssh_fn" "usage_init_event"
+
+echo "case: result validate emits status_bucket + hint on unknown"
+vok="$("$AGENT" claude result validate w1 --json 2>/dev/null)"
+assert "validate status_bucket success" "$(printf '%s' "$vok" | jq -r .status_bucket)" "success"
+
+# unknown status → bucket unknown + stderr hint
+du="$(mkfake wu '2026-06-20T10:00:00Z')"
+printf '{"schema_version":1,"status":"wobble","summary":"s","artifacts":[],"errors":[]}' > "$du/result.json"
+set +e
+vraw="$("$AGENT" claude result validate wu --json 2>"$WORK/hint.err")"
+set -e
+assert "validate status_bucket unknown" "$(printf '%s' "$vraw" | jq -r .status_bucket)" "unknown"
+assert_contains "unknown emits stderr hint" "$(cat "$WORK/hint.err")" "not a recognized value"
+assert_contains "hint names canonical set" "$(cat "$WORK/hint.err")" "success|partial|blocked|error"
+
+# schema-INVALID result must still emit the JSON verdict and keep the
+# original non-zero exit code (regression: set -e aborted before printf)
+dinv="$(mkfake winv '2026-06-20T11:00:00Z')"
+printf '{"status":"success","summary":"no schema_version"}' > "$dinv/result.json"
+set +e
+vinv="$("$AGENT" claude result validate winv --json 2>/dev/null)"
+vinv_rc=$?
+set -e
+assert "invalid result still emits JSON verdict" "$(printf '%s' "$vinv" | jq -r .valid)" "false"
+assert "invalid result keeps status_bucket" "$(printf '%s' "$vinv" | jq -r .status_bucket)" "success"
+assert "invalid result keeps non-zero exit" "$([[ $vinv_rc -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+
+echo "case: real oneshot start writes launch-meta (dry-run does not)"
+fake_cli="$WORK/fake-cli"
+cat > "$fake_cli" <<'EOF'
+#!/usr/bin/env zsh
+printf 'oneshot run: %s\n' "$*"
+exit 0
+EOF
+chmod +x "$fake_cli"
+
+oneshot_profile="$WORK/fake-oneshot.conf"
+cat > "$oneshot_profile" <<EOF
+bin=$fake_cli
+exec_mode=oneshot
+prompt_via=argv
+prompt_flag=-p
+session_id_capture=off
+EOF
+
+# dry-run must NOT write launch-meta
+"$AGENT" claude --profile "$oneshot_profile" start --dry-run --exact dr-w "$WORK" 'x' >/dev/null 2>&1 || true
+assert "dry-run writes no launch-meta" "$([[ -f "$TMUX_AGENT_DIR/dr-w/launch-meta.json" ]] && echo yes || echo no)" "no"
+
+# real oneshot start writes launch-meta with exec_mode=oneshot, cli=claude,
+# and passes a valid --task-shape through to the file
+"$AGENT" claude --profile "$oneshot_profile" start --exact --task-shape bounded os-w "$WORK" 'bounded task' >/dev/null 2>&1 || true
+lm="$TMUX_AGENT_DIR/os-w/launch-meta.json"
+assert "launch-meta exists" "$([[ -f "$lm" ]] && echo yes || echo no)" "yes"
+assert "launch-meta exec_mode oneshot" "$(jq -r .exec_mode "$lm" 2>/dev/null)" "oneshot"
+assert "launch-meta cli claude" "$(jq -r .cli "$lm" 2>/dev/null)" "claude"
+assert "launch-meta schema_version" "$(jq -r .schema_version "$lm" 2>/dev/null)" "1"
+assert "launch-meta task_shape bounded" "$(jq -r .task_shape "$lm" 2>/dev/null)" "bounded"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

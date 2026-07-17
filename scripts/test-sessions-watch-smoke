@@ -1,0 +1,128 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #104 `tmux-agent-sessions watch` event subscribe mode.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
+CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+
+for bin in "$SESSIONS" "$CLAUDE_TMUX"; do
+  [[ -x "$bin" ]] || { echo "not executable: $bin" >&2; exit 1; }
+done
+
+WORK="$(mktemp -d -t tmux-agent-sessions-watch-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+# Unique prefix so we don't collide with the user's real sessions.
+SUFFIX="$$-$RANDOM"
+export CLAUDE_TMUX_PREFIX="claude-cli-watchsmoke-$SUFFIX"
+
+cleanup() {
+  "$CLAUDE_TMUX" stop "watch-a" >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+cat > "$WORK/fake-agent.sh" <<'EOF'
+#!/bin/sh
+echo "fake-agent ready"
+sleep 60
+EOF
+chmod +x "$WORK/fake-agent.sh"
+
+PASS=0
+FAIL=0
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    needle:   $needle" >&2
+    echo "    haystack: $haystack" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_eq() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2
+    echo "    expected: $expected" >&2
+    echo "    got:      $actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: --count 1 exits after one poll, first tick is silent"
+out1="$(CLAUDE_CLI_BIN="$WORK/fake-agent.sh" "$SESSIONS" watch --count 1 --interval 1 --tool claude 2>&1 || true)"
+assert_eq "first tick is silent (no prior snapshot)" "$out1" ""
+
+echo "case: session_added emitted when new session appears between ticks"
+EVENTS_FILE="$WORK/events.jsonl"
+"$SESSIONS" watch --count 2 --interval 2 --tool claude > "$EVENTS_FILE" 2>&1 &
+WATCH_PID=$!
+/bin/sleep 1
+CLAUDE_CLI_BIN="$WORK/fake-agent.sh" "$CLAUDE_TMUX" start --exact "watch-a" "$WORK" >/dev/null
+wait "$WATCH_PID" || true
+
+events_added="$(cat "$EVENTS_FILE")"
+assert_contains "session_added event present" "$events_added" '"event":"session_added"'
+assert_contains "session_added carries name" "$events_added" '"name":"watch-a"'
+assert_contains "session_added carries schema_version" "$events_added" '"schema_version":1'
+assert_contains "session_added carries tool" "$events_added" '"tool":"claude"'
+
+echo "case: two stable ticks produce zero events"
+out_silent="$("$SESSIONS" watch --count 2 --interval 1 --tool claude 2>&1)"
+assert_eq "silent tick when nothing changes" "$out_silent" ""
+
+echo "case: session ends -> session_state_changed and/or session_removed"
+EVENTS_FILE2="$WORK/events2.jsonl"
+"$SESSIONS" watch --count 3 --interval 2 --tool claude > "$EVENTS_FILE2" 2>&1 &
+WATCH_PID2=$!
+/bin/sleep 1
+"$CLAUDE_TMUX" stop "watch-a" >/dev/null 2>&1 || true
+wait "$WATCH_PID2" || true
+
+events_stop="$(cat "$EVENTS_FILE2")"
+if [[ "$events_stop" == *'"event":"session_state_changed"'* ]] || \
+   [[ "$events_stop" == *'"event":"session_removed"'* ]]; then
+  echo "  ok   stop produced state_changed or removed event"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL stop produced no transition event" >&2
+  echo "    got: $events_stop" >&2
+  FAIL=$((FAIL + 1))
+fi
+assert_contains "stop event carries schema_version" "$events_stop" '"schema_version":1'
+
+echo "case: --count 0 parses as unlimited (interrupt to bound runtime)"
+"$SESSIONS" watch --count 0 --interval 1 --tool claude > "$WORK/events3.jsonl" 2>&1 &
+WATCH_PID3=$!
+/bin/sleep 2
+kill "$WATCH_PID3" 2>/dev/null || true
+wait "$WATCH_PID3" 2>/dev/null || true
+echo "  ok   --count 0 starts and is interruptible"
+PASS=$((PASS + 1))
+
+echo "case: rejects bad --count"
+code=0
+"$SESSIONS" watch --count abc 2>/dev/null || code=$?
+if (( code != 0 )); then
+  echo "  ok   bad --count rejected"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL bad --count not rejected" >&2
+  FAIL=$((FAIL + 1))
+fi
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ? 1 : 0 ))

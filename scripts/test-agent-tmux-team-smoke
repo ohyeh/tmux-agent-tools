@@ -1,0 +1,83 @@
+#!/usr/bin/env zsh
+# Smoke test for `agent-tmux team` (PR B): list, workers/lead, rm-refusal
+# while live, stop then rm, team-stop self-guard, mixed-CLI member dispatch.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-team-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+mkdir -p "$WORK/work"
+# Ownership-based cleanup — kill-server would murder unrelated live workers
+# on the shared tmux server (including a worker running this very suite), and
+# a fixed-prefix pattern breaks under TMUX_AGENT_TOOLS_TENANT (session names
+# become <cli>-cli-<tenant>-<name>). Only kill sessions that (a) did not
+# exist when this smoke started AND (b) carry one of this smoke's team names.
+SESSIONS_BEFORE="$(tmux list-sessions -F '#S' 2>/dev/null || true)"
+cleanup() {
+  local s
+  for s in $(tmux list-sessions -F '#S' 2>/dev/null | grep -E -- '-(t1|mix)-'); do
+    printf '%s\n' "$SESSIONS_BEFORE" | grep -qx -- "$s" && continue
+    tmux kill-session -t "$s" 2>/dev/null || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+sleep 60
+EOF
+chmod +x "$WORK/fake.sh"
+export CODEX="$WORK/fake.sh" CLAUDE="$WORK/fake.sh"
+
+PASS=0; FAIL=0
+assert() { local l="$1" a="$2" e="$3"; if [[ "$a" == "$e" ]]; then echo "  ok   $l"; PASS=$((PASS+1)); else echo "  FAIL $l expected=$e got=$a" >&2; FAIL=$((FAIL+1)); fi; }
+contains() { local l="$1" h="$2" n="$3"; if [[ "$h" == *"$n"* ]]; then echo "  ok   $l"; PASS=$((PASS+1)); else echo "  FAIL $l: '$n' missing" >&2; FAIL=$((FAIL+1)); fi; }
+
+echo "case: setup team via pair (2 codex workers)"
+"$AGENT" pair codex t1 "$WORK/work" --workers 2 >/dev/null
+/bin/sleep 1
+
+echo "case: team workers / lead"
+assert "workers list" "$("$AGENT" team workers t1 | sort | tr '\n' ',')" "t1-w1,t1-w2,"
+assert "lead name" "$("$AGENT" team lead t1)" "t1"
+
+echo "case: team list shows running workers"
+lst="$("$AGENT" team list t1)"
+contains "list has w1 running" "$lst" "worker  codex   t1-w1"
+contains "list header" "$lst" "team: t1"
+
+echo "case: team rm refused while members live"
+code=0; "$AGENT" team rm t1 >/dev/null 2>&1 || code=$?
+assert "rm-while-live exit=1" "$code" "1"
+
+echo "case: team-stop self-guard skips the calling session"
+guard_err="$(TMUX_AGENT_RESULT="$TMUX_AGENT_DIR/t1-w1/result.json" "$AGENT" team stop t1 2>&1 1>/dev/null)"
+contains "self-guard warns" "$guard_err" "skipping self (t1-w1)"
+assert "self not stopped (still running)" "$("$AGENT" codex status --json t1-w1 | jq -r .running)" "true"
+
+echo "case: full stop then rm"
+"$AGENT" team stop t1 >/dev/null 2>&1
+/bin/sleep 1
+code=0; "$AGENT" team rm t1 >/dev/null 2>&1 || code=$?
+assert "rm-after-stop exit=0" "$code" "0"
+assert "state file gone" "$([[ -f "$TMUX_AGENT_DIR/teams/t1.json" ]] && echo yes || echo no)" "no"
+
+echo "case: mixed-CLI team (claude lead, codex worker)"
+"$AGENT" pair claude mix "$WORK/work" --workers 1 --worker-cli codex >/dev/null
+/bin/sleep 1
+mf="$TMUX_AGENT_DIR/teams/mix.json"
+assert "lead_cli claude" "$(jq -r .lead_cli "$mf")" "claude"
+assert "lead member cli" "$(jq -r '.members[]|select(.role=="lead")|.cli' "$mf")" "claude"
+assert "worker member cli" "$(jq -r '.members[]|select(.role=="worker")|.cli' "$mf")" "codex"
+# team list must query each member by its own cli (codex worker resolves under codex prefix)
+contains "mixed list worker running" "$("$AGENT" team list mix)" "worker  codex   mix-w1"
+"$AGENT" team stop mix >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

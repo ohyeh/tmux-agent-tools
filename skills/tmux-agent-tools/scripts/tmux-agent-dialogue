@@ -1,0 +1,1297 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SELF="${0:t}"
+SCRIPT_DIR="${0:A:h}"
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX:-}" && -x "${TMUX:-}" ]]; then
+    print -r -- "$TMUX"
+    return
+  fi
+  command -v tmux 2>/dev/null || true
+}
+
+TMUX_BIN="$(resolve_tmux_bin)"
+unset TMUX
+TMUX="$TMUX_BIN"
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+GH="${GH:-$(command -v gh 2>/dev/null || true)}"
+
+usage() {
+  cat <<'EOF'
+tmux-agent-dialogue - run a bounded two-agent tmux dialogue
+
+Usage:
+  tmux-agent-dialogue --turns <n> --workdir <dir> (--agent-a <claude|codex|agy|…|fake>|--agent-a-profile <name>) (--agent-b <claude|codex|agy|…|fake>|--agent-b-profile <name>) --prompt-file <path> --transcript <path|-> [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue pair-review --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <claude|codex|agy|…|fake>] [--agent-b <claude|codex|agy|…|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <n>] [--swap] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue critic --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <claude|codex|agy|…|fake>] [--agent-b <claude|codex|agy|…|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue debate --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <claude|codex|agy|…|fake>] [--agent-b <claude|codex|agy|…|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--turns <even-n>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue handoff --workdir <dir> --prompt-file <path> --transcript <path|-> [--agent-a <claude|codex|agy|…|fake>] [--agent-b <claude|codex|agy|…|fake>] [--agent-a-profile <name>] [--agent-b-profile <name>] [--participants-config <path>] [--agent-a-ssh <target> --agent-a-workdir <remote-dir>] [--agent-b-ssh <target> --agent-b-workdir <remote-dir>] [--timeout <seconds>] [--summary-file <path>] [--on-blocked-trigger <path>]
+  tmux-agent-dialogue validate-transcript [--schema-version 1] --transcript <path>
+  tmux-agent-dialogue summarize --transcript <path> [--summary-file <path>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...]
+  tmux-agent-dialogue github-comment (--transcript <path>|--summary-file <path>) --github-repo <owner/repo> [--github-pr <number-or-url>|--edit-existing <comment-id>] [--output-format markdown|json] [--max-lines <n>] [--max-bytes <n>] [--redact-pattern <regex> ...] [--post-github-comment]
+
+Example:
+  tmux-agent-dialogue \
+    --turns 4 \
+    --workdir . \
+    --agent-a fake \
+    --agent-b fake \
+    --prompt-file prompt.md \
+    --transcript transcript.jsonl
+
+Behavior:
+  - alternates turns between agent A and agent B;
+  - waits for a unique marker after each turn;
+  - writes one JSONL object per turn;
+  - validates transcript JSONL before summary or GitHub comment rendering;
+  - pair-review, critic, debate, and handoff are thin presets and print local summaries;
+  - pair-review --swap reverses speaker order without changing participant definitions;
+  - --on-blocked-trigger writes a local JSON artifact only when a participant appears blocked;
+  - github-comment prints a dry-run body unless --post-github-comment is explicit;
+  - a real participant is any CLI agent-tmux can drive (claude, codex, agy,
+    gemini, cursor, grok, in-house CLIs, ...) — driven directly as
+    "agent-tmux <cli>", so new CLIs work with no per-CLI code; fake is the
+    in-process stub;
+  - real participants can run locally or through the wrapper start-ssh mode;
+  - optional participant profiles live at ~/.config/tmux-agent-tools/participants.json or TMUX_AGENT_TOOLS_PARTICIPANTS;
+  - cleans up sessions it created;
+  - has no GitHub, network, or external publishing side effects.
+EOF
+}
+
+die() {
+  echo "$SELF: $*" >&2
+  exit 1
+}
+
+append_jsonl() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local text="$5"
+  local line
+  line="$("$JQ" -cn \
+    --arg event "turn" \
+    --argjson turn "$turn" \
+    --arg speaker "$speaker" \
+    --arg agent "$agent" \
+    --arg marker "$marker" \
+    --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg text "$text" \
+    '{event:$event,turn:$turn,speaker:$speaker,agent:$agent,marker:$marker,timestamp:$timestamp,text:$text}')"
+
+  if [[ "$TRANSCRIPT" == "-" ]]; then
+    print -r -- "$line"
+  else
+    print -r -- "$line" >> "$TRANSCRIPT"
+  fi
+}
+
+append_failure_jsonl() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local failure_type="$5"
+  local text="$6"
+  local line
+  line="$("$JQ" -cn \
+    --arg event "failure" \
+    --argjson turn "$turn" \
+    --arg speaker "$speaker" \
+    --arg agent "$agent" \
+    --arg marker "$marker" \
+    --arg failure_type "$failure_type" \
+    --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg text "$text" \
+    '{event:$event,turn:$turn,speaker:$speaker,agent:$agent,marker:$marker,failure_type:$failure_type,timestamp:$timestamp,text:$text}')"
+
+  if [[ "$TRANSCRIPT" == "-" ]]; then
+    print -r -- "$line"
+  else
+    print -r -- "$line" >> "$TRANSCRIPT"
+  fi
+}
+
+write_blocked_trigger() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local blocked_reason="$5"
+  local trigger_path="$6"
+
+  [[ -n "$trigger_path" ]] || return 0
+  case "$blocked_reason" in
+    cli_exited|ssh_prompt|permission_prompt)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  mkdir -p "${trigger_path:h}"
+  "$JQ" -cn \
+    --arg event "blocked" \
+    --argjson turn "$turn" \
+    --arg participant "$speaker" \
+    --arg agent "$agent" \
+    --arg marker "$marker" \
+    --arg blocked_reason "$blocked_reason" \
+    --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{event:$event,turn:$turn,participant:$participant,agent:$agent,marker:$marker,blocked_reason:$blocked_reason,timestamp:$timestamp}' \
+    > "$trigger_path"
+}
+
+require_tmux() {
+  command -v "$TMUX" >/dev/null 2>&1 || die "tmux not found"
+  require_jq
+}
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
+}
+
+profile_value() {
+  local profile="$1"
+  local key="$2"
+  "$JQ" -er --arg profile "$profile" --arg key "$key" '.[$profile][$key] // empty' "$PARTICIPANTS_CONFIG" 2>/dev/null || true
+}
+
+available_profiles() {
+  "$JQ" -er 'keys | join(", ")' "$PARTICIPANTS_CONFIG" 2>/dev/null || print -r -- "unavailable"
+}
+
+profile_env_entries() {
+  local profile="$1"
+  "$JQ" -er --arg profile "$profile" '
+    .[$profile].env // {}
+    | to_entries[]
+    | "\(.key)=\(.value)"
+  ' "$PARTICIPANTS_CONFIG" 2>/dev/null || true
+}
+
+apply_profile() {
+  local label="$1"
+  local profile="$2"
+  local agent_set="$3"
+  local ssh_set="$4"
+  local workdir_set="$5"
+
+  [[ -z "$profile" ]] && return 0
+  require_jq
+  [[ -f "$PARTICIPANTS_CONFIG" ]] || die "participant profile config not found: $PARTICIPANTS_CONFIG"
+  "$JQ" -e 'type == "object"' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile config must be a JSON object: $PARTICIPANTS_CONFIG"
+  "$JQ" -e --arg profile "$profile" '.[$profile] | type == "object"' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile not found: $profile (available: $(available_profiles))"
+  "$JQ" -e --arg profile "$profile" '
+    .[$profile]
+    | to_entries
+    | all(.key == "agent" or .key == "ssh" or .key == "workdir" or .key == "timeout" or .key == "env")
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile may only contain agent, ssh, workdir, timeout, and env"
+  "$JQ" -e --arg profile "$profile" '
+    .[$profile]
+    | to_entries
+    | all(if .key == "env" then (.value | type == "object") else (.value | type == "string") end)
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile values must be strings, except env must be an object"
+  "$JQ" -e --arg profile "$profile" '
+    .[$profile].env // {}
+    | to_entries
+    | all((.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type == "string") and ((.value | contains("\n")) | not))
+  ' "$PARTICIPANTS_CONFIG" >/dev/null || die "participant profile $profile env must be an object of newline-free string values keyed by shell environment names"
+
+  local profile_agent profile_ssh profile_workdir profile_timeout
+  profile_agent="$(profile_value "$profile" agent)"
+  profile_ssh="$(profile_value "$profile" ssh)"
+  profile_workdir="$(profile_value "$profile" workdir)"
+  profile_timeout="$(profile_value "$profile" timeout)"
+  if [[ -n "$profile_timeout" ]]; then
+    [[ "$profile_timeout" =~ ^[0-9]+$ && "$profile_timeout" -gt 0 ]] || die "participant profile $profile timeout must be a positive integer string"
+  fi
+
+  case "$label" in
+    a)
+      [[ "$agent_set" -eq 1 || -z "$profile_agent" ]] || AGENT_A="$profile_agent"
+      [[ "$ssh_set" -eq 1 || -z "$profile_ssh" ]] || AGENT_A_SSH="$profile_ssh"
+      [[ "$workdir_set" -eq 1 || -z "$profile_workdir" ]] || AGENT_A_WORKDIR="$profile_workdir"
+      [[ "$TIMEOUT_SET" -eq 1 || -z "$profile_timeout" ]] || AGENT_A_TIMEOUT="$profile_timeout"
+      AGENT_A_ENV=("${(@f)$(profile_env_entries "$profile")}")
+      AGENT_A_ENV=("${(@)AGENT_A_ENV:#}")
+      ;;
+    b)
+      [[ "$agent_set" -eq 1 || -z "$profile_agent" ]] || AGENT_B="$profile_agent"
+      [[ "$ssh_set" -eq 1 || -z "$profile_ssh" ]] || AGENT_B_SSH="$profile_ssh"
+      [[ "$workdir_set" -eq 1 || -z "$profile_workdir" ]] || AGENT_B_WORKDIR="$profile_workdir"
+      [[ "$TIMEOUT_SET" -eq 1 || -z "$profile_timeout" ]] || AGENT_B_TIMEOUT="$profile_timeout"
+      AGENT_B_ENV=("${(@f)$(profile_env_entries "$profile")}")
+      AGENT_B_ENV=("${(@)AGENT_B_ENV:#}")
+      ;;
+    *)
+      die "unsupported participant profile label: $label"
+      ;;
+  esac
+}
+
+validate_transcript_file() {
+  local transcript_path="$1"
+  require_jq
+  [[ -n "$transcript_path" && -f "$transcript_path" ]] || die "--transcript must be an existing file"
+
+  local line line_no=0 failures=0
+  local validation_errors
+  local jq_error_file
+  jq_error_file="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    (( ++line_no ))
+
+    if [[ -z "$line" ]]; then
+      echo "$SELF: $transcript_path:$line_no: empty JSONL line" >&2
+      (( failures += 1 ))
+      continue
+    fi
+
+    if ! validation_errors="$(print -r -- "$line" | "$JQ" -r '
+      if type != "object" then
+        ["line must be a JSON object"]
+      else
+        def has_nonempty_string($key):
+          has($key) and (.[$key] | type == "string") and (.[$key] | length > 0);
+        def has_string($key):
+          has($key) and (.[$key] | type == "string");
+        def has_positive_integer($key):
+          has($key) and (.[$key] | type == "number") and ((.[$key] % 1) == 0) and (.[$key] > 0);
+        [
+          (if (.event == "turn" or .event == "failure") then empty else "event must be turn or failure" end),
+          (if has_positive_integer("turn") then empty else "turn must be a positive integer" end),
+          (if (.speaker == "agent-a" or .speaker == "agent-b") then empty else "speaker must be agent-a or agent-b" end),
+          (if has_nonempty_string("agent") then empty else "agent must be a non-empty string" end),
+          (if has_nonempty_string("marker") then empty else "marker must be a non-empty string" end),
+          (if (.event != "failure" or (has("failure_type") | not) or (.failure_type == "marker_timeout" or .failure_type == "session_missing" or .failure_type == "cli_exited" or .failure_type == "ssh_prompt" or .failure_type == "permission_prompt")) then empty else "failure_type must be marker_timeout, session_missing, cli_exited, ssh_prompt, or permission_prompt" end),
+          (if has_nonempty_string("timestamp") then empty else "timestamp must be a non-empty string" end),
+          (if has_string("text") then empty else "text must be a string" end)
+        ]
+      end
+      | .[]
+    ' 2>"$jq_error_file")"; then
+      echo "$SELF: $transcript_path:$line_no: invalid JSON: $(< "$jq_error_file")" >&2
+      (( failures += 1 ))
+      continue
+    fi
+
+    if [[ -n "$validation_errors" ]]; then
+      local error
+      while IFS= read -r error; do
+        [[ -n "$error" ]] || continue
+        echo "$SELF: $transcript_path:$line_no: $error" >&2
+        (( failures += 1 ))
+      done <<< "$validation_errors"
+    fi
+  done < "$transcript_path"
+  rm -f "$jq_error_file"
+
+  if (( line_no == 0 )); then
+    echo "$SELF: $transcript_path: transcript is empty" >&2
+    (( failures += 1 ))
+  fi
+
+  (( failures == 0 )) || return 1
+}
+
+validate_transcript_schema_version() {
+  local schema_version="$1"
+  [[ -n "$schema_version" ]] || die "--schema-version must be 1"
+  [[ "$schema_version" == "1" ]] || die "unsupported transcript schema version: $schema_version"
+}
+
+session_name() {
+  local label="$1"
+  print -r -- "tmux-agent-dialogue-${RUN_ID}-${label}"
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+start_fake_agent() {
+  local label="$1"
+  local session
+  local command
+  local env_prefix="env"
+  local entry
+  session="$(session_name "$label")"
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    env_prefix="${env_prefix} $(shell_quote "$entry")"
+  done < <(participant_env_entries "$label")
+  command="${env_prefix} DIALOGUE_LABEL=$(shell_quote "$label") zsh -lc 'stty -echo 2>/dev/null || true; while IFS= read -r line; do if [[ \"\$line\" == __TMUX_AGENT_DIALOGUE_STOP__* ]]; then break; fi; marker=\"\${line##* MARKER:}\"; body=\"\${line%% MARKER:*}\"; print -r -- \"fake-\${DIALOGUE_LABEL}: \${body}\"; print -r -- \"\$marker\"; done'"
+  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  "$TMUX" new-session -d -s "$session" "$command"
+  OWNED_SESSIONS+=("$session")
+}
+
+# Every real agent is driven through the engine as `agent-tmux <cli> ...`.
+# The claude-tmux/codex-tmux/agy-tmux shims are themselves just
+# `exec agent-tmux <cli> "$@"`, so going straight to the engine supports any
+# CLI — claude, codex, agy, and any future coding-agent CLI — with zero
+# per-CLI code, matching how the rest of the suite generalized. Returns the
+# command as two array elements (engine path + cli) for safe quoting.
+engine_cmd_for_agent() {
+  print -r -- "$SCRIPT_DIR/agent-tmux"
+  print -r -- "$1"
+}
+
+participant_ssh_target() {
+  local label="$1"
+  case "$label" in
+    a) print -r -- "$AGENT_A_SSH" ;;
+    b) print -r -- "$AGENT_B_SSH" ;;
+    *) die "unsupported participant label: $label" ;;
+  esac
+}
+
+participant_workdir() {
+  local label="$1"
+  case "$label" in
+    a) print -r -- "${AGENT_A_WORKDIR:-$WORKDIR}" ;;
+    b) print -r -- "${AGENT_B_WORKDIR:-$WORKDIR}" ;;
+    *) die "unsupported participant label: $label" ;;
+  esac
+}
+
+participant_env_entries() {
+  local label="$1"
+  local entry
+  case "$label" in
+    a)
+      for entry in "${AGENT_A_ENV[@]}"; do
+        print -r -- "$entry"
+      done
+      ;;
+    b)
+      for entry in "${AGENT_B_ENV[@]}"; do
+        print -r -- "$entry"
+      done
+      ;;
+    *)
+      die "unsupported participant label: $label"
+      ;;
+  esac
+}
+
+participant_timeout() {
+  local label="$1"
+  case "$label" in
+    a) print -r -- "${AGENT_A_TIMEOUT:-$TIMEOUT}" ;;
+    b) print -r -- "${AGENT_B_TIMEOUT:-$TIMEOUT}" ;;
+    *) die "unsupported participant label: $label" ;;
+  esac
+}
+
+start_real_agent() {
+  local label="$1"
+  local agent="$2"
+  local session
+  local -a wrapper
+  local ssh_target
+  local agent_workdir
+  local -a env_entries
+  session="$(session_name "$label")"
+  wrapper=("${(@f)$(engine_cmd_for_agent "$agent")}")
+  ssh_target="$(participant_ssh_target "$label")"
+  agent_workdir="$(participant_workdir "$label")"
+  env_entries=("${(@f)$(participant_env_entries "$label")}")
+  env_entries=("${(@)env_entries:#}")
+  "${wrapper[@]}" stop "$session" >/dev/null 2>&1 || true
+  if [[ -n "$ssh_target" ]]; then
+    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "${wrapper[@]}" start-ssh --exact "$session" "$ssh_target" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+  else
+    env TMUX_AGENT_TOOLS_SESSION_ENV="${(F)env_entries}" "${wrapper[@]}" start --exact "$session" "$agent_workdir" "You are participant ${label} in a bounded tmux-agent-dialogue run. Wait for turn prompts. Do not execute external side effects unless explicitly requested in the user prompt. Every turn prompt includes a split marker. Your final output line for each turn must contain only the joined marker, with no spaces, quotes, Markdown fence, or extra text on that line. If uncertain, still print the marker final line."
+  fi
+  OWNED_WRAPPERS+=("$agent:$session")
+  "${wrapper[@]}" wait "$session" "$(participant_timeout "$label")" >/dev/null
+}
+
+send_to_agent() {
+  local label="$1"
+  local agent="$2"
+  local message="$3"
+
+  if [[ "$agent" == "fake" ]]; then
+    "$TMUX" send-keys -t "$(session_name "$label")" -- "$message" C-m
+  else
+    "$SCRIPT_DIR/agent-tmux" "$agent" send "$(session_name "$label")" "$message"
+  fi
+}
+
+send_and_wait_for_marker() {
+  local label="$1"
+  local agent="$2"
+  local message="$3"
+  local marker="$4"
+
+  if [[ "$agent" == "fake" ]]; then
+    send_to_agent "$label" "$agent" "$message"
+    wait_for_marker "$label" "$agent" "$marker" "fake-${label}: ${message%% MARKER:*}"
+    return
+  fi
+
+  "$SCRIPT_DIR/agent-tmux" "$agent" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$(participant_timeout "$label")"
+}
+
+wait_for_marker() {
+  local label="$1"
+  local agent="$2"
+  local marker="$3"
+  local processed="${4:-}"
+
+  if [[ "$agent" == "fake" ]]; then
+    local deadline=$((SECONDS + $(participant_timeout "$label")))
+    local current=""
+    while (( SECONDS < deadline )); do
+      current="$("$TMUX" capture-pane -J -t "$(session_name "$label")" -p -S -200 2>/dev/null)" || return 1
+      if [[ "$current" == *"$processed"* && "$current" == *"$marker"* ]]; then
+        return 0
+      fi
+      sleep 1
+    done
+    return 1
+  fi
+
+  "$SCRIPT_DIR/agent-tmux" "$agent" wait-literal "$(session_name "$label")" "$marker" "$(participant_timeout "$label")"
+}
+
+capture_agent() {
+  local label="$1"
+  local agent="$2"
+
+  if [[ "$agent" == "fake" ]]; then
+    "$TMUX" capture-pane -J -t "$(session_name "$label")" -p -S -1000
+  else
+    "$SCRIPT_DIR/agent-tmux" "$agent" capture "$(session_name "$label")" 1000
+  fi
+}
+
+capture_agent_tail() {
+  local label="$1"
+  local agent="$2"
+  local tail_count="${3:-80}"
+
+  capture_agent "$label" "$agent" | tail -n "$tail_count"
+}
+
+agent_session_exists() {
+  local label="$1"
+  local agent="$2"
+
+  if [[ "$agent" == "fake" ]]; then
+    "$TMUX" has-session -t "$(session_name "$label")" 2>/dev/null
+    return
+  fi
+
+  "$SCRIPT_DIR/agent-tmux" "$agent" status "$(session_name "$label")" >/dev/null 2>&1
+}
+
+classify_failure_type() {
+  local label="$1"
+  local agent="$2"
+  local tail_text="$3"
+
+  if ! agent_session_exists "$label" "$agent"; then
+    print -r -- "session_missing"
+    return
+  fi
+
+  if [[ "$tail_text" == *"exited with code"* || "$tail_text" == *"process exited"* || "$tail_text" == *"exit status"* ]]; then
+    print -r -- "cli_exited"
+    return
+  fi
+
+  if [[ "$tail_text" == *"Permission denied"* || "$tail_text" == *"password:"* || "$tail_text" == *"Are you sure you want to continue connecting"* ]]; then
+    print -r -- "ssh_prompt"
+    return
+  fi
+
+  if [[ "$tail_text" == *"Do you want to allow"* || "$tail_text" == *"[y/N]" || "$tail_text" == *"No, exit"* ]]; then
+    print -r -- "permission_prompt"
+    return
+  fi
+
+  print -r -- "marker_timeout"
+}
+
+summarize_previous() {
+  local captured="$1"
+  local max_lines=24
+  local -a out_lines
+  local start=1
+  local i
+  local line
+
+  out_lines=("${(@f)captured}")
+  if (( ${#out_lines[@]} > max_lines )); then
+    start=$(( ${#out_lines[@]} - max_lines + 1 ))
+  fi
+
+  for (( i = start; i <= ${#out_lines[@]}; i++ )); do
+    line="${out_lines[$i]}"
+    [[ "$line" == \[TMUX_AGENT_DIALOGUE_*_DONE\] ]] && continue
+    print -r -- "$line"
+  done
+}
+
+record_marker_timeout() {
+  local turn="$1"
+  local speaker="$2"
+  local agent="$3"
+  local marker="$4"
+  local label="$5"
+  local tail_text
+  local failure_type
+
+  tail_text="$(capture_agent_tail "$label" "$agent" 80 2>/dev/null || true)"
+  failure_type="$(classify_failure_type "$label" "$agent" "$tail_text")"
+  echo "$SELF: timeout waiting for $label turn $turn marker: $marker" >&2
+  echo "$SELF: failure type: $failure_type" >&2
+  if [[ -n "$tail_text" ]]; then
+    echo "$SELF: captured tail for $speaker follows:" >&2
+    print -r -- "$tail_text" >&2
+  fi
+  append_failure_jsonl "$turn" "$speaker" "$agent" "$marker" "$failure_type" "$tail_text"
+  write_blocked_trigger "$turn" "$speaker" "$agent" "$marker" "$failure_type" "$ON_BLOCKED_TRIGGER"
+}
+
+build_pair_review_summary_raw() {
+  [[ "$TRANSCRIPT" != "-" ]] || die "${SUMMARY_LABEL} summary requires --transcript to be a file path"
+  validate_transcript_file "$TRANSCRIPT"
+
+  "$JQ" -r '
+    def tail_lines:
+      split("\n")
+      | map(select(length > 0))
+      | .[-8:]
+      | join("\n");
+    "## tmux-agent-tools \($label)",
+    "",
+    "- Transcript: `\($transcript)`",
+    "- Turns: \(map(select(.event == "turn")) | length)",
+    "",
+    (.[] | select(.event == "turn") | "### \(.speaker) / \(.agent) / turn \(.turn)\n\n```\n\(.text | tail_lines)\n```")
+  ' --arg transcript "$TRANSCRIPT" --arg label "$SUMMARY_LABEL" -s "$TRANSCRIPT"
+}
+
+close_open_markdown_fence() {
+  local body="$1"
+  local fence_count
+  fence_count="$(print -r -- "$body" | "$JQ" -Rs '([match("(?m)^```"; "g")] | length)')"
+  if (( fence_count % 2 == 1 )); then
+    print -r -- "$body"
+    print -r -- '```'
+  else
+    print -r -- "$body"
+  fi
+}
+
+limit_markdown_lines() {
+  local body="$1"
+  local max_lines="$2"
+  [[ -n "$max_lines" ]] || { print -r -- "$body"; return; }
+
+  local -a out_lines
+  out_lines=("${(@f)body}")
+  if (( ${#out_lines[@]} <= max_lines )); then
+    print -r -- "$body"
+    return
+  fi
+
+  local limited=""
+  local i
+  for (( i = 1; i <= max_lines; i++ )); do
+    if [[ -z "$limited" ]]; then
+      limited="${out_lines[$i]}"
+    else
+      limited="${limited}"$'\n'"${out_lines[$i]}"
+    fi
+  done
+  limited="$(close_open_markdown_fence "$limited")"
+  print -r -- "$limited"
+  print -r -- ""
+  print -r -- "> **Note:** transcript summary truncated at ${max_lines} lines by --max-lines."
+}
+
+limit_markdown_bytes() {
+  local body="$1"
+  local max_bytes="$2"
+  [[ -n "$max_bytes" ]] || { print -r -- "$body"; return; }
+
+  local body_bytes
+  body_bytes="$(LC_ALL=C printf '%s' "$body" | wc -c | tr -d ' ')"
+  if (( body_bytes <= max_bytes )); then
+    print -r -- "$body"
+    return
+  fi
+
+  local -a out_lines
+  local line next candidate candidate_bytes
+  local limited=""
+  out_lines=("${(@f)body}")
+  for line in "${out_lines[@]}"; do
+    if [[ -z "$limited" ]]; then
+      candidate="$line"
+    else
+      candidate="${limited}"$'\n'"${line}"
+    fi
+    candidate_bytes="$(LC_ALL=C printf '%s' "$candidate" | wc -c | tr -d ' ')"
+    (( candidate_bytes <= max_bytes )) || break
+    limited="$candidate"
+  done
+
+  limited="$(close_open_markdown_fence "$limited")"
+  print -r -- "$limited"
+  print -r -- ""
+  print -r -- "> **Note:** transcript summary truncated at ${max_bytes} bytes by --max-bytes."
+}
+
+apply_markdown_redactions() {
+  local body="$1"
+  local pattern
+  (( ${#REDACT_PATTERNS[@]} )) || { print -r -- "$body"; return; }
+
+  for pattern in "${REDACT_PATTERNS[@]}"; do
+    body="$(print -r -- "$body" | "$JQ" -Rrs --arg pattern "$pattern" 'gsub($pattern; "[REDACTED]")')"
+  done
+  print -r -- "$body"
+  print -r -- ""
+  print -r -- "> **Note:** one or more redact patterns were applied."
+}
+
+build_pair_review_summary() {
+  build_pair_review_summary_raw
+}
+
+build_shareable_pair_review_summary() {
+  local body
+  body="$(build_pair_review_summary_raw)"
+  body="$(limit_markdown_lines "$body" "$MAX_LINES")"
+  body="$(limit_markdown_bytes "$body" "$MAX_BYTES")"
+  body="$(apply_markdown_redactions "$body")"
+  print -r -- "$body"
+}
+
+build_shareable_pair_review_summary_json() {
+  local raw_body="$1"
+  local final_body="$2"
+  local raw_line_count
+  local raw_byte_count
+  local line_limited_body="$raw_body"
+  local line_limited_byte_count
+  local max_lines_json="null"
+  local max_bytes_json="null"
+  local truncated_by_lines="false"
+  local truncated_by_bytes="false"
+  local redaction_patterns_json
+
+  raw_line_count="$(print -r -- "$raw_body" | "$JQ" -Rsc 'if length == 0 then 0 else split("\n") | length end')"
+  raw_byte_count="$(LC_ALL=C printf '%s' "$raw_body" | wc -c | tr -d ' ')"
+  redaction_patterns_json="$(printf '%s\n' "${REDACT_PATTERNS[@]}" | "$JQ" -Rsc 'if length == 0 then [] else split("\n")[:-1] end')"
+  if [[ -n "$MAX_LINES" ]]; then
+    max_lines_json="$MAX_LINES"
+    if (( raw_line_count > MAX_LINES )); then
+      truncated_by_lines="true"
+    fi
+    line_limited_body="$(limit_markdown_lines "$raw_body" "$MAX_LINES")"
+  fi
+  line_limited_byte_count="$(LC_ALL=C printf '%s' "$line_limited_body" | wc -c | tr -d ' ')"
+  if [[ -n "$MAX_BYTES" ]]; then
+    max_bytes_json="$MAX_BYTES"
+    if (( line_limited_byte_count > MAX_BYTES )); then
+      truncated_by_bytes="true"
+    fi
+  fi
+
+  "$JQ" -s \
+    --arg label "$SUMMARY_LABEL" \
+    --arg transcript "$TRANSCRIPT" \
+    --arg rendered_markdown "$final_body" \
+    --argjson max_lines "$max_lines_json" \
+    --argjson max_bytes "$max_bytes_json" \
+    --argjson raw_line_count "$raw_line_count" \
+    --argjson raw_byte_count "$raw_byte_count" \
+    --argjson redaction_patterns "$redaction_patterns_json" \
+    --argjson truncated_by_lines "$truncated_by_lines" \
+    --argjson truncated_by_bytes "$truncated_by_bytes" \
+    '
+      def tail_lines:
+        split("\n")
+        | map(select(length > 0))
+        | .[-8:];
+      def redact:
+        reduce $redaction_patterns[] as $pattern (. ; gsub($pattern; "[REDACTED]"));
+      {
+        schema_version: "1",
+        format: "json",
+        label: $label,
+        transcript: $transcript,
+        turns: [ .[] | select(.event == "turn") | {
+          turn,
+          speaker,
+          agent,
+          marker,
+          timestamp,
+          tail_lines: (.text | tail_lines | map(redact))
+        } ],
+        failures: [ .[] | select(.event == "failure") | {
+          turn,
+          speaker,
+          agent,
+          marker,
+          failure_type,
+          timestamp
+        } ],
+        metadata: {
+          output_format: "json",
+          raw_line_count: $raw_line_count,
+          raw_byte_count: $raw_byte_count,
+          max_lines: $max_lines,
+          max_bytes: $max_bytes,
+          truncated_by_lines: $truncated_by_lines,
+          truncated_by_bytes: $truncated_by_bytes,
+          redaction_pattern_count: ($redaction_patterns | length),
+          redacted: (($redaction_patterns | length) > 0)
+        },
+        rendered_markdown: $rendered_markdown
+      }
+    ' "$TRANSCRIPT"
+}
+
+build_shareable_summary_output() {
+  local raw_body
+  local final_body
+  raw_body="$(build_pair_review_summary_raw)"
+  final_body="$(limit_markdown_lines "$raw_body" "$MAX_LINES")"
+  final_body="$(limit_markdown_bytes "$final_body" "$MAX_BYTES")"
+  final_body="$(apply_markdown_redactions "$final_body")"
+
+  if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    build_shareable_pair_review_summary_json "$raw_body" "$final_body"
+  else
+    print -r -- "$final_body"
+  fi
+}
+
+build_shareable_summary_file_body() {
+  local body
+  body="$(< "$SUMMARY_FILE")"
+  body="$(limit_markdown_lines "$body" "$MAX_LINES")"
+  body="$(limit_markdown_bytes "$body" "$MAX_BYTES")"
+  body="$(apply_markdown_redactions "$body")"
+  print -r -- "$body"
+}
+
+build_github_comment_body() {
+  if [[ "$MODE" == "github-comment" && -n "$SUMMARY_FILE" ]]; then
+    build_shareable_summary_file_body
+  else
+    build_shareable_pair_review_summary
+  fi
+}
+
+print_github_comment_result_json() {
+  local result_status="$1"
+  local action="$2"
+  local body_file="$3"
+  local gh_output="${4:-}"
+  local body_byte_count
+  local comment_url=""
+  local comment_id=""
+  body_byte_count="$(LC_ALL=C wc -c < "$body_file" | tr -d ' ')"
+
+  if [[ -n "$gh_output" ]]; then
+    comment_url="$(print -r -- "$gh_output" | "$JQ" -Rrs 'capture("(?<url>https?://[^[:space:]\"]+)")?.url // ""')"
+    comment_id="$(print -r -- "$gh_output" | "$JQ" -Rrs 'try (fromjson.id | tostring) catch ""')"
+  fi
+  if [[ -z "$comment_id" && -n "$GITHUB_EDIT_EXISTING" ]]; then
+    comment_id="$GITHUB_EDIT_EXISTING"
+  fi
+
+  "$JQ" -n \
+    --arg schema_version "1" \
+    --arg status "$result_status" \
+    --arg action "$action" \
+    --arg github_repo "$GITHUB_REPO" \
+    --arg github_pr "$GITHUB_PR" \
+    --arg edit_existing "$GITHUB_EDIT_EXISTING" \
+    --arg output_format "json" \
+    --argjson post_github_comment "$POST_GITHUB_COMMENT" \
+    --argjson body_byte_count "$body_byte_count" \
+    --rawfile body "$body_file" \
+    --arg gh_output "$gh_output" \
+    --arg comment_url "$comment_url" \
+    --arg comment_id "$comment_id" \
+    '
+      {
+        schema_version: $schema_version,
+        mode: "github-comment",
+        status: $status,
+        action: $action,
+        output_format: $output_format,
+        post_github_comment: ($post_github_comment == 1),
+        github_repo: $github_repo,
+        github_pr: (if $github_pr == "" then null else $github_pr end),
+        edit_existing: (if $edit_existing == "" then null else $edit_existing end),
+        body_byte_count: $body_byte_count,
+        body: $body,
+        gh_output: (if $gh_output == "" then null else $gh_output end)
+      }
+      + (if $comment_url == "" then {} else {comment_url: $comment_url} end)
+      + (if $comment_id == "" then {} else {comment_id: $comment_id} end)
+    '
+}
+
+print_pair_review_summary() {
+  build_pair_review_summary >&2
+}
+
+write_pair_review_summary_file() {
+  [[ -n "$SUMMARY_FILE" ]] || return 0
+  build_pair_review_summary > "$SUMMARY_FILE"
+  echo "summary file: $SUMMARY_FILE" >&2
+}
+
+run_summary_mode() {
+  require_jq
+  [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || die "--transcript must be an existing file"
+  TRANSCRIPT="${TRANSCRIPT:A}"
+  validate_transcript_file "$TRANSCRIPT"
+  if [[ -n "$SUMMARY_FILE" ]]; then
+    SUMMARY_FILE="${SUMMARY_FILE:A}"
+    mkdir -p "${SUMMARY_FILE:h}"
+    build_shareable_summary_output > "$SUMMARY_FILE"
+    echo "summary file: $SUMMARY_FILE" >&2
+  else
+    build_shareable_summary_output
+  fi
+}
+
+run_github_comment_mode() {
+  require_jq
+  [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required"
+  if [[ -z "$GITHUB_EDIT_EXISTING" ]]; then
+    [[ -n "$GITHUB_PR" ]] || die "--github-pr is required"
+  fi
+  if [[ -z "$TRANSCRIPT" && -z "$SUMMARY_FILE" ]] || [[ -n "$TRANSCRIPT" && -n "$SUMMARY_FILE" ]]; then
+    die "github-comment requires exactly one of --transcript or --summary-file"
+  fi
+  if [[ -n "$SUMMARY_FILE" ]]; then
+    [[ -f "$SUMMARY_FILE" ]] || die "--summary-file must be an existing file"
+    SUMMARY_FILE="${SUMMARY_FILE:A}"
+  else
+    [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || die "--transcript must be an existing file"
+    TRANSCRIPT="${TRANSCRIPT:A}"
+    validate_transcript_file "$TRANSCRIPT"
+  fi
+
+  local body_file
+  local action
+  local gh_output=""
+  body_file="$(mktemp)"
+  build_github_comment_body > "$body_file"
+  if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+    action="edit"
+  else
+    action="post"
+  fi
+
+  if (( POST_GITHUB_COMMENT )); then
+    [[ -n "$GITHUB_REPO" ]] || die "--github-repo is required with --post-github-comment"
+    [[ -n "$GH" && -x "$GH" ]] || die "gh not found; install GitHub CLI or set GH=/path/to/gh"
+
+    if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+      local api_body_file
+      api_body_file="$(mktemp)"
+      "$JQ" -n --rawfile body "$body_file" '{body: $body}' > "$api_body_file"
+      gh_output="$("$GH" api --method PATCH "repos/$GITHUB_REPO/issues/comments/$GITHUB_EDIT_EXISTING" --input "$api_body_file")"
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        print_github_comment_result_json "edited" "$action" "$body_file" "$gh_output"
+      else
+        [[ -z "$gh_output" ]] || print -r -- "$gh_output"
+        echo "updated GitHub PR comment: $GITHUB_EDIT_EXISTING" >&2
+      fi
+    else
+      [[ -n "$GITHUB_PR" ]] || die "--github-pr is required with --post-github-comment"
+      gh_output="$("$GH" pr comment "$GITHUB_PR" --repo "$GITHUB_REPO" --body-file "$body_file")"
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        print_github_comment_result_json "posted" "$action" "$body_file" "$gh_output"
+      else
+        [[ -z "$gh_output" ]] || print -r -- "$gh_output"
+        echo "posted GitHub PR comment: $GITHUB_PR" >&2
+      fi
+    fi
+  else
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+      print_github_comment_result_json "dry_run" "$action" "$body_file"
+    else
+      cat "$body_file"
+      if [[ -n "$GITHUB_EDIT_EXISTING" ]]; then
+        echo "dry-run: add --post-github-comment to update GitHub comment $GITHUB_EDIT_EXISTING" >&2
+      else
+        echo "dry-run: add --post-github-comment to post to GitHub" >&2
+      fi
+    fi
+  fi
+}
+
+cleanup() {
+  local item
+  if (( ${#OWNED_WRAPPERS[@]} )); then
+    for item in "${OWNED_WRAPPERS[@]}"; do
+      local agent="${item%%:*}"
+      local session="${item#*:}"
+      "$SCRIPT_DIR/agent-tmux" "$agent" stop "$session" >/dev/null 2>&1 || true
+    done
+  fi
+
+  if (( ${#OWNED_SESSIONS[@]} )); then
+    for item in "${OWNED_SESSIONS[@]}"; do
+      "$TMUX" send-keys -t "$item" -- "__TMUX_AGENT_DIALOGUE_STOP__" C-m 2>/dev/null || true
+      "$TMUX" kill-session -t "$item" 2>/dev/null || true
+    done
+  fi
+}
+
+make_turn_prompt() {
+  local turn="$1"
+  local label="$2"
+  local marker="$3"
+  local previous="$4"
+  local instruction="Respond concisely for this turn."
+  local half=$(( ${#marker} / 2 ))
+  local marker_a="${marker[1,half]}"
+  local marker_b="${marker[half+1,-1]}"
+
+  if [[ "$MODE" == "handoff" && "$turn" -eq 1 ]]; then
+    instruction="Produce a concise context handoff: current objective, important constraints, evidence already gathered, open risks, and the next concrete action."
+  elif [[ "$MODE" == "handoff" && "$turn" -eq 2 ]]; then
+    instruction="Respond to the handoff with readiness, risks, missing context, and the next-action summary. Do not continue executing the task."
+  elif [[ "$MODE" == "debate" && $(( turn % 2 )) -eq 1 ]]; then
+    instruction="Argue the strongest case for your position, respond to the previous points, and name concrete evidence or risks. Do not declare a winner or continue unbounded."
+  elif [[ "$MODE" == "debate" ]]; then
+    instruction="Argue the strongest opposing or refining case, respond to the previous points, and name concrete evidence or risks. Do not declare a winner or continue unbounded."
+  fi
+
+  cat <<EOF
+Turn: $turn
+Speaker: $label
+
+Initial/user prompt and previous response:
+$previous
+
+$instruction End your response with the marker formed by joining these two parts with no spaces:
+PART_A: $marker_a
+PART_B: $marker_b
+
+Required final line shape:
+PART_A + PART_B
+
+The final line must contain only the joined marker, with no quotes, no Markdown fence, no spaces, and no extra commentary.
+EOF
+}
+
+TURN_COUNT=0
+WORKDIR=""
+AGENT_A=""
+AGENT_B=""
+AGENT_A_SSH=""
+AGENT_B_SSH=""
+AGENT_A_WORKDIR=""
+AGENT_B_WORKDIR=""
+PROMPT_FILE=""
+TRANSCRIPT=""
+TIMEOUT=180
+TIMEOUT_SET=0
+PARTICIPANTS_CONFIG="${TMUX_AGENT_TOOLS_PARTICIPANTS:-${XDG_CONFIG_HOME:-$HOME/.config}/tmux-agent-tools/participants.json}"
+AGENT_A_PROFILE=""
+AGENT_B_PROFILE=""
+AGENT_A_SET=0
+AGENT_B_SET=0
+AGENT_A_SSH_SET=0
+AGENT_B_SSH_SET=0
+AGENT_A_WORKDIR_SET=0
+AGENT_B_WORKDIR_SET=0
+AGENT_A_ENV=()
+AGENT_B_ENV=()
+AGENT_A_TIMEOUT=""
+AGENT_B_TIMEOUT=""
+MODE="dialogue"
+SUMMARY_FILE=""
+SUMMARY_LABEL="transcript"
+ON_BLOCKED_TRIGGER=""
+OUTPUT_FORMAT="markdown"
+OUTPUT_FORMAT_SET=0
+POST_GITHUB_COMMENT=0
+PAIR_REVIEW_SWAP=0
+GITHUB_PR=""
+GITHUB_REPO=""
+GITHUB_EDIT_EXISTING=""
+MAX_LINES=""
+MAX_BYTES=""
+TRANSCRIPT_SCHEMA_VERSION=""
+TRANSCRIPT_SCHEMA_VERSION_SET=0
+REDACT_PATTERNS=()
+RUN_ID="${$}-$(date -u '+%Y%m%d%H%M%S')"
+OWNED_SESSIONS=()
+OWNED_WRAPPERS=()
+
+if [[ "${1:-}" == "--swap" ]]; then
+  die "--swap is only supported after the pair-review subcommand"
+fi
+
+if [[ "${1:-}" == "pair-review" ]]; then
+  MODE="pair-review"
+  SUMMARY_LABEL="pair-review"
+  TURN_COUNT=2
+  AGENT_A="codex"
+  AGENT_B="claude"
+  shift
+elif [[ "${1:-}" == "critic" ]]; then
+  MODE="critic"
+  SUMMARY_LABEL="critic"
+  TURN_COUNT=4
+  AGENT_A="codex"
+  AGENT_B="claude"
+  shift
+elif [[ "${1:-}" == "debate" ]]; then
+  MODE="debate"
+  SUMMARY_LABEL="debate"
+  TURN_COUNT=4
+  AGENT_A="codex"
+  AGENT_B="claude"
+  shift
+elif [[ "${1:-}" == "handoff" ]]; then
+  MODE="handoff"
+  SUMMARY_LABEL="handoff"
+  TURN_COUNT=2
+  AGENT_A="codex"
+  AGENT_B="claude"
+  shift
+elif [[ "${1:-}" == "summarize" ]]; then
+  MODE="summarize"
+  shift
+elif [[ "${1:-}" == "validate-transcript" ]]; then
+  MODE="validate-transcript"
+  shift
+elif [[ "${1:-}" == "github-comment" ]]; then
+  MODE="github-comment"
+  shift
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    --turns) TURN_COUNT="${2:-}"; shift 2 ;;
+    --workdir) WORKDIR="${2:-}"; shift 2 ;;
+    --agent-a) AGENT_A="${2:-}"; AGENT_A_SET=1; shift 2 ;;
+    --agent-b) AGENT_B="${2:-}"; AGENT_B_SET=1; shift 2 ;;
+    --agent-a-profile) AGENT_A_PROFILE="${2:-}"; shift 2 ;;
+    --agent-b-profile) AGENT_B_PROFILE="${2:-}"; shift 2 ;;
+    --participants-config) PARTICIPANTS_CONFIG="${2:-}"; shift 2 ;;
+    --agent-a-ssh) AGENT_A_SSH="${2:-}"; AGENT_A_SSH_SET=1; shift 2 ;;
+    --agent-b-ssh) AGENT_B_SSH="${2:-}"; AGENT_B_SSH_SET=1; shift 2 ;;
+    --agent-a-workdir) AGENT_A_WORKDIR="${2:-}"; AGENT_A_WORKDIR_SET=1; shift 2 ;;
+    --agent-b-workdir) AGENT_B_WORKDIR="${2:-}"; AGENT_B_WORKDIR_SET=1; shift 2 ;;
+    --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --transcript) TRANSCRIPT="${2:-}"; shift 2 ;;
+    --timeout) TIMEOUT="${2:-}"; TIMEOUT_SET=1; shift 2 ;;
+    --summary-file) SUMMARY_FILE="${2:-}"; shift 2 ;;
+    --output-format) OUTPUT_FORMAT="${2:-}"; OUTPUT_FORMAT_SET=1; shift 2 ;;
+    --on-blocked-trigger) ON_BLOCKED_TRIGGER="${2:-}"; shift 2 ;;
+    --max-lines) MAX_LINES="${2:-}"; shift 2 ;;
+    --max-bytes) MAX_BYTES="${2:-}"; shift 2 ;;
+    --schema-version) TRANSCRIPT_SCHEMA_VERSION="${2:-}"; TRANSCRIPT_SCHEMA_VERSION_SET=1; shift 2 ;;
+    --redact-pattern) REDACT_PATTERNS+=("${2:-}"); shift 2 ;;
+    --swap) PAIR_REVIEW_SWAP=1; shift ;;
+    --post-github-comment) POST_GITHUB_COMMENT=1; shift ;;
+    --github-pr) GITHUB_PR="${2:-}"; shift 2 ;;
+    --github-repo) GITHUB_REPO="${2:-}"; shift 2 ;;
+    --edit-existing) GITHUB_EDIT_EXISTING="${2:-}"; shift 2 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+if [[ -n "$MAX_LINES" || -n "$MAX_BYTES" || ${#REDACT_PATTERNS[@]} -gt 0 ]]; then
+  [[ "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--max-lines, --max-bytes, and --redact-pattern are only supported with summarize or github-comment"
+fi
+[[ "$OUTPUT_FORMAT" == "markdown" || "$OUTPUT_FORMAT" == "json" ]] || die "--output-format must be markdown or json"
+[[ "$OUTPUT_FORMAT_SET" -eq 0 || "$MODE" == "summarize" || "$MODE" == "github-comment" ]] || die "--output-format is only supported with summarize or github-comment"
+[[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 || "$MODE" == "validate-transcript" ]] || die "--schema-version is only supported with validate-transcript"
+[[ "$PAIR_REVIEW_SWAP" -eq 0 || "$MODE" == "pair-review" ]] || die "--swap is only supported with pair-review"
+[[ -z "$GITHUB_EDIT_EXISTING" || "$MODE" == "github-comment" ]] || die "--edit-existing is only supported with github-comment"
+[[ -z "$GITHUB_EDIT_EXISTING" || "$GITHUB_EDIT_EXISTING" =~ ^[0-9]+$ ]] || die "--edit-existing must be a GitHub comment id"
+if [[ -n "$AGENT_A_PROFILE" || -n "$AGENT_B_PROFILE" ]]; then
+  [[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" ]] || die "--agent-a-profile and --agent-b-profile are only supported with dialogue, pair-review, critic, debate, or handoff"
+fi
+[[ -z "$MAX_LINES" || ( "$MAX_LINES" =~ '^[0-9]+$' && "$MAX_LINES" -gt 0 ) ]] || die "--max-lines must be a positive integer"
+[[ -z "$MAX_BYTES" || ( "$MAX_BYTES" =~ '^[0-9]+$' && "$MAX_BYTES" -gt 0 ) ]] || die "--max-bytes must be a positive integer"
+[[ -z "$PARTICIPANTS_CONFIG" ]] || PARTICIPANTS_CONFIG="${PARTICIPANTS_CONFIG:A}"
+
+if [[ "$MODE" == "summarize" ]]; then
+  run_summary_mode
+  exit 0
+fi
+if [[ "$MODE" == "validate-transcript" ]]; then
+  require_jq
+  if [[ "$TRANSCRIPT_SCHEMA_VERSION_SET" -eq 0 ]]; then
+    TRANSCRIPT_SCHEMA_VERSION="1"
+  fi
+  validate_transcript_schema_version "$TRANSCRIPT_SCHEMA_VERSION"
+  [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || die "--transcript must be an existing file"
+  validate_transcript_file "${TRANSCRIPT:A}"
+  echo "transcript valid: ${TRANSCRIPT:A} schema_version=$TRANSCRIPT_SCHEMA_VERSION" >&2
+  exit 0
+fi
+if [[ "$MODE" == "github-comment" ]]; then
+  run_github_comment_mode
+  exit 0
+fi
+
+[[ "$TURN_COUNT" =~ '^[0-9]+$' && "$TURN_COUNT" -gt 0 ]] || die "--turns must be a positive integer"
+[[ "$MODE" != "critic" || $(( TURN_COUNT % 2 )) -eq 0 ]] || die "critic --turns must be a positive even integer"
+[[ "$MODE" != "debate" || $(( TURN_COUNT % 2 )) -eq 0 ]] || die "debate --turns must be a positive even integer"
+[[ "$MODE" != "handoff" || "$TURN_COUNT" -eq 2 ]] || die "handoff runs exactly two turns"
+[[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer"
+[[ -n "$WORKDIR" && -d "$WORKDIR" ]] || die "--workdir must be an existing directory"
+[[ -n "$PROMPT_FILE" && -f "$PROMPT_FILE" ]] || die "--prompt-file must be an existing file"
+[[ -n "$TRANSCRIPT" ]] || die "--transcript is required"
+
+apply_profile a "$AGENT_A_PROFILE" "$AGENT_A_SET" "$AGENT_A_SSH_SET" "$AGENT_A_WORKDIR_SET"
+apply_profile b "$AGENT_B_PROFILE" "$AGENT_B_SET" "$AGENT_B_SSH_SET" "$AGENT_B_WORKDIR_SET"
+
+# Any non-empty CLI name agent-tmux can drive (claude, codex, agy, gemini,
+# cursor, grok, future CLIs) is valid; an unknown CLI gets generic defaults and
+# fails clearly at launch if its binary is missing. fake is the in-process stub.
+[[ "$AGENT_A" == [!-]* ]] || die "--agent-a must be 'fake' or a CLI name agent-tmux can drive (claude, codex, agy, ...)"
+[[ "$AGENT_B" == [!-]* ]] || die "--agent-b must be 'fake' or a CLI name agent-tmux can drive (claude, codex, agy, ...)"
+[[ -z "$AGENT_A_SSH" || "$AGENT_A" != "fake" ]] || die "--agent-a-ssh cannot be used with --agent-a fake"
+[[ -z "$AGENT_B_SSH" || "$AGENT_B" != "fake" ]] || die "--agent-b-ssh cannot be used with --agent-b fake"
+[[ -z "$AGENT_A_SSH" || -n "$AGENT_A_WORKDIR" ]] || die "--agent-a-workdir is required when --agent-a-ssh is set"
+[[ -z "$AGENT_B_SSH" || -n "$AGENT_B_WORKDIR" ]] || die "--agent-b-workdir is required when --agent-b-ssh is set"
+[[ -z "$AGENT_A_SSH" || "$AGENT_A_WORKDIR" == /* ]] || die "--agent-a-workdir must be an absolute remote path when --agent-a-ssh is set"
+[[ -z "$AGENT_B_SSH" || "$AGENT_B_WORKDIR" == /* ]] || die "--agent-b-workdir must be an absolute remote path when --agent-b-ssh is set"
+[[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" || -z "$SUMMARY_FILE" ]] || die "--summary-file is only supported with pair-review, critic, debate, or handoff"
+[[ "$MODE" == "dialogue" || "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" || -z "$ON_BLOCKED_TRIGGER" ]] || die "--on-blocked-trigger is only supported with dialogue, pair-review, critic, debate, or handoff"
+[[ "$POST_GITHUB_COMMENT" -eq 0 ]] || die "--post-github-comment is only supported with github-comment"
+[[ -z "$GITHUB_PR" ]] || die "--github-pr is only supported with github-comment"
+[[ -z "$GITHUB_REPO" ]] || die "--github-repo is only supported with github-comment"
+[[ -z "$GITHUB_EDIT_EXISTING" ]] || die "--edit-existing is only supported with github-comment"
+[[ -z "$SUMMARY_FILE" || "$TRANSCRIPT" != "-" ]] || die "--summary-file requires --transcript to be a file path"
+[[ -z "$ON_BLOCKED_TRIGGER" || "$ON_BLOCKED_TRIGGER" != "-" ]] || die "--on-blocked-trigger must be a file path"
+
+require_tmux
+WORKDIR="${WORKDIR:A}"
+PROMPT_FILE="${PROMPT_FILE:A}"
+if [[ -z "$AGENT_A_SSH" && -n "$AGENT_A_WORKDIR" ]]; then
+  [[ -d "$AGENT_A_WORKDIR" ]] || die "--agent-a-workdir must be an existing directory for local participants"
+  AGENT_A_WORKDIR="${AGENT_A_WORKDIR:A}"
+fi
+if [[ -z "$AGENT_B_SSH" && -n "$AGENT_B_WORKDIR" ]]; then
+  [[ -d "$AGENT_B_WORKDIR" ]] || die "--agent-b-workdir must be an existing directory for local participants"
+  AGENT_B_WORKDIR="${AGENT_B_WORKDIR:A}"
+fi
+if [[ "$TRANSCRIPT" != "-" ]]; then
+  TRANSCRIPT="${TRANSCRIPT:A}"
+  mkdir -p "${TRANSCRIPT:h}"
+  : > "$TRANSCRIPT"
+fi
+if [[ -n "$SUMMARY_FILE" ]]; then
+  SUMMARY_FILE="${SUMMARY_FILE:A}"
+  mkdir -p "${SUMMARY_FILE:h}"
+fi
+if [[ -n "$ON_BLOCKED_TRIGGER" ]]; then
+  ON_BLOCKED_TRIGGER="${ON_BLOCKED_TRIGGER:A}"
+  mkdir -p "${ON_BLOCKED_TRIGGER:h}"
+fi
+
+trap cleanup EXIT
+
+if [[ "$AGENT_A" == "fake" ]]; then
+  start_fake_agent "a"
+else
+  start_real_agent "a" "$AGENT_A"
+fi
+
+if [[ "$AGENT_B" == "fake" ]]; then
+  start_fake_agent "b"
+else
+  start_real_agent "b" "$AGENT_B"
+fi
+
+initial_prompt="$(<"$PROMPT_FILE")"
+previous="No previous response yet."
+
+for (( turn = 1; turn <= TURN_COUNT; turn++ )); do
+  if (( PAIR_REVIEW_SWAP && turn % 2 == 1 )); then
+    label="b"
+    agent="$AGENT_B"
+    speaker="agent-b"
+  elif (( PAIR_REVIEW_SWAP )); then
+    label="a"
+    agent="$AGENT_A"
+    speaker="agent-a"
+  elif (( turn % 2 == 1 )); then
+    label="a"
+    agent="$AGENT_A"
+    speaker="agent-a"
+  else
+    label="b"
+    agent="$AGENT_B"
+    speaker="agent-b"
+  fi
+
+  marker="[TMUX_AGENT_DIALOGUE_${RUN_ID}_${label}_${turn}_DONE]"
+  prompt="$(make_turn_prompt "$turn" "$label" "$marker" "Initial prompt:
+$initial_prompt
+
+Previous response:
+$previous")"
+
+  if [[ "$agent" == "fake" ]]; then
+    if [[ "${TMUX_AGENT_DIALOGUE_TEST_BLOCKED_FAKE_TURN:-}" == "$turn" ]]; then
+      send_to_agent "$label" "$agent" "Do you want to allow this action?" || true
+      if ! wait_for_marker "$label" "$agent" "$marker" "fake-${label}: Do you want to allow this action?"; then
+        record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+        exit 1
+      fi
+    elif [[ "${TMUX_AGENT_DIALOGUE_TEST_TIMEOUT_FAKE_TURN:-}" == "$turn" ]]; then
+      if ! wait_for_marker "$label" "$agent" "$marker" "fake-${label}: turn ${turn} received"; then
+        record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+        exit 1
+      fi
+    elif [[ "${TMUX_AGENT_DIALOGUE_TEST_KILL_FAKE_TURN:-}" == "$turn" ]]; then
+      send_to_agent "$label" "$agent" "turn ${turn} received MARKER:${marker}" || true
+      "$TMUX" kill-session -t "$(session_name "$label")" 2>/dev/null || true
+      if ! wait_for_marker "$label" "$agent" "$marker" "fake-${label}: turn ${turn} received"; then
+        record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+        exit 1
+      fi
+    elif ! send_and_wait_for_marker "$label" "$agent" "turn ${turn} received MARKER:${marker}" "$marker"; then
+      record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+      exit 1
+    fi
+  else
+    if ! send_and_wait_for_marker "$label" "$agent" "$prompt" "$marker"; then
+      record_marker_timeout "$turn" "$speaker" "$agent" "$marker" "$label"
+      exit 1
+    fi
+  fi
+
+  captured="$(capture_agent "$label" "$agent")"
+  append_jsonl "$turn" "$speaker" "$agent" "$marker" "$captured"
+  previous="$(summarize_previous "$captured")"
+done
+
+echo "dialogue complete: turns=$TURN_COUNT transcript=$TRANSCRIPT" >&2
+if [[ "$MODE" == "pair-review" || "$MODE" == "critic" || "$MODE" == "debate" || "$MODE" == "handoff" ]]; then
+  print_pair_review_summary
+  write_pair_review_summary_file
+fi

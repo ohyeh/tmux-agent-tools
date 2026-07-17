@@ -1,0 +1,154 @@
+#!/usr/bin/env zsh
+# tmux-agent-notify (issue #121): post a JSON envelope to a webhook.
+#
+# Designed to be chained with #95 `--on-exit`:
+#
+#   claude-tmux start --sentinel /tmp/x.exit \
+#     --on-exit 'tmux-agent-notify --webhook https://hooks.slack.com/... --format slack' \
+#     worker ~/project
+#
+# Reads ON_EXIT_CODE + ON_EXIT_NAME (exported by the on-exit hook) plus
+# any extra context the caller passes as flags. POSTs a single JSON body.
+#
+# v1 scope: --format generic-json + slack. Discord / Mattermost / Teams
+# are followups — same envelope, different field names.
+
+set -euo pipefail
+
+JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+CURL="${CURL:-$(command -v curl 2>/dev/null || true)}"
+RETRY_MAX=3
+RETRY_BASE_DELAY=1
+
+usage() {
+  cat <<'EOF'
+tmux-agent-notify - post a JSON envelope to a webhook (#121).
+
+Usage:
+  tmux-agent-notify --webhook <url> [--format <generic-json|slack>] [--tag <key=value>]... [--dry-run]
+
+Behavior:
+  Reads ON_EXIT_CODE + ON_EXIT_NAME from the environment (set by the
+  on-exit hook from #95). Constructs a JSON envelope and POSTs it to
+  the webhook. Failures are logged to stderr but never exit non-zero —
+  notification is a side channel and must not break the agent's exit
+  code.
+
+Envelope (generic-json):
+  {
+    "schema_version": 1,
+    "tool": "tmux-agent-tools",
+    "agent": "<ON_EXIT_NAME>",
+    "exit_code": <ON_EXIT_CODE>,
+    "tags": {...},
+    "at": "<ISO-8601 UTC>"
+  }
+
+Slack adapter wraps the envelope as:
+  {"text": "agent <name> exited with code <code>"}
+plus the original envelope as a non-displayed attachment.
+
+Flags:
+  --webhook <url>      required. POST target.
+  --format <name>      generic-json (default) | slack
+  --tag k=v            extra context, repeatable. Merged into `tags`.
+  --dry-run            print the would-be body to stdout, do not POST.
+EOF
+}
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+require_jq() {
+  [[ -n "$JQ" && -x "$JQ" ]] || { echo "[notify] jq not found" >&2; exit 1; }
+}
+
+require_curl() {
+  [[ -n "$CURL" && -x "$CURL" ]] || { echo "[notify] curl not found" >&2; exit 1; }
+}
+
+build_envelope() {
+  # Build the generic JSON envelope. Tags array is folded into an object.
+  local agent="$1" exit_code="$2"; shift 2
+  local tags_json='{}'
+  local kv
+  for kv in "$@"; do
+    [[ "$kv" == *=* ]] || continue
+    local k="${kv%%=*}" v="${kv#*=}"
+    tags_json="$("$JQ" -c -n --argjson cur "$tags_json" --arg k "$k" --arg v "$v" \
+      '$cur + {($k): $v}')"
+  done
+  "$JQ" -c -n \
+    --arg agent "$agent" \
+    --argjson exit_code "${exit_code:-0}" \
+    --argjson tags "$tags_json" \
+    --arg at "$(iso_now)" \
+    '{schema_version: 1, tool: "tmux-agent-tools", agent: $agent,
+      exit_code: $exit_code, tags: $tags, at: $at}'
+}
+
+format_slack() {
+  # Wrap envelope as Slack-friendly payload.
+  local envelope="$1"
+  local agent code
+  agent="$(printf '%s' "$envelope" | "$JQ" -r .agent)"
+  code="$(printf '%s' "$envelope" | "$JQ" -r .exit_code)"
+  "$JQ" -c -n --argjson envelope "$envelope" \
+    --arg text "tmux-agent-tools: agent \`$agent\` exited with code $code" \
+    '{text: $text, attachments: [{text: ($envelope | tostring)}]}'
+}
+
+post_with_retry() {
+  local url="$1" body="$2"
+  require_curl
+  local attempt=1
+  local delay=$RETRY_BASE_DELAY
+  while (( attempt <= RETRY_MAX )); do
+    if "$CURL" -fsSL -X POST -H 'Content-Type: application/json' \
+         --data "$body" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "[notify] attempt $attempt failed, retrying after ${delay}s" >&2
+    /bin/sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+  echo "[notify] giving up after $RETRY_MAX attempts" >&2
+  return 0  # never fail the caller
+}
+
+# --- argv ---
+webhook=""
+format="generic-json"
+dry_run=0
+typeset -a extra_tags
+extra_tags=()
+while (( $# )); do
+  case "$1" in
+    --webhook)  webhook="${2:-}"; shift 2 || true ;;
+    --format)   format="${2:-}"; shift 2 || true ;;
+    --tag)      extra_tags+=("${2:-}"); shift 2 || true ;;
+    --dry-run)  dry_run=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          echo "Unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$webhook" || $dry_run -eq 1 ]] || { echo "--webhook required (or --dry-run)" >&2; exit 2; }
+require_jq
+
+agent="${ON_EXIT_NAME:-unknown}"
+exit_code="${ON_EXIT_CODE:-0}"
+
+envelope="$(build_envelope "$agent" "$exit_code" "${extra_tags[@]}")"
+
+case "$format" in
+  generic-json) body="$envelope" ;;
+  slack)        body="$(format_slack "$envelope")" ;;
+  *)            echo "Unknown --format: $format" >&2; exit 2 ;;
+esac
+
+if (( dry_run )); then
+  printf '%s\n' "$body"
+  exit 0
+fi
+
+post_with_retry "$webhook" "$body"

@@ -1,0 +1,31 @@
+{
+  "name": "tmux-agent-tools",
+  "owner": {
+    "name": "PaulYeh",
+    "url": "https://github.com/ohyeh"
+  },
+  "metadata": {
+    "description": "Tmux-based supervision and orchestration tooling for Claude Code and Codex CLI agents.",
+    "version": "0.24.0"
+  },
+  "plugins": [
+    {
+      "name": "tmux-agent-tools",
+      "source": "./",
+      "description": "Run Claude Code or Codex CLI as controllable, supervised tmux sessions with tmux-delegate, start/resume, send, wait, capture, status/doctor/setup, result files, approval gates, and multi-agent pair/team orchestration.",
+      "version": "0.24.0",
+      "author": {
+        "name": "PaulYeh"
+      },
+      "category": "development",
+      "keywords": [
+        "tmux",
+        "claude-code",
+        "codex",
+        "agent",
+        "orchestration",
+        "multi-agent"
+      ]
+    }
+  ]
+}
