@@ -34,7 +34,7 @@ If `doctor` flags anything, fix it before continuing — every later step assume
 ## Hello, agent
 
 ```bash
-codex-tmux start --exact hello ~ 'Print HELLO from your first agent, then write final JSON to the wrapper-provided result path: {"schema_version":1,"status":"ok","summary":"hello complete","artifacts":[],"errors":[]}'
+codex-tmux start --exact hello ~ 'Print HELLO from your first agent, then write final JSON to the wrapper-provided result path: {"schema_version":1,"status":"success","summary":"hello complete","artifacts":[],"errors":[]}'
 codex-tmux wait-text hello 'HELLO' 60
 codex-tmux capture hello 30
 codex-tmux result wait-required hello --fields status,summary --wait 60 --json

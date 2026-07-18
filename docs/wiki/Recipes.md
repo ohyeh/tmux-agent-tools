@@ -6,7 +6,7 @@ Copy-pasteable workflows. Each one starts from a clean shell — adapt the agent
 
 ```bash
 codex-tmux start --exact reviewer ~/repo --transcript /tmp/reviewer.jsonl \
-  'Review the latest commit. End by writing $TMUX_AGENT_RESULT with {"schema_version":1,"status":"ok"|"blocked"|"error","summary":"...","artifacts":[],"errors":[]}.'
+  'Review the latest commit. End by writing $TMUX_AGENT_RESULT with {"schema_version":1,"status":"success"|"failed"|"blocked"|"needs-input","summary":"...","artifacts":[],"errors":[]}.'
 
 codex-tmux wait-and-capture --marker '"status"' --tail 5 reviewer 600
 

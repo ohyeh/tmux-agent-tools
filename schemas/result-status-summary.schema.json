@@ -2,12 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "tmux-agent-tools result-status-summary",
   "description": "Lightweight result.json contract used by tmux-agent-tools. v1 validator (see #125) only checks: type (object), required keys, additionalProperties: false.",
+  "definitions": {
+    "canonicalStatus": {
+      "type": "string",
+      "enum": ["success", "failed", "blocked", "needs-input"]
+    }
+  },
   "type": "object",
   "required": ["schema_version", "status", "summary"],
   "additionalProperties": false,
   "properties": {
     "schema_version": {"type": "integer"},
-    "status": {"type": "string"},
+    "status": {"type": "string", "description": "Writers use definitions.canonicalStatus; readers normalize legacy strings without rewriting stored files."},
     "summary": {"type": "string"},
     "artifacts": {"type": "array"},
     "errors": {"type": "array"},

@@ -73,7 +73,7 @@ Make the agent write `$TMUX_AGENT_RESULT` (a path the wrapper sets) with this sh
 ```jsonc
 {
   "schema_version": 1,
-  "status": "ok" | "blocked" | "error",
+  "status": "success" | "failed" | "blocked" | "needs-input",
   "summary": "one-line human-readable summary",
   "artifacts": [{"kind": "pr|file|url", "ref": "PR-1234"}],
   "errors": [{"code": "...", "message": "...", "remediation": "..."}]

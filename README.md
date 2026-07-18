@@ -363,9 +363,14 @@ TMUX_AGENT_RESULT=$TMUX_AGENT_DIR/<short-name>/result.json
 Recommended prompt wording:
 
 > Write final JSON to the wrapper-provided result path. The JSON must include
-> `schema_version`, `status`, `summary`, `artifacts`, and `errors`. Use an
+> `schema_version`, `status`, `summary`, `artifacts`, and `errors`. Write
+> `status` as `success`, `failed`, `blocked`, or `needs-input`. Use an
 > atomic rename if you write from shell so a `result --wait` reader never sees
 > partial content.
+
+Readers preserve `.body.status` and add `canonical_status`, mapping legacy
+spellings such as `ok`, `PASS`, `APPROVE`, `CONCERN`, and `needs-fixes` at read
+time. Existing files are never rewritten.
 
 Read the result with the new `result` subcommand:
 

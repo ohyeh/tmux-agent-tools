@@ -30,7 +30,7 @@
 #                   transitive descendants are skipped.
 #
 # Task status decision:
-#   - exit code 0 AND (no result_path OR result_path exists AND status=="ok") -> ok
+#   - exit code 0 AND (no result_path OR result_path has a success status) -> ok
 #   - otherwise -> failed
 #
 # Final JSON summary (stdout, also --summary-out PATH):
@@ -73,6 +73,15 @@ EOF
 }
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+result_status_is_success() {
+  local normalized="${1:l}"
+  normalized="${normalized//-/_}"
+  case "$normalized" in
+    success|ok|done|complete|completed|pass|passed|fixed|clean|approve|accept|accepted|resolved|shipped|merged) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 emit_summary() {
   local manifest_arg="$1" ordered_json="$2" results_json="$3" ok_val="$4" summary_out="$5"
@@ -332,7 +341,7 @@ run_task() {
     fi
     local st
     st="$("$JQ" -r '.status // ""' "$rp" 2>/dev/null || echo "")"
-    if [[ -n "$st" && "$st" != "ok" ]]; then
+    if ! result_status_is_success "$st"; then
       task_status[$name]="failed"
       task_error[$name]="result.status=$st"
       return 1

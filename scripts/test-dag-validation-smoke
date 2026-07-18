@@ -49,9 +49,9 @@ cat > "$T1/manifest.json" <<EOF
   "schema_version": 1,
   "fail_fast": true,
   "tasks": [
-    {"name":"c","depends_on":["b"],"command":"echo c >> $T1/order && printf '{\"status\":\"ok\"}' > $T1/c.json","result_path":"$T1/c.json"},
-    {"name":"a","depends_on":[],"command":"echo a >> $T1/order && printf '{\"status\":\"ok\"}' > $T1/a.json","result_path":"$T1/a.json"},
-    {"name":"b","depends_on":["a"],"command":"echo b >> $T1/order && printf '{\"status\":\"ok\"}' > $T1/b.json","result_path":"$T1/b.json"}
+    {"name":"c","depends_on":["b"],"command":"echo c >> $T1/order && printf '{\"status\":\"PASS\"}' > $T1/c.json","result_path":"$T1/c.json"},
+    {"name":"a","depends_on":[],"command":"echo a >> $T1/order && printf '{\"status\":\"success\"}' > $T1/a.json","result_path":"$T1/a.json"},
+    {"name":"b","depends_on":["a"],"command":"echo b >> $T1/order && printf '{\"status\":\"completed\"}' > $T1/b.json","result_path":"$T1/b.json"}
   ]
 }
 EOF

@@ -64,7 +64,7 @@ codex-tmux start --exact w ~/repo \
 
 The agent never wrote `$TMUX_AGENT_RESULT`. Re-prompt explicitly:
 
-> Write `$TMUX_AGENT_RESULT` before signaling done. Schema: `{"schema_version":1,"status":"ok|blocked|error","summary":"…","artifacts":[],"errors":[]}`.
+> Write `$TMUX_AGENT_RESULT` before signaling done. Schema: `{"schema_version":1,"status":"success|failed|blocked|needs-input","summary":"…","artifacts":[],"errors":[]}`.
 
 Agents forget this constraint unless it's stated in the prompt. The prompt is the contract.
 

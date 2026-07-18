@@ -81,7 +81,7 @@ Full walkthrough: `references/core-workflow.md`.
 
 ## result.json completion contract
 
-Agents write `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, and `errors` (optional `verdict`/`decision`). Codex/generic prompt sends inject the literal result path once per session; the worker cannot rely on `$TMUX_AGENT_RESULT` inside tool sandboxes. Branch in this order — never scrape the pane when a valid result exists: `.present -> .valid -> .body`.
+Agents write `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, canonical `status` (`success|failed|blocked|needs-input`), `summary`, `artifacts`, and `errors` (optional `verdict`/`decision`). Codex/generic prompt sends inject the literal result path once per session; the worker cannot rely on `$TMUX_AGENT_RESULT` inside tool sandboxes. Branch in this order — never scrape the pane when a valid result exists: `.present -> .valid -> .body`.
 
 ```bash
 codex-tmux result --json --wait 30 worker

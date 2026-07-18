@@ -21,6 +21,8 @@ trap 'rm -rf "$WORK"' EXIT
 PASS=0
 FAIL=0
 
+canonical_enum="$(jq -c '.definitions.canonicalStatus.enum' "$SCHEMA")"
+
 assert() {
   local label="$1" actual="$2" expected="$3"
   if [[ "$actual" == "$expected" ]]; then
@@ -98,6 +100,8 @@ run_validator_cases() {
   assert "$prefix-noresult present=false" "$(printf '%s' "$out" | jq -r .present)" "false"
   assert "$prefix-noresult valid=false" "$(printf '%s' "$out" | jq -r .valid)" "false"
 }
+
+assert "schema defines canonical status enum" "$canonical_enum" '["success","failed","blocked","needs-input"]'
 
 run_flag_rejections() {
   local wrapper="$1" prefix="$2"

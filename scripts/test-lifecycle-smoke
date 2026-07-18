@@ -134,7 +134,7 @@ mkfake_launch lsn 'lsn-x-bbbb' '2026-07-10T00:00:00Z'
 "$AGENT" claude stop lsn >/dev/null 2>&1 || true
 sj="$TMUX_AGENT_DIR/lsn/result.json"
 assert "skeleton exists" "$([[ -f "$sj" ]] && echo yes || echo no)" "yes"
-assert "skeleton status unknown" "$(jq -r .status "$sj")" "unknown"
+assert "skeleton status failed" "$(jq -r .status "$sj")" "failed"
 assert "skeleton terminal_reason=stopped" "$(jq -r .terminal_reason "$sj")" "stopped"
 assert "skeleton launch_id" "$(jq -r .launch_id "$sj")" "lsn-x-bbbb"
 assert "launch_end result_present false" \
@@ -195,7 +195,7 @@ printf '{not json' > "$IDIR/winv/result.json"
 TMUX_AGENT_DIR="$IDIR" "$AGENT" claude stop winv >/dev/null 2>&1 || true
 assert "invalid bytes preserved" \
   "$([[ -f "$IDIR/winv/result.json.invalid" ]] && echo yes || echo no)" "yes"
-assert "skeleton parses (status unknown)" "$(jq -r .status "$IDIR/winv/result.json" 2>/dev/null)" "unknown"
+assert "skeleton parses (status failed)" "$(jq -r .status "$IDIR/winv/result.json" 2>/dev/null)" "failed"
 assert "skeleton terminal_reason=stopped" "$(jq -r .terminal_reason "$IDIR/winv/result.json")" "stopped"
 assert "invalid-json launch_end logged once" \
   "$(grep -c '"event":"launch_end"' "$IDIR/winv/usage.jsonl")" "1"

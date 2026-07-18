@@ -68,6 +68,15 @@ EOF
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+result_status_is_success() {
+  local normalized="${1:l}"
+  normalized="${normalized//-/_}"
+  case "$normalized" in
+    success|ok|done|complete|completed|pass|passed|fixed|clean|approve|accept|accepted|resolved|shipped|merged) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # -------- Parse argv --------
 
 subcommand=""
@@ -297,10 +306,11 @@ for i in {1..$total}; do
   if [[ -f "$per_result_path" ]]; then
     # Inspect status in result.json; treat missing/unparsable as failed.
     inner_status="$("$JQ" -r '.status // "unknown"' "$per_result_path" 2>/dev/null || echo "unknown")"
-    case "$inner_status" in
-      ok|success|completed) status_val="ok" ;;
-      *) status_val="failed"; error_msg="result.status=$inner_status" ;;
-    esac
+    if result_status_is_success "$inner_status"; then
+      status_val="ok"
+    else
+      status_val="failed"; error_msg="result.status=$inner_status"
+    fi
   fi
 
   agent_statuses+=("$status_val")

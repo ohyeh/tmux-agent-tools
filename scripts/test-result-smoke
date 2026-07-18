@@ -54,7 +54,7 @@ run_result_variants() {
   # Give the fake CLI a moment to write the result file.
   sleep 3
 
-  local status_value summary_value json_present json_schema_v json_missing
+  local status_value summary_value json_present json_schema_v json_missing canonical_status
   status_value="$("$wrapper" result --field .status "$prefix" 2>&1 || true)"
   assert "$prefix --field .status" "$status_value" "ok"
 
@@ -70,6 +70,8 @@ run_result_variants() {
   local valid_flag
   valid_flag="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
   assert "$prefix --json valid=true on parseable JSON" "$valid_flag" "true"
+  canonical_status="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .canonical_status || true)"
+  assert "$prefix --json normalizes legacy ok" "$canonical_status" "success"
 
   # --wait when file already present is essentially a no-op (must run
   # BEFORE the invalid-JSON test since it overwrites result.json).

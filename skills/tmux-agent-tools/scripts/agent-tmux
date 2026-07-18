@@ -608,7 +608,7 @@ Fields (JSON):
                                 absent = unknown, e.g. pre-v0.32 legacy runs).
   by_cli                       claude/codex/... /unknown.
   result_coverage              with_result / without_result / pct.
-  status_buckets               success/failure/review/partial/unknown/
+  status_buckets               success/failed/blocked/needs-input/unknown/
                                 missing_status/no_result (see `result validate`).
   status_raw_top               Top 10 raw status values with counts.
 HELP_EOF
@@ -2309,7 +2309,7 @@ result_init_session() {
   local subdir result_path
   subdir="$(ensure_agent_dir "$name")"
   result_path="$subdir/result.json"
-  "$JQ" -n '{schema_version: 1, status: "ok", summary: "", artifacts: [], errors: []}' > "$result_path"
+  "$JQ" -n '{schema_version: 1, status: "success", summary: "", artifacts: [], errors: []}' > "$result_path"
   # Seed sidecar with null so it is discoverable before capture runs (P1).
   local meta_path="$subdir/session-meta.json"
   "$JQ" -n '{schema_version: 1, cli_session_id: null}' > "$meta_path"
@@ -2396,22 +2396,22 @@ result_validate_session() {
     "$JQ" -n --arg path "$result_path" \
       '{schema_version: 1, path: $path, present: false, valid: false,
         errors: [{path: ".", message: "result file not found"}], body: null,
-        status_bucket: "missing"}'
+        status_bucket: "missing", canonical_status: "missing"}'
     return 1
   fi
-  # Additive status_bucket (usage-survey rec 1): classify body.status into a
-  # coarse bucket without touching the shared validator (still called by the
-  # status read path). unknown bucket → one-line canonical-set hint on stderr.
-  local lightweight_out raw_status bucket
+  # Normalize body.status at read time without rewriting legacy result files.
+  # status_bucket remains as a compatibility alias for canonical_status.
+  local lightweight_out raw_status canonical_status
   local rc=0
   # || guard: set -e would otherwise abort here on the invalid path, and
   # validate must still emit its JSON verdict and original exit code.
   lightweight_out="$(result_validate_lightweight "$result_path" "$schema_path")" || rc=$?
   raw_status="$(printf '%s' "$lightweight_out" | "$JQ" -r '.body.status // ""' 2>/dev/null)" || raw_status=""
-  bucket="$(status_bucket_of "$raw_status")"
-  printf '%s' "$lightweight_out" | "$JQ" --arg b "$bucket" '. + {status_bucket: $b}'
-  if [[ "$bucket" == "unknown" ]]; then
-    printf "hint: status '%s' is not a recognized value; canonical set: success|partial|blocked|error (free-form still allowed)\n" "$raw_status" >&2
+  canonical_status="$(canonical_status_of "$raw_status")"
+  printf '%s' "$lightweight_out" | "$JQ" --arg s "$canonical_status" \
+    '. + {canonical_status: $s, status_bucket: $s}'
+  if [[ "$canonical_status" == "unknown" ]]; then
+    printf "hint: status '%s' is not recognized; canonical set: success|failed|blocked|needs-input\n" "$raw_status" >&2
   fi
   return $rc
 }
@@ -2695,7 +2695,7 @@ stats_session() {
     if [[ -f "$d/result.json" ]]; then
       has_result=1
       raw_status="$("$JQ" -r '.status // ""' "$d/result.json" 2>/dev/null)" || raw_status=""
-      bucket="$(status_bucket_of "$raw_status")"
+      bucket="$(canonical_status_of "$raw_status")"
       [[ "$bucket" == "missing" ]] && bucket="missing_status"
     else
       has_result=0
@@ -2762,7 +2762,7 @@ stats_session() {
           pct: (if $total > 0 then (($with * 1000 / $total) | floor) / 10 else 0 end)
         },
         status_buckets: (reduce $rows[] as $r
-          ({success:0, failure:0, review:0, partial:0, unknown:0, missing_status:0, no_result:0};
+          ({success:0, failed:0, blocked:0, "needs-input":0, unknown:0, missing_status:0, no_result:0};
            .[$r[4]] = ((.[$r[4]] // 0) + 1))),
         status_raw_top: ([ $rows[] | .[5] | select(. != "") ]
           | group_by(.) | map({status: .[0], count: length})
@@ -3123,7 +3123,7 @@ finalize_launch_envelope() {
       # still holds (reviewer finding 2).
       mv -f "$result_path" "$result_path.invalid" 2>/dev/null || true
       if "$JQ" -c -n --argjson add "$add" \
-        '{schema_version: 1, status: "unknown",
+        '{schema_version: 1, status: "failed",
           errors: ["agent-written result.json was not valid JSON; original preserved at result.json.invalid"]}
          + $add' > "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$result_path"
@@ -3133,7 +3133,7 @@ finalize_launch_envelope() {
     fi
   else
     result_present=false
-    if "$JQ" -c -n --argjson add "$add" '{schema_version: 1, status: "unknown"} + $add' > "$tmp" 2>/dev/null; then
+    if "$JQ" -c -n --argjson add "$add" '{schema_version: 1, status: "failed"} + $add' > "$tmp" 2>/dev/null; then
       mv -f "$tmp" "$result_path"
     else
       rm -f "$tmp" 2>/dev/null
@@ -3210,30 +3210,27 @@ launch_envelope_inline_block() {
   local merge='. + {launch_id:$lid,finished_at:$fa,terminal_reason:$tr,process_exit_code:$ec}'
   # Invalid agent JSON: preserve the bytes as result.json.invalid and replace
   # with a parseable skeleton, mirroring finalize_launch_envelope (finding 2).
-  local skel='{schema_version:1,status:"unknown",errors:["agent-written result.json was not valid JSON; original preserved at result.json.invalid"],launch_id:$lid,finished_at:$fa,terminal_reason:"process-exit",process_exit_code:$ec}'
+  local skel='{schema_version:1,status:"failed",errors:["agent-written result.json was not valid JSON; original preserved at result.json.invalid"],launch_id:$lid,finished_at:$fa,terminal_reason:"process-exit",process_exit_code:$ec}'
   local end='{schema_version:1,event:"launch_end",launch_id:$lid,finished_at:$fa,terminal_reason:"process-exit",exit_code:$ec,result_present:$rp}'
   print -r -- "__le_fa=\$(date -u +%Y-%m-%dT%H:%M:%SZ); if [ -s $rp ]; then __le_rp=true; $jq --arg lid $lid --arg fa \"\$__le_fa\" --arg tr process-exit --argjson ec \"\$cli_code\" '$merge' $rp > $rp.tmp 2>/dev/null && mv -f $rp.tmp $rp || { rm -f $rp.tmp; mv -f $rp $rp.invalid 2>/dev/null || true; $jq -c -n --arg lid $lid --arg fa \"\$__le_fa\" --argjson ec \"\$cli_code\" '$skel' > $rp 2>/dev/null || true; }; else __le_rp=false; fi; $jq -c -n --arg lid $lid --arg fa \"\$__le_fa\" --argjson ec \"\$cli_code\" --argjson rp \"\$__le_rp\" '$end' >> $up 2>/dev/null || true"
 }
 
-# status_bucket_of <raw> → success|failure|review|partial|unknown|missing
-# Normalize a free-form result.json status into a coarse bucket. Case-
-# insensitive; `-` folds to `_` before matching. review wins over
-# success/failure (e.g. `block`, `approve_with_changes` are review; plain
-# `approve` is success). Empty/absent → missing. Pure shell, no fork.
-status_bucket_of() {
+# canonical_status_of <raw> → success|failed|blocked|needs-input|unknown|missing
+# Normalize legacy result.json values at read time only. Empty/absent → missing.
+canonical_status_of() {
   local raw="${1:-}"
   [[ -n "$raw" ]] || { printf 'missing'; return 0; }
   local s="${raw:l}"
   s="${s//-/_}"
   case "$s" in
-    approve_with_changes|accept_with_changes|changes_requested|should_fix|issues_found|concern|block|disagree|needs_fix|needs_fixes|needs_fix_before_publish|pass_with_caveat)
-      printf 'review' ;;
+    needs_input|approve_with_changes|accept_with_changes|changes_requested|should_fix|issues_found|concern|disagree|needs_fix|needs_fixes|needs_fix_before_publish|pass_with_caveat|partial|degraded)
+      printf 'needs-input' ;;
     success|ok|done|complete|completed|pass|passed|fixed|clean|approve|accept|accepted|resolved|shipped|merged)
       printf 'success' ;;
-    error|fail|failed|blocked|build_blocked|timeout|crashed)
-      printf 'failure' ;;
-    partial|degraded)
-      printf 'partial' ;;
+    blocked|build_blocked|block)
+      printf 'blocked' ;;
+    error|fail|failed|failure|timeout|crashed)
+      printf 'failed' ;;
     *)
       printf 'unknown' ;;
   esac
@@ -5318,7 +5315,8 @@ result_session() {
       # "result-not-yet" condition lives in `.present`. Callers branch
       # on the payload, not the exit code.
       "$JQ" -n --arg path "$result_path" \
-        '{schema_version: 1, path: $path, present: false, valid: false, body: null}'
+        '{schema_version: 1, path: $path, present: false, valid: false,
+          canonical_status: "missing", body: null}'
       return 0
     fi
     echo "Result file not found: $result_path" >&2
@@ -5349,22 +5347,27 @@ result_session() {
     # cannot tell that case apart from "wrapper failed to parse". Emit
     # both: valid=true with parsed body, or valid=false with the raw
     # bytes wrapped as a JSON string so the caller can still inspect.
-    local body_json valid_flag
+    local body_json valid_flag raw_status canonical_status
     if printf '%s' "$body" | "$JQ" -e . >/dev/null 2>&1; then
       body_json="$body"
       valid_flag=true
+      raw_status="$(printf '%s' "$body" | "$JQ" -r '.status // ""')"
     else
       body_json="$(printf '%s' "$body" | "$JQ" -Rs .)"
       valid_flag=false
+      raw_status=""
     fi
+    canonical_status="$(canonical_status_of "$raw_status")"
     "$JQ" -n \
       --arg path "$result_path" \
       --argjson bytes "$bytes" \
       --arg mtime "$mtime" \
       --argjson valid "$valid_flag" \
+      --arg canonical_status "$canonical_status" \
       --argjson body "$body_json" \
       '{schema_version: 1, path: $path, present: true, bytes: $bytes,
-        mtime: $mtime, valid: $valid, body: $body}'
+        mtime: $mtime, valid: $valid, canonical_status: $canonical_status,
+        body: $body}'
     return 0
   fi
 
