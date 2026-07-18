@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### BREAKING
+- Retired the `tmux-delegate` / `codex-oneshot` / `claude-oneshot` subagent defs and their four synced locations (`agents/`, `.claude/agents/`, `.codex/agents/*.toml`, `skills/tmux-agent-tools/agents/`), plus the `.gitignore` whitelist that tracked the project-local copies. Rationale: usage-trigger investigation found 100% of real `codex-oneshot`/`claude-oneshot` invocations (16/16) already depended on repo-local `.claude/agents/` auto-discovery rather than the plugin-root registration, `tmux-delegate` itself had 0/16 real triggers (its decision logic was already being carried ambiently by the `using-tmux-agent-tools` router prose), and `codex exec` never exposed the `.codex/agents/*.toml` mirrors as `spawn_agent` agent_type values at runtime despite passing Codex's validator. The inline-vs-worker gate and the one-shot forwarding pattern now live directly in `skills/using-tmux-agent-tools/SKILL.md` as a forcing-gate section (observable-trigger + naming obligation, not ambient advice) — no file to install, no plugin-restart lifecycle, and one fewer four-way drift surface to maintain (the skill-packaged `agents/` copy had already silently drifted from the canonical source before this change). `scripts/test-agent-delegate-packaging-smoke` is repointed accordingly: it now asserts the four legacy locations stay gone and that the skill carries the gate in forcing-gate form. GitHub repo metrics at removal time (0 stars/forks/watchers, 14-day views=1, clone count consistent with the maintainer's own machine fleet + bot traffic) support no silent external consumer of these subagent defs, but this is **UNCONFIRMED** — if you installed this plugin and relied on the `tmux-delegate`/`codex-oneshot`/`claude-oneshot` subagents, the equivalent decision logic is now in the `using-tmux-agent-tools` skill's "Inline-vs-worker gate" section; there is no drop-in subagent replacement.
+
 ## v0.35.0 - 2026-07-11
 
 ### Added

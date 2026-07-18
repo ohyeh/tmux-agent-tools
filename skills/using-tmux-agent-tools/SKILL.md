@@ -16,13 +16,62 @@ Before spawning any tmux agent, delegating work, or answering a "how do I run
 the wrapper, then read its row in the canonical capability table (see below).
 Never paraphrase that capability table from memory.
 
+## Inline-vs-worker gate (decide FIRST)
+
+This gate used to live in a dedicated `tmux-delegate` subagent def. That def
+is retired (see CHANGELOG) — the decision logic below is what it carried,
+unchanged, now living directly in this router instead of a separate file.
+
+**This is a forcing gate, not ambient advice.** Before spawning anything,
+running any wrapper command, or answering a "should this be a worker"
+question, name the specific trigger below that fired (or that none did).
+"It looks substantial" without naming a bullet is not a valid gate pass —
+the requirement is an observable, checkable decision, not a vibe.
+
+1. **Delegate or inline? Name which trigger fired.** Delegate when ANY of
+   these are true:
+   - Estimated wall time is more than 30s.
+   - The task modifies 2 files or more.
+   - The task needs an independent context window.
+   - The task requires a multi-step read-plan-write cycle.
+   - The task runs tests, builds, or lint across the codebase.
+   - It is a follow-up task in the same repo/domain as an existing worker
+     with clean context: prefer sending to that worker (after `result init`)
+     over starting a new one.
+
+   Handle inline when any of these are true instead:
+   - The task is a single file read, search, or formatting request.
+   - The task is a one-liner with immediate output.
+   - The caller says "quick" or "inline".
+   - The case is marginal or unclear; trivial is the safe default.
+
+   Boundary: a single already-known command (test, build, lint) runs inline
+   even when it touches many files — the delegate triggers above target
+   multi-step work that needs reasoning, not one known command.
+
+2. **If delegating, one-shot or teammate? State which, and why.**
+   - Teammate (expect a follow-up message to the SAME worker — task series,
+     review loop, cross-turn collaboration) → interactive `start` (no
+     `--headless`); do not `stop` between tasks; reuse via the protocol in
+     `references/multi-agent.md#persistent-teammates-worker-reuse`.
+   - One-shot (one bounded task, no follow-up of any kind) →
+     `start --headless --task-shape bounded`. This used to run inside a
+     separate `codex-oneshot` / `claude-oneshot` forwarder subagent
+     (also retired); run the same bounded sequence yourself now — start,
+     exactly one `result wait-required`, then `stop` unless keepalive was
+     requested — per the headless examples in
+     `skills/tmux-agent-tools/references/core-workflow.md` and the Fast
+     answers in `skills/tmux-agent-tools/SKILL.md`. Still inject the
+     no-cascade guard verbatim in the worker prompt: "Do not spawn
+     additional tmux sessions or delegate further."
+
 ## Decision tree — task shape → wrapper
 
 ```
 What does the task need?
 │
 ├─ Not sure a worker is even warranted?
-│   └─ .claude/agents/tmux-delegate.md   (inline-vs-worker gate — decide FIRST)
+│   └─ Inline-vs-worker gate above — decide FIRST
 │
 ├─ Loop-shaped work — a whole audit / plan→build / consensus / triage chain?
 │   └─ go to the `using-workflows` skill first (closed-loop recipes)

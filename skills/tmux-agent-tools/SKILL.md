@@ -18,7 +18,7 @@ Fast answers:
 
 - **Bounded task with no follow-ups?** Default to `start --headless`: the CLI runs non-interactively (`claude -p` / `codex exec`), completion is the process exit, and `result wait-required` returns immediately at exit (a contract-valid result.json is synthesized from exit code + stdout when the worker didn't write one). No TUI quirks, no pane-heuristic WAITING stalls. Interactive `start` is only for work that needs follow-up sends or mid-run supervision.
 - **Wrapper not on PATH?** Run it from this bundle: `<skill-dir>/scripts/codex-tmux …`.
-- **Auto-delegate substantial work?** Use `tmux-delegate`; details live in `references/core-workflow.md`.
+- **Auto-delegate substantial work?** Use the inline-vs-worker gate in the `using-tmux-agent-tools` skill (absorbed there, no longer a separate subagent); details live in `references/core-workflow.md`.
 - **Writing the worker prompt?** Shape it with the `delegation-templates` skill: GOAL / ACCEPTANCE / REPORT + common footer, plus its tmux addendum (no-cascade ban + literal result path).
 - **New or renamed CLI?** Add a profile with `bin=…`, then prove it with `doctor --json` and `start --dry-run`; see `references/profiles.md`.
 
@@ -101,7 +101,7 @@ If `.present:false`, the agent never wrote the file — re-prompt with the liter
 
 Load these only when you hit the relevant scenario — they are not needed for routine use:
 
-- `references/core-workflow.md` — full single-worker workflow, session naming, remote sessions, peer-review, approval gates, tmux-delegate.
+- `references/core-workflow.md` — full single-worker workflow, session naming, remote sessions, peer-review, approval gates, the inline-vs-worker gate.
 - `references/profiles.md` — custom CLI profile keys, precedence, examples, detection overrides.
 - `references/cheatsheets.md` — full capability table, scenario commands, marker pitfalls, failure triage.
 - `references/multi-agent.md` — dialogue/fanout rules, bridge pattern, SSH participants, github-comment behavior.
@@ -110,10 +110,8 @@ Load these only when you hit the relevant scenario — they are not needed for r
 - `references/troubleshooting.md` — failure modes and fixes for stuck/unsent/stale-marker scenarios.
 - `references/recipes.md` — copy-pasteable workflows (approval gate, fanout, DAG).
 
-## Bundled agents and schemas
-
-`agents/` ships `tmux-delegate.md` (inline-vs-worker gate) plus `claude-oneshot.md` / `codex-oneshot.md` (thin one-shot forwarders). Install by copying `agents/*.md` into `~/.claude/agents/`.
-
-Model ladder: forwarder agents (`claude-oneshot` / `codex-oneshot`) run haiku; the `tmux-delegate` gate runs sonnet; the worker's model is chosen per task (the `agents/*.md` frontmatter is authoritative).
+## Bundled schemas
 
 `schemas/` ships `result-status-summary.schema.json` and `fanout-summary.schema.json` — the offline fallback the scripts already resolve for `result.json` validation when no other copy is found on disk.
+
+The `agents/` subagent bundle (`tmux-delegate.md`, `claude-oneshot.md`, `codex-oneshot.md`) is retired — see CHANGELOG. The inline-vs-worker gate and the one-shot forwarding pattern they carried now live in the `using-tmux-agent-tools` skill's decision tree; there is nothing to install into `~/.claude/agents/` anymore.

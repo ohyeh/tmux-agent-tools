@@ -1,8 +1,16 @@
 #!/usr/bin/env zsh
-# Smoke test for issue #283 Gap 1: the tmux-delegate subagent is shipped at the
-# plugin-root agents/ dir (where Claude Code registers plugin subagents at
-# startup), has valid frontmatter + the no-cascade worker constraint, and does
-# not drift from the project-local .claude/agents/ copy used for repo dogfooding.
+# Smoke test for issue #283 Gap 1 (superseded): the tmux-delegate /
+# codex-oneshot / claude-oneshot subagent defs that used to ship at
+# agents/, .claude/agents/, .codex/agents/*.toml, and
+# skills/tmux-agent-tools/agents/ are retired (Codex CLI never exposed
+# these as spawn_agent agent_type values at runtime, and Claude Code's
+# repo-local .claude/agents/ discovery was carrying 100% of real usage —
+# see CHANGELOG for the removal). The decision logic and no-cascade
+# worker constraint they carried now live directly in the
+# using-tmux-agent-tools skill's decision tree. This test's job changes
+# accordingly: assert the four legacy locations stay gone (no silent
+# reintroduction of the drifting four-copy sync burden), and assert the
+# skill carries the gate in forcing-gate form, not ambient prose.
 
 set -euo pipefail
 
@@ -15,7 +23,6 @@ PASS=0
 FAIL=0
 ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
-check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi }
 
 for agent in "${AGENTS[@]}"; do
   PLUGIN_AGENT="$REPO_ROOT/agents/$agent.md"
@@ -23,50 +30,26 @@ for agent in "${AGENTS[@]}"; do
   CODEX_AGENT="$REPO_ROOT/.codex/agents/$agent.toml"
   SKILL_AGENT="$REPO_ROOT/skills/tmux-agent-tools/agents/$agent.md"
 
-  # The skill package must carry the delegation policy, not just the scripts.
-  if cmp -s "$PLUGIN_AGENT" "$SKILL_AGENT"; then
-    ok "$agent skill-packaged copy is identical"
-  else
-    bad "$agent skill copy missing or drifted (re-sync skills/tmux-agent-tools/agents/$agent.md)"
-  fi
-
-  [[ -f "$PLUGIN_AGENT" ]]  && ok "plugin-root agents/$agent.md exists"      || bad "plugin-root agents/$agent.md missing"
-  [[ -f "$PROJECT_AGENT" ]] && ok ".claude/agents/$agent.md exists"          || bad ".claude/agents/$agent.md missing"
-  [[ -f "$CODEX_AGENT" ]]   && ok ".codex/agents/$agent.toml exists"         || bad ".codex/agents/$agent.toml missing"
-
-  # Valid Claude Code subagent frontmatter: first line is '---', has name/description.
-  head -1 "$PLUGIN_AGENT" | grep -q '^---$' && ok "$agent frontmatter opens with ---"      || bad "$agent frontmatter does not open with ---"
-  grep -q "^name: $agent$" "$PLUGIN_AGENT" && ok "$agent frontmatter name present"  || bad "$agent frontmatter name missing"
-  grep -q '^description: ' "$PLUGIN_AGENT" && ok "$agent frontmatter description present"  || bad "$agent frontmatter description missing"
-
-  # The no-further-delegation worker constraint must be present.
-  grep -qF 'Do not spawn additional tmux sessions or delegate further.' "$PLUGIN_AGENT" \
-    && ok "$agent no-cascade worker constraint present" || bad "$agent no-cascade worker constraint missing"
-
-  # No drift between the shipped plugin agent and the project-local copy.
-  if cmp -s "$PLUGIN_AGENT" "$PROJECT_AGENT"; then
-    ok "$agent plugin and project subagent copies are identical"
-  else
-    bad "$agent plugin and project subagent copies have drifted (re-sync agents/$agent.md)"
-  fi
-
-  if python3 - "$CODEX_AGENT" "$agent" <<'PY'
-import sys
-import tomllib
-path, expected = sys.argv[1:]
-with open(path, "rb") as fh:
-    doc = tomllib.load(fh)
-body = doc.get("developer_instructions", "")
-assert doc.get("name") == expected
-assert doc.get("description")
-assert "Do not spawn additional tmux sessions or delegate further." in body
-PY
-  then
-    ok "$agent Codex custom-agent TOML is valid"
-  else
-    bad "$agent Codex custom-agent TOML invalid"
-  fi
+  [[ ! -f "$PLUGIN_AGENT" ]]  && ok "plugin-root agents/$agent.md stays retired"      || bad "plugin-root agents/$agent.md was reintroduced"
+  [[ ! -f "$PROJECT_AGENT" ]] && ok ".claude/agents/$agent.md stays retired"          || bad ".claude/agents/$agent.md was reintroduced"
+  [[ ! -f "$CODEX_AGENT" ]]   && ok ".codex/agents/$agent.toml stays retired"         || bad ".codex/agents/$agent.toml was reintroduced"
+  [[ ! -f "$SKILL_AGENT" ]]   && ok "skills/tmux-agent-tools/agents/$agent.md stays retired" || bad "skills/tmux-agent-tools/agents/$agent.md was reintroduced"
 done
+
+# The gate now lives in using-tmux-agent-tools/SKILL.md — check it carries
+# the forcing-gate form (observable trigger + evidence obligation), not a
+# paraphrase, and still carries the no-cascade worker constraint.
+GATE_SKILL="$REPO_ROOT/skills/using-tmux-agent-tools/SKILL.md"
+[[ -f "$GATE_SKILL" ]] && ok "using-tmux-agent-tools/SKILL.md exists" || bad "using-tmux-agent-tools/SKILL.md missing"
+
+grep -qF '## Inline-vs-worker gate (decide FIRST)' "$GATE_SKILL" \
+  && ok "gate section heading present" || bad "gate section heading missing"
+grep -qF 'This is a forcing gate, not ambient advice.' "$GATE_SKILL" \
+  && ok "gate states forcing-gate contract explicitly" || bad "gate does not state the forcing-gate contract"
+grep -qF 'name the specific trigger below that fired' "$GATE_SKILL" \
+  && ok "gate requires naming an observable trigger" || bad "gate does not require naming an observable trigger"
+grep -qF 'Do not spawn additional tmux sessions or delegate further.' "$GATE_SKILL" \
+  && ok "gate carries the no-cascade worker constraint" || bad "gate missing the no-cascade worker constraint"
 
 # Skill-packaged doc/schema copies must not drift from their repo canonicals.
 SKILL_DIR="$REPO_ROOT/skills/tmux-agent-tools"

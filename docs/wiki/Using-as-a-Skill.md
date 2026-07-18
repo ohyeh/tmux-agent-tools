@@ -104,7 +104,7 @@ In your prompt, be explicit: **"Write `$TMUX_AGENT_RESULT` before signaling done
 
 ## Skill payload contents
 
-The installable skill directory (`skills/tmux-agent-tools/`) bundles more than the scripts: `agents/` holds the `tmux-delegate` gate plus `claude-oneshot`/`codex-oneshot` forwarders (copy `agents/*.md` into `~/.claude/agents/` to install them), and `schemas/` holds the `result.json`/fanout-summary JSON Schemas the scripts fall back to offline. `references/troubleshooting.md` and `references/recipes.md` are packaged copies of this wiki's [Troubleshooting](Troubleshooting) and [Recipes](Recipes) pages for offline/skill-context use.
+The installable skill directory (`skills/tmux-agent-tools/`) bundles more than the scripts: `schemas/` holds the `result.json`/fanout-summary JSON Schemas the scripts fall back to offline, and `references/troubleshooting.md` and `references/recipes.md` are packaged copies of this wiki's [Troubleshooting](Troubleshooting) and [Recipes](Recipes) pages for offline/skill-context use. The inline-vs-worker gate and one-shot forwarding pattern that used to ship as a separate `agents/` subagent bundle (`tmux-delegate`, `claude-oneshot`, `codex-oneshot`) are retired; that decision logic now lives directly in the `using-tmux-agent-tools` skill's decision tree — there is nothing to copy into `~/.claude/agents/` anymore.
 
 ## What to read next
 
