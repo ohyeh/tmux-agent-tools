@@ -9,6 +9,7 @@ CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
 
 WORK="$(mktemp -d -t tmux-agent-audit-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
+export XDG_STATE_HOME="$WORK/xdg"
 trap 'rm -rf "$WORK"' EXIT
 
 cat > "$WORK/fake.sh" <<'EOF'
@@ -58,26 +59,61 @@ run_audit() {
   "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
 }
 
-run_no_env_no_log() {
+run_default_log() {
   local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix without env → no audit log written"
+  local audit_log="$XDG_STATE_HOME/tmux-agent-tools/audit.jsonl"
+  echo "case: $prefix without env → default audit log written"
   unset TMUX_AGENT_TOOLS_AUDIT_LOG
   env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-noenv" "$WORK" >/dev/null
   /bin/sleep 1
-  if [[ -f "$WORK/audit.jsonl" ]]; then
-    echo "  FAIL $prefix audit log unexpectedly created" >&2
-    FAIL=$((FAIL + 1))
-  else
-    echo "  ok   $prefix no audit log without env"
+  if [[ -s "$audit_log" ]]; then
+    echo "  ok   $prefix default audit log created"
     PASS=$((PASS + 1))
+  else
+    echo "  FAIL $prefix default audit log missing" >&2
+    FAIL=$((FAIL + 1))
   fi
   "$wrapper" stop "$prefix-noenv" >/dev/null 2>&1 || true
 }
 
+run_disabled_no_log() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  local audit_log="$XDG_STATE_HOME/tmux-agent-tools/audit.jsonl"
+  echo "case: $prefix AUDIT_LOG=0 → no audit log written"
+  unset TMUX_AGENT_TOOLS_AUDIT_LOG
+  rm -f "$audit_log"
+  AUDIT_LOG=0 env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-disabled" "$WORK" >/dev/null
+  /bin/sleep 1
+  if [[ -f "$audit_log" ]]; then
+    echo "  FAIL $prefix disabled audit log unexpectedly created" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix no audit log when disabled"
+    PASS=$((PASS + 1))
+  fi
+  AUDIT_LOG=0 "$wrapper" stop "$prefix-disabled" >/dev/null 2>&1 || true
+}
+
+run_append_failure() {
+  local wrapper="$1" cli_env="$2" prefix="$3"
+  echo "case: $prefix append failure → command fails"
+  if TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK" env "$cli_env=$WORK/fake.sh" \
+    "$wrapper" start --exact "$prefix-fail" "$WORK" >/dev/null 2>&1; then
+    echo "  FAIL $prefix append failure was swallowed" >&2
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ok   $prefix append failure surfaced"
+    PASS=$((PASS + 1))
+  fi
+}
+
 run_audit "$CODEX_TMUX"  "CODEX"  "a-codex"
 run_audit "$CLAUDE_TMUX" "CLAUDE" "a-claude"
-run_no_env_no_log "$CODEX_TMUX"  "CODEX"  "n-codex"
-run_no_env_no_log "$CLAUDE_TMUX" "CLAUDE" "n-claude"
+run_default_log "$CODEX_TMUX"  "CODEX"  "n-codex"
+run_default_log "$CLAUDE_TMUX" "CLAUDE" "n-claude"
+run_disabled_no_log "$CODEX_TMUX"  "CODEX"  "d-codex"
+run_disabled_no_log "$CLAUDE_TMUX" "CLAUDE" "d-claude"
+run_append_failure "$CODEX_TMUX" "CODEX" "f-codex"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

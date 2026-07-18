@@ -59,19 +59,19 @@ Default regex set already scrubs AWS keys, GitHub tokens, `api_key=`, `password=
 
 Tamper-evident, append-only JSONL log spanning all agents. Each line includes the previous line's hash so any retro-edit is detectable.
 
-### Enable
+### Configure
 
-Any of these:
+Audit logging is enabled by default. Use these overrides when needed:
 
 ```bash
 # Per-invocation flag (recommended):
 codex-tmux start --audit-log --exact worker ~/repo '...'
 
-# Env (default path):
-AUDIT_LOG=1 codex-tmux start --exact worker ~/repo '...'
-
 # Explicit path (pre-existing surface):
 TMUX_AGENT_TOOLS_AUDIT_LOG=/var/log/tmux-agent.audit.jsonl codex-tmux start --exact worker ~/repo '...'
+
+# Explicit opt-out:
+AUDIT_LOG=0 codex-tmux start --exact worker ~/repo '...'
 ```
 
 Default path: `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.

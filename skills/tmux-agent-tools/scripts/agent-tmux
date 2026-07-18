@@ -2968,7 +2968,10 @@ _audit_log_append_locked() {
   local final_line
   final_line="$("$JQ" -c -n --argjson e "$with_meta" --arg h "$new_hash" \
     '$e + {chain_hash: $h}')"
-  ( printf '%s\n' "$final_line" >> "$audit_target" ) 2>/dev/null || true
+  ( printf '%s\n' "$final_line" >> "$audit_target" ) || {
+    echo "audit: failed to append $audit_target" >&2
+    return 1
+  }
 }
 
 audit_log_append() {
@@ -7833,8 +7836,8 @@ _resolve_audit_default_path() {
 # Global --audit-log handling (#188). Accepts:
 #   --audit-log <path>   → export TMUX_AGENT_TOOLS_AUDIT_LOG
 #   --audit-log          → default path
-# Env AUDIT_LOG=1 also enables default path (lower precedence than env-set
-# TMUX_AGENT_TOOLS_AUDIT_LOG, higher than nothing).
+# Audit is on by default. AUDIT_LOG=0 disables it; an explicit
+# TMUX_AGENT_TOOLS_AUDIT_LOG path has highest precedence.
 _global_args=()
 while (( $# > 0 )); do
   case "$1" in
@@ -7861,11 +7864,14 @@ done
 if (( ${#_global_args[@]} > 0 )); then
   set -- "${_global_args[@]}" "$@"
 fi
-if [[ -z "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" && "${AUDIT_LOG:-}" == "1" ]]; then
+if [[ -z "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" && "${AUDIT_LOG:-1}" != "0" ]]; then
   export TMUX_AGENT_TOOLS_AUDIT_LOG="$(_resolve_audit_default_path)"
 fi
 if [[ -n "${TMUX_AGENT_TOOLS_AUDIT_LOG:-}" ]]; then
-  mkdir -p "$(dirname "$TMUX_AGENT_TOOLS_AUDIT_LOG")" 2>/dev/null || true
+  mkdir -p "$(dirname "$TMUX_AGENT_TOOLS_AUDIT_LOG")" || {
+    echo "audit: failed to create $(dirname "$TMUX_AGENT_TOOLS_AUDIT_LOG")" >&2
+    exit 1
+  }
 fi
 
 # pair / team are management modes, not a <cli>: $CLI holds the keyword and

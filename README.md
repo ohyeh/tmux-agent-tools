@@ -580,10 +580,10 @@ Both wrappers ship a hash-chained JSONL audit log (#119). The
 `tmux-agent-audit` binary (#188) provides verify / query / rotation:
 
 ```bash
-# enable: any of these works
+# audit is enabled by default; use these to choose a path
 claude-tmux --audit-log /var/log/tmux-agent.jsonl start ...
-AUDIT_LOG=1 codex-tmux start ...                          # default path
 TMUX_AGENT_TOOLS_AUDIT_LOG=/path codex-tmux start ...     # v0.10 contract
+AUDIT_LOG=0 codex-tmux start ...                          # explicit opt-out
 
 # verify chain integrity
 tmux-agent-audit verify --log /var/log/tmux-agent.jsonl
@@ -597,7 +597,8 @@ tmux-agent-audit path
 tmux-agent-audit rotate --force
 ```
 
-Default log path: `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.
+Audit logging is enabled by default at
+`${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.
 Size-based rotation triggers at `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default
 10MB), retaining `TMUX_AGENT_TOOLS_AUDIT_RETAIN` files (default 5). A
 `audit.rotation` HEAD-link record preserves the chain across rotations.
