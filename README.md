@@ -85,7 +85,7 @@ Local and SSH sessions keep the pane open after the agent CLI exits, showing the
 Resume an existing Claude Code conversation inside a managed tmux session:
 
 ```bash
-claude-tmux resume --exact resume /home/alice/tmux-agent-tools ee5aca88-a1af-48d3-af21-54f60d618f22
+claude-tmux resume --exact resume ~/tmux-agent-tools ee5aca88-a1af-48d3-af21-54f60d618f22
 ```
 
 This launches Claude as `claude --dangerously-skip-permissions --resume <session-id>` while preserving the usual `claude-tmux status`, `capture`, `send`, `attach`, and `stop` controls.
@@ -93,7 +93,7 @@ This launches Claude as `claude --dangerously-skip-permissions --resume <session
 Resume an existing Codex conversation inside a managed tmux session:
 
 ```bash
-codex-tmux resume --exact resume /home/alice/tmux-agent-tools 019e356f-f95d-7570-9784-ea7b58e404a5
+codex-tmux resume --exact resume ~/tmux-agent-tools 019e356f-f95d-7570-9784-ea7b58e404a5
 ```
 
 This launches Codex as `codex --yolo resume <session-id>` while preserving the usual `codex-tmux status`, `capture`, `send`, `attach`, and `stop` controls.
@@ -465,7 +465,7 @@ Participant profiles can reduce repeated agent, SSH, and workdir flags without a
 {
   "local-reviewer": {
     "agent": "claude",
-    "workdir": "/Users/example/github/project",
+    "workdir": "~/github/project",
     "timeout": "240",
     "env": {
       "TMUX_AGENT_MODE": "review"
@@ -474,7 +474,7 @@ Participant profiles can reduce repeated agent, SSH, and workdir flags without a
   "remote-worker": {
     "agent": "codex",
     "ssh": "example-host",
-    "workdir": "/Users/example/github/project"
+    "workdir": "/srv/github/project"
   }
 }
 ```
@@ -498,14 +498,14 @@ tmux-agent-dialogue \
   --workdir . \
   --agent-a codex \
   --agent-a-ssh example-host \
-  --agent-a-workdir /home/alice/project \
+  --agent-a-workdir /srv/project \
   --agent-b claude \
   --prompt-file prompt.md \
   --transcript transcript.jsonl
 ```
 
 Remote mode uses the existing wrapper `start-ssh` path: tmux stays local, while the selected real participant runs through SSH in the remote directory. `fake` participants cannot use SSH mode.
-Use an absolute remote workdir such as `/home/alice/project`; shell-expansion paths like `~/project` are rejected so the local wrapper does not quote them into a non-expanded remote path.
+Use an absolute remote workdir such as `/srv/project`; shell-expansion paths like `~/project` are rejected so the local wrapper does not quote them into a non-expanded remote path.
 
 Credential-free smoke:
 

@@ -128,7 +128,7 @@ Add `--post-github-comment` only when the user explicitly asks to publish.
 ## SSH: agent CLI runs remote, tmux stays local
 
 ```bash
-claude-tmux start-ssh --exact review example-host /Users/example/repo \
+claude-tmux start-ssh --exact review example-host /srv/repo \
   'Review the diff and write a summary.'
 ```
 
