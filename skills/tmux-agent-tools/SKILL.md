@@ -26,6 +26,23 @@ Fast answers:
 
 `agent-tmux <cli> <command>` runs any AI coding CLI as a managed tmux worker. `claude-tmux`/`codex-tmux`/`agy-tmux` are shims for common CLIs (`claude-tmux start …` = `agent-tmux claude start …`). Other CLIs use `agent-tmux <cli>` plus an optional profile.
 
+## Required preflight and safe invocation
+
+Before the first worker command:
+
+1. Resolve the wrapper bundle instead of assuming PATH. Probe, in order,
+   `<repo-dir>/skills/tmux-agent-tools/scripts`,
+   `~/.agents/skills/tmux-agent-tools/scripts`,
+   `~/.claude/skills/tmux-agent-tools/scripts`, and
+   `~/.codex/skills/tmux-agent-tools/scripts`; use bare wrapper names only when
+   no bundle exists and PATH lookup succeeds.
+2. Run the resolved `agent-tmux <cli> setup` and stop if preflight fails.
+3. Pass the raw task as a separately quoted argument or prompt-file content.
+   Never interpolate task text into `eval`, `sh -c`, or a constructed shell
+   command.
+4. Pass task-specific credentials only through `--secret KEY=URI`. Never embed
+   credential values in task text or a constructed shell command.
+
 ## When to use
 
 - Long-running Claude/Codex/agy/custom CLI work that needs later supervision.

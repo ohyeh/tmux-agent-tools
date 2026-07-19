@@ -42,11 +42,11 @@ done
 GATE_SKILL="$REPO_ROOT/skills/using-tmux-agent-tools/SKILL.md"
 [[ -f "$GATE_SKILL" ]] && ok "using-tmux-agent-tools/SKILL.md exists" || bad "using-tmux-agent-tools/SKILL.md missing"
 
-grep -qF '## Inline-vs-worker gate (decide FIRST)' "$GATE_SKILL" \
+grep -qF '## BYPASS — inline is the DEFAULT' "$GATE_SKILL" \
   && ok "gate section heading present" || bad "gate section heading missing"
-grep -qF 'This is a forcing gate, not ambient advice.' "$GATE_SKILL" \
+grep -qF 'forcing gate, not ambient advice' "$GATE_SKILL" \
   && ok "gate states forcing-gate contract explicitly" || bad "gate does not state the forcing-gate contract"
-grep -qF 'name the specific trigger below that fired' "$GATE_SKILL" \
+grep -qF 'record the winner BY NAME' "$GATE_SKILL" \
   && ok "gate requires naming an observable trigger" || bad "gate does not require naming an observable trigger"
 grep -qF 'Do not spawn additional tmux sessions or delegate further.' "$GATE_SKILL" \
   && ok "gate carries the no-cascade worker constraint" || bad "gate missing the no-cascade worker constraint"
