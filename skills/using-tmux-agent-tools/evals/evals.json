@@ -1,0 +1,42 @@
+{
+  "skill_name": "using-tmux-agent-tools",
+  "note": "Routing cases for the inline-versus-worker gate and wrapper selection. Loop-shaped work belongs to using-workflows.",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "用 codex-tmux 開一個 persistent worker 修這個 bug，後面我還會追問。",
+      "expected_output": "ROUTE. The user explicitly requests a managed persistent worker; select codex-tmux after preflight and use start/send-wait/result/stop semantics.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "這個 refactor 要不要交給 tmux worker？幫我依規則判斷。",
+      "expected_output": "ROUTE. Run the forcing gate and name the winning trigger; delegate only if one of the four worker exceptions fires.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "只要幫我跑一次 npm test，不要開 worker。",
+      "expected_output": "ROUTE to the gate, then INLINE via explicit-inline and single-known-command; emit no-delegate-trigger and do not start tmux.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "同一個 prompt 同時交給三個不同 CLI 比較答案。",
+      "expected_output": "ROUTE. This suggests tmux-agent-fanout, but worker count, tools, models, and effort require explicit authorization before launch.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "跑一輪 plan→build→雙 reviewer 的完整流程。",
+      "expected_output": "DEFER. This is loop-shaped; enter using-workflows instead of selecting a tmux wrapper directly.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "幫我調整 tmux status bar 顏色和快捷鍵。",
+      "expected_output": "NO ROUTE. General tmux configuration is outside tmux-agent-tools.",
+      "files": []
+    }
+  ]
+}
