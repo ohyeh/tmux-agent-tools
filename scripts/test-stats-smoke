@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Smoke test for `stats` aggregation, `result validate` status_bucket, and the
+# Smoke test for `stats` aggregation, canonical status reads, and the
 # launch-meta.json written at start (usage-survey rec 1+7).
 
 set -euo pipefail
@@ -58,7 +58,7 @@ d1="$(mkfake w1 '2026-06-01T10:00:00Z')"
 printf '{"schema_version":1,"cli":"claude","exec_mode":"headless","task_shape":"bounded"}' > "$d1/launch-meta.json"
 printf '{"schema_version":1,"status":"success","summary":"ok","artifacts":[],"errors":[]}' > "$d1/result.json"
 
-# w2: June, oneshot/codex, result SHOULD_FIX (→ review bucket)
+# w2: June, oneshot/codex, legacy SHOULD_FIX (→ needs-input)
 d2="$(mkfake w2 '2026-06-15T10:00:00Z')"
 printf '{"schema_version":1,"cli":"codex","exec_mode":"oneshot"}' > "$d2/launch-meta.json"
 printf '{"schema_version":1,"status":"SHOULD_FIX","summary":"nit","artifacts":[],"errors":[]}' > "$d2/result.json"
@@ -86,9 +86,9 @@ assert "coverage with_result" "$(printf '%s' "$sjson" | jq -r '.result_coverage.
 assert "coverage without_result" "$(printf '%s' "$sjson" | jq -r '.result_coverage.without_result')" "1"
 assert "coverage pct" "$(printf '%s' "$sjson" | jq -r '.result_coverage.pct')" "66.6"
 assert "bucket success" "$(printf '%s' "$sjson" | jq -r '.status_buckets.success')" "1"
-assert "bucket review (SHOULD_FIX)" "$(printf '%s' "$sjson" | jq -r '.status_buckets.review')" "1"
+assert "bucket needs-input (SHOULD_FIX)" "$(printf '%s' "$sjson" | jq -r '.status_buckets["needs-input"]')" "1"
 assert "bucket no_result" "$(printf '%s' "$sjson" | jq -r '.status_buckets.no_result')" "1"
-assert "bucket failure zero" "$(printf '%s' "$sjson" | jq -r '.status_buckets.failure')" "0"
+assert "bucket failed zero" "$(printf '%s' "$sjson" | jq -r '.status_buckets.failed')" "0"
 assert "raw_top has 2 values" "$(printf '%s' "$sjson" | jq -r '.status_raw_top | length')" "2"
 assert "raw_top success count" "$(printf '%s' "$sjson" | jq -r '.status_raw_top[] | select(.status=="success") | .count')" "1"
 assert "task_shape bounded" "$(printf '%s' "$sjson" | jq -r '.by_task_shape.bounded')" "1"
@@ -138,9 +138,10 @@ assert_contains "start-ssh calls write_launch_meta" "$ssh_fn" "write_launch_meta
 assert_contains "start-ssh calls record_started_at" "$ssh_fn" "record_started_at"
 assert_contains "start-ssh calls usage_init_event" "$ssh_fn" "usage_init_event"
 
-echo "case: result validate emits status_bucket + hint on unknown"
+echo "case: result validate emits canonical_status + hint on unknown"
 vok="$("$AGENT" claude result validate w1 --json 2>/dev/null)"
 assert "validate status_bucket success" "$(printf '%s' "$vok" | jq -r .status_bucket)" "success"
+assert "validate canonical_status success" "$(printf '%s' "$vok" | jq -r .canonical_status)" "success"
 
 # unknown status → bucket unknown + stderr hint
 du="$(mkfake wu '2026-06-20T10:00:00Z')"
@@ -149,8 +150,8 @@ set +e
 vraw="$("$AGENT" claude result validate wu --json 2>"$WORK/hint.err")"
 set -e
 assert "validate status_bucket unknown" "$(printf '%s' "$vraw" | jq -r .status_bucket)" "unknown"
-assert_contains "unknown emits stderr hint" "$(cat "$WORK/hint.err")" "not a recognized value"
-assert_contains "hint names canonical set" "$(cat "$WORK/hint.err")" "success|partial|blocked|error"
+assert_contains "unknown emits stderr hint" "$(cat "$WORK/hint.err")" "not recognized"
+assert_contains "hint names canonical set" "$(cat "$WORK/hint.err")" "success|failed|blocked|needs-input"
 
 # schema-INVALID result must still emit the JSON verdict and keep the
 # original non-zero exit code (regression: set -e aborted before printf)
@@ -195,6 +196,23 @@ assert "launch-meta exec_mode oneshot" "$(jq -r .exec_mode "$lm" 2>/dev/null)" "
 assert "launch-meta cli claude" "$(jq -r .cli "$lm" 2>/dev/null)" "claude"
 assert "launch-meta schema_version" "$(jq -r .schema_version "$lm" 2>/dev/null)" "1"
 assert "launch-meta task_shape bounded" "$(jq -r .task_shape "$lm" 2>/dev/null)" "bounded"
+
+echo "case: stats normalizes observed legacy status values without rewriting files"
+legacy_root="$WORK/legacy-state"
+legacy_statuses=(success ok PASS pass completed complete done APPROVE blocked failed FAIL CONCERN needs-fixes)
+for i in {1..${#legacy_statuses[@]}}; do
+  mkdir -p "$legacy_root/w$i"
+  printf '2026-07-18T00:00:00Z' > "$legacy_root/w$i/started_at"
+  jq -n --arg status "${legacy_statuses[$i]}" \
+    '{schema_version:1,status:$status,summary:"legacy",artifacts:[],errors:[]}' \
+    > "$legacy_root/w$i/result.json"
+done
+legacy_stats="$(TMUX_AGENT_DIR="$legacy_root" "$AGENT" claude stats --json)"
+assert "legacy success variants" "$(printf '%s' "$legacy_stats" | jq -r .status_buckets.success)" "8"
+assert "legacy failed variants" "$(printf '%s' "$legacy_stats" | jq -r .status_buckets.failed)" "2"
+assert "legacy blocked variant" "$(printf '%s' "$legacy_stats" | jq -r .status_buckets.blocked)" "1"
+assert "legacy needs-input variants" "$(printf '%s' "$legacy_stats" | jq -r '.status_buckets["needs-input"]')" "2"
+assert "legacy raw files unchanged" "$(jq -r .status "$legacy_root/w3/result.json")" "PASS"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

@@ -138,7 +138,7 @@ One real agent can run remotely while tmux stays local:
 
 ```bash
 tmux-agent-dialogue --turns 2 --workdir . \
-  --agent-a codex --agent-a-ssh example-host --agent-a-workdir /Users/example/github/project \
+  --agent-a codex --agent-a-ssh example-host --agent-a-workdir /srv/github/project \
   --agent-b claude \
   --prompt-file prompt.md --transcript transcript.jsonl
 ```

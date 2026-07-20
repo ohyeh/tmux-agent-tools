@@ -28,7 +28,7 @@ Agents write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with this sha
 ```jsonc
 {
   "schema_version": 1,
-  "status": "ok" | "blocked" | "error",
+  "status": "success" | "failed" | "blocked" | "needs-input",
   "summary": "one-line human-readable summary",
   "artifacts": [{"kind": "pr|file|url", "ref": "PR-1234"}],
   "errors": [{"code": "...", "message": "...", "remediation": "..."}],
@@ -51,6 +51,8 @@ Agents write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with this sha
 
 `verdict` and `decision` are optional Wave 2 blocks. The lightweight validator checks `verdict.verdict` against `ACCEPT`, `BLOCK`, and `ACCEPT_WITH_CHANGES`; checks `verdict.blockers` is an array; and checks `decision.decision_by` against `agent`, `user`, `owner`, and `delegate`.
 
+New writers use only the four canonical status values. Readers preserve the raw `.body.status` and expose `canonical_status`; legacy values such as `ok`, `PASS`, `completed`, `APPROVE`, `CONCERN`, and `needs-fixes` are normalized at read time without rewriting stored files.
+
 Parent reads it via `result --json --wait <seconds> <name>`. Always branch in this order before consuming `.body`; do not scrape the pane when a valid result exists:
 
 1. `.present` — file existed
@@ -64,7 +66,7 @@ $ codex-tmux result --json --wait 30 worker
 {
   "present": true,
   "valid": true,
-  "body": {"schema_version": 1, "status": "ok", "summary": "Refactor complete; 3 files changed.", "artifacts": [{"kind": "file", "ref": "src/auth/login.rs"}], "errors": []}
+  "body": {"schema_version": 1, "status": "success", "summary": "Refactor complete; 3 files changed.", "artifacts": [{"kind": "file", "ref": "src/auth/login.rs"}], "errors": []}
 }
 ```
 
@@ -81,7 +83,7 @@ Result helpers available in both wrappers:
 | Command | Behavior |
 | --- | --- |
 | `result --path <name>` | Prints the literal `$TMUX_AGENT_DIR/<name>/result.json` path and exits `0`, without requiring the file to exist. |
-| `result init <name>` | Writes `$TMUX_AGENT_DIR/<name>/result.json` as a valid skeleton: `schema_version:1`, `status:"ok"`, empty `summary`, `artifacts`, and `errors`. Exits `0` after writing the file path. |
+| `result init <name>` | Writes `$TMUX_AGENT_DIR/<name>/result.json` as a valid skeleton: `schema_version:1`, `status:"success"`, empty `summary`, `artifacts`, and `errors`. Exits `0` after writing the file path. |
 | `result validate <name> --json` | Validates `result.json` with the recorded schema path, or the bundled result schema when none was recorded. Valid files exit `0` with `valid:true`; missing files exit `1`; malformed or contract-invalid files exit `2` with `valid:false` and `errors[]`. |
 | `result wait-required <name> --fields status,summary,artifacts --wait 60 --json` | Polls until the file exists and every named field is non-empty. Success exits `0` with the normal `result --json` payload; timeout exits `1` with JSON including `timeout:true` and `missing_fields`. Usage errors exit `2`. |
 

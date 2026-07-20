@@ -9,11 +9,6 @@
 .tmux-agent-result.json
 # .claude: ignore local/runtime by default, but track shared artifacts
 .claude/*
-!.claude/agents/
-.claude/agents/*
-!.claude/agents/tmux-delegate.md
-!.claude/agents/codex-oneshot.md
-!.claude/agents/claude-oneshot.md
 !.claude/handoffs/
 !.claude/workflows/
 skills/tmux-agent-tools-workspace/

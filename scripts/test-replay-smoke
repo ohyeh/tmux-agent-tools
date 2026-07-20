@@ -81,8 +81,11 @@ assert "diff missing-b exit=1" "$code" "1"
 
 # ----- redact -----
 echo "case: redact default patterns"
-cat > "$WORK/secrets.jsonl" <<'EOF'
-{"schema_version":1,"event":"send","text":"AWS key AKIAIOSFODNN7EXAMPLE here"}
+# FAKE_AWS_KEY is AWS's documented public example key, split so repo-wide
+# secret scans (scrub.sh AKIA pattern) never match this file's source text.
+FAKE_AWS_KEY='AKIA''IOSFODNN7EXAMPLE'
+cat > "$WORK/secrets.jsonl" <<EOF
+{"schema_version":1,"event":"send","text":"AWS key $FAKE_AWS_KEY here"}
 {"schema_version":1,"event":"send","text":"Bearer abc.def.ghi.jklmnop"}
 {"schema_version":1,"event":"send","text":"api_key=ABCDEFGHIJ1234"}
 {"schema_version":1,"event":"send","text":"nothing sensitive"}
@@ -91,7 +94,7 @@ EOF
 clean="$(cat "$WORK/clean.jsonl")"
 assert_contains "redact removes AWS access key" "$clean" "[redacted]"
 # Original secret literal must not appear
-if [[ "$clean" == *"AKIAIOSFODNN7EXAMPLE"* ]]; then
+if [[ "$clean" == *"$FAKE_AWS_KEY"* ]]; then
   echo "  FAIL redact leaked AWS key" >&2; FAIL=$((FAIL + 1))
 else
   echo "  ok   redact does not leak raw AWS key"; PASS=$((PASS + 1))

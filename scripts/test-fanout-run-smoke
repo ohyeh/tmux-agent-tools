@@ -75,9 +75,9 @@ run_fanout() {
 
 # -------- Case 1: 3 agents all succeed, mode=all --------
 echo "case: 3 agents all succeed, mode=all"
-echo "ok" >"$TMP/policy/wd-a"
-echo "ok" >"$TMP/policy/wd-b"
-echo "ok" >"$TMP/policy/wd-c"
+echo "success"   >"$TMP/policy/wd-a"
+echo "PASS"      >"$TMP/policy/wd-b"
+echo "completed" >"$TMP/policy/wd-c"
 RD="$TMP/run1"
 out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
     --agent claude:a --agent codex:b --agent claude:c \

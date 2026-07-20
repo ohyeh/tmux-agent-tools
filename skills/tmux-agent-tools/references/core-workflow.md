@@ -2,6 +2,75 @@
 
 Read this for the complete start -> send -> wait -> inspect -> result -> stop walkthrough, including flags and edge cases. The main SKILL.md has the condensed one-line version for the common path.
 
+## Codex native proxy for an external CLI worker
+
+Codex App lists native child threads, not arbitrary external processes. To make
+an authorized Claude, Codex CLI, agy, Gemini, Cursor, or custom CLI worker
+visible under Subagents, spawn one cheap supervision-only native Codex sub-agent
+and have it drive exactly one existing wrapper.
+
+Naming is the identity contract:
+
+```text
+claude_auth_review  -> claude-tmux
+codex_test_fix      -> codex-tmux
+agy_ui_audit        -> agy-tmux
+gemini_research     -> agent-tmux gemini
+native_code_review  -> Codex in-process sub-agent; no external CLI
+```
+
+Names use lowercase ASCII snake case. The proxy brief follows
+`delegation-templates` (GOAL / ACCEPTANCE / REPORT) and passes
+`model-dispatch.md`. Prefer `gpt-5.6-luna` for shell supervision and progress
+summarization, fall back to `gpt-5.6-terra` when luna is unavailable, and use
+`gpt-5.6-sol` only when the proxy task itself needs frontier reasoning. Include
+this hard boundary:
+
+```text
+Supervise exactly the named external CLI worker. Do not edit the target work
+yourself. Do not spawn another sub-agent, start any additional tmux session, or
+delegate further. Validate the worker's result.json before reporting success.
+```
+
+The proxy progress contract depends on execution mode:
+
+| Mode | Progress source | Update policy | Terminal evidence |
+| --- | --- | --- | --- |
+| Headless | bounded `watch`/`status`, then `capture` for changed output | summarize material changes; heartbeat within 60s | valid `result.json` or process failure |
+| Headed / persistent | `status --json`, CLI-aware `probe`, diagnostic `capture` | latest useful pane signal; `ping` only when stale | valid `result.json`; keep session only for expected follow-ups |
+
+Example headless worker commands inside a `claude_research` proxy:
+
+```bash
+claude-tmux start --exact --headless --task-shape bounded claude-research ~/repo '<GOAL / ACCEPTANCE / REPORT prompt>'
+claude-tmux watch --any --timeout 60 --json claude-research
+claude-tmux status --json claude-research
+claude-tmux capture claude-research --tail 20
+claude-tmux result wait-required claude-research --fields status,summary --wait 60 --json
+```
+
+Example headed liveness checks inside a `codex_feature_fix` proxy:
+
+```bash
+codex-tmux status --json codex-feature-fix
+codex-tmux probe --metric tool_active --json codex-feature-fix
+codex-tmux capture codex-feature-fix --tail 20
+codex-tmux ping --json --timeout 5 codex-feature-fix  # stale/unclear only
+```
+
+The proxy reports each material milestone to its parent when the native runtime
+offers a message operation; otherwise the proxy thread itself is the progress
+surface. A running pane proves liveness, not completion. Prefer a valid
+`result.json` over pane text. Treat a 60-second `watch` or `result` timeout as a
+progress checkpoint: inspect status/result and continue; timeout alone is not a
+worker failure.
+
+If native sub-agents are unavailable, run the wrapper directly and label the
+adaptation `UNAVAILABLE-NATIVE`. The worker remains manageable through
+`tmux-agent-sessions`, but cannot appear in Codex App Subagents. The panel's
+provider icon represents the native proxy; provider-specific external icons and
+collapsed-card progress are not guaranteed by this integration.
+
 ## Supervising an existing worker: listen before send
 
 Use an existing teammate when one already exists; resolve it before creating another session. Status/result/watch are the automation contract.
@@ -160,7 +229,7 @@ codex-tmux result validate worker --json
 codex-tmux result wait-required worker --fields status,summary --wait 60 --json
 ```
 
-Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, `status`, `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. For `result_path_via_prompt=true` families (Codex and generic by default), the **first** prompt-bearing start/send injects the literal path **once per session** (sandboxed tool envs cannot expand `$TMUX_AGENT_RESULT`); follow-up sends and `send --raw` keystrokes are never prefixed, so answering a TUI prompt with a single key stays clean (#283). Use `result --path <name>` as the debug surface. Parent branches on `.present` -> `.valid` -> `.body` in that order. See `references/contracts.md`.
+Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, canonical `status` (`success|failed|blocked|needs-input`), `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. For `result_path_via_prompt=true` families (Codex and generic by default), the **first** prompt-bearing start/send injects the literal path **once per session** (sandboxed tool envs cannot expand `$TMUX_AGENT_RESULT`); follow-up sends and `send --raw` keystrokes are never prefixed, so answering a TUI prompt with a single key stays clean (#283). Use `result --path <name>` as the debug surface. Parent branches on `.present` -> `.valid` -> `.body` in that order. See `references/contracts.md`.
 
 `cli_session_id` is not stored in `result.json`; `result --field .cli_session_id` reads the per-session `session-meta.json` sidecar so resume can work before the worker writes a final result. `--result-schema <abs.json>` on `start`/`resume` persists a schema path for `result validate`; profile `result_required_fields` supplies the default required-field contract for `result wait-required`.
 
@@ -223,8 +292,8 @@ Before spawning more than one worker — including any `dialogue` / `pair-review
 
 Always run `tmux-agent-dialogue validate-transcript --transcript <path>` before summarizing, sharing, or posting a transcript.
 
-## Auto-delegation via tmux-delegate
+## Auto-delegation via the inline-vs-worker gate
 
-Claude Code can use the `tmux-delegate` subagent as the decision gate for substantial work. Discovery depends on how this bundle is loaded: installed as a plugin, the subagent ships at the plugin root `agents/tmux-delegate.md` and is addressable as `tmux-delegate` (qualified `tmux-agent-tools:tmux-delegate`); in a checked-out repo, the same agent is at `.claude/agents/tmux-delegate.md`. The two files are kept byte-for-byte in sync (a smoke test fails on drift). Note the lifecycle: editing a subagent file requires a session restart to re-register it, and changing other plugin components requires `/reload-plugins` — adding the agent mid-session does not take effect. It delegates when the task is likely to take more than 30s, modifies 2 files or more, needs an independent context window, requires a multi-step read-plan-write cycle, or runs tests/builds/lint across the codebase. It handles inline for single-file reads/searches/formatting, one-liners with immediate output, explicit "quick"/"inline" requests, and marginal cases.
+The decision gate for substantial work used to be a separate `tmux-delegate` subagent (retired — see CHANGELOG for the removal and rationale). It now lives directly in the `using-tmux-agent-tools` skill's decision tree as the "Inline-vs-worker gate" section, which every caller reads before spawning anything — no plugin registration or session-restart lifecycle to worry about, since it is skill prose rather than a subagent definition. It delegates when the task is likely to take more than 30s, modifies 2 files or more, needs an independent context window, requires a multi-step read-plan-write cycle, or runs tests/builds/lint across the codebase. It handles inline for single-file reads/searches/formatting, one-liners with immediate output, explicit "quick"/"inline" requests, and marginal cases.
 
-`tmux-delegate` must include this literal worker constraint in every delegated prompt: "Do not spawn additional tmux sessions or delegate further." It uses a hardcoded wrapper command skeleton instead of interpolating raw task text into Bash. Resume (v2): after `start`, a background capture may populate `session-meta.json` with a `cli_session_id` UUID — read it with `jq -r .cli_session_id "$TMUX_AGENT_DIR/<name>/session-meta.json"` or `result --field .cli_session_id`, then use it with `resume` if non-null. Bundled `claude.conf` and `codex.conf` ship `session_id_pattern` UNSET — resume is unsupported by default (guardrail: no verified deterministic session-label format confirmed across versions). Operators opt in per-CLI by setting `session_id_pattern` to a label-anchored ERE (e.g. `session_id_pattern=Session ID:`) in a user-local profile once they know the exact label line their version prints. Capture is label-anchored + UUID-validated (decoy UUIDs on non-matching lines are ignored).
+Every delegated prompt must still include this literal worker constraint: "Do not spawn additional tmux sessions or delegate further." Use a hardcoded wrapper command skeleton instead of interpolating raw task text into Bash. Resume (v2): after `start`, a background capture may populate `session-meta.json` with a `cli_session_id` UUID — read it with `jq -r .cli_session_id "$TMUX_AGENT_DIR/<name>/session-meta.json"` or `result --field .cli_session_id`, then use it with `resume` if non-null. Bundled `claude.conf` and `codex.conf` ship `session_id_pattern` UNSET — resume is unsupported by default (guardrail: no verified deterministic session-label format confirmed across versions). Operators opt in per-CLI by setting `session_id_pattern` to a label-anchored ERE (e.g. `session_id_pattern=Session ID:`) in a user-local profile once they know the exact label line their version prints. Capture is label-anchored + UUID-validated (decoy UUIDs on non-matching lines are ignored).
