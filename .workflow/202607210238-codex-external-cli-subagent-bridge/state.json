@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "title": "Codex external CLI sub-agent bridge",
+  "slug": "codex-external-cli-subagent-bridge",
+  "status": "complete",
+  "approval": "approved",
+  "packets": [
+    {
+      "id": "P1",
+      "status": "completed",
+      "owner": "root",
+      "scope": "skill routing, reference, evals, changelog"
+    },
+    {
+      "id": "P2",
+      "status": "completed",
+      "owner": "root",
+      "scope": "verification and App capability caveat"
+    }
+  ],
+  "verification": {
+    "workflow": "passed",
+    "targeted": "passed",
+    "full_smokes": "passed: 60/60, exit 0",
+    "app_ui": "passed: three native proxies visible; external worker results validated"
+  }
+}
