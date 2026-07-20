@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.35.0",
+  "version": "0.36.0",
   "description": "Cursor plugin exposing the tmux-agent-tools skill: run Claude Code or Codex CLI as controllable, supervised tmux sessions with an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, approval gates, and multi-agent pair/team orchestration.",
   "author": {
     "name": "PaulYeh",

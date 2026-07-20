@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.36.0 - 2026-07-21
+
+### Added
+- Codex-native proxy routing for external CLI workers: one supervision-only native sub-agent named `<cli>_<task>` drives exactly one existing `claude-tmux` / `codex-tmux` / `agy-tmux` / `agent-tmux <cli>` worker so Codex App can track allocation and running/done state. Shell supervision prefers `gpt-5.6-luna`, falls back to `gpt-5.6-terra`, and reserves `gpt-5.6-sol` for proxy tasks that need frontier reasoning. Headless proxies summarize material progress changes with a bounded heartbeat; headed proxies report passive pane liveness and use `ping` only when stale. External `result.json` remains terminal evidence, and runtimes without native sub-agents fall back explicitly as `UNAVAILABLE-NATIVE`.
+
 ### Fixed
 - Audit events are now written to the documented default path without requiring `--audit-log` or an environment opt-in. `AUDIT_LOG=0` remains an explicit opt-out, and directory/append failures now fail fast instead of silently losing telemetry.
 - `result.json` writers and templates now use `success|failed|blocked|needs-input`. Read surfaces normalize legacy spellings into `canonical_status`, while schemas keep accepting existing string values so on-disk results remain valid.

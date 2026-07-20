@@ -44,6 +44,43 @@ No exception fired → inline, receipt `no-delegate-trigger`.
   `start` (no `--headless`); do not `stop` between tasks; reuse via
   `skills/tmux-agent-tools/references/multi-agent.md#persistent-teammates-worker-reuse`.
 
+## CODEX VISIBILITY — external CLI as a native proxy sub-agent
+
+When an external CLI worker is authorized and the current Codex runtime exposes
+native sub-agents, default to exactly one supervision-only native proxy per
+external worker. This is an observability bridge: the Codex App tracks the
+proxy's native thread while the existing wrapper remains the execution engine.
+Do not claim that the external process itself is a native sub-agent.
+
+- Name the proxy `<cli>_<task>` using lowercase ASCII letters, digits, and
+  underscores (`claude_auth_review`, `codex_test_fix`, `agy_ui_audit`).
+  `codex_<task>` means `codex-tmux`; reserve `native_<task>` for work performed
+  by a Codex in-process sub-agent without an external CLI.
+- Before dispatch, pass `model-dispatch.md` and `delegation-templates`: prefer
+  `gpt-5.6-luna` for shell supervision and progress summarization, fall back to
+  `gpt-5.6-terra` when luna is unavailable, and use `gpt-5.6-sol` only when the
+  proxy task itself needs frontier reasoning. Send a self-contained GOAL /
+  ACCEPTANCE / REPORT brief. The proxy launches exactly the one named
+  worker and MUST NOT edit the target itself, spawn another sub-agent, start any
+  additional tmux session, or delegate further.
+- **Headless**: launch `start --headless`; after bounded waits, summarize only
+  material progress changes from status/capture and emit a heartbeat at least
+  every 60 seconds while running. A valid `result.json` or process failure ends
+  the proxy. A 60-second wait timeout is a progress checkpoint: inspect
+  status/result and continue; do not report worker failure from timeout alone.
+- **Headed / persistent**: launch interactive `start`; report `running`,
+  `last_change_at`, `idle_seconds`, `blocked_reason`, and the latest useful
+  probe/capture signal. Use `ping` only when passive evidence is stale or
+  unclear. Keep the worker alive when follow-ups were requested.
+- Send milestone summaries to the parent when the native collaboration runtime
+  provides a message operation; otherwise keep them in the proxy thread. Never
+  scrape a pane as terminal success when a valid result contract is available.
+
+If native sub-agents are unavailable, launch the selected wrapper directly and
+report `UNAVAILABLE-NATIVE`: execution still works, but it will not appear in
+the Codex App Subagents panel. Provider-specific panel icons and collapsed-card
+progress are app behavior, not promises made by this skill.
+
 ## SELECT — wrapper by task shape
 
 - Loop-shaped chain (audit / plan→build / consensus / triage) → the
