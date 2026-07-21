@@ -19,7 +19,7 @@ Fast answers:
 - **Bounded task with no follow-ups?** Default to `start --headless`: the CLI runs non-interactively (`claude -p` / `codex exec`), completion is the process exit, and `result wait-required` returns immediately at exit (a contract-valid result.json is synthesized from exit code + stdout when the worker didn't write one). No TUI quirks, no pane-heuristic WAITING stalls. Interactive `start` is only for work that needs follow-up sends or mid-run supervision.
 - **Wrapper not on PATH?** Run it from this bundle: `<skill-dir>/scripts/codex-tmux …`.
 - **Auto-delegate substantial work?** Use the inline-vs-worker gate in the `using-tmux-agent-tools` skill (absorbed there, no longer a separate subagent); details live in `references/core-workflow.md`.
-- **Show an external CLI worker in Codex Subagents?** When native sub-agents are available and authorized, spawn one supervision-only proxy named `<cli>_<task>`; the proxy drives exactly one existing wrapper, reports progress, and validates its `result.json`. See `references/core-workflow.md#codex-native-proxy-for-an-external-cli-worker`.
+- **Long-running external CLI worker under Codex?** When native sub-agents are available, MUST spawn exactly one cheap supervision-only proxy named `<cli>_<task>`. The proxy exclusively owns the existing wrapper and makes one blocking `supervise` call; the parent MUST NOT directly poll that worker. See `references/core-workflow.md#codex-native-proxy-for-an-external-cli-worker`.
 - **Writing the worker prompt?** Shape it with the `delegation-templates` skill: GOAL / ACCEPTANCE / REPORT + common footer, plus its tmux addendum (no-cascade ban + literal result path).
 - **New or renamed CLI?** Add a profile with `bin=…`, then prove it with `doctor --json` and `start --dry-run`; see `references/profiles.md`.
 
@@ -82,9 +82,10 @@ Full capability table (every subcommand + when to use it): `references/cheatshee
 # Bounded one-shot (headless, preferred for fire-and-collect tasks):
 codex-tmux start --exact --headless job ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
 codex-tmux result wait-required job --fields status,summary --wait 600 --json   # returns at process exit
+codex-tmux supervise --result-required --silent-while-unchanged --json job       # one silent call until terminal event
 codex-tmux stop job
 
-# Interactive one-worker flow (only when follow-ups are needed): start -> send-wait -> status/result -> stop.
+# Interactive one-worker flow (only when follow-ups are needed): start -> send-wait -> supervise -> stop.
 codex-tmux start --exact worker ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
 codex-tmux send-wait worker 'Follow-up instruction.' 180
 codex-tmux status --json worker
@@ -103,7 +104,7 @@ Agents write `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, cano
 
 ```bash
 codex-tmux result --json --wait 30 worker
-codex-tmux result wait-required worker --fields status,summary --wait 60 --json
+codex-tmux supervise --result-required --silent-while-unchanged --json worker
 ```
 
 If `.present:false`, the agent never wrote the file — re-prompt with the literal path from `result --path <name>`. Full schema, worked example, `status --json` fields, approval-gate exit codes, concurrency model: `references/contracts.md`.

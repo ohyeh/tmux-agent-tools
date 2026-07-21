@@ -36,17 +36,14 @@ The proxy progress contract depends on execution mode:
 
 | Mode | Progress source | Update policy | Terminal evidence |
 | --- | --- | --- | --- |
-| Headless | bounded `watch`/`status`, then `capture` for changed output | summarize material changes; heartbeat within 60s | valid `result.json` or process failure |
-| Headed / persistent | `status --json`, CLI-aware `probe`, diagnostic `capture` | latest useful pane signal; `ping` only when stale | valid `result.json`; keep session only for expected follow-ups |
+| Headless | one blocking `supervise` call | silent while unchanged; terminal event only | valid `result.json` or process failure |
+| Headed / persistent | one blocking `supervise` call; diagnostics only after abnormal return | silent while unchanged; material exception or terminal event only | valid `result.json`; keep session only for expected follow-ups |
 
 Example headless worker commands inside a `claude_research` proxy:
 
 ```bash
 claude-tmux start --exact --headless --task-shape bounded claude-research ~/repo '<GOAL / ACCEPTANCE / REPORT prompt>'
-claude-tmux watch --any --timeout 60 --json claude-research
-claude-tmux status --json claude-research
-claude-tmux capture claude-research --tail 20
-claude-tmux result wait-required claude-research --fields status,summary --wait 60 --json
+claude-tmux supervise --result-required --silent-while-unchanged --json claude-research
 ```
 
 Example headed liveness checks inside a `codex_feature_fix` proxy:
@@ -58,12 +55,14 @@ codex-tmux capture codex-feature-fix --tail 20
 codex-tmux ping --json --timeout 5 codex-feature-fix  # stale/unclear only
 ```
 
-The proxy reports each material milestone to its parent when the native runtime
-offers a message operation; otherwise the proxy thread itself is the progress
-surface. A running pane proves liveness, not completion. Prefer a valid
-`result.json` over pane text. Treat a 60-second `watch` or `result` timeout as a
-progress checkpoint: inspect status/result and continue; timeout alone is not a
-worker failure.
+The proxy prompt contains only the worker name, wrapper command, result
+contract, terminal states, and ownership boundary. It calls `supervise` once
+and reports only a material exception or the terminal result. Polling,
+unchanged-state suppression, result validation, and process-loss detection
+happen inside the deterministic wrapper. A timeout is internal control flow,
+not a progress update. The parent never supervises the same worker concurrently.
+`capture` is reserved for abnormal termination or contradictory liveness
+evidence.
 
 If native sub-agents are unavailable, run the wrapper directly and label the
 adaptation `UNAVAILABLE-NATIVE`. The worker remains manageable through

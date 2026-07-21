@@ -71,6 +71,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `status`
 - `ping`
 - `probe`
+- `supervise`
 - `doctor`
 - `self-test`
 - `stop`
@@ -79,6 +80,12 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 `tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` sessions. Claude and Codex inventory rows reuse the wrapper `status --json` contract and add `state` (`running`, `exited`, `stopped`, or wrapper-reported `missing`), so a pane that remains capturable after an exit-code marker is not reported as still running. Dialogue rows are tmux inventory rows and use conservative `running` state while the session exists. Use `--tool`, `--name`, `--state`, and `--sort <tool|name|session|state>` to make list output script-friendly without changing cleanup behavior. `tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>]` polls that inventory for a finite number of snapshots and emits one JSON array per poll; `--count 0` exits successfully without polling, and list filters/sorting apply to each snapshot. `tmux-agent-sessions cleanup --preview` is also read-only and includes the same state in JSON mode; combine `--preview --json` with `--tool` or `--name` for scriptable cleanup decisions before executing. `cleanup --execute` is required before it stops tool-owned sessions, execution must include `--all`, `--tool`, or `--name`, and `--json` is only accepted for preview. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
 
 `tmux-agent-sessions` is included in the stable Homebrew install starting with `v0.3.0`.
+
+For one asynchronous worker, `supervise --result-required
+--silent-while-unchanged --json <name>` is the token-efficient completion path:
+polling and result validation stay inside the wrapper process, unchanged state
+emits nothing, and the command returns once with a terminal result, confirmed
+process loss, or the overall deadline.
 
 Local and SSH sessions keep the pane open after the agent CLI exits, showing the exit code so failures can still be captured.
 

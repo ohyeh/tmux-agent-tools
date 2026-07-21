@@ -67,6 +67,18 @@
       "prompt": "這項 review 用 Codex 原生 sub-agent，不要啟動任何外部 CLI。",
       "expected_output": "ROUTE to one native in-process sub-agent named native_code_review. Do not start agent-tmux; native_ distinguishes it from the external codex_ CLI prefix.",
       "files": []
+    },
+    {
+      "id": 12,
+      "prompt": "用外部 Claude CLI 跑一個長時間 review，不用特別顯示進度。",
+      "expected_output": "ROUTE. Native sub-agents are available, so exactly one cheap supervision-only proxy is mandatory even when visibility was not requested. The parent transfers wrapper ownership and must not directly poll the Claude worker.",
+      "files": []
+    },
+    {
+      "id": 13,
+      "prompt": "worker 還在正常跑，但狀態沒有改變。",
+      "expected_output": "WAIT SILENTLY. Continue the single deterministic supervise call. Do not emit a heartbeat, capture output, or repeat running/waiting status.",
+      "files": []
     }
   ]
 }

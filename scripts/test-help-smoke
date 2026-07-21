@@ -38,7 +38,7 @@ assert_exit() {
 
 # Subcommands that MUST get focused help — change-detecting list
 TOPICS=(start resume start-ssh send send-wait send-wait-literal wait wait-text \
-        wait-literal wait-and-capture capture result status list \
+        wait-literal wait-and-capture supervise capture result status list \
         attach stop doctor self-test help)
 
 run_wrapper() {

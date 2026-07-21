@@ -303,6 +303,7 @@ Usage:
   agent-tmux result init <name>
   agent-tmux result validate <name> --json
   agent-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
+  agent-tmux supervise [--timeout <seconds>] [--interval <seconds>] [--result-required] [--silent-while-unchanged] --json <name>
   agent-tmux list
   agent-tmux status [--json] <name>
   agent-tmux stats [--json] [--since YYYY-MM-DD]
@@ -475,6 +476,16 @@ When using --from-file, the positionals are: <name> [timeout_seconds].
 
 If the nonce wait times out, a fresh valid result.json modified after the send
 counts as submitted=true with completion_source=result_json.
+HELP_EOF
+      ;;
+    supervise)
+      cat <<'HELP_EOF'
+agent-tmux supervise [--timeout N] [--interval N] [--result-required] [--silent-while-unchanged] --json <name>
+
+Block in one deterministic process until the worker writes a valid terminal
+result, exits without one, or reaches the supervision deadline. Unchanged state
+produces no output. This is the ownership-transfer boundary for a native Codex
+supervision proxy; the parent must not poll the same worker concurrently.
 HELP_EOF
       ;;
     send-wait-literal)
@@ -2502,6 +2513,74 @@ result_wait_required_session() {
       missing_fields: (if $missing != "" then ($missing | split(","))
         else $requested_fields end)}'
   return 1
+}
+
+# Deterministic one-call supervision. Polling stays inside this process, so an
+# unchanged worker consumes no model turns and emits no progress narration.
+supervise_session() {
+  local timeout=86400 interval=2 output_json=0 result_required=0 silent=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --timeout) [[ -n "${2:-}" ]] || { echo "supervise: --timeout needs a value" >&2; exit 2; }; timeout="$2"; shift 2 ;;
+      --interval) [[ -n "${2:-}" ]] || { echo "supervise: --interval needs a value" >&2; exit 2; }; interval="$2"; shift 2 ;;
+      --result-required) result_required=1; shift ;;
+      --silent-while-unchanged) silent=1; shift ;;
+      --json) output_json=1; shift ;;
+      --) shift; break ;;
+      -*) echo "Unknown supervise flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local name="${1:-}"
+  if [[ -z "$name" || "$output_json" -ne 1 || "$result_required" -ne 1 || "$silent" -ne 1 ]]; then
+    echo "Usage: agent-tmux supervise [--timeout N] [--interval N] [--result-required] [--silent-while-unchanged] --json <name>" >&2
+    exit 2
+  fi
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "supervise: --timeout must be a positive integer" >&2; exit 2; }
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || { echo "supervise: --interval must be a positive integer" >&2; exit 2; }
+  require_jq
+  require_tmux
+
+  local result_path session deadline validation canonical body_status
+  result_path="$(result_path_session "$name")"
+  session="$(session_for_name "$name")"
+  deadline=$((SECONDS + timeout))
+  while true; do
+    if [[ -f "$result_path" ]] && "$JQ" -e . "$result_path" >/dev/null 2>&1; then
+      validation="$(result_validate_session "$name" --json 2>/dev/null)" || validation=""
+      if [[ -n "$validation" ]] && [[ "$(printf '%s' "$validation" | "$JQ" -r '.valid // false')" == true ]]; then
+        canonical="$(printf '%s' "$validation" | "$JQ" -r '.canonical_status // "unknown"')"
+        case "$canonical" in
+          success|failed|blocked|needs-input)
+            body_status="$(printf '%s' "$validation" | "$JQ" -r '.body.status // ""')"
+            printf '%s' "$validation" | "$JQ" -c \
+              --arg name "$name" --arg session "$session" --arg result_path "$result_path" \
+              --arg status "$canonical" --arg raw_status "$body_status" \
+              '. + {event:"terminal", name:$name, session:$session, result_path:$result_path,
+                    status:$status, raw_status:$raw_status, worker_alive:false}'
+            [[ "$canonical" == success ]] && return 0
+            return 1
+            ;;
+        esac
+      fi
+    fi
+
+    if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+      "$JQ" -cn --arg name "$name" --arg session "$session" --arg path "$result_path" \
+        '{schema_version:1,event:"lost-liveness",status:"failed",name:$name,
+          session:$session,result_path:$path,worker_alive:false,
+          error:"worker exited without a valid terminal result"}'
+      return 1
+    fi
+    if (( SECONDS >= deadline )); then
+      "$JQ" -cn --arg name "$name" --arg session "$session" --arg path "$result_path" \
+        '{schema_version:1,event:"deadline",status:"failed",name:$name,
+          session:$session,result_path:$path,worker_alive:true,
+          error:"supervision deadline reached while worker remained active"}'
+      return 1
+    fi
+    sleep "$interval"
+  done
 }
 
 tag_record() {
@@ -7969,6 +8048,9 @@ case "$command" in
     ;;
   watch)
     watch_session "$@"
+    ;;
+  supervise)
+    supervise_session "$@"
     ;;
   env-doctor)
     env_doctor_session "$@"

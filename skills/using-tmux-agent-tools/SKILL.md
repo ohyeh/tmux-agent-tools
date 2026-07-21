@@ -46,9 +46,10 @@ No exception fired → inline, receipt `no-delegate-trigger`.
 
 ## CODEX VISIBILITY — external CLI as a native proxy sub-agent
 
-When an external CLI worker is authorized and the current Codex runtime exposes
-native sub-agents, default to exactly one supervision-only native proxy per
-external worker. This is an observability bridge: the Codex App tracks the
+When an external CLI worker is authorized, asynchronous, and the current Codex
+runtime exposes native sub-agents, exactly one cheap supervision-only native
+proxy per external worker is REQUIRED. This is an ownership and observability
+bridge: the Codex App tracks the
 proxy's native thread while the existing wrapper remains the execution engine.
 Do not claim that the external process itself is a native sub-agent.
 
@@ -63,18 +64,30 @@ Do not claim that the external process itself is a native sub-agent.
   ACCEPTANCE / REPORT brief. The proxy launches exactly the one named
   worker and MUST NOT edit the target itself, spawn another sub-agent, start any
   additional tmux session, or delegate further.
-- **Headless**: launch `start --headless`; after bounded waits, summarize only
-  material progress changes from status/capture and emit a heartbeat at least
-  every 60 seconds while running. A valid `result.json` or process failure ends
-  the proxy. A 60-second wait timeout is a progress checkpoint: inspect
-  status/result and continue; do not report worker failure from timeout alone.
-- **Headed / persistent**: launch interactive `start`; report `running`,
-  `last_change_at`, `idle_seconds`, `blocked_reason`, and the latest useful
-  probe/capture signal. Use `ping` only when passive evidence is stale or
-  unclear. Keep the worker alive when follow-ups were requested.
-- Send milestone summaries to the parent when the native collaboration runtime
-  provides a message operation; otherwise keep them in the proxy thread. Never
-  scrape a pane as terminal success when a valid result contract is available.
+- After launch or attach, call `supervise --result-required
+  --silent-while-unchanged --json` exactly once. Polling remains inside the
+  deterministic wrapper process; unchanged state emits nothing and consumes no
+  additional model turns. A valid terminal `result.json`, confirmed process
+  loss, needs-input/blocker, or the overall supervision deadline ends the call.
+- **Headed / persistent**: launch interactive `start`, then use the same blocking
+  supervisor. Keep the worker alive when follow-ups were requested; inspect
+  detailed liveness fields only after an abnormal supervisor return.
+- The normal-call budget is one launch/attach, one blocking `supervise`, and its
+  built-in terminal validation. One diagnostic `capture` is allowed only after
+  abnormal termination or contradictory evidence; further calls require a new
+  blocker hypothesis, not another elapsed interval.
+- Keep the proxy brief slim: worker name, wrapper command, result contract,
+  terminal states, and the no-concurrent-owner rule. Do not copy the worker's
+  production task context into the supervisor prompt.
+- Once assigned, all wrapper interaction transfers to the proxy. The parent MUST
+  NOT call `status`, `watch`, `capture`, `probe`, `ping`, `result`, or send a
+  follow-up unless the proxy reports blocked/lost-liveness, terminates
+  unexpectedly, or the user explicitly requests direct inspection. The proxy
+  reports only material state changes or its terminal result; periodic
+  heartbeats and unchanged `running`/`waiting` narration are prohibited.
+- `capture` is diagnostic-only: use it when status/process evidence conflicts,
+  liveness is unknown, the worker exits without a valid result, or a blocker
+  needs classification. Never capture merely because a wait interval elapsed.
 
 If native sub-agents are unavailable, launch the selected wrapper directly and
 report `UNAVAILABLE-NATIVE`: execution still works, but it will not appear in

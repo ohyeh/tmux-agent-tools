@@ -35,6 +35,7 @@ Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focu
 | Wait for first/all worker completions | `watch --any|--all --timeout 600 --json <n1> <n2>` |
 | Read the agent's structured result | `result --field '.status' --wait 30 --json <name>` |
 | Wait until required result fields exist | `result wait-required <name> --fields status,summary --wait 60 --json` |
+| Supervise one asynchronous worker without model polling | `supervise --result-required --silent-while-unchanged --json <name>` |
 | Validate the structured result contract | `result validate <name> --json` |
 | Fleet usage snapshot (adoption/status health) | `stats --json` — add `--exclude-selftest` to drop self-test workers (reports `excluded_selftest` count); top-level `by_task_shape` / `task_shape_coverage` fill in when launches carry `start --task-shape` |
 | Launch lifecycle audit (completion coverage, name reuse) | `stats --json` then read `.launches` — `total` launches vs `ended` (`end_coverage_pct`), `by_terminal_reason` (`agent-result`/`process-exit`/`stopped`/`max-runtime`/`unknown`), and `name_reuse`; sourced from the append-only per-worker `usage.jsonl` ledger, so restarts of one name each count as a distinct launch |
@@ -60,6 +61,7 @@ Default capture dumps raw scrollback — most of those tokens are ANSI escapes, 
 | --- | --- |
 | Agent writes the wrapper-injected literal result path, parent reads with `result --wait` | Parent never reads pane scrollback. Token cost = result body, not pane history. |
 | `watch --any|--all --timeout 600 --json w1 w2` | One blocking call supervises many workers; no orchestrator polling loop. |
+| `supervise --result-required --silent-while-unchanged --json worker` | One blocking call waits for a valid terminal result or confirmed process loss; unchanged state emits nothing. |
 | `status --json` + `ping --json --timeout 5` | Passive + active liveness without reading pane history. |
 | `send-wait worker '...' 300` | Generates a fresh nonce marker and waits for it, so old pane text cannot satisfy the new turn. |
 | `wait-and-capture --marker '[DONE]' --timeout 300 --tail 80 --strip-ansi --json` | Diagnostic fallback when branch logic needs nearby pane text. |

@@ -1,0 +1,58 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WRAPPER="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+WORK="$(mktemp -d -t tmux-agent-supervise-smoke.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap '"$WRAPPER" stop supervise-ok >/dev/null 2>&1 || true; "$WRAPPER" stop supervise-lost >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-cli" <<'EOF'
+#!/bin/sh
+sleep 60
+EOF
+chmod +x "$WORK/fake-cli"
+
+pass=0 fail=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; pass=$((pass + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2; fail=$((fail + 1))
+  fi
+}
+
+echo "case: unchanged state is silent until terminal result"
+CODEX="$WORK/fake-cli" "$WRAPPER" start --exact supervise-ok "$WORK" >/dev/null
+out="$WORK/supervise.out"
+set +e
+"$WRAPPER" supervise --timeout 15 --interval 1 --result-required --silent-while-unchanged --json supervise-ok >"$out" &
+pid=$!
+set -e
+sleep 2
+assert "no output while unchanged" "$([[ -s "$out" ]] && echo noisy || echo silent)" "silent"
+mkdir -p "$TMUX_AGENT_DIR/supervise-ok"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"done","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/supervise-ok/result.json"
+sup_code=0
+wait "$pid" || sup_code=$?
+assert "terminal supervise exit" "$sup_code" "0"
+assert "terminal event" "$(jq -r .event "$out")" "terminal"
+assert "terminal status" "$(jq -r .status "$out")" "success"
+
+echo "case: ownership flags are explicit"
+flags_code=0
+"$WRAPPER" supervise --timeout 1 --json supervise-ok >/dev/null 2>&1 || flags_code=$?
+assert "missing ownership flags rejected" "$flags_code" "2"
+
+echo "case: lost liveness is terminal without capture"
+CODEX="$WORK/fake-cli" "$WRAPPER" start --exact supervise-lost "$WORK" >/dev/null
+"$WRAPPER" stop supervise-lost >/dev/null
+code=0
+lost="$($WRAPPER supervise --timeout 5 --interval 1 --result-required --silent-while-unchanged --json supervise-lost)" || code=$?
+assert "lost liveness exit" "$code" "1"
+assert "lost liveness event" "$(printf '%s' "$lost" | jq -r .event)" "lost-liveness"
+
+echo "supervise smoke: $pass passed, $fail failed"
+(( fail == 0 ))
