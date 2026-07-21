@@ -2557,7 +2557,7 @@ supervise_session() {
               --arg name "$name" --arg session "$session" --arg result_path "$result_path" \
               --arg status "$canonical" --arg raw_status "$body_status" \
               '. + {event:"terminal", name:$name, session:$session, result_path:$result_path,
-                    status:$status, raw_status:$raw_status, worker_alive:false}'
+                    status:$status, raw_status:$raw_status}'
             [[ "$canonical" == success ]] && return 0
             return 1
             ;;

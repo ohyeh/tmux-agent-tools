@@ -46,23 +46,15 @@ claude-tmux start --exact --headless --task-shape bounded claude-research ~/repo
 claude-tmux supervise --result-required --silent-while-unchanged --json claude-research
 ```
 
-Example headed liveness checks inside a `codex_feature_fix` proxy:
-
-```bash
-codex-tmux status --json codex-feature-fix
-codex-tmux probe --metric tool_active --json codex-feature-fix
-codex-tmux capture codex-feature-fix --tail 20
-codex-tmux ping --json --timeout 5 codex-feature-fix  # stale/unclear only
-```
-
 The proxy prompt contains only the worker name, wrapper command, result
 contract, terminal states, and ownership boundary. It calls `supervise` once
 and reports only a material exception or the terminal result. Polling,
 unchanged-state suppression, result validation, and process-loss detection
 happen inside the deterministic wrapper. A timeout is internal control flow,
 not a progress update. The parent never supervises the same worker concurrently.
-`capture` is reserved for abnormal termination or contradictory liveness
-evidence.
+After an abnormal return only, one diagnostic `capture` may classify the
+failure. Routine `status`, `probe`, `capture`, and `ping` calls are not part of
+the normal path.
 
 If native sub-agents are unavailable, run the wrapper directly and label the
 adaptation `UNAVAILABLE-NATIVE`. The worker remains manageable through

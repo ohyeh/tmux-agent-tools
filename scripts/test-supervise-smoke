@@ -40,6 +40,7 @@ wait "$pid" || sup_code=$?
 assert "terminal supervise exit" "$sup_code" "0"
 assert "terminal event" "$(jq -r .event "$out")" "terminal"
 assert "terminal status" "$(jq -r .status "$out")" "success"
+assert "terminal does not guess worker liveness" "$(jq -r 'has("worker_alive")' "$out")" "false"
 
 echo "case: ownership flags are explicit"
 flags_code=0
