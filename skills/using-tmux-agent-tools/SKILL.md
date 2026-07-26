@@ -44,22 +44,27 @@ No exception fired → inline, receipt `no-delegate-trigger`.
   `start` (no `--headless`); do not `stop` between tasks; reuse via
   `skills/tmux-agent-tools/references/multi-agent.md#persistent-teammates-worker-reuse`.
 
-## CODEX VISIBILITY — external CLI as a native proxy sub-agent
+## NATIVE PROXY (ALL RUNTIMES) — external CLI as a native proxy sub-agent
 
-When an external CLI worker is authorized, asynchronous, and the current Codex
-runtime exposes native sub-agents, exactly one cheap supervision-only native
-proxy per external worker is REQUIRED. This is an ownership and observability
-bridge: the Codex App tracks the
-proxy's native thread while the existing wrapper remains the execution engine.
+When an external CLI worker is authorized, asynchronous, and the current
+runtime exposes native sub-agents (Codex `spawn_agent`, Claude Code `Agent`
+tool), exactly one cheap supervision-only native proxy per external worker is
+REQUIRED. The parent MUST NOT run `start`/`send-wait`/`supervise` on that
+worker directly — direct driving happens only inside the proxy. This is
+supervision hygiene on every runtime; on Codex it is also an ownership and
+observability bridge: the Codex App tracks the proxy's native thread while the
+existing wrapper remains the execution engine.
 Do not claim that the external process itself is a native sub-agent.
 
 - Name the proxy `<cli>_<task>` using lowercase ASCII letters, digits, and
   underscores (`claude_auth_review`, `codex_test_fix`, `agy_ui_audit`).
   `codex_<task>` means `codex-tmux`; reserve `native_<task>` for work performed
   by a Codex in-process sub-agent without an external CLI.
-- Before dispatch, pass `model-dispatch.md` and `delegation-templates`: prefer
-  `gpt-5.6-luna` for shell supervision and progress summarization, fall back to
-  `gpt-5.6-terra` when luna is unavailable, and use `gpt-5.6-sol` only when the
+- Before dispatch, pass `model-dispatch.md` and `delegation-templates`. On
+  Claude Code the proxy is a `general-purpose` sub-agent on `haiku`
+  (model-dispatch §4). On Codex prefer `gpt-5.6-luna` for shell supervision and
+  progress summarization, fall back to `gpt-5.6-terra` when luna is
+  unavailable, and use `gpt-5.6-sol` only when the
   proxy task itself needs frontier reasoning. Send a self-contained GOAL /
   ACCEPTANCE / REPORT brief. The proxy launches exactly the one named
   worker and MUST NOT edit the target itself, spawn another sub-agent, start any

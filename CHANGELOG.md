@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.37.0 - 2026-07-26
+
+### Changed
+- The supervision-proxy mandate is now runtime-neutral. It was documented only under "CODEX VISIBILITY" / "Codex native proxy" headings, which a Claude Code commander read as Codex-only and drove tmux workers directly with `send-wait` (observed in a live session on 2026-07-26, violating model-dispatch §4's "supervise external CLI worker → general-purpose on haiku" row). The router section is renamed "NATIVE PROXY (ALL RUNTIMES)", the hub fast-path and `references/core-workflow.md` (heading renamed to "Native proxy for an external CLI worker") name the Claude Code shape explicitly (`general-purpose` sub-agent on `haiku`), and all three surfaces now state the hard boundary in place: the parent MUST NOT run `start`/`send-wait`/`supervise` on an external worker directly — exactly one supervision-only native proxy owns it.
+
 ## v0.36.0 - 2026-07-21
 
 ### Added
