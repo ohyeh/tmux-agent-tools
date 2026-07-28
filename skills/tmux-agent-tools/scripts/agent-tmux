@@ -1733,7 +1733,7 @@ send_blocked_guard() {
   st="$(status_session --json "$name")" || st=""
   reason="$("$JQ" -r '.blocked_reason // empty' <<< "$st" 2>/dev/null || true)"
   case "$reason" in
-    hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+    hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt|startup_pending)
       diagnostic="$("$JQ" -r '.diagnostic // empty' <<< "$st" 2>/dev/null || true)"
       "$JQ" -cn --arg tool "$CLI" --arg name "$name" --arg session "$session" \
         --arg blocked_reason "$reason" --arg diagnostic "$diagnostic" \
@@ -4151,11 +4151,35 @@ start_session() {
   if [[ "$EXEC_MODE" != "oneshot" && -n "$initial_text" ]]; then
     sleep 3
     start_preflight_ran=1
+    # Readiness poll: transient startup screens (startup_pending, e.g. agy
+    # "Verifying your account eligibility") swallow pasted text, so wait for
+    # them to clear before injecting the initial prompt. Hard interactive
+    # prompts (login/permission/approval/hook-trust) never clear on their own
+    # and fail immediately, as before. A screen still pending at the deadline
+    # fails loudly rather than pasting into a swallowing UI.
     local preflight_reason preflight_diag preflight_json
-    preflight_json="$(status_session --json "$name")" || preflight_json=""
-    preflight_reason="$("$JQ" -r '.blocked_reason // empty' <<< "$preflight_json" 2>/dev/null || true)"
-    preflight_diag="$("$JQ" -r '.diagnostic // empty' <<< "$preflight_json" 2>/dev/null || true)"
-    if [[ "$preflight_reason" == "permission_prompt" || "$preflight_reason" == "hook_trust_prompt" || "$preflight_reason" == "approval_prompt" || "$preflight_reason" == "login_prompt" ]]; then
+    local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} ))
+    while :; do
+      preflight_json="$(status_session --json "$name")" || preflight_json=""
+      preflight_reason="$("$JQ" -r '.blocked_reason // empty' <<< "$preflight_json" 2>/dev/null || true)"
+      preflight_diag="$("$JQ" -r '.diagnostic // empty' <<< "$preflight_json" 2>/dev/null || true)"
+      case "$preflight_reason" in
+        permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
+          break   # hard prompt: fail now
+          ;;
+        startup_pending)
+          if (( SECONDS >= ready_deadline )); then
+            break   # still pending at deadline: fail loudly below
+          fi
+          sleep 2
+          ;;
+        *)
+          preflight_reason=""
+          break   # ready
+          ;;
+      esac
+    done
+    if [[ -n "$preflight_reason" ]]; then
       "$JQ" -cn --arg tool "$CLI" --arg name "$name" --arg session "$session" \
         --arg blocked_reason "$preflight_reason" --arg diagnostic "$preflight_diag" \
         '{schema_version:1,submitted:false,blocked:true,blocked_reason:$blocked_reason,diagnostic:$diagnostic,tool:$tool,name:$name,session:$session}'
@@ -6286,8 +6310,15 @@ blocked_reason_for_text() {
     print -r -- "permission_prompt"
   elif [[ "$lowered" == *"approval"* || "$lowered" == *"approve"* || "$lowered" == *"[y/n]"* ]]; then
     print -r -- "approval_prompt"
-  elif [[ "$lowered" == *"codex login"* || "$lowered" == *"please log in to codex"* || "$lowered" == *"log in to codex"* || "$lowered" == *"sign in to codex"* || "$lowered" == *"not logged in to codex"* ]]; then
+  elif [[ "$lowered" == *"codex login"* || "$lowered" == *"please log in to codex"* || "$lowered" == *"log in to codex"* || "$lowered" == *"sign in to codex"* || "$lowered" == *"not logged in to codex"* || "$lowered" == *"please run /login"* ]]; then
     print -r -- "login_prompt"
+  elif [[ "$lowered" == *"verifying your account"* ]]; then
+    # Transient CLI startup screens (e.g. Antigravity/agy "Verifying your
+    # account eligibility... try again shortly"). Anything pasted while this
+    # shows is swallowed — the pane looks alive but the input box is not
+    # accepting a task yet. Unlike the hard prompts above this clears on its
+    # own, so start_session waits it out instead of failing immediately.
+    print -r -- "startup_pending"
   fi
 }
 
@@ -6312,6 +6343,9 @@ diagnostic_for_blocked_reason() {
       ;;
     permission_prompt|approval_prompt|ssh_prompt|login_prompt)
       echo "session may be waiting for interactive confirmation; attach or capture the pane before sending prompts"
+      ;;
+    startup_pending)
+      echo "CLI is still on a transient startup/verification screen; text sent now would be swallowed — wait for it to clear (status --json) before sending"
       ;;
   esac
 }

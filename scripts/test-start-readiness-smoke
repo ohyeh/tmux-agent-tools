@@ -1,0 +1,122 @@
+#!/usr/bin/env zsh
+# Smoke test for the start-time readiness poll: transient startup screens
+# (blocked_reason=startup_pending, e.g. agy "Verifying your account
+# eligibility") must delay the initial prompt injection until they clear,
+# fail loudly at the deadline if they never clear, and block send paths
+# while showing. Also covers the claude-style "Please run /login" screen
+# classifying as login_prompt. Style mirrors scripts/test-hook-trust-status-smoke.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-start-ready.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+# Verification screen that clears after ~6s, then shows a ready prompt and
+# echoes input (so a delayed paste is visible in the pane).
+cat > "$WORK/fake-verify-clears.sh" <<'EOF'
+#!/bin/sh
+echo "We're finishing verifying your account eligibility."
+echo "This usually takes a moment. Please try again shortly."
+sleep 6
+echo "› Write a prompt"
+while IFS= read -r line; do echo "got:$line"; done
+EOF
+chmod +x "$WORK/fake-verify-clears.sh"
+
+# Verification screen that never clears.
+cat > "$WORK/fake-verify-stuck.sh" <<'EOF'
+#!/bin/sh
+echo "We're finishing verifying your account eligibility."
+echo "This usually takes a moment. Please try again shortly."
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-verify-stuck.sh"
+
+# Claude-style logged-out screen.
+cat > "$WORK/fake-run-login.sh" <<'EOF'
+#!/bin/sh
+echo "Not logged in"
+echo "Please run /login"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-run-login.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+echo "case: status classifies the verification screen as startup_pending"
+V="verify-status"
+env CODEX="$WORK/fake-verify-stuck.sh" "$CODEX_TMUX" start --exact "$V" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$V")"
+assert "blocked_reason startup_pending" "$(printf '%s' "$st" | jq -r .blocked_reason)" "startup_pending"
+assert "diagnostic non-null" "$(printf '%s' "$st" | jq -r '.diagnostic | type')" "string"
+
+echo "case: send is blocked while the verification screen shows"
+code=0
+out="$("$CODEX_TMUX" send "$V" "must-not-send-verify" 2>&1)" || code=$?
+json_line="${out##*$'\n'}"
+assert "send blocked exit=1" "$code" "1"
+assert "send blocked_reason startup_pending" "$(printf '%s' "$json_line" | jq -r .blocked_reason)" "startup_pending"
+pane="$(tmux capture-pane -J -t "codex-cli-$V" -p -S -80)"
+if [[ "$pane" == *"must-not-send-verify"* ]]; then
+  echo "  FAIL send pasted text into the verification screen" >&2; FAIL=$((FAIL + 1))
+else
+  echo "  ok   send did not paste into the verification screen"; PASS=$((PASS + 1))
+fi
+"$CODEX_TMUX" stop "$V" >/dev/null 2>&1 || true
+
+echo "case: start waits out a clearing verification screen, then injects"
+W="verify-clears"
+MARK="delayed-initial-prompt-marker"
+code=0
+env CODEX="$WORK/fake-verify-clears.sh" AGENT_TMUX_START_READY_TIMEOUT=30 \
+  "$CODEX_TMUX" start --exact "$W" "$WORK" "$MARK" >/dev/null || code=$?
+assert "start exit=0 after screen cleared" "$code" "0"
+sleep 2
+pane="$(tmux capture-pane -J -t "codex-cli-$W" -p -S -120)"
+if [[ "$pane" == *"got:"*"$MARK"* || "$pane" == *"$MARK"* ]]; then
+  echo "  ok   initial prompt injected after readiness"; PASS=$((PASS + 1))
+else
+  echo "  FAIL initial prompt missing from pane after readiness" >&2; FAIL=$((FAIL + 1))
+fi
+"$CODEX_TMUX" stop "$W" >/dev/null 2>&1 || true
+
+echo "case: start fails loudly when the screen never clears"
+S="verify-stuck"
+code=0
+out="$(env CODEX="$WORK/fake-verify-stuck.sh" AGENT_TMUX_START_READY_TIMEOUT=6 \
+  "$CODEX_TMUX" start --exact "$S" "$WORK" "must-not-send-stuck" 2>&1)" || code=$?
+json_line="${out##*$'\n'}"
+assert "stuck start exit=1" "$code" "1"
+assert "stuck submitted=false" "$(printf '%s' "$json_line" | jq -r .submitted)" "false"
+assert "stuck blocked_reason startup_pending" "$(printf '%s' "$json_line" | jq -r .blocked_reason)" "startup_pending"
+pane="$(tmux capture-pane -J -t "codex-cli-$S" -p -S -80)"
+if [[ "$pane" == *"must-not-send-stuck"* ]]; then
+  echo "  FAIL initial prompt was pasted into a stuck verification screen" >&2; FAIL=$((FAIL + 1))
+else
+  echo "  ok   initial prompt withheld from the stuck screen"; PASS=$((PASS + 1))
+fi
+"$CODEX_TMUX" stop "$S" >/dev/null 2>&1 || true
+
+echo "case: 'Please run /login' classifies as login_prompt and blocks start"
+L="run-login"
+code=0
+out="$(env CODEX="$WORK/fake-run-login.sh" "$CODEX_TMUX" start --exact "$L" "$WORK" "must-not-send-login" 2>&1)" || code=$?
+json_line="${out##*$'\n'}"
+assert "login start exit=1" "$code" "1"
+assert "login blocked_reason login_prompt" "$(printf '%s' "$json_line" | jq -r .blocked_reason)" "login_prompt"
+"$CODEX_TMUX" stop "$L" >/dev/null 2>&1 || true
+
+echo "start-readiness smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))
