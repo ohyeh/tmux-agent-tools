@@ -33,6 +33,8 @@
       "Gate destructive actions behind human approval files",
       "Orchestrate multi-agent pair and team review workflows"
     ],
-    "defaultPrompt": "Use claude-tmux or codex-tmux to start a supervised agent session for this task and report its structured result."
+    "defaultPrompt": [
+      "Start a supervised agent session for this task with agent-tmux claude start or agent-tmux codex start, then report its structured result."
+    ]
   }
 }
