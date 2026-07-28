@@ -76,7 +76,7 @@ Behavior:
   - cleanup --preview is read-only;
   - cleanup --execute requires --all or a filter before stopping sessions;
   - cleanup --execute refuses dirty managed worktrees unless --force is passed;
-  - cleanup --execute only stops matching sessions owned by claude-tmux, codex-tmux, agy-tmux, or tmux-agent-dialogue;
+  - cleanup --execute only stops matching sessions owned by agent-tmux claude/codex/agy or tmux-agent-dialogue;
   - sessions outside known tmux-agent-tools prefixes are never stopped.
 EOF
 }
@@ -94,12 +94,12 @@ require_jq() {
   [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
 }
 
+# Sets $reply to the wrapper command array: the unified engine plus the CLI
+# preset (the per-CLI shims are deprecated; removal planned for v0.39).
 wrapper_for_tool() {
   local tool="$1"
   case "$tool" in
-    claude) print -r -- "$SCRIPT_DIR/claude-tmux" ;;
-    codex) print -r -- "$SCRIPT_DIR/codex-tmux" ;;
-    agy) print -r -- "$SCRIPT_DIR/agy-tmux" ;;
+    claude|codex|agy) reply=("$SCRIPT_DIR/agent-tmux" "$tool") ;;
     *) die "unsupported wrapper tool: $tool" ;;
   esac
 }
@@ -191,14 +191,16 @@ emit_wrapper_session_json() {
   local tool="$1"
   local name="$2"
   local session="$3"
-  local wrapper output prefix
-  wrapper="$(wrapper_for_tool "$tool")"
+  local output prefix
+  local -a wrapper
+  wrapper_for_tool "$tool"
+  wrapper=("${reply[@]}")
   case "$tool" in
     claude) prefix="$CLAUDE_PREFIX" ;;
     codex) prefix="$CODEX_PREFIX" ;;
     agy) prefix="$AGY_PREFIX" ;;
   esac
-  if output="$("$wrapper" status --json "$name" 2>/dev/null)"; then
+  if output="$("${wrapper[@]}" status --json "$name" 2>/dev/null)"; then
     print -r -- "$output" | add_state_field
     return
   fi
@@ -410,7 +412,10 @@ inventory_json_array() {
 
 list_owned_sessions() {
   require_tmux
-  "$TMUX" ls 2>/dev/null | while IFS= read -r line; do
+  # `tmux ls` exits 1 when no server / no sessions exist; under
+  # `set -euo pipefail` that would kill every caller (list, watch) instead of
+  # yielding an empty inventory. An empty server is a valid empty inventory.
+  { "$TMUX" ls 2>/dev/null || true; } | while IFS= read -r line; do
     local session="${line%%:*}"
     local tool=""
     local name=""

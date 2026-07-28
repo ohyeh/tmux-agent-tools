@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Smoke test for hooks/tmux-dispatch-gate.sh — feeds PreToolUse-shaped
+# stdin JSON straight into the hook and asserts exit codes + deny messages.
+# No tmux, no Claude runtime needed.
+set -euo pipefail
+
+HOOK="$(cd "$(dirname "$0")/.." && pwd)/hooks/tmux-dispatch-gate.sh"
+SID="smoke-$$"
+STATE_DIR="$HOME/.local/state/agent-hooks/$SID"
+cleanup() { rm -rf "$STATE_DIR"; }
+trap cleanup EXIT
+
+FAILS=0
+check() { # check <name> <expected_exit> <json> [expected_stderr_grep]
+  local name="$1" want="$2" json="$3" grep_for="${4:-}"
+  local err rc=0
+  err="$(printf '%s' "$json" | bash "$HOOK" 2>&1 >/dev/null)" || rc=$?
+  if [ "$rc" != "$want" ]; then
+    echo "FAIL [$name] exit=$rc want=$want"; FAILS=$((FAILS+1)); return
+  fi
+  if [ -n "$grep_for" ] && ! printf '%s' "$err" | grep -q "$grep_for"; then
+    echo "FAIL [$name] stderr missing '$grep_for': $err"; FAILS=$((FAILS+1)); return
+  fi
+  echo "PASS [$name]"
+}
+
+j() { # j <command> -> parent-context PreToolUse JSON
+  printf '{"session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$SID" "$1"
+}
+
+# 1. non-dispatch command passes
+check "non-dispatch" 0 "$(j 'git status')"
+# 2. read-only wrapper subcommand passes
+check "readonly-subcmd" 0 "$(j 'agent-tmux codex status foo --json')"
+# 3. parent dispatch without receipt -> GATE 1 deny
+check "gate1-deny" 2 "$(j 'agent-tmux codex start worker1 --headless')" "BLOCKED by dispatch gate"
+# 4. subagent context passes even without receipt
+check "subagent-pass" 0 '{"session_id":"'"$SID"'","agent_type":"general-purpose","tool_input":{"command":"agent-tmux codex start worker1"}}'
+# 5. receipt marker -> GATE 1 passes
+mkdir -p "$STATE_DIR"; echo "role=review model=sol brief=GOAL/ACCEPTANCE/REPORT" > "$STATE_DIR/gate-receipt-dispatch"
+check "gate1-receipt-pass" 0 "$(j 'agent-tmux codex start worker1 --headless')"
+# 6. first review-shaped dispatch passes (counter=1... but #5 already logged one
+#    'worker1' — non-review name, so counter starts here)
+check "review-1st-pass" 0 "$(j 'agent-tmux codex start sol_review_e1 --headless')"
+# 7. second review-shaped dispatch -> GATE 2 deny; --exact flag between
+#    start and the name must not hide the review shape
+check "review-2nd-deny" 2 "$(j 'agent-tmux codex start --exact sol_review_e2 --headless')" "BLOCKED by workflow gate"
+# 8. workflow receipt -> GATE 2 passes
+echo "recipe=consensus-gate" > "$STATE_DIR/gate-receipt-workflow"
+check "gate2-receipt-pass" 0 "$(j 'agent-tmux codex start sol_review_e3 --headless')"
+# 9. non-review start never counts toward GATE 2
+check "nonreview-start-pass" 0 "$(j 'agent-tmux codex start impl_worker --headless')"
+
+if [ "$FAILS" -ne 0 ]; then echo "SMOKE FAIL ($FAILS)"; exit 1; fi
+echo "SMOKE OK — all checks passed"

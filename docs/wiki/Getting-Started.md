@@ -21,9 +21,9 @@ skills/tmux-agent-tools/scripts/install-bin
 ## Verify the environment
 
 ```bash
-codex-tmux doctor
-claude-tmux doctor
-codex-tmux self-test
+agent-tmux codex doctor
+agent-tmux claude doctor
+agent-tmux codex self-test
 ```
 
 - `doctor` reports missing dependencies (tmux, jq, the agent CLI itself).
@@ -34,11 +34,11 @@ If `doctor` flags anything, fix it before continuing — every later step assume
 ## Hello, agent
 
 ```bash
-codex-tmux start --exact hello ~ 'Print HELLO from your first agent, then write final JSON to the wrapper-provided result path: {"schema_version":1,"status":"success","summary":"hello complete","artifacts":[],"errors":[]}'
-codex-tmux wait-text hello 'HELLO' 60
-codex-tmux capture hello 30
-codex-tmux result wait-required hello --fields status,summary --wait 60 --json
-codex-tmux stop hello
+agent-tmux codex start --exact hello ~ 'Print HELLO from your first agent, then write final JSON to the wrapper-provided result path: {"schema_version":1,"status":"success","summary":"hello complete","artifacts":[],"errors":[]}'
+agent-tmux codex wait-text hello 'HELLO' 60
+agent-tmux codex capture hello 30
+agent-tmux codex result wait-required hello --fields status,summary --wait 60 --json
+agent-tmux codex stop hello
 ```
 
 What just happened:

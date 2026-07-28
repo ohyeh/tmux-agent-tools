@@ -16,9 +16,9 @@ Cursor, or custom CLI worker visible under Subagents.
 Naming is the identity contract:
 
 ```text
-claude_auth_review  -> claude-tmux
-codex_test_fix      -> codex-tmux
-agy_ui_audit        -> agy-tmux
+claude_auth_review  -> agent-tmux claude
+codex_test_fix      -> agent-tmux codex
+agy_ui_audit        -> agent-tmux agy
 gemini_research     -> agent-tmux gemini
 native_code_review  -> Codex in-process sub-agent; no external CLI
 ```
@@ -47,8 +47,8 @@ The proxy progress contract depends on execution mode:
 Example headless worker commands inside a `claude_research` proxy:
 
 ```bash
-claude-tmux start --exact --headless --task-shape bounded claude-research ~/repo '<GOAL / ACCEPTANCE / REPORT prompt>'
-claude-tmux supervise --result-required --silent-while-unchanged --json claude-research
+agent-tmux claude start --exact --headless --task-shape bounded claude-research ~/repo '<GOAL / ACCEPTANCE / REPORT prompt>'
+agent-tmux claude supervise --result-required --silent-while-unchanged --json claude-research
 ```
 
 The proxy prompt contains only the worker name, wrapper command, result
@@ -84,9 +84,9 @@ Copyable flow:
 
 ```bash
 tmux-agent-sessions resolve --name worker --json
-codex-tmux status --json worker
-codex-tmux result --json --wait 30 worker
-codex-tmux ping --json --timeout 5 worker
+agent-tmux codex status --json worker
+agent-tmux codex result --json --wait 30 worker
+agent-tmux codex ping --json --timeout 5 worker
 ```
 
 Only send after those checks show the teammate is idle, stalled, or explicitly blocked on human input. Repeated prompts while the teammate is thinking usually create duplicate work, prompt echoes, and stale-pane confusion.
@@ -94,8 +94,8 @@ Only send after those checks show the teammate is idle, stalled, or explicitly b
 ## 1. Start
 
 ```bash
-codex-tmux start --exact worker ~/github/project 'Read the repo and report the failing test. Write final JSON to the wrapper-provided result path when done.'
-claude-tmux resume --exact worker ~/github/project ee5aca88-a1af-48d3-af21-54f60d618f22
+agent-tmux codex start --exact worker ~/github/project 'Read the repo and report the failing test. Write final JSON to the wrapper-provided result path when done.'
+agent-tmux claude resume --exact worker ~/github/project ee5aca88-a1af-48d3-af21-54f60d618f22
 ```
 
 Use `start --dry-run` first when validating a new profile, `--result-schema`, or launch flags; it prints the resolved invocation and exits without creating a tmux session.
@@ -111,7 +111,7 @@ Use `start --dry-run` first when validating a new profile, `--result-schema`, or
 `start-ssh` when the target repo is on another host (tmux stays local, the CLI runs over SSH):
 
 ```bash
-claude-tmux start-ssh --exact review example-host ~/github/project 'Review the diff and return findings only.'
+agent-tmux claude start-ssh --exact review example-host ~/github/project 'Review the diff and return findings only.'
 ```
 
 Requirements: local `tmux`; remote shell can resolve `claude` or `codex` on `PATH`; SSH target preconfigured.
@@ -119,8 +119,8 @@ Requirements: local `tmux`; remote shell can resolve `claude` or `codex` on `PAT
 ## 2. Send follow-up work without attaching
 
 ```bash
-codex-tmux send worker 'Now implement the smallest fix and run the targeted test.'
-codex-tmux send-wait worker 'Summarize the current blocker in result.json.' 180
+agent-tmux codex send worker 'Now implement the smallest fix and run the targeted test.'
+agent-tmux codex send-wait worker 'Summarize the current blocker in result.json.' 180
 ```
 
 Use `send-wait <name> <text> <timeout>` for marker-driven orchestration. It generates a fresh nonce, appends the instruction to end with that nonce, sends the text, and waits for that unique marker. Fresh nonce markers avoid both stale pane matches and prompt-echo matches.
@@ -142,19 +142,19 @@ Make submission verifiable, never assumed:
 Every blocking wait needs a timeout; never write shell `sleep`, `while status ...`, or hand-rolled capture polling loops.
 
 ```bash
-codex-tmux wait worker 180                                # idle stability
-codex-tmux wait-literal worker '[CODEX-01]' 180           # literal marker
-codex-tmux wait-text worker '[CODEX-01]' 180              # literal-by-default
-codex-tmux wait-text --regex worker 'DONE|Need approval' 180
-codex-tmux wait-and-capture --marker '[DONE]' --timeout 180 --tail 80 --strip-ansi --json worker
+agent-tmux codex wait worker 180                                # idle stability
+agent-tmux codex wait-literal worker '[CODEX-01]' 180           # literal marker
+agent-tmux codex wait-text worker '[CODEX-01]' 180              # literal-by-default
+agent-tmux codex wait-text --regex worker 'DONE|Need approval' 180
+agent-tmux codex wait-and-capture --marker '[DONE]' --timeout 180 --tail 80 --strip-ansi --json worker
 ```
 
 To supervise **multiple workers with one blocking call** (no per-worker polling from the orchestrator), use `watch`. A worker counts as done when it (re)writes `result.json` after the watch started, or when its tmux session exits:
 
 ```bash
-codex-tmux watch --any --timeout 600 --json w1 w2 w3   # first completion wins
-codex-tmux watch --all --timeout 600 --json w1 w2 w3   # block until all done
-codex-tmux watch --count 2 --timeout 600 --json w1 w2 w3 # proceed on 2 done
+agent-tmux codex watch --any --timeout 600 --json w1 w2 w3   # first completion wins
+agent-tmux codex watch --all --timeout 600 --json w1 w2 w3   # block until all done
+agent-tmux codex watch --count 2 --timeout 600 --json w1 w2 w3 # proceed on 2 done
 ```
 
 Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` and `reason` (`result_updated` | `exited`); `--count` also includes `required_count` and `done_count`. Polling happens inside the shell call, so the supervising agent spends one tool call instead of a status loop — this is the token-efficient pattern for fanout supervision.
@@ -164,7 +164,7 @@ Exit 0 when the condition is met, 1 on timeout. The JSON lists per-agent `done` 
 The commands `watch`, `result`, and `status` resolve sessions by NAME.
 - **Result path resolution** is fully engine-independent; `result` paths are resolved as `$TMUX_AGENT_DIR/<name>/result.json` using the bare session name.
 - **Tmux session presence checks** (used in `status` and `watch` exited liveness checks) are prefix-dependent; they prepend the active wrapper CLI's prefix (e.g. `codex-cli-`, `claude-cli-`, `agy-cli-`).
-- Any `agent-tmux <cli> watch` command will successfully detect when a session's `result.json` is updated regardless of which wrapper/engine started it (`reason:result_updated` is always engine-agnostic), but it will report a session from a **different** wrapper/engine as `reason:exited` while the session is still running — a **false positive** caused by mismatched tmux prefixes (e.g. a codex-tmux watch cannot see an `agy-cli-*` tmux session). Only trust `reason:exited` when all workers were started by the same wrapper family.
+- Any `agent-tmux <cli> watch` command will successfully detect when a session's `result.json` is updated regardless of which wrapper/engine started it (`reason:result_updated` is always engine-agnostic), but it will report a session from a **different** wrapper/engine as `reason:exited` while the session is still running — a **false positive** caused by mismatched tmux prefixes (e.g. a agent-tmux codex watch cannot see an `agy-cli-*` tmux session). Only trust `reason:exited` when all workers were started by the same wrapper family.
 - **Preferred neutral entrypoint:** For heterogeneous fleets (mixed codex+agy+claude workers), `tmux-agent-sessions` is the preferred engine-neutral inventory and supervision surface (resolve/list/watch by name across all wrappers). It supports `--tool agy` natively and recognises `agy-cli-*` sessions alongside `claude-cli-*`, `codex-cli-*`, and `tmux-agent-dialogue-*`.
 
 Example: Watching a mixed fleet containing a `codex` and an `agy` session (`ios-deliv` and `ios-native`):
@@ -203,13 +203,13 @@ For **alternation markers** (e.g. wait for `[DONE]` OR `Need approval`), use `wa
 ## 4. Inspect, probe liveness, or clean up
 
 ```bash
-codex-tmux status worker
-codex-tmux status --json worker
-codex-tmux ping --json --timeout 5 worker
-codex-tmux env-doctor worker
-codex-tmux doctor
-codex-tmux self-test
-codex-tmux stop worker
+agent-tmux codex status worker
+agent-tmux codex status --json worker
+agent-tmux codex ping --json --timeout 5 worker
+agent-tmux codex env-doctor worker
+agent-tmux codex doctor
+agent-tmux codex self-test
+agent-tmux codex stop worker
 ```
 
 `status --json` is the passive liveness contract. Treat `running:false` as authoritative even if the tmux session still exists for capture. `ping --json --timeout <s>` is the active liveness check; it proves the pane responds to benign input, not that the agent has completed.
@@ -219,10 +219,10 @@ Use `env-doctor [name]` before deeper debugging when an agent CLI uses the wrong
 ## 5. Read the agent's structured result
 
 ```bash
-codex-tmux result --field '.status' --wait 30 --json worker
-codex-tmux result --field '.cli_session_id' --wait 30 worker
-codex-tmux result validate worker --json
-codex-tmux result wait-required worker --fields status,summary --wait 60 --json
+agent-tmux codex result --field '.status' --wait 30 --json worker
+agent-tmux codex result --field '.cli_session_id' --wait 30 worker
+agent-tmux codex result validate worker --json
+agent-tmux codex result wait-required worker --fields status,summary --wait 60 --json
 ```
 
 Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, canonical `status` (`success|failed|blocked|needs-input`), `summary`, `artifacts`, `errors`; review workflows may also include optional `verdict` and `decision` blocks. For `result_path_via_prompt=true` families (Codex and generic by default), the **first** prompt-bearing start/send injects the literal path **once per session** (sandboxed tool envs cannot expand `$TMUX_AGENT_RESULT`); follow-up sends and `send --raw` keystrokes are never prefixed, so answering a TUI prompt with a single key stays clean (#283). Use `result --path <name>` as the debug surface. Parent branches on `.present` -> `.valid` -> `.body` in that order. See `references/contracts.md`.
@@ -245,8 +245,8 @@ tmux-agent-dialogue pair-review \
   --summary-file /tmp/review-round-1.md
 
 # Between rounds, the human decides what should change next.
-codex-tmux send-wait reviewer 'Review the updated diff. Write result.json with verdict.verdict as ACCEPT, BLOCK, or ACCEPT_WITH_CHANGES, blockers as an array, and marker set to the nonce you end with.' 600
-codex-tmux result wait-required reviewer --fields status,summary,verdict --wait 60 --json
+agent-tmux codex send-wait reviewer 'Review the updated diff. Write result.json with verdict.verdict as ACCEPT, BLOCK, or ACCEPT_WITH_CHANGES, blockers as an array, and marker set to the nonce you end with.' 600
+agent-tmux codex result wait-required reviewer --fields status,summary,verdict --wait 60 --json
 
 # Repeat the send-wait/result pair for rounds 2..N until the human stops.
 ```
@@ -273,7 +273,7 @@ To pause a worker until a human writes a decision file:
 
 ```bash
 marker=/tmp/agent-7/approve.txt
-codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
+agent-tmux codex wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
   --timeout 300 --pause-until-file "$marker" --pause-timeout 1800 worker
 # Operator (another shell): echo approve > "$marker"  -> exit 0
 #                           echo reject  > "$marker"  -> exit 7

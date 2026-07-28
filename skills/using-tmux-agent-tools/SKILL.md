@@ -58,7 +58,7 @@ Do not claim that the external process itself is a native sub-agent.
 
 - Name the proxy `<cli>_<task>` using lowercase ASCII letters, digits, and
   underscores (`claude_auth_review`, `codex_test_fix`, `agy_ui_audit`).
-  `codex_<task>` means `codex-tmux`; reserve `native_<task>` for work performed
+  `codex_<task>` means `agent-tmux codex`; reserve `native_<task>` for work performed
   by a Codex in-process sub-agent without an external CLI.
 - Before dispatch, pass `model-dispatch.md` and `delegation-templates`. On
   Claude Code the proxy is a `general-purpose` sub-agent on `haiku`
@@ -103,8 +103,8 @@ progress are app behavior, not promises made by this skill.
 
 - Loop-shaped chain (audit / plan→build / consensus / triage) → the
   `using-workflows` skill, not this router.
-- ONE coding CLI as a supervised worker (most common) → `claude-tmux` /
-  `codex-tmux` / `agy-tmux` / `agent-tmux <cli>` (gemini, cursor, custom).
+- ONE coding CLI as a supervised worker (most common) → `agent-tmux <cli>`
+  (claude / codex / agy built in; gemini, cursor, custom via profile).
 - Same prompt across MANY workers → `tmux-agent-fanout`; bounded TWO-party
   exchange → `tmux-agent-dialogue`. BOTH require the user's explicit
   authorization for count, tool, model, and effort — never assume it.

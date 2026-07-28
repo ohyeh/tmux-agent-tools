@@ -5,7 +5,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.37.0'
+AGENT_TMUX_VERSION='0.38.0'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -1748,6 +1748,31 @@ _send_guarded_locked() {
   shift 2
   send_blocked_guard "$name" "$session" || return $?
   "$@"
+}
+
+# --- Dispatch gate receipt (runtime-agnostic) ------------------------------
+# Opt-in enforcement mirroring the Claude Code tmux-dispatch-gate hook for
+# runtimes without a hook system (Codex, agy). When
+# AGENT_TMUX_REQUIRE_GATE_RECEIPT is non-empty, every dispatch-shaped command
+# (start/resume/start-ssh/send/send-wait/send-wait-literal) requires the
+# receipt file named by AGENT_TMUX_GATE_RECEIPT to exist; otherwise the
+# command is refused with blocked JSON before touching tmux. The receipt is
+# created by the orchestrator only after passing the dispatch gate
+# (model-dispatch + delegation-templates).
+require_gate_receipt_guard() {
+  local cmd="$1"
+  [[ -n "${AGENT_TMUX_REQUIRE_GATE_RECEIPT:-}" ]] || return 0
+  local receipt="${AGENT_TMUX_GATE_RECEIPT:-}"
+  [[ -n "$receipt" && -f "$receipt" ]] && return 0
+  local diagnostic
+  if [[ -z "$receipt" ]]; then
+    diagnostic="AGENT_TMUX_REQUIRE_GATE_RECEIPT is set but AGENT_TMUX_GATE_RECEIPT is empty; export AGENT_TMUX_GATE_RECEIPT=<receipt file> and create it after passing the dispatch gate (model-dispatch + delegation-templates)."
+  else
+    diagnostic="dispatch gate receipt missing: $receipt. Create it only after passing the dispatch gate (model-dispatch + delegation-templates); loop-shaped work routes to a workflow recipe instead of hand-rolled dispatch."
+  fi
+  "$JQ" -cn --arg tool "$CLI" --arg command "$cmd" --arg diagnostic "$diagnostic" \
+    '{schema_version:1,submitted:false,blocked:true,blocked_reason:"gate_receipt_missing",diagnostic:$diagnostic,tool:$tool,command:$command}'
+  return 1
 }
 
 send_guarded_lock_around() {
@@ -3587,8 +3612,11 @@ secret_redact_apply() {
       sval="${sval%[$'\n\r']}"
     done
     [[ -z "$sval" ]] && continue
-    text="$(printf '%s' "$text" | awk -v s="$sval" -v r="[REDACTED:${skey}]" '
-      BEGIN { RS="\0"; ORS=""; n=length(s) }
+    # Pass the secret via ENVIRON, not `awk -v`: -v values get C-escape
+    # processing, so a secret containing backslashes (e.g. `\d`) is mangled
+    # and index() never matches — the secret would leak unredacted.
+    text="$(printf '%s' "$text" | REDACT_S="$sval" REDACT_R="[REDACTED:${skey}]" awk '
+      BEGIN { RS="\0"; ORS=""; s=ENVIRON["REDACT_S"]; r=ENVIRON["REDACT_R"]; n=length(s) }
       { out=""; while ((i=index($0,s))>0) { out=out substr($0,1,i-1) r; $0=substr($0,i+n) } print out $0 }')"
   done
   printf '%s' "$text"
@@ -7999,6 +8027,14 @@ command="${1:-help}"
 if [[ "$#" -gt 0 ]]; then
   shift
 fi
+
+# Runtime-agnostic dispatch gate: refuse dispatch-shaped commands when a gate
+# receipt is required but absent (see require_gate_receipt_guard).
+case "$command" in
+  start|resume|start-ssh|send|send-wait|send-wait-literal)
+    require_gate_receipt_guard "$command" || exit 1
+    ;;
+esac
 
 case "$command" in
   __fuse_watcher)

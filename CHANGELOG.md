@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+## v0.38.0 - 2026-07-28
+
+### Deprecated
+- The per-CLI shims `claude-tmux` / `codex-tmux` / `agy-tmux` are deprecated in
+  favor of the canonical `agent-tmux <cli> <command>` spelling. They keep
+  working through v0.38 but print a one-line stderr warning
+  (suppress with `AGENT_TMUX_SUPPRESS_DEPRECATION=1`); removal is planned for
+  v0.39. All docs, skills, references, and the wiki now use the canonical
+  spelling; `tmux-agent-fanout` and `tmux-agent-sessions` invoke
+  `agent-tmux <cli>` directly instead of resolving shim paths at runtime.
+  The `wrapper` display field in `tmux-agent-sessions` JSON keeps the legacy
+  names until the v0.39 removal.
+
+### Added
+- `start` now waits out transient CLI startup screens (new
+  `blocked_reason=startup_pending`, e.g. agy "Verifying your account
+  eligibility") before injecting the initial prompt, fails loudly at
+  `AGENT_TMUX_START_READY_TIMEOUT` (default 45s) if the screen never clears,
+  and blocks `send` paths while the screen shows. "Please run /login"
+  screens classify as `login_prompt`. (`scripts/test-start-readiness-smoke`)
+- Runtime-agnostic dispatch gate: when `AGENT_TMUX_REQUIRE_GATE_RECEIPT` is
+  set, dispatch-shaped commands (`start`/`resume`/`start-ssh`/`send`/
+  `send-wait`/`send-wait-literal`) are refused with
+  `blocked_reason=gate_receipt_missing` unless the receipt file named by
+  `AGENT_TMUX_GATE_RECEIPT` exists. Mirrors the Claude Code dispatch-gate
+  hook for runtimes without a hook system (Codex, agy).
+  (`scripts/test-gate-receipt-smoke`)
+- The Claude Code plugin now ships a `PreToolUse(Bash)` hook
+  (`hooks/hooks.json` + `hooks/tmux-dispatch-gate.sh`, moved here from
+  ohyeh/agent-scripts): GATE 1 requires a per-session dispatch receipt before
+  driving tmux workers from a parent session; GATE 2 routes the second
+  review-shaped dispatch of a session to a workflow recipe. Subagent
+  (supervision proxy) contexts pass through. The review-shape detector now
+  also sees names behind bare flags (`start --exact review_x`).
+  (`scripts/test-dispatch-gate-hook-smoke`)
+
+### Changed
+- `skills/tmux-agent-tools/SKILL.md` is repositioned as the mechanics
+  library; the `using-tmux-agent-tools` router skill is the single entry
+  point.
+
+### Fixed
+- Secret redaction: values containing backslashes (e.g. `\d`) leaked
+  unredacted from `capture` because `awk -v` C-escape processing mangled the
+  literal match value; the secret now reaches awk via `ENVIRON`, which does
+  no escape processing. (`test-secret-uri-smoke` regex-meta case)
+- `tmux-agent-sessions list`/`watch` died under `set -euo pipefail` whenever
+  the tmux server had no sessions at a poll tick (`tmux ls` exits 1), so
+  `watch` silently emitted no events on an otherwise idle machine; an empty
+  server now yields an empty inventory. (`test-sessions-watch-smoke`)
+
 ## v0.37.0 - 2026-07-26
 
 ### Changed

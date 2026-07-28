@@ -3,7 +3,7 @@
 #
 # Designed to be chained with #95 `--on-exit`:
 #
-#   claude-tmux start --sentinel /tmp/x.exit \
+#   agent-tmux claude start --sentinel /tmp/x.exit \
 #     --on-exit 'tmux-agent-notify --webhook https://hooks.slack.com/... --format slack' \
 #     worker ~/project
 #

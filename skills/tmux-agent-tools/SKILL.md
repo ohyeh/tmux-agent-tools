@@ -1,6 +1,6 @@
 ---
 name: tmux-agent-tools
-description: Use when running or supervising AI coding CLIs as managed tmux workers via agent-tmux, claude-tmux, codex-tmux, agy-tmux, or tmux-agent-sessions. Covers start/send-wait/status/result/stop, structured result.json completion, multi-worker watch, profiles for custom CLIs, and bounded dialogue/fanout. Not for general tmux config, theming, non-tmux headless CLI use, or human team debate.
+description: Mechanics library for running AI coding CLIs as managed tmux workers via agent-tmux <cli> <command> (plus tmux-agent-sessions and the other bundled tools). Entry point is the using-tmux-agent-tools router skill — route through it first; read this skill for wrapper mechanics it defers to. Covers start/send-wait/status/result/stop, structured result.json completion, multi-worker watch, profiles for custom CLIs, and bounded dialogue/fanout. Not for general tmux config, theming, non-tmux headless CLI use, or human team debate.
 ---
 
 # Tmux Agent Tools
@@ -17,7 +17,7 @@ Non-negotiable rules:
 Fast answers:
 
 - **Bounded task with no follow-ups?** Default to `start --headless`: the CLI runs non-interactively (`claude -p` / `codex exec`), completion is the process exit, and `result wait-required` returns immediately at exit (a contract-valid result.json is synthesized from exit code + stdout when the worker didn't write one). No TUI quirks, no pane-heuristic WAITING stalls. Interactive `start` is only for work that needs follow-up sends or mid-run supervision.
-- **Wrapper not on PATH?** Run it from this bundle: `<skill-dir>/scripts/codex-tmux …`.
+- **Wrapper not on PATH?** Run it from this bundle: `<skill-dir>/scripts/agent-tmux codex …`.
 - **Auto-delegate substantial work?** Use the inline-vs-worker gate in the `using-tmux-agent-tools` skill (absorbed there, no longer a separate subagent); details live in `references/core-workflow.md`.
 - **Long-running external CLI worker (Codex or Claude Code)?** When native sub-agents are available, MUST spawn exactly one cheap supervision-only proxy named `<cli>_<task>` (on Claude Code: a `general-purpose` sub-agent on `haiku`). The proxy exclusively owns the existing wrapper and makes one blocking `supervise` call; the parent MUST NOT run `start`/`send-wait` or poll that worker directly. See `references/core-workflow.md#native-proxy-for-an-external-cli-worker`.
 - **Writing the worker prompt?** Shape it with the `delegation-templates` skill: GOAL / ACCEPTANCE / REPORT + common footer, plus its tmux addendum (no-cascade ban + literal result path).
@@ -25,7 +25,7 @@ Fast answers:
 
 ## Overview
 
-`agent-tmux <cli> <command>` runs any AI coding CLI as a managed tmux worker. `claude-tmux`/`codex-tmux`/`agy-tmux` are shims for common CLIs (`claude-tmux start …` = `agent-tmux claude start …`). Other CLIs use `agent-tmux <cli>` plus an optional profile.
+`agent-tmux <cli> <command>` runs any AI coding CLI as a managed tmux worker; claude/codex/agy are built-in presets, other CLIs use an optional profile. The old `claude-tmux`/`codex-tmux`/`agy-tmux` shims are DEPRECATED (removal: v0.39) — always spell `agent-tmux <cli> <command>`.
 
 ## Required preflight and safe invocation
 
@@ -55,7 +55,7 @@ Before the first worker command:
 
 | Need | Use |
 | --- | --- |
-| Run Claude Code / Codex / agy as a worker | `claude-tmux` / `codex-tmux` / `agy-tmux` |
+| Run Claude Code / Codex / agy as a worker | `agent-tmux claude` / `agent-tmux codex` / `agent-tmux agy` |
 | Any other CLI (gemini, cursor, grok, custom) | `agent-tmux <cli>` (+ optional profile) |
 | **Bounded task, result only, no follow-ups** | `start --headless` — headless one-shot (`claude -p` / `codex exec`), completion = process exit, no TUI/pane heuristics, no WAITING stalls |
 | Interactive worker (follow-up sends, supervision) | `start` |
@@ -80,20 +80,20 @@ Full capability table (every subcommand + when to use it): `references/cheatshee
 
 ```bash
 # Bounded one-shot (headless, preferred for fire-and-collect tasks):
-codex-tmux start --exact --headless job ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
-codex-tmux result wait-required job --fields status,summary --wait 600 --json   # returns at process exit
-codex-tmux supervise --result-required --silent-while-unchanged --json job       # one silent call until terminal event
-codex-tmux stop job
+agent-tmux codex start --exact --headless job ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
+agent-tmux codex result wait-required job --fields status,summary --wait 600 --json   # returns at process exit
+agent-tmux codex supervise --result-required --silent-while-unchanged --json job       # one silent call until terminal event
+agent-tmux codex stop job
 
 # Interactive one-worker flow (only when follow-ups are needed): start -> send-wait -> supervise -> stop.
-codex-tmux start --exact worker ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
-codex-tmux send-wait worker 'Follow-up instruction.' 180
-codex-tmux status --json worker
-codex-tmux result --json --wait 30 worker
-codex-tmux stop worker
+agent-tmux codex start --exact worker ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
+agent-tmux codex send-wait worker 'Follow-up instruction.' 180
+agent-tmux codex status --json worker
+agent-tmux codex result --json --wait 30 worker
+agent-tmux codex stop worker
 
 # Multiple workers: block on first/all/N completion with one bounded call.
-codex-tmux watch --any --timeout 600 --json w1 w2 w3
+agent-tmux codex watch --any --timeout 600 --json w1 w2 w3
 ```
 
 Full walkthrough: `references/core-workflow.md`.
@@ -103,8 +103,8 @@ Full walkthrough: `references/core-workflow.md`.
 Agents write `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, canonical `status` (`success|failed|blocked|needs-input`), `summary`, `artifacts`, and `errors` (optional `verdict`/`decision`). Codex/generic prompt sends inject the literal result path once per session; the worker cannot rely on `$TMUX_AGENT_RESULT` inside tool sandboxes. Branch in this order — never scrape the pane when a valid result exists: `.present -> .valid -> .body`.
 
 ```bash
-codex-tmux result --json --wait 30 worker
-codex-tmux supervise --result-required --silent-while-unchanged --json worker
+agent-tmux codex result --json --wait 30 worker
+agent-tmux codex supervise --result-required --silent-while-unchanged --json worker
 ```
 
 If `.present:false`, the agent never wrote the file — re-prompt with the literal path from `result --path <name>`. Full schema, worked example, `status --json` fields, approval-gate exit codes, concurrency model: `references/contracts.md`.

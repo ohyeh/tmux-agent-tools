@@ -9,8 +9,9 @@ tmux-agent-tools/
 ├── skills/tmux-agent-tools/
 │   ├── SKILL.md                       # canonical command reference
 │   └── scripts/
-│       ├── claude-tmux                # main wrapper for Claude Code
-│       ├── codex-tmux                 # main wrapper for Codex CLI
+│       ├── agent-tmux                 # unified wrapper engine (agent-tmux <cli> <command>)
+│       ├── claude-tmux                # deprecated shim (removal: v0.39)
+│       ├── codex-tmux                 # deprecated shim (removal: v0.39)
 │       ├── tmux-agent-dialogue        # bounded two-agent dialogue
 │       ├── tmux-agent-sessions        # cross-agent inventory
 │       ├── tmux-agent-fanout          # parallel run across agents

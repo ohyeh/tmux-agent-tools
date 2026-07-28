@@ -5,7 +5,7 @@
     {
       "id": 1,
       "prompt": "用 codex-tmux 開一個 persistent worker 修這個 bug，後面我還會追問。",
-      "expected_output": "ROUTE. The user explicitly requests a managed persistent worker; select codex-tmux after preflight and use start/send-wait/result/stop semantics.",
+      "expected_output": "ROUTE. The user explicitly requests a managed persistent worker; select agent-tmux codex after preflight and use start/send-wait/result/stop semantics.",
       "files": []
     },
     {
@@ -41,19 +41,19 @@
     {
       "id": 7,
       "prompt": "把 Claude CLI 派去做 auth review，而且我要在 Codex App 的 Subagents 看得到它。",
-      "expected_output": "ROUTE. With authorized native sub-agents, prefer gpt-5.6-luna for one supervision-only proxy named claude_auth_review; it drives exactly one claude-tmux worker and validates result.json. Do not claim the external Claude process itself is native.",
+      "expected_output": "ROUTE. With authorized native sub-agents, prefer gpt-5.6-luna for one supervision-only proxy named claude_auth_review; it drives exactly one agent-tmux claude worker and validates result.json. Do not claim the external Claude process itself is native.",
       "files": []
     },
     {
       "id": 8,
       "prompt": "用 agy headless 跑研究工作，在 Subagents 顯示並定期告訴我進度。",
-      "expected_output": "ROUTE. Prefer gpt-5.6-luna for one native proxy named agy_research, launch exactly one agy-tmux headless worker, summarize only material changes, heartbeat within 60 seconds, and finish from valid result.json or process failure.",
+      "expected_output": "ROUTE. Prefer gpt-5.6-luna for one native proxy named agy_research, launch exactly one agent-tmux agy headless worker, summarize only material changes, heartbeat within 60 seconds, and finish from valid result.json or process failure.",
       "files": []
     },
     {
       "id": 9,
       "prompt": "開 codex CLI persistent worker 修功能，Subagents 只要讓我知道最新 pane 進度和它還活著。",
-      "expected_output": "ROUTE. Prefer gpt-5.6-luna for one native proxy named codex_feature_fix, launch codex-tmux in headed mode, report passive status/probe/capture evidence, ping only when stale, and preserve the session for expected follow-ups.",
+      "expected_output": "ROUTE. Prefer gpt-5.6-luna for one native proxy named codex_feature_fix, launch agent-tmux codex in headed mode, report passive status/probe/capture evidence, ping only when stale, and preserve the session for expected follow-ups.",
       "files": []
     },
     {

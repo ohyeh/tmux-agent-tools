@@ -5,7 +5,7 @@ Three surfaces work together to keep agent runs inspectable without leaking what
 ## Transcript: per-agent event log
 
 ```bash
-codex-tmux start --exact worker ~/repo --transcript /tmp/worker.jsonl '...'
+agent-tmux codex start --exact worker ~/repo --transcript /tmp/worker.jsonl '...'
 ```
 
 Every wrapper event is appended as JSONL: `start`, `send`, `wait_*` (matched / timeout / stable / session_gone), `capture`, `stop`. Each line carries `schema_version: 1`, ISO-8601 UTC timestamp, and event-specific fields.
@@ -13,7 +13,7 @@ Every wrapper event is appended as JSONL: `start`, `send`, `wait_*` (matched / t
 For oversized text payloads, opt into truncation:
 
 ```bash
-codex-tmux start --exact worker ~/repo \
+agent-tmux codex start --exact worker ~/repo \
   --transcript /tmp/worker.jsonl \
   --transcript-text-truncate 1024 \
   '...'
@@ -24,7 +24,7 @@ When a `send` text exceeds the threshold, the transcript records `text: "[trunca
 For first-class multi-line injection, use:
 
 ```bash
-codex-tmux send --from-file /abs/handoff.md --enter-count 3 worker
+agent-tmux codex send --from-file /abs/handoff.md --enter-count 3 worker
 ```
 
 The `send --from-file` transcript event carries `multiline: true`, `bytes`, and
@@ -65,13 +65,13 @@ Audit logging is enabled by default. Use these overrides when needed:
 
 ```bash
 # Per-invocation flag (recommended):
-codex-tmux start --audit-log --exact worker ~/repo '...'
+agent-tmux codex start --audit-log --exact worker ~/repo '...'
 
 # Explicit path (pre-existing surface):
-TMUX_AGENT_TOOLS_AUDIT_LOG=/var/log/tmux-agent.audit.jsonl codex-tmux start --exact worker ~/repo '...'
+TMUX_AGENT_TOOLS_AUDIT_LOG=/var/log/tmux-agent.audit.jsonl agent-tmux codex start --exact worker ~/repo '...'
 
 # Explicit opt-out:
-AUDIT_LOG=0 codex-tmux start --exact worker ~/repo '...'
+AUDIT_LOG=0 agent-tmux codex start --exact worker ~/repo '...'
 ```
 
 Default path: `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/audit.jsonl`.
@@ -106,7 +106,7 @@ Size-triggered. Defaults: `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=10485760` (10 MB), `
 
 ## `--secret KEY=URI`: env injection without leakage
 
-`claude-tmux start` and `codex-tmux start` accept repeated `--secret KEY=URI`. The URI scheme picks the backend; the resolved value is exported as `$KEY` to the agent CLI's process.
+`agent-tmux claude start` and `agent-tmux codex start` accept repeated `--secret KEY=URI`. The URI scheme picks the backend; the resolved value is exported as `$KEY` to the agent CLI's process.
 
 ### Backends
 
@@ -131,7 +131,7 @@ Registered secret values are scrubbed from `capture` output and transcript event
 ### Safe end-to-end example
 
 ```bash
-codex-tmux start --exact agent-x ~/work \
+agent-tmux codex start --exact agent-x ~/work \
   --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
   --secret SENTRY_DSN=keychain:default/sentry-dsn \
   --audit-log \

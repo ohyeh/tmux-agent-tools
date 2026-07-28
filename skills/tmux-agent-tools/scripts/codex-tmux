@@ -1,3 +1,6 @@
 #!/usr/bin/env zsh
-# codex-tmux — thin preset shim over agent-tmux. See docs/agent-tmux-design.md.
+# codex-tmux — DEPRECATED shim over agent-tmux; use `agent-tmux codex <command>`.
+# Kept working through v0.38; removal planned for v0.39.
+[[ -z "${AGENT_TMUX_SUPPRESS_DEPRECATION:-}" ]] && \
+  print -u2 -- "codex-tmux is deprecated; use: agent-tmux codex <command> (removal: v0.39)"
 exec "${0:A:h}/agent-tmux" codex "$@"

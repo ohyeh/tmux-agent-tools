@@ -19,8 +19,8 @@ A set of bash wrappers and helper binaries that turn the agent CLIs into somethi
 
 | Capability | Tool |
 | --- | --- |
-| Run a Claude/Codex worker in tmux | `claude-tmux` / `codex-tmux` |
-| Resume an existing CLI session inside tmux | `claude-tmux resume` / `codex-tmux resume` |
+| Run a Claude/Codex worker in tmux | `agent-tmux claude` / `agent-tmux codex` |
+| Resume an existing CLI session inside tmux | `agent-tmux claude resume` / `agent-tmux codex resume` |
 | Read-only inventory across all agents | `tmux-agent-sessions list` |
 | Bounded two-agent dialogue | `tmux-agent-dialogue` (with `critic` / `debate` / `pair-review` presets) |
 | Parallel agents on one prompt | `tmux-agent-fanout` |

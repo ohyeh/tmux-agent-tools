@@ -5,7 +5,7 @@ Small tmux wrappers for running Claude Code and Codex CLI as controllable named 
 This repository is both:
 
 - a `skills.sh` compatible skill package;
-- a Homebrew formula source for installing `claude-tmux`, `codex-tmux`, `tmux-agent-dialogue`, and unreleased `--HEAD` tools on macOS or Linuxbrew.
+- a Homebrew formula source for installing `agent-tmux`, `tmux-agent-dialogue`, and unreleased `--HEAD` tools on macOS or Linuxbrew (the deprecated `claude-tmux`/`codex-tmux` shims are still linked until their v0.39 removal).
 
 ## Inspired By
 
@@ -18,11 +18,10 @@ This project is inspired by two tmux skills in the `skills.sh` ecosystem:
 
 ## Tools
 
-- `claude-tmux`: starts Claude Code in tmux with `--dangerously-skip-permissions`.
-- `codex-tmux`: starts Codex CLI in tmux with `--yolo`.
+- `agent-tmux <cli>`: starts any AI coding CLI in tmux (`agent-tmux claude` uses `--dangerously-skip-permissions`, `agent-tmux codex` uses `--yolo`, `agent-tmux agy` is built in; others via profiles). The per-CLI shims `claude-tmux`/`codex-tmux`/`agy-tmux` are DEPRECATED, removal planned for v0.39.
 - `tmux-agent-dialogue`: runs a bounded two-party tmux dialogue, writes a JSONL transcript, and validates transcript artifacts.
 - `tmux-agent-sessions`: lists and safely cleans up tmux-agent-tools owned sessions.
-- `tmux-agent-fanout`: synchronous fan-out coordinator across mixed `claude-tmux` / `codex-tmux` wrappers (issue #184).
+- `tmux-agent-fanout`: synchronous fan-out coordinator across mixed `agent-tmux claude` / `agent-tmux codex` workers (issue #184).
 
 ### Fanout (mixed wrappers, one prompt)
 
@@ -53,7 +52,7 @@ Merge modes: `all` (default — `ok=true` iff every agent ok) or
 recorded — they are NOT killed). Majority/custom modes are explicitly
 deferred.
 
-The `claude-tmux` and `codex-tmux` wrapper tools support:
+The `agent-tmux <cli>` wrapper supports:
 
 - `start`
 - `resume`
@@ -77,7 +76,7 @@ The `claude-tmux` and `codex-tmux` wrapper tools support:
 - `stop`
 - `help`
 
-`tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `claude-tmux`, `codex-tmux`, and `tmux-agent-dialogue` sessions. Claude and Codex inventory rows reuse the wrapper `status --json` contract and add `state` (`running`, `exited`, `stopped`, or wrapper-reported `missing`), so a pane that remains capturable after an exit-code marker is not reported as still running. Dialogue rows are tmux inventory rows and use conservative `running` state while the session exists. Use `--tool`, `--name`, `--state`, and `--sort <tool|name|session|state>` to make list output script-friendly without changing cleanup behavior. `tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>]` polls that inventory for a finite number of snapshots and emits one JSON array per poll; `--count 0` exits successfully without polling, and list filters/sorting apply to each snapshot. `tmux-agent-sessions cleanup --preview` is also read-only and includes the same state in JSON mode; combine `--preview --json` with `--tool` or `--name` for scriptable cleanup decisions before executing. `cleanup --execute` is required before it stops tool-owned sessions, execution must include `--all`, `--tool`, or `--name`, and `--json` is only accepted for preview. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
+`tmux-agent-sessions list [--json]` gives a read-only cross-tool inventory for `agent-tmux claude`, `agent-tmux codex`, and `tmux-agent-dialogue` sessions. Claude and Codex inventory rows reuse the wrapper `status --json` contract and add `state` (`running`, `exited`, `stopped`, or wrapper-reported `missing`), so a pane that remains capturable after an exit-code marker is not reported as still running. Dialogue rows are tmux inventory rows and use conservative `running` state while the session exists. Use `--tool`, `--name`, `--state`, and `--sort <tool|name|session|state>` to make list output script-friendly without changing cleanup behavior. `tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>]` polls that inventory for a finite number of snapshots and emits one JSON array per poll; `--count 0` exits successfully without polling, and list filters/sorting apply to each snapshot. `tmux-agent-sessions cleanup --preview` is also read-only and includes the same state in JSON mode; combine `--preview --json` with `--tool` or `--name` for scriptable cleanup decisions before executing. `cleanup --execute` is required before it stops tool-owned sessions, execution must include `--all`, `--tool`, or `--name`, and `--json` is only accepted for preview. It never stops tmux sessions outside the known tmux-agent-tools prefixes.
 
 `tmux-agent-sessions` is included in the stable Homebrew install starting with `v0.3.0`.
 
@@ -92,18 +91,18 @@ Local and SSH sessions keep the pane open after the agent CLI exits, showing the
 Resume an existing Claude Code conversation inside a managed tmux session:
 
 ```bash
-claude-tmux resume --exact resume ~/tmux-agent-tools ee5aca88-a1af-48d3-af21-54f60d618f22
+agent-tmux claude resume --exact resume ~/tmux-agent-tools ee5aca88-a1af-48d3-af21-54f60d618f22
 ```
 
-This launches Claude as `claude --dangerously-skip-permissions --resume <session-id>` while preserving the usual `claude-tmux status`, `capture`, `send`, `attach`, and `stop` controls.
+This launches Claude as `claude --dangerously-skip-permissions --resume <session-id>` while preserving the usual `agent-tmux claude status`, `capture`, `send`, `attach`, and `stop` controls.
 
 Resume an existing Codex conversation inside a managed tmux session:
 
 ```bash
-codex-tmux resume --exact resume ~/tmux-agent-tools 019e356f-f95d-7570-9784-ea7b58e404a5
+agent-tmux codex resume --exact resume ~/tmux-agent-tools 019e356f-f95d-7570-9784-ea7b58e404a5
 ```
 
-This launches Codex as `codex --yolo resume <session-id>` while preserving the usual `codex-tmux status`, `capture`, `send`, `attach`, and `stop` controls.
+This launches Codex as `codex --yolo resume <session-id>` while preserving the usual `agent-tmux codex status`, `capture`, `send`, `attach`, and `stop` controls.
 
 `tmux-agent-dialogue` is included in the stable Homebrew install starting with `v0.2.0`. Its credential-free `fake` participants are covered by CI; real `codex`/`claude` participants are accepted by the command and should still use manual smoke evidence rather than default CI.
 
@@ -135,8 +134,8 @@ Claude Code (the repository is its own marketplace):
 Codex CLI and Cursor read `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json`
 respectively from a clone of this repository; both expose the same skill.
 
-The plugin installs the skill, not the `*-tmux` binaries. To get `claude-tmux`,
-`codex-tmux`, and the helpers on `PATH`, still use Homebrew or `install-bin` below; the
+The plugin installs the skill, not the `*-tmux` binaries. To get `agent-tmux`
+and the helpers on `PATH`, still use Homebrew or `install-bin` below; the
 skill resolves the bundled scripts from its own directory when they are not on `PATH`.
 
 ## Install Commands With Homebrew
@@ -183,17 +182,17 @@ brew style ohyeh/tmux-agent-tools/tmux-agent-tools
 ## Usage
 
 ```bash
-codex-tmux start --exact worker ~/github/project 'Read the repo and report status.'
-codex-tmux send-wait worker 'Run the targeted tests.' 180
-codex-tmux send --from-file /tmp/large-prompt.md --enter-count 3 worker
-codex-tmux send-wait-literal worker 'Reply with the marker described in this prompt.' '[CODEX-01]' 180
-codex-tmux wait worker 180
-codex-tmux wait-text worker 'Done|Need approval' 180
-codex-tmux wait-text --literal worker '[CODEX-01]' 180
-codex-tmux wait-literal worker '[CODEX-01]' 180
-codex-tmux capture worker 120
-codex-tmux status --json worker
-codex-tmux stop worker
+agent-tmux codex start --exact worker ~/github/project 'Read the repo and report status.'
+agent-tmux codex send-wait worker 'Run the targeted tests.' 180
+agent-tmux codex send --from-file /tmp/large-prompt.md --enter-count 3 worker
+agent-tmux codex send-wait-literal worker 'Reply with the marker described in this prompt.' '[CODEX-01]' 180
+agent-tmux codex wait worker 180
+agent-tmux codex wait-text worker 'Done|Need approval' 180
+agent-tmux codex wait-text --literal worker '[CODEX-01]' 180
+agent-tmux codex wait-literal worker '[CODEX-01]' 180
+agent-tmux codex capture worker 120
+agent-tmux codex status --json worker
+agent-tmux codex stop worker
 ```
 
 Default to `send-wait` for follow-up work: it sends the prompt, injects a fresh nonce, and waits for that nonce so stale pane text cannot satisfy the new turn. Bare `send` is a paste-and-submit helper for cases where you will verify submission another way.
@@ -209,7 +208,7 @@ Captured pane text joins tmux soft-wrapped screen lines before matching or writi
 `capture` supports three optional post-processing flags that let the wrapper trim output BEFORE returning it, so the caller does not pay token cost for boilerplate or pre-marker scrollback:
 
 ```bash
-codex-tmux capture --strip-ansi --since-marker '[T02]' --json worker 200
+agent-tmux codex capture --strip-ansi --since-marker '[T02]' --json worker 200
 ```
 
 | Flag | Behavior |
@@ -247,8 +246,8 @@ watching for pane changes. `probe` answers "what CLI-specific progress signal is
 visible?" by parsing the pane tail in the wrapper:
 
 ```bash
-claude-tmux probe --metric context_percent --json reviewer
-codex-tmux probe --metric progress --json worker
+agent-tmux claude probe --metric context_percent --json reviewer
+agent-tmux codex probe --metric progress --json worker
 ```
 
 Claude metrics: `context_percent`, `goal_active`, `active_spinner`. Codex
@@ -264,10 +263,10 @@ file so single-agent sessions get the same audit-trail shape as
 `tmux-agent-dialogue`:
 
 ```bash
-codex-tmux start --exact --transcript /tmp/worker.jsonl worker ~/proj
-codex-tmux send worker 'do step 1'
-codex-tmux capture worker 20
-codex-tmux stop worker
+agent-tmux codex start --exact --transcript /tmp/worker.jsonl worker ~/proj
+agent-tmux codex send worker 'do step 1'
+agent-tmux codex capture worker 20
+agent-tmux codex stop worker
 cat /tmp/worker.jsonl
 # {"schema_version":1,"event":"start","tool":"codex","name":"worker", ...}
 # {"schema_version":1,"event":"send","name":"worker","text":"do step 1","at": ...}
@@ -298,7 +297,7 @@ pattern is so common that the wrappers ship a single `wait-and-capture`
 subcommand for it:
 
 ```bash
-codex-tmux wait-and-capture --literal --marker '[DONE]' --strip-ansi --json worker
+agent-tmux codex wait-and-capture --literal --marker '[DONE]' --strip-ansi --json worker
 ```
 
 | Flag | Behavior |
@@ -325,7 +324,7 @@ decision to that file.
 ```bash
 # Agent: wait for "[NEEDS-APPROVAL]" and pause for human review.
 marker=/tmp/agent-7/approve.txt
-codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
+agent-tmux codex wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
   --pause-until-file "$marker" --pause-timeout 1800 worker
 rc=$?
 
@@ -382,10 +381,10 @@ time. Existing files are never rewritten.
 Read the result with the new `result` subcommand:
 
 ```bash
-codex-tmux result worker                # cat result.json
-codex-tmux result --field .status worker
-codex-tmux result --wait 180 worker     # block up to 180s for the file
-codex-tmux result --json worker         # metadata-wrapped output
+agent-tmux codex result worker                # cat result.json
+agent-tmux codex result --field .status worker
+agent-tmux codex result --wait 180 worker     # block up to 180s for the file
+agent-tmux codex result --json worker         # metadata-wrapped output
 ```
 
 | Flag | Behavior |
@@ -396,10 +395,10 @@ codex-tmux result --json worker         # metadata-wrapped output
 
 ### Event-driven completion (sentinel + lifecycle hooks)
 
-`claude-tmux` and `codex-tmux` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.
+`agent-tmux claude` and `agent-tmux codex` can write an **exit-code sentinel file** when the underlying CLI exits, and optionally invoke a hook command. This lets external automation wait on a real file instead of polling pane text.
 
 ```bash
-codex-tmux start --exact --sentinel /tmp/worker.exit --on-exit /usr/local/bin/notify-done worker ~/github/project
+agent-tmux codex start --exact --sentinel /tmp/worker.exit --on-exit /usr/local/bin/notify-done worker ~/github/project
 # ... later, an external watcher does:
 while [[ ! -f /tmp/worker.exit ]]; do sleep 1; done
 exit_code=$(cat /tmp/worker.exit)
@@ -443,18 +442,18 @@ Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, a
 Reliability checks:
 
 ```bash
-codex-tmux doctor
-codex-tmux self-test
-claude-tmux doctor
-claude-tmux self-test
+agent-tmux codex doctor
+agent-tmux codex self-test
+agent-tmux claude doctor
+agent-tmux claude self-test
 ```
 
-`claude-tmux status <name>` and `codex-tmux status <name>` report diagnostics when the pane appears to be waiting for known first-run, permission, approval, SSH, or login prompts. They do not auto-accept prompts; attach or capture the pane and make the decision explicitly.
+`agent-tmux claude status <name>` and `agent-tmux codex status <name>` report diagnostics when the pane appears to be waiting for known first-run, permission, approval, SSH, or login prompts. They do not auto-accept prompts; attach or capture the pane and make the decision explicitly.
 
 Remote run with local tmux:
 
 ```bash
-claude-tmux start-ssh --exact review example-host ~/github/project 'Review the diff.'
+agent-tmux claude start-ssh --exact review example-host ~/github/project 'Review the diff.'
 ```
 
 Bounded dialogue with JSONL transcript:
@@ -593,9 +592,9 @@ Both wrappers ship a hash-chained JSONL audit log (#119). The
 
 ```bash
 # audit is enabled by default; use these to choose a path
-claude-tmux --audit-log /var/log/tmux-agent.jsonl start ...
-TMUX_AGENT_TOOLS_AUDIT_LOG=/path codex-tmux start ...     # v0.10 contract
-AUDIT_LOG=0 codex-tmux start ...                          # explicit opt-out
+agent-tmux claude --audit-log /var/log/tmux-agent.jsonl start ...
+TMUX_AGENT_TOOLS_AUDIT_LOG=/path agent-tmux codex start ...     # v0.10 contract
+AUDIT_LOG=0 agent-tmux codex start ...                          # explicit opt-out
 
 # verify chain integrity
 tmux-agent-audit verify --log /var/log/tmux-agent.jsonl
@@ -620,21 +619,21 @@ Schema documented in `docs/design-issue-188-audit-surface.md`.
 
 - `zsh`
 - `tmux`
-- `claude` on `PATH` for `claude-tmux`
-- `codex` on `PATH` for `codex-tmux`
+- `claude` on `PATH` for `agent-tmux claude`
+- `codex` on `PATH` for `agent-tmux codex`
 
 Override binary paths when needed:
 
 ```bash
-TMUX=/opt/homebrew/bin/tmux CLAUDE=~/.local/bin/claude claude-tmux help
-CODEX=/path/to/codex codex-tmux help
+TMUX=/opt/homebrew/bin/tmux CLAUDE=~/.local/bin/claude agent-tmux claude help
+CODEX=/path/to/codex agent-tmux codex help
 ```
 
 ## Codex Skill
 
 ### Secret injection (`--secret KEY=URI`, #189)
 
-`claude-tmux start` and `codex-tmux start` accept one or more `--secret KEY=URI`
+`agent-tmux claude start` and `agent-tmux codex start` accept one or more `--secret KEY=URI`
 flags to inject a value into the tmux session env. Supported URI backends:
 
 | URI                                | Source                                                  |
@@ -659,7 +658,7 @@ written.
 Example (safe):
 
 ```bash
-codex-tmux start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
+agent-tmux codex start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
   agent-x ~/work
 ```
 
@@ -672,8 +671,9 @@ skills/tmux-agent-tools
 The shell wrappers live inside the skill package:
 
 ```text
-skills/tmux-agent-tools/scripts/claude-tmux
-skills/tmux-agent-tools/scripts/codex-tmux
+skills/tmux-agent-tools/scripts/agent-tmux
+skills/tmux-agent-tools/scripts/claude-tmux   # deprecated shim (removal: v0.39)
+skills/tmux-agent-tools/scripts/codex-tmux    # deprecated shim (removal: v0.39)
 ```
 
 Install it into Codex skill discovery with:

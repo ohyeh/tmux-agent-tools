@@ -1,0 +1,74 @@
+#!/usr/bin/env zsh
+# Smoke test for the runtime-agnostic dispatch gate: when
+# AGENT_TMUX_REQUIRE_GATE_RECEIPT is set, dispatch-shaped commands
+# (start/send*) must be refused with blocked_reason=gate_receipt_missing
+# unless the file named by AGENT_TMUX_GATE_RECEIPT exists. Non-dispatch
+# commands (help/status) stay ungated. No tmux sessions are spawned:
+# blocked paths exit before tmux, allowed paths use `start --dry-run`.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-gate-receipt.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$WORK/fake.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+echo "case: gate off (env unset) -> start --dry-run passes"
+code=0
+env CODEX="$WORK/fake.sh" "$AGENT_TMUX" codex start --exact --dry-run gate-off "$WORK" >/dev/null 2>&1 || code=$?
+assert "ungated dry-run exit=0" "$code" "0"
+
+echo "case: gate on, receipt var unset -> start blocked"
+code=0
+out="$(env CODEX="$WORK/fake.sh" AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 \
+  "$AGENT_TMUX" codex start --exact --dry-run gate-novar "$WORK" 2>&1)" || code=$?
+json_line="${out##*$'\n'}"
+assert "no-var start exit=1" "$code" "1"
+assert "no-var blocked_reason" "$(printf '%s' "$json_line" | jq -r .blocked_reason)" "gate_receipt_missing"
+assert "no-var submitted=false" "$(printf '%s' "$json_line" | jq -r .submitted)" "false"
+
+echo "case: gate on, receipt file missing -> send blocked before session resolution"
+code=0
+out="$(env AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 AGENT_TMUX_GATE_RECEIPT="$WORK/receipt" \
+  "$AGENT_TMUX" codex send no-such-session "text" 2>&1)" || code=$?
+json_line="${out##*$'\n'}"
+assert "missing-file send exit=1" "$code" "1"
+assert "missing-file blocked_reason" "$(printf '%s' "$json_line" | jq -r .blocked_reason)" "gate_receipt_missing"
+assert "missing-file command field" "$(printf '%s' "$json_line" | jq -r .command)" "send"
+
+echo "case: gate on, receipt present -> start --dry-run passes"
+touch "$WORK/receipt"
+code=0
+env CODEX="$WORK/fake.sh" AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 AGENT_TMUX_GATE_RECEIPT="$WORK/receipt" \
+  "$AGENT_TMUX" codex start --exact --dry-run gate-ok "$WORK" >/dev/null 2>&1 || code=$?
+assert "receipt-present dry-run exit=0" "$code" "0"
+
+echo "case: gate on -> non-dispatch commands stay ungated"
+code=0
+out="$(env AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 "$AGENT_TMUX" codex help 2>&1)" || code=$?
+assert "help exit=0 under gate" "$code" "0"
+if [[ "$out" == *gate_receipt_missing* ]]; then
+  echo "  FAIL help was gate-blocked" >&2; FAIL=$((FAIL + 1))
+else
+  echo "  ok   help not gate-blocked"; PASS=$((PASS + 1))
+fi
+
+echo "gate-receipt smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

@@ -4,7 +4,7 @@ Read this when reading or writing `result.json`, parsing `status --json`, planni
 
 ## `status --json` stable fields
 
-The shared automation contract for both `claude-tmux status --json` and `codex-tmux status --json`. Stable fields:
+The shared automation contract for both `agent-tmux claude status --json` and `agent-tmux codex status --json`. Stable fields:
 
 - `tool` — `claude` or `codex`
 - `name` — agent name
@@ -62,7 +62,7 @@ Parent reads it via `result --json --wait <seconds> <name>`. Always branch in th
 Worked example:
 
 ```bash
-$ codex-tmux result --json --wait 30 worker
+$ agent-tmux codex result --json --wait 30 worker
 {
   "present": true,
   "valid": true,
@@ -99,7 +99,7 @@ Exit codes from `wait-and-capture --pause-until-file`:
 
 ## CI-mode exit codes
 
-`claude-tmux start --ci` / `codex-tmux start --ci` (or `CLAUDE_TMUX_CI=1` / `CODEX_TMUX_CI=1`) exit with a stable contract — branch on the code, don't parse output:
+`agent-tmux claude start --ci` / `agent-tmux codex start --ci` (or `CLAUDE_TMUX_CI=1` / `CODEX_TMUX_CI=1`) exit with a stable contract — branch on the code, don't parse output:
 
 | Code | Meaning |
 |------|---------|

@@ -208,11 +208,10 @@ echo "tmux-agent-fanout: result-dir=$result_dir" >&2
 # -------- Resolve wrappers --------
 
 SCRIPT_DIR="${0:A:h}"
+# Wrapper command is an array: the unified engine plus the CLI preset
+# (the per-CLI shims are deprecated; removal planned for v0.39).
 wrapper_for() {
-  case "$1" in
-    claude) echo "$SCRIPT_DIR/claude-tmux" ;;
-    codex)  echo "$SCRIPT_DIR/codex-tmux" ;;
-  esac
+  reply=("$SCRIPT_DIR/agent-tmux" "$1")
 }
 
 # Test-mode override: when TMUX_AGENT_FANOUT_FAKE_WRAPPER is set, use it
@@ -242,10 +241,12 @@ for i in {1..$total}; do
   session_names+=("$session_name")
   result_paths+=("$per_result_path")
 
+  typeset -a wrapper
   if [[ -n "$fake_wrapper" ]]; then
-    wrapper="$fake_wrapper"
+    wrapper=("$fake_wrapper")
   else
-    wrapper="$(wrapper_for "$a_tool")"
+    wrapper_for "$a_tool"
+    wrapper=("${reply[@]}")
   fi
 
   if [[ ! -d "$a_wd" ]]; then
@@ -261,7 +262,7 @@ for i in {1..$total}; do
   # --timeout window waiting for a result.json that will never appear.
   set +e
   TMUX_AGENT_RESULT="$per_result_path" \
-    "$wrapper" start --exact "$session_name" "$a_wd" "$prompt_text" >/dev/null 2>&1
+    "${wrapper[@]}" start --exact "$session_name" "$a_wd" "$prompt_text" >/dev/null 2>&1
   wrapper_rc=$?
   set -e
 
@@ -329,8 +330,8 @@ if [[ -z "$fake_wrapper" ]]; then
   for i in {1..$total}; do
     a_tool="${agents_tool[$i]}"
     session_name="${session_names[$i]}"
-    wrapper="$(wrapper_for "$a_tool")"
-    "$wrapper" stop "$session_name" >/dev/null 2>&1 || true
+    wrapper_for "$a_tool"
+    "${reply[@]}" stop "$session_name" >/dev/null 2>&1 || true
   done
 fi
 
