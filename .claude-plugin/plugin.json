@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.38.0",
+  "version": "0.38.1",
   "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent pair/team orchestration.",
   "author": {
     "name": "PaulYeh",
