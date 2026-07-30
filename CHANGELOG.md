@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.39.0 - 2026-07-30
+
+### Changed
+- **tmux-dispatch-gate hardened to proxy enforcement.** GATE 1 no longer
+  accepts a read-the-rules receipt from the parent session: task-carrying
+  dispatch (`start`/`send`/`send-wait`) now passes only from a subagent
+  context (harness-injected `agent_type`, probed on Claude Code 2.1.220).
+  The parent's escape hatch is `gate-receipt-parent-dispatch` quoting the
+  user's explicit direct-dispatch instruction. The old
+  `gate-receipt-dispatch` marker is retired.
+- GATE 2 (workflow escalation) now counts review-shaped dispatches from
+  subagent contexts too — the pass-through was moved after the counter, so a
+  proxy-driven manual review loop still escalates to a workflow recipe.
+- Gate receipts are content-validated: a receipt opens a gate only if it
+  carries a `YYYY-MM-DD` date and at least 40 bytes of rationale; an empty
+  `touch` no longer counts.
+
 ## v0.38.0 - 2026-07-28
 
 ### Deprecated
