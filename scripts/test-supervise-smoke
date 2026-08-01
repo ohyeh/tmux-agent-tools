@@ -42,6 +42,31 @@ assert "terminal event" "$(jq -r .event "$out")" "terminal"
 assert "terminal status" "$(jq -r .status "$out")" "success"
 assert "terminal does not guess worker liveness" "$(jq -r 'has("worker_alive")' "$out")" "false"
 
+echo "case: #317 result init seed must not satisfy terminal"
+"$WRAPPER" result init seed-probe >/dev/null
+seed_status="$(jq -r .status "$TMUX_AGENT_DIR/seed-probe/result.json")"
+assert "init seeds non-terminal status" "$seed_status" "pending"
+seed_val="$("$WRAPPER" result validate seed-probe --json 2>/dev/null)"
+assert "seed is schema-valid" "$(printf '%s' "$seed_val" | jq -r .valid)" "true"
+assert "seed canonical is non-terminal" "$(printf '%s' "$seed_val" | jq -r .canonical_status)" "pending"
+seed_code=0
+seed_out="$("$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json seed-probe)" || seed_code=$?
+assert "seed does not report terminal success" "$seed_code" "1"
+assert "seed supervise event is not terminal" "$(printf '%s' "$seed_out" | jq -r '.event != "terminal"')" "true"
+# A legacy-shaped success seed (empty summary) must also be rejected: supervise
+# enforces the same non-empty completion evidence as `result wait-required`.
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/seed-probe/result.json"
+empty_code=0
+empty_out="$("$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json seed-probe)" || empty_code=$?
+assert "empty-summary success is not terminal" "$empty_code" "1"
+assert "empty-summary success event is not terminal" "$(printf '%s' "$empty_out" | jq -r '.event != "terminal"')" "true"
+# Backward compat: a real success with a non-empty summary still terminates.
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"did the thing","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/seed-probe/result.json"
+ok_code=0
+ok_out="$("$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json seed-probe)" || ok_code=$?
+assert "non-empty summary success is terminal" "$ok_code" "0"
+assert "non-empty summary success event" "$(printf '%s' "$ok_out" | jq -r .event)" "terminal"
+
 echo "case: ownership flags are explicit"
 flags_code=0
 "$WRAPPER" supervise --timeout 1 --json supervise-ok >/dev/null 2>&1 || flags_code=$?
