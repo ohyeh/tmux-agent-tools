@@ -285,6 +285,7 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
+  agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
   agent-tmux start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   agent-tmux start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
@@ -385,6 +386,29 @@ help_for_subcommand() {
     "")
       usage
       return 0
+      ;;
+    brief)
+      cat <<'HELP_EOF'
+agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
+
+Render a GOAL/ACCEPTANCE/REPORT prompt from flags (backlog T1). Not a launcher:
+compiles text only. Feed the result into start/send/send-wait via --from-file:
+
+  agent-tmux brief --template implement --goal 'Fix X' --acceptance 'tests pass' > /tmp/p.txt
+  agent-tmux start --exact worker1 ~/repo --from-file /tmp/p.txt
+
+Flags:
+  --template implement           Required. Only "implement" is supported today.
+  --goal <text>                  Required. Fills the GOAL section.
+  --acceptance <text>            Required. Fills the ACCEPTANCE section.
+  --report <text>                Optional. Fills the REPORT section; defaults
+                                  to a sane evidence-first requirement.
+  --dry-run                      Print the compiled prompt to stdout instead
+                                  of writing it to a temp file.
+
+Without --dry-run, writes the compiled prompt to a temp file and prints its
+path (an absolute path suitable for --from-file/--prompt-file).
+HELP_EOF
       ;;
     start)
       cat <<'HELP_EOF'
@@ -3746,6 +3770,58 @@ _extract_prompt_file_prepass() {
         ;;
     esac
   done
+}
+
+# ---- brief: render a GOAL/ACCEPTANCE/REPORT prompt from flags -------------
+# Backlog T1: delegated-worker prompts measured 4.3% GOAL/ACCEPTANCE/REPORT
+# compliant at the call site. This renders the `implement` template from
+# flags so the compiled text can feed --from-file/--prompt-file on start/
+# send/send-wait/send-wait-literal. Named "brief" (not "dispatch") because
+# "dispatch" already names the PreToolUse gate concept in this repo (see
+# require_gate_receipt_guard / "Dispatch gate receipt").
+_brief_default_report() {
+  printf '%s' "State the outcome (not an adjacent partial result), the evidence for each ACCEPTANCE item (command + exit code + key lines, or artifact path), and any item skipped or deviated from with the reason."
+}
+
+brief_session() {
+  local template="" goal="" acceptance="" report="" dry_run=0
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --template)    template="${2:-}"; shift 2 ;;
+      --goal)        goal="${2:-}"; shift 2 ;;
+      --acceptance)  acceptance="${2:-}"; shift 2 ;;
+      --report)      report="${2:-}"; shift 2 ;;
+      --dry-run)     dry_run=1; shift ;;
+      *) echo "brief: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+
+  local usage_msg="Usage: agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]"
+  if [[ -z "$template" ]]; then
+    echo "brief: missing required --template" >&2; echo "$usage_msg" >&2; return 2
+  fi
+  if [[ "$template" != "implement" ]]; then
+    echo "brief: unsupported --template: $template (supported: implement)" >&2; return 2
+  fi
+  if [[ -z "$goal" ]]; then
+    echo "brief: missing required --goal" >&2; echo "$usage_msg" >&2; return 2
+  fi
+  if [[ -z "$acceptance" ]]; then
+    echo "brief: missing required --acceptance" >&2; echo "$usage_msg" >&2; return 2
+  fi
+  [[ -n "$report" ]] || report="$(_brief_default_report)"
+
+  local compiled
+  compiled="$(printf 'GOAL: %s\n\nACCEPTANCE: %s\n\nREPORT: %s\n' "$goal" "$acceptance" "$report")"
+
+  if (( dry_run )); then
+    printf '%s' "$compiled"
+    return 0
+  fi
+
+  local out; out="$(mktemp -t agent-tmux-brief.XXXXXX)"
+  printf '%s' "$compiled" > "$out"
+  printf '%s\n' "$out"
 }
 
 start_session() {
@@ -8068,6 +8144,9 @@ case "$command" in
     ;;
   start)
     start_session "$@"
+    ;;
+  brief)
+    brief_session "$@"
     ;;
   resume)
     resume_session "$@"
