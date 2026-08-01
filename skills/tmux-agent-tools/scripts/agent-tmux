@@ -619,7 +619,7 @@ Fields (JSON):
                                 absent = unknown, e.g. pre-v0.32 legacy runs).
   by_cli                       claude/codex/... /unknown.
   result_coverage              with_result / without_result / pct.
-  status_buckets               success/failed/blocked/needs-input/unknown/
+  status_buckets               success/failed/blocked/needs-input/pending/unknown/
                                 missing_status/no_result (see `result validate`).
   status_raw_top               Top 10 raw status values with counts.
 HELP_EOF
@@ -2345,7 +2345,10 @@ result_init_session() {
   local subdir result_path
   subdir="$(ensure_agent_dir "$name")"
   result_path="$subdir/result.json"
-  "$JQ" -n '{schema_version: 1, status: "success", summary: "", artifacts: [], errors: []}' > "$result_path"
+  # Seed a NON-TERMINAL placeholder (#317). A "success" seed was schema-valid
+  # and satisfied supervise --result-required, reporting completion before any
+  # work ran. "pending" normalizes to the non-terminal canonical bucket.
+  "$JQ" -n '{schema_version: 1, status: "pending", summary: "", artifacts: [], errors: []}' > "$result_path"
   # Seed sidecar with null so it is discoverable before capture runs (P1).
   local meta_path="$subdir/session-meta.json"
   "$JQ" -n '{schema_version: 1, cli_session_id: null}' > "$meta_path"
@@ -2540,6 +2543,27 @@ result_wait_required_session() {
   return 1
 }
 
+# result_terminal_ready <validation-json> — shared completion adjudicator (#317).
+# A result counts as terminal only when it is schema-valid, carries a terminal
+# canonical status, and (for "success") carries completion evidence: a non-empty
+# summary, matching the required/non-empty contract of `result wait-required`.
+# Echoes the canonical status on success; returns 1 when not yet terminal.
+result_terminal_ready() {
+  local validation="$1" canonical summary
+  [[ -n "$validation" ]] || return 1
+  [[ "$(printf '%s' "$validation" | "$JQ" -r '.valid // false')" == true ]] || return 1
+  canonical="$(printf '%s' "$validation" | "$JQ" -r '.canonical_status // "unknown"')"
+  case "$canonical" in
+    success)
+      summary="$(printf '%s' "$validation" | "$JQ" -r '.body.summary // ""')"
+      [[ -n "${summary//[[:space:]]/}" ]] || return 1
+      ;;
+    failed|blocked|needs-input) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$canonical"
+}
+
 # Deterministic one-call supervision. Polling stays inside this process, so an
 # unchanged worker consumes no model turns and emits no progress narration.
 supervise_session() {
@@ -2573,20 +2597,16 @@ supervise_session() {
   while true; do
     if [[ -f "$result_path" ]] && "$JQ" -e . "$result_path" >/dev/null 2>&1; then
       validation="$(result_validate_session "$name" --json 2>/dev/null)" || validation=""
-      if [[ -n "$validation" ]] && [[ "$(printf '%s' "$validation" | "$JQ" -r '.valid // false')" == true ]]; then
-        canonical="$(printf '%s' "$validation" | "$JQ" -r '.canonical_status // "unknown"')"
-        case "$canonical" in
-          success|failed|blocked|needs-input)
-            body_status="$(printf '%s' "$validation" | "$JQ" -r '.body.status // ""')"
-            printf '%s' "$validation" | "$JQ" -c \
-              --arg name "$name" --arg session "$session" --arg result_path "$result_path" \
-              --arg status "$canonical" --arg raw_status "$body_status" \
-              '. + {event:"terminal", name:$name, session:$session, result_path:$result_path,
-                    status:$status, raw_status:$raw_status}'
-            [[ "$canonical" == success ]] && return 0
-            return 1
-            ;;
-        esac
+      canonical="$(result_terminal_ready "$validation")" || canonical=""
+      if [[ -n "$canonical" ]]; then
+        body_status="$(printf '%s' "$validation" | "$JQ" -r '.body.status // ""')"
+        printf '%s' "$validation" | "$JQ" -c \
+          --arg name "$name" --arg session "$session" --arg result_path "$result_path" \
+          --arg status "$canonical" --arg raw_status "$body_status" \
+          '. + {event:"terminal", name:$name, session:$session, result_path:$result_path,
+                status:$status, raw_status:$raw_status}'
+        [[ "$canonical" == success ]] && return 0
+        return 1
       fi
     fi
 
@@ -3319,7 +3339,8 @@ launch_envelope_inline_block() {
   print -r -- "__le_fa=\$(date -u +%Y-%m-%dT%H:%M:%SZ); if [ -s $rp ]; then __le_rp=true; $jq --arg lid $lid --arg fa \"\$__le_fa\" --arg tr process-exit --argjson ec \"\$cli_code\" '$merge' $rp > $rp.tmp 2>/dev/null && mv -f $rp.tmp $rp || { rm -f $rp.tmp; mv -f $rp $rp.invalid 2>/dev/null || true; $jq -c -n --arg lid $lid --arg fa \"\$__le_fa\" --argjson ec \"\$cli_code\" '$skel' > $rp 2>/dev/null || true; }; else __le_rp=false; fi; $jq -c -n --arg lid $lid --arg fa \"\$__le_fa\" --argjson ec \"\$cli_code\" --argjson rp \"\$__le_rp\" '$end' >> $up 2>/dev/null || true"
 }
 
-# canonical_status_of <raw> → success|failed|blocked|needs-input|unknown|missing
+# canonical_status_of <raw> → success|failed|blocked|needs-input|pending|unknown|missing
+# "pending" is non-terminal: seeded/in-flight results never satisfy completion.
 # Normalize legacy result.json values at read time only. Empty/absent → missing.
 canonical_status_of() {
   local raw="${1:-}"
@@ -3327,6 +3348,8 @@ canonical_status_of() {
   local s="${raw:l}"
   s="${s//-/_}"
   case "$s" in
+    pending|in_progress|running|started|queued|init|initialized|waiting)
+      printf 'pending' ;;
     needs_input|approve_with_changes|accept_with_changes|changes_requested|should_fix|issues_found|concern|disagree|needs_fix|needs_fixes|needs_fix_before_publish|pass_with_caveat|partial|degraded)
       printf 'needs-input' ;;
     success|ok|done|complete|completed|pass|passed|fixed|clean|approve|accept|accepted|resolved|shipped|merged)
