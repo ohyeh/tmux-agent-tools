@@ -229,6 +229,16 @@ Agents should write `result.json` at `$TMUX_AGENT_DIR/<name>/result.json` with `
 
 `cli_session_id` is not stored in `result.json`; `result --field .cli_session_id` reads the per-session `session-meta.json` sidecar so resume can work before the worker writes a final result. `--result-schema <abs.json>` on `start`/`resume` persists a schema path for `result validate`; profile `result_required_fields` supplies the default required-field contract for `result wait-required`.
 
+**Exit code is not the verdict.** The task verdict comes ONLY from the
+result.json body (`status` + `summary`). A non-zero exit from `supervise` /
+`result wait-required` with a missing or invalid result.json is a PROTOCOL
+failure, not a task failure: check `result --path`, then `capture` the pane
+tail. If the pane shows completed work (tests green, PASS printed), the work
+is done but unreported — send ONE bounded recovery prompt ("Write result.json
+now, status success, summary = what you completed") and re-read; never
+re-dispatch the task from scratch. The inverse also holds: PASS in the pane
+without a valid result.json stays UNCONFIRMED until the write lands.
+
 Stall fallback: if `status --json` reports `running:true` with high `idle_seconds` and `ping` times out, send one bounded recovery prompt with `send-wait`: "Write result.json now with status blocked and the current blocker." Then read `result wait-required worker --fields status,summary --wait 60 --json`. If that also times out, stop waiting and report stalled with structured status plus one diagnostic capture tail.
 
 ## Peer-review loop

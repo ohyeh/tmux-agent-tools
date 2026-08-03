@@ -16,8 +16,9 @@ Non-negotiable rules:
 
 Fast answers:
 
-- **Bounded task with no follow-ups?** Default to `start --headless`: the CLI runs non-interactively (`claude -p` / `codex exec`), completion is the process exit, and `result wait-required` returns immediately at exit (a contract-valid result.json is synthesized from exit code + stdout when the worker didn't write one). No TUI quirks, no pane-heuristic WAITING stalls. Interactive `start` is only for work that needs follow-up sends or mid-run supervision.
+- **Bounded task with no follow-ups?** Default to interactive `start` (headed): the tmux pane is the debug surface — `capture`, `status`, or attaching shows exactly what the CLI is doing, mid-run and post-mortem. `start --headless` (`claude -p` / `codex exec`) is OPT-IN only: user explicitly asks for it, or the output is trivially verifiable and nobody will need to inspect the run. A headless failure leaves only an exit code and a stdout file — repeatedly observed to cost long blind-debugging sessions (user ruling 2026-08-03: headed by default).
 - **Wrapper not on PATH?** Run it from this bundle: `<skill-dir>/scripts/agent-tmux codex …`.
+- **Worker "failed" but the pane says PASS?** Exit code is not the verdict — see `references/core-workflow.md#5-read-the-agents-structured-result` ("Exit code is not the verdict") before re-dispatching or reporting failure.
 - **Auto-delegate substantial work?** Use the inline-vs-worker gate in the `using-tmux-agent-tools` skill (absorbed there, no longer a separate subagent); details live in `references/core-workflow.md`.
 - **Long-running external CLI worker (Codex or Claude Code)?** When native sub-agents are available, MUST spawn exactly one cheap supervision-only proxy named `<cli>_<task>` (on Claude Code: a `general-purpose` sub-agent on `sonnet`; haiku is retired). The proxy exclusively owns the existing wrapper and makes one blocking `supervise` call; the parent MUST NOT run `start`/`send-wait` or poll that worker directly. See `references/core-workflow.md#native-proxy-for-an-external-cli-worker`.
 - **Writing the worker prompt?** Shape it with the `delegation-templates` skill: GOAL / ACCEPTANCE / REPORT + common footer, plus its tmux addendum (no-cascade ban + literal result path).
@@ -57,8 +58,8 @@ Before the first worker command:
 | --- | --- |
 | Run Claude Code / Codex / agy as a worker | `agent-tmux claude` / `agent-tmux codex` / `agent-tmux agy` |
 | Any other CLI (gemini, cursor, grok, custom) | `agent-tmux <cli>` (+ optional profile) |
-| **Bounded task, result only, no follow-ups** | `start --headless` — headless one-shot (`claude -p` / `codex exec`), completion = process exit, no TUI/pane heuristics, no WAITING stalls |
-| Interactive worker (follow-up sends, supervision) | `start` |
+| **Any worker, including bounded one-shots** | interactive `start` (headed) — pane = debug surface; DEFAULT |
+| Trivially verifiable fire-and-collect, user opted in | `start --headless` — completion = process exit; failures leave only exit code + stdout file |
 | Local working directory | `start` |
 | Repo on another host, tmux stays local | `start-ssh` |
 | Pin a model for one run | `start --model <m> <name> <dir> '<prompt>'` |
@@ -79,8 +80,8 @@ Full capability table (every subcommand + when to use it): `references/cheatshee
 ## The 6 commands you need most
 
 ```bash
-# Bounded one-shot (headless, preferred for fire-and-collect tasks):
-agent-tmux codex start --exact --headless job ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
+# Bounded one-shot (headed by default; add --headless only when the user opted in):
+agent-tmux codex start --exact job ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
 agent-tmux codex result wait-required job --fields status,summary --wait 600 --json   # returns at process exit
 agent-tmux codex supervise --result-required --silent-while-unchanged --json job       # one silent call until terminal event
 agent-tmux codex stop job

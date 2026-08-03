@@ -36,8 +36,9 @@ No exception fired → inline, receipt `no-delegate-trigger`.
 ## QUESTIONS — if delegating, one-shot or teammate? State which, and why.
 
 - **One-shot** (one bounded answer, no follow-up of any kind) →
-  `start --headless --task-shape bounded`; exactly one `result
-  wait-required`, then `stop` unless keepalive was requested. Shell-safe
+  interactive `start --task-shape bounded` (headed; the pane is the debug
+  surface — `--headless` only when the user explicitly opted in); exactly one
+  `result wait-required`, then `stop` unless keepalive was requested. Shell-safe
   name matching `[A-Za-z0-9._-]+`; arrange failure-safe cleanup equivalent
   to `trap cleanup EXIT` (success, wait failure, or interruption).
 - **Teammate** (expect a second message to the SAME worker) → interactive

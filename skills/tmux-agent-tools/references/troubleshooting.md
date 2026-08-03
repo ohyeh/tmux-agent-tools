@@ -74,11 +74,12 @@ In interactive mode a finished worker that never wrote `result.json` leaves ever
 result wait blocking until timeout — the wrapper cannot tell "done, forgot the
 file" from "still working". Two fixes:
 
-- **Prefer `start --headless` for bounded tasks.** Completion becomes the process
-  exit: the wrapper synthesizes a contract-valid `result.json` (status, summary
-  from the stdout tail, exit_code, stdout_path) the moment the CLI exits, so
-  `result wait-required --fields status,summary` returns immediately. A result
-  the worker wrote itself is preserved, never clobbered.
+- **`start --headless` sidesteps this for user-opted-in fire-and-collect runs.**
+  Completion becomes the process exit: the wrapper synthesizes a contract-valid
+  `result.json` (status, summary from the stdout tail, exit_code, stdout_path)
+  the moment the CLI exits. But headed `start` stays the DEFAULT — a headless
+  failure leaves only exit code + stdout file to debug from; use `--headless`
+  only when the user opted in (see the SKILL.md fast answers).
 - Already interactive and stuck? Check `status --json` for `running:false` /
   `exit_detected`, then read `capture --strip-ansi <name> 80` instead of waiting
   the timeout out, and re-prompt with the literal result path if needed.
