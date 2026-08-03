@@ -13,7 +13,7 @@ profiles, not as code.
 3. `~/.config/agent-tmux/profiles` (or `$XDG_CONFIG_HOME/agent-tmux/profiles`)
 4. this directory (bundled defaults)
 
-`agent-tmux <cli> --profile <file> ...` bypasses the search and loads that
+`agent-tmux <cli> --profile <path-or-name> ...` loads that profile: a path is used as-is; a bare name is resolved as `<name>.conf` (then `<name>`) through the same search order. It bypasses the `<cli>.conf` lookup and loads the named
 exact file. The first match wins and overrides the built-in preset for that
 CLI.
 Files are plain `key=value` (never sourced, so they cannot execute code).

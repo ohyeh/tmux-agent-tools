@@ -109,11 +109,23 @@ HEADLESS_PROMPT_FLAG="${_HEADLESS_PROMPT_FLAG:-}"
 load_cli_profile() {
   local cli="$1" dir file='' line key value
   if [[ -n "$_PROFILE_FILE_FLAG" ]]; then
-    if [[ ! -f "$_PROFILE_FILE_FLAG" ]]; then
+    if [[ -f "$_PROFILE_FILE_FLAG" ]]; then
+      file="$_PROFILE_FILE_FLAG"
+    elif [[ "$_PROFILE_FILE_FLAG" != */* ]]; then
+      # Bare name: resolve through the same search order as <cli>.conf,
+      # trying <name>.conf then <name> (docs promise --profile <path-or-name>).
+      for dir in "$_PROFILE_DIR_FLAG" "${AGENT_TMUX_PROFILE_DIR:-}" "${XDG_CONFIG_HOME:-$HOME/.config}/agent-tmux/profiles" "${SELF:h}/profiles"; do
+        [[ -n "$dir" && -f "$dir/$_PROFILE_FILE_FLAG.conf" ]] && { file="$dir/$_PROFILE_FILE_FLAG.conf"; break; }
+        [[ -n "$dir" && -f "$dir/$_PROFILE_FILE_FLAG" ]] && { file="$dir/$_PROFILE_FILE_FLAG"; break; }
+      done
+      if [[ -z "$file" ]]; then
+        echo "agent-tmux: --profile not found as a file or profile name: $_PROFILE_FILE_FLAG (searched --profile-dir, \$AGENT_TMUX_PROFILE_DIR, ~/.config/agent-tmux/profiles, bundled profiles)" >&2
+        exit 2
+      fi
+    else
       echo "agent-tmux: --profile file not found: $_PROFILE_FILE_FLAG" >&2
       exit 2
     fi
-    file="$_PROFILE_FILE_FLAG"
   else
     if [[ -n "$_PROFILE_DIR_FLAG" && ! -d "$_PROFILE_DIR_FLAG" ]]; then
       echo "agent-tmux: --profile-dir directory not found: $_PROFILE_DIR_FLAG" >&2
