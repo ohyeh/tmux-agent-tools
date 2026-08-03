@@ -61,8 +61,8 @@ Do not claim that the external process itself is a native sub-agent.
   `codex_<task>` means `agent-tmux codex`; reserve `native_<task>` for work performed
   by a Codex in-process sub-agent without an external CLI.
 - Before dispatch, pass `model-dispatch.md` and `delegation-templates`. On
-  Claude Code the proxy is a `general-purpose` sub-agent on `haiku`
-  (model-dispatch §4). On Codex prefer `gpt-5.6-luna` for shell supervision and
+  Claude Code the proxy is a `general-purpose` sub-agent on `sonnet`
+  (haiku retired; former haiku roles run sonnet at effort low, model-dispatch §1). On Codex prefer `gpt-5.6-luna` for shell supervision and
   progress summarization, fall back to `gpt-5.6-terra` when luna is
   unavailable, and use `gpt-5.6-sol` only when the
   proxy task itself needs frontier reasoning. Send a self-contained GOAL /

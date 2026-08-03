@@ -7,7 +7,7 @@ Read this for the complete start -> send -> wait -> inspect -> result -> stop wa
 This rule applies on every runtime with native sub-agents, not only Codex: the
 parent never drives an external worker directly — one supervision-only native
 sub-agent owns it and drives exactly one existing wrapper. On Claude Code that
-proxy is a `general-purpose` sub-agent on `haiku` (model-dispatch §4) running
+proxy is a `general-purpose` sub-agent on `sonnet` (haiku retired; model-dispatch §1) running
 the wrapper commands through its own Bash calls. On Codex the proxy is also a
 visibility bridge: Codex App lists native child threads, not arbitrary external
 processes, so the proxy makes an authorized Claude, Codex CLI, agy, Gemini,
@@ -25,7 +25,7 @@ native_code_review  -> Codex in-process sub-agent; no external CLI
 
 Names use lowercase ASCII snake case. The proxy brief follows
 `delegation-templates` (GOAL / ACCEPTANCE / REPORT) and passes
-`model-dispatch.md`. On Claude Code use `general-purpose` on `haiku`. On Codex
+`model-dispatch.md`. On Claude Code use `general-purpose` on `sonnet`. On Codex
 prefer `gpt-5.6-luna` for shell supervision and progress summarization, fall
 back to `gpt-5.6-terra` when luna is unavailable, and use `gpt-5.6-sol` only
 when the proxy task itself needs frontier reasoning. Include this hard
