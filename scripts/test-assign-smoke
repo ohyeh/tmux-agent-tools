@@ -74,4 +74,17 @@ fi
 grep -q '"status"' "$OUT" || { cat "$OUT" >&2; fail "supervise JSON missing from stdout" }
 echo "ok: full assign sequence (start → init → send → confirm → supervise)"
 
+# 3) --detach: steps 1-4 then immediate return with assigned:true JSON —
+#    no long-lived supervise process left behind (reaper-hostile harnesses).
+"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
+DOUT="$WORK/detach.out"
+"$AGENT_TMUX" fakecli assign --detach --confirm-window 60 assign-smoke "$WORK" "$WORK/prompt.txt" \
+  > "$DOUT" 2> "$WORK/detach.err" || { cat "$WORK/detach.err" >&2; fail "assign --detach exited non-zero" }
+grep -q '"detached":true' "$DOUT" || { cat "$DOUT" >&2; fail "detach JSON missing detached:true" }
+grep -q '"assigned":true' "$DOUT" || { cat "$DOUT" >&2; fail "detach JSON missing assigned:true" }
+grep -q 'assign\[5/5\] detached' "$WORK/detach.err" || { cat "$WORK/detach.err" >&2; fail "detach step-5 banner missing" }
+"$AGENT_TMUX" fakecli status --json assign-smoke >/dev/null 2>&1 || fail "worker not alive after --detach returned"
+"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
+echo "ok: assign --detach (verified dispatch, immediate return, worker still alive)"
+
 echo "PASS: assign smoke"

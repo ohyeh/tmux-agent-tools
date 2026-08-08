@@ -297,7 +297,7 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
-  agent-tmux assign [--timeout N] [--confirm-window N] <name> <directory> <prompt-file>
+  agent-tmux assign [--timeout N] [--confirm-window N] [--detach] <name> <directory> <prompt-file>
   agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
   agent-tmux start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
@@ -402,7 +402,7 @@ help_for_subcommand() {
       ;;
     assign)
       cat <<'HELP_EOF'
-agent-tmux assign [--timeout N] [--confirm-window N] <name> <directory> <prompt-file>
+agent-tmux assign [--timeout N] [--confirm-window N] [--detach] <name> <directory> <prompt-file>
 
 The stepwise dispatch sequence as ONE command (W32 retro M5). Runs, in order,
 refusing to continue past a failed step:
@@ -3888,16 +3888,17 @@ _assign_fail() {
 }
 
 assign_session() {
-  local timeout=86400 confirm_window=90
+  local timeout=86400 confirm_window=90 detach=0
   while [[ "${1:-}" == --* ]]; do
     case "$1" in
       --timeout)        timeout="${2:-}"; shift 2 ;;
       --confirm-window) confirm_window="${2:-}"; shift 2 ;;
+      --detach)         detach=1; shift ;;
       *) echo "assign: unknown flag: $1" >&2; return 2 ;;
     esac
   done
   local name="${1:-}" dir="${2:-}" prompt="${3:-}"
-  local usage_msg="Usage: agent-tmux assign [--timeout N] [--confirm-window N] <name> <directory> <prompt-file>"
+  local usage_msg="Usage: agent-tmux assign [--timeout N] [--confirm-window N] [--detach] <name> <directory> <prompt-file>"
   if [[ -z "$name" || -z "$dir" || -z "$prompt" ]]; then
     echo "$usage_msg" >&2; return 2
   fi
@@ -3997,6 +3998,21 @@ assign_session() {
   done
   (( confirmed )) || _assign_fail confirm-processing \
     "no processing activity within ${confirm_window}s of send, even after one resend — the task never reached the CLI" "$name"
+
+  if (( detach )); then
+    # --detach: the dispatch is verified (steps 1-4) but no long-lived
+    # process stays behind. For harnesses that reap long background tasks
+    # (observed 2026-08-08: local Claude Code kills background Bash tasks
+    # with exit 144 after ~10 min, taking a tmux server spawned inside the
+    # task's process tree with it) — run `assign --detach` in a short
+    # FOREGROUND call so the tmux server daemonizes safely, then harvest
+    # with bounded `result wait-required` / `supervise` calls.
+    echo "assign[5/5] detached — harvest with: $SELF $CLI result wait-required $name --wait <s> --json" >&2
+    "$JQ" -cn --arg tool "$CLI" --arg name "$name" \
+      --arg result_path "$(result_session path "$name" 2>/dev/null || true)" \
+      '{schema_version:1,tool:$tool,name:$name,assigned:true,detached:true,result_path:$result_path}'
+    return 0
+  fi
 
   echo "assign[5/5] supervise --result-required (timeout ${timeout}s)" >&2
   ( supervise_session --timeout "$timeout" --result-required --silent-while-unchanged --json "$name" ) \
