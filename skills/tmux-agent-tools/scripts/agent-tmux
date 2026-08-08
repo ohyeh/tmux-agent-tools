@@ -3920,37 +3920,67 @@ assign_session() {
     || _assign_fail result-init "result init exited non-zero" "$name"
 
   echo "assign[3/5] send --from-file $prompt" >&2
-  local send_out send_rc=0
-  send_out="$( ( send_session --from-file "$prompt" "$name" ) 2>&1 )" || send_rc=$?
-  printf '%s\n' "$send_out" >&2
-  if (( send_rc != 0 )) || printf '%s' "$send_out" | grep -q '"submitted":false'; then
-    _assign_fail send "prompt was not submitted (see send output above)" "$name"
-  fi
-
-  echo "assign[4/5] confirm the worker is processing (window ${confirm_window}s)" >&2
-  local sent_at now confirmed=0 st blocked busy idle
-  sent_at="$(date +%s)"
+  # Readiness gate before send: `start` without initial text returns as soon
+  # as the tmux session exists, so a real CLI may still be booting when the
+  # send fires — the pasted prompt lands before the TUI takes the screen and
+  # is silently dropped (observed live 2026-08-08: prompt text above the
+  # Codex banner, empty input box after boot). Same policy as the start
+  # preflight: wait out startup_pending, fail immediately on hard prompts.
+  local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) rj rreason
   while :; do
-    now="$(date +%s)"
-    (( now - sent_at > confirm_window )) && break
-    st="$( ( status_session --json "$name" ) 2>/dev/null || true )"
-    blocked="$(printf '%s' "$st" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
-    if [[ -n "$blocked" ]]; then
-      _assign_fail confirm-processing "worker blocked after send: $blocked" "$name"
+    rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
+    rreason="$(printf '%s' "$rj" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
+    case "$rreason" in
+      permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
+        _assign_fail send "worker blocked before send: $rreason" "$name" ;;
+      startup_pending)
+        (( SECONDS >= ready_deadline )) && _assign_fail send \
+          "CLI still starting after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s (startup_pending) — refusing to paste into a swallowing UI" "$name"
+        sleep 2 ;;
+      *) break ;;
+    esac
+  done
+  # Delivery + processing check, with ONE self-heal resend. A paste that
+  # races the CLI's boot is silently swallowed (observed live 2026-08-08:
+  # prompt text above the Codex banner, empty input box after boot), and
+  # bare `send` still reports success — the swallow only becomes visible as
+  # "no processing activity" in the confirm window. By then the pane IS
+  # ready and its input box is empty, so a single resend is safe and lands.
+  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy idle
+  for attempt in 1 2; do
+    send_rc=0
+    send_out="$( ( send_session --from-file "$prompt" "$name" ) 2>&1 )" || send_rc=$?
+    printf '%s\n' "$send_out" >&2
+    if (( send_rc != 0 )) || printf '%s' "$send_out" | grep -q '"submitted":false'; then
+      _assign_fail send "prompt was not submitted (see send output above)" "$name"
     fi
-    # Preferred signal: the CLI's busy spinner. Falls back (CLIs whose
-    # heuristic family has no busy metric, e.g. generic/agy) to "the pane is
-    # still changing well after the prompt injection".
-    busy="$( ( probe_session --json --metric busy "$name" ) 2>/dev/null | "$JQ" -r '.value // empty' 2>/dev/null || true )"
-    if [[ "$busy" == "true" ]]; then confirmed=1; break; fi
-    idle="$(printf '%s' "$st" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
-    if [[ -n "$idle" && "$idle" -le 3 ]] && (( now - sent_at > 10 )); then
-      confirmed=1; break
-    fi
-    sleep 3
+
+    echo "assign[4/5] confirm the worker is processing (window ${confirm_window}s, attempt ${attempt}/2)" >&2
+    sent_at="$(date +%s)"
+    while :; do
+      now="$(date +%s)"
+      (( now - sent_at > confirm_window )) && break
+      st="$( ( status_session --json "$name" ) 2>/dev/null || true )"
+      blocked="$(printf '%s' "$st" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
+      if [[ -n "$blocked" && "$blocked" != "startup_pending" ]]; then
+        _assign_fail confirm-processing "worker blocked after send: $blocked" "$name"
+      fi
+      # Preferred signal: the CLI's busy spinner. Falls back (CLIs whose
+      # heuristic family has no busy metric, e.g. generic/agy) to "the pane is
+      # still changing well after the prompt injection".
+      busy="$( ( probe_session --json --metric busy "$name" ) 2>/dev/null | "$JQ" -r '.value // empty' 2>/dev/null || true )"
+      if [[ "$busy" == "true" ]]; then confirmed=1; break; fi
+      idle="$(printf '%s' "$st" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
+      if [[ -n "$idle" && "$idle" -le 3 ]] && (( now - sent_at > 10 )); then
+        confirmed=1; break
+      fi
+      sleep 3
+    done
+    (( confirmed )) && break
+    (( attempt == 1 )) && echo "assign[3/5] no activity after first send — resending once (boot-race self-heal)" >&2
   done
   (( confirmed )) || _assign_fail confirm-processing \
-    "no processing activity within ${confirm_window}s of send — the task likely never reached the CLI" "$name"
+    "no processing activity within ${confirm_window}s of send, even after one resend — the task never reached the CLI" "$name"
 
   echo "assign[5/5] supervise --result-required (timeout ${timeout}s)" >&2
   ( supervise_session --timeout "$timeout" --result-required --silent-while-unchanged --json "$name" ) \
