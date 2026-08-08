@@ -3946,6 +3946,16 @@ assign_session() {
   # bare `send` still reports success — the swallow only becomes visible as
   # "no processing activity" in the confirm window. By then the pane IS
   # ready and its input box is empty, so a single resend is safe and lands.
+  # Delivery proof: a submitted prompt is echoed into the CLI's transcript,
+  # so a distinctive slice of it must be visible in the pane. Activity alone
+  # is NOT delivery — observed live 2026-08-08: MCP-server startup noise kept
+  # the pane changing and confirmed a send that a still-booting TUI had
+  # swallowed (empty input box, placeholder prompt).
+  local proof
+  proof="$(grep -m1 -E '[^[:space:]]' "$prompt" | cut -c1-60)"
+  _assign_delivered() {
+    ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null | grep -qF "$proof"
+  }
   local send_out send_rc attempt sent_at now confirmed=0 st blocked busy idle
   for attempt in 1 2; do
     send_rc=0
@@ -3968,11 +3978,17 @@ assign_session() {
       # Preferred signal: the CLI's busy spinner. Falls back (CLIs whose
       # heuristic family has no busy metric, e.g. generic/agy) to "the pane is
       # still changing well after the prompt injection".
-      busy="$( ( probe_session --json --metric busy "$name" ) 2>/dev/null | "$JQ" -r '.value // empty' 2>/dev/null || true )"
-      if [[ "$busy" == "true" ]]; then confirmed=1; break; fi
-      idle="$(printf '%s' "$st" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
-      if [[ -n "$idle" && "$idle" -le 3 ]] && (( now - sent_at > 10 )); then
-        confirmed=1; break
+      # Confirmed = activity signal AND delivery proof AND >20s elapsed.
+      # Activity alone false-positives on startup noise (MCP timeouts keep
+      # the pane changing); proof alone false-positives on the swallowed
+      # paste still sitting in the scrollback before the TUI's alt-screen
+      # takes over — the 20s floor gives the alt-screen time to wipe it, so
+      # a surviving proof line means the CLI really echoed the prompt.
+      if (( now - sent_at > 20 )) && _assign_delivered "$name"; then
+        busy="$( ( probe_session --json --metric busy "$name" ) 2>/dev/null | "$JQ" -r '.value // empty' 2>/dev/null || true )"
+        if [[ "$busy" == "true" ]]; then confirmed=1; break; fi
+        idle="$(printf '%s' "$st" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
+        if [[ -n "$idle" && "$idle" -le 3 ]]; then confirmed=1; break; fi
       fi
       sleep 3
     done
