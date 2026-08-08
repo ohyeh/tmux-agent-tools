@@ -36,20 +36,33 @@ check "readonly-subcmd" 0 "$(j 'agent-tmux codex status foo --json')"
 check "gate1-deny" 2 "$(j 'agent-tmux codex start worker1 --headless')" "BLOCKED by dispatch gate"
 # 4. subagent context passes even without receipt
 check "subagent-pass" 0 '{"session_id":"'"$SID"'","agent_type":"general-purpose","tool_input":{"command":"agent-tmux codex start worker1"}}'
-# 5. receipt marker -> GATE 1 passes
-mkdir -p "$STATE_DIR"; echo "role=review model=sol brief=GOAL/ACCEPTANCE/REPORT" > "$STATE_DIR/gate-receipt-dispatch"
+# 5. an undated/short receipt is still rejected
+mkdir -p "$STATE_DIR"; printf 'short receipt\n' > "$STATE_DIR/gate-receipt-parent-dispatch"
+check "gate1-invalid-receipt" 2 "$(j 'agent-tmux codex start worker1 --headless')" "BLOCKED by dispatch gate"
+# 6. dated substantive receipt -> GATE 1 passes
+printf '%s User explicitly authorized direct parent dispatch for this smoke test; the fixture exercises the enforced receipt contract.\n' "$(date -u +%F)" > "$STATE_DIR/gate-receipt-parent-dispatch"
 check "gate1-receipt-pass" 0 "$(j 'agent-tmux codex start worker1 --headless')"
-# 6. first review-shaped dispatch passes (counter=1... but #5 already logged one
+# 7. first review-shaped dispatch passes (counter=1... but #6 already logged one
 #    'worker1' — non-review name, so counter starts here)
 check "review-1st-pass" 0 "$(j 'agent-tmux codex start sol_review_e1 --headless')"
-# 7. second review-shaped dispatch -> GATE 2 deny; --exact flag between
+# 8. second review-shaped dispatch -> GATE 2 deny; --exact flag between
 #    start and the name must not hide the review shape
 check "review-2nd-deny" 2 "$(j 'agent-tmux codex start --exact sol_review_e2 --headless')" "BLOCKED by workflow gate"
-# 8. workflow receipt -> GATE 2 passes
-echo "recipe=consensus-gate" > "$STATE_DIR/gate-receipt-workflow"
+# 9. dated substantive workflow receipt -> GATE 2 passes
+printf '%s consensus-gate is the selected workflow for this second review-shaped dispatch; this is the smoke rationale.\n' "$(date -u +%F)" > "$STATE_DIR/gate-receipt-workflow"
 check "gate2-receipt-pass" 0 "$(j 'agent-tmux codex start sol_review_e3 --headless')"
-# 9. non-review start never counts toward GATE 2
+# 10. non-review start never counts toward GATE 2
 check "nonreview-start-pass" 0 "$(j 'agent-tmux codex start impl_worker --headless')"
+
+# 11–13. false-positive regressions (fresh session id: no receipts, so a
+# misclassified dispatch would DENY, not pass). Observed live 2026-08-08:
+# `help send-wait` and a git commit whose message quoted the subcommands.
+SID2="smoke2-$$"
+j2() { printf '{"session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$SID2" "$1"; }
+check "help-subcmd-pass" 0 "$(j2 'agent-tmux codex help send-wait')"
+check "commit-msg-pass" 0 "$(j2 'git commit -m \"docs: agent-tmux codex flow — result init then send --from-file\"')"
+check "assign-pass" 0 "$(j2 'agent-tmux codex assign job /repo /abs/prompt.txt')"
+rm -rf "$HOME/.local/state/agent-hooks/$SID2"
 
 if [ "$FAILS" -ne 0 ]; then echo "SMOKE FAIL ($FAILS)"; exit 1; fi
 echo "SMOKE OK — all checks passed"

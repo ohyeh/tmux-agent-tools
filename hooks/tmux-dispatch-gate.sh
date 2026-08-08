@@ -3,9 +3,11 @@
 #
 # Enforces two kernel routing rules at the tool layer (prompt ceremony -> tooling,
 # per kernel v4.10 "Routing index" note):
-#   GATE 1 (proxy enforcement): task-carrying dispatch (start/send/send-wait)
-#     is only allowed from a subagent context — external workers are driven via
-#     ONE supervision proxy, never from the parent session. Detected via the
+#   GATE 1 (dispatch-shape enforcement): hand-chained task dispatch
+#     (start/send/send-wait) from the parent session is the retired shape —
+#     the sanctioned path is ONE blocking `assign` call (which this gate
+#     never matches), run as a background task or inside a subagent when the
+#     runtime caps foreground waits. Subagent context passes. Detected via the
 #     harness-injected stdin field agent_type (probed interface, verified on
 #     Claude Code 2.1.220; see agent-scripts harness-diagnosis.md "Interface
 #     trust tiers"). The parent's escape hatch is a content-validated receipt
@@ -37,9 +39,12 @@ command -v jq >/dev/null 2>&1 || exit 0   # no jq -> never block work
 cmd="$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)"
 [ -n "$cmd" ] || exit 0
 
-# Dispatch = wrapper + a task-carrying subcommand. Everything else passes.
-printf '%s' "$cmd" | grep -Eq '(^|[/[:space:]])(agent|agy|claude|codex)-tmux[[:space:]]' || exit 0
-printf '%s' "$cmd" | grep -Eq '[[:space:]](start|send|send-wait)([[:space:]]|$)' || exit 0
+# Dispatch = wrapper IMMEDIATELY followed by a task-carrying subcommand
+# (optionally with the <cli> word between: `agent-tmux codex send`). The two
+# independent greps this replaced fired on any command string that happened
+# to contain both tokens anywhere — observed false positives: `help send-wait`
+# and a `git commit` whose message quoted the subcommands.
+printf '%s' "$cmd" | grep -Eq '(^|[/[:space:]])(agent|agy|claude|codex)-tmux[[:space:]]+([A-Za-z0-9._-]+[[:space:]]+)?(start|send|send-wait)([[:space:]]|$)' || exit 0
 
 session_id="$(printf '%s' "$IN" | jq -r '.session_id // empty' 2>/dev/null)"
 agent_type="$(printf '%s' "$IN" | jq -r '.agent_type // empty' 2>/dev/null)"
@@ -77,14 +82,15 @@ fi
 
 if ! valid_receipt "$STATE_DIR/gate-receipt-parent-dispatch"; then
   cat >&2 <<EOF
-BLOCKED by dispatch gate: external tmux workers are driven via ONE
-supervision-proxy subagent, never from the parent session. Read
-~/.agents/rules/model-dispatch.md §3/§4 and
-~/.agents/skills/delegation-templates/SKILL.md, then spawn a general-purpose
-subagent to run this dispatch (the gate passes automatically inside a
-subagent context). Only if the user explicitly instructed direct parent
-dispatch: write that quoted instruction plus today's date to
-$STATE_DIR/gate-receipt-parent-dispatch and retry.
+BLOCKED by dispatch gate: hand-chained start/send is the retired dispatch
+shape (proxy pattern retired 2026-08-08, W32 M5). Dispatch external workers
+with ONE blocking call instead:
+  agent-tmux <cli> assign <name> <dir> <prompt-file>
+run where a long wait is appropriate (a background task, or one cheap
+subagent when foreground timeouts cap the wait). Read
+~/.agents/rules/model-dispatch.md §4. Only if the user explicitly instructed
+hand-chained parent dispatch: write that quoted instruction plus today's
+date to $STATE_DIR/gate-receipt-parent-dispatch and retry.
 EOF
   exit 2
 fi
