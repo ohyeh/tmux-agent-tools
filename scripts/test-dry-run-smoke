@@ -6,8 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$AGENT_TMUX"
+CLAUDE_TMUX="$AGENT_TMUX"
 
 WORK="$(mktemp -d -t tmux-agent-dry-run-smoke.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -49,20 +50,20 @@ run_ok_case() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-ok ($wrapper, all green)"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run "$prefix-ok" "$WORK" 2>&1)" || code=$?
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run "$prefix-ok" "$WORK" 2>&1)" || code=$?
   assert "$prefix-ok exit=0" "$code" "0"
   assert "$prefix-ok ok=true" "$(jq_val "$out" .ok)" "true"
   assert "$prefix-ok schema_version=1" "$(jq_val "$out" .schema_version)" "1"
   assert "$prefix-ok workdir_exists=pass" "$(jq_val "$out" '.checks[] | select(.name=="workdir_exists") | .status')" "pass"
   assert "$prefix-ok agent_cli_binary=pass" "$(jq_val "$out" '.checks[] | select(.name=="agent_cli_binary") | .status')" "pass"
-  assert "$prefix-ok tool field" "$(jq_val "$out" .tool)" "$(basename "$wrapper")"
+  assert "$prefix-ok tool field" "$(jq_val "$out" .tool)" "${cli_env:l}-tmux"
 }
 
 run_bad_workdir() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-bad-dir ($wrapper, missing workdir)"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run "$prefix-bad" /no/such/dir 2>&1)" || code=$?
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run "$prefix-bad" /no/such/dir 2>&1)" || code=$?
   assert "$prefix-bad-dir exit=2" "$code" "2"
   assert "$prefix-bad-dir ok=false" "$(jq_val "$out" .ok)" "false"
   assert "$prefix-bad-dir workdir_exists=fail" "$(jq_val "$out" '.checks[] | select(.name=="workdir_exists") | .status')" "fail"
@@ -73,7 +74,7 @@ run_preexisting_sentinel() {
   echo "case: $prefix-stale-sentinel ($wrapper, pre-existing sentinel)"
   touch "$WORK/$prefix-stale"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --sentinel "$WORK/$prefix-stale" "$prefix-s" "$WORK" 2>&1)" || code=$?
   assert "$prefix-stale exit=2" "$code" "2"
   assert "$prefix-stale sentinel_path=fail" "$(jq_val "$out" '.checks[] | select(.name=="sentinel_path") | .status')" "fail"
@@ -83,7 +84,7 @@ run_on_exit_without_sentinel() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-orphan-on-exit ($wrapper, --on-exit without --sentinel)"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --on-exit "echo done" "$prefix-x" "$WORK" 2>&1)" || code=$?
   assert "$prefix-orphan exit=2" "$code" "2"
   assert "$prefix-orphan on_exit_pairing=fail" "$(jq_val "$out" '.checks[] | select(.name=="on_exit_pairing") | .status')" "fail"
@@ -93,7 +94,7 @@ run_relative_transcript() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-relative-transcript ($wrapper, relative path rejected)"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --transcript "relative.jsonl" "$prefix-r" "$WORK" 2>&1)" || code=$?
   assert "$prefix-relative exit=2" "$code" "2"
   assert "$prefix-relative transcript_path=fail" "$(jq_val "$out" '.checks[] | select(.name=="transcript_path") | .status')" "fail"
@@ -102,11 +103,11 @@ run_relative_transcript() {
 run_no_side_effects() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-no-side-effects ($wrapper, dry-run must not create session)"
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run "$prefix-side" "$WORK" >/dev/null 2>&1
+  env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run "$prefix-side" "$WORK" >/dev/null 2>&1
   # If start_session actually ran, tmux would have created a real session.
   # Probe tmux directly because `status` returns 0 even for stopped sessions.
   local tmux_session
-  if [[ "$wrapper" == *codex-tmux ]]; then
+  if [[ "$cli_env" == CODEX ]]; then
     tmux_session="codex-cli-$prefix-side"
   else
     tmux_session="claude-cli-$prefix-side"
@@ -122,16 +123,16 @@ run_no_side_effects() {
 }
 
 run_wrong_env_var_does_not_cross_fallback() {
-  # Regression for gemini HIGH-priority finding: claude-tmux must NOT
+  # Regression for gemini HIGH-priority finding: agent-tmux claude must NOT
   # fall back to $CODEX when $CLAUDE is unset, and vice versa.
-  local wrapper="$1" wrong_env="$2" prefix="$3"
+  local wrapper="$1" cli="$2" wrong_env="$3" prefix="$4"
   echo "case: $prefix-wrong-env ($wrapper, wrong env var should not satisfy CLI check)"
   local out code=0
   # Pass only the *other* tool's env var; the dry-run's correct env is unset.
   # Also unset PATH-resolved fallbacks by pointing the wrong env at a path
   # that exists but is wrong-tool — wrapper should still resolve via the
   # right env var only.
-  out="$(env -u CODEX -u CLAUDE "$wrong_env=$WORK/fake.sh" "$wrapper" \
+  out="$(env -u CODEX -u CLAUDE "$wrong_env=$WORK/fake.sh" "$wrapper" "$cli" \
     start --exact --dry-run "$prefix-wrong" "$WORK" 2>&1)" || code=$?
   # The right env is unset; wrapper should fall back to `command -v <tool>`
   # which may or may not resolve depending on shell PATH. We only assert
@@ -153,7 +154,7 @@ run_transcript_no_side_effect() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-transcript-no-side-effect ($wrapper)"
   local tpath="$WORK/$prefix-side-effect.jsonl"
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --transcript "$tpath" "$prefix-tse" "$WORK" >/dev/null 2>&1
   if [[ -e "$tpath" ]]; then
     echo "  FAIL $prefix transcript dry-run created $tpath" >&2
@@ -169,7 +170,7 @@ run_model_passthrough() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-model (--model appended to launch flags) ($wrapper)"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --model claude-sonnet-4-6 "$prefix-m" "$WORK" 2>&1)" || code=$?
   assert "$prefix-model exit=0" "$code" "0"
   local flags; flags="$(jq_val "$out" .invocation.launch_flags)"
@@ -180,7 +181,7 @@ run_model_passthrough() {
   fi
   # value needing shell quoting must be preserved as one token
   local out2 code2=0
-  out2="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out2="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --model "spaced model" "$prefix-m2" "$WORK" 2>&1)" || code2=$?
   local flags2; flags2="$(jq_val "$out2" .invocation.launch_flags)"
   if [[ "$flags2" == *"--model 'spaced model'"* || "$flags2" == *'--model "spaced model"'* || "$flags2" == *'--model spaced\ model'* ]]; then
@@ -190,7 +191,7 @@ run_model_passthrough() {
   fi
   # missing value is rejected (--model is the final token, nothing follows)
   local code3=0
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run --model >/dev/null 2>&1 || code3=$?
+  env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run --model >/dev/null 2>&1 || code3=$?
   assert "$prefix-model missing-value exit=2" "$code3" "2"
 }
 
@@ -200,14 +201,14 @@ run_extra_launch_flags() {
 
   local out code=0
   out="$(env "$cli_env=$WORK/fake.sh" "${cli_env}_TMUX_EXTRA_LAUNCH_FLAGS=-c added=true" \
-    "$wrapper" start --exact --dry-run "$prefix-extra" "$WORK" 2>&1)" || code=$?
+    "$wrapper" "${cli_env:l}" start --exact --dry-run "$prefix-extra" "$WORK" 2>&1)" || code=$?
   assert "$prefix-extra exit=0" "$code" "0"
   assert "$prefix-extra after default" "$(jq_val "$out" .invocation.launch_flags)" "$default_flags -c added=true"
 
   local out2 code2=0
   out2="$(env "$cli_env=$WORK/fake.sh" "${cli_env}_TMUX_LAUNCH_FLAGS=--override" \
     "${cli_env}_TMUX_EXTRA_LAUNCH_FLAGS=-c added=true" \
-    "$wrapper" start --exact --dry-run "$prefix-extra-override" "$WORK" 2>&1)" || code2=$?
+    "$wrapper" "${cli_env:l}" start --exact --dry-run "$prefix-extra-override" "$WORK" 2>&1)" || code2=$?
   assert "$prefix-extra-override exit=0" "$code2" "0"
   assert "$prefix-extra after override" "$(jq_val "$out2" .invocation.launch_flags)" "--override -c added=true"
 }
@@ -215,13 +216,13 @@ run_extra_launch_flags() {
 run_effort_passthrough() {
   echo "case: cd-effort (--effort expands codex effort_flags)"
   local out code=0
-  out="$(env CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --dry-run \
+  out="$(env CODEX="$WORK/fake.sh" "$CODEX_TMUX" codex start --exact --dry-run \
     --effort high cd-eff "$WORK" 2>&1)" || code=$?
   assert "cd-effort exit=0" "$code" "0"
   assert "cd-effort launch_flags" "$(jq_val "$out" .invocation.launch_flags)" "--yolo -c model_reasoning_effort=high"
 
   local out2 code2=0
-  out2="$(env CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --dry-run \
+  out2="$(env CODEX="$WORK/fake.sh" "$CODEX_TMUX" codex start --exact --dry-run \
     --model gpt-5 --effort high cd-model-eff "$WORK" 2>&1)" || code2=$?
   assert "cd-model-effort exit=0" "$code2" "0"
   local flags; flags="$(jq_val "$out2" .invocation.launch_flags)"
@@ -232,7 +233,7 @@ run_effort_passthrough() {
 run_effort_rejected_without_profile_key() {
   echo "case: cl-effort-unsupported (--effort rejected without effort_flags)"
   local out code=0
-  out="$(env CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact --dry-run \
+  out="$(env CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" claude start --exact --dry-run \
     --effort high cl-eff "$WORK" 2>&1)" || code=$?
   assert "cl-effort-unsupported exit=2" "$code" "2"
   assert_contains "cl-effort-unsupported message" "$out" "--effort not supported by profile 'claude' (set effort_flags in the profile)"
@@ -243,19 +244,19 @@ run_misplaced_flag_rejections() {
   echo "case: $prefix-misplaced-flags ($wrapper)"
 
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     "$prefix-mf" --model haiku "$WORK" 2>&1)" || code=$?
   assert "$prefix-misplaced-start exit=2" "$code" "2"
   assert_contains "$prefix-misplaced-start names token" "$out" "unknown or misplaced flag: --model"
 
   local ok_out ok_code=0
-  ok_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  ok_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --model haiku "$prefix-order" "$WORK" 2>&1)" || ok_code=$?
   assert "$prefix-documented-order exit=0" "$ok_code" "0"
   assert "$prefix-documented-order ok=true" "$(jq_val "$ok_out" .ok)" "true"
 
   local ssh_out ssh_code=0
-  ssh_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start-ssh --exact \
+  ssh_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start-ssh --exact \
     "$prefix-ssh" --model example-host /tmp 2>&1)" || ssh_code=$?
   assert "$prefix-misplaced-start-ssh exit=2" "$ssh_code" "2"
   assert_contains "$prefix-misplaced-start-ssh names token" "$ssh_out" "unknown or misplaced flag: --model"
@@ -265,7 +266,7 @@ run_project_config_guard() {
   local wrapper="$1" cli_env="$2" prefix="$3"
   echo "case: $prefix-project-config-guard ($wrapper)"
   local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     "$prefix-guard" "$WORK" "do the task" 2>&1)" || code=$?
   assert "$prefix-guard exit=0" "$code" "0"
   assert "$prefix-guard initial_text unchanged" "$(jq_val "$out" .invocation.initial_text)" "do the task"
@@ -277,7 +278,7 @@ run_project_config_guard() {
   fi
 
   local opt_out code2=0
-  opt_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
+  opt_out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" "${cli_env:l}" start --exact --dry-run \
     --allow-project-config "$prefix-allow" "$WORK" "do the task" 2>&1)" || code2=$?
   assert "$prefix-allow-project-config exit=0" "$code2" "0"
   assert "$prefix-allow-project-config no effective override" "$(jq_val "$opt_out" '.invocation.effective_initial_text // "none"')" "none"
@@ -301,8 +302,8 @@ done
 run_effort_passthrough
 run_effort_rejected_without_profile_key
 
-run_wrong_env_var_does_not_cross_fallback "$CODEX_TMUX"  "CLAUDE" "xcd"
-run_wrong_env_var_does_not_cross_fallback "$CLAUDE_TMUX" "CODEX"  "xcl"
+run_wrong_env_var_does_not_cross_fallback "$CODEX_TMUX"  codex  "CLAUDE" "xcd"
+run_wrong_env_var_does_not_cross_fallback "$CLAUDE_TMUX" claude "CODEX"  "xcl"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"
