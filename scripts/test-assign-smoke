@@ -74,7 +74,26 @@ fi
 grep -q '"status"' "$OUT" || { cat "$OUT" >&2; fail "supervise JSON missing from stdout" }
 echo "ok: full assign sequence (start → init → send → confirm → supervise)"
 
-# 3) --detach: steps 1-4 then immediate return with assigned:true JSON —
+# 3) A fast terminal result is processing evidence and must not trigger resend.
+"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
+FAST_OUT="$WORK/fast.out"
+"$AGENT_TMUX" fakecli assign --timeout 30 --confirm-window 30 assign-smoke "$WORK" "$WORK/prompt.txt" \
+  > "$FAST_OUT" 2> "$WORK/fast.err" &
+FAST_PID=$!
+for _ in {1..60}; do
+  grep -q 'assign\[4/5\]' "$WORK/fast.err" && break
+  sleep 1
+done
+grep -q 'assign\[4/5\]' "$WORK/fast.err" || { cat "$WORK/fast.err" >&2; fail "fast assign never reached confirmation"; }
+RESULT_PATH="$("$AGENT_TMUX" fakecli result path assign-smoke 2>/dev/null || true)"
+[[ -n "$RESULT_PATH" && -e "$RESULT_PATH" ]] || { cat "$WORK/fast.err" >&2; fail "fast result path missing"; }
+printf '{"schema_version":1,"status":"success","summary":"fast done"}\n' > "$RESULT_PATH"
+wait $FAST_PID || { cat "$WORK/fast.err" >&2; fail "fast terminal result was not accepted"; }
+grep -q 'attempt 2/2' "$WORK/fast.err" && { cat "$WORK/fast.err" >&2; fail "fast terminal result triggered a resend"; }
+grep -q '"status"' "$FAST_OUT" || { cat "$FAST_OUT" >&2; fail "fast terminal result missing from stdout"; }
+echo "ok: fast terminal result prevents resend"
+
+# 4) --detach: steps 1-4 then immediate return with assigned:true JSON —
 #    no long-lived supervise process left behind (reaper-hostile harnesses).
 "$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
 DOUT="$WORK/detach.out"

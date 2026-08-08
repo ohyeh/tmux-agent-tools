@@ -3957,7 +3957,7 @@ assign_session() {
   _assign_delivered() {
     ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null | grep -qF "$proof"
   }
-  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy idle
+  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy idle validation
   for attempt in 1 2; do
     send_rc=0
     send_out="$( ( send_session --from-file "$prompt" "$name" ) 2>&1 )" || send_rc=$?
@@ -3971,6 +3971,11 @@ assign_session() {
     while :; do
       now="$(date +%s)"
       (( now - sent_at > confirm_window )) && break
+      validation="$( ( result_session --json "$name" ) 2>/dev/null || true )"
+      if result_terminal_ready "$validation" >/dev/null; then
+        confirmed=1
+        break
+      fi
       st="$( ( status_session --json "$name" ) 2>/dev/null || true )"
       blocked="$(printf '%s' "$st" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
       if [[ -n "$blocked" && "$blocked" != "startup_pending" ]]; then

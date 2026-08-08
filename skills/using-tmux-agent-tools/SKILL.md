@@ -45,60 +45,19 @@ No exception fired → inline, receipt `no-delegate-trigger`.
   `start` (no `--headless`); do not `stop` between tasks; reuse via
   `skills/tmux-agent-tools/references/multi-agent.md#persistent-teammates-worker-reuse`.
 
-## NATIVE PROXY (ALL RUNTIMES) — external CLI as a native proxy sub-agent
+## ONE OWNER — `assign` is the supervision boundary
 
-When an external CLI worker is authorized, asynchronous, and the current
-runtime exposes native sub-agents (Codex `spawn_agent`, Claude Code `Agent`
-tool), exactly one cheap supervision-only native proxy per external worker is
-REQUIRED. The parent MUST NOT run `start`/`send-wait`/`supervise` on that
-worker directly — direct driving happens only inside the proxy. This is
-supervision hygiene on every runtime; on Codex it is also an ownership and
-observability bridge: the Codex App tracks the proxy's native thread while the
-existing wrapper remains the execution engine.
-Do not claim that the external process itself is a native sub-agent.
+Dispatch one external CLI worker with one blocking `agent-tmux <cli> assign
+<name> <directory> <prompt-file>` call. `assign` owns start, result init,
+verified send, processing confirmation, and terminal supervision. Do not add a
+native supervision proxy or concurrently call `status`, `capture`, `probe`,
+`result`, or another wait while it runs.
 
-- Name the proxy `<cli>_<task>` using lowercase ASCII letters, digits, and
-  underscores (`claude_auth_review`, `codex_test_fix`, `agy_ui_audit`).
-  `codex_<task>` means `agent-tmux codex`; reserve `native_<task>` for work performed
-  by a Codex in-process sub-agent without an external CLI.
-- Before dispatch, pass `model-dispatch.md` and `delegation-templates`. On
-  Claude Code the proxy is a `general-purpose` sub-agent on `sonnet`
-  (haiku retired; former haiku roles run sonnet at effort low, model-dispatch §1). On Codex prefer `gpt-5.6-luna` for shell supervision and
-  progress summarization, fall back to `gpt-5.6-terra` when luna is
-  unavailable, and use `gpt-5.6-sol` only when the
-  proxy task itself needs frontier reasoning. Send a self-contained GOAL /
-  ACCEPTANCE / REPORT brief. The proxy launches exactly the one named
-  worker and MUST NOT edit the target itself, spawn another sub-agent, start any
-  additional tmux session, or delegate further.
-- After launch or attach, call `supervise --result-required
-  --silent-while-unchanged --json` exactly once. Polling remains inside the
-  deterministic wrapper process; unchanged state emits nothing and consumes no
-  additional model turns. A valid terminal `result.json`, confirmed process
-  loss, needs-input/blocker, or the overall supervision deadline ends the call.
-- **Headed / persistent**: launch interactive `start`, then use the same blocking
-  supervisor. Keep the worker alive when follow-ups were requested; inspect
-  detailed liveness fields only after an abnormal supervisor return.
-- The normal-call budget is one launch/attach, one blocking `supervise`, and its
-  built-in terminal validation. One diagnostic `capture` is allowed only after
-  abnormal termination or contradictory evidence; further calls require a new
-  blocker hypothesis, not another elapsed interval.
-- Keep the proxy brief slim: worker name, wrapper command, result contract,
-  terminal states, and the no-concurrent-owner rule. Do not copy the worker's
-  production task context into the supervisor prompt.
-- Once assigned, all wrapper interaction transfers to the proxy. The parent MUST
-  NOT call `status`, `watch`, `capture`, `probe`, `ping`, `result`, or send a
-  follow-up unless the proxy reports blocked/lost-liveness, terminates
-  unexpectedly, or the user explicitly requests direct inspection. The proxy
-  reports only material state changes or its terminal result; periodic
-  heartbeats and unchanged `running`/`waiting` narration are prohibited.
-- `capture` is diagnostic-only: use it when status/process evidence conflicts,
-  liveness is unknown, the worker exits without a valid result, or a blocker
-  needs classification. Never capture merely because a wait interval elapsed.
-
-If native sub-agents are unavailable, launch the selected wrapper directly and
-report `UNAVAILABLE-NATIVE`: execution still works, but it will not appear in
-the Codex App Subagents panel. Provider-specific panel icons and collapsed-card
-progress are app behavior, not promises made by this skill.
+Use `assign --detach` only when the calling harness cannot keep a blocking
+process alive. Harvest afterward with one bounded `result wait-required`; a
+single diagnostic call is allowed only when dispatch or harvest reports an
+abnormal result. Native sub-agents may do real independent work, but are not a
+required wrapper around an external CLI process.
 
 ## SELECT — wrapper by task shape
 
