@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+- **`assign` — the stepwise dispatch sequence as one command** (W32 retro M5,
+  P0). Runs `start --exact` → `result init` → `send --from-file` → a
+  confirm-processing check (busy probe, else pane-still-changing fallback) →
+  one blocking `supervise --result-required`, refusing to continue past a
+  failed step and printing the failed step + pane capture + a JSON line on
+  error. Encodes the user-verified sequence that replaces the stale
+  `start --prompt-file` shape (worker sits idle with no task; the symptom
+  mimics an auth hang — re-hit by ≥4 sessions after the lesson was recorded).
+  Smoke: `scripts/test-assign-smoke`.
+
 ## v0.39.0 - 2026-07-30
 
 ### Changed

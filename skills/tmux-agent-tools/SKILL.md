@@ -80,6 +80,12 @@ Full capability table (every subcommand + when to use it): `references/cheatshee
 ## The 6 commands you need most
 
 ```bash
+# Dispatch a prompt-file task: ONE command runs the whole verified sequence
+# (start -> result init -> send --from-file -> confirm the pane is processing
+# -> blocking supervise). Prefer this over hand-chaining the steps; it cannot
+# be misordered and it catches "task never reached the CLI" before waiting.
+agent-tmux codex assign job ~/repo /abs/path/prompt.txt
+
 # Bounded one-shot (headed by default; add --headless only when the user opted in):
 agent-tmux codex start --exact job ~/repo 'Task. Write final JSON to the wrapper-provided result path when done.'
 agent-tmux codex result wait-required job --fields status,summary --wait 600 --json   # returns at process exit

@@ -297,6 +297,7 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
+  agent-tmux assign [--timeout N] [--confirm-window N] <name> <directory> <prompt-file>
   agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
   agent-tmux start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
@@ -397,6 +398,33 @@ help_for_subcommand() {
   case "$topic" in
     "")
       usage
+      return 0
+      ;;
+    assign)
+      cat <<'HELP_EOF'
+agent-tmux assign [--timeout N] [--confirm-window N] <name> <directory> <prompt-file>
+
+The stepwise dispatch sequence as ONE command (W32 retro M5). Runs, in order,
+refusing to continue past a failed step:
+  1. start --exact (no prompt text; readiness polls own startup/trust screens)
+  2. result init
+  3. send --from-file <prompt-file>   (absolute path, must be non-empty)
+  4. confirm the pane is actually processing (busy probe, else still-changing)
+  5. one blocking supervise --result-required --json
+
+Replaces the hand-rolled start/init/send/supervise chain — and the stale
+`start --prompt-file` shape that leaves a worker idle with no task (the
+symptom mimics an auth hang). On failure prints the step, a pane capture
+tail, and a JSON line {assigned:false,failed_step,...}; exit 1.
+
+Flags:
+  --timeout N          supervise budget in seconds (default 86400)
+  --confirm-window N   seconds to wait for processing evidence (default 90)
+
+Example:
+  p="$(agent-tmux brief --template implement --goal 'Fix X' --acceptance 'tests pass')"
+  agent-tmux claude assign fixer ~/repo "$p"
+HELP_EOF
       return 0
       ;;
     brief)
@@ -3834,6 +3862,99 @@ brief_session() {
   local out; out="$(mktemp -t agent-tmux-brief.XXXXXX)"
   printf '%s' "$compiled" > "$out"
   printf '%s\n' "$out"
+}
+
+# ---- assign: the stepwise dispatch sequence as ONE command -----------------
+# W32 retro M5 (P0): four independent sessions re-hit the stale
+# `start --prompt-file` shape — the worker sits idle with no task and no
+# result.json, and the symptom mimics an auth hang ("Verifying your
+# account"). The user-designed sequence is encoded as a single entrypoint so
+# the steps cannot be skipped or misordered:
+#   1. start (no prompt text; start/send readiness polls own the startup/
+#      trust/login screens)            2. result init
+#   3. send --from-file <abs>          4. confirm the pane is actually
+#      processing (busy probe, else pane-still-changing heuristic)
+#   5. one blocking supervise --result-required.
+# Each step must pass before the next runs; any failure prints the step name,
+# a pane capture tail, and a machine-readable JSON line, then exits 1.
+_assign_fail() {
+  # $1=step $2=diagnostic $3=name
+  echo "assign: step '$1' failed: $2" >&2
+  echo "assign: last pane output:" >&2
+  ( capture_session --strip-ansi --tail 25 "$3" ) >&2 2>/dev/null || true
+  "$JQ" -n --arg tool "$CLI" --arg name "$3" --arg step "$1" --arg diagnostic "$2" \
+    '{schema_version:1,tool:$tool,name:$name,assigned:false,failed_step:$step,diagnostic:$diagnostic}'
+  exit 1
+}
+
+assign_session() {
+  local timeout=86400 confirm_window=90
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --timeout)        timeout="${2:-}"; shift 2 ;;
+      --confirm-window) confirm_window="${2:-}"; shift 2 ;;
+      *) echo "assign: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  local name="${1:-}" dir="${2:-}" prompt="${3:-}"
+  local usage_msg="Usage: agent-tmux assign [--timeout N] [--confirm-window N] <name> <directory> <prompt-file>"
+  if [[ -z "$name" || -z "$dir" || -z "$prompt" ]]; then
+    echo "$usage_msg" >&2; return 2
+  fi
+  if [[ "$prompt" != /* ]]; then
+    echo "assign: <prompt-file> must be an absolute path (got: $prompt)" >&2; return 2
+  fi
+  if [[ ! -r "$prompt" || ! -s "$prompt" ]]; then
+    echo "assign: <prompt-file> is missing, unreadable, or empty: $prompt" >&2; return 2
+  fi
+  if [[ ! -d "$dir" ]]; then
+    echo "assign: <directory> does not exist: $dir" >&2; return 2
+  fi
+
+  echo "assign[1/5] start --exact $name" >&2
+  ( start_session --exact "$name" "$dir" ) >&2 \
+    || _assign_fail start "start_session exited non-zero (readiness poll output above)" "$name"
+
+  echo "assign[2/5] result init" >&2
+  ( result_session init "$name" ) >&2 \
+    || _assign_fail result-init "result init exited non-zero" "$name"
+
+  echo "assign[3/5] send --from-file $prompt" >&2
+  local send_out send_rc=0
+  send_out="$( ( send_session --from-file "$prompt" "$name" ) 2>&1 )" || send_rc=$?
+  printf '%s\n' "$send_out" >&2
+  if (( send_rc != 0 )) || printf '%s' "$send_out" | grep -q '"submitted":false'; then
+    _assign_fail send "prompt was not submitted (see send output above)" "$name"
+  fi
+
+  echo "assign[4/5] confirm the worker is processing (window ${confirm_window}s)" >&2
+  local sent_at now confirmed=0 st blocked busy idle
+  sent_at="$(date +%s)"
+  while :; do
+    now="$(date +%s)"
+    (( now - sent_at > confirm_window )) && break
+    st="$( ( status_session --json "$name" ) 2>/dev/null || true )"
+    blocked="$(printf '%s' "$st" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
+    if [[ -n "$blocked" ]]; then
+      _assign_fail confirm-processing "worker blocked after send: $blocked" "$name"
+    fi
+    # Preferred signal: the CLI's busy spinner. Falls back (CLIs whose
+    # heuristic family has no busy metric, e.g. generic/agy) to "the pane is
+    # still changing well after the prompt injection".
+    busy="$( ( probe_session --json --metric busy "$name" ) 2>/dev/null | "$JQ" -r '.value // empty' 2>/dev/null || true )"
+    if [[ "$busy" == "true" ]]; then confirmed=1; break; fi
+    idle="$(printf '%s' "$st" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
+    if [[ -n "$idle" && "$idle" -le 3 ]] && (( now - sent_at > 10 )); then
+      confirmed=1; break
+    fi
+    sleep 3
+  done
+  (( confirmed )) || _assign_fail confirm-processing \
+    "no processing activity within ${confirm_window}s of send — the task likely never reached the CLI" "$name"
+
+  echo "assign[5/5] supervise --result-required (timeout ${timeout}s)" >&2
+  ( supervise_session --timeout "$timeout" --result-required --silent-while-unchanged --json "$name" ) \
+    || _assign_fail supervise "supervise exited non-zero (worker died or timeout before a terminal result.json)" "$name"
 }
 
 start_session() {
@@ -8156,6 +8277,9 @@ case "$command" in
     ;;
   start)
     start_session "$@"
+    ;;
+  assign)
+    assign_session "$@"
     ;;
   brief)
     brief_session "$@"

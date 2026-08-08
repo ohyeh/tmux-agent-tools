@@ -1,0 +1,77 @@
+#!/usr/bin/env zsh
+# Smoke test for `assign` (W32 retro M5): the stepwise dispatch sequence as
+# one command — start → result init → send --from-file → confirm-processing →
+# blocking supervise --result-required. Uses a fake CLI that shows a ready
+# prompt, echoes input, and keeps the pane changing (so the generic-family
+# still-changing fallback confirms processing); the smoke then writes a
+# terminal result.json and expects assign to exit 0 with the supervise JSON.
+# Style mirrors scripts/test-start-readiness-smoke.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-assign.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap '"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+
+fail() { echo "FAIL: $1" >&2; exit 1 }
+
+# Fake CLI: ready prompt, echoes stdin, and ticks once per second so the
+# pane keeps changing while "working".
+cat > "$WORK/fakecli" <<'EOF'
+#!/bin/sh
+echo "› Write a prompt"
+( i=0; while :; do i=$((i+1)); echo "tick $i"; sleep 1; done ) &
+TICKER=$!
+trap 'kill $TICKER 2>/dev/null' EXIT
+while IFS= read -r line; do echo "got:$line"; done
+EOF
+chmod +x "$WORK/fakecli"
+export PATH="$WORK:$PATH"
+
+printf 'GOAL: demo\n\nACCEPTANCE: none\n\nREPORT: none\n' > "$WORK/prompt.txt"
+
+# 1) invalid-arg guards (no tmux needed)
+"$AGENT_TMUX" fakecli assign 2>/dev/null && fail "assign with no args must exit non-zero"
+"$AGENT_TMUX" fakecli assign n "$WORK" relative.txt 2>/dev/null && fail "relative prompt path must be rejected"
+: > "$WORK/empty.txt"
+"$AGENT_TMUX" fakecli assign n "$WORK" "$WORK/empty.txt" 2>/dev/null && fail "empty prompt file must be rejected"
+echo "ok: argument guards"
+
+# 2) full sequence — background assign, then complete the result contract.
+OUT="$WORK/assign.out"
+"$AGENT_TMUX" fakecli assign --timeout 120 --confirm-window 60 assign-smoke "$WORK" "$WORK/prompt.txt" \
+  > "$OUT" 2> "$WORK/assign.err" &
+ASSIGN_PID=$!
+
+# Wait until the sequence reaches supervise (result.json path exists after
+# step 2; the send + confirm steps are visible in stderr).
+RESULT_PATH=""
+for _ in {1..60}; do
+  RESULT_PATH="$("$AGENT_TMUX" fakecli result path assign-smoke 2>/dev/null || true)"
+  [[ -n "$RESULT_PATH" && -e "$RESULT_PATH" ]] && break
+  sleep 1
+done
+[[ -n "$RESULT_PATH" ]] || { cat "$WORK/assign.err" >&2; fail "result init never produced a result path" }
+
+# Give confirm-processing time to pass, then finish the worker's contract.
+for _ in {1..90}; do
+  grep -q 'assign\[5/5\]' "$WORK/assign.err" && break
+  kill -0 $ASSIGN_PID 2>/dev/null || break
+  sleep 1
+done
+grep -q 'assign\[5/5\]' "$WORK/assign.err" || { cat "$WORK/assign.err" >&2; fail "never reached supervise step (confirm-processing failed?)" }
+
+printf '{"schema_version":1,"status":"success","summary":"smoke done"}\n' > "$RESULT_PATH"
+
+if ! wait $ASSIGN_PID; then
+  cat "$WORK/assign.err" >&2; cat "$OUT" >&2
+  fail "assign exited non-zero after terminal result.json"
+fi
+grep -q '"status"' "$OUT" || { cat "$OUT" >&2; fail "supervise JSON missing from stdout" }
+echo "ok: full assign sequence (start → init → send → confirm → supervise)"
+
+echo "PASS: assign smoke"
