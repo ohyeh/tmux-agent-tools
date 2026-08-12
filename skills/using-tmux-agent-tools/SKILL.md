@@ -50,14 +50,19 @@ No exception fired → inline, receipt `no-delegate-trigger`.
 Dispatch one external CLI worker with one blocking `agent-tmux <cli> assign
 <name> <directory> <prompt-file>` call. `assign` owns start, result init,
 verified send, processing confirmation, and terminal supervision. Do not add a
-native supervision proxy or concurrently call `status`, `capture`, `probe`,
-`result`, or another wait while it runs.
+native supervision proxy: while `assign` runs, no second supervisor may
+concurrently call `status`, `capture`, `probe`, `result`, or another wait.
+Hosting that one `assign` call inside a sub-agent is not a proxy — see below.
 
-Use `assign --detach` only when the calling harness cannot keep a blocking
-process alive. Harvest afterward with one bounded `result wait-required`; a
-single diagnostic call is allowed only when dispatch or harvest reports an
-abnormal result. Native sub-agents may do real independent work, but are not a
-required wrapper around an external CLI process.
+Keep the long supervise off the expensive main context: host that one blocking
+`assign` in a cheap general-purpose sub-agent (model override, e.g. Sonnet), or
+in a background task. The host still makes exactly one `assign` call — it hosts,
+it does not proxy. Exception — a harness that reaps long-running tasks (local
+Claude Code kills them after ~10 min, together with any tmux server in the task
+tree) cannot hold the blocking wait at all: there, dispatch with `assign
+--detach` in a short foreground call, then harvest with bounded `result
+wait-required --wait <s>` calls. A single diagnostic call is allowed only when
+dispatch or harvest reports an abnormal result.
 
 ## SELECT — wrapper by task shape
 
