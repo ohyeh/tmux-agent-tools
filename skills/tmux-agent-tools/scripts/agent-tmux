@@ -3253,11 +3253,18 @@ write_launch_meta() {
   local subdir
   subdir="$(ensure_agent_dir "$name")"
   require_jq
+  # launch_flags + cli_bin (additive, schema stays 1): forensic record of what
+  # this generation actually launched with — without it, "which flags/model did
+  # generation N run?" is unanswerable after a restart (live incident 2026-08-18:
+  # a re-assigned worker's model could not be attributed to profile vs default).
   "$JQ" -n --arg cli "$CLI" --arg exec_mode "$exec_mode" --arg launch_id "$launch_id" \
     --arg task_shape "$task_shape" \
+    --arg launch_flags "${LAUNCH_FLAGS:-}" --arg cli_bin "${CLI_BIN:-}" \
     '{schema_version: 1, cli: $cli, exec_mode: $exec_mode}
      + (if $launch_id == "" then {} else {launch_id: $launch_id} end)
-     + (if $task_shape == "" then {} else {task_shape: $task_shape} end)' > "$subdir/launch-meta.json" 2>/dev/null || true
+     + (if $task_shape == "" then {} else {task_shape: $task_shape} end)
+     + (if $launch_flags == "" then {} else {launch_flags: $launch_flags} end)
+     + (if $cli_bin == "" then {} else {cli_bin: $cli_bin} end)' > "$subdir/launch-meta.json" 2>/dev/null || true
 }
 
 # finalize_launch_envelope <name> <terminal_reason> [exit_code]
