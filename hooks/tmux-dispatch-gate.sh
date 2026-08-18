@@ -82,15 +82,18 @@ fi
 
 if ! valid_receipt "$STATE_DIR/gate-receipt-parent-dispatch"; then
   cat >&2 <<EOF
-BLOCKED by dispatch gate: hand-chained start/send is the retired dispatch
-shape (proxy pattern retired 2026-08-08, W32 M5). Dispatch external workers
-with ONE blocking call instead:
+BLOCKED by dispatch gate: start/send/send-wait must not run in the PARENT
+session — host it in a supervision proxy (ONE general-purpose subagent on
+sonnet low) instead. First bring-up of a worker = ONE blocking
   agent-tmux <cli> assign <name> <dir> <prompt-file>
-run where a long wait is appropriate (a background task, or one cheap
-subagent when foreground timeouts cap the wait). Read
-~/.agents/rules/model-dispatch.md §4. Only if the user explicitly instructed
-hand-chained parent dispatch: write that quoted instruction plus today's
-date to $STATE_DIR/gate-receipt-parent-dispatch and retry.
+inside the proxy; every FOLLOW-UP task to the SAME persistent worker =
+  agent-tmux <cli> send-wait <name> ...
+also inside a proxy (send-wait itself is NOT retired — workers are session
+teammates, per model-dispatch.md §4 lifecycle ruling 2026-08-18; what is
+retired is hand-chaining the bring-up steps and parent-foreground hosting).
+Only if the user explicitly instructed hand-chained parent dispatch: write
+that quoted instruction plus today's date to
+$STATE_DIR/gate-receipt-parent-dispatch and retry.
 EOF
   exit 2
 fi
