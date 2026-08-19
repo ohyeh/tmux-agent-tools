@@ -2204,12 +2204,15 @@ RESULT_PATH_MARKER="Write final JSON to this exact path:"
 # miss into a permanent silent failure, because *_should_inject is
 # sentinel-gated and skips forever after (2026-08-19 blindagy2).
 # ponytail: fixed 5x200ms poll; make it a preference only if a slow TUI needs it.
-# ponytail: fixed 5x200ms poll — measured sufficient for agy's echo once the
-# proof slice is short enough to survive the TUI's re-flow. Widen only if a
-# slower TUI is observed to need it.
+# 10s window (50 x 200ms). The costs are asymmetric: a match breaks the loop
+# immediately, so a long window costs nothing whenever the text DID land; the
+# window is only spent on the path that has already failed. A short window
+# instead false-negatives on any TUI slower than it — exactly the failure class
+# this check exists to catch. agy echoed within ~1s when measured, but that is
+# one CLI on one machine, so the margin stays.
 _sentinel_landed() {
   local session="$1" needle="$2" i
-  for (( i = 0; i < 5; i++ )); do
+  for (( i = 0; i < 50; i++ )); do
     if "$TMUX" capture-pane -J -p -S -200 -t "$session" 2>/dev/null \
          | grep -qF -- "$needle"; then
       return 0
