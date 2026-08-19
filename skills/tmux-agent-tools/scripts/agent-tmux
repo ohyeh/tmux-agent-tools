@@ -2204,19 +2204,17 @@ RESULT_PATH_MARKER="Write final JSON to this exact path:"
 # miss into a permanent silent failure, because *_should_inject is
 # sentinel-gated and skips forever after (2026-08-19 blindagy2).
 # ponytail: fixed 5x200ms poll; make it a preference only if a slow TUI needs it.
-# Attempts/interval are arguments because the right window depends on the check:
-# ~1s is enough to confirm text already known to be rendered, but a lazily
-# redrawing TUI needs much longer for the FIRST sighting (observed live
-# 2026-08-19: agy echoed a landed prompt after >1s, so a 1s window reported a
-# false "swallowed" on a prompt the worker went on to answer correctly).
+# ponytail: fixed 5x200ms poll — measured sufficient for agy's echo once the
+# proof slice is short enough to survive the TUI's re-flow. Widen only if a
+# slower TUI is observed to need it.
 _sentinel_landed() {
-  local session="$1" needle="$2" attempts="${3:-5}" interval="${4:-0.2}" i
-  for (( i = 0; i < attempts; i++ )); do
+  local session="$1" needle="$2" i
+  for (( i = 0; i < 5; i++ )); do
     if "$TMUX" capture-pane -J -p -S -200 -t "$session" 2>/dev/null \
          | grep -qF -- "$needle"; then
       return 0
     fi
-    sleep "$interval"
+    sleep 0.2
   done
   return 1
 }
@@ -4586,7 +4584,7 @@ start_session() {
     for _start_attempt in 1 2; do
       paste_and_submit "$session" "$buffer_name" "$initial_text"
       [[ -z "$_start_proof" ]] && break
-      _sentinel_landed "$session" "$_start_proof" 60 0.5 && break
+      _sentinel_landed "$session" "$_start_proof" && break
       if (( _start_attempt == 1 )); then
         echo "start: initial prompt not echoed in the pane — a startup screen swallowed it; waiting for readiness and resending once" >&2
         local _reheal_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) _reheal_reason
