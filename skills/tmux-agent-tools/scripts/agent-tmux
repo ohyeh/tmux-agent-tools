@@ -2204,14 +2204,19 @@ RESULT_PATH_MARKER="Write final JSON to this exact path:"
 # miss into a permanent silent failure, because *_should_inject is
 # sentinel-gated and skips forever after (2026-08-19 blindagy2).
 # ponytail: fixed 5x200ms poll; make it a preference only if a slow TUI needs it.
+# Attempts/interval are arguments because the right window depends on the check:
+# ~1s is enough to confirm text already known to be rendered, but a lazily
+# redrawing TUI needs much longer for the FIRST sighting (observed live
+# 2026-08-19: agy echoed a landed prompt after >1s, so a 1s window reported a
+# false "swallowed" on a prompt the worker went on to answer correctly).
 _sentinel_landed() {
-  local session="$1" needle="$2" i
-  for (( i = 0; i < 5; i++ )); do
+  local session="$1" needle="$2" attempts="${3:-5}" interval="${4:-0.2}" i
+  for (( i = 0; i < attempts; i++ )); do
     if "$TMUX" capture-pane -J -p -S -200 -t "$session" 2>/dev/null \
          | grep -qF -- "$needle"; then
       return 0
     fi
-    sleep 0.2
+    sleep "$interval"
   done
   return 1
 }
@@ -4564,7 +4569,44 @@ start_session() {
     if result_path_should_inject "$name" "$initial_text"; then
       initial_text="$(result_path_prepend "$name" "$initial_text")"; _rp_inject=1
     fi
-    paste_and_submit "$session" "$buffer_name" "$initial_text"
+    # Delivery proof + one self-heal resend, mirroring the live-verified assign
+    # path (2e0c097). The readiness poll above checks ONCE and can pass before a
+    # swallowing screen renders: agy prints its logo, THEN "Verifying your
+    # account eligibility" (every launch, trusted dir or not), and an untrusted
+    # cwd raises a workspace-trust dialog. Either one eats the paste while
+    # paste_and_submit still reports success, leaving a worker that looks alive
+    # and never received its task (observed live 2026-08-19, both screens).
+    # Proof is a distinctive slice of the submitted text echoed into the pane —
+    # activity alone is NOT delivery.
+    local _start_proof _start_attempt
+    # 40 chars, not 60: the TUI re-flows the echoed prompt to its own width and
+    # indent, so a longer slice is split across displayed lines and never
+    # matches even with capture-pane -J (observed live 2026-08-19).
+    _start_proof="$(printf '%s\n' "$initial_text" | grep -m1 -E '[^[:space:]]' | cut -c1-40)"
+    for _start_attempt in 1 2; do
+      paste_and_submit "$session" "$buffer_name" "$initial_text"
+      [[ -z "$_start_proof" ]] && break
+      _sentinel_landed "$session" "$_start_proof" 60 0.5 && break
+      if (( _start_attempt == 1 )); then
+        echo "start: initial prompt not echoed in the pane — a startup screen swallowed it; waiting for readiness and resending once" >&2
+        local _reheal_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) _reheal_reason
+        while (( SECONDS < _reheal_deadline )); do
+          _reheal_reason="$(status_session --json "$name" 2>/dev/null | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
+          [[ -z "$_reheal_reason" ]] && break
+          if [[ "$_reheal_reason" != "startup_pending" ]]; then
+            "$JQ" -cn --arg tool "$CLI" --arg name "$name" --arg session "$session" \
+              --arg blocked_reason "$_reheal_reason" \
+              '{schema_version:1,submitted:false,blocked:true,blocked_reason:$blocked_reason,tool:$tool,name:$name,session:$session}'
+            return 1
+          fi
+          sleep 2
+        done
+      else
+        "$JQ" -cn --arg tool "$CLI" --arg name "$name" --arg session "$session" \
+          '{schema_version:1,submitted:false,blocked:true,blocked_reason:"prompt_swallowed",diagnostic:"initial prompt was not echoed in the pane after two attempts; inspect the pane before re-sending",tool:$tool,name:$name,session:$session}'
+        return 1
+      fi
+    done
     (( _scope_guard_inject )) && { task_scope_guard_mark_injected "$name" "$session" || true; }
     (( _rp_inject )) && { result_path_mark_injected "$name" "$session" || true; }
     echo "sent: $initial_text"
