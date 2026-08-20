@@ -3999,7 +3999,11 @@ assign_session() {
   # the pane changing and confirmed a send that a still-booting TUI had
   # swallowed (empty input box, placeholder prompt).
   local proof
-  proof="$(grep -m1 -E '[^[:space:]]' "$prompt" | cut -c1-60)"
+  # 40 chars, not 60: the TUI re-flows the echoed prompt to its own width and
+  # indent, so a longer slice straddles a wrap boundary and never matches even
+  # via capture-pane -J (start path, 2026-08-19; assign hit the same 2026-08-20:
+  # Opus was provably processing and assign still failed confirm-processing).
+  proof="$(grep -m1 -E '[^[:space:]]' "$prompt" | cut -c1-40)"
   _assign_delivered() {
     ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null | grep -qF "$proof"
   }
