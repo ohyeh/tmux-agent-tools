@@ -22,6 +22,16 @@ if [[ -z "$CLI" || "$CLI" == -* ]]; then
   echo "  <cli>: claude | codex | agy | cursor | grok | <custom-binary>" >&2
   exit 2
 fi
+# A command name in <cli> position is the classic misread of this usage (a stale
+# help line cost a session two failed dispatches, 2026-08-21): without this guard
+# `agent-tmux assign ...` treats "assign" as a custom binary and dies on the next
+# token, and `agent-tmux list` prints help with exit 0 — a silent no-op success.
+case " assign brief start resume start-ssh attach send send-wait send-wait-literal wait wait-text wait-literal wait-and-capture capture result supervise list status stats ping probe watch env-doctor doctor setup self-test stop checkpoint " in
+  *" $CLI "*)
+    echo "agent-tmux: '$CLI' is a command, not a <cli>. Use: agent-tmux <cli> $CLI ..." >&2
+    echo "  <cli>: claude | codex | agy | cursor | grok | <custom-binary>" >&2
+    exit 2 ;;
+esac
 shift
 JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 
@@ -297,60 +307,60 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
-  agent-tmux assign [--timeout N] [--confirm-window N] [--detach] <name> <directory> <prompt-file>
-  agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
-  agent-tmux start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
-  agent-tmux resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
-  agent-tmux start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
-  agent-tmux attach <name>
-  agent-tmux send [--allow-project-config] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
-  agent-tmux send --key enter|up|down <name>
-  agent-tmux send-wait [--allow-project-config] <name> <text> [timeout_seconds]
-  agent-tmux send-wait-literal [--allow-project-config] <name> <text> <literal> [timeout_seconds]
-  agent-tmux wait <name> [timeout_seconds]
-  agent-tmux wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]
-  agent-tmux wait-literal <name> <text> [timeout_seconds]
-  agent-tmux wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] [--wait-for-human] [--cancel-file <path>] <name>
-  agent-tmux capture [--strip-ansi] [--since-marker <text>] [--tail <N>] [--json] <name> [lines]
-  agent-tmux result [--path] [--field <jq>] [--wait <seconds>] [--json] <name>
-  agent-tmux result path <name>
-  agent-tmux result init <name>
-  agent-tmux result validate <name> --json
-  agent-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
-  agent-tmux supervise [--timeout <seconds>] [--interval <seconds>] [--result-required] [--silent-while-unchanged] --json <name>
-  agent-tmux list
-  agent-tmux status [--json] <name>
-  agent-tmux stats [--json] [--since YYYY-MM-DD]
-  agent-tmux ping [--timeout <s>] [--json] <name>
-  agent-tmux probe --metric <metric> [--json] <name>
-  agent-tmux watch [--any|--all|--count <n>] [--timeout <s>] [--interval <s>] [--json] <name...>
-  agent-tmux env-doctor [name]
-  agent-tmux doctor
-  agent-tmux setup
-  agent-tmux self-test
-  agent-tmux stop <name>
+  agent-tmux <cli> assign [--timeout N] [--confirm-window N] [--detach] <name> <directory> <prompt-file>
+  agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
+  agent-tmux <cli> start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
+  agent-tmux <cli> resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
+  agent-tmux <cli> start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
+  agent-tmux <cli> attach <name>
+  agent-tmux <cli> send [--allow-project-config] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
+  agent-tmux <cli> send --key enter|up|down <name>
+  agent-tmux <cli> send-wait [--allow-project-config] <name> <text> [timeout_seconds]
+  agent-tmux <cli> send-wait-literal [--allow-project-config] <name> <text> <literal> [timeout_seconds]
+  agent-tmux <cli> wait <name> [timeout_seconds]
+  agent-tmux <cli> wait-text [--literal|--regex] <name> <text-or-regex> [timeout_seconds]
+  agent-tmux <cli> wait-literal <name> <text> [timeout_seconds]
+  agent-tmux <cli> wait-and-capture --marker <text> [--literal|--regex] [--timeout <s>] [--tail <n>] [--strip-ansi] [--since-marker <text>] [--json] [--no-timeout-error] [--pause-until-file <path>] [--pause-timeout <s>] [--wait-for-human] [--cancel-file <path>] <name>
+  agent-tmux <cli> capture [--strip-ansi] [--since-marker <text>] [--tail <N>] [--json] <name> [lines]
+  agent-tmux <cli> result [--path] [--field <jq>] [--wait <seconds>] [--json] <name>
+  agent-tmux <cli> result path <name>
+  agent-tmux <cli> result init <name>
+  agent-tmux <cli> result validate <name> --json
+  agent-tmux <cli> result wait-required <name> --fields <csv> --wait <seconds> --json
+  agent-tmux <cli> supervise [--timeout <seconds>] [--interval <seconds>] [--result-required] [--silent-while-unchanged] --json <name>
+  agent-tmux <cli> list
+  agent-tmux <cli> status [--json] <name>
+  agent-tmux <cli> stats [--json] [--since YYYY-MM-DD]
+  agent-tmux <cli> ping [--timeout <s>] [--json] <name>
+  agent-tmux <cli> probe --metric <metric> [--json] <name>
+  agent-tmux <cli> watch [--any|--all|--count <n>] [--timeout <s>] [--interval <s>] [--json] <name...>
+  agent-tmux <cli> env-doctor [name]
+  agent-tmux <cli> doctor
+  agent-tmux <cli> setup
+  agent-tmux <cli> self-test
+  agent-tmux <cli> stop <name>
   agent-tmux --version
   agent-tmux help
 
 Examples:
-  agent-tmux start --attach pr5 ~/github/example-service
-  agent-tmux resume --exact pr5 ~/github/example-service ee5aca88-a1af-48d3-af21-54f60d618f22
-  agent-tmux start-ssh --attach pr5 example-host ~/github/example-service
-  agent-tmux start --exact pr5 ~/github/example-service 'hi'
-  agent-tmux attach pr5
-  agent-tmux send pr5 'Read the PR description first.'
-  agent-tmux send-wait pr5 'Summarize the current state.' 180
-  agent-tmux send-wait-literal pr5 'Reply with the requested marker.' '[CLAUDE-01]' 180
-  agent-tmux wait pr5 180
-  agent-tmux wait-text --regex pr5 'Done|Need approval' 180
-  agent-tmux wait-text --literal pr5 '[CLAUDE-01]' 180
-  agent-tmux wait-literal pr5 '[CLAUDE-01]' 180
-  agent-tmux capture pr5 80
-  agent-tmux doctor
-  agent-tmux setup
-  agent-tmux self-test
-  agent-tmux list
-  agent-tmux stop pr5
+  agent-tmux claude start --attach pr5 ~/github/example-service
+  agent-tmux claude resume --exact pr5 ~/github/example-service ee5aca88-a1af-48d3-af21-54f60d618f22
+  agent-tmux claude start-ssh --attach pr5 example-host ~/github/example-service
+  agent-tmux claude start --exact pr5 ~/github/example-service 'hi'
+  agent-tmux claude attach pr5
+  agent-tmux claude send pr5 'Read the PR description first.'
+  agent-tmux claude send-wait pr5 'Summarize the current state.' 180
+  agent-tmux claude send-wait-literal pr5 'Reply with the requested marker.' '[CLAUDE-01]' 180
+  agent-tmux claude wait pr5 180
+  agent-tmux claude wait-text --regex pr5 'Done|Need approval' 180
+  agent-tmux claude wait-text --literal pr5 '[CLAUDE-01]' 180
+  agent-tmux claude wait-literal pr5 '[CLAUDE-01]' 180
+  agent-tmux claude capture pr5 80
+  agent-tmux claude doctor
+  agent-tmux claude setup
+  agent-tmux claude self-test
+  agent-tmux claude list
+  agent-tmux claude stop pr5
 
 Behavior:
   - Session name is claude-cli-<name> by default.
