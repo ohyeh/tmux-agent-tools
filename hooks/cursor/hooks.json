@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "./hooks/cursor-pretooluse.sh",
+        "matcher": "Shell",
+        "timeout": 10,
+        "failClosed": true
+      }
+    ]
+  }
+}

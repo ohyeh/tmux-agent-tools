@@ -1,7 +1,8 @@
 # agent-tmux CLI profiles
 
 Declarative per-CLI profiles. **This directory is the canonical source of
-per-CLI defaults**: `claude.conf`, `codex.conf`, `agy.conf`, `cursor.conf`,
+per-CLI defaults**: `claude.conf`, `codex.conf`, `agy.conf`, `cursor.conf`
+(`bin=cursor-agent`; `cursor` is the editor),
 and `grok.conf` mirror the legacy in-script preset table, which is frozen and
 only acts as a fallback when this directory is missing. New CLIs are added as
 profiles, not as code.

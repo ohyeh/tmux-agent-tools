@@ -18,5 +18,6 @@
     "session",
     "cursor"
   ],
-  "skills": "./skills/"
+  "skills": "./skills/",
+  "hooks": "./hooks/cursor/hooks.json"
 }

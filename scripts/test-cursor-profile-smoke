@@ -1,0 +1,103 @@
+#!/usr/bin/env zsh
+# Smoke: Cursor Agent CLI profile resolves cursor-agent, not `cursor` or `agent`.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+HOOK="$REPO_ROOT/hooks/cursor-pretooluse.sh"
+
+WORK="$(mktemp -d -t tmux-agent-cursor-profile.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing '$needle' in: $haystack" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+cat > "$WORK/cursor-agent" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$WORK/cursor-agent"
+# A colliding `agent` binary must not win.
+cat > "$WORK/agent" <<'EOF'
+#!/bin/sh
+echo 'wrong: grok agent' >&2
+exit 1
+EOF
+chmod +x "$WORK/agent"
+
+echo "case: doctor finds cursor-agent on PATH"
+out="$(env -u CURSOR PATH="$WORK:/usr/bin:/bin" "$AGENT_TMUX" cursor doctor --json 2>/dev/null)" || true
+ok="$(printf '%s' "$out" | jq -r '.ok')"
+detail="$(printf '%s' "$out" | jq -r '.checks[] | select(.name=="agent_cli_binary") | .detail')"
+assert "doctor ok" "$ok" "true"
+assert_contains "doctor detail is cursor-agent" "$detail" "cursor-agent"
+
+echo "case: CURSOR= override wins"
+out="$(env CURSOR="$WORK/cursor-agent" PATH="/usr/bin:/bin" "$AGENT_TMUX" cursor doctor --json 2>/dev/null)" || true
+detail="$(printf '%s' "$out" | jq -r '.checks[] | select(.name=="agent_cli_binary") | .detail')"
+assert_contains "CURSOR override" "$detail" "$WORK/cursor-agent"
+
+echo "case: dry-run start"
+code=0
+out="$(env CURSOR="$WORK/cursor-agent" "$AGENT_TMUX" cursor start --exact --dry-run cu-ok "$WORK" 2>&1)" || code=$?
+assert "dry-run exit" "$code" "0"
+assert "dry-run ok" "$(printf '%s' "$out" | jq -r .ok)" "true"
+flags="$(printf '%s' "$out" | jq -r .invocation.launch_flags)"
+assert_contains "launch_flags --force" "$flags" "--force"
+assert_contains "launch_flags --trust" "$flags" "--trust"
+bin="$(printf '%s' "$out" | jq -r .invocation.cli_bin)"
+assert_contains "cli_bin cursor-agent" "$bin" "cursor-agent"
+
+echo "case: headless dry-run uses -p"
+code=0
+out="$(env CURSOR="$WORK/cursor-agent" "$AGENT_TMUX" cursor start --exact --headless --dry-run cu-h "$WORK" 'ping' 2>&1)" || code=$?
+assert "headless dry-run exit" "$code" "0"
+assert "headless dry-run ok" "$(printf '%s' "$out" | jq -r .ok)" "true"
+hflags="$(printf '%s' "$out" | jq -r .invocation.launch_flags)"
+assert_contains "headless still --force" "$hflags" "--force"
+pflag="$(printf '%s' "$out" | jq -r .invocation.prompt_flag)"
+assert "headless prompt_flag -p" "$pflag" "-p"
+
+echo "case: Cursor dispatch-gate wrapper"
+chmod +x "$HOOK"
+parent='{"hook_event_name":"preToolUse","tool_name":"Shell","conversation_id":"cu-smoke","tool_input":{"command":"agent-tmux cursor start w /tmp ping"}}'
+code=0
+out="$(printf '%s' "$parent" | bash "$HOOK" 2>/dev/null)" || code=$?
+assert "parent start deny exit" "$code" "2"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("permission")=="deny"' "$out"
+assert "parent start deny JSON" "0" "0"
+
+child='{"hook_event_name":"preToolUse","tool_name":"Shell","subagent_id":"s1","subagent_type":"generalPurpose","conversation_id":"cu-smoke","tool_input":{"command":"agent-tmux cursor start w /tmp ping"}}'
+code=0
+out="$(printf '%s' "$child" | bash "$HOOK" 2>/dev/null)" || code=$?
+assert "subagent start allow exit" "$code" "0"
+
+parent_assign='{"hook_event_name":"preToolUse","tool_name":"Shell","conversation_id":"cu-smoke","tool_input":{"command":"agent-tmux cursor assign job /tmp /p.md"}}'
+code=0
+out="$(printf '%s' "$parent_assign" | bash "$HOOK" 2>/dev/null)" || code=$?
+assert "parent assign passes dispatch-gate" "$code" "0"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

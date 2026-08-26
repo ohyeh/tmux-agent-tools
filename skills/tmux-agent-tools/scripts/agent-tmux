@@ -46,7 +46,7 @@ preset_for_cli() {
     claude) _ENV_NS=CLAUDE; _bin=claude; _PRESET_PREFIX=claude-cli; _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='--resume'; HEURISTIC_FAMILY=claude; _USAGE_KIND='Code' ;;
     codex)  _ENV_NS=CODEX;  _bin=codex;  _PRESET_PREFIX=codex-cli;  _PRESET_FLAGS='--yolo';                          RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=codex;  _USAGE_KIND='CLI' ;;
     agy)    _ENV_NS=AGY;    _bin=agy;    _PRESET_PREFIX=agy-cli;    _PRESET_FLAGS='--dangerously-skip-permissions'; RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
-    cursor) _ENV_NS=CURSOR; _bin=cursor; _PRESET_PREFIX=cursor-cli; _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
+    cursor) _ENV_NS=CURSOR; _bin=cursor-agent; _PRESET_PREFIX=cursor-cli; _PRESET_FLAGS='--force --trust --approve-mcps'; RESUME_KEYWORD='resume'; HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
     grok)   _ENV_NS=GROK;   _bin=grok;   _PRESET_PREFIX=grok-cli;   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
     *)      _ENV_NS=AGENT;  _bin="$1";   _PRESET_PREFIX="$1-cli";   _PRESET_FLAGS='';                                RESUME_KEYWORD='resume';   HEURISTIC_FAMILY=generic; _USAGE_KIND='CLI' ;;
   esac
@@ -56,6 +56,7 @@ preset_for_cli() {
   case "$1" in
     claude) _HEADLESS_FLAGS='--dangerously-skip-permissions'; _HEADLESS_PROMPT_FLAG='-p' ;;
     codex)  _HEADLESS_FLAGS='exec --dangerously-bypass-approvals-and-sandbox'; _HEADLESS_PROMPT_FLAG='' ;;
+    cursor) _HEADLESS_FLAGS='--force --trust --approve-mcps'; _HEADLESS_PROMPT_FLAG='-p' ;;
     *)      _HEADLESS_FLAGS=''; _HEADLESS_PROMPT_FLAG='' ;;
   esac
 }
@@ -266,6 +267,15 @@ _pref_set() {
 _binvar="$_ENV_NS"
 CLI_BIN="${(P)_binvar:-}"
 [[ -z "$CLI_BIN" ]] && CLI_BIN="$(command -v "$_bin" 2>/dev/null || true)"
+# Cursor Agent CLI is `cursor-agent`; `cursor` is the editor. Never fall back
+# to `agent` — Grok CLI owns that name on PATH.
+if [[ -z "$CLI_BIN" && "$CLI" == cursor ]]; then
+  for _cand in cursor-agent cursor; do
+    CLI_BIN="$(command -v "$_cand" 2>/dev/null || true)"
+    [[ -n "$CLI_BIN" ]] && break
+  done
+  unset _cand
+fi
 
 _BASE_PREFIX="$(_pref PREFIX "$_PRESET_PREFIX")"
 if [[ -n "${TMUX_AGENT_TOOLS_TENANT:-}" ]]; then

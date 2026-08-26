@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Added
+- **Cursor Agent CLI profile** (`cursor.conf`): `bin=cursor-agent` (not `cursor`,
+  the editor; not `agent`, which collides with Grok). Headed and `--headless`
+  launches pass `--force --trust --approve-mcps`; headless adds `-p`. Legacy
+  preset and PATH fallback (`cursor-agent` then `cursor`) match. Cursor plugin
+  now ships `preToolUse` Shell hooks that remap stdin into `tmux-dispatch-gate.sh`
+  and always emit JSON. Smoke: `scripts/test-cursor-profile-smoke`.
 - **`assign` — the stepwise dispatch sequence as one command** (W32 retro M5,
   P0). Runs `start --exact` → `result init` → `send --from-file` → a
   confirm-processing check (busy probe, else pane-still-changing fallback) →
