@@ -6732,7 +6732,13 @@ blocked_reason_for_text() {
     print -r -- "ssh_prompt"
   elif [[ "$lowered" == *"do you want to proceed"* || "$lowered" == *"press enter to continue"* || "$lowered" == *"permission confirmation"* || "$lowered" == *"permission prompt"* || "$lowered" == *"permission required"* || "$lowered" == *"trust this"* || "$lowered" == *"trust the contents"* || "$lowered" == *"trust the files"* ]]; then
     print -r -- "permission_prompt"
-  elif [[ "$lowered" == *"approval"* || "$lowered" == *"approve"* || "$lowered" == *"[y/n]"* ]]; then
+  elif [[ "$lowered" == *"[y/n]"* || "$lowered" == *"waiting for approval"* || "$lowered" == *"your approval"* || "$lowered" == *"allow this"* || "$lowered" == *"approve?"* || "$lowered" == *"approval?"* ]]; then
+    # Narrow, dialog-shaped approval phrases only (#320) — never a bare
+    # "approve"/"approval" substring, which false-triggers on idle CLI chrome
+    # (agy "file edits auto-approved" footer) and on the worker's own argv
+    # (cursor-agent --approve-mcps) echoed in the pane before the TUI paints.
+    # Oddly-shaped real prompts belong in a profile `pattern_approval_prompt`,
+    # which is checked above and wins.
     print -r -- "approval_prompt"
   elif [[ "$lowered" == *"codex login"* || "$lowered" == *"please log in to codex"* || "$lowered" == *"log in to codex"* || "$lowered" == *"sign in to codex"* || "$lowered" == *"not logged in to codex"* || "$lowered" == *"please run /login"* ]]; then
     print -r -- "login_prompt"
