@@ -1,0 +1,70 @@
+#!/usr/bin/env zsh
+# Smoke test for issue #320: idle CLI chrome and the worker's own launch
+# flags containing "approve" must NOT read as approval_prompt; a
+# dialog-shaped approval prompt still must.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-approval-chrome.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+# Negative (#320 Repro A): agy idle footer — --dangerously-skip-permissions
+# worked, and the footer itself prints "auto-approved".
+cat > "$WORK/fake-agy-idle.sh" <<'EOF'
+#!/bin/sh
+echo "Antigravity CLI 1.1.22"
+echo "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-agy-idle.sh"
+
+# Negative (#320 Repro B): pane still shows the launch command line before
+# the TUI paints — the worker's own argv contains --approve-mcps.
+cat > "$WORK/fake-cursor-launch.sh" <<'EOF'
+#!/bin/sh
+echo "cursor-agent --trust --approve-mcps"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-cursor-launch.sh"
+
+# Positive: dialog-shaped approval prompt still blocks.
+cat > "$WORK/fake-approval-dialog.sh" <<'EOF'
+#!/bin/sh
+echo "Waiting for approval to run: rm -rf /tmp/x [y/n]"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-approval-dialog.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+run_case() {
+  local label="$1" fake="$2" name="$3" want="$4" st
+  env CODEX="$fake" "$CODEX_TMUX" start --exact "$name" "$WORK" >/dev/null
+  sleep 1
+  st="$("$CODEX_TMUX" status --json "$name")"
+  assert "$label blocked_reason" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "$want"
+  "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+}
+
+echo "case: agy idle 'auto-approved' footer is not an approval prompt"
+run_case "agy-idle" "$WORK/fake-agy-idle.sh" "approval-chrome-agy" "null"
+
+echo "case: cursor-agent launch flags are not an approval prompt"
+run_case "cursor-launch" "$WORK/fake-cursor-launch.sh" "approval-chrome-cursor" "null"
+
+echo "case: dialog-shaped approval prompt still blocks"
+run_case "approval-dialog" "$WORK/fake-approval-dialog.sh" "approval-chrome-real" "approval_prompt"
+
+echo "approval-chrome smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))
