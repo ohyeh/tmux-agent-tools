@@ -2252,7 +2252,10 @@ task_scope_guard_should_inject() {
 # session: there is no pane echo to verify and argv delivery cannot half-land.
 task_scope_guard_mark_injected() {
   local name="$1" session="${2:-}"
+  # Cheapest disqualifier first (see result_path_mark_injected).
+  _sentinel_trustworthy || { _sentinel_unconfirmed "scope-guard" "$name"; return 1; }
   if [[ -n "$session" ]] && ! _sentinel_landed "$session" "$TASK_SCOPE_GUARD_MARKER"; then
+    _sentinel_unconfirmed "scope-guard" "$name"
     return 1
   fi
   : > "$(task_scope_guard_sentinel "$name")" 2>/dev/null || true
@@ -2502,10 +2505,34 @@ result_path_prepend() {
 # silently never learned its result path (#283).
 result_path_mark_injected() {
   local name="$1" session="${2:-}"
+  # Cheapest disqualifier first: for an untrustworthy family the pane poll's
+  # outcome is discarded anyway, so do not pay its up-to-10s wait.
+  _sentinel_trustworthy || { _sentinel_unconfirmed "result-path" "$name"; return 1; }
   if [[ -n "$session" ]] && ! _sentinel_landed "$session" "$RESULT_PATH_MARKER"; then
+    _sentinel_unconfirmed "result-path" "$name"
     return 1
   fi
   : > "$(result_path_sentinel "$name")" 2>/dev/null || true
+}
+
+# A sentinel suppresses re-injection FOREVER, so its two error directions are
+# not symmetric: a missing sentinel costs one duplicated instruction on the next
+# send (idempotent, cosmetic), while a false one silently and permanently
+# disables the instruction it claims to have delivered. Bias to under-marking.
+#
+# `_sentinel_landed` reads the tmux pane, which proves the text was VISIBLE, not
+# that the CLI submitted it. For a family with no busy metric there is no second
+# signal to cross-check against, and both error directions were observed in a
+# single dispatch on 2026-08-30 (agy: result-path missed => no sentinel, correct;
+# scope-guard matched in the composer => sentinel written, but the CLI's own
+# transcript proves it never received the text). So for those families we decline
+# to record delivery at all and simply re-inject next time.
+_sentinel_trustworthy() {
+  [[ "$HEURISTIC_FAMILY" != generic ]]
+}
+
+_sentinel_unconfirmed() {
+  echo "agent-tmux: $1 instruction delivery UNCONFIRMED for '$2' — not recording it as delivered; it will be re-sent on the next prompt send." >&2
 }
 
 result_validate_session() {
@@ -4063,6 +4090,19 @@ assign_session() {
   done
   (( confirmed )) || _assign_fail confirm-processing \
     "no processing activity within ${confirm_window}s of send, even after one resend — the task never reached the CLI" "$name"
+
+  # The delivery proof above matches the PROMPT BODY's first line, so it cannot
+  # see whether the injected result-path instruction survived the paste. A worker
+  # that never learned its result path can never write result.json: its `pending`
+  # is PERMANENT, and every downstream wait is doomed from minute zero. That
+  # silence has now cost two sessions (c48c0d3a: 2h40m dead wait; 2026-08-30: a
+  # 422-line review that only ever existed in the tmux pane, because the agy CLI
+  # dropped both injected prefixes during a 95s boot and nothing said so).
+  # Report it as its own step outcome — non-fatal, because some TUIs redraw the
+  # prefix out of view after submitting it, but never silent again.
+  if [[ "$RESULT_PATH_VIA_PROMPT" == true && ! -e "$(result_path_sentinel "$name")" ]]; then
+    echo "assign[4/5] WARNING: result-path delivery UNCONFIRMED for '$name' — the worker may never have been told $(result_session path "$name" 2>/dev/null || echo '<result path>'). Treat a 'pending' result as possibly permanent: re-prompt with that literal path before waiting on it again, and never take a pane scrape as a confirmed answer." >&2
+  fi
 
   if (( detach )); then
     # --detach: the dispatch is verified (steps 1-4) but no long-lived
@@ -7228,6 +7268,43 @@ FAKE_EOF
   echo "self-test result-path-prompt: ok"
 }
 
+# Sentinels must bias to under-marking: a family whose delivery cannot be
+# cross-checked (no busy metric) must never record an instruction as delivered,
+# because a false sentinel suppresses re-injection permanently and silently
+# (observed 2026-08-30: agy's scope-guard sentinel written for text the CLI's
+# own transcript proves it never received).
+self_test_sentinel_bias() {
+  local saved_family="$HEURISTIC_FAMILY" saved_dir="${TMUX_AGENT_DIR-}" rc
+  local tmp_dir; tmp_dir="$(mktemp -d)"
+  export TMUX_AGENT_DIR="$tmp_dir"
+  mkdir -p "$tmp_dir/probe"
+
+  HEURISTIC_FAMILY=generic
+  rc=0; result_path_mark_injected probe "" 2>/dev/null || rc=$?
+  if (( rc == 0 )) || [[ -e "$(result_path_sentinel probe)" ]]; then
+    echo "self-test sentinel-bias: FAIL (generic family recorded result-path as delivered)" >&2
+    HEURISTIC_FAMILY="$saved_family"; rm -rf "$tmp_dir"; return 1
+  fi
+  rc=0; task_scope_guard_mark_injected probe "" 2>/dev/null || rc=$?
+  if (( rc == 0 )) || [[ -e "$(task_scope_guard_sentinel probe)" ]]; then
+    echo "self-test sentinel-bias: FAIL (generic family recorded scope-guard as delivered)" >&2
+    HEURISTIC_FAMILY="$saved_family"; rm -rf "$tmp_dir"; return 1
+  fi
+
+  # A family with a busy metric still records delivery, so follow-up sends stay clean.
+  HEURISTIC_FAMILY=claude
+  rc=0; result_path_mark_injected probe "" 2>/dev/null || rc=$?
+  if (( rc != 0 )) || [[ ! -e "$(result_path_sentinel probe)" ]]; then
+    echo "self-test sentinel-bias: FAIL (claude family did not record result-path delivery)" >&2
+    HEURISTIC_FAMILY="$saved_family"; rm -rf "$tmp_dir"; return 1
+  fi
+
+  HEURISTIC_FAMILY="$saved_family"
+  if [[ -n "$saved_dir" ]]; then export TMUX_AGENT_DIR="$saved_dir"; else unset TMUX_AGENT_DIR; fi
+  rm -rf "$tmp_dir"
+  echo "self-test sentinel-bias: ok"
+}
+
 self_test_watch_count() {
   require_tmux
   require_jq
@@ -8549,6 +8626,7 @@ case "$command" in
     self_test_result_required_fields
     self_test_dry_run
     self_test_result_path_prompt
+    self_test_sentinel_bias
     self_test_watch_count
     self_test_team_quorum
     self_test_session

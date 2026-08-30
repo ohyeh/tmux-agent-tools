@@ -72,6 +72,17 @@ reports `tail`'s status, so the wrapper's `exit 2` reads as success. A single
 diagnostic call is allowed only when dispatch or harvest reports an abnormal
 result.
 
+A `pending` result is a TERMINATING PROCEDURE, not a verdict: wait out the bound
+→ still pending, re-prompt the worker ONCE with the literal path from `result
+--path <name>` and wait one more bounded round → only then may a pane capture
+stand in, labelled UNCONFIRMED and never shipped as verified. Heed `assign`'s
+`result-path delivery UNCONFIRMED` warning: a worker that never learned its path
+can never write result.json, so that `pending` is permanent. Stand the proxy DOWN
+BEFORE stopping the worker it supervises. Never brief a proxy to return the
+worker's output verbatim — it may not read that output, so the brief is
+unsatisfiable; have the WORKER write to a declared artifact path and read it
+yourself.
+
 ## SELECT — wrapper by task shape
 
 - Loop-shaped chain (audit / plan→build / consensus / triage) → the
