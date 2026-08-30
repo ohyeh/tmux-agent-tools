@@ -58,11 +58,19 @@ Keep the long supervise off the expensive main context: host that one blocking
 `assign` in a cheap general-purpose sub-agent (model override, e.g. Sonnet), or
 in a background task. The host still makes exactly one `assign` call — it hosts,
 it does not proxy. Exception — a harness that reaps long-running tasks (local
-Claude Code kills them after ~10 min, together with any tmux server in the task
-tree) cannot hold the blocking wait at all: there, dispatch with `assign
---detach` in a short foreground call, then harvest with bounded `result
-wait-required --wait <s>` calls. A single diagnostic call is allowed only when
-dispatch or harvest reports an abnormal result.
+Claude Code moves a foreground call to the background at ~600s; a background
+task spawning its own tmux server was killed at ~10 min with exit 144,
+2026-08-08) cannot hold the blocking wait in a sub-agent at all: a reaped
+sub-agent has no `TaskOutput` to wait on its own task and can only report
+in-flight (measured 2026-08-30). There, the PARENT owns the wait — dispatch
+with `assign --detach` in a short foreground call, then harvest with bounded
+`result wait-required --fields <csv> --wait <s> --json` calls the parent itself
+runs as background tasks. Never leave a non-terminal report unattended: only a
+parent-owned task re-invokes the session, one orphaned by a terminated
+sub-agent notifies nobody. Never pipe a harvest call — a trailing `| tail`
+reports `tail`'s status, so the wrapper's `exit 2` reads as success. A single
+diagnostic call is allowed only when dispatch or harvest reports an abnormal
+result.
 
 ## SELECT — wrapper by task shape
 
