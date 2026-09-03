@@ -3,6 +3,18 @@
 ## Unreleased
 
 ### Fixed
+- **Plugin manifests and `--version` lagged the CHANGELOG by a release.**
+  `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json` still said
+  `0.38.0` against a released `0.39.0`, and `AGENT_TMUX_VERSION` — what
+  `--version` and `doctor` print, the offline signal for multi-machine
+  skill-copy drift — said `0.38.0` too because nothing compared it.
+  `test-version-sync-smoke` now covers it: `4 passed, 0 failed`.
+- **`test-result-path-once-smoke` merged stderr into a JSON payload.** The
+  `send-wait` result-fallback case captured `2>&1`, so the `codex-tmux` shim's
+  deprecation banner (`print -u2`) landed in front of correct JSON and both
+  `jq` reads failed. The payload was always right
+  (`completion_source: result_json`, `submitted: true`); the capture was wrong.
+  Now `26 passed, 0 failed`.
 - **`using-tmux-agent-tools` contradicted the dispatch gate.** ONE OWNER told
   the parent to dispatch with `assign --detach` "in a short foreground call",
   which `tmux-assign-host-gate.sh` blocks outright (with or without

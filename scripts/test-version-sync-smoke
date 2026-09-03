@@ -34,5 +34,12 @@ for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json .cursor-plu
   assert "$manifest matches CHANGELOG" "$v" "$changelog_version"
 done
 
+# AGENT_TMUX_VERSION is what `--version` and `doctor` print — the offline signal
+# for multi-machine skill-copy drift. It lagged the CHANGELOG by a full release
+# (0.38.0 vs 0.39.0) because nothing compared it, so compare it here too.
+script_version="$(sed -n "s/^AGENT_TMUX_VERSION='\\(.*\\)'$/\\1/p" \
+  skills/tmux-agent-tools/scripts/agent-tmux)"
+assert "agent-tmux AGENT_TMUX_VERSION matches CHANGELOG" "$script_version" "$changelog_version"
+
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

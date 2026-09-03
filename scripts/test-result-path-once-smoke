@@ -176,7 +176,13 @@ D="rp-sw-result"
 env CODEX="$WORK/fake-result-no-nonce.sh" "$CODEX_TMUX" start --exact "$D" "$WORK" >/dev/null
 sleep 1
 rc=0
-out="$("$CODEX_TMUX" send-wait "$D" "first-task" 5 2>&1)" || rc=$?
+# stdout only: the codex-tmux shim prints its deprecation banner to stderr
+# (`print -u2`), and merging it into $out made every `jq` read below fail
+# to parse a payload that was in fact correct. Keep stderr in a file so a
+# real error is still inspectable instead of swallowed.
+sw_err="$WORK/sw-result.err"
+out="$("$CODEX_TMUX" send-wait "$D" "first-task" 5 2>"$sw_err")" || rc=$?
+[[ "$rc" -eq 0 ]] || cat "$sw_err" >&2
 assert "send-wait result fallback exit=0" "$rc" "0"
 assert "send-wait result fallback completion_source" "$(printf '%s' "$out" | jq -r .completion_source)" "result_json"
 assert "send-wait result fallback submitted" "$(printf '%s' "$out" | jq -r .submitted)" "true"
