@@ -62,11 +62,16 @@ Claude Code moves a foreground call to the background at ~600s; a background
 task spawning its own tmux server was killed at ~10 min with exit 144,
 2026-08-08) cannot hold the blocking wait in a sub-agent at all: a reaped
 sub-agent has no `TaskOutput` to wait on its own task and can only report
-in-flight (measured 2026-08-30). There, the PARENT owns the wait — dispatch
-with `assign --detach` in a short foreground call, then harvest with bounded
-`result wait-required --fields <csv> --wait <s> --json` calls the parent itself
-runs as background tasks. Never leave a non-terminal report unattended: only a
-parent-owned task re-invokes the session, one orphaned by a terminated
+in-flight (measured 2026-08-30). There, split dispatch from the wait: the PROXY
+sub-agent runs `assign --detach` — a short call that returns as soon as the
+worker is started and sent, so nothing can reap it — and the PARENT owns the
+wait, harvesting with bounded `result wait-required --fields <csv> --wait <s>
+--json` calls it runs itself as background tasks. Never host a BLOCKING
+`assign` in a sub-agent under such a harness: it is reaped mid-wait and can
+only report in-flight (three times, 2026-09-03). Never run `assign`, with or
+without `--detach`, in the parent's own foreground — a dispatch gate blocks
+it. Never leave a non-terminal report unattended: only a parent-owned task
+re-invokes the session, one orphaned by a terminated
 sub-agent notifies nobody. Never pipe a harvest call — a trailing `| tail`
 reports `tail`'s status, so the wrapper's `exit 2` reads as success. A single
 diagnostic call is allowed only when dispatch or harvest reports an abnormal
@@ -75,10 +80,16 @@ result.
 A `pending` result is a TERMINATING PROCEDURE, not a verdict: wait out the bound
 → still pending, re-prompt the worker ONCE with the literal path from `result
 --path <name>` and wait one more bounded round → only then may a pane capture
-stand in, labelled UNCONFIRMED and never shipped as verified. Heed `assign`'s
-`result-path delivery UNCONFIRMED` warning: a worker that never learned its path
-can never write result.json, so that `pending` is permanent. Stand the proxy DOWN
-BEFORE stopping the worker it supervises. Never brief a proxy to return the
+stand in, labelled UNCONFIRMED and never shipped as verified. `assign`'s
+`result-path delivery UNCONFIRMED` warning is NOT evidence of a delivery
+failure: for a profile with `heuristic_family=generic` the sentinel is never
+marked by design (`_sentinel_trustworthy`), so the warning fires on every
+dispatch while the path instruction is in fact re-injected on every send.
+Diagnose a permanent `pending` from the worker's own state dir, never from
+that warning — and note that a TUI which collapses pasted input (cursor shows
+`[Pasted text #1 +N lines]`) cannot confirm or deny the marker from a pane
+capture either. Stand the proxy DOWN BEFORE stopping the worker it
+supervises. Never brief a proxy to return the
 worker's output verbatim — it may not read that output, so the brief is
 unsatisfiable; have the WORKER write to a declared artifact path and read it
 yourself.

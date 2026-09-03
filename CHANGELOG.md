@@ -3,6 +3,20 @@
 ## Unreleased
 
 ### Fixed
+- **`using-tmux-agent-tools` contradicted the dispatch gate.** ONE OWNER told
+  the parent to dispatch with `assign --detach` "in a short foreground call",
+  which `tmux-assign-host-gate.sh` blocks outright (with or without
+  `--detach`). Following the hook instead meant a BLOCKING `assign` inside a
+  proxy sub-agent, reaped at ~600s three times on 2026-09-03, each reporting
+  in-flight with nobody left to wait. The shape that satisfies both is now
+  stated: proxy runs `assign --detach`, parent harvests with bounded
+  background `result wait-required`.
+- **`result-path delivery UNCONFIRMED` was documented as a delivery failure.**
+  For `heuristic_family=generic` (cursor) `_sentinel_trustworthy` declines to
+  mark by design, so the warning fires on every dispatch while the path
+  instruction is re-injected on every send. The skill no longer reads it as
+  proof of permanent `pending`, and notes that a TUI collapsing pasted input
+  makes a pane capture inconclusive either way.
 - **`cursor` resolved the wrong binary.** The bundled profile and the legacy
   preset both set `bin=cursor`, but the Cursor agent CLI installs as
   `cursor-agent`; `cursor` is the editor launcher and never starts an agent
