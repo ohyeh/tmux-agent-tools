@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+- **`cursor` resolved the wrong binary.** The bundled profile and the legacy
+  preset both set `bin=cursor`, but the Cursor agent CLI installs as
+  `cursor-agent`; `cursor` is the editor launcher and never starts an agent
+  TUI. Line 268 does one `command -v` with no fallback, so every
+  `agent-tmux cursor assign` died at the `start` step with
+  `cursor not found at <empty>` and `assigned: false` — measured 2026-09-03,
+  worked around only by passing `CURSOR=/path/to/cursor-agent`. The script's
+  own approval-prompt comment already referenced `cursor-agent`, so the preset
+  was the odd one out. Verified: `agent-tmux cursor doctor` now reports
+  `cursor: …/cursor-agent` with no env override.
+
 ### Added
 - **`assign` — the stepwise dispatch sequence as one command** (W32 retro M5,
   P0). Runs `start --exact` → `result init` → `send --from-file` → a
