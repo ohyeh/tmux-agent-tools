@@ -1,0 +1,14 @@
+#!/usr/bin/env zsh
+# Test fixture: print the path of an executable that runs `agent-tmux <cli> "$@"`.
+# The smokes need a real file, not a shell function, because many cases start
+# workers through `env VAR=... "$wrapper" start ...` and env can only exec a
+# file. Written under TMPDIR at a fixed path per cli, so repeated runs reuse it.
+set -euo pipefail
+cli="${1:?usage: cli-launcher <cli>}"
+engine="${0:A:h:h:h}/skills/tmux-agent-tools/scripts/agent-tmux"
+dir="${TMPDIR:-/tmp}/tmux-agent-smoke-launchers"
+mkdir -p "$dir"
+launcher="$dir/$cli"
+printf '#!/usr/bin/env zsh\nexec %q %q "$@"\n' "$engine" "$cli" > "$launcher.tmp"
+chmod +x "$launcher.tmp" && mv -f "$launcher.tmp" "$launcher"
+print -r -- "$launcher"

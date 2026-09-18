@@ -3,6 +3,9 @@ set -u
 
 script_dir="${0:A:h}"
 repo_root="${script_dir:h}"
+# Smokes still exercise the deprecated per-CLI shims until their v0.39 removal;
+# silence the shim deprecation warning so it doesn't pollute captured output.
+export AGENT_TMUX_SUPPRESS_DEPRECATION=1
 timeout_seconds=180
 kill_after_seconds=15
 

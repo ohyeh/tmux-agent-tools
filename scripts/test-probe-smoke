@@ -6,8 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-probe.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -52,8 +53,8 @@ assert_exit() {
   assert "$label" "$actual" "$expected"
 }
 
-env CLAUDE="$WORK/fake-claude.sh" "$CLAUDE_TMUX" start --exact probe-claude "$WORK" >/dev/null
-env CODEX="$WORK/fake-codex.sh" "$CODEX_TMUX" start --exact probe-codex "$WORK" >/dev/null
+CLAUDE="$WORK/fake-claude.sh" "$CLAUDE_TMUX" start --exact probe-claude "$WORK" >/dev/null
+CODEX="$WORK/fake-codex.sh" "$CODEX_TMUX" start --exact probe-codex "$WORK" >/dev/null
 sleep 1
 
 payload="$("$CLAUDE_TMUX" probe --json --metric context_percent probe-claude)"

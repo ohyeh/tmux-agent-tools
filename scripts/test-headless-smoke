@@ -67,7 +67,7 @@ assert_contains "grok --headless error names profile keys" "$grok_out" "headless
 fake_cli="$WORK/fake-cli"
 cat > "$fake_cli" <<'EOF'
 #!/usr/bin/env zsh
-printf 'headless run: %s\n' "$*"
+printf '%s\nheadless run: done\n' "$*"
 exit 0
 EOF
 chmod +x "$fake_cli"
@@ -76,7 +76,7 @@ chmod +x "$fake_cli"
 fake_cli_self="$WORK/fake-cli-self"
 cat > "$fake_cli_self" <<'EOF'
 #!/usr/bin/env zsh
-printf 'headless run: %s\n' "$*"
+printf '%s\nheadless run: done\n' "$*"
 [[ -n "${TMUX_AGENT_RESULT:-}" ]] || { echo 'TMUX_AGENT_RESULT unset' >&2; exit 3; }
 printf '{"schema_version":1,"status":"success","summary":"self-written","artifacts":[],"errors":[]}' > "$TMUX_AGENT_RESULT"
 exit 0

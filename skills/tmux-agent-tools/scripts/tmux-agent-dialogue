@@ -331,9 +331,8 @@ start_fake_agent() {
   OWNED_SESSIONS+=("$session")
 }
 
-# Every real agent is driven through the engine as `agent-tmux <cli> ...`.
-# The claude-tmux/codex-tmux/agy-tmux shims are themselves just
-# `exec agent-tmux <cli> "$@"`, so going straight to the engine supports any
+# Every real agent is driven through the engine as `agent-tmux <cli> ...`,
+# which supports any
 # CLI — claude, codex, agy, and any future coding-agent CLI — with zero
 # per-CLI code, matching how the rest of the suite generalized. Returns the
 # command as two array elements (engine path + cli) for safe quoting.

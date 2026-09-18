@@ -30,7 +30,8 @@ sleep 30
 EOF
 chmod +x "$WORK/fake.sh"
 
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact rot-a "$WORK" >/dev/null
 sleep 1
 "$CLAUDE_TMUX" stop rot-a >/dev/null 2>&1 || true

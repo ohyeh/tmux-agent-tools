@@ -7,7 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
 WORK="$(mktemp -d -t tmux-agent-hook-trust.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -116,7 +117,7 @@ assert_blocked_send_guard() {
 
 echo "case: hook-trust prompt detected"
 P="hook-trust"
-env CODEX="$WORK/fake-trust.sh" "$CODEX_TMUX" start --exact "$P" "$WORK" >/dev/null
+CODEX="$WORK/fake-trust.sh" "$CODEX_TMUX" start --exact "$P" "$WORK" >/dev/null
 sleep 1
 st="$("$CODEX_TMUX" status --json "$P")"
 assert "confirmation_detected true" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "true"
@@ -126,7 +127,7 @@ assert "diagnostic non-null" "$(printf '%s' "$st" | jq -r '.diagnostic | type')"
 
 echo "case: ordinary 'needs review' prose is not a hook-trust prompt"
 N="prose-review"
-env CODEX="$WORK/fake-prose.sh" "$CODEX_TMUX" start --exact "$N" "$WORK" >/dev/null
+CODEX="$WORK/fake-prose.sh" "$CODEX_TMUX" start --exact "$N" "$WORK" >/dev/null
 sleep 1
 st="$("$CODEX_TMUX" status --json "$N")"
 assert "no false hook_trust" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
@@ -135,7 +136,7 @@ assert "no false confirmation" "$(printf '%s' "$st" | jq -r .confirmation_detect
 
 echo "case: unrelated MCP login warning with ready prompt is not blocked"
 M="mcp-login-warning"
-env CODEX="$WORK/fake-mcp-login-warning.sh" "$CODEX_TMUX" start --exact "$M" "$WORK" >/dev/null
+CODEX="$WORK/fake-mcp-login-warning.sh" "$CODEX_TMUX" start --exact "$M" "$WORK" >/dev/null
 sleep 1
 st="$("$CODEX_TMUX" status --json "$M")"
 assert "no false login_prompt" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
@@ -144,7 +145,7 @@ assert "ready prompt not blocked" "$(printf '%s' "$st" | jq -r .confirmation_det
 
 echo "case: historical trigger keywords above current prompt are not blocked"
 H="scrollback-ready"
-env CODEX="$WORK/fake-scrollback-keywords-ready.sh" "$CODEX_TMUX" start --exact "$H" "$WORK" >/dev/null
+CODEX="$WORK/fake-scrollback-keywords-ready.sh" "$CODEX_TMUX" start --exact "$H" "$WORK" >/dev/null
 sleep 1
 st="$("$CODEX_TMUX" status --json "$H")"
 assert "historical triggers ignored" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
@@ -153,7 +154,7 @@ assert "current ready prompt not blocked" "$(printf '%s' "$st" | jq -r .confirma
 
 echo "case: active approval prompt still blocks"
 A="approval-current"
-env CODEX="$WORK/fake-approval.sh" "$CODEX_TMUX" start --exact "$A" "$WORK" >/dev/null
+CODEX="$WORK/fake-approval.sh" "$CODEX_TMUX" start --exact "$A" "$WORK" >/dev/null
 sleep 1
 st="$("$CODEX_TMUX" status --json "$A")"
 assert "approval confirmation_detected true" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "true"
@@ -162,7 +163,7 @@ assert "blocked_reason approval_prompt" "$(printf '%s' "$st" | jq -r .blocked_re
 
 echo "case: active Codex login prompt still blocks"
 L="login-current"
-env CODEX="$WORK/fake-login.sh" "$CODEX_TMUX" start --exact "$L" "$WORK" >/dev/null
+CODEX="$WORK/fake-login.sh" "$CODEX_TMUX" start --exact "$L" "$WORK" >/dev/null
 sleep 1
 st="$("$CODEX_TMUX" status --json "$L")"
 assert "login confirmation_detected true" "$(printf '%s' "$st" | jq -r .confirmation_detected)" "true"
@@ -172,7 +173,7 @@ assert "blocked_reason login_prompt" "$(printf '%s' "$st" | jq -r .blocked_reaso
 echo "case: start-time permission prompt blocks before initial prompt"
 S="start-permission"
 code=0
-out="$(env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$S" "$WORK" "must-not-send" 2>&1)" || code=$?
+out="$(CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$S" "$WORK" "must-not-send" 2>&1)" || code=$?
 json_line="${out##*$'\n'}"
 assert "start blocked exit=1" "$code" "1"
 assert "start blocked submitted=false" "$(printf '%s' "$json_line" | jq -r .submitted)" "false"
@@ -190,21 +191,21 @@ fi
 echo "case: send paths block active permission prompt after no-initial-text start"
 B1="send-permission"
 M1="must-not-send-plain"
-env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B1" "$WORK" >/dev/null
+CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B1" "$WORK" >/dev/null
 sleep 1
 assert_blocked_send_guard "send" "$B1" "$M1" "$CODEX_TMUX" send "$B1" "$M1"
 "$CODEX_TMUX" stop "$B1" >/dev/null 2>&1 || true
 
 B2="send-wait-permission"
 M2="must-not-send-wait"
-env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B2" "$WORK" >/dev/null
+CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B2" "$WORK" >/dev/null
 sleep 1
 assert_blocked_send_guard "send-wait" "$B2" "$M2" "$CODEX_TMUX" send-wait "$B2" "$M2" 1
 "$CODEX_TMUX" stop "$B2" >/dev/null 2>&1 || true
 
 B3="send-wait-literal-permission"
 M3="must-not-send-literal"
-env CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B3" "$WORK" >/dev/null
+CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact "$B3" "$WORK" >/dev/null
 sleep 1
 assert_blocked_send_guard "send-wait-literal" "$B3" "$M3" "$CODEX_TMUX" send-wait-literal "$B3" "$M3" "never-seen" 1
 "$CODEX_TMUX" stop "$B3" >/dev/null 2>&1 || true
@@ -212,7 +213,7 @@ assert_blocked_send_guard "send-wait-literal" "$B3" "$M3" "$CODEX_TMUX" send-wai
 echo "case: send works after permission prompt is cleared"
 C="send-permission-cleared"
 CM="send-after-clear-marker"
-env CODEX="$WORK/fake-permission-clears.sh" "$CODEX_TMUX" start --exact "$C" "$WORK" >/dev/null
+CODEX="$WORK/fake-permission-clears.sh" "$CODEX_TMUX" start --exact "$C" "$WORK" >/dev/null
 sleep 1
 "$CODEX_TMUX" send --raw --enter-count 1 "$C" "y" >/dev/null
 sleep 1

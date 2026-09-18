@@ -7,8 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MONITOR="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-monitor"
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-monitor-smoke.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT

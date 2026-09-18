@@ -4,8 +4,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 PASS=0
 FAIL=0

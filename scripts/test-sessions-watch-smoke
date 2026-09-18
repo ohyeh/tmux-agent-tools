@@ -7,7 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 for bin in "$SESSIONS" "$CLAUDE_TMUX"; do
   [[ -x "$bin" ]] || { echo "not executable: $bin" >&2; exit 1; }

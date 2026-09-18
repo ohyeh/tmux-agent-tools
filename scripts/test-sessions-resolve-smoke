@@ -133,7 +133,7 @@ assert_nonzero() {
 echo "case: resolve full tmux session"
 full_json="$("$SESSIONS" resolve --name "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475" --json)"
 assert_eq "full session resolves agent name" "$(print -r -- "$full_json" | jq -r '.agent_name')" "trade-pine-c5b475"
-assert_eq "full session resolves wrapper" "$(print -r -- "$full_json" | jq -r '.wrapper')" "claude-tmux"
+assert_eq "full session resolves wrapper" "$(print -r -- "$full_json" | jq -r '.wrapper')" "agent-tmux claude"
 assert_eq "full session includes wait-and-capture command" "$(print -r -- "$full_json" | jq -r '.recommended_next_commands[] | select(test("wait-and-capture"))' | wc -l | tr -d ' ')" "1"
 
 echo "case: resolve short name"
