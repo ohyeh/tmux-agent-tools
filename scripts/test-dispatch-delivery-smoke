@@ -1,0 +1,235 @@
+#!/usr/bin/env zsh
+# Smoke test for the two 2026-09-08 dispatch defects (see the investigation
+# report in agent-scripts .workflow/202609090043-cli-session-investigation):
+#
+#  1. Launch blockers were indistinguishable from slow workers. `cursor-agent
+#     --version` returned "your macOS login keychain is locked" and the review
+#     was never dispatched; nothing in the wrapper said so. assign must now
+#     stop at step 0 with blocked_reason and start NO tmux session.
+#  2. A bracketed-pasted multiline prompt reached agy as 12 separate inputs,
+#     the first a fragment from the middle of the prompt. `prompt_delivery=
+#     file-ref` must deliver the task as exactly ONE input naming a composed
+#     file that carries the whole task.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-delivery.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+export AGENT_TMUX_PREFLIGHT_TIMEOUT=5
+# Keep this run's audit events out of the machine's real trail.
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
+trap '"$AGENT_TMUX" echocli stop deliver-smoke >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" got="$2" want="$3"
+  if [[ "$got" == "$want" ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: got '$got' want '$want'"; FAIL=$((FAIL+1)); fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: '$needle' not in output"; FAIL=$((FAIL+1)); fi
+}
+
+# ---- case 1: launch blocker (the real Cursor keychain text) ------------------
+cat > "$WORK/lockedcli" <<'EOF'
+#!/bin/sh
+echo "Error: Your macOS login keychain is locked." >&2
+echo "Run security unlock-keychain and try again." >&2
+exit 1
+EOF
+chmod +x "$WORK/lockedcli"
+export PATH="$WORK:$PATH"
+
+echo "case: launch blocker is reported, never waited on"
+code=0
+out="$("$AGENT_TMUX" lockedcli preflight --json 2>/dev/null)" || code=$?
+assert "preflight exit" "$code" "4"
+assert "preflight blocked" "$(printf '%s' "$out" | jq -r .blocked)" "true"
+assert "preflight reason" "$(printf '%s' "$out" | jq -r .blocked_reason)" "keychain_locked"
+assert_contains "preflight keeps the CLI's own words" "$(printf '%s' "$out" | jq -r .detail)" "keychain is locked"
+assert_contains "preflight says what to do" "$(printf '%s' "$out" | jq -r .diagnostic)" "unlock-keychain"
+
+printf 'GOAL: never dispatched\n' > "$WORK/blocked-prompt.txt"
+code=0
+out="$("$AGENT_TMUX" lockedcli assign --timeout 20 blocked-smoke "$WORK" "$WORK/blocked-prompt.txt" 2>/dev/null)" || code=$?
+assert "assign exit on launch blocker" "$code" "4"
+assert "assign reports not assigned" "$(printf '%s' "$out" | jq -r .assigned)" "false"
+assert "assign names the step" "$(printf '%s' "$out" | jq -r .failed_step)" "preflight"
+assert "assign names the reason" "$(printf '%s' "$out" | jq -r .blocked_reason)" "keychain_locked"
+assert "no session was started" "$("$AGENT_TMUX" lockedcli list 2>/dev/null | grep -c blocked-smoke || true)" "0"
+
+# ---- case 2: one submission carries the whole task --------------------------
+# echocli mimics a TUI that treats every newline as submit: it reads stdin
+# line by line and logs one entry per input, exactly as agy's transcript
+# recorded 12 inputs for one pasted prompt.
+cat > "$WORK/echocli" <<'EOF'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "echocli 1.0"; exit 0; }
+# Paths arrive as launch flags, never as environment: a tmux SERVER that is
+# already running hands its own (stale) env to every new pane, so an exported
+# variable is not a reliable channel into the worker.
+LOG=/dev/null; RES=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log) LOG="$2"; shift 2 ;;
+    --result) RES="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "> ready"
+while IFS= read -r line; do
+  [ -n "$line" ] && printf '%s\n' "$line" >> "$LOG"
+  printf 'got:%s\n' "$line"
+  # Terminal result on the first input, so confirm-processing passes on the
+  # result contract and the input count measures delivery shape alone.
+  [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"echoed","artifacts":[],"errors":[]}\n' > "$RES"
+done
+EOF
+chmod +x "$WORK/echocli"
+
+printf 'GOAL: prove the whole prompt arrives.\nCONTEXT: read these first.\nACCEPTANCE: one input.\nREPORT: say done.\n' > "$WORK/multi.txt"
+
+run_dispatch() {  # <delivery> <name> → sets DELIVERED
+  local delivery="$1" name="$2"
+  local log="$WORK/$name.log"
+  : > "$log"
+  mkdir -p "$TMUX_AGENT_DIR/$name"
+  AGENT_TMUX_LAUNCH_FLAGS="--log $log --result $TMUX_AGENT_DIR/$name/result.json" \
+    "$AGENT_TMUX" echocli assign --timeout 60 --confirm-window 45 \
+      --prompt-delivery "$delivery" "$name" "$WORK" "$WORK/multi.txt" \
+      >"$WORK/$name.out" 2>"$WORK/$name.err" || true
+  sleep 2
+  # grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would emit twice.
+  DELIVERED="$(awk 'NF' "$log" 2>/dev/null | wc -l | tr -d ' ')"
+  DELIVERED_TEXT="$(cat "$log" 2>/dev/null)"
+  if [[ "$DELIVERED" == "0" ]]; then
+    print -r -- "  --- $name pane (no input reached the worker) ---"
+    "$AGENT_TMUX" echocli capture --strip-ansi --tail 15 "$name" 2>&1 | sed 's/^/  | /' || true
+    print -r -- "  --- $name assign stderr ---"
+    tail -8 "$WORK/$name.err" | sed 's/^/  | /'
+  fi
+  "$AGENT_TMUX" echocli stop "$name" >/dev/null 2>&1 || true
+}
+
+echo
+echo "case: paste delivery splits a multiline prompt (the observed defect)"
+run_dispatch paste deliver-paste
+if (( DELIVERED >= 2 )); then
+  print -r -- "  ok   paste delivery arrived as $DELIVERED separate inputs"; PASS=$((PASS+1))
+else
+  print -r -- "  FAIL paste delivery: expected >=2 inputs on a newline-submitting TUI, got $DELIVERED"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "case: file-ref delivery is one input that carries the whole task"
+run_dispatch file-ref deliver-fileref
+assert "file-ref arrived as a single input" "$DELIVERED" "1"
+COMPOSED="$TMUX_AGENT_DIR/deliver-fileref/prompt.md"
+assert "composed prompt exists" "$([[ -f "$COMPOSED" ]] && echo yes || echo no)" "yes"
+assert_contains "the one input names the composed file" "$DELIVERED_TEXT" "$COMPOSED"
+COMPOSED_BODY="$(cat "$COMPOSED" 2>/dev/null || true)"
+assert_contains "composed prompt keeps GOAL" "$COMPOSED_BODY" "GOAL: prove the whole prompt arrives."
+assert_contains "composed prompt keeps CONTEXT" "$COMPOSED_BODY" "CONTEXT: read these first."
+assert_contains "composed prompt keeps REPORT" "$COMPOSED_BODY" "REPORT: say done."
+assert_contains "composed prompt carries the result path" "$COMPOSED_BODY" "result.json"
+# File-ref delivery cannot half-land, so both prepended instructions must be
+# recorded as landed. A pane-echo check here would always come back
+# UNCONFIRMED (the marker text is in the file, never pasted) and every
+# follow-up send would re-inject the same instructions.
+assert "result-path instruction recorded as landed" \
+  "$([[ -e "$TMUX_AGENT_DIR/deliver-fileref/.result-path-injected" ]] && echo yes || echo no)" "yes"
+assert "scope-guard instruction recorded as landed" \
+  "$([[ -e "$TMUX_AGENT_DIR/deliver-fileref/scope-guard-injected" ]] && echo yes || echo no)" "yes"
+assert_contains "the audit trail records the delivery" \
+  "$(grep -h assign.file_ref "$WORK/audit.jsonl" 2>/dev/null | tail -1)" \
+  "deliver-fileref"
+
+# ---- case 3: the TUI re-flows the echoed prompt (agy, 2026-09-17) -----------
+# reflowcli echoes each input folded at 28 columns with a two-space indent —
+# the ref line's path breaks mid-token, as agy's did — and never writes a
+# result, so confirm-processing has ONLY the pane echo to go on. It keeps the
+# pane changing (a spinner) so the activity signal is there; the proof is what
+# decides. Old code: `launch-failed … the task never reached the CLI`.
+cat > "$WORK/reflowcli" <<'EOF'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "reflowcli 1.0"; exit 0; }
+# No tty echo: a real TUI never shows the raw paste, only its own re-flow.
+stty -echo 2>/dev/null
+echo "> ready"
+while IFS= read -r line; do
+  printf '%s\n' "$line" | fold -w 28 | sed 's/^/  /'
+  i=0
+  while [ $i -lt 400 ]; do printf 'working %s\r' "$i"; i=$((i+1)); sleep 0.5; done
+done
+EOF
+chmod +x "$WORK/reflowcli"
+
+echo
+echo "case: a TUI that re-flows the echoed prompt is still confirmed as processing"
+mkdir -p "$TMUX_AGENT_DIR/deliver-reflow"
+code=0
+"$AGENT_TMUX" reflowcli assign --timeout 60 --confirm-window 45 --detach \
+  --prompt-delivery file-ref deliver-reflow "$WORK" "$WORK/multi.txt" \
+  >"$WORK/reflow.out" 2>"$WORK/reflow.err" || code=$?
+assert "reflow: assign confirmed the worker" "$code" "0"
+assert_contains "reflow: reached the supervise step" "$(cat "$WORK/reflow.err")" "assign[5/5]"
+"$AGENT_TMUX" reflowcli stop deliver-reflow >/dev/null 2>&1 || true
+
+# ---- case 4: the prompt sits in the composer, Enter never took (claude, 2026-09-17)
+# The claude worker of 09-17 had its ref line in the composer for 294s at $0,
+# yet assign had CONFIRMED it: Claude Code redraws its status bar while hooks
+# load, `idle_seconds` read <= 3, and the proof matched the unsent text. So
+# stuckcli is a claude-family fake (profile conf: heuristic_family=claude) that
+# redraws a status line for 30s after the paste, then freezes with the text
+# still in its box; only a BARE Enter (an empty line) submits, which shows a
+# spinner and writes the result. Old code: confirmed at ~21s on the redraws,
+# exit 0, result never written. New code: spinner=false forbids the idle
+# shortcut, the freeze reaches idle>=10, one Enter is pressed, spinner + result.
+cat > "$WORK/stuckcli" <<'EOF2'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "stuckcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+RES=""
+while [ $# -gt 0 ]; do case "$1" in --result) RES="$2"; shift 2 ;; *) shift ;; esac; done
+echo "> ready"
+while IFS= read -r line; do
+  if [ -z "$line" ]; then
+    printf '\342\227\217 Thinking\342\200\246 (3s)\n'
+    [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"nudged","artifacts":[],"errors":[]}\n' > "$RES"
+  else
+    printf '\342\224\202 > %s\n' "$line"
+    i=0
+    while [ $i -lt 15 ]; do printf 'Context 0%% | cache %ss\r' "$i"; i=$((i+1)); sleep 2; done
+  fi
+done
+EOF2
+chmod +x "$WORK/stuckcli"
+mkdir -p "$WORK/profiles"
+printf 'bin=%s\nheuristic_family=claude\n' "$WORK/stuckcli" > "$WORK/profiles/stuckclaude.conf"
+
+echo
+echo "case: a claude-family prompt stuck in the composer gets one Enter, not a resend, and is not confirmed on redraws"
+mkdir -p "$TMUX_AGENT_DIR/deliver-stuck"
+code=0
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" \
+AGENT_TMUX_LAUNCH_FLAGS="--result $TMUX_AGENT_DIR/deliver-stuck/result.json" \
+  "$AGENT_TMUX" stuckclaude assign --timeout 90 --confirm-window 75 --detach \
+    --prompt-delivery file-ref deliver-stuck "$WORK" "$WORK/multi.txt" \
+    >"$WORK/stuck.out" 2>"$WORK/stuck.err" || code=$?
+assert "stuck: assign confirmed the worker" "$code" "0"
+assert_contains "stuck: the nudge was logged" "$(cat "$WORK/stuck.err")" "composer nudge"
+assert "stuck: the prompt was pasted once, not resent" \
+  "$(AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" stuckclaude capture --strip-ansi --tail 60 deliver-stuck 2>/dev/null | grep -c '> Your task' || true)" "1"
+assert "stuck: the worker ran after the nudge (result written, not confirmed on redraws)" \
+  "$(jq -r .status "$TMUX_AGENT_DIR/deliver-stuck/result.json" 2>/dev/null)" "success"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" stuckclaude stop deliver-stuck >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+(( FAIL == 0 )) || exit 1
+echo "PASS: dispatch delivery smoke"
