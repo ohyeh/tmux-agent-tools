@@ -1,0 +1,29 @@
+#!/usr/bin/env zsh
+# `claude plugin validate` and `claude plugin test` do NOT type-check the mods:
+# v0.3.0 shipped four tsc errors past both of them (an omitted required argument,
+# an unassignable render child, two malformed ConfigRow mocks) and only an
+# external review caught it. This makes the type check a smoke, so it is run by
+# run-all-smokes and CI rather than remembered.
+#
+# npx MUST be given `-p typescript`: bare `npx tsc` resolves a squatter package.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+if [[ ! -f mods/tsconfig.json ]]; then
+  echo "  FAIL mods/tsconfig.json not found — the mods tree moved" >&2
+  exit 1
+fi
+
+echo "typechecking mods/ against mods/tsconfig.json"
+if npx -p typescript tsc --noEmit -p mods/tsconfig.json; then
+  echo "  ok   mods typecheck clean"
+  echo "1 passed, 0 failed"
+else
+  echo "  FAIL mods typecheck reported errors (above)" >&2
+  echo "0 passed, 1 failed" >&2
+  exit 1
+fi

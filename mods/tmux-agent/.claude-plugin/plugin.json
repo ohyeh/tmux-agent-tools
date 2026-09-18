@@ -1,0 +1,19 @@
+{
+  "name": "tmux-agent",
+  "version": "0.7.2",
+  "description": "Dispatch an agent-tmux worker and let the mod own the wait: every session reconciles its own workers' result.json on a clock and submits a prompt when one reaches a terminal state.",
+  "author": {
+    "name": "PaulYeh",
+    "url": "https://github.com/ohyeh"
+  },
+  "homepage": "https://github.com/ohyeh/tmux-agent-tools/blob/main/mods/tmux-agent/README.md",
+  "repository": "https://github.com/ohyeh/tmux-agent-tools",
+  "keywords": [
+    "tmux",
+    "claude-code",
+    "codex",
+    "agent",
+    "orchestration"
+  ],
+  "types": "./types/index.d.ts"
+}
