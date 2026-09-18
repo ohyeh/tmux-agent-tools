@@ -1,0 +1,73 @@
+#!/usr/bin/env zsh
+# Smoke test for backlog T1: `agent-tmux brief` GOAL/ACCEPTANCE/REPORT prompt
+# compiler that feeds --from-file on start/send/send-wait.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WRAPPER="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+PASS=0
+FAIL=0
+
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label expected=$expected got=$actual" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label (needle not found: $needle)" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "case: brief --dry-run prints compiled GOAL/ACCEPTANCE/REPORT"
+out="$("$WRAPPER" claude brief --template implement --goal 'Fix flaky login test' \
+  --acceptance 'pytest tests/test_login.py passes' --dry-run 2>&1)"
+assert_contains "dry-run has GOAL" "$out" "GOAL: Fix flaky login test"
+assert_contains "dry-run has ACCEPTANCE" "$out" "ACCEPTANCE: pytest tests/test_login.py passes"
+assert_contains "dry-run has REPORT" "$out" "REPORT:"
+
+echo "case: brief missing required flag fails with usage, exit non-zero"
+code=0
+out="$("$WRAPPER" claude brief --template implement --goal 'only goal' 2>&1)" || code=$?
+assert "missing --acceptance exit=2" "$code" "2"
+assert_contains "missing --acceptance usage text" "$out" "Usage: agent-tmux brief"
+
+echo "case: brief missing --template fails"
+code=0
+"$WRAPPER" claude brief --goal g --acceptance a >/dev/null 2>&1 || code=$?
+assert "missing --template exit=2" "$code" "2"
+
+echo "case: brief unsupported --template fails"
+code=0
+"$WRAPPER" claude brief --template bogus --goal g --acceptance a >/dev/null 2>&1 || code=$?
+assert "unsupported template exit=2" "$code" "2"
+
+echo "case: brief (no --dry-run) writes compiled prompt to a file, feeds --from-file"
+pfile="$("$WRAPPER" claude brief --template implement --goal 'g' --acceptance 'a')"
+[[ -f "$pfile" ]] && { echo "  ok   brief wrote a file"; PASS=$((PASS + 1)); } || \
+  { echo "  FAIL brief did not write a file" >&2; FAIL=$((FAIL + 1)); }
+body="$(cat "$pfile" 2>/dev/null || true)"
+assert_contains "written file has GOAL" "$body" "GOAL: g"
+
+out="$(CODEX=/bin/true "$WRAPPER" codex start --exact --dry-run --from-file "$pfile" \
+  brief-smoke-demo /tmp 2>&1)" || true
+assert_contains "start --from-file consumed brief output" "$out" '"initial_text"'
+rm -f "$pfile"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
