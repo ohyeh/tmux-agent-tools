@@ -2,6 +2,348 @@
 
 ## Unreleased
 
+- `mods/tmux-agent` 0.7.2 — the panel title prints the mod version (`tmux workers v0.7.2`). Observed 2026-09-18: a session ran `/reload-plugins` after the 0.7.1 update and its panel still showed the 0.7.0 bug, while a later reload did pick up 0.7.2 — with nothing on screen naming the code that drew the panel, the two cases could not be told apart. `test-version-sync-smoke` holds `MOD_VERSION` to the mod manifest (8 checks).
+
+- `mods/tmux-agent` 0.7.1 — a `tmux ls` that answers `no server running` (exit 1) empties the panel. `liveSessions` read every non-zero exit as "tmux too slow" and kept the last answered fleet, so once the whole tmux server was gone a delivered teammate stayed listed as `done — tell it more, or stop it` forever, and [refresh] walked the same branch (observed 2026-09-18 16:3x: `smcs2084-design-review-hmqq` on the panel with `tmux ls` empty). `process.run` rejects on timeout and resolves with any exit code once tmux exits, so now only a rejection keeps the last fleet; a resolved run is the truth, exit 1 = empty fleet. `stop --all` and the panel share the probe. Tests: the old "exit 1 keeps the fleet" case is replaced by a rejection case plus a new "exit 1 empties the panel" case (76 pass; the new case fails on 0.7.0).
+
+- **Removed** the `claude-tmux` / `codex-tmux` / `agy-tmux` shims (deprecated since v0.35, removal announced for v0.39) and the Homebrew formula (`Formula/`, unused). Spell `agent-tmux <cli> <command>`; install with `skills/tmux-agent-tools/scripts/install-bin`. CI and the release workflow lint and self-test `agent-tmux` directly; the smokes drive the engine through `codex_tmux()` / `claude_tmux()` functions instead of the shim files. `tmux-agent-sessions` prints `agent-tmux <cli>` as the wrapper name.
+
+## v0.41.0 - 2026-09-18
+
+- `mods/tmux-agent` 0.7.0 — the `mode` option is gone; every session collects. `lite` (dispatch, never collect) had one remaining use, opting out of the 10s clock, and one cost: the finished result sat on disk until a person harvested it, which is the silence this mod exists to remove. With per-session acks (0.5.2) and owner-only delivery (0.6.0) several collectors never duplicate, so there is nothing left to opt out of. No `$.config.list()` read on the tick, at startup, in the panel or in the receipts any more; a leftover `pluginConfigs.tmux-agent.options.mode` in settings is ignored by the engine. Receipt text: `collector: active in this session — end the turn; …` (the `(mode full)` tag is dropped; `using-tmux-agent-tools` SKILL.md updated to match). Tests: `mode gate` (2), the lite receipt test and the hanging-config-row test are removed with the code they covered (75 pass).
+
+- `agent-tmux start`: the initial-prompt echo proof now looks for as long as the readiness timeout (`AGENT_TMUX_START_READY_TIMEOUT`, default 45s) instead of a fixed 10s. Observed 2026-09-18: a claude peer with hooks + MCP took 44s from launch to reading its first message (06:41:13 → 06:41:57), the readiness poll saw no startup screen and pasted at once, the paste sat unread in the pty, and at 10s `start` called it swallowed, resent once, and returned `prompt_swallowed` exit 1 — while the prompt had landed. `_sentinel_landed` takes the window as an optional third argument; the two marker checks keep 10s. `test-start-readiness-smoke` new case (banner, tty echo off, reads after 18s): old wrapper reads the prompt twice and logs a resend; this one reads it once, no resend (16 pass).
+
+- `mods/tmux-agent` 0.6.3 — `mode` defaults to `full`. A session that can dispatch but never collects hands the result back to the person (`collector: NONE — harvest yourself`), which is the gap this mod exists to close; with per-session acks (0.5.2) and owner-only delivery (0.6.0) several collectors no longer duplicate, so there is no reason left to opt in. `lite` stays as an explicit opt-out for a session that wants no 10s clock.
+
+- `agent-tmux`: `result_path_via_prompt` now defaults to `true` for every family, claude included. The `self-test result-path-prompt` family-defaults check expects `true` for claude too (it failed on 0.6.3-era wrappers with `unexpected family defaults`). No CLI can read `$TMUX_AGENT_RESULT` from inside its tool sandbox and nothing else told a claude worker where result.json lives, so every claude-family worker dispatched with a brief that did not restate the path finished its task, answered in the pane, and left result.json `pending` forever — the tmux-agent mod's collector never delivered it (observed 2026-09-18 13:57 and 14:00, two workers). The claude exception dated from the 0.35 baseline with no channel behind it. Docs (README, SKILL.md, contracts.md, core-workflow.md, `--help`) updated.
+
+- `mods/tmux-agent` 0.6.2 — a launch receipt older than the episode is stale. `tell` opens a new episode on a pane that is provably alive, but `launch.exit` from the failed first launch stayed and `collect` reads it before result.json, so the old `launch-failed` was delivered again and the episode's real result never was. Observed 2026-09-18 14:01: agy blocked on the workspace-trust dialog (assign exited 1, delivered once), `keys Enter` + `tell` got the task done and result.json said `success`, and the collector delivered the launch failure a second time. Now `launchFailure` ignores a receipt whose mtime is older than `dispatch.since`. Regression test: episode 5 with a receipt from episode 0 and a finished result delivers the result, not the receipt (79 pass; fails on 0.6.1).
+
+- `mods/tmux-agent` 0.6.1 — a tmux session that does not exist YET is not `exited`. `dispatch.json` is written about a second before `agent-tmux assign` creates the session, and `status --json` answers `exists:false` (exit 0) for "not yet" exactly as for "gone"; a stall probe in that gap marked the worker exited, the next tick delivered `exited — no result` and acknowledged it, and the worker's real report (here: `launch-failed`, codex out of quota) was never delivered while its pane sat alive and off the panel. Observed 2026-09-18 13:36 on a live codex dispatch. Now the `gone` verdict waits for the launch receipt (`launch.exit`): until assign has written it, assign owns the pane and a missing session says nothing. One log line marks the transition to exited, so the next occurrence leaves a trace. Regression test: dispatch present, no receipt, `exists:false` → nothing delivered, row not exited; receipt appears → delivered once as exited (78 pass; fails on 0.6.0).
+
+- `mods/tmux-agent` 0.6.0 — two sessions in one repo see and drive the same teammates. `/tmux`, `tell`, `stop` and `peek` now cover every worker whose `ownerCwd` is this session's cwd, whoever dispatched it (rows tagged `@<sid8>`); another repo's workers stay invisible. Delivery is still the owner's alone. Adoption of a dead owner's worker (no heartbeat for 90s) is a CLAIM: the record is rewritten with `owner = me`, `adoptedFrom = <old sid>`, nothing is delivered on that tick, and next tick only the session the record names delivers — two collectors seeing the same orphan cannot both deliver (#323). A `tell` from a non-owner moves the worker to the teller: whoever gave the latest instruction gets the answer, never both. Delivery text names `adopted from session <sid>`. Verified from disk that `--resume` keeps the session id, so a resumed session is still the owner with no wait. Tests: claim-then-deliver, second collector stands down, same-repo visibility + tell moves ownership, other-repo invisible (77 pass; 3 fail on 0.5.2).
+
+- `mods/tmux-agent` 0.5.2 — one acknowledged-set key PER SESSION (`tmux-agent.reported.<sessionId>`), read as a union, written only by its owner. The plugin store is shared by every session and has no atomic read-modify-write, so with one shared key two collectors acknowledging in the same second had the later write drop the earlier id and that worker was delivered again. Now no session touches another's key; a dead session's key, and the pre-0.5.2 shared key, are deleted once nothing they name is on disk. Tests: own-key isolation, no re-delivery on the next tick, garbage collection of dead keys (74 pass).
+
+- `mods/tmux-agent` 0.5.1 — the acknowledged set is pruned against every record on disk, not against the records this session owns. The store is one file per plugin, shared by every session on the machine; with `mode: full` set globally every session is a collector, and a collector in another project saw the owner's worker as "not mine", pruned its ack, and the owner re-delivered the same finished result every 10s — 131 times into one session (observed 2026-09-18). Regression test: a second collector in another cwd leaves the first one's ack alone and prunes only ids whose directory is gone.
+
+- `agent-tmux assign` confirm-processing: the delivery proof is compared with all whitespace removed on both sides. Observed 2026-09-17: agy re-flowed the file-ref line at ~78 columns and broke it inside a path, the 40-char proof never matched, and a worker that had already read its task and run its command was reported `launch-failed — the task never reached the CLI`. Same fix in `_sentinel_landed` (start path, 2026-08-19). New: when the proof is on screen but nothing is busy and the pane has been frozen ≥10s, assign presses Enter once (logged `composer nudge`) instead of resending — observed 2026-09-17: a claude worker sat with the ref line in its composer for 294s, $0, until Enter was pressed by hand; the old path would have pasted the prompt a second time. The busy probe now asks the family's own metric (`active_spinner` for claude, `tool_active` otherwise): `--metric busy` was never a metric and answered "Unknown metric", so every confirmation had been riding on `idle <= 3` — which is how the stuck claude worker got confirmed on startup redraws. For the claude family a definite spinner `false` now forbids that idle shortcut (an idle composer holding unsent text has no spinner); the generic families keep it. The claude family's default busy pattern now knows Claude Code v2.1's markers — `● <Verb>… (Ns · …)`, the in-flight `◐ <Tool>` status cell, `esc to interrupt` — measured 2026-09-18 against a live pane where the braille-only pattern read `false` for the whole of a 60s task. The probe's boolean is read with an explicit null check, not `.value // empty`, which swallows `false`. The nudge goes through `send --key enter` (send lock, audit trail), not raw tmux. `test-dispatch-delivery-smoke` case 3 (re-flowing TUI, tty echo off) and case 4 (claude-family fake that redraws 30s then freezes with the text in its box) fail on the old wrapper — case 4 also on the first nudge version — and pass on this one.
+
+- `mods/tmux-agent` 0.5.0 — `/tmux` panel moves from a `Pane` to the `AbovePrompt` band. Observed 2026-09-17 on two machines: the Pane docked to the right of the transcript from 110 columns (fullscreen layout) and sat inline under `CLAUDE_CODE_NO_FLICKER=0` / in tmux — and inline, none of its buttons could be pressed (clicks are only reported in the fullscreen layout; `hotkey` is honoured only in the band). The band is always above the prompt in both layouts. Rows 1–9 press on a bare digit from an empty prompt (`1: name`); `r` refresh, `x` stop, `q` close once the band is focused (`ctrl+x tab`); a `[close]` button replaces the Pane's ✕. The tree stays under the band's `maxRows` (a scrolling band disarms the digit hotkeys), so the mirror is sized from `maxRows`, not `viewport.rows`. The hook yields to a survey and nests whatever plugins below drew. No `mobile`/`desktop` surface any more: the band is terminal-only (the Pane's mobile branch was defensive, never requested). README advice to pin the panel with `NO_FLICKER=0` is withdrawn — the position no longer depends on it.
+
+## v0.40.1 - 2026-09-17
+
+- `mods/tmux-agent` 0.4.1 — `/tmux` panel: the rows no longer wait on `$.config.list()`. Observed in a fresh session (no reload): panel opened, then an assign, and the new row never appeared — [refresh] did nothing, the 2s clock did nothing, close-and-reopen showed it. The mode-row read was the one await inside `refresh` the rows did not need; if it never settled, `refreshing` stayed set and every later refresh returned early. The read now runs off the rows' path, and a refresh that throws is logged instead of lost. Cause not logged in the field — the regression test drives it with a mode row that never answers (old code: timed out on open).
+
+## v0.40.0 - 2026-09-17
+
+tmux-agent mod v0.4.0（隊友：tell／stop／peek／keys／stop all、/tmux 面板保留已交付隊友、session-id 所有權與孤兒接手、needs-input、狀態色點）；wrapper 側 preflight、prompt_delivery=file-ref、assign 一步派工、result wait-required 修正等。
+
+### tmux-agent mod：peek／keys／stop all，交付不再截斷
+
+- 新工具 `mcp__tmux-agent__peek(name, lines?)`：一次回傳 pane 尾巴（去 ANSI、預設 40 行、上限 200）
+  加狀態（running／idle／pane gone／needs input — <blocked_reason>）。Claude 想看就叫，不輪詢。
+  Bash gate 對 status／capture／probe 的拒絕文字改指向 `peek`。
+- 新工具 `mcp__tmux-agent__keys(name, keys[])`：白名單鍵（Enter Escape Tab Space 方向鍵 y n）
+  送進該 worker 的 tmux session，回答 trust／permission／login 對話框。不能打字；打字走 `tell`。
+- 面板新狀態 `needs input — <reason>`：status 探測讀 `blocked_reason`，一出現就改標並 toast 一次。
+- `stop` 加 `all: true`：停掉本專案所有還有 tmux session 的 worker（含已交付但忘了關的）。
+  只掃本專案的 dispatch 紀錄，不碰別的 tmux session。
+- 交付截斷修正：summary 上限 800 → 12,000 字元，截斷提示改為指名 result.json 路徑。
+  實測起因：cursor／agy 兩個搜尋任務各 11／23 筆結果，交付時只剩前 6／7 筆。
+- 修 README 因錨點錯誤重複整節的問題（12d40bb 引入）；三份 handoff 加 STALE 橫幅。
+- 面板每列前加狀態色點（running 綠、done／finished 青、stalled 黃、needs-input 紫 `?`、exited／
+  launch-failed 紅），summary 行 success 綠、其他黃。Button 沒有 color 屬性，所以色點放在旁邊。
+- 面板：`tmux ls` 上限 2s → 5s，失敗時沿用上一次結果（一次慢 tick 不再清空已交付的隊友）；
+  行列重讀單飛，慢的那次不會被下一個 tick 疊上；標頭加 `[refresh]` 按鈕手動重刷；
+  面板開啟讀完列表立刻重繪（不再等 2 秒才從「No workers outstanding」變成真狀態）。
+- peek：有終態 result.json 的 worker 說 `finished (result.json: <status>)`，不再照 wrapper 的
+  `running:true` 說 running；idle 秒數照印。
+
+### tmux-agent mod：已投遞的隊友留在 /tmux
+
+- `/tmux` 改畫「還有 pane 的隊友」：已投遞記帳的 worker 標 `done — tell it more, or stop it`，
+  選中仍有輸入列、`[stop]` 與 `success: <summary>`；tmux session 沒了才從面板消失。
+  每個 tick 多一次 `tmux ls -F '#S'`（2s 上限），用 `-<name>` 尾綴比對，不猜 profile 前綴。
+  實測起因：assign→tell→投遞完後 `/tmux` 只剩 `No workers outstanding.`。
+- Bash gate 對 status／capture／probe／result 的拒絕文字改成一句話（原本印成 `use nothing: …`）。
+- pane 已死、沒寫 result 的 worker 不再永遠掛在 `/tmux` 等人按 stop：status 探測到
+  `exists:false` 後，下一個 tick 以 `exited` 交付一次並記帳，列就消失。
+  `exists:true, running:false` 是 idle（活著、停在 prompt），不算 exited。
+  實測起因：兩個 P5 fixture（p5a／p5b）掛在面板上 1 小時 41 分。
+- dispatch.json 新增 `owner`（派工 session 的 `$.session.id()`）與 `ownerCwd`。collector／
+  `/tmux`／tell／stop 只認本 session 的 worker；每次對帳 touch `<root>/.collector-<id>` 心跳，
+  別的 session 的 worker 只在它心跳停 90 秒以上且 `ownerCwd` 同 cwd 時接手（孤兒不漏收）。
+  同一 repo 多個 session 各做各的不互搶；沒有 `owner` 的舊紀錄照舊可被接手。實測起因：
+  兩個 session 共用一個 state root，彼此把對方的 worker 當自己的交付。
+- 已知代價（不修）：交付是「先 submit、後記帳」，模組若在兩步之間被卸載（plugin 目錄
+  熱重載、session 結束），該結果會多送一次（僅一次）。反過來先記帳會在崩潰時弄丟結果，
+  重複比遺失便宜。2026-09-17 觀察到 p5a／p5b 各送兩次（16:23:17、16:25:25），同時段
+  有 mod 原始檔存檔；「熱重載落在窗口內」是與 commit 時序一致的推論，未在 log 中抓到。
+
+### Added
+- **`tmux-agent` mod — workers are teammates: `tell`, `stop`, and a Bash gate.**
+  `mcp__tmux-agent__tell` sends a follow-up to a worker this mod dispatched: it
+  resets the worker's `result.json` (`result init`), sends the text with the
+  result path spelled out (follow-up sends are never prefixed by the wrapper),
+  and bumps `dispatch.json`'s `since` — strictly above the previous value, since
+  the id is `<name>@<since>` and a collision would inherit the old "delivered"
+  mark — so the collector watches the worker again and it returns to `/tmux`.
+  `mcp__tmux-agent__stop` stops the worker and acknowledges it, so it leaves the
+  panel instead of sitting there as `exited`. While the mod is loaded, a
+  hand-typed `agent-tmux <cli> assign|send|send-wait|stop|status|capture|probe|result`
+  in Bash is denied with the tool to use instead (`--help` passes): only the tool
+  writes the record the collector reads, and a status poll is a second
+  supervisor. `assign`'s description now says `profile` is any agent-tmux profile,
+  including a custom one (a second claude through a provider gateway via its own
+  `--settings`), and the mod README shows that profile.
+  Verification moved into CI: `scripts/test-mod-permissions-smoke` pins the
+  `claude plugin validate` surface to `mods/tmux-agent/permissions.txt` and runs
+  `claude plugin test` (55 tests, previously developer-machine only); CI installs
+  the latest Claude Code for these on purpose — the API moves fast, and the
+  typecheck against the committed declarations (regenerated on 2.1.274) is what
+  says it moved under the mod. A first `claude plugin eval` case checks that the
+  model, denied the shell probe, reports the denial instead of a status.
+  The panel itself grew the teammate controls: the selected row carries an input
+  line (type, Enter — that is a `tell`) and a `stop` button, both through the
+  same functions the tools use, and a finished row shows its `status: summary`
+  instead of a pane mirror.
+- **`tmux-agent` mod — the panel and the `assign` receipt say who will deliver.**
+  The `/tmux` panel gains a fifth row state, `launch failed` (read from the same
+  `launch.exit` receipt the collector reads), so a dispatch whose `agent-tmux
+  assign` died no longer draws as `running`. Its first line now names why nothing
+  will be delivered when that is so — mode `lite`, paused after three refusals,
+  or paused over the store budget — with the fix beside it. The `assign` tool's
+  result ends with the same verdict: `collector: active …` (end the turn and wait
+  to be woken) or `collector: NONE — …` plus the exact `result wait-required`
+  command to harvest by hand. `skills/using-tmux-agent-tools/SKILL.md` gains a
+  COLLECTOR section that branches on that sentence, so a mod session ends its
+  turn instead of starting a second supervisor, while Codex, Cursor and mod-less
+  sessions keep the ONE OWNER proxy/harvest procedure untouched. Five new tests,
+  each mutation-checked (`50 pass, 0 fail`); the row-switch test closes the last
+  panel acceptance item left UNCONFIRMED on 2026-09-17.
+- **`tmux-agent` mod v0.3.0 — `/tmux` panel and stall detection.**
+  `/tmux` opens a pane listing every outstanding worker (name, repo, state,
+  elapsed, and the brief's GOAL line, now recorded at dispatch). Pressing a row
+  mirrors that worker's pane tail; only the selected row is mirrored, and the
+  2-second mirror clock exists only while the panel is open, so a closed panel
+  spawns no captures at all while reconcile keeps running. The mirror strips
+  ANSI rather than guessing at a colour mapping the engine does not document.
+  A live worker whose pane has not changed for 15 minutes is flagged `stalled`
+  and shown apart from `running`, announced once, never killed — reusing the
+  `idle_seconds` `agent-tmux status --json` already maintains.
+- **`tmux-agent` mod v0.2.0 — the collector session owns the wait.**
+  A function-hook plugin (`mods/tmux-agent/`, its own version line) that adds
+  `$.tmux` and an `assign` tool over `agent-tmux`, reconciles `result.json` on a
+  clock and submits a prompt when a worker reaches a terminal state, so a
+  dispatch no longer needs a supervising proxy to sit and wait. Delivery is
+  submit-then-record: a worker is marked reported only after the session accepts
+  the prompt, because `prompt.submit` can legitimately answer `{ drop }`.
+  Ownership comes from minting a fresh state directory per dispatch, so
+  re-assigning a name can never collect the previous generation's result, and no
+  producer-side protocol field is required. The `mode` gate reads the live
+  `/config` row every tick, so switching `lite` to `full` takes effect without
+  restarting the session.
+- **`preflight` — the CLI's own launch probe, before any tmux session exists.**
+  `agent-tmux <cli> preflight [--json]` runs the profile's `preflight_flags`
+  (default `--version`), and classifies a failure as `keychain_locked`,
+  `login_required`, `quota_exhausted`, `cli_not_found` or
+  `cli_preflight_failed`, keeping the CLI's own output in `detail`. Exit `4`
+  when blocked. `assign` runs it as step 0 and exits `4` with
+  `{assigned:false,failed_step:"preflight",blocked_reason,...}`, starting no
+  session; `doctor` reports it as a `cli_launch` check. On 2026-09-08
+  `cursor-agent` was blocked on a locked macOS login keychain and the review it
+  was meant to run was never dispatched — nothing in the wrapper distinguished
+  that from a slow worker. Verified against all five real CLIs (claude, codex,
+  agy, cursor, grok: launchable, side-effect-free, sub-second).
+- **`prompt_delivery=file-ref` — one-line dispatch for TUIs that submit on
+  every newline.** agy's own transcript shows a single bracketed-pasted prompt
+  arriving as **12 separate inputs** on 2026-09-08, the first being a fragment
+  from the MIDDLE of the prompt, with `GOAL` and `CONTEXT` never delivered at
+  all — while the wrapper reported `assigned:true` and the worker looked busy
+  (it invented its own context and produced a plausible report). `file-ref`
+  composes scope-guard + result-path + body into
+  `$TMUX_AGENT_DIR/<name>/prompt.md` and sends ONE line naming that file, so
+  there is no newline for the TUI to submit on; delivery proof matches the line
+  actually sent, and an `assign.file_ref` audit event records the file, its
+  byte count and sha256. `agy.conf` now ships `prompt_delivery=file-ref`;
+  override per dispatch with `assign --prompt-delivery paste|file-ref`. New
+  `scripts/test-dispatch-delivery-smoke` reproduces the defect (paste → 6
+  inputs on a newline-submitting fake CLI) and pins the fix (file-ref → exactly
+  1 input, whole task retrievable): `21 passed, 0 failed`. File-ref delivery
+  records the scope-guard and result-path instructions as landed without a
+  pane-echo check: that check exists to catch a half-landed *paste*, and a
+  composed file either exists or does not, so requiring it would mark both
+  instructions UNCONFIRMED on every dispatch and re-inject them on every
+  follow-up send. A same-named profile under `~/.config/agent-tmux/profiles`
+  shadows the bundled one whole (keys are not merged), so a host with its own
+  `agy.conf` needs `prompt_delivery=file-ref` added there too.
+
+### Fixed
+- **`tmux-agent` mod — the v0.3.0 review round.** An external adversarial review
+  (`.review/astra-v030-review.md`, `VERDICT: BLOCK`) found eight defects, all
+  fixed here: four type errors that `claude plugin validate` and `claude plugin
+  test` both pass over; a `ui.close` that tore the panel down on a *resolved*
+  `{ deny }`, killing the mirror of a pane still on screen; a mirror that could
+  start a second capture on top of a slow one, and could paint a frame captured
+  before a close onto the panel reopened after it; a stall probe window pinned to
+  the first eight workers, so a ninth was never probed; a stall registry that only
+  ever grew, because a delivered worker was never removed; a probe timeout that
+  could overrun the sweep budget by a whole probe; a control-character strip using
+  a non-global regex, which cleaned only the first escape in a string; and a panel
+  that drew a finished-but-undelivered worker as `running`. Each fix has a
+  regression test that was mutation-checked -- reverting the fix fails that test
+  and only that test (`tests/register.test.ts`, `regressions`). The one exception
+  is documented at its call site: with the per-probe cap in place, the sweep's
+  `left <= 0` early return cannot be told apart from the engine's own refusal of a
+  non-positive `timeoutMs`, so the harness cannot isolate it.
+- **`scripts/test-mod-typecheck-smoke` — the type check is no longer skippable.**
+  `claude plugin validate` and `claude plugin test` do not type-check the mods, so
+  v0.3.0 reached review with four `tsc` errors while both reported clean. The
+  check is now a smoke, picked up by `run-all-smokes` and CI.
+- **`result wait-required` waited out its whole budget on a field the producer
+  never writes.** Both workers of the 2026-09-08 dispatch had written terminal
+  results with `status,summary,artifacts,errors`; the parent harvested with
+  `--fields status,summary,artifact_path` and sat in a `--wait 2400` for ~24
+  minutes until a human asked whether it was stuck. Replaying the untouched
+  results with the correct field list returns `exit 0` immediately, which is
+  the whole diagnosis. A terminal result that lacks a requested field now exits
+  **3** at once with `event:"contract-mismatch"`, `timeout:false`,
+  `missing_fields`, and the worker's `body` attached — a finished producer
+  cannot be made to answer a field it never writes, and losing its result to a
+  fake timeout was the expensive part. Usage errors keep exit `2`. The waiter
+  also no longer aborts on a transient read failure or a half-written
+  `result.json` (agy rewrote its result 26s after the first write), and it
+  checks the required fields against the SAME snapshot it returns.
+  `test-result-contract-smoke` covers all of it across five profiles:
+  `150 passed, 0 failed`.
+- **`result wait-required` could report progress as completion.** It returned
+  the moment the named fields were non-empty, so a worker's `status:"pending",
+  summary:"working on it"` ended the wait as a success — the false-completion
+  trap `references/multi-agent.md` warns about, reached through the field list
+  instead of a stale file. The wait now also requires a TERMINAL canonical
+  status (`success` with a non-empty summary, or `failed`/`blocked`/
+  `needs-input`), sharing the `result_terminal_ready` adjudicator with
+  `supervise`. Behaviour change for callers that deliberately polled for
+  interim fields: they now wait out the bound. `contracts.md` states the new
+  condition.
+- **Plugin manifests and `--version` lagged the CHANGELOG by a release.**
+  `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json` still said
+  `0.38.0` against a released `0.39.0`, and `AGENT_TMUX_VERSION` — what
+  `--version` and `doctor` print, the offline signal for multi-machine
+  skill-copy drift — said `0.38.0` too because nothing compared it.
+  `test-version-sync-smoke` now covers it: `4 passed, 0 failed`.
+- **`test-result-path-once-smoke` merged stderr into a JSON payload.** The
+  `send-wait` result-fallback case captured `2>&1`, so the `codex-tmux` shim's
+  deprecation banner (`print -u2`) landed in front of correct JSON and both
+  `jq` reads failed. The payload was always right
+  (`completion_source: result_json`, `submitted: true`); the capture was wrong.
+  Now `26 passed, 0 failed`.
+- **`using-tmux-agent-tools` contradicted the dispatch gate.** ONE OWNER told
+  the parent to dispatch with `assign --detach` "in a short foreground call",
+  which `tmux-assign-host-gate.sh` blocks outright (with or without
+  `--detach`). Following the hook instead meant a BLOCKING `assign` inside a
+  proxy sub-agent, reaped at ~600s three times on 2026-09-03, each reporting
+  in-flight with nobody left to wait. The shape that satisfies both is now
+  stated: proxy runs `assign --detach`, parent harvests with bounded
+  background `result wait-required`.
+- **`result-path delivery UNCONFIRMED` was documented as a delivery failure.**
+  For `heuristic_family=generic` (cursor) `_sentinel_trustworthy` declines to
+  mark by design, so the warning fires on every dispatch while the path
+  instruction is re-injected on every send. The skill no longer reads it as
+  proof of permanent `pending`, and notes that a TUI collapsing pasted input
+  makes a pane capture inconclusive either way.
+- **`cursor` resolved the wrong binary.** The bundled profile and the legacy
+  preset both set `bin=cursor`, but the Cursor agent CLI installs as
+  `cursor-agent`; `cursor` is the editor launcher and never starts an agent
+  TUI. Line 268 does one `command -v` with no fallback, so every
+  `agent-tmux cursor assign` died at the `start` step with
+  `cursor not found at <empty>` and `assigned: false` — measured 2026-09-03,
+  worked around only by passing `CURSOR=/path/to/cursor-agent`. The script's
+  own approval-prompt comment already referenced `cursor-agent`, so the preset
+  was the odd one out. Verified: `agent-tmux cursor doctor` now reports
+  `cursor: …/cursor-agent` with no env override.
+
+### Added
+- **`assign` — the stepwise dispatch sequence as one command** (W32 retro M5,
+  P0). Runs `start --exact` → `result init` → `send --from-file` → a
+  confirm-processing check (busy probe, else pane-still-changing fallback) →
+  one blocking `supervise --result-required`, refusing to continue past a
+  failed step and printing the failed step + pane capture + a JSON line on
+  error. Encodes the user-verified sequence that replaces the stale
+  `start --prompt-file` shape (worker sits idle with no task; the symptom
+  mimics an auth hang — re-hit by ≥4 sessions after the lesson was recorded).
+  Smoke: `scripts/test-assign-smoke`.
+
+## v0.39.0 - 2026-07-30
+
+### Changed
+- **tmux-dispatch-gate hardened to proxy enforcement.** GATE 1 no longer
+  accepts a read-the-rules receipt from the parent session: task-carrying
+  dispatch (`start`/`send`/`send-wait`) now passes only from a subagent
+  context (harness-injected `agent_type`, probed on Claude Code 2.1.220).
+  The parent's escape hatch is `gate-receipt-parent-dispatch` quoting the
+  user's explicit direct-dispatch instruction. The old
+  `gate-receipt-dispatch` marker is retired.
+- GATE 2 (workflow escalation) now counts review-shaped dispatches from
+  subagent contexts too — the pass-through was moved after the counter, so a
+  proxy-driven manual review loop still escalates to a workflow recipe.
+- Gate receipts are content-validated: a receipt opens a gate only if it
+  carries a `YYYY-MM-DD` date and at least 40 bytes of rationale; an empty
+  `touch` no longer counts.
+
+## v0.38.0 - 2026-07-28
+
+### Deprecated
+- The per-CLI shims `claude-tmux` / `codex-tmux` / `agy-tmux` are deprecated in
+  favor of the canonical `agent-tmux <cli> <command>` spelling. They keep
+  working through v0.38 but print a one-line stderr warning
+  (suppress with `AGENT_TMUX_SUPPRESS_DEPRECATION=1`); removal is planned for
+  v0.39. All docs, skills, references, and the wiki now use the canonical
+  spelling; `tmux-agent-fanout` and `tmux-agent-sessions` invoke
+  `agent-tmux <cli>` directly instead of resolving shim paths at runtime.
+  The `wrapper` display field in `tmux-agent-sessions` JSON keeps the legacy
+  names until the v0.39 removal.
+
+### Added
+- `start` now waits out transient CLI startup screens (new
+  `blocked_reason=startup_pending`, e.g. agy "Verifying your account
+  eligibility") before injecting the initial prompt, fails loudly at
+  `AGENT_TMUX_START_READY_TIMEOUT` (default 45s) if the screen never clears,
+  and blocks `send` paths while the screen shows. "Please run /login"
+  screens classify as `login_prompt`. (`scripts/test-start-readiness-smoke`)
+- Runtime-agnostic dispatch gate: when `AGENT_TMUX_REQUIRE_GATE_RECEIPT` is
+  set, dispatch-shaped commands (`start`/`resume`/`start-ssh`/`send`/
+  `send-wait`/`send-wait-literal`) are refused with
+  `blocked_reason=gate_receipt_missing` unless the receipt file named by
+  `AGENT_TMUX_GATE_RECEIPT` exists. Mirrors the Claude Code dispatch-gate
+  hook for runtimes without a hook system (Codex, agy).
+  (`scripts/test-gate-receipt-smoke`)
+- The Claude Code plugin now ships a `PreToolUse(Bash)` hook
+  (`hooks/hooks.json` + `hooks/tmux-dispatch-gate.sh`, moved here from
+  ohyeh/agent-scripts): GATE 1 requires a per-session dispatch receipt before
+  driving tmux workers from a parent session; GATE 2 routes the second
+  review-shaped dispatch of a session to a workflow recipe. Subagent
+  (supervision proxy) contexts pass through. The review-shape detector now
+  also sees names behind bare flags (`start --exact review_x`).
+  (`scripts/test-dispatch-gate-hook-smoke`)
+
+### Changed
+- `skills/tmux-agent-tools/SKILL.md` is repositioned as the mechanics
+  library; the `using-tmux-agent-tools` router skill is the single entry
+  point.
+
+### Fixed
+- Secret redaction: values containing backslashes (e.g. `\d`) leaked
+  unredacted from `capture` because `awk -v` C-escape processing mangled the
+  literal match value; the secret now reaches awk via `ENVIRON`, which does
+  no escape processing. (`test-secret-uri-smoke` regex-meta case)
+- `tmux-agent-sessions list`/`watch` died under `set -euo pipefail` whenever
+  the tmux server had no sessions at a poll tick (`tmux ls` exits 1), so
+  `watch` silently emitted no events on an otherwise idle machine; an empty
+  server now yields an empty inventory. (`test-sessions-watch-smoke`)
+
 ## v0.37.0 - 2026-07-26
 
 ### Changed

@@ -21,3 +21,6 @@ skills/tmux-agent-tools-workspace/
 # are whitelisted so they can be added.
 skills/tmux-agent-tools/scripts/profiles/*.conf
 !skills/tmux-agent-tools/scripts/profiles/*.conf.example
+
+# plugin eval runs are local artifacts (reports, per-run transcripts)
+mods/*/evals/results/

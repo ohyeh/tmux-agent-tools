@@ -56,14 +56,11 @@ jobs:
             echo "tag already exists: ${VERSION}" >&2
             exit 1
           fi
-          zsh -n skills/tmux-agent-tools/scripts/claude-tmux
-          zsh -n skills/tmux-agent-tools/scripts/codex-tmux
+          zsh -n skills/tmux-agent-tools/scripts/agent-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
-          ruby -c Formula/tmux-agent-tools.rb
-          brew style Formula/tmux-agent-tools.rb
-          skills/tmux-agent-tools/scripts/codex-tmux self-test
-          skills/tmux-agent-tools/scripts/claude-tmux self-test
+          skills/tmux-agent-tools/scripts/agent-tmux codex self-test
+          skills/tmux-agent-tools/scripts/agent-tmux claude self-test
           scripts/test-version-sync-smoke
           scripts/test-session-meta-smoke
           scripts/test-oneshot-smoke
@@ -98,7 +95,6 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           echo "dry run: would create annotated tag and GitHub release for ${VERSION}"
-          echo "dry run: after the real release, open a follow-up Formula bump PR with the released archive SHA-256"
 
   publish:
     runs-on: macos-latest
@@ -145,22 +141,3 @@ jobs:
             prerelease_flag=(--prerelease)
           fi
           gh release create "$VERSION" --title "$VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"
-
-      - name: Summarize Homebrew formula bump
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${VERSION}.tar.gz"
-          archive_path="$(mktemp)"
-          curl -fsSL "$archive_url" -o "$archive_path"
-          sha256="$(ruby -rdigest -e 'puts Digest::SHA256.file(ARGV.fetch(0)).hexdigest' "$archive_path")"
-          {
-            echo "## Homebrew formula bump"
-            echo
-            echo "Open a follow-up PR that updates:"
-            echo
-            echo '```ruby'
-            echo "url \"${archive_url}\""
-            echo "sha256 \"${sha256}\""
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
