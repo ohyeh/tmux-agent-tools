@@ -7,9 +7,9 @@ The failures you'll actually hit, ordered roughly by frequency.
 The marker contains a regex metacharacter (`[`, `]`, `(`, `)`, `.`, `*`, `?`, `+`, `|`). `wait-text` is regex by default. Switch to:
 
 ```bash
-codex-tmux wait-literal worker '[CODEX-01]' 180
+agent-tmux codex wait-literal worker '[CODEX-01]' 180
 # or:
-codex-tmux wait-text --literal worker '[CODEX-01]' 180
+agent-tmux codex wait-text --literal worker '[CODEX-01]' 180
 ```
 
 Use regex `wait-text` only when you actually want regex matching.
@@ -19,7 +19,7 @@ Use regex `wait-text` only when you actually want regex matching.
 Stale marker from a previous turn — the pane scrollback already contains an old occurrence. Use `send-wait-literal` instead, which waits for a *new* occurrence relative to the send:
 
 ```bash
-codex-tmux send-wait-literal worker 'Next step.' '[CODEX-02]' 180
+agent-tmux codex send-wait-literal worker 'Next step.' '[CODEX-02]' 180
 ```
 
 ## `status --json` says `running:true` but no visible progress
@@ -27,7 +27,7 @@ codex-tmux send-wait-literal worker 'Next step.' '[CODEX-02]' 180
 The agent CLI is sitting on a permission / first-run confirmation prompt. Check the `diagnostic` field — `confirmation_detected` means the wrapper saw a prompt shape. Attach to the session and answer:
 
 ```bash
-codex-tmux attach worker
+agent-tmux codex attach worker
 # answer the prompt
 # Ctrl+B, D to detach
 ```
@@ -40,8 +40,8 @@ The wrapper deliberately does not auto-accept permission prompts.
 wrapper-local parser for CLI footer/progress text:
 
 ```bash
-claude-tmux probe --metric context_percent --json worker
-codex-tmux probe --metric progress --json worker
+agent-tmux claude probe --metric context_percent --json worker
+agent-tmux codex probe --metric progress --json worker
 ```
 
 Branch on `.confidence`; a low-confidence parse is a signal to inspect the pane
@@ -52,7 +52,7 @@ or update this repo's parser instead of copying regexes into downstream tools.
 `--on-exit` requires `--sentinel`. Add it:
 
 ```bash
-codex-tmux start --exact w ~/repo \
+agent-tmux codex start --exact w ~/repo \
   --sentinel /tmp/w.exit \
   --on-exit 'echo done >> /tmp/w.log' \
   '...'
@@ -74,21 +74,51 @@ In interactive mode a finished worker that never wrote `result.json` leaves ever
 result wait blocking until timeout — the wrapper cannot tell "done, forgot the
 file" from "still working". Two fixes:
 
-- **Prefer `start --headless` for bounded tasks.** Completion becomes the process
-  exit: the wrapper synthesizes a contract-valid `result.json` (status, summary
-  from the stdout tail, exit_code, stdout_path) the moment the CLI exits, so
-  `result wait-required --fields status,summary` returns immediately. A result
-  the worker wrote itself is preserved, never clobbered.
+- **`start --headless` sidesteps this for user-opted-in fire-and-collect runs.**
+  Completion becomes the process exit: the wrapper synthesizes a contract-valid
+  `result.json` (status, summary from the stdout tail, exit_code, stdout_path)
+  the moment the CLI exits. But headed `start` stays the DEFAULT — a headless
+  failure leaves only exit code + stdout file to debug from; use `--headless`
+  only when the user opted in (see the SKILL.md fast answers).
 - Already interactive and stuck? Check `status --json` for `running:false` /
   `exit_detected`, then read `capture --strip-ansi <name> 80` instead of waiting
   the timeout out, and re-prompt with the literal result path if needed.
+
+## `assign` exits 4 before starting anything
+
+The CLI failed its own launch probe: locked login keychain, missing login,
+quota. `blocked_reason` says which and `detail` carries the CLI's own words.
+Nothing was dispatched, so there is nothing to wait for — fix the blocker on
+that host (for `keychain_locked`, unlock the login keychain in a real login
+session; the wrapper never stores the password) and dispatch again. Check a
+host before dispatching with `agent-tmux <cli> preflight --json`.
+
+## `result wait-required` exits 3 with `contract-mismatch`
+
+The worker HAS written a terminal result; it just does not contain a field the
+caller asked for. Waiting longer cannot fix that. Compare `missing_fields`
+against what the producer actually writes (`status`, `summary`, `artifacts`,
+`errors`) and re-read with those; the finished result is attached under `.body`
+so nothing is lost. Field names come from the result contract, never from a
+prompt placeholder like `{artifact_path}`.
+
+## The worker is running but only received part of the prompt
+
+Some TUIs submit on every newline, turning one bracketed-paste into many
+inputs — agy recorded 12 separate inputs for a single pasted prompt on
+2026-09-08 and never received its `GOAL`/`CONTEXT` at all, while the wrapper
+still reported `assigned:true`. Dispatch such a CLI with
+`assign --prompt-delivery file-ref` (or `prompt_delivery=file-ref` in its
+profile, which `agy.conf` already ships): the whole task is composed into
+`$TMUX_AGENT_DIR/<name>/prompt.md` and delivered as ONE line naming that file.
+The `assign.file_ref` audit event records the file and its sha256.
 
 ## Pane shows the exit-code marker but the session lingers
 
 Normal. The wrapper keeps the pane open after the CLI exits so failures stay capturable. Clean up with:
 
 ```bash
-codex-tmux stop worker
+agent-tmux codex stop worker
 ```
 
 `status --json` reports `running:false` and `exit_detected:true` for this state.
@@ -99,16 +129,16 @@ For large handoff packets or prompts with embedded newlines, prefer the
 first-class file path:
 
 ```bash
-codex-tmux send --from-file /abs/prompt.md --enter-count 3 --enter-delay 0.5 worker
+agent-tmux codex send --from-file /abs/prompt.md --enter-count 3 --enter-delay 0.5 worker
 ```
 
 If you are using inline `send <name> <text>`, the submit timing may be too tight
 for your environment. Raise the legacy delay:
 
 ```bash
-CODEX_TMUX_SUBMIT_DELAY=0.5 codex-tmux start --exact w ~/repo '...'
+CODEX_TMUX_SUBMIT_DELAY=0.5 agent-tmux codex start --exact w ~/repo '...'
 # or, for the Claude wrapper:
-CLAUDE_TMUX_SUBMIT_DELAY=0.5 claude-tmux start --exact w ~/repo '...'
+CLAUDE_TMUX_SUBMIT_DELAY=0.5 agent-tmux claude start --exact w ~/repo '...'
 ```
 
 Default is 0.2s.
@@ -146,7 +176,7 @@ CI lint at `scripts/lint-no-path-tied-locals` enforces this. If your lint passes
 Run `self-test`:
 
 ```bash
-codex-tmux self-test
+agent-tmux codex self-test
 ```
 
 It exercises tmux capture/wait without spawning a real agent. Failures there point at tmux config, not your prompt.

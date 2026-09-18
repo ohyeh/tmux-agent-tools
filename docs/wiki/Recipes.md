@@ -5,13 +5,13 @@ Copy-pasteable workflows. Each one starts from a clean shell — adapt the agent
 ## Single agent with structured result
 
 ```bash
-codex-tmux start --exact reviewer ~/repo --transcript /tmp/reviewer.jsonl \
+agent-tmux codex start --exact reviewer ~/repo --transcript /tmp/reviewer.jsonl \
   'Review the latest commit. End by writing $TMUX_AGENT_RESULT with {"schema_version":1,"status":"success"|"failed"|"blocked"|"needs-input","summary":"...","artifacts":[],"errors":[]}.'
 
-codex-tmux wait-and-capture --marker '"status"' --tail 5 reviewer 600
+agent-tmux codex wait-and-capture --marker '"status"' --tail 5 reviewer 600
 
-codex-tmux result --field '.summary' --wait 10 --json reviewer
-codex-tmux stop reviewer
+agent-tmux codex result --field '.summary' --wait 10 --json reviewer
+agent-tmux codex stop reviewer
 ```
 
 The wait-and-capture polls for the moment the agent writes the result, then returns immediately. You never parse scrollback.
@@ -21,7 +21,7 @@ The wait-and-capture polls for the moment the agent writes the result, then retu
 Run code automatically when the agent CLI exits:
 
 ```bash
-codex-tmux start --exact builder ~/repo \
+agent-tmux codex start --exact builder ~/repo \
   --sentinel /tmp/builder.exit \
   --on-exit 'echo "builder exited with $ON_EXIT_CODE" >> /tmp/build.log' \
   'Build the project, run tests, write result to $TMUX_AGENT_RESULT.'
@@ -39,7 +39,7 @@ echo "exit code: $(cat /tmp/builder.exit)"
 marker=/tmp/agent-7/approve.txt
 mkdir -p "$(dirname "$marker")"
 
-codex-tmux wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
+agent-tmux codex wait-and-capture --literal --marker '[NEEDS-APPROVAL]' \
   --pause-until-file "$marker" --pause-timeout 1800 worker
 # In another shell:
 #   echo approve > "$marker"   → exit 0
@@ -74,9 +74,9 @@ Manifest (`pipeline.json`):
   "schema_version": 1,
   "fail_fast": false,
   "tasks": [
-    {"name": "lint",   "depends_on": [],         "command": "codex-tmux start --exact lint ~/repo 'lint'",   "result_path": "/tmp/lint.json"},
-    {"name": "test",   "depends_on": ["lint"],   "command": "codex-tmux start --exact test ~/repo 'test'",   "result_path": "/tmp/test.json"},
-    {"name": "deploy", "depends_on": ["test"],   "command": "codex-tmux start --exact dep  ~/repo 'deploy'", "result_path": "/tmp/dep.json"}
+    {"name": "lint",   "depends_on": [],         "command": "agent-tmux codex start --exact lint ~/repo 'lint'",   "result_path": "/tmp/lint.json"},
+    {"name": "test",   "depends_on": ["lint"],   "command": "agent-tmux codex start --exact test ~/repo 'test'",   "result_path": "/tmp/test.json"},
+    {"name": "deploy", "depends_on": ["test"],   "command": "agent-tmux codex start --exact dep  ~/repo 'deploy'", "result_path": "/tmp/dep.json"}
   ]
 }
 ```
@@ -128,7 +128,7 @@ Add `--post-github-comment` only when the user explicitly asks to publish.
 ## SSH: agent CLI runs remote, tmux stays local
 
 ```bash
-claude-tmux start-ssh --exact review example-host /srv/repo \
+agent-tmux claude start-ssh --exact review example-host /srv/repo \
   'Review the diff and write a summary.'
 ```
 

@@ -1,6 +1,6 @@
 # CI Mode Exit Code Contract (issue #120 v1)
 
-Stable contract for `claude-tmux start --ci` / `codex-tmux start --ci`
+Stable contract for `agent-tmux claude start --ci` / `agent-tmux codex start --ci`
 (or env `CLAUDE_TMUX_CI=1` / `CODEX_TMUX_CI=1`) and downstream tools.
 
 ## Exit codes
@@ -20,7 +20,7 @@ Stable contract for `claude-tmux start --ci` / `codex-tmux start --ci`
 CI consumers should branch on these directly:
 
 ```bash
-claude-tmux start --ci --result-schema schema.json worker ~/proj 'task'
+agent-tmux claude start --ci --result-schema schema.json worker ~/proj 'task'
 rc=$?
 case "$rc" in
   0)   echo "agent ok" ;;
