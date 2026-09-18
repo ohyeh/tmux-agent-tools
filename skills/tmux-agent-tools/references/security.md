@@ -10,7 +10,7 @@ Both wrappers launch agent CLIs with permissive flags: Claude uses `--dangerousl
 
 ## Secret injection (`--secret KEY=URI`)
 
-`claude-tmux start` and `codex-tmux start` accept `--secret KEY=URI` to inject a value into the tmux session env. Backends:
+`agent-tmux claude start` and `agent-tmux codex start` accept `--secret KEY=URI` to inject a value into the tmux session env. Backends:
 
 - `file:<path>` — read value from a local file
 - bare `<path>` — back-compat alias for `file:`
@@ -25,7 +25,7 @@ Registered secret values are redacted from `capture` output and transcript event
 When `TMUX_AGENT_TOOLS_AUDIT_LOG` is set, a `secret.read` event records the key and backend label only — never the value.
 
 ```bash
-codex-tmux start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
+agent-tmux codex start --secret OPENAI_API_KEY=op://Personal/OpenAI/credential \
   agent-x ~/work
 ```
 
@@ -78,10 +78,10 @@ Event schema (`schema_version: 1`) and rotation semantics: `docs/design-issue-18
 Before debugging agent behavior, prefer:
 
 ```bash
-codex-tmux doctor      # verify wrapper dependencies
-codex-tmux self-test   # verify tmux capture/wait without spawning real CLI
-codex-tmux status --json worker
-codex-tmux ping --json --timeout 5 worker
+agent-tmux codex doctor      # verify wrapper dependencies
+agent-tmux codex self-test   # verify tmux capture/wait without spawning real CLI
+agent-tmux codex status --json worker
+agent-tmux codex ping --json --timeout 5 worker
 ```
 
 `doctor` and `self-test` do not start a real agent and surface 90% of "why didn't it work" issues. For an existing worker, use structured `status`/`ping` before pane capture.

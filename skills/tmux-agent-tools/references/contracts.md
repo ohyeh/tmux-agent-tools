@@ -4,7 +4,7 @@ Read this when reading or writing `result.json`, parsing `status --json`, planni
 
 ## `status --json` stable fields
 
-The shared automation contract for both `claude-tmux status --json` and `codex-tmux status --json`. Stable fields:
+The shared automation contract for both `agent-tmux claude status --json` and `agent-tmux codex status --json`. Stable fields:
 
 - `tool` — `claude` or `codex`
 - `name` — agent name
@@ -62,7 +62,7 @@ Parent reads it via `result --json --wait <seconds> <name>`. Always branch in th
 Worked example:
 
 ```bash
-$ codex-tmux result --json --wait 30 worker
+$ agent-tmux codex result --json --wait 30 worker
 {
   "present": true,
   "valid": true,
@@ -76,7 +76,9 @@ If the worker stalls (`status --json` has `running:true` with high `idle_seconds
 
 ### Why the worker can't use `$TMUX_AGENT_RESULT`
 
-Agent CLIs run tool commands in a sandboxed environment that does not inherit the tmux session environment, so `$TMUX_AGENT_RESULT` is empty inside the worker. For `result_path_via_prompt=true` families (Codex and generic by default), prompt sends automatically prepend `Write final JSON to this exact path: <absolute result_path>`. Use `result --path <name>` to debug or manually recover a stalled worker, and optionally run `result init <name>` first.
+Agent CLIs run tool commands in a sandboxed environment that does not inherit the tmux session environment, so `$TMUX_AGENT_RESULT` is empty inside the worker. For `result_path_via_prompt=true` (the default for every family since 2026-09-18; claude was the exception and its workers never learned the path), prompt sends automatically prepend two lines: `Write final JSON to this exact path: <absolute result_path>`, then the required shape (`schema_version`, `status`, `summary`, `artifacts`, `errors`, with `status` one of `success`, `failed`, `blocked`, `needs-input`). Use `result --path <name>` to debug or manually recover a stalled worker, and optionally run `result init <name>` first.
+
+The shape travels with the path because the path alone is not the contract: a worker told only where to write treats "final JSON" as its own answer and overwrites the seeded skeleton, after which every terminal-status reader (`result wait-required`, `supervise`, the tmux-agent mod's reconciler) skips that worker in silence. A brief therefore does NOT need to restate the result contract — the wrapper injects it once per session. The two lines stay separate: `result_path_once` parses the marker line as `<marker> <path>`, so anything appended there corrupts the parsed path.
 
 Result helpers available in both wrappers:
 
@@ -85,7 +87,30 @@ Result helpers available in both wrappers:
 | `result --path <name>` | Prints the literal `$TMUX_AGENT_DIR/<name>/result.json` path and exits `0`, without requiring the file to exist. |
 | `result init <name>` | Writes `$TMUX_AGENT_DIR/<name>/result.json` as a valid skeleton: `schema_version:1`, `status:"success"`, empty `summary`, `artifacts`, and `errors`. Exits `0` after writing the file path. |
 | `result validate <name> --json` | Validates `result.json` with the recorded schema path, or the bundled result schema when none was recorded. Valid files exit `0` with `valid:true`; missing files exit `1`; malformed or contract-invalid files exit `2` with `valid:false` and `errors[]`. |
-| `result wait-required <name> --fields status,summary,artifacts --wait 60 --json` | Polls until the file exists and every named field is non-empty. Success exits `0` with the normal `result --json` payload; timeout exits `1` with JSON including `timeout:true` and `missing_fields`. Usage errors exit `2`. |
+| `result wait-required <name> --fields status,summary,artifacts --wait 60 --json` | Polls until the file exists, carries a TERMINAL canonical status (`success` with a non-empty summary, or `failed`/`blocked`/`needs-input`), and has every named field non-empty — a `pending` result whose named fields happen to be filled in is progress, not completion, and no longer ends the wait. Success exits `0` with the normal `result --json` payload; timeout exits `1` with JSON including `timeout:true` and `missing_fields`. Usage errors exit `2`. A worker that has ALREADY written a terminal result which does not carry a requested field exits `3` immediately with `event:"contract-mismatch"`, `timeout:false`, `missing_fields`, and the worker's `body` — waiting longer cannot make a finished producer answer a field it never writes. |
+
+### Field names come from the producer, never from the prompt
+
+`--fields` names keys inside the worker's `result.json`. On 2026-09-08 a parent
+waited on `artifact_path`, which no worker writes (the contract is `status`,
+`summary`, `artifacts`, `errors`): both workers had finished and the harvest
+still burned ~24 minutes before a human asked. Use the profile's
+`result_required_fields` (or `status,summary`) and read the payload under
+`.body`; ask for a produced artifact with `.body.artifacts`, and never invent a
+field name from a prompt template placeholder such as `{artifact_path}`. Exit
+`3` now names that mistake instead of hiding it as a timeout.
+
+## Launch preflight
+
+`preflight [--json]` runs the CLI's own launch probe (profile `preflight_flags`,
+default `--version`) before any tmux session exists. Exits `0` when the CLI is
+launchable, `4` with `blocked_reason` (`keychain_locked`, `login_required`,
+`quota_exhausted`, `cli_not_found`, `cli_preflight_failed`) plus the CLI's own
+output in `detail`. `assign` runs it as step 0 and exits `4` with
+`{assigned:false,failed_step:"preflight",blocked:true,blocked_reason,...}`,
+starting no session — a CLI that cannot launch must never turn into a wait
+(observed 2026-09-08: `cursor-agent` blocked on a locked login keychain, and
+nothing in the dispatch chain said so).
 
 ## Approval-gate state file
 
@@ -99,7 +124,7 @@ Exit codes from `wait-and-capture --pause-until-file`:
 
 ## CI-mode exit codes
 
-`claude-tmux start --ci` / `codex-tmux start --ci` (or `CLAUDE_TMUX_CI=1` / `CODEX_TMUX_CI=1`) exit with a stable contract — branch on the code, don't parse output:
+`agent-tmux claude start --ci` / `agent-tmux codex start --ci` (or `CLAUDE_TMUX_CI=1` / `CODEX_TMUX_CI=1`) exit with a stable contract — branch on the code, don't parse output:
 
 | Code | Meaning |
 |------|---------|
