@@ -17,6 +17,7 @@
     "summary": {"type": "string"},
     "artifacts": {"type": "array"},
     "errors": {"type": "array"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Optional. Full 40-hex sha of the commit a success delivers; the tmux-agent mod verifies it exists in the worker dir repo before delivering. Omit when the worker made no commit."},
     "verdict": {
       "type": "object",
       "properties": {

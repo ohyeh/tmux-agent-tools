@@ -2259,7 +2259,7 @@ RESULT_PATH_MARKER="Write final JSON to this exact path:"
 # `result validate` accepts all three today, so this is drift, not breakage —
 # pinned in the wording rather than normalized in code, because no reader
 # compares the value yet and a normalizer would be built for no consumer.
-RESULT_SCHEMA_LINE="Result JSON must include schema_version, status, summary, artifacts, and errors; schema_version must be the number 1 (not a string), and status must be exactly one of success, failed, blocked, needs-input."
+RESULT_SCHEMA_LINE="Result JSON must include schema_version, status, summary, artifacts, and errors; schema_version must be the number 1 (not a string), and status must be exactly one of success, failed, blocked, needs-input. If you committed, add commit: the full 40-hex sha of your final commit."
 
 # Did an injected prefix actually LAND in the pane? Intent (the paste command
 # was issued) is not arrival. Marking a sentinel on intent turns a transport

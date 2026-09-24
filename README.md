@@ -363,7 +363,8 @@ Recommended prompt wording:
 
 > Write final JSON to the wrapper-provided result path. The JSON must include
 > `schema_version`, `status`, `summary`, `artifacts`, and `errors`. Write
-> `status` as `success`, `failed`, `blocked`, or `needs-input`. Use an
+> `status` as `success`, `failed`, `blocked`, or `needs-input`. If you
+> committed, add `commit` with the full 40-hex sha of your final commit. Use an
 > atomic rename if you write from shell so a `result --wait` reader never sees
 > partial content.
 

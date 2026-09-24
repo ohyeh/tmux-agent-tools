@@ -384,6 +384,96 @@ describe('delivery', () => {
     expect(store.acked()).toEqual(['w1@0'])
   })
 
+  /** A worker's repo that knows exactly one commit; records every git argv. */
+  const mockGit = (on: On, known: string) => {
+    const calls: (readonly string[])[] = []
+    on('process.run', ($, e) => {
+      calls.push(e.argv)
+      const ok = e.argv[0] === 'git' && e.argv.includes(`${known}^{commit}`)
+      return { value: { exitCode: ok ? 0 : 128, stdout: '', stderr: ok ? '' : 'fatal: Not a valid object name' } }
+    })
+    return calls
+  }
+  const SHA = 'a'.repeat(12) + 'b'.repeat(28)
+  const withCommit = (commit: string) => JSON.stringify({ status: 'success', summary: 'done', commit })
+
+  test('a success whose commit exists in the worker repo is delivered as verified', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit(SHA) })
+    const woken = mockWake(on)
+    const git = mockGit(on, SHA)
+
+    await $.turn.complete(turn())
+
+    expect(git).toEqual([['git', '-C', '/work', 'cat-file', '-e', `${SHA}^{commit}`]])
+    expect(woken.length).toEqual(1)
+    expect(woken[0]).toContain(`"w1" on codex: success — commit ${SHA.slice(0, 12)} verified`)
+    expect(store.acked()).toEqual(['w1@0'])
+  })
+
+  test('a success whose commit does not exist is still delivered, marked NOT verified', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    const missing = 'c'.repeat(40)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit(missing) })
+    const woken = mockWake(on)
+    mockGit(on, SHA)
+
+    await $.turn.complete(turn())
+
+    expect(woken.length, 'an unverified claim is never swallowed').toEqual(1)
+    expect(woken[0]).toContain(`success claimed, commit ${missing} NOT verified: no such commit in /work`)
+    expect(woken[0]).not.toContain(': success\n')
+    expect(store.acked()).toEqual(['w1@0'])
+  })
+
+  test('a malformed sha never reaches git and is NOT verified', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit('--output=/x') })
+    const woken = mockWake(on)
+    const git = mockGit(on, SHA)
+
+    await $.turn.complete(turn())
+
+    expect(git, 'the 40-hex guard runs before argv').toEqual([])
+    expect(woken[0]).toContain('commit --output=/x NOT verified: not a full 40-hex commit sha')
+  })
+
+  test('a result with no commit is delivered exactly as before, with no git call', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: finished() })
+    const woken = mockWake(on)
+    const git = mockGit(on, SHA)
+
+    await $.turn.complete(turn())
+
+    expect(git).toEqual([])
+    expect(woken[0]).toContain('"w1" on codex: success\n')
+    expect(woken[0]).not.toContain('verified')
+  })
+
+  test('a commit written as null reads as no commit', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const body = JSON.stringify({ status: 'success', summary: 'done', commit: null })
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: body })
+    const woken = mockWake(on)
+    const git = mockGit(on, SHA)
+
+    await $.turn.complete(turn())
+
+    expect(git).toEqual([])
+    expect(woken[0]).toContain('"w1" on codex: success\n')
+  })
+
   test('a refusal does not acknowledge; a later acceptance does', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)

@@ -172,6 +172,13 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 連續 3 次被拒（backoff 10 秒、60 秒）後**暫停自動交付**，寫一次 log 告訴你還有
 幾筆留在磁碟上；修好原因後重啟收集端 session 即恢復。
 
+`success` 的 result 若帶 `commit`（完整 40-hex sha），交付前先在 worker 的 `dir`
+跑 `git -C <dir> cat-file -e <sha>^{commit}`：存在 → 狀態行寫
+`success — commit <sha12> verified`；不存在、不是 40-hex、或 git 跑不起來 → 照樣交付
+（不吞），但寫 `success claimed, commit <sha> NOT verified: <reason>`。沒有 `commit`
+（唯讀／review worker）→ 與以前完全相同。dispatch 不記 base／branch，所以不檢查
+reachability。
+
 ## 掃描窗口
 
 24 小時是**結果**的窗口，不是任務壽命：以 `result.finished_at`（缺則檔案

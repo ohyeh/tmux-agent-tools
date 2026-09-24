@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.3'
+const MOD_VERSION = '0.7.4'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -98,6 +98,10 @@ const STALL_PROBE_MAX = 8
 const STALL_SWEEP_MS = 4_000
 /** One probe's own ceiling. Capturing a pane is fast or it is not answering. */
 const STALL_PROBE_MS = 3_000
+/** A result's `commit`: the full sha, never an abbreviation git could resolve ambiguously. */
+const SHA_RE = /^[0-9a-f]{40}$/
+/** One `git cat-file` on a local repo: instant, or the repo is not answering. */
+const COMMIT_PROBE_MS = 2_000
 /** The mirror's own clock. It runs ONLY while the panel is open; see `Panel`. */
 const MIRROR_MS = 2_000
 /**
@@ -411,7 +415,9 @@ async function readOrEmpty(host: Host, path: string): Promise<string> {
   return host.read(path).catch(() => '')
 }
 
-type Finished = { d: TmuxDispatch; path: string; status: string; summary: string }
+/** A claimed commit, checked against the worker's own repo before delivery. */
+type CommitCheck = { sha: string; verified: true } | { sha: string; verified: false; reason: string }
+type Finished = { d: TmuxDispatch; path: string; status: string; summary: string; commit?: CommitCheck }
 /**
  * One pass over the state root.
  *
@@ -603,7 +609,7 @@ async function collect(
         continue
       }
       const raw = parseJson(await readOrEmpty(host, path)) as
-        | { status?: unknown; summary?: unknown; body?: { status?: unknown; summary?: unknown } }
+        | { status?: unknown; summary?: unknown; commit?: unknown; body?: { status?: unknown; summary?: unknown; commit?: unknown } }
         | undefined
       // Three worker CLIs write three key sets; status/summary are the
       // intersection, top-level in a raw result.json and under .body in a wrapper.
@@ -621,12 +627,43 @@ async function collect(
       const at = await finishedAt(host, path, raw)
       if (at !== undefined && now - at > WINDOW_MS) continue
       const s = raw.summary ?? raw.body?.summary
-      out.push({ d, path, status, summary: typeof s === 'string' ? s : '' })
+      const sha = raw.commit ?? raw.body?.commit
+      // Only a success claim is bound to its commit; no sha (a read-only or
+      // review worker) delivers exactly as before.
+      const commit = status === 'success' && sha != null && sha !== '' ? await checkCommit(host, d.dir, sha) : undefined
+      out.push({ d, path, status, summary: typeof s === 'string' ? s : '', ...(commit ? { commit } : {}) })
     } catch (error) {
       host.log(`tmux-agent: could not read result for ${d.name}: ${String(error)}`)
     }
   }
   return out
+}
+
+/**
+ * Completion evidence bound to a commit (W39-19): the sha a worker claims must
+ * exist as a commit in its own repo. The anchored 40-hex test runs BEFORE the
+ * sha reaches argv — it is the guard against flag smuggling, as NAME_RE is.
+ * The dispatch records no base or branch, so reachability is not checked.
+ */
+async function checkCommit(host: Host, dir: string, sha: unknown): Promise<CommitCheck> {
+  const shown = String(sha).replace(CTRL_ALL_RE, ' ').slice(0, 64)
+  if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
+    return { sha: shown, verified: false, reason: 'not a full 40-hex commit sha' }
+  }
+  const probe = await host
+    .run(['git', '-C', dir, 'cat-file', '-e', `${sha}^{commit}`], dir, COMMIT_PROBE_MS)
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: `git did not run: ${String(error)}` }))
+  if (probe.exitCode === 0) return { sha, verified: true }
+  const why = (probe.stderr || probe.stdout).replace(CTRL_ALL_RE, ' ').trim().slice(0, 200)
+  return { sha, verified: false, reason: `no such commit in ${dir} (git cat-file exit ${probe.exitCode}${why ? `: ${why}` : ''})` }
+}
+
+/** The status line's verdict: a verified commit, an unverified claim, or plain status. */
+function statusOf(f: Finished): string {
+  if (!f.commit) return f.status
+  return f.commit.verified
+    ? `${f.status} — commit ${f.commit.sha.slice(0, 12)} verified`
+    : `success claimed, commit ${f.commit.sha} NOT verified: ${f.commit.reason}`
 }
 
 /** One prompt per tick, bounded: a backlog is reported over several ticks, not at once. */
@@ -637,7 +674,7 @@ function payloadOf(done: readonly Finished[]): { text: string; included: Finishe
   let size = head.length
   for (const f of done) {
     const block = [
-      `- "${f.d.name}" on ${f.d.profile}: ${f.status}`,
+      `- "${f.d.name}" on ${f.d.profile}: ${statusOf(f)}`,
       ...(f.d.adoptedFrom ? [`  adopted from session ${f.d.adoptedFrom} (it stopped collecting)`] : []),
       `  dir: ${f.d.dir}`,
       `  result: ${f.path}`,
@@ -1033,7 +1070,7 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
   const dir = `${root}/${d.name}`
   const body =
     `${text}\n\nREPORT: when this task is finished, write your result to ${dir}/result.json ` +
-    '(JSON with "status": success|failed|blocked|needs-input and "summary").'
+    '(JSON with "status": success|failed|blocked|needs-input and "summary"; if you committed, "commit": the full 40-hex sha).'
   const since = Math.max(await host.now(), d.since + 1)
   const tellPath = `${dir}/tell-${since}.md`
   await host.write(tellPath, body)
