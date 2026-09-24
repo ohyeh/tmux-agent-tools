@@ -172,12 +172,19 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 連續 3 次被拒（backoff 10 秒、60 秒）後**暫停自動交付**，寫一次 log 告訴你還有
 幾筆留在磁碟上；修好原因後重啟收集端 session 即恢復。
 
-`success` 的 result 若帶 `commit`（完整 40-hex sha），交付前先在 worker 的 `dir`
-跑 `git -C <dir> cat-file -e <sha>^{commit}`：存在 → 狀態行寫
-`success — commit <sha12> verified`；不存在、不是 40-hex、或 git 跑不起來 → 照樣交付
-（不吞），但寫 `success claimed, commit <sha> NOT verified: <reason>`。沒有 `commit`
-（唯讀／review worker）→ 與以前完全相同。dispatch 不記 base／branch，所以不檢查
-reachability。
+`success` 的 result 若帶 `commit`（完整 40-hex sha），交付前在 worker 的 `dir` 驗兩件事：
+`git cat-file -t <sha>` 必須是 `commit`（tag id 也解析得到 `^{commit}`，所以不能只看
+存在），而且它是這一輪的**新工作**：`git merge-base --is-ancestor <base> <sha>` 成立且
+`sha ≠ base`。`base` 是派工（`assign`、每次 `tell`）當下、worker 啟動前讀的
+`git rev-parse HEAD`，記在 dispatch.json。成立 → 狀態行寫
+`success — commit <sha12> verified (descends from dispatch base <base12>)`；`dir` 不是 repo
+或 0.7.5 以前的紀錄沒有 base → 只能證明物件存在，狀態行照實寫
+`verified (commit object exists; no dispatch base recorded)`。不是字串、空字串、不是
+40-hex、不存在、不是 commit、是 base 本身、不在 base 之後 → 照樣交付（不吞），寫
+`success claimed, commit <sha> NOT verified: <reason>`。缺 `commit` 或 `null`（唯讀／
+review worker）→ 與以前完全相同。整批 commit 檢查共用 4 秒預算：用完就停，剩下的
+留到下一個 tick，不會被說成「查無 commit」。這證明的是「有一個在 base 之後的新
+commit」，不是任務做對了。
 
 ## 掃描窗口
 
@@ -396,16 +403,26 @@ reached」七天：沒有終態、沒有 exit，等 result 會等到天荒地老
 
 閒置超過 15 分鐘且 pane 仍 running 的 worker 只是「安靜」，不等於卡住：面板顯示
 `running · idle Nm`，log 播報一次「pane unchanged for N min; not confirmed stuck」
-並附上 pane 最後 3 行（≤300 字元）當證據。只有 pane 尾巴出現阻擋字樣（quota
-reached／exceeded、usage／rate limit、out of credits、not logged in、error；移植自
-`agent-tmux` 的 `launch_blocker_for_text`）才標成 `stalled`，log 引出那一行。尾巴來自
-同一次 `status --json` 的 `last_capture_lines`，不多跑 capture。**不殺、不叫醒**
-—— 等配額窗口的 worker 本來就可能自己恢復。閒置時鐘讀的是
+並附上 pane 最後 3 行（≤300 字元）當證據，**不叫醒**。
+
+`stalled` 只由 wrapper 判：`agent-tmux status --json` 的 `blocked_reason` 是
+`quota_exhausted` 或 `login_required`（CLI 自己說停了：用量窗口、憑證失效），證據是
+同一份輸出的 `blocked_evidence`（CLI 最後幾行輸出裡命中的那一行）。mod 自己不留字表
+—— 0.7.3／0.7.4 在 mod 裡複製的半份字表會把 worker 自己寫的「Implemented rate limit
+handling」當成阻擋（astra 審查 F5）。pane 靜止滿 2 分鐘才算數（剛恢復時畫面上還留著
+舊橫幅，不該叫人），然後**叫醒 session 一次**（每個 episode 一次；hot reload 後可能
+再說一次）：這個 worker 不會自己交出結果，owner 空等才是這個 mod 要消除的沉默
+（2026-09-24：兩個 codex worker 停在 usage limit 一個小時，lead 不知道）。不殺。
+對話框（trust、permission、login prompt）是 `needs-input`，同時清掉這個 episode 的
+stalled 紀錄，面板、log、`$.tmux.stalled()` 三者一致。閒置時鐘讀的是
 `agent-tmux status --json` 已經在維護的 `idle_seconds`，不另外算一份。
 
 第五種狀態 `launch-failed` 來自 `launch.exit`（與 `collect` 讀同一份收據）：
-`agent-tmux assign` 自己以非零碼結束，pane 從未存在，永遠不會有 result。以前
-這種 worker 也畫成 `running`。
+`agent-tmux assign` 自己以非零碼結束。這是**暫定**判斷：assign 看的是 pane，而 CLI
+可能收下了 brief 卻沒顯示在 pane 上（2026-09-24：claude-fable-gate 開進 session
+picker，brief 變成背景 session，結果照樣寫出來）。所以 launch-failed 通知另記一個
+ack（`<name>@<since>#launch`），episode 不關；同一 episode 之後寫出的 terminal result
+一律優先於收據，照常交付一次。以前這種結果會被永遠丟掉。
 
 面板最上面一行說 collector 現在會不會投遞：連續三次投遞被拒而
 暫停、或已回報集合超出預算而暫停，都會印出原因與解法；沒有這一行就表示

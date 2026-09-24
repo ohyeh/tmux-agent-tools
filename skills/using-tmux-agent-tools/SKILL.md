@@ -74,7 +74,7 @@ follows ONE OWNER below unchanged.
    path it names for the full body.
 4. `/tmux` shows this project's teammates while their tmux session lives —
    running (`running · idle Nm` when the pane is quiet but shows no blocker),
-   stalled (the pane tail shows a quota/limit/login blocker), finished, `done` (delivered; tell it more or stop it),
+   stalled (`status --json` says `quota_exhausted`/`login_required`; the session is woken once), finished, `done` (delivered; tell it more or stop it),
    `needs input — <dialog>` — and whether the collector is live. A row marked
    `launch failed` or `exited — no result` is a worker nobody should wait on;
    the collector delivers those once and they leave on their own.

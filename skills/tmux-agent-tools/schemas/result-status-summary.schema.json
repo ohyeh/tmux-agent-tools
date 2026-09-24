@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "tmux-agent-tools result-status-summary",
-  "description": "Lightweight result.json contract used by tmux-agent-tools. v1 validator (see #125) only checks: type (object), required keys, additionalProperties: false.",
+  "description": "Lightweight result.json contract used by tmux-agent-tools. v1 validator (see #125) only checks: type (object), required keys, additionalProperties: false, the verdict/decision blocks, and commit (40-hex).",
   "definitions": {
     "canonicalStatus": {
       "type": "string",
@@ -17,7 +17,7 @@
     "summary": {"type": "string"},
     "artifacts": {"type": "array"},
     "errors": {"type": "array"},
-    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Optional. Full 40-hex sha of the commit a success delivers; the tmux-agent mod verifies it exists in the worker dir repo before delivering. Omit when the worker made no commit."},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Optional. Full lowercase 40-hex sha of the commit a success delivers; the tmux-agent mod verifies it is a commit that descends from the dispatch base in the worker dir repo. Omit the key when the worker made no commit (the file must not hold null; readers tolerate null as absent)."},
     "verdict": {
       "type": "object",
       "properties": {

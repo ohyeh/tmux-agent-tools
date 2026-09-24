@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.4'
+const MOD_VERSION = '0.7.5'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -69,23 +69,27 @@ const STORE_BUDGET = 3 * 1024 * 1024
 const FAIL_MAX = 3
 /**
  * A live worker whose pane has not changed for this long is IDLE — an
- * observation, not a verdict. It is STALLED only when its pane tail also shows
- * a blocker (`BLOCKER_RE`). Observed case: a session with `dead=0` sat 7 days on
- * `⚠ Individual quota reached`. No terminal state, no exit — a result wait would
- * have waited forever. But silence alone is not "stuck": a worker thinking, or
- * waiting on a long build, is quiet too (W39-20).
+ * observation, not a verdict. Silence alone is not "stuck": a worker thinking,
+ * or waiting on a long build, is quiet too (W39-20).
  */
 const STALL_SECONDS = 15 * 60
 /**
- * Pane text that turns a quiet pane into a stalled one. Ported from agent-tmux's
- * `launch_blocker_for_text` quota/login rows, plus `quota reached` (the observed
- * case above, which that list lacks). No bare `error` word: a worker that
- * printed "fixed the error" and then went quiet is not stuck (W39 review). Dialogs (trust,
- * permission, login prompt) are not here: `status --json` already reports them
- * as `blocked_reason`, and they read as needs-input before this is consulted.
+ * The `blocked_reason`s of `agent-tmux status` that mean the CLI refuses work
+ * until a person acts — STALLED, as opposed to a dialog waiting for a key
+ * (needs-input). The wrapper is the one classifier: it reads the CLI's own
+ * last output lines with CLI-shaped phrases, so this mod keeps no word list of
+ * its own (a half-copy here matched a worker's prose — astra 0.7.4 review F5).
+ * Observed cases: `⚠ Individual quota reached` for 7 days with `dead=0`; a
+ * codex `■ You’ve hit your usage limit` for hours on 2026-09-24 while the lead
+ * waited on a result that could not come.
  */
-const BLOCKER_RE =
-  /quota (reached|exceeded)|usage limit|rate limit|out of credits|insufficient credit|not logged in|please log ?in|not authenticated/i
+const RUNTIME_BLOCKERS = new Set(['quota_exhausted', 'login_required'])
+/**
+ * How long the pane must be unchanged before a runtime blocker counts. Short,
+ * because the CLI has already said it stopped; not zero, so a banner still on
+ * screen right after a resume does not wake anyone.
+ */
+const BLOCKED_SECONDS = 2 * 60
 /** Evidence carried in an idle notice: the last few non-empty pane lines, bounded. */
 const TAIL_LINES = 3
 const TAIL_MAX = 300
@@ -103,6 +107,14 @@ const STALL_PROBE_MS = 3_000
 const SHA_RE = /^[0-9a-f]{40}$/
 /** One `git cat-file` on a local repo: instant, or the repo is not answering. */
 const COMMIT_PROBE_MS = 2_000
+/** Every commit check of one collect pass together; the rest wait for the next tick. */
+const COMMIT_BUDGET_MS = 4_000
+
+/** `git rev-parse HEAD` output as a dispatch base, or nothing when `dir` is not a repo. */
+const baseFrom = (p: { exitCode: number; stdout: string } | undefined) => {
+  const head = p?.exitCode === 0 ? p.stdout.trim() : ''
+  return SHA_RE.test(head) ? { base: head } : {}
+}
 /** The mirror's own clock. It runs ONLY while the panel is open; see `Panel`. */
 const MIRROR_MS = 2_000
 /**
@@ -329,7 +341,7 @@ const isName = (v: unknown): v is string => typeof v === 'string' && NAME_RE.tes
  */
 function asDispatch(v: unknown): TmuxDispatch | undefined {
   if (!v || typeof v !== 'object') return undefined
-  const { profile, name, dir, since, goal, owner, ownerCwd, adoptedFrom } = v as Record<string, unknown>
+  const { profile, name, dir, since, goal, owner, ownerCwd, adoptedFrom, base } = v as Record<string, unknown>
   if (!isName(name) || !isName(profile)) return undefined
   if (typeof dir !== 'string' || !dir.startsWith('/') || CTRL_RE.test(dir)) return undefined
   if (typeof since !== 'number' || !Number.isFinite(since)) return undefined
@@ -344,6 +356,7 @@ function asDispatch(v: unknown): TmuxDispatch | undefined {
     ...(clean(owner) && !legacyCwd ? { owner } : {}),
     ...(legacyCwd ? { ownerCwd: owner } : clean(ownerCwd) && ownerCwd.startsWith('/') ? { ownerCwd } : {}),
     ...(clean(adoptedFrom) ? { adoptedFrom } : {}),
+    ...(typeof base === 'string' && SHA_RE.test(base) ? { base } : {}),
   }
   return { profile, name, dir, since, ...(line ? { goal: line } : {}), ...own }
 }
@@ -353,6 +366,10 @@ function asReported(v: unknown): string[] {
 }
 
 const idOf = (d: TmuxDispatch) => `${d.name}@${d.since}`
+/** The ack of a launch-failed notice: it closes the notice, not the episode (see `collect`). */
+const LAUNCH_ACK = '#launch'
+const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
+const ackOf = (f: Finished) => (f.status === LAUNCH_FAILED ? launchIdOf(f.d) : idOf(f.d))
 
 /**
  * The acknowledged set, one key PER SESSION: `tmux-agent.reported.<sessionId>`.
@@ -417,7 +434,7 @@ async function readOrEmpty(host: Host, path: string): Promise<string> {
 }
 
 /** A claimed commit, checked against the worker's own repo before delivery. */
-type CommitCheck = { sha: string; verified: true } | { sha: string; verified: false; reason: string }
+type CommitCheck = { sha: string; verified: true; scope: string } | { sha: string; verified: false; reason: string }
 type Finished = { d: TmuxDispatch; path: string; status: string; summary: string; commit?: CommitCheck }
 /**
  * One pass over the state root.
@@ -594,28 +611,37 @@ async function collect(
   root: string,
   ready: TmuxDispatch[],
   exited: ReadonlySet<string> = new Set(),
+  reported: ReadonlySet<string> = new Set(),
 ): Promise<Finished[]> {
   const now = await host.now()
+  const gitDeadline = now + COMMIT_BUDGET_MS
   const out: Finished[] = []
   for (const d of ready) {
     if (out.length >= BATCH_MAX) break
     const dir = `${root}/${d.name}`
     const path = `${dir}/result.json`
     try {
-      // A failed launch is reported first: there is no result coming, and silence
-      // here is exactly the failure mode this mod exists to remove.
-      const failure = await launchFailure(host, dir, d.since)
-      if (failure) {
-        out.push({ d, path: `${dir}/mod-assign.log`, status: LAUNCH_FAILED, summary: failure })
-        continue
-      }
       const raw = parseJson(await readOrEmpty(host, path)) as
         | { status?: unknown; summary?: unknown; commit?: unknown; body?: { status?: unknown; summary?: unknown; commit?: unknown } }
         | undefined
       // Three worker CLIs write three key sets; status/summary are the
       // intersection, top-level in a raw result.json and under .body in a wrapper.
       const status = raw?.status ?? raw?.body?.status
-      if (!raw || typeof status !== 'string' || !TERMINAL.has(status)) {
+      const terminal = !!raw && typeof status === 'string' && TERMINAL.has(status)
+      // A failed launch is news the session must hear, but it is provisional:
+      // `assign` judges from the pane, and a CLI that took the brief without
+      // showing it (claude-fable-gate booting into its session picker, observed
+      // 2026-09-24) still writes a real result later. The notice is acknowledged
+      // under its own key, so the episode stays open and that result — which
+      // outranks the receipt whenever it exists — is delivered once too.
+      if (!terminal) {
+        const failure = await launchFailure(host, dir, d.since)
+        if (failure) {
+          if (!reported.has(launchIdOf(d))) out.push({ d, path: `${dir}/mod-assign.log`, status: LAUNCH_FAILED, summary: failure })
+          continue
+        }
+      }
+      if (!terminal || !raw || typeof status !== 'string') {
         // No result and no pane: nothing will ever arrive. Delivered once as
         // `exited` and acknowledged, so it leaves /tmux instead of sitting there
         // until someone presses stop (observed 2026-09-17: two dead fixtures on
@@ -629,9 +655,17 @@ async function collect(
       if (at !== undefined && now - at > WINDOW_MS) continue
       const s = raw.summary ?? raw.body?.summary
       const sha = raw.commit ?? raw.body?.commit
-      // Only a success claim is bound to its commit; no sha (a read-only or
-      // review worker) delivers exactly as before.
-      const commit = status === 'success' && sha != null && sha !== '' ? await checkCommit(host, d.dir, sha) : undefined
+      // Only a success claim is bound to its commit; absent or null (a read-only
+      // or review worker) delivers exactly as before. '' is a malformed claim.
+      let commit: CommitCheck | undefined
+      if (status === 'success' && sha != null) {
+        // One budget for the whole batch: twenty slow repos must not hold the
+        // tick for forty seconds. What is not checked yet stays outstanding for
+        // the next tick — never delivered as "no such commit".
+        const left = gitDeadline - (await host.now())
+        if (left <= 0) break
+        commit = await checkCommit(host, d, sha, left)
+      }
       out.push({ d, path, status, summary: typeof s === 'string' ? s : '', ...(commit ? { commit } : {}) })
     } catch (error) {
       host.log(`tmux-agent: could not read result for ${d.name}: ${String(error)}`)
@@ -641,29 +675,58 @@ async function collect(
 }
 
 /**
- * Completion evidence bound to a commit (W39-19): the sha a worker claims must
- * exist as a commit in its own repo. The anchored 40-hex test runs BEFORE the
- * sha reaches argv — it is the guard against flag smuggling, as NAME_RE is.
- * The dispatch records no base or branch, so reachability is not checked.
+ * Completion evidence bound to a commit (W39-19). The claim holds only when the
+ * sha names a COMMIT object (a tag id also resolves `^{commit}`) that is new
+ * work on top of the dispatch's base: a descendant of `base` and not `base`
+ * itself, so an old commit cannot pass as this task's output. A dispatch with no
+ * base (dir was not a repo, or a record from before 0.7.5) can only show that
+ * the object exists, and the line says exactly that.
+ *
+ * The type check comes before anything touches the value: it is disk JSON, and
+ * `String({toString: null})` throws. The anchored 40-hex test runs before the
+ * sha reaches argv — the guard against flag smuggling, as NAME_RE is.
  */
-async function checkCommit(host: Host, dir: string, sha: unknown): Promise<CommitCheck> {
-  const shown = String(sha).replace(CTRL_ALL_RE, ' ').slice(0, 64)
-  if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
-    return { sha: shown, verified: false, reason: 'not a full 40-hex commit sha' }
+async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: number): Promise<CommitCheck> {
+  if (typeof sha !== 'string') {
+    return { sha: (JSON.stringify(sha) ?? typeof sha).slice(0, 64), verified: false, reason: 'not a string' }
   }
-  const probe = await host
-    .run(['git', '-C', dir, 'cat-file', '-e', `${sha}^{commit}`], dir, COMMIT_PROBE_MS)
-    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: `git did not run: ${String(error)}` }))
-  if (probe.exitCode === 0) return { sha, verified: true }
-  const why = (probe.stderr || probe.stdout).replace(CTRL_ALL_RE, ' ').trim().slice(0, 200)
-  return { sha, verified: false, reason: `no such commit in ${dir} (git cat-file exit ${probe.exitCode}${why ? `: ${why}` : ''})` }
+  if (!SHA_RE.test(sha)) {
+    return { sha: sha.replace(CTRL_ALL_RE, ' ').slice(0, 64), verified: false, reason: 'not a full 40-hex commit sha' }
+  }
+  const deadline = (await host.now()) + budgetMs
+  const git = async (args: readonly string[]) => {
+    const left = deadline - (await host.now())
+    if (left <= 0) return { exitCode: -1, stdout: '', stderr: `git did not answer within ${budgetMs} ms` }
+    return host
+      .run(['git', '-C', d.dir, ...args], d.dir, Math.min(COMMIT_PROBE_MS, left))
+      .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: `git did not run or answer in time: ${String(error)}` }))
+  }
+  const why = (p: { stdout: string; stderr: string }) => (p.stderr || p.stdout).replace(CTRL_ALL_RE, ' ').trim().slice(0, 200)
+  const type = await git(['cat-file', '-t', sha])
+  if (type.exitCode !== 0) {
+    return { sha, verified: false, reason: `no such object in ${d.dir} (git cat-file exit ${type.exitCode}${why(type) ? `: ${why(type)}` : ''})` }
+  }
+  const kind = type.stdout.trim()
+  if (kind !== 'commit') return { sha, verified: false, reason: `${d.dir} has it as a ${kind || '?'}, not a commit` }
+  if (!d.base) return { sha, verified: true, scope: 'commit object exists; no dispatch base recorded' }
+  if (sha === d.base) return { sha, verified: false, reason: 'it is the dispatch base itself — nothing was committed on top of it' }
+  const anc = await git(['merge-base', '--is-ancestor', d.base, sha])
+  if (anc.exitCode === 0) return { sha, verified: true, scope: `descends from dispatch base ${d.base.slice(0, 12)}` }
+  return {
+    sha,
+    verified: false,
+    reason:
+      anc.exitCode === 1
+        ? `it does not descend from the dispatch base ${d.base.slice(0, 12)}`
+        : `ancestry against ${d.base.slice(0, 12)} could not be checked (git merge-base exit ${anc.exitCode}${why(anc) ? `: ${why(anc)}` : ''})`,
+  }
 }
 
 /** The status line's verdict: a verified commit, an unverified claim, or plain status. */
 function statusOf(f: Finished): string {
   if (!f.commit) return f.status
   return f.commit.verified
-    ? `${f.status} — commit ${f.commit.sha.slice(0, 12)} verified`
+    ? `${f.status} — commit ${f.commit.sha.slice(0, 12)} verified (${f.commit.scope})`
     : `success claimed, commit ${f.commit.sha} NOT verified: ${f.commit.reason}`
 }
 
@@ -699,7 +762,7 @@ function payloadOf(done: readonly Finished[]): { text: string; included: Finishe
  */
 function pruned(reported: readonly string[], seen: ReadonlySet<string>, complete: boolean): string[] {
   if (!complete) return [...reported]
-  return reported.filter(id => seen.has(id))
+  return reported.filter(id => seen.has(id.endsWith(LAUNCH_ACK) ? id.slice(0, -LAUNCH_ACK.length) : id))
 }
 
 /**
@@ -719,11 +782,15 @@ function pruned(reported: readonly string[], seen: ReadonlySet<string>, complete
  * `idle_seconds` (#98). Re-deriving it in the mod would be a second, drifting
  * copy of the same measurement — this reads the one the CLI already maintains.
  *
- * Nothing is killed and nobody is woken: a stall is a fact for the person to act
- * on, and a worker waiting on a quota window may well resume by itself.
+ * Nothing is killed. A quiet pane is only logged. A worker the CLI itself stopped
+ * (a usage window, lost credentials) wakes the session ONCE per episode: nothing
+ * will arrive from it until someone acts, and an owner left waiting on a result
+ * that cannot come is the silence this mod exists to remove (2026-09-24: two
+ * codex workers sat on a usage limit for an hour, the lead none the wiser).
  */
 async function flagStalls(host: Host, gate: Gate, root: string, live: readonly TmuxDispatch[]): Promise<void> {
   const deadline = (await host.now()) + STALL_SWEEP_MS
+  const woken: string[] = []
   const seen = new Set(live.map(idOf))
   // A worker that is no longer outstanding is no longer stalled: it was
   // delivered, or its directory is gone. Without this the registry only ever
@@ -751,7 +818,7 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
     // budget yields a non-positive `timeoutMs` that the engine refuses anyway, so
     // the harness cannot tell this return from that refusal. It stays because
     // exiting the loop beats issuing four more calls we know will be rejected.
-    if (left <= 0) return
+    if (left <= 0) break
     const id = idOf(d)
     let probe: { exitCode: number; stdout: string }
     try {
@@ -774,16 +841,22 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
       idle_seconds?: unknown
       blocked_reason?: unknown
       last_capture_lines?: unknown
+      blocked_evidence?: unknown
+      diagnostic?: unknown
     }
+    const reason = typeof row.blocked_reason === 'string' ? row.blocked_reason : ''
+    const runtime = RUNTIME_BLOCKERS.has(reason)
     // A pane parked on a trust/permission/login dialog is not working and not
     // stalled: it is waiting for a key. The row says so; `peek` shows the dialog
-    // and `keys` answers it.
-    if (typeof row.blocked_reason === 'string' && row.blocked_reason && row.blocked_reason !== 'startup_pending') {
-      if (!gate.blocked.has(id)) host.toast(`tmux-agent: ${d.name} needs input — ${row.blocked_reason}`)
-      gate.blocked.set(id, row.blocked_reason)
-    } else {
-      gate.blocked.delete(id)
+    // and `keys` answers it. One state per worker: a dialog clears any stall this
+    // episode recorded, so the panel, the log and `$.tmux.stalled()` agree.
+    if (reason && reason !== 'startup_pending' && !runtime) {
+      if (!gate.blocked.has(id)) host.toast(`tmux-agent: ${d.name} needs input — ${reason}`)
+      gate.blocked.set(id, reason)
+      gate.stalled.delete(id)
+      continue
     }
+    gate.blocked.delete(id)
     // Only a LIVE pane can be stalled — but a pane that is GONE with no terminal
     // result is its own state, not an absence of one: the panel shows it and the
     // next reconcile delivers it (agent-tmux status: exists=false → "stopped").
@@ -807,35 +880,42 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
     gate.exited.delete(id)
     // Running, but this CLI's status did not carry an idle measurement: nothing
     // to judge, so the worker keeps whatever state it already had.
-    if (typeof row.idle_seconds !== 'number') {
+    if (typeof row.idle_seconds !== 'number' || row.idle_seconds < (runtime ? BLOCKED_SECONDS : STALL_SECONDS)) {
       gate.stalled.delete(id)
       continue
     }
-    if (row.idle_seconds < STALL_SECONDS) {
-      gate.stalled.delete(id)
-      continue
-    }
-    // Evidence comes from the tail this same probe already returned (the CLI's
-    // bounded `last_capture_lines`): no second capture, no extra budget.
-    const lines = (Array.isArray(row.last_capture_lines) ? row.last_capture_lines : [])
-      .filter((l): l is string => typeof l === 'string' && l.trim() !== '')
-      .map(l => l.replace(CTRL_ALL_RE, ' ').trim())
-    const tail = lines.slice(-TAIL_LINES).join(' | ').slice(0, TAIL_MAX)
-    const evidence = lines.findLast(l => BLOCKER_RE.test(l))?.slice(0, TAIL_MAX)
+    const shown = (v: unknown) => (typeof v === 'string' ? v.replace(CTRL_ALL_RE, ' ').trim() : '')
+    const evidence = runtime ? `${reason}: ${shown(row.blocked_evidence) || '(no line captured)'}`.slice(0, TAIL_MAX) : undefined
     const before = gate.stalled.get(id)
     gate.stalled.set(id, { dispatch: d, idleSeconds: row.idle_seconds, ...(evidence ? { evidence } : {}) })
     if (before && (before.evidence || !evidence)) continue
     const minutes = Math.round(row.idle_seconds / 60)
+    if (evidence) {
+      host.log(`tmux-agent: ${d.name} (${d.profile}) is stalled: ${evidence}`)
+      woken.push(
+        `- "${d.name}" on ${d.profile}: stalled for ${minutes} min — ${evidence}\n` +
+          `  ${shown(row.diagnostic) || 'nothing will arrive until someone acts'}\n` +
+          `  dir: ${d.dir}`,
+      )
+      continue
+    }
+    // Quiet with no blocker: an observation for the log, never a wake-up.
+    const lines = (Array.isArray(row.last_capture_lines) ? row.last_capture_lines : []).map(shown).filter(Boolean)
+    const tail = lines.slice(-TAIL_LINES).join(' | ').slice(0, TAIL_MAX)
     host.log(
-      `tmux-agent: ${d.name} (${d.profile}) ` +
-        (evidence
-          ? `is stalled: pane unchanged for ${minutes} min and shows a blocker: ${evidence}. `
-          : `pane unchanged for ${minutes} min; not confirmed stuck. Last lines: ${tail || '(none captured)'}. `) +
+      `tmux-agent: ${d.name} (${d.profile}) pane unchanged for ${minutes} min; not confirmed stuck. ` +
+        `Last lines: ${tail || '(none captured)'}. ` +
         // The tmux session name carries the profile's own prefix, which this mod
         // does not compute; `list` is what maps the worker name to it.
         `Find its session with: agent-tmux ${d.profile} list`,
     )
   }
+  if (!woken.length) return
+  // Best effort: a refused wake-up is logged, and the panel still shows the row
+  // as stalled. Once per episode per activation — a reload may say it once more.
+  const text = [`tmux-agent: ${woken.length} worker(s) stalled — no result will arrive until someone acts.`, ...woken].join('\n')
+  const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error) }))
+  if (answer?.drop) host.log(`tmux-agent: could not report a stall to the session: ${answer.drop}`)
 }
 
 /**
@@ -908,11 +988,8 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
     let summary: string | undefined
     if (root) {
       const dir = `${root}/${d.name}`
-      // Same receipt `collect` reads: a launch that never took has no pane and
-      // will never write a result, so `running` would be the one wrong answer.
-      failed = (await launchFailure(host, dir, d.since).catch(() => undefined)) !== undefined
       const path = `${dir}/result.json`
-      if (!failed && (await host.exists(path).catch(() => false))) {
+      if (await host.exists(path).catch(() => false)) {
         const raw = parseJson(await readOrEmpty(host, path)) as
           | { status?: unknown; summary?: unknown; body?: { status?: unknown; summary?: unknown } }
           | undefined
@@ -921,6 +998,9 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
         const s = raw?.summary ?? raw?.body?.summary
         if (done && typeof s === 'string') summary = `${status}: ${s}`.replace(CTRL_ALL_RE, ' ').slice(0, SUMMARY_MAX)
       }
+      // Same order as `collect`: a real result outranks the launch receipt, and
+      // without one a launch that never took must not read as `running`.
+      failed = !done && (await launchFailure(host, dir, d.since).catch(() => undefined)) !== undefined
     }
     rows.push({
       id,
@@ -992,7 +1072,7 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
   }
   const reported = new Set<string>([...keep, ...[...acks.others.values()].flat()])
   const pending = dispatches.filter(d => !reported.has(idOf(d)))
-  const done = await collect(host, root, pending, gate.exited)
+  const done = await collect(host, root, pending, gate.exited, reported)
 
   // Whatever is still outstanding after collection has no terminal result yet —
   // exactly the set where "running" and "stuck" look identical from disk.
@@ -1008,7 +1088,7 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
   const { text, included } = payloadOf(done)
   if (!included.length) return
 
-  const next = [...keep, ...included.map(f => idOf(f.d))]
+  const next = [...keep, ...included.map(ackOf)]
   // The cap is on the whole store, so the budget is judged over every key.
   if (byteLength([...next, ...[...acks.others.values()].flat()]) > STORE_BUDGET) {
     // Refusing to deliver beats delivering and then failing to remember it: the
@@ -1073,6 +1153,8 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
     `${text}\n\nREPORT: when this task is finished, write your result to ${dir}/result.json ` +
     '(JSON with "status": success|failed|blocked|needs-input and "summary"; if you committed, "commit": the full 40-hex sha).'
   const since = Math.max(await host.now(), d.since + 1)
+  // The new episode's work starts from wherever the repo is now.
+  const head = await host.run(['git', '-C', d.dir, 'rev-parse', 'HEAD'], d.dir, COMMIT_PROBE_MS).catch(() => undefined)
   const tellPath = `${dir}/tell-${since}.md`
   await host.write(tellPath, body)
   const init = await host.run(['agent-tmux', d.profile, 'result', 'init', d.name], d.dir, 5_000)
@@ -1095,6 +1177,7 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
     dir: d.dir,
     since,
     ...(goal ? { goal } : {}),
+    ...baseFrom(head),
     // Whoever gave the latest instruction gets the answer: a tell from another
     // session of this repo moves the worker to that session, and the previous
     // owner's next tick delivers nothing for it. Never both.
@@ -1739,6 +1822,11 @@ export const register: Register = on => {
     const logPath = `${stateDir}/mod-assign.log`
     const exitPath = `${stateDir}/launch.exit`
     await $.fs.write(briefPath, input.brief)
+    // Read before the worker starts: a success's commit must be new work on top
+    // of this (checkCommit), and a worker that commits fast must not move it.
+    const head = await $.process
+      .run(['git', '-C', input.dir, 'rev-parse', 'HEAD'], { cwd: input.dir, timeoutMs: COMMIT_PROBE_MS })
+      .catch(() => undefined)
 
     // Every hook has a budget and `assign` (start + result init + send + confirm)
     // outlasts it, so it runs detached from a shell that exits at once. The outer
@@ -1765,6 +1853,7 @@ export const register: Register = on => {
       dir: input.dir,
       since,
       ...(goal ? { goal } : {}),
+      ...baseFrom(head),
       ...(sessionId ? { owner: sessionId } : {}),
       ...(sessionCwd ? { ownerCwd: sessionCwd } : {}),
     }

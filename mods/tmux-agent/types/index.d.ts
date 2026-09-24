@@ -15,7 +15,7 @@ export type TmuxStalled = {
   dispatch: TmuxDispatch
   /** Seconds since the worker's pane last changed, as `agent-tmux status` measures it. */
   idleSeconds: number
-  /** The pane line that shows a blocker (quota, rate limit, login, error). Absent = quiet, not confirmed stuck. */
+  /** `<blocked_reason>: <line>` when agent-tmux status says the CLI stopped (quota_exhausted, login_required). Absent = quiet, not confirmed stuck. */
   evidence?: string
 }
 
@@ -38,6 +38,8 @@ export type TmuxDispatch = {
   ownerCwd?: string
   /** Set when a collector claimed this worker from a session that stopped heartbeating: that session's id. */
   adoptedFrom?: string
+  /** `git rev-parse HEAD` of `dir` when the episode began; a claimed commit must descend from it. Absent when `dir` was not a repo. */
+  base?: string
 }
 
 declare module 'claude-code' {

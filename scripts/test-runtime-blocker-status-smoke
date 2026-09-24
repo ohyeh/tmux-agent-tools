@@ -1,0 +1,115 @@
+#!/usr/bin/env zsh
+# Smoke test: `status --json` names a worker the CLI stopped on a usage limit or
+# lost credentials for (blocked_reason quota_exhausted / login_required, with
+# the matching line in blocked_evidence), and does NOT fire on a worker's own
+# prose or on a banner that is old history. The quota pane is the live codex
+# screen of 2026-09-24 (banner above the `›` input, outside the prompt area).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+
+WORK="$(mktemp -d -t tmux-agent-runtime-blocker.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+fake() {
+  local file="$WORK/$1.sh"
+  { print -r -- '#!/bin/sh'; print -r -- 'cat <<'"'"'PANE'"'"''; cat; print -r -- 'PANE'; print -r -- 'while IFS= read -r line; do : ; done'; } > "$file"
+  chmod +x "$file"
+}
+
+fake codex-quota <<'EOF'
+  Do not spawn additional tmux sessions or delegate further.
+↳ Hook · PONYTAIL:FULL
+• Hook failed
+  └ hook returned invalid session start JSON output
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),
+visit https://chatgpt.com/codex/settings/usage to purchase more credits or try
+again at Sep 25th, 2026 12:32 AM.
+
+
+› Ask Codex to do anything
+
+  GPT-6-Astra low · tmux-agent-tools · ⚠ 1 warning · f2 to view
+EOF
+
+fake prose <<'EOF'
+• Implemented rate limit handling and a usage limit counter in api/client.ts.
+• Error handling now covers quota errors from the upstream.
+› Ask Codex to do anything
+EOF
+
+fake old-banner <<'EOF'
+■ You’ve hit your usage limit. try again at 12:32 AM.
+• resumed after the reset
+• step 1
+• step 2
+• step 3
+• step 4
+• step 5
+• step 6
+• step 7
+• step 8
+• step 9
+• step 10
+› Ask Codex to do anything
+EOF
+
+fake auth <<'EOF'
+Error: invalid api key — check your credentials.
+› Ask Codex to do anything
+EOF
+
+fake no-boundary <<'EOF'
+⏺ Working on the migration.
+  ⎿  Claude usage limit reached. Your limit will reset at 3am.
+────────────────────────────────────────
+  ? for shortcuts
+EOF
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+status_of() {
+  local name="$1"
+  CODEX="$WORK/$name.sh" "$CODEX_TMUX" start --exact "$name" "$WORK" >/dev/null
+  sleep 1
+  "$CODEX_TMUX" status --json "$name"
+  "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+}
+
+echo "case: live codex usage-limit banner above the prompt"
+st="$(status_of codex-quota)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the banner line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),"
+assert "not a confirmation dialog" "$(jq -r .confirmation_detected <<< "$st")" "false"
+assert "diagnostic names the limit" "$(jq -r '.diagnostic // ""' <<< "$st" | grep -c 'usage/quota limit')" "1"
+
+echo "case: a worker's own prose about rate/usage limits is not a blocker"
+st="$(status_of prose)"
+assert "prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "prose has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
+
+echo "case: a banner pushed out of the last output lines is history"
+st="$(status_of old-banner)"
+assert "old banner not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: lost credentials mid-run"
+st="$(status_of auth)"
+assert "blocked_reason login_required" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "login_required"
+assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "Error: invalid api key — check your credentials."
+
+echo "case: a pane with no prompt boundary reads its last lines (shape UNCONFIRMED on a live claude pane)"
+st="$(status_of no-boundary)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

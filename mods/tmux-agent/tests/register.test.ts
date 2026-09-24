@@ -384,33 +384,151 @@ describe('delivery', () => {
     expect(store.acked()).toEqual(['w1@0'])
   })
 
-  /** A worker's repo that knows exactly one commit; records every git argv. */
-  const mockGit = (on: On, known: string) => {
+  /**
+   * A worker's repo: object id → type, and the commits that descend from BASE.
+   * Records every git argv.
+   */
+  const mockGit = (
+    on: On,
+    objects: Record<string, string>,
+    descendants: readonly string[] = [],
+    onCall: () => unknown = () => {},
+  ) => {
     const calls: (readonly string[])[] = []
-    on('process.run', ($, e) => {
+    on('process.run', async ($, e) => {
       calls.push(e.argv)
-      const ok = e.argv[0] === 'git' && e.argv.includes(`${known}^{commit}`)
-      return { value: { exitCode: ok ? 0 : 128, stdout: '', stderr: ok ? '' : 'fatal: Not a valid object name' } }
+      await onCall()
+      const [, , , verb, a, b, c] = e.argv
+      if (verb === 'cat-file' && a === '-t') {
+        const kind = objects[b!]
+        return { value: kind ? { exitCode: 0, stdout: `${kind}\n`, stderr: '' } : { exitCode: 128, stdout: '', stderr: 'fatal: Not a valid object name' } }
+      }
+      if (verb === 'merge-base') return { value: { exitCode: descendants.includes(c!) ? 0 : 1, stdout: '', stderr: '' } }
+      return { value: { exitCode: 128, stdout: '', stderr: 'unexpected' } }
     })
     return calls
   }
   const SHA = 'a'.repeat(12) + 'b'.repeat(28)
-  const withCommit = (commit: string) => JSON.stringify({ status: 'success', summary: 'done', commit })
+  const BASE = 'd'.repeat(40)
+  const withCommit = (commit: unknown) => JSON.stringify({ status: 'success', summary: 'done', commit })
 
-  test('a success whose commit exists in the worker repo is delivered as verified', WITH_DRIVER, async ($, on) => {
+  test('a success whose commit descends from the dispatch base is delivered as verified', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mock.clock(on)
-    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit(SHA) })
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { base: BASE }), [`${ROOT}/w1/result.json`]: withCommit(SHA) })
     const woken = mockWake(on)
-    const git = mockGit(on, SHA)
+    const git = mockGit(on, { [SHA]: 'commit', [BASE]: 'commit' }, [SHA])
 
     await $.turn.complete(turn())
 
-    expect(git).toEqual([['git', '-C', '/work', 'cat-file', '-e', `${SHA}^{commit}`]])
+    expect(git).toEqual([
+      ['git', '-C', '/work', 'cat-file', '-t', SHA],
+      ['git', '-C', '/work', 'merge-base', '--is-ancestor', BASE, SHA],
+    ])
     expect(woken.length).toEqual(1)
-    expect(woken[0]).toContain(`"w1" on codex: success — commit ${SHA.slice(0, 12)} verified`)
+    expect(woken[0]).toContain(`"w1" on codex: success — commit ${SHA.slice(0, 12)} verified (descends from dispatch base ${BASE.slice(0, 12)})`)
     expect(store.acked()).toEqual(['w1@0'])
+  })
+
+  test('a commit that exists but is not new work on the base is NOT verified', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const old = 'e'.repeat(40)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { base: BASE }),
+      [`${ROOT}/w1/result.json`]: withCommit(old),
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0, { base: BASE }),
+      [`${ROOT}/w2/result.json`]: withCommit(BASE),
+    })
+    const woken = mockWake(on)
+    mockGit(on, { [old]: 'commit', [BASE]: 'commit' }, [SHA])
+
+    await $.turn.complete(turn())
+
+    expect(woken[0]).toContain(`commit ${old} NOT verified: it does not descend from the dispatch base ${BASE.slice(0, 12)}`)
+    expect(woken[0]).toContain(`commit ${BASE} NOT verified: it is the dispatch base itself`)
+  })
+
+  test('a tag id is not a commit, even though it resolves to one', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { base: BASE }), [`${ROOT}/w1/result.json`]: withCommit(SHA) })
+    const woken = mockWake(on)
+    const git = mockGit(on, { [SHA]: 'tag' }, [SHA])
+
+    await $.turn.complete(turn())
+
+    expect(git.length, 'no ancestry check for a non-commit').toEqual(1)
+    expect(woken[0]).toContain(`commit ${SHA} NOT verified: /work has it as a tag, not a commit`)
+  })
+
+  test('a dispatch with no base can only show the commit exists, and says so', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit(SHA) })
+    const woken = mockWake(on)
+    const git = mockGit(on, { [SHA]: 'commit' })
+
+    await $.turn.complete(turn())
+
+    expect(git).toEqual([['git', '-C', '/work', 'cat-file', '-t', SHA]])
+    expect(woken[0]).toContain(`verified (commit object exists; no dispatch base recorded)`)
+  })
+
+  test('a non-string or empty commit is delivered once as NOT verified and never reaches git', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    const bad: unknown[] = [{ toString: null }, ['x'], 42, '']
+    const files: Files = {}
+    bad.forEach((c, i) => {
+      files[`${ROOT}/w${i}/dispatch.json`] = dispatch(`w${i}`, 0)
+      files[`${ROOT}/w${i}/result.json`] = withCommit(c)
+    })
+    mockFs(on, files)
+    const woken = mockWake(on)
+    const git = mockGit(on, {})
+
+    await $.turn.complete(turn())
+
+    expect(git).toEqual([])
+    expect(woken.length).toEqual(1)
+    expect(store.acked().sort()).toEqual(['w0@0', 'w1@0', 'w2@0', 'w3@0'])
+    expect(woken[0]).toContain('commit {"toString":null} NOT verified: not a string')
+    expect(woken[0]).toContain('commit ["x"] NOT verified: not a string')
+    expect(woken[0]).toContain('commit 42 NOT verified: not a string')
+    expect(woken[0]).toContain('commit  NOT verified: not a full 40-hex commit sha')
+  })
+
+  test('commit checks share one budget per pass; the rest wait for the next tick, never "no such commit"', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = {}
+    for (let i = 0; i < 5; i++) {
+      files[`${ROOT}/w${i}/dispatch.json`] = dispatch(`w${i}`, 0)
+      files[`${ROOT}/w${i}/result.json`] = withCommit(SHA)
+    }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    // Every git call costs 1.5 s of the 4 s budget.
+    mockGit(on, { [SHA]: 'commit' }, [], () => clock.advance(1_500))
+
+    await $.turn.complete(turn())
+
+    expect(woken.length).toEqual(1)
+    expect(store.acked().length, 'only what fit in the budget').toBeLessThan(5)
+    expect(woken[0]).not.toContain('no such object')
+
+    // Each later pass has a fresh budget and picks up where the last one stopped.
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(store.acked().sort()).toEqual(['w0@0', 'w1@0', 'w2@0', 'w3@0', 'w4@0'])
+    expect(woken.join('\n')).not.toContain('NOT verified')
   })
 
   test('a success whose commit does not exist is still delivered, marked NOT verified', WITH_DRIVER, async ($, on) => {
@@ -420,12 +538,12 @@ describe('delivery', () => {
     const missing = 'c'.repeat(40)
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit(missing) })
     const woken = mockWake(on)
-    mockGit(on, SHA)
+    mockGit(on, { [SHA]: 'commit' })
 
     await $.turn.complete(turn())
 
     expect(woken.length, 'an unverified claim is never swallowed').toEqual(1)
-    expect(woken[0]).toContain(`success claimed, commit ${missing} NOT verified: no such commit in /work`)
+    expect(woken[0]).toContain(`success claimed, commit ${missing} NOT verified: no such object in /work`)
     expect(woken[0]).not.toContain(': success\n')
     expect(store.acked()).toEqual(['w1@0'])
   })
@@ -436,7 +554,7 @@ describe('delivery', () => {
     mock.clock(on)
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: withCommit('--output=/x') })
     const woken = mockWake(on)
-    const git = mockGit(on, SHA)
+    const git = mockGit(on, { [SHA]: "commit" })
 
     await $.turn.complete(turn())
 
@@ -450,7 +568,7 @@ describe('delivery', () => {
     mock.clock(on)
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: finished() })
     const woken = mockWake(on)
-    const git = mockGit(on, SHA)
+    const git = mockGit(on, { [SHA]: "commit" })
 
     await $.turn.complete(turn())
 
@@ -466,7 +584,7 @@ describe('delivery', () => {
     const body = JSON.stringify({ status: 'success', summary: 'done', commit: null })
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: body })
     const woken = mockWake(on)
-    const git = mockGit(on, SHA)
+    const git = mockGit(on, { [SHA]: "commit" })
 
     await $.turn.complete(turn())
 
@@ -773,9 +891,10 @@ describe('assign', () => {
     }
     mockFs(on, files)
     const argvs: string[][] = []
+    const head = 'f'.repeat(40)
     on('process.run', ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '' } }
     })
 
     const out = await $.tool.call({
@@ -789,11 +908,13 @@ describe('assign', () => {
     const fresh = Object.keys(files).filter(p => /\/w1-[^/]+\/dispatch\.json$/.test(p))
     expect(fresh.length, 'the new dispatch does not land in the old directory').toEqual(1)
     const record = JSON.parse(files[fresh[0] ?? ''] ?? '{}')
-    expect(record).toMatchObject({ profile: 'codex', dir: '/work' })
+    expect(record).toMatchObject({ profile: 'codex', dir: '/work', base: head })
     expect(record.name).not.toEqual('w1')
+    // HEAD is read BEFORE the launch, so a worker that commits fast cannot move the base.
+    expect(argvs.length).toEqual(2)
+    expect(argvs[0]).toEqual(['git', '-C', '/work', 'rev-parse', 'HEAD'])
     // The launched argv carries the fresh name, and the brief went with it.
-    expect(argvs.length).toEqual(1)
-    expect((argvs[0] ?? []).join(' ')).toContain(record.name)
+    expect((argvs[1] ?? []).join(' ')).toContain(record.name)
     expect(files[`${ROOT}/${record.name}/brief.md`]).toContain('ACCEPTANCE')
     // The reply does not claim the worker started, only that a launch was requested.
     expect(JSON.stringify(out)).toContain('NOT proof the worker started')
@@ -821,7 +942,7 @@ describe('launch receipt', () => {
     expect(woken[0]).toContain('exited 4')
     // The log is the worker's own text, so it is fenced like any other.
     expect(woken[0]).toContain('<worker-output')
-    expect(store.acked()).toEqual(['w1@0'])
+    expect(store.acked(), 'the notice is acked under its own key; the episode stays open').toEqual(['w1@0#launch'])
   })
 
   test('a launch that succeeded is not mistaken for a finished worker', WITH_DRIVER, async ($, on) => {
@@ -880,19 +1001,16 @@ describe('acknowledged set', () => {
 
   test('an acknowledged set that would exceed the budget pauses instead of delivering', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
-    // Enough LIVE dispatches that the acknowledged set alone fills the budget:
-    // pruning cannot help, because every one of these directories is still there.
+    // Another session's key that pruning cannot touch: it is not ours to prune,
+    // and it still names a live directory, so it is not deleted either. Its size
+    // alone fills the budget (3 MiB), which is the seam under test — not how long
+    // a scan of tens of thousands of directories takes.
     const files: Files = {
       [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
       [`${ROOT}/w1/result.json`]: finished(),
+      [`${ROOT}/keep/dispatch.json`]: dispatch('keep', 0),
     }
-    const fat: string[] = []
-    for (let i = 0; i < 65_000; i += 1) {
-      const name = `w${'x'.repeat(40)}${i}`
-      files[`${ROOT}/${name}/dispatch.json`] = dispatch(name, 0)
-      fat.push(`${name}@0`)
-    }
-    const store = mockStore(on, fat)
+    const store = mockStore(on, ['keep@0', 'y'.repeat(3 * 1024 * 1024)], 'tmux-agent.reported.other-session')
     mock.clock(on)
     mockFs(on, files)
     const woken = mockWake(on)
@@ -905,7 +1023,7 @@ describe('acknowledged set', () => {
 })
 
 /** Floors for a stall test: no delivery happens, so only the log matters. */
-function mockQuiet(on: On): string[] {
+function mockQuiet(on: On, submits: string[] = []): string[] {
   const logs: string[] = []
   on('turn.complete', () => ({ text: '' }))
   on('ui.toast', () => ({ value: undefined }))
@@ -913,7 +1031,10 @@ function mockQuiet(on: On): string[] {
     logs.push(e.text)
     return { value: undefined }
   })
-  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('prompt.submit', ($, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
   return logs
 }
 
@@ -961,25 +1082,70 @@ describe('stall detection', () => {
     expect(logs.length, 'an idle notice is given once, not every tick').toEqual(1)
   })
 
-  test('a quiet pane whose tail shows a quota limit is stalled', WITH_DRIVER, async ($, on) => {
+  test('a worker the CLI stopped on a usage limit is stalled and wakes the session once', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     mock.clock(on)
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
-    const logs = mockQuiet(on)
+    const submits: string[] = []
+    const logs = mockQuiet(on, submits)
+    // The observed case (2026-09-24): the wrapper classifies the codex banner.
+    const banner = '■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),'
     mockStatus(on, {
       running: true,
-      idle_seconds: 30 * 60,
-      // The observed case: agy sat 7 days on this line, chrome beneath it.
-      last_capture_lines: ['⚠ Individual quota reached', '? for shortcuts', '> '],
+      idle_seconds: 3 * 60,
+      blocked_reason: 'quota_exhausted',
+      blocked_evidence: banner,
+      diagnostic: 'the CLI stopped on a usage/quota limit',
+      last_capture_lines: [banner, '› Ask Codex to do anything'],
     })
 
     await $.turn.complete(turn())
 
     expect(logs.length).toEqual(1)
-    expect(logs[0]).toContain('is stalled')
-    expect(logs[0]).toContain('⚠ Individual quota reached')
-    expect((await $.command.run(run('stalled'))).text).toEqual('w1:1800')
+    expect(logs[0]).toContain(`is stalled: quota_exhausted: ${banner}`)
+    expect(submits.length, 'the owner is woken: no result will ever arrive on its own').toEqual(1)
+    expect(submits[0]).toContain('"w1" on codex: stalled for 3 min — quota_exhausted')
+    expect(submits[0]).toContain('the CLI stopped on a usage/quota limit')
+    expect((await $.command.run(run('stalled'))).text).toEqual('w1:180')
+
+    await $.turn.complete(turn())
+    expect(submits.length, 'once per episode, not every tick').toEqual(1)
+  })
+
+  test('a banner on a pane that changed within the last two minutes wakes nobody', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const submits: string[] = []
+    mockQuiet(on, submits)
+    mockStatus(on, { running: true, idle_seconds: 30, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' })
+
+    await $.turn.complete(turn())
+
+    expect(submits).toEqual([])
+  })
+
+  test('a dialog is needs-input, not stalled, in the panel, the log and the API alike', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const submits: string[] = []
+    const logs = mockQuiet(on, submits)
+    mockStatus(on, {
+      running: true,
+      idle_seconds: 30 * 60,
+      blocked_reason: 'login_prompt',
+      last_capture_lines: ['Please log in to Codex to continue.'],
+    })
+
+    await $.turn.complete(turn())
+
+    expect(logs.filter(l => l.includes('stalled'))).toEqual([])
+    expect(submits).toEqual([])
+    expect((await $.command.run(run('stalled'))).text).toEqual('')
   })
 
   test('a quiet pane that merely mentions an error is not stalled', WITH_DRIVER, async ($, on) => {
@@ -1284,7 +1450,13 @@ describe('panel rendering', () => {
       [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { goal: 'port the poller' }),
       [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0),
     })
-    mockPanel(on, { running: true, idle_seconds: 30 * 60, last_capture_lines: ['Error: rate limit reached'] })
+    mockPanel(on, {
+      running: true,
+      idle_seconds: 30 * 60,
+      blocked_reason: 'quota_exhausted',
+      blocked_evidence: 'usage limit reached',
+      last_capture_lines: ['usage limit reached'],
+    })
 
     await $.session.start(session())
     await clock.advance(10_000) // reconcile probes, both come back stalled
@@ -1879,6 +2051,35 @@ describe('teammates', () => {
     expect(woken[0], 'the stale receipt must not be delivered again').not.toContain('launch-failed')
     expect(woken[0]).toContain('second task done')
     expect(store.acked(), 'episode 0 is off disk, so its ack is pruned; episode 5 is acknowledged').toEqual(['w1@5'])
+  })
+
+  test('a launch-failed notice is provisional: a real result of the SAME episode is still delivered once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    // assign judged the launch failed from the pane (observed 2026-09-24: the CLI
+    // took the brief into a background session), no tell follows.
+    const files: Files = { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/launch.exit`]: '1\n' }
+    mockFs(on, files)
+    const woken = mockWake(on)
+
+    await $.turn.complete(turn())
+    expect(woken.length).toEqual(1)
+    expect(woken[0]).toContain('launch-failed')
+    expect(store.acked()).toEqual(['w1@0#launch'])
+
+    await $.turn.complete(turn())
+    expect(woken.length, 'the notice is not repeated, and no "exited" follows it').toEqual(1)
+
+    files[`${ROOT}/w1/result.json`] = finished('it worked after all')
+    await $.turn.complete(turn())
+    expect(woken.length).toEqual(2)
+    expect(woken[1]).toContain('"w1" on codex: success')
+    expect(woken[1]).toContain('it worked after all')
+    expect(store.acked().sort()).toEqual(['w1@0', 'w1@0#launch'])
+
+    await $.turn.complete(turn())
+    expect(woken.length, 'delivered exactly once').toEqual(2)
   })
 
   test('tell refuses a name this mod never dispatched', WITH_DRIVER, async ($, on) => {

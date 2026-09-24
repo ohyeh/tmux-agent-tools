@@ -93,6 +93,23 @@ run_validator_cases() {
   assert "$prefix-bad valid=false on parse fail" "$(printf '%s' "$out" | jq -r .valid)" "false"
   assert_contains "$prefix-bad error mentions parse" "$out" "parse_error"
 
+  echo "case: $prefix commit field is checked, not just allowed"
+  local sha="$(printf 'a%.0s' {1..40})" c
+  setup_agent "$prefix-commit-ok"
+  printf '%s\n' "{\"schema_version\":1,\"status\":\"success\",\"summary\":\"x\",\"commit\":\"$sha\"}" > "$TMUX_AGENT_DIR/$prefix-commit-ok/result.json"
+  code=0
+  out="$("$wrapper" "$cli" result --validate "$prefix-commit-ok" 2>&1)" || code=$?
+  assert "$prefix-commit-ok exit=0" "$code" "0"
+  for c in '"abc123"' 'null' '{}' '""' "\"${sha:u}\""; do
+    setup_agent "$prefix-commit-bad"
+    printf '%s\n' "{\"schema_version\":1,\"status\":\"success\",\"summary\":\"x\",\"commit\":$c}" > "$TMUX_AGENT_DIR/$prefix-commit-bad/result.json"
+    code=0
+    out="$("$wrapper" "$cli" result --validate "$prefix-commit-bad" 2>&1)" || code=$?
+    assert "$prefix-commit $c exit=2" "$code" "2"
+    assert "$prefix-commit $c valid=false" "$(printf '%s' "$out" | jq -r .valid)" "false"
+    assert "$prefix-commit $c error path" "$(printf '%s' "$out" | jq -r '.errors[0].path')" "commit"
+  done
+
   echo "case: $prefix missing result file"
   setup_agent "$prefix-noresult"
   # no result.json written
