@@ -19,8 +19,11 @@ function mockFs(
   seen: Seen = { reads: [], stats: [], lists: [], exists: [] },
   /** Paths the engine refuses for reasons that are NOT "the file is gone". */
   unreadable: ReadonlySet<string> = new Set(),
+  /** Runs before each read answers: a read that costs time on the mocked clock. */
+  beforeRead?: (path: string) => Promise<void>,
 ): Seen {
-  on('fs.read', ($, e) => {
+  on('fs.read', async ($, e) => {
+    if (beforeRead) await beforeRead(e.path)
     seen.reads.push(e.path)
     if (unreadable.has(e.path)) throw new Error(`EIO: ${e.path}`)
     const text = files[e.path]
@@ -2569,4 +2572,76 @@ test('re-review: a peer deletes another session key once its episodes are gone, 
   on('ui.status', () => ({ value: undefined }))
   await $.session.start({ ...session(), cwd: '/other' })
   expect(store.keys()).not.toContain('tmux-agent.reported.sess-A')
+})
+
+describe('astra re-review of 3b83a9e',()=>{
+  test('first slow repo must receive a full ancestry window and not defer forever',WITH_DRIVER,async($,on)=>{
+    mock.env(on,{HOME});const store=mockStore(on);const clock=mock.clock(on);
+    const files:Files={
+      [`${ROOT}/slow/dispatch.json`]:dispatch('slow',0,{base:'b'.repeat(40)}),
+      [`${ROOT}/slow/result.json`]:JSON.stringify({status:'success',summary:'done',commit:'a'.repeat(40)}),
+      [`${ROOT}/tail/dispatch.json`]:dispatch('tail',0),
+      [`${ROOT}/tail/result.json`]:finished('already done'),
+    };
+    mockFs(on,files,undefined,undefined,async path=>{
+      if(path.endsWith('/slow/result.json'))await clock.advance(200);
+    });
+    const wake=mockWake(on),windows:number[]=[];
+    on('process.run',async($,e)=>{
+      if(e.argv.includes('cat-file')){
+        await clock.advance(1900);
+        return {value:{exitCode:0,stdout:'commit\n',stderr:''}};
+      }
+      windows.push(e.init?.timeoutMs??0);
+      await clock.advance(e.init?.timeoutMs??0);
+      throw new Error('simulated git timeout');
+    });
+    for(let i=0;i<3;i++)await $.turn.complete(turn());
+    expect(store.acked()).toContain('tail@0');
+    expect(wake.length).toBeGreaterThan(0);
+    expect(windows).toEqual([2000]);
+  });
+  test('a terminal result deferred for Git must clear an earlier stalled API entry',WITH_DRIVER,async($,on)=>{
+    mock.env(on,{HOME});mockStore(on);const clock=mock.clock(on);
+    const files:Files={
+      [`${ROOT}/w0/dispatch.json`]:dispatch('w0',0),
+      [`${ROOT}/w1/dispatch.json`]:dispatch('w1',0,{base:'b'.repeat(40)}),
+    };
+    mockFs(on,files);mockWake(on);
+    let phase=0;
+    on('process.run',async($,e)=>{
+      if(e.argv[0]==='git'){
+        await clock.advance(2000);
+        return {value:{exitCode:0,stdout:'commit\n',stderr:''}};
+      }
+      return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:''}};
+    });
+    await $.turn.complete(turn());
+    expect((await $.command.run(run('stalled'))).text).toContain('w1:180');
+    for(const name of ['w0','w1'])files[`${ROOT}/${name}/result.json`]=JSON.stringify({status:'success',summary:'done',commit:'a'.repeat(40)});
+    await $.turn.complete(turn());
+    expect((await $.command.run(run('stalled'))).text).toEqual('');
+  });
+});
+
+test('re-review: a claim deferred by the budget does not hold back a result that needs no git', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  const store = mockStore(on)
+  const clock = mock.clock(on)
+  const files: Files = {
+    [`${ROOT}/w0/dispatch.json`]: dispatch('w0', 0, { base: 'b'.repeat(40) }),
+    [`${ROOT}/w0/result.json`]: JSON.stringify({ status: 'success', summary: 'done', commit: 'a'.repeat(40) }),
+    [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+    [`${ROOT}/w1/result.json`]: JSON.stringify({ status: 'success', summary: 'done', commit: 'a'.repeat(40) }),
+    [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0),
+    [`${ROOT}/w2/result.json`]: finished('no commit'),
+  }
+  mockFs(on, files)
+  mockWake(on)
+  on('process.run', async ($, e) => {
+    await clock.advance(e.init?.timeoutMs ?? 0)
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+  })
+  await $.turn.complete(turn())
+  expect(store.acked().sort()).toEqual(['w0@0', 'w2@0'])
 })

@@ -101,6 +101,32 @@ fake tool-output <<'EOF'
   ? for shortcuts
 EOF
 
+# The re-review of 3b83a9e (2026-09-25): "Error" without its colon is prose; a
+# tool's multi-line output indents its lines; the agy banner starts with ⚠.
+fake error-word-prose <<'EOF'
+Error handling for invalid api key responses is now implemented.
+› Ask Codex to do anything
+EOF
+
+fake multiline-tool-output <<'EOF'
+⏺ Bash(cat error-fixture.txt)
+  ⎿  Expected error text:
+     Error: invalid api key
+? for shortcuts
+EOF
+
+fake claude-retried <<'EOF'
+⏺ Reading the config.
+  ⎿  API Error: 429 rate limit exceeded
+  ⎿  Read 20 lines
+EOF
+
+fake agy-quota <<'EOF'
+⚠ Individual quota reached
+? for shortcuts
+>
+EOF
+
 PASS=0
 FAIL=0
 assert() {
@@ -162,6 +188,22 @@ assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<<
 echo "case: a tool's output under ⎿ is the tool's, not the CLI's"
 st="$(status_of tool-output)"
 assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: prose that opens with the word Error is not an error line"
+st="$(status_of error-word-prose)"
+assert "prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: an error line inside a tool's multi-line output is the tool's"
+st="$(status_of multiline-tool-output)"
+assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: tool output under ⎿ after an API error means claude retried"
+st="$(status_of claude-retried)"
+assert "retried not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: the documented agy quota banner"
+st="$(status_of agy-quota)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
 
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

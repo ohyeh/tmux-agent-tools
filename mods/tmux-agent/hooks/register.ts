@@ -635,15 +635,21 @@ async function collect(
   ready: TmuxDispatch[],
   exited: ReadonlySet<string> = new Set(),
   reported: ReadonlySet<string> = new Set(),
-): Promise<{ finished: Finished[]; unfinished: TmuxDispatch[] }> {
+): Promise<{ finished: Finished[]; unfinished: TmuxDispatch[]; terminal: Set<string> }> {
   const now = await host.now()
-  const gitDeadline = now + COMMIT_BUDGET_MS
+  // Set when the pass's FIRST commit check starts, which runs outside it: that
+  // check always has full COMMIT_PROBE_MS windows, so every pass settles at least
+  // one claim and no slow repo is deferred forever (a budget set before the
+  // result reads left the ancestry call 1900 ms, every pass, for good).
+  let gitDeadline: number | undefined
   const out: Finished[] = []
   // What this pass READ and found with no terminal result: the only workers the
   // stall sweep may call "no result will arrive". One the pass did not reach (a
-  // budget or batch break) or whose result is terminal but not deliverable is
-  // not in it — its result exists.
+  // batch break) is in neither set and keeps whatever state it had.
   const unfinished: TmuxDispatch[] = []
+  // What this pass read as terminal, delivered now or not: its stall/dialog
+  // observations are stale, whatever the pane still shows.
+  const terminalIds = new Set<string>()
   for (const d of ready) {
     if (out.length >= BATCH_MAX) break
     const dir = `${root}/${d.name}`
@@ -656,6 +662,7 @@ async function collect(
       // intersection, top-level in a raw result.json and under .body in a wrapper.
       const status = raw?.status ?? raw?.body?.status
       const terminal = !!raw && typeof status === 'string' && TERMINAL.has(status)
+      if (terminal) terminalIds.add(idOf(d))
       // A failed launch is news the session must hear, but it is provisional:
       // `assign` judges from the pane, and a CLI that took the brief without
       // showing it (claude-fable-gate booting into its session picker, observed
@@ -689,11 +696,13 @@ async function collect(
       if (status === 'success' && sha != null) {
         // One budget for the whole batch: twenty slow repos must not hold the
         // tick for forty seconds. What is not checked yet stays outstanding for
-        // the next tick — never delivered as "no such commit".
-        const left = gitDeadline - (await host.now())
-        if (left <= 0) break
-        const check = await checkCommit(host, d, sha, left)
-        if (check === DEFERRED) break
+        // the next tick — never delivered as "no such commit" — and the scan
+        // goes on, so a result that needs no git is not held behind it.
+        const started = await host.now()
+        const first = gitDeadline === undefined
+        gitDeadline ??= started + COMMIT_BUDGET_MS
+        const check = await checkCommit(host, d, sha, first ? Number.POSITIVE_INFINITY : gitDeadline - started)
+        if (check === DEFERRED) continue
         commit = check
       }
       out.push({ d, path, status, summary: typeof s === 'string' ? s : '', ...(commit ? { commit } : {}) })
@@ -701,7 +710,7 @@ async function collect(
       host.log(`tmux-agent: could not read result for ${d.name}: ${String(error)}`)
     }
   }
-  return { finished: out, unfinished }
+  return { finished: out, unfinished, terminal: terminalIds }
 }
 
 /**
@@ -727,9 +736,9 @@ async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: 
   const deadline = (await host.now()) + budgetMs
   // The pass's budget running out is not git's answer: that check is DEFERRED,
   // left outstanding for the next tick. Only a call given its full
-  // COMMIT_PROBE_MS that still failed to answer is a failure to report. The first
-  // check of a pass always has the full window for both calls (the budget is two
-  // probes), so a slow repo is reported, never deferred forever.
+  // COMMIT_PROBE_MS that still failed to answer is a failure to report. `collect`
+  // gives the pass's first check an unbounded budget, so both its calls get the
+  // full window and a slow repo is reported, never deferred forever.
   const git = async (args: readonly string[]) => {
     const left = deadline - (await host.now())
     if (left <= 0) return DEFERRED
@@ -1146,13 +1155,15 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
   }
   const reported = new Set<string>([...keep, ...[...acks.others.values()].flat()])
   const pending = dispatches.filter(d => !reported.has(idOf(d)))
-  const { finished: done, unfinished } = await collect(host, root, pending, gate.exited, reported)
+  const { finished: done, unfinished, terminal } = await collect(host, root, pending, gate.exited, reported)
 
   // Only what collection read and found with no terminal result — exactly the
   // set where "running" and "stuck" look identical from disk. A worker whose
   // result is waiting on the commit budget is finished, not stalled.
   const finished = new Set(done.map(f => idOf(f.d)))
-  if (probeStalls) await flagStalls(host, gate, root, pending.filter(d => !finished.has(idOf(d))), unfinished)
+  if (probeStalls) {
+    await flagStalls(host, gate, root, pending.filter(d => !finished.has(idOf(d)) && !terminal.has(idOf(d))), unfinished)
+  }
 
   if (!done.length) {
     // Nothing to say, but a shrunken keep-set is still worth writing back.

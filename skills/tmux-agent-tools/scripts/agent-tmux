@@ -7108,14 +7108,25 @@ current_prompt_area_for_text() {
   ' <<< "$current"
 }
 
+# The phrase table for one error line: "<reason><TAB><line>", or nothing.
+runtime_blocker_phrase() {
+  case "${1:l}" in
+    *"hit your usage limit"*|*"usage limit reached"*|*"quota exceeded"*|*"quota reached"*|*"out of credits"*|*"insufficient credit"*|*"rate limit exceeded"*|*"rate limit reached"*|*"rate_limit_exceeded"*|*"too many requests"*)
+      print -r -- "quota_exhausted"$'\t'"$1" ;;
+    *"invalid api key"*|*"api key not found"*|*"no api key"*|*"authentication required"*|*"not authenticated"*|*"please run /login"*)
+      print -r -- "login_required"$'\t'"$1" ;;
+  esac
+}
+
 # Runtime blockers: the CLI is alive but refuses work until a person acts (a
 # usage window, a rate limit it gave up on, credentials). Three rules, each
 # from a counterexample:
-#   - the CLI's own error block only: a line that STARTS as one (`■` banner,
-#     `Error…`, claude's `⎿  API Error…`). A worker's prose ("• Implemented rate
-#     limit handling", 'Added a test for "invalid api key"') and a tool's output
-#     under `⎿`/`└` are not the CLI refusing work;
-#   - the LAST block only: any newer output line (`•`, `⏺`, `⎿`, `✔`, a "Worked
+#   - the CLI's own error block only: a line that STARTS at column 0 as one
+#     (`■` banner, `⚠ Individual quota reached`, `Error:`), or claude's
+#     `⎿  API Error…`. A worker's prose ("• Implemented rate limit handling",
+#     "Error handling for invalid api key…" — no colon) and a tool's output
+#     (under `⎿`/`└`, or indented beneath them) are not the CLI refusing work;
+#   - the LAST block only: any newer output line (`•`, `⏺`, `⎿`, `└`, `✔`, a "Worked
 #     for" rule) after the error means the worker resumed, so the banner is
 #     history however recent. Unmarked lines are the block's continuation (the
 #     codex banner wraps onto "visit https://…" and "again at …");
@@ -7127,25 +7138,26 @@ current_prompt_area_for_text() {
 # ponytail: shapes verified on a live codex banner (2026-09-24); the
 # claude/agy/cursor/grok shapes are UNCONFIRMED — add a row when one is captured.
 runtime_blocker_for_text() {
-  local current="$1" line body lowered hit=""
+  local current="$1" line body hit=""
   local -a recent
   recent=("${(@f)$(awk '
     /[^[:space:]]/ { lines[++n] = $0 }
     END { for (i = (n > 10 ? n - 9 : 1); i <= n; i++) print lines[i] }' <<< "$current")}")
   for line in "${recent[@]}"; do
     body="${line#"${line%%[![:space:]]*}"}"
-    case "$body" in
-      '■'*|'✗'*|'✘'*|Error*|error*|ERROR*|'⎿'*'API Error'*|'⎿'*'Claude usage limit'*|'⎿'*'Claude AI usage limit'*)
-        lowered="${line:l}"
-        case "$lowered" in
-          *"hit your usage limit"*|*"usage limit reached"*|*"quota exceeded"*|*"quota reached"*|*"out of credits"*|*"insufficient credit"*|*"rate limit exceeded"*|*"rate limit reached"*|*"rate_limit_exceeded"*|*"too many requests"*)
-            hit="quota_exhausted"$'\t'"$line" ;;
-          *"invalid api key"*|*"api key not found"*|*"no api key"*|*"authentication required"*|*"not authenticated"*|*"please run /login"*)
-            hit="login_required"$'\t'"$line" ;;
-          *) hit="" ;;
-        esac ;;
-      '•'*|'⏺'*|'⎿'*|'✔'*|'✓'*|'↳'*|*'Worked for '*) hit="" ;;
-    esac
+    if [[ "$body" == '⎿'* ]]; then
+      # claude nests its own API errors under ⎿; anything else there is a tool's output.
+      case "$body" in
+        '⎿'*'API Error'*|'⎿'*'Claude usage limit'*|'⎿'*'Claude AI usage limit'*) hit="$(runtime_blocker_phrase "$line")" ;;
+        *) hit="" ;;
+      esac
+    elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error')* ]]; then
+      hit="$(runtime_blocker_phrase "$line")"
+    else
+      case "$body" in
+        '•'*|'⏺'*|'✔'*|'✓'*|'↳'*|'└'*|*'Worked for '*) hit="" ;;
+      esac
+    fi
   done
   [[ -n "$hit" ]] && print -r -- "$hit"
   return 0
