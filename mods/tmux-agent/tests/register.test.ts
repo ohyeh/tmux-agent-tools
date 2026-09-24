@@ -848,7 +848,11 @@ describe('stall detection', () => {
     // dispatch.json but no result.json: from disk alone this is "still running".
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
     const logs = mockQuiet(on)
-    const probe = mockStatus(on, { running: true, idle_seconds: 30 * 60 })
+    const probe = mockStatus(on, {
+      running: true,
+      idle_seconds: 30 * 60,
+      last_capture_lines: ['old line', 'Running cargo build', '  Compiling foo v0.1', '> '],
+    })
 
     await $.turn.complete(turn())
 
@@ -856,12 +860,36 @@ describe('stall detection', () => {
     expect(probe.calls[0]).toEqual(['agent-tmux', 'codex', 'status', '--json', 'w1'])
     expect(logs.length).toEqual(1)
     expect(logs[0]).toContain('w1')
-    expect(logs[0]).toContain('stalled')
+    expect(logs[0], 'silence alone is an observation, not a verdict').toContain('not confirmed stuck')
+    expect(logs[0]).not.toContain('stalled')
+    expect(logs[0], 'the last lines ride along as evidence').toContain('Running cargo build | Compiling foo v0.1 | >')
+    expect(logs[0], 'bounded to the last three lines').not.toContain('old line')
     expect((await $.command.run(run('stalled'))).text).toEqual('w1:1800')
 
-    // Second pass: still stalled, still alive, but the person was already told.
+    // Second pass: still quiet, still alive, but the person was already told.
     await $.turn.complete(turn())
-    expect(logs.length, 'a stall is announced once, not every tick').toEqual(1)
+    expect(logs.length, 'an idle notice is given once, not every tick').toEqual(1)
+  })
+
+  test('a quiet pane whose tail shows a quota limit is stalled', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const logs = mockQuiet(on)
+    mockStatus(on, {
+      running: true,
+      idle_seconds: 30 * 60,
+      // The observed case: agy sat 7 days on this line, chrome beneath it.
+      last_capture_lines: ['⚠ Individual quota reached', '? for shortcuts', '> '],
+    })
+
+    await $.turn.complete(turn())
+
+    expect(logs.length).toEqual(1)
+    expect(logs[0]).toContain('is stalled')
+    expect(logs[0]).toContain('⚠ Individual quota reached')
+    expect((await $.command.run(run('stalled'))).text).toEqual('w1:1800')
   })
 
   test('a worker that is merely slow is not flagged', WITH_DRIVER, async ($, on) => {
@@ -1147,7 +1175,7 @@ describe('panel rendering', () => {
       [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { goal: 'port the poller' }),
       [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0),
     })
-    mockPanel(on, { running: true, idle_seconds: 30 * 60 })
+    mockPanel(on, { running: true, idle_seconds: 30 * 60, last_capture_lines: ['Error: rate limit reached'] })
 
     await $.session.start(session())
     await clock.advance(10_000) // reconcile probes, both come back stalled
@@ -1158,6 +1186,22 @@ describe('panel rendering', () => {
     expect(drawn).toContain('stalled')
     expect(drawn, 'the brief\'s GOAL line is the row\'s subtitle').toContain('port the poller')
     expect(drawn, 'a record written before goal existed still draws a row').toContain('w2')
+  })
+
+  test('a quiet worker with no blocker in its tail reads as running and idle, not stalled', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 30 * 60, last_capture_lines: ['thinking about the port', '> '] })
+
+    await $.session.start(session())
+    await clock.advance(10_000)
+    await $.command.run(run('tmux'))
+
+    const drawn = textOf(await $.ui.render(bandRender()))
+    expect(drawn).toContain('running · idle 30m')
+    expect(drawn).not.toContain('stalled')
   })
 
   test('the empty panel says so rather than drawing nothing', WITH_DRIVER, async ($, on) => {

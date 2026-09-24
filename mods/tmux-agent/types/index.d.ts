@@ -3,7 +3,10 @@ export type Tmux = {
   outstanding: () => Promise<readonly TmuxDispatch[]>
   /** Scan now instead of waiting for the next tick; wakes the session for each terminal worker. */
   reconcile: () => Promise<void>
-  /** Workers that are alive but whose pane has stopped changing. Nothing is killed. */
+  /**
+   * Workers that are alive but whose pane has stopped changing — an observation.
+   * Only an entry with `evidence` is confirmed stuck. Nothing is killed.
+   */
   stalled: () => Promise<readonly TmuxStalled[]>
 }
 
@@ -12,6 +15,8 @@ export type TmuxStalled = {
   dispatch: TmuxDispatch
   /** Seconds since the worker's pane last changed, as `agent-tmux status` measures it. */
   idleSeconds: number
+  /** The pane line that shows a blocker (quota, rate limit, login, error). Absent = quiet, not confirmed stuck. */
+  evidence?: string
 }
 
 export type TmuxDispatch = {

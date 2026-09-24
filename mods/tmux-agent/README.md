@@ -387,8 +387,12 @@ session 正是這個 mod 的目的。
 活著不等於在做事。已觀察到 `dead=0` 的 session 卡在「⚠ Individual quota
 reached」七天：沒有終態、沒有 exit，等 result 會等到天荒地老。
 
-閒置超過 15 分鐘且 pane 仍 running 的 worker 會被標成 `stalled`，在面板上與
-`running` 分開顯示，並在 log 播報一次（不是每個 tick 洗版）。**不殺、不叫醒**
+閒置超過 15 分鐘且 pane 仍 running 的 worker 只是「安靜」，不等於卡住：面板顯示
+`running · idle Nm`，log 播報一次「pane unchanged for N min; not confirmed stuck」
+並附上 pane 最後 3 行（≤300 字元）當證據。只有 pane 尾巴出現阻擋字樣（quota
+reached／exceeded、usage／rate limit、out of credits、not logged in、error；移植自
+`agent-tmux` 的 `launch_blocker_for_text`）才標成 `stalled`，log 引出那一行。尾巴來自
+同一次 `status --json` 的 `last_capture_lines`，不多跑 capture。**不殺、不叫醒**
 —— 等配額窗口的 worker 本來就可能自己恢復。閒置時鐘讀的是
 `agent-tmux status --json` 已經在維護的 `idle_seconds`，不另外算一份。
 

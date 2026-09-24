@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.2'
+const MOD_VERSION = '0.7.3'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -68,11 +68,26 @@ const STORE_BUDGET = 3 * 1024 * 1024
 /** Delivery refusals in a row before this collector stops trying until restart. */
 const FAIL_MAX = 3
 /**
- * A live worker whose pane has not changed for this long is STALLED, not working.
- * Observed case: a session with `dead=0` sat 7 days on `⚠ Individual quota
- * reached`. No terminal state, no exit — a result wait would have waited forever.
+ * A live worker whose pane has not changed for this long is IDLE — an
+ * observation, not a verdict. It is STALLED only when its pane tail also shows
+ * a blocker (`BLOCKER_RE`). Observed case: a session with `dead=0` sat 7 days on
+ * `⚠ Individual quota reached`. No terminal state, no exit — a result wait would
+ * have waited forever. But silence alone is not "stuck": a worker thinking, or
+ * waiting on a long build, is quiet too (W39-20).
  */
 const STALL_SECONDS = 15 * 60
+/**
+ * Pane text that turns a quiet pane into a stalled one. Ported from agent-tmux's
+ * `launch_blocker_for_text` quota/login rows, plus `quota reached` (the observed
+ * case above, which that list lacks) and a bare `error` word. Dialogs (trust,
+ * permission, login prompt) are not here: `status --json` already reports them
+ * as `blocked_reason`, and they read as needs-input before this is consulted.
+ */
+const BLOCKER_RE =
+  /quota (reached|exceeded)|usage limit|rate limit|out of credits|insufficient credit|not logged in|please log ?in|not authenticated|\berror\b/i
+/** Evidence carried in an idle notice: the last few non-empty pane lines, bounded. */
+const TAIL_LINES = 3
+const TAIL_MAX = 300
 /** Probes per tick. Each one spawns a capture, so a big fleet is sampled, not swept. */
 const STALL_PROBE_MAX = 8
 /**
@@ -241,8 +256,12 @@ type Gate = {
   paused: boolean
   /** Set when the store itself is full: deliveries stop rather than repeat forever. */
   capacityPaused: boolean
-  /** Stalled workers by id → the worker and its last measured idle. Announced once each. */
-  stalled: Map<string, { dispatch: TmuxDispatch; idleSeconds: number }>
+  /**
+   * Idle workers by id → the worker, its last measured idle, and the blocker line
+   * when the pane tail shows one. Only an entry WITH evidence is stalled.
+   * Announced once, and again when evidence first appears.
+   */
+  stalled: Map<string, { dispatch: TmuxDispatch; idleSeconds: number; evidence?: string }>
   /** Workers whose pane is sitting on a dialog (agent-tmux status `blocked_reason`). */
   blocked: Map<string, string>
   /** The last `tmux ls` that answered, so one slow tick cannot empty the panel. */
@@ -711,7 +730,13 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
     if (probe.exitCode !== 0) continue
     const st = parseJson(probe.stdout)
     if (typeof st !== 'object' || st === null) continue
-    const row = st as { exists?: unknown; running?: unknown; idle_seconds?: unknown; blocked_reason?: unknown }
+    const row = st as {
+      exists?: unknown
+      running?: unknown
+      idle_seconds?: unknown
+      blocked_reason?: unknown
+      last_capture_lines?: unknown
+    }
     // A pane parked on a trust/permission/login dialog is not working and not
     // stalled: it is waiting for a key. The row says so; `peek` shows the dialog
     // and `keys` answers it.
@@ -752,12 +777,22 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
       gate.stalled.delete(id)
       continue
     }
-    const announced = gate.stalled.has(id)
-    gate.stalled.set(id, { dispatch: d, idleSeconds: row.idle_seconds })
-    if (announced) continue
+    // Evidence comes from the tail this same probe already returned (the CLI's
+    // bounded `last_capture_lines`): no second capture, no extra budget.
+    const lines = (Array.isArray(row.last_capture_lines) ? row.last_capture_lines : [])
+      .filter((l): l is string => typeof l === 'string' && l.trim() !== '')
+      .map(l => l.replace(CTRL_ALL_RE, ' ').trim())
+    const tail = lines.slice(-TAIL_LINES).join(' | ').slice(0, TAIL_MAX)
+    const evidence = lines.findLast(l => BLOCKER_RE.test(l))?.slice(0, TAIL_MAX)
+    const before = gate.stalled.get(id)
+    gate.stalled.set(id, { dispatch: d, idleSeconds: row.idle_seconds, ...(evidence ? { evidence } : {}) })
+    if (before && (before.evidence || !evidence)) continue
+    const minutes = Math.round(row.idle_seconds / 60)
     host.log(
-      `tmux-agent: ${d.name} (${d.profile}) is alive but its pane has not changed for ` +
-        `${Math.round(row.idle_seconds / 60)} min — stalled, not working. ` +
+      `tmux-agent: ${d.name} (${d.profile}) ` +
+        (evidence
+          ? `is stalled: pane unchanged for ${minutes} min and shows a blocker: ${evidence}. `
+          : `pane unchanged for ${minutes} min; not confirmed stuck. Last lines: ${tail || '(none captured)'}. `) +
         // The tmux session name carries the profile's own prefix, which this mod
         // does not compute; `list` is what maps the worker name to it.
         `Find its session with: agent-tmux ${d.profile} list`,
@@ -860,7 +895,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
             ? 'finished'
           : blockedReason
             ? 'needs-input'
-          : stall
+          : stall?.evidence
             ? 'stalled'
             : gate.exited.has(id)
               ? 'exited'
@@ -1416,7 +1451,9 @@ export const register: Register = on => {
               ? 'exited — no result'
               : r.state === 'launch-failed'
                 ? 'launch failed — see mod-assign.log'
-                : 'running'
+                : r.idleSeconds !== undefined
+                  ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
+                  : 'running'
       // Another session's teammate is tagged with that session's id, so two
       // sessions in one repo can tell whose is whose; an adopted one says so.
       const me = world?.owner()
