@@ -70,6 +70,37 @@ fake no-boundary <<'EOF'
   ? for shortcuts
 EOF
 
+# The astra re-review's counterexamples (2026-09-25), each once a wrong answer.
+fake quoted <<'EOF'
+Added a test for "invalid api key" responses.
+› Ask Codex to do anything
+EOF
+
+fake resumed-recent <<'EOF'
+■ You’ve hit your usage limit.
+• resumed after reset
+• Running slow build
+› Ask Codex to do anything
+EOF
+
+fake rate-limit <<'EOF'
+Error: rate limit exceeded
+› Ask Codex to do anything
+EOF
+
+fake after-boundary <<'EOF'
+› run tests
+■ You’ve hit your usage limit.
+EOF
+
+fake tool-output <<'EOF'
+⏺ Bash(rg "usage limit" src)
+  ⎿  src/client.ts: // usage limit reached → back off
+  ⎿  Error: invalid api key
+────────────────────────────────────────
+  ? for shortcuts
+EOF
+
 PASS=0
 FAIL=0
 assert() {
@@ -110,6 +141,27 @@ assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "
 echo "case: a pane with no prompt boundary reads its last lines (shape UNCONFIRMED on a live claude pane)"
 st="$(status_of no-boundary)"
 assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a worker's own line quoting an error phrase is not the CLI's error"
+st="$(status_of quoted)"
+assert "quoted not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: output after a recent banner means the worker resumed"
+st="$(status_of resumed-recent)"
+assert "resumed not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: a rate limit the CLI stopped on"
+st="$(status_of rate-limit)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "Error: rate limit exceeded"
+
+echo "case: an error printed after an echoed prompt is the newest output"
+st="$(status_of after-boundary)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a tool's output under ⎿ is the tool's, not the CLI's"
+st="$(status_of tool-output)"
+assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
 
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

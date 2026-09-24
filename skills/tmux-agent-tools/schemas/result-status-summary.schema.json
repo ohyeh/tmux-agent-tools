@@ -17,7 +17,7 @@
     "summary": {"type": "string"},
     "artifacts": {"type": "array"},
     "errors": {"type": "array"},
-    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Optional. Full lowercase 40-hex sha of the commit a success delivers; the tmux-agent mod verifies it is a commit that descends from the dispatch base in the worker dir repo. Omit the key when the worker made no commit (the file must not hold null; readers tolerate null as absent)."},
+    "commit": {"type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[0-9a-f]{40}$", "description": "Optional. Full lowercase 40-hex sha of the commit a success delivers; exactly 40 characters, no surrounding whitespace or newline. The tmux-agent mod checks it is a commit object that descends from the dispatch base in the worker dir repo (an ancestry check, not proof of authorship). Omit the key when the worker made no commit (the file must not hold null; readers tolerate null as absent)."},
     "verdict": {
       "type": "object",
       "properties": {

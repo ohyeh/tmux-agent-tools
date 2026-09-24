@@ -2134,8 +2134,10 @@ result_validate_lightweight() {
         ) as $decision_errors
       | # commit: the one property with a pattern. Writers omit it when they made
         # no commit; a reader (the tmux-agent mod) tolerates null, the file does not.
+        # The length is checked on its own: in jq, `$` also matches before a final
+        # newline, so the pattern alone passes 40 hex + LF.
         ( if ($body | type) == "object" and ($body | has("commit"))
-             and (($body.commit | type) != "string" or ($body.commit | test("^[0-9a-f]{40}$") | not))
+             and (($body.commit | type) != "string" or ($body.commit | length) != 40 or ($body.commit | test("^[0-9a-f]{40}$") | not))
           then [{path: "commit", message: "expected the full 40-hex sha of a commit (lowercase), or omit the key"}]
           else [] end
         ) as $commit_errors
@@ -2181,7 +2183,7 @@ result_validate_lightweight() {
           else [] end
         ) as $decision_errors
       | ( if ($body | type) == "object" and ($body | has("commit"))
-             and (($body.commit | type) != "string" or ($body.commit | test("^[0-9a-f]{40}$") | not))
+             and (($body.commit | type) != "string" or ($body.commit | length) != 40 or ($body.commit | test("^[0-9a-f]{40}$") | not))
           then [1] else [] end
         ) as $commit_errors
       | ($type_errors + $required_errors + $extra_errors + $verdict_errors + $decision_errors + $commit_errors | length == 0);
@@ -7107,32 +7109,42 @@ current_prompt_area_for_text() {
 }
 
 # Runtime blockers: the CLI is alive but refuses work until a person acts (a
-# usage window, credentials). Read from the LAST output lines only — codex
-# prints its limit banner just above the `›` input, outside the prompt area —
-# and with CLI-shaped phrases only, never a bare "rate limit" or "error": a
-# worker's own prose ("Implemented rate limit handling") is not a blocker.
-# Prints "<reason><TAB><the line>" for the last matching line, or nothing.
-# ponytail: phrase list verified on a live codex banner (2026-09-24); the
+# usage window, a rate limit it gave up on, credentials). Three rules, each
+# from a counterexample:
+#   - the CLI's own error block only: a line that STARTS as one (`■` banner,
+#     `Error…`, claude's `⎿  API Error…`). A worker's prose ("• Implemented rate
+#     limit handling", 'Added a test for "invalid api key"') and a tool's output
+#     under `⎿`/`└` are not the CLI refusing work;
+#   - the LAST block only: any newer output line (`•`, `⏺`, `⎿`, `✔`, a "Worked
+#     for" rule) after the error means the worker resumed, so the banner is
+#     history however recent. Unmarked lines are the block's continuation (the
+#     codex banner wraps onto "visit https://…" and "again at …");
+#   - the whole pane's last 10 non-empty lines, no prompt-boundary slicing: codex
+#     draws its banner above the `›` input, and an error printed right after an
+#     echoed `› prompt` is still the newest output. A `›` line is neither an
+#     error nor new output, so it changes nothing.
+# Prints "<reason><TAB><the line>", or nothing.
+# ponytail: shapes verified on a live codex banner (2026-09-24); the
 # claude/agy/cursor/grok shapes are UNCONFIRMED — add a row when one is captured.
 runtime_blocker_for_text() {
-  local current="$1" line lowered hit=""
+  local current="$1" line body lowered hit=""
   local -a recent
   recent=("${(@f)$(awk '
-    /^[[:space:]]*›/ || /^[[:space:]]*[─-]+ Worked for / { boundary = NR }
-    { lines[NR] = $0 }
-    END {
-      last = boundary ? boundary - 1 : NR
-      n = 0
-      for (i = last; i >= 1 && n < 10; i--) if (lines[i] ~ /[^[:space:]]/) keep[++n] = lines[i]
-      for (i = n; i >= 1; i--) print keep[i]
-    }' <<< "$current")}")
+    /[^[:space:]]/ { lines[++n] = $0 }
+    END { for (i = (n > 10 ? n - 9 : 1); i <= n; i++) print lines[i] }' <<< "$current")}")
   for line in "${recent[@]}"; do
-    lowered="${line:l}"
-    case "$lowered" in
-      *"hit your usage limit"*|*"usage limit reached"*|*"quota exceeded"*|*"quota reached"*|*"out of credits"*|*"insufficient credit"*)
-        hit="quota_exhausted"$'\t'"$line" ;;
-      *"invalid api key"*|*"api key not found"*|*"no api key"*|*"authentication required"*|*"not authenticated"*|*"please run /login"*)
-        hit="login_required"$'\t'"$line" ;;
+    body="${line#"${line%%[![:space:]]*}"}"
+    case "$body" in
+      '■'*|'✗'*|'✘'*|Error*|error*|ERROR*|'⎿'*'API Error'*|'⎿'*'Claude usage limit'*|'⎿'*'Claude AI usage limit'*)
+        lowered="${line:l}"
+        case "$lowered" in
+          *"hit your usage limit"*|*"usage limit reached"*|*"quota exceeded"*|*"quota reached"*|*"out of credits"*|*"insufficient credit"*|*"rate limit exceeded"*|*"rate limit reached"*|*"rate_limit_exceeded"*|*"too many requests"*)
+            hit="quota_exhausted"$'\t'"$line" ;;
+          *"invalid api key"*|*"api key not found"*|*"no api key"*|*"authentication required"*|*"not authenticated"*|*"please run /login"*)
+            hit="login_required"$'\t'"$line" ;;
+          *) hit="" ;;
+        esac ;;
+      '•'*|'⏺'*|'⎿'*|'✔'*|'✓'*|'↳'*|*'Worked for '*) hit="" ;;
     esac
   done
   [[ -n "$hit" ]] && print -r -- "$hit"

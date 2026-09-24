@@ -174,8 +174,8 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 
 `success` 的 result 若帶 `commit`（完整 40-hex sha），交付前在 worker 的 `dir` 驗兩件事：
 `git cat-file -t <sha>` 必須是 `commit`（tag id 也解析得到 `^{commit}`，所以不能只看
-存在），而且它是這一輪的**新工作**：`git merge-base --is-ancestor <base> <sha>` 成立且
-`sha ≠ base`。`base` 是派工（`assign`、每次 `tell`）當下、worker 啟動前讀的
+存在），而且 commit 物件與祖先關係成立：`git merge-base --is-ancestor <base> <sha>`
+成立且 `sha ≠ base`。`base` 是派工（`assign`、每次 `tell`）當下、worker 啟動前讀的
 `git rev-parse HEAD`，記在 dispatch.json。成立 → 狀態行寫
 `success — commit <sha12> verified (descends from dispatch base <base12>)`；`dir` 不是 repo
 或 0.7.5 以前的紀錄沒有 base → 只能證明物件存在，狀態行照實寫
@@ -183,8 +183,12 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 40-hex、不存在、不是 commit、是 base 本身、不在 base 之後 → 照樣交付（不吞），寫
 `success claimed, commit <sha> NOT verified: <reason>`。缺 `commit` 或 `null`（唯讀／
 review worker）→ 與以前完全相同。整批 commit 檢查共用 4 秒預算：用完就停，剩下的
-留到下一個 tick，不會被說成「查無 commit」。這證明的是「有一個在 base 之後的新
-commit」，不是任務做對了。
+（包括 cat-file 查完、merge-base 還沒輪到的那一筆）留到下一個 tick 再查，不會被說成
+「查無 commit」或「NOT verified」，也不會被停滯探測當成「沒有結果」；每一 pass 的第一筆
+永遠拿得到兩次完整的 2 秒，所以慢 repo 會被回報，不會永遠延後。`dir` 讀不到 base 時
+（不是 repo、git 沒回應）log 會寫原因。這證明的是 DAG 關係——「有一個在 base 之後的
+commit」——不是這個 worker 寫的（另一條 branch 上早就在 base 之後的 commit 也會過），
+更不是任務做對了。
 
 ## 掃描窗口
 
@@ -407,11 +411,16 @@ reached」七天：沒有終態、沒有 exit，等 result 會等到天荒地老
 
 `stalled` 只由 wrapper 判：`agent-tmux status --json` 的 `blocked_reason` 是
 `quota_exhausted` 或 `login_required`（CLI 自己說停了：用量窗口、憑證失效），證據是
-同一份輸出的 `blocked_evidence`（CLI 最後幾行輸出裡命中的那一行）。mod 自己不留字表
+同一份輸出的 `blocked_evidence`（命中的那一行）。wrapper 只認 CLI 自己的錯誤區塊：
+pane 最後 10 個非空行裡，**行首**就是錯誤形狀的那一行（`■` 橫幅、`Error…`、claude 的
+`⎿  API Error…`），而且它之後沒有新的輸出行（`•`、`⏺`、`⎿`、`✔`、「Worked for」）——
+worker 自己引述的「invalid api key」、工具輸出、恢復後才剛被推上去的舊橫幅都不算；
+CLI 放棄的 rate limit（`Error: rate limit exceeded`）算 `quota_exhausted`。mod 自己不留字表
 —— 0.7.3／0.7.4 在 mod 裡複製的半份字表會把 worker 自己寫的「Implemented rate limit
 handling」當成阻擋（astra 審查 F5）。pane 靜止滿 2 分鐘才算數（剛恢復時畫面上還留著
-舊橫幅，不該叫人），然後**叫醒 session 一次**（每個 episode 一次；hot reload 後可能
-再說一次）：這個 worker 不會自己交出結果，owner 空等才是這個 mod 要消除的沉默
+舊橫幅，不該叫人），然後**叫醒 session 一次**：session 接受了才算說過（被拒就下一個
+tick 再試，連續拒 3 次就放棄並寫 log）；閒置時間中途歸零又回來不重說；記在記憶體，
+所以 hot reload 或別的 collector 認領後可能再說一次。這個 worker 不會自己交出結果，owner 空等才是這個 mod 要消除的沉默
 （2026-09-24：兩個 codex worker 停在 usage limit 一個小時，lead 不知道）。不殺。
 對話框（trust、permission、login prompt）是 `needs-input`，同時清掉這個 episode 的
 stalled 紀錄，面板、log、`$.tmux.stalled()` 三者一致。閒置時鐘讀的是

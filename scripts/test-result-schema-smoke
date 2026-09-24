@@ -100,7 +100,9 @@ run_validator_cases() {
   code=0
   out="$("$wrapper" "$cli" result --validate "$prefix-commit-ok" 2>&1)" || code=$?
   assert "$prefix-commit-ok exit=0" "$code" "0"
-  for c in '"abc123"' 'null' '{}' '""' "\"${sha:u}\""; do
+  # jq's `$` matches before a final newline: the LF and CRLF cases are the
+  # 41/42-char shas the pattern alone let through.
+  for c in '"abc123"' 'null' '{}' '""' "\"${sha:u}\"" "\"${sha}\\n\"" "\"${sha}\\r\\n\"" "\" ${sha}\"" "\"${sha} \""; do
     setup_agent "$prefix-commit-bad"
     printf '%s\n' "{\"schema_version\":1,\"status\":\"success\",\"summary\":\"x\",\"commit\":$c}" > "$TMUX_AGENT_DIR/$prefix-commit-bad/result.json"
     code=0

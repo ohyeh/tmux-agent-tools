@@ -2400,3 +2400,173 @@ describe('teammates', () => {
     expect(ran).toEqual([`${WRAPPER} codex assign --help`, `${WRAPPER} codex list`, 'git status'])
   })
 })
+
+describe('astra re-review of e8704d6', () => {
+  test('a peer must preserve another live worker launch acknowledgement', WITH_DRIVER, async ($, on) => {
+    mock.env(on,{HOME}); mock.clock(on);
+    const store=mockStore(on,['w1@0#launch'],'tmux-agent.reported.sess-A');
+    on('session.id',()=>({value:'sess-B'}));
+    mockFs(on,{[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0,{owner:'sess-A',ownerCwd:'/work'}),[`${ROOT}/w1/launch.exit`]:'1',[`${ROOT}/.collector-sess-A`]:'0'});
+    mockWake(on); mockSessionStart(on); on('ui.status',()=>({value:undefined}));
+    await $.session.start({...session(),cwd:'/other'});
+    expect(store.key('tmux-agent.reported.sess-A')).toEqual(['w1@0#launch']);
+  });
+  test('a refused stall wake must be retried before it is considered notified', WITH_DRIVER, async ($,on)=>{
+    mock.env(on,{HOME});mockStore(on);mock.clock(on);
+    mockFs(on,{[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0)});
+    const wake=mockWake(on,[{drop:'busy'},'accept']);
+    mockStatus(on,{running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'You hit your usage limit'});
+    await $.turn.complete(turn());await $.turn.complete(turn());
+    expect(wake.length).toEqual(2);
+  });
+  test('an actual stall followed by a dialog clears its evidence',WITH_DRIVER,async ($,on)=>{
+    mock.env(on,{HOME});mockStore(on);mock.clock(on);
+    mockFs(on,{[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0)});
+    const wake=mockWake(on);
+    const row={running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'};
+    mockStatus(on,row);
+    await $.turn.complete(turn());
+    expect((await $.command.run(run('stalled'))).text).toEqual('w1:180');
+    row.blocked_reason='login_prompt';
+    await $.turn.complete(turn());
+    expect((await $.command.run(run('stalled'))).text).toEqual('');
+    expect(wake.length).toEqual(1);
+  });
+  test('a stalled worker that later finishes is delivered and removed from stalled',WITH_DRIVER,async ($,on)=>{
+    mock.env(on,{HOME});mockStore(on);mock.clock(on);
+    const files:Files={[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0)};
+    mockFs(on,files);const wake=mockWake(on);
+    mockStatus(on,{running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'});
+    await $.turn.complete(turn());
+    files[`${ROOT}/w1/result.json`]=finished('recovered');
+    await $.turn.complete(turn());await $.turn.complete(turn());
+    expect(wake.length).toEqual(2);
+    expect(wake[1]).toContain('recovered');
+    expect((await $.command.run(run('stalled'))).text).toEqual('');
+  });
+  test('completed workers deferred by commit budget must not announce no result will arrive',WITH_DRIVER,async ($,on)=>{
+    mock.env(on,{HOME});mockStore(on);const clock=mock.clock(on);
+    const files:Files={};
+    for(let i=0;i<4;i++){
+      files[`${ROOT}/w${i}/dispatch.json`]=dispatch('w'+i,0);
+      files[`${ROOT}/w${i}/result.json`]=JSON.stringify({status:'success',summary:'done',commit:'a'.repeat(40)});
+    }
+    mockFs(on,files);const wake=mockWake(on);
+    on('process.run',async ($,e)=>{
+      if(e.argv[0]==='git'){await clock.advance(2000);return {value:{exitCode:0,stdout:'commit\n',stderr:''}};}
+      return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:''}};
+    });
+    await $.turn.complete(turn());
+    expect(wake.join('\n')).not.toContain('no result will arrive');
+  });
+  test('tell without git continues and removes the previous episode base',WITH_DRIVER,async ($,on)=>{
+    mock.env(on,{HOME});mockStore(on,['w1@0']);mock.clock(on);
+    const files:Files={[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0,{base:'a'.repeat(40)}),[`${ROOT}/w1/result.json`]:finished()};
+    mockFs(on,files);mockWake(on);mockSessionStart(on);on('ui.status',()=>({value:undefined}));
+    const calls:string[][]=[];
+    on('process.run',($,e)=>{calls.push([...e.argv]);return {value:{exitCode:e.argv[0]==='git'?128:0,stdout:'',stderr:e.argv[0]==='git'?'not a repository':''}};});
+    await $.session.start(session());
+    const out=JSON.stringify(await $.tool.call({tool:'mcp__tmux-agent__tell' as const,name:'w1',text:'next'}));
+    expect(out).toContain('sent to');
+    const d=JSON.parse(files[`${ROOT}/w1/dispatch.json`]!);
+    expect(d.base).toEqual(undefined);
+    expect(calls[0]).toEqual(['git','-C','/work','rev-parse','HEAD']);
+  });
+});
+
+test('re-review: a commit whose ancestry did not fit stays outstanding',WITH_DRIVER,async ($,on)=>{
+  mock.env(on,{HOME});const store=mockStore(on);const clock=mock.clock(on);
+  const base='b'.repeat(40),sha='a'.repeat(40);
+  const files:Files={};
+  for(let i=0;i<2;i++){
+    files[`${ROOT}/w${i}/dispatch.json`]=dispatch('w'+i,0,{base});
+    files[`${ROOT}/w${i}/result.json`]=JSON.stringify({status:'success',summary:'done',commit:sha});
+  }
+  mockFs(on,files);const wake=mockWake(on);let count=0;
+  on('process.run',async ($,e)=>{
+    count++;
+    await clock.advance(Math.min(1500,e.init?.timeoutMs??1500));
+    return {value:{exitCode:0,stdout:e.argv.includes('cat-file')?'commit\n':'',stderr:''}};
+  });
+  await $.turn.complete(turn());
+  expect(count).toEqual(3);
+  expect(store.acked()).toEqual(['w0@0']);
+  expect(wake.join('\n')).not.toContain('NOT verified');
+});
+test('re-review: tell records the refreshed base before sending',WITH_DRIVER,async ($,on)=>{
+  mock.env(on,{HOME});mockStore(on,['w1@0']);mock.clock(on);
+  const fresh='c'.repeat(40);
+  const files:Files={[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0,{base:'b'.repeat(40)}),[`${ROOT}/w1/result.json`]:finished()};
+  mockFs(on,files);mockWake(on);mockSessionStart(on);on('ui.status',()=>({value:undefined}));
+  const calls:string[][]=[];
+  on('process.run',($,e)=>{calls.push([...e.argv]);return {value:{exitCode:0,stdout:e.argv[0]==='git'?fresh+'\n':'',stderr:''}};});
+  await $.session.start(session());
+  await $.tool.call({tool:'mcp__tmux-agent__tell' as const,name:'w1',text:'next'});
+  expect(JSON.parse(files[`${ROOT}/w1/dispatch.json`]!).base).toEqual(fresh);
+  expect(calls[0]).toEqual(['git','-C','/work','rev-parse','HEAD']);
+  expect(calls[2]![2]).toEqual('send');
+});
+test('re-review: once per episode survives a transient idle reset',WITH_DRIVER,async ($,on)=>{
+  mock.env(on,{HOME});mockStore(on);mock.clock(on);
+  mockFs(on,{[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0)});
+  const wake=mockWake(on);const row={running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'};
+  mockStatus(on,row);
+  await $.turn.complete(turn());
+  row.idle_seconds=30;
+  await $.turn.complete(turn());
+  row.idle_seconds=180;
+  await $.turn.complete(turn());
+  expect(wake.length).toEqual(1);
+});
+
+test('re-review: the deferred ancestry check finishes next tick and delivers once, verified', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  const store = mockStore(on)
+  const clock = mock.clock(on)
+  const base = 'b'.repeat(40), sha = 'a'.repeat(40)
+  const files: Files = {}
+  for (let i = 0; i < 2; i++) {
+    files[`${ROOT}/w${i}/dispatch.json`] = dispatch('w' + i, 0, { base })
+    files[`${ROOT}/w${i}/result.json`] = JSON.stringify({ status: 'success', summary: 'done', commit: sha })
+  }
+  mockFs(on, files)
+  const wake = mockWake(on)
+  const windows: number[] = []
+  on('process.run', async ($, e) => {
+    if (e.argv[0] === 'git') windows.push(e.init?.timeoutMs ?? -1)
+    await clock.advance(Math.min(1500, e.init?.timeoutMs ?? 1500))
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+  })
+  await $.turn.complete(turn())
+  await $.turn.complete(turn())
+  await $.turn.complete(turn())
+  expect(store.acked()).toEqual(['w0@0', 'w1@0'])
+  expect(wake.length).toEqual(2)
+  expect(wake[1]).toContain('"w1" on codex: success — commit aaaaaaaaaaaa verified (descends from dispatch base bbbbbbbbbbbb)')
+  expect(wake.join('\n')).not.toContain('NOT verified')
+  expect(windows.every(ms => ms > 0 && ms <= 2_000)).toEqual(true)
+})
+
+test('re-review: a stall wake refused STALL_WAKE_MAX times is given up on, not retried forever', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  mockStore(on)
+  mock.clock(on)
+  mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+  const wake = mockWake(on, [{ drop: 'busy' }, { drop: 'busy' }, { drop: 'busy' }, 'accept'])
+  mockStatus(on, { running: true, idle_seconds: 180, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' })
+  for (let i = 0; i < 5; i++) await $.turn.complete(turn())
+  expect(wake.length).toEqual(3)
+})
+
+test('re-review: a peer deletes another session key once its episodes are gone, #launch included', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  mock.clock(on)
+  const store = mockStore(on, ['gone@0#launch', 'gone@0'], 'tmux-agent.reported.sess-A')
+  on('session.id', () => ({ value: 'sess-B' }))
+  mockFs(on, { [`${ROOT}/.collector-sess-A`]: '0' })
+  mockWake(on)
+  mockSessionStart(on)
+  on('ui.status', () => ({ value: undefined }))
+  await $.session.start({ ...session(), cwd: '/other' })
+  expect(store.keys()).not.toContain('tmux-agent.reported.sess-A')
+})

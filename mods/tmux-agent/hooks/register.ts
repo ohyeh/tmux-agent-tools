@@ -103,6 +103,8 @@ const STALL_PROBE_MAX = 8
 const STALL_SWEEP_MS = 4_000
 /** One probe's own ceiling. Capturing a pane is fast or it is not answering. */
 const STALL_PROBE_MS = 3_000
+/** Refused stall wake-ups one episode gets before the mod stops trying and logs it. */
+const STALL_WAKE_MAX = 3
 /** A result's `commit`: the full sha, never an abbreviation git could resolve ambiguously. */
 const SHA_RE = /^[0-9a-f]{40}$/
 /** One `git cat-file` on a local repo: instant, or the repo is not answering. */
@@ -110,11 +112,19 @@ const COMMIT_PROBE_MS = 2_000
 /** Every commit check of one collect pass together; the rest wait for the next tick. */
 const COMMIT_BUDGET_MS = 4_000
 
-/** `git rev-parse HEAD` output as a dispatch base, or nothing when `dir` is not a repo. */
-const baseFrom = (p: { exitCode: number; stdout: string } | undefined) => {
-  const head = p?.exitCode === 0 ? p.stdout.trim() : ''
-  return SHA_RE.test(head) ? { base: head } : {}
+/**
+ * `git rev-parse HEAD` output as a dispatch base, or nothing. Without a base a
+ * commit check can only show the object exists, so the reason is logged: not a
+ * repo, a git that did not answer, and an unreadable HEAD read the same on disk.
+ */
+const baseFrom = (p: { exitCode: number; stdout: string; stderr: string }, dir: string, log: (text: string) => void) => {
+  const head = p.exitCode === 0 ? p.stdout.trim() : ''
+  if (SHA_RE.test(head)) return { base: head }
+  const why = (p.stderr || p.stdout || `exit ${p.exitCode}`).replace(CTRL_ALL_RE, ' ').trim().slice(0, 200)
+  log(`tmux-agent: no dispatch base for ${dir} (git rev-parse HEAD: ${why}); a commit claim there can only be checked as an existing object`)
+  return {}
 }
+const gitFailed = (error: unknown) => ({ exitCode: -1, stdout: '', stderr: `git did not run or answer in time: ${String(error)}` })
 /** The mirror's own clock. It runs ONLY while the panel is open; see `Panel`. */
 const MIRROR_MS = 2_000
 /**
@@ -275,10 +285,19 @@ type Gate = {
   capacityPaused: boolean
   /**
    * Idle workers by id → the worker, its last measured idle, and the blocker line
-   * when the pane tail shows one. Only an entry WITH evidence is stalled.
-   * Announced once, and again when evidence first appears.
+   * when the pane tail shows one. Only an entry WITH evidence is stalled. An
+   * observation only: an idle reset or a dialog clears it, and it says nothing
+   * about whether the owner was told — `stallNoticed` does.
    */
   stalled: Map<string, { dispatch: TmuxDispatch; idleSeconds: number; evidence?: string }>
+  /**
+   * Episode ids whose stall the session ACCEPTED a wake-up for, or that were
+   * given up on after STALL_WAKE_MAX refusals. Kept for as long as the worker is
+   * outstanding, so a pane that flickers active and freezes again is not news.
+   */
+  stallNoticed: Set<string>
+  /** Refused stall wake-ups per episode id, for the bound on retrying them. */
+  stallDrops: Map<string, number>
   /** Workers whose pane is sitting on a dialog (agent-tmux status `blocked_reason`). */
   blocked: Map<string, string>
   /** The last `tmux ls` that answered, so one slow tick cannot empty the panel. */
@@ -370,6 +389,8 @@ const idOf = (d: TmuxDispatch) => `${d.name}@${d.since}`
 const LAUNCH_ACK = '#launch'
 const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
 const ackOf = (f: Finished) => (f.status === LAUNCH_FAILED ? launchIdOf(f.d) : idOf(f.d))
+/** The episode an ack belongs to: a launch notice's ack names its episode plus the suffix. */
+const episodeOf = (ack: string) => (ack.endsWith(LAUNCH_ACK) ? ack.slice(0, -LAUNCH_ACK.length) : ack)
 
 /**
  * The acknowledged set, one key PER SESSION: `tmux-agent.reported.<sessionId>`.
@@ -435,6 +456,8 @@ async function readOrEmpty(host: Host, path: string): Promise<string> {
 
 /** A claimed commit, checked against the worker's own repo before delivery. */
 type CommitCheck = { sha: string; verified: true; scope: string } | { sha: string; verified: false; reason: string }
+/** A commit check the pass's time budget did not reach the end of: not an answer. */
+const DEFERRED = 'deferred' as const
 type Finished = { d: TmuxDispatch; path: string; status: string; summary: string; commit?: CommitCheck }
 /**
  * One pass over the state root.
@@ -612,10 +635,15 @@ async function collect(
   ready: TmuxDispatch[],
   exited: ReadonlySet<string> = new Set(),
   reported: ReadonlySet<string> = new Set(),
-): Promise<Finished[]> {
+): Promise<{ finished: Finished[]; unfinished: TmuxDispatch[] }> {
   const now = await host.now()
   const gitDeadline = now + COMMIT_BUDGET_MS
   const out: Finished[] = []
+  // What this pass READ and found with no terminal result: the only workers the
+  // stall sweep may call "no result will arrive". One the pass did not reach (a
+  // budget or batch break) or whose result is terminal but not deliverable is
+  // not in it — its result exists.
+  const unfinished: TmuxDispatch[] = []
   for (const d of ready) {
     if (out.length >= BATCH_MAX) break
     const dir = `${root}/${d.name}`
@@ -648,7 +676,7 @@ async function collect(
         // the panel for hours).
         if (exited.has(idOf(d))) {
           out.push({ d, path, status: EXITED, summary: 'the tmux session is gone and no terminal result.json was written' })
-        }
+        } else unfinished.push(d)
         continue
       }
       const at = await finishedAt(host, path, raw)
@@ -664,29 +692,32 @@ async function collect(
         // the next tick — never delivered as "no such commit".
         const left = gitDeadline - (await host.now())
         if (left <= 0) break
-        commit = await checkCommit(host, d, sha, left)
+        const check = await checkCommit(host, d, sha, left)
+        if (check === DEFERRED) break
+        commit = check
       }
       out.push({ d, path, status, summary: typeof s === 'string' ? s : '', ...(commit ? { commit } : {}) })
     } catch (error) {
       host.log(`tmux-agent: could not read result for ${d.name}: ${String(error)}`)
     }
   }
-  return out
+  return { finished: out, unfinished }
 }
 
 /**
  * Completion evidence bound to a commit (W39-19). The claim holds only when the
- * sha names a COMMIT object (a tag id also resolves `^{commit}`) that is new
- * work on top of the dispatch's base: a descendant of `base` and not `base`
- * itself, so an old commit cannot pass as this task's output. A dispatch with no
- * base (dir was not a repo, or a record from before 0.7.5) can only show that
- * the object exists, and the line says exactly that.
+ * sha names a COMMIT object (a tag id also resolves `^{commit}`) that descends
+ * from the dispatch's base and is not `base` itself — so a commit older than the
+ * dispatch cannot pass. That is an ancestry check on the DAG, not proof this
+ * worker authored it: a descendant already on another branch passes too. A
+ * dispatch with no base (dir was not a repo, or a record from before 0.7.5) can
+ * only show that the object exists, and the line says exactly that.
  *
  * The type check comes before anything touches the value: it is disk JSON, and
  * `String({toString: null})` throws. The anchored 40-hex test runs before the
  * sha reaches argv — the guard against flag smuggling, as NAME_RE is.
  */
-async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: number): Promise<CommitCheck> {
+async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: number): Promise<CommitCheck | typeof DEFERRED> {
   if (typeof sha !== 'string') {
     return { sha: (JSON.stringify(sha) ?? typeof sha).slice(0, 64), verified: false, reason: 'not a string' }
   }
@@ -694,15 +725,26 @@ async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: 
     return { sha: sha.replace(CTRL_ALL_RE, ' ').slice(0, 64), verified: false, reason: 'not a full 40-hex commit sha' }
   }
   const deadline = (await host.now()) + budgetMs
+  // The pass's budget running out is not git's answer: that check is DEFERRED,
+  // left outstanding for the next tick. Only a call given its full
+  // COMMIT_PROBE_MS that still failed to answer is a failure to report. The first
+  // check of a pass always has the full window for both calls (the budget is two
+  // probes), so a slow repo is reported, never deferred forever.
   const git = async (args: readonly string[]) => {
     const left = deadline - (await host.now())
-    if (left <= 0) return { exitCode: -1, stdout: '', stderr: `git did not answer within ${budgetMs} ms` }
+    if (left <= 0) return DEFERRED
+    const window = Math.min(COMMIT_PROBE_MS, left)
     return host
-      .run(['git', '-C', d.dir, ...args], d.dir, Math.min(COMMIT_PROBE_MS, left))
-      .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: `git did not run or answer in time: ${String(error)}` }))
+      .run(['git', '-C', d.dir, ...args], d.dir, window)
+      .catch((error: unknown) =>
+        window < COMMIT_PROBE_MS
+          ? DEFERRED
+          : gitFailed(error),
+      )
   }
   const why = (p: { stdout: string; stderr: string }) => (p.stderr || p.stdout).replace(CTRL_ALL_RE, ' ').trim().slice(0, 200)
   const type = await git(['cat-file', '-t', sha])
+  if (type === DEFERRED) return DEFERRED
   if (type.exitCode !== 0) {
     return { sha, verified: false, reason: `no such object in ${d.dir} (git cat-file exit ${type.exitCode}${why(type) ? `: ${why(type)}` : ''})` }
   }
@@ -711,6 +753,7 @@ async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: 
   if (!d.base) return { sha, verified: true, scope: 'commit object exists; no dispatch base recorded' }
   if (sha === d.base) return { sha, verified: false, reason: 'it is the dispatch base itself — nothing was committed on top of it' }
   const anc = await git(['merge-base', '--is-ancestor', d.base, sha])
+  if (anc === DEFERRED) return DEFERRED
   if (anc.exitCode === 0) return { sha, verified: true, scope: `descends from dispatch base ${d.base.slice(0, 12)}` }
   return {
     sha,
@@ -762,7 +805,7 @@ function payloadOf(done: readonly Finished[]): { text: string; included: Finishe
  */
 function pruned(reported: readonly string[], seen: ReadonlySet<string>, complete: boolean): string[] {
   if (!complete) return [...reported]
-  return reported.filter(id => seen.has(id.endsWith(LAUNCH_ACK) ? id.slice(0, -LAUNCH_ACK.length) : id))
+  return reported.filter(id => seen.has(episodeOf(id)))
 }
 
 /**
@@ -788,14 +831,24 @@ function pruned(reported: readonly string[], seen: ReadonlySet<string>, complete
  * that cannot come is the silence this mod exists to remove (2026-09-24: two
  * codex workers sat on a usage limit for an hour, the lead none the wiser).
  */
-async function flagStalls(host: Host, gate: Gate, root: string, live: readonly TmuxDispatch[]): Promise<void> {
+async function flagStalls(
+  host: Host,
+  gate: Gate,
+  root: string,
+  outstanding: readonly TmuxDispatch[],
+  live: readonly TmuxDispatch[],
+): Promise<void> {
   const deadline = (await host.now()) + STALL_SWEEP_MS
-  const woken: string[] = []
-  const seen = new Set(live.map(idOf))
+  const woken: { id: string; text: string }[] = []
+  // State is kept for every worker still outstanding — one this pass did not
+  // reach keeps what it had — and only `live` (read, no terminal result) is probed.
+  const seen = new Set(outstanding.map(idOf))
   // A worker that is no longer outstanding is no longer stalled: it was
   // delivered, or its directory is gone. Without this the registry only ever
   // grows, and `$.tmux.stalled()` stops meaning "alive and frozen".
   for (const id of [...gate.stalled.keys()]) if (!seen.has(id)) gate.stalled.delete(id)
+  for (const id of [...gate.stallNoticed]) if (!seen.has(id)) gate.stallNoticed.delete(id)
+  for (const id of [...gate.stallDrops.keys()]) if (!seen.has(id)) gate.stallDrops.delete(id)
   for (const id of [...gate.exited]) if (!seen.has(id)) gate.exited.delete(id)
   for (const id of [...gate.blocked.keys()]) if (!seen.has(id)) gate.blocked.delete(id)
   if (!live.length) return
@@ -888,17 +941,22 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
     const evidence = runtime ? `${reason}: ${shown(row.blocked_evidence) || '(no line captured)'}`.slice(0, TAIL_MAX) : undefined
     const before = gate.stalled.get(id)
     gate.stalled.set(id, { dispatch: d, idleSeconds: row.idle_seconds, ...(evidence ? { evidence } : {}) })
-    if (before && (before.evidence || !evidence)) continue
     const minutes = Math.round(row.idle_seconds / 60)
     if (evidence) {
-      host.log(`tmux-agent: ${d.name} (${d.profile}) is stalled: ${evidence}`)
-      woken.push(
-        `- "${d.name}" on ${d.profile}: stalled for ${minutes} min — ${evidence}\n` +
+      if (!before?.evidence) host.log(`tmux-agent: ${d.name} (${d.profile}) is stalled: ${evidence}`)
+      // Told is what the session accepted, not what this sweep saw: a refused
+      // wake-up is asked again next tick, up to STALL_WAKE_MAX times.
+      if (gate.stallNoticed.has(id)) continue
+      woken.push({
+        id,
+        text:
+          `- "${d.name}" on ${d.profile}: stalled for ${minutes} min — ${evidence}\n` +
           `  ${shown(row.diagnostic) || 'nothing will arrive until someone acts'}\n` +
           `  dir: ${d.dir}`,
-      )
+      })
       continue
     }
+    if (before) continue
     // Quiet with no blocker: an observation for the log, never a wake-up.
     const lines = (Array.isArray(row.last_capture_lines) ? row.last_capture_lines : []).map(shown).filter(Boolean)
     const tail = lines.slice(-TAIL_LINES).join(' | ').slice(0, TAIL_MAX)
@@ -911,11 +969,27 @@ async function flagStalls(host: Host, gate: Gate, root: string, live: readonly T
     )
   }
   if (!woken.length) return
-  // Best effort: a refused wake-up is logged, and the panel still shows the row
-  // as stalled. Once per episode per activation — a reload may say it once more.
-  const text = [`tmux-agent: ${woken.length} worker(s) stalled — no result will arrive until someone acts.`, ...woken].join('\n')
+  // Once per episode per activation: the notice set lives in memory, so a reload
+  // or an adopting collector may say it once more. A refusal is retried on the
+  // next tick and given up on — logged, the panel still showing the row as
+  // stalled — after STALL_WAKE_MAX of them.
+  const text = [
+    `tmux-agent: ${woken.length} worker(s) stalled — no result will arrive until someone acts.`,
+    ...woken.map(w => w.text),
+  ].join('\n')
   const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error) }))
-  if (answer?.drop) host.log(`tmux-agent: could not report a stall to the session: ${answer.drop}`)
+  if (!answer?.drop) {
+    for (const w of woken) gate.stallNoticed.add(w.id)
+    return
+  }
+  for (const w of woken) {
+    const drops = (gate.stallDrops.get(w.id) ?? 0) + 1
+    gate.stallDrops.set(w.id, drops)
+    if (drops < STALL_WAKE_MAX) continue
+    gate.stallNoticed.add(w.id)
+    host.log(`tmux-agent: gave up reporting the stall of ${w.id} after ${drops} refusals: ${answer.drop}`)
+  }
+  host.log(`tmux-agent: could not report a stall to the session: ${answer.drop}`)
 }
 
 /**
@@ -1067,17 +1141,18 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
   const keep = pruned(stored, present, complete)
   if (complete) {
     for (const [key, ids] of acks.others) {
-      if (ids.every(id => !present.has(id))) await host.storeDelete(key).catch(() => undefined)
+      if (ids.every(id => !present.has(episodeOf(id)))) await host.storeDelete(key).catch(() => undefined)
     }
   }
   const reported = new Set<string>([...keep, ...[...acks.others.values()].flat()])
   const pending = dispatches.filter(d => !reported.has(idOf(d)))
-  const done = await collect(host, root, pending, gate.exited, reported)
+  const { finished: done, unfinished } = await collect(host, root, pending, gate.exited, reported)
 
-  // Whatever is still outstanding after collection has no terminal result yet —
-  // exactly the set where "running" and "stuck" look identical from disk.
+  // Only what collection read and found with no terminal result — exactly the
+  // set where "running" and "stuck" look identical from disk. A worker whose
+  // result is waiting on the commit budget is finished, not stalled.
   const finished = new Set(done.map(f => idOf(f.d)))
-  if (probeStalls) await flagStalls(host, gate, root, pending.filter(d => !finished.has(idOf(d))))
+  if (probeStalls) await flagStalls(host, gate, root, pending.filter(d => !finished.has(idOf(d))), unfinished)
 
   if (!done.length) {
     // Nothing to say, but a shrunken keep-set is still worth writing back.
@@ -1154,7 +1229,7 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
     '(JSON with "status": success|failed|blocked|needs-input and "summary"; if you committed, "commit": the full 40-hex sha).'
   const since = Math.max(await host.now(), d.since + 1)
   // The new episode's work starts from wherever the repo is now.
-  const head = await host.run(['git', '-C', d.dir, 'rev-parse', 'HEAD'], d.dir, COMMIT_PROBE_MS).catch(() => undefined)
+  const head = await host.run(['git', '-C', d.dir, 'rev-parse', 'HEAD'], d.dir, COMMIT_PROBE_MS).catch(gitFailed)
   const tellPath = `${dir}/tell-${since}.md`
   await host.write(tellPath, body)
   const init = await host.run(['agent-tmux', d.profile, 'result', 'init', d.name], d.dir, 5_000)
@@ -1177,7 +1252,7 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
     dir: d.dir,
     since,
     ...(goal ? { goal } : {}),
-    ...baseFrom(head),
+    ...baseFrom(head, d.dir, host.log),
     // Whoever gave the latest instruction gets the answer: a tell from another
     // session of this repo moves the worker to that session, and the previous
     // owner's next tick delivers nothing for it. Never both.
@@ -1308,6 +1383,8 @@ export const register: Register = on => {
     paused: false,
     capacityPaused: false,
     stalled: new Map(),
+    stallNoticed: new Set(),
+    stallDrops: new Map(),
     exited: new Set(),
     blocked: new Map(),
     probeCursor: 0,
@@ -1822,11 +1899,11 @@ export const register: Register = on => {
     const logPath = `${stateDir}/mod-assign.log`
     const exitPath = `${stateDir}/launch.exit`
     await $.fs.write(briefPath, input.brief)
-    // Read before the worker starts: a success's commit must be new work on top
-    // of this (checkCommit), and a worker that commits fast must not move it.
+    // Read before the worker starts: a success's commit must descend from
+    // this (checkCommit), and a worker that commits fast must not move it.
     const head = await $.process
       .run(['git', '-C', input.dir, 'rev-parse', 'HEAD'], { cwd: input.dir, timeoutMs: COMMIT_PROBE_MS })
-      .catch(() => undefined)
+      .catch(gitFailed)
 
     // Every hook has a budget and `assign` (start + result init + send + confirm)
     // outlasts it, so it runs detached from a shell that exits at once. The outer
@@ -1853,7 +1930,7 @@ export const register: Register = on => {
       dir: input.dir,
       since,
       ...(goal ? { goal } : {}),
-      ...baseFrom(head),
+      ...baseFrom(head, input.dir, text => $.ui.log(text)),
       ...(sessionId ? { owner: sessionId } : {}),
       ...(sessionCwd ? { ownerCwd: sessionCwd } : {}),
     }
