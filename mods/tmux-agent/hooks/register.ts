@@ -79,12 +79,13 @@ const STALL_SECONDS = 15 * 60
 /**
  * Pane text that turns a quiet pane into a stalled one. Ported from agent-tmux's
  * `launch_blocker_for_text` quota/login rows, plus `quota reached` (the observed
- * case above, which that list lacks) and a bare `error` word. Dialogs (trust,
+ * case above, which that list lacks). No bare `error` word: a worker that
+ * printed "fixed the error" and then went quiet is not stuck (W39 review). Dialogs (trust,
  * permission, login prompt) are not here: `status --json` already reports them
  * as `blocked_reason`, and they read as needs-input before this is consulted.
  */
 const BLOCKER_RE =
-  /quota (reached|exceeded)|usage limit|rate limit|out of credits|insufficient credit|not logged in|please log ?in|not authenticated|\berror\b/i
+  /quota (reached|exceeded)|usage limit|rate limit|out of credits|insufficient credit|not logged in|please log ?in|not authenticated/i
 /** Evidence carried in an idle notice: the last few non-empty pane lines, bounded. */
 const TAIL_LINES = 3
 const TAIL_MAX = 300

@@ -982,6 +982,25 @@ describe('stall detection', () => {
     expect((await $.command.run(run('stalled'))).text).toEqual('w1:1800')
   })
 
+  test('a quiet pane that merely mentions an error is not stalled', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const logs = mockQuiet(on)
+    mockStatus(on, {
+      running: true,
+      idle_seconds: 30 * 60,
+      last_capture_lines: ['Fixed the error in parse()', 'Thinking…', '> '],
+    })
+
+    await $.turn.complete(turn())
+
+    expect(logs.length).toEqual(1)
+    expect(logs[0], 'the word "error" is not blocker evidence').toContain('not confirmed stuck')
+    expect(logs[0]).not.toContain('is stalled')
+  })
+
   test('a worker that is merely slow is not flagged', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
