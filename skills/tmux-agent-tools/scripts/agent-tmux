@@ -1842,7 +1842,7 @@ send_blocked_guard() {
   st="$(status_session --json "$name")" || st=""
   reason="$("$JQ" -r '.blocked_reason // empty' <<< "$st" 2>/dev/null || true)"
   case "$reason" in
-    hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt|startup_pending)
+    hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt|update_prompt|startup_pending)
       diagnostic="$("$JQ" -r '.diagnostic // empty' <<< "$st" 2>/dev/null || true)"
       "$JQ" -cn --arg tool "$CLI" --arg name "$name" --arg session "$session" \
         --arg blocked_reason "$reason" --arg diagnostic "$diagnostic" \
@@ -4225,6 +4225,8 @@ assign_session() {
     rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
     rreason="$(printf '%s' "$rj" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
     case "$rreason" in
+      update_prompt)
+        _assign_fail send "worker blocked before send: update_prompt — the brief was NOT sent and no key was pressed. The CLI is offering to update itself (an Enter would run its installer): update it or skip the update by hand (peek, then keys), then send the brief again ($prompt)" "$name" ;;
       permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
         _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
@@ -4288,7 +4290,18 @@ assign_session() {
       | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = $0 } END { print last }' \
       | grep -qE '^[[:space:]]*(→|›|❯|>)[[:space:]]+\[Pasted (text|Content)'
   }
-  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy busy_metric idle validation nudged=0 nudged_at=0
+  # The elapsed counters on screen: claude's spinner row `● Orbiting… (27s ·` and
+  # codex's `• Working (3m 01s •`. The verb is random and CLI-specific, the
+  # counter is not. One that moves between two looks is the CLI working, whether
+  # or not the brief's own text is on screen: codex 0.157.0 queued the brief as a
+  # one-line preview of the injected first line and claude folded it (live
+  # 2026-09-25), so the delivery proof below never matched, the busy and idle
+  # signals behind it were never read, and the brief was pasted a second time.
+  _assign_counters() {
+    printf '%s' "$1" | "$JQ" -r '.last_capture_lines[]?' 2>/dev/null \
+      | grep -oE '\(([0-9]+h )?([0-9]+m )?[0-9]+s[ )]' | tr '\n' ' ' || true
+  }
+  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy busy_metric idle validation nudged=0 nudged_at=0 counters prev_counters
   for attempt in 1 2; do
     send_rc=0
     if [[ "$delivery" == "file-ref" ]]; then
@@ -4304,7 +4317,7 @@ assign_session() {
     fi
 
     echo "assign[4/5] confirm the worker is processing (window ${confirm_window}s, attempt ${attempt}/2)" >&2
-    sent_at="$(date +%s)"
+    sent_at="$(date +%s)"; prev_counters=""
     while :; do
       now="$(date +%s)"
       (( now - sent_at > confirm_window )) && break
@@ -4318,6 +4331,12 @@ assign_session() {
       if [[ -n "$blocked" && "$blocked" != "startup_pending" ]]; then
         _assign_fail confirm-processing "worker blocked after send: $blocked" "$name"
       fi
+      counters="$(_assign_counters "$st")"
+      if [[ -n "$counters" && -n "$prev_counters" && "$counters" != "$prev_counters" ]] && ! _assign_paste_unsent "$name"; then
+        echo "assign[4/5] an elapsed counter is moving (${counters% }) — the worker is processing" >&2
+        confirmed=1; break
+      fi
+      prev_counters="$counters"
       # Preferred signal: the CLI's busy spinner. Falls back (CLIs whose
       # heuristic family has no busy metric, e.g. generic/agy) to "the pane is
       # still changing well after the prompt injection".
@@ -4374,6 +4393,12 @@ assign_session() {
       sleep 3
     done
     (( confirmed )) && break
+    # A counter on screen means the first send may be queued or running: a
+    # resend would hand the worker the brief twice.
+    if (( attempt == 1 )) && [[ -n "$counters" ]]; then
+      _assign_fail confirm-processing \
+        "no processing activity confirmed within ${confirm_window}s of send, but an elapsed counter is on screen (${counters% }) — the first send may be queued or processing, so the brief was NOT sent again; peek at the worker" "$name"
+    fi
     (( attempt == 1 )) && echo "assign[3/5] no activity after first send — resending once (boot-race self-heal)" >&2
   done
   if (( confirmed )) && [[ "$delivery" == "file-ref" ]]; then
@@ -4914,7 +4939,7 @@ start_session() {
       preflight_reason="$("$JQ" -r '.blocked_reason // empty' <<< "$preflight_json" 2>/dev/null || true)"
       preflight_diag="$("$JQ" -r '.diagnostic // empty' <<< "$preflight_json" 2>/dev/null || true)"
       case "$preflight_reason" in
-        permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
+        permission_prompt|hook_trust_prompt|approval_prompt|login_prompt|update_prompt)
           break   # hard prompt: fail now
           ;;
         startup_pending)
@@ -7196,10 +7221,20 @@ status_pane_text() {
   "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
 }
 
+# The CLI's own UI: from the last composer line (or "Worked for" rule) down.
+# Every CLI's composer glyph counts, the one _assign_paste_unsent reads: with
+# `›` alone, a cursor (`→`) or claude (`❯`/`>`) pane had no boundary and the
+# whole capture was scanned, so an idle worker whose answer quoted "Verifying
+# your account" read as startup_pending forever (live 2026-09-25). A numbered
+# menu line (`› 1. Update now`, `❯ 1. Yes`) is a dialog's cursor, not a
+# composer: it is no boundary, so the question above it stays in the area.
+# ponytail: an unnumbered dialog cursor (`❯ Yes, proceed`) would be taken as the
+# composer and hide its question — UNCONFIRMED on any live CLI; add its shape then.
 current_prompt_area_for_text() {
   local current="$1"
   awk '
-    /^[[:space:]]*›/ || /^[[:space:]]*[─-]+ Worked for / { boundary = NR }
+    /^[[:space:]]*(→|›|❯|>)([[:space:]]|$)/ && !/^[[:space:]]*(→|›|❯|>)[[:space:]]+[0-9]+[.)]/ { boundary = NR }
+    /^[[:space:]]*[─-]+ Worked for / { boundary = NR }
     { lines[NR] = $0 }
     END {
       start = boundary ? boundary : 1
@@ -7288,6 +7323,12 @@ blocked_reason_for_text() {
   if [[ "$lowered" == *"press t to trust"* || "$lowered" == *"hook needs review"* || "$lowered" == *"hooks need review"* || "$lowered" == *"hook(s) need review"* ]]; then
     print -r -- "hook_trust_prompt"; return 0
   fi
+  # A self-update menu (codex 0.156.1: "Update available · … › 1. Update now (runs
+  # `sh -c 'curl … | sh'`) 2. Skip"): Enter picks the install. Dialog-shaped only —
+  # an update word AND a way to skip it — so a footer "update available" hint is not.
+  if [[ ( "$lowered" == *"update available"* || "$lowered" == *"update now"* ) && "$lowered" == *"skip"* ]]; then
+    print -r -- "update_prompt"; return 0
+  fi
   if [[ "$lowered" == *"local command exited with code"* || "$lowered" == *"remote command exited with code"* ]]; then
     print -r -- "cli_exited"
   elif [[ "$lowered" == *"password:"* || "$lowered" == *"permission denied"* || "$lowered" == *"are you sure you want to continue connecting"* ]]; then
@@ -7335,6 +7376,9 @@ diagnostic_for_blocked_reason() {
       ;;
     permission_prompt|approval_prompt|ssh_prompt|login_prompt)
       echo "session may be waiting for interactive confirmation; capture the pane to read the choices, then answer with a mapped key (the keys tool, or agent-tmux <cli> send --key up|down|enter <name>); send --raw is literal and types the word \"Enter\" instead of pressing it"
+      ;;
+    update_prompt)
+      echo "the CLI is showing a self-update menu; nothing was sent and no key was pressed (an Enter would run its installer) — update or skip that CLI by hand (capture the pane, then the keys tool), then send again"
       ;;
     startup_pending)
       echo "CLI is still on a transient startup/verification screen; text sent now would be swallowed — wait for it to clear (status --json) before sending"
@@ -8077,7 +8121,7 @@ status_session() {
     fi
     diagnostic="$(diagnostic_for_blocked_reason "$blocked_reason")"
     case "$blocked_reason" in
-      hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt)
+      hook_trust_prompt|permission_prompt|approval_prompt|ssh_prompt|login_prompt|update_prompt)
         confirmation_detected=true
         ;;
     esac

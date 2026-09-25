@@ -26,6 +26,8 @@ cleanup() {
   "$AGENT_TMUX" foldcli stop fold-whole >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
+  "$AGENT_TMUX" updcli stop upd-smoke >/dev/null 2>&1 || true
+  local n; for n in work-codex work-claude work-frozen; do "$AGENT_TMUX" workcli stop "$n" >/dev/null 2>&1 || true; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -196,6 +198,105 @@ assert_contains "oneline: the warning is kept" "$(cat "$WORK/fold-oneline.err")"
 assert "oneline: result-path instruction not recorded" \
   "$([[ -e "$TMUX_AGENT_DIR/fold-oneline/.result-path-injected" ]] && echo yes || echo no)" "no"
 "$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
+
+# ---- case 3: a self-update menu at boot --------------------------------------
+# Live 2026-09-25, codex 0.156.1: the send's Enter chose "1. Update now", which
+# ran an unapproved `curl … | sh` install and the CLI exited. updcli draws that
+# menu and takes the first line it reads as the answer.
+cat > "$WORK/updcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "updcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac; done
+printf '\033[?1049h'
+printf '  Update available · 0.156.1 → 0.157.0\n\n'
+printf "  › 1. Update now (runs \`sh -c 'curl -fsSL https://example.invalid/install.sh | sh'\`)\n"
+printf '    2. Skip\n    3. Skip until next version\n\n  enter continue · esc skip\n'
+IFS= read -r answer
+printf 'dialog:%s\n' "$answer" >> "$LOG"
+EOF
+chmod +x "$WORK/updcli"
+
+echo
+echo "case: an update menu at boot gets no brief and no key"
+LOG="$WORK/upd.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/upd-smoke"
+code=0
+AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
+  "$AGENT_TMUX" updcli assign --timeout 60 --confirm-window 20 --detach \
+    --prompt-delivery paste upd-smoke "$WORK" "$WORK/brief.txt" \
+    >"$WORK/upd.out" 2>"$WORK/upd.err" || code=$?
+assert "update: assign failed" "$code" "1"
+assert "update: the failed step is send" "$(jq -r .failed_step "$WORK/upd.out" 2>/dev/null)" "send"
+assert_contains "update: the diagnostic names update_prompt" "$(jq -r .diagnostic "$WORK/upd.out" 2>/dev/null)" "update_prompt"
+assert_contains "update: the diagnostic says the brief was not sent" "$(jq -r .diagnostic "$WORK/upd.out" 2>/dev/null)" "the brief was NOT sent"
+assert "update: the menu got no input from assign" "$(cat "$LOG")" ""
+"$AGENT_TMUX" updcli stop upd-smoke >/dev/null 2>&1 || true
+
+# ---- case 4: a worker that is processing but never shows the brief -----------
+# Live 2026-09-25: codex 0.157.0 queued the brief as a one-line preview of the
+# injected first line, and claude folded it; neither showed the brief's first
+# line, so confirm-processing called both launch-failed and pasted the brief a
+# second time. workcli reads the paste, then redraws an elapsed counter every
+# second (--frozen: once) and never echoes the brief. Every line read is logged.
+cat > "$WORK/workcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "workcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null; SHAPE=codex; FROZEN=""
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; --shape) SHAPE="$2"; shift 2 ;; --frozen) FROZEN=1; shift ;; *) shift ;; esac; done
+idle() {
+  if [ "$SHAPE" = codex ]; then printf '› Ask Codex to do anything\n  GPT-6-Astra medium · agent-scripts\n'
+  else printf '❯\n[Opus 5.5 ◔ medium] │ github/tmux-agent-tools git:(main* ↑3)\n'; fi
+}
+draw() {
+  printf '\033[2J\033[H'
+  if [ "$SHAPE" = codex ]; then
+    printf '• Working (%dm %02ds • esc to interrupt)\n' $(($1 / 60)) $(($1 % 60))
+    printf '• Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n'
+    printf '  ↳ Write final JSON to this exact path: …/result.json\n'
+  else
+    printf '● Orbiting… (%ds · ↓ 1.4k tokens · thinking with medium effort)\n' "$1"
+  fi
+  idle
+}
+printf '\033[?1049h'; idle
+IFS= read -r line; printf 'input:%s\n' "$line" >> "$LOG"
+if [ -n "$FROZEN" ]; then draw 27
+else ( s=180; while :; do draw "$s"; s=$((s + 1)); sleep 1; done ) & fi
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$LOG"; done
+EOF
+chmod +x "$WORK/workcli"
+
+work_assign() {  # <name> <launch flags>
+  mkdir -p "$TMUX_AGENT_DIR/$1"; : > "$WORK/$1.log"
+  code=0
+  AGENT_TMUX_LAUNCH_FLAGS="--log $WORK/$1.log $2" \
+    "$AGENT_TMUX" workcli assign --timeout 60 --confirm-window 30 --detach \
+      --prompt-delivery paste "$1" "$WORK" "$WORK/brief.txt" \
+      >"$WORK/$1.out" 2>"$WORK/$1.err" || code=$?
+}
+brief_count() { grep -c '^input:GOAL: prove the brief survives the dialog.' "$WORK/$1.log" || true; }
+
+for shape in codex claude; do
+  echo
+  echo "case: a $shape pane whose elapsed counter moves is processing"
+  work_assign "work-$shape" "--shape $shape"
+  assert "$shape: assign confirmed the worker" "$code" "0"
+  refute_contains "$shape: no resend" "$(cat "$WORK/work-$shape.err")" "resending once"
+  assert "$shape: the brief arrived exactly once" "$(brief_count "work-$shape")" "1"
+  "$AGENT_TMUX" workcli stop "work-$shape" >/dev/null 2>&1 || true
+done
+
+echo
+echo "case: a failed confirm never resends while an elapsed counter is on screen"
+work_assign work-frozen "--shape claude --frozen"
+assert "frozen: assign failed" "$code" "1"
+assert "frozen: the failed step is confirm-processing" "$(jq -r .failed_step "$WORK/work-frozen.out" 2>/dev/null)" "confirm-processing"
+refute_contains "frozen: no resend" "$(cat "$WORK/work-frozen.err")" "resending once"
+assert "frozen: the brief arrived exactly once" "$(brief_count work-frozen)" "1"
+"$AGENT_TMUX" workcli stop work-frozen >/dev/null 2>&1 || true
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

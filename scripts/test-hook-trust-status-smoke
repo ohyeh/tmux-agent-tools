@@ -231,5 +231,34 @@ else
 fi
 "$CODEX_TMUX" stop "$C" >/dev/null 2>&1 || true
 
+# Live 2026-09-25: a cursor-agent worker's final report quoted "Verifying your
+# account"; with no `›` in the pane the whole capture was scanned, so the idle
+# worker read as startup_pending forever and `tell` was refused.
+cat > "$WORK/fake-cursor-quotes.sh" <<'EOF'
+#!/bin/sh
+echo "  Report: the agy boot shows Verifying your account eligibility first."
+echo "  Then it asks: Do you trust this folder? and waits for [y/n]."
+echo "  Do you want to proceed? was the question I answered in the fixture."
+echo ""
+echo " → Add a follow-up"
+echo "   Opus 5.5 · 12% · 3 files edited"
+while IFS= read -r line; do echo "got:$line"; done
+EOF
+chmod +x "$WORK/fake-cursor-quotes.sh"
+
+echo "case: dialog words in an idle worker's transcript are not a dialog"
+Q="cursor-quotes"
+QM="send-past-quoted-words"
+CODEX="$WORK/fake-cursor-quotes.sh" "$CODEX_TMUX" start --exact "$Q" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$Q")"
+assert "quoted words not blocked" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+code=0; "$CODEX_TMUX" send "$Q" "$QM" >/dev/null 2>&1 || code=$?
+assert "send to the quoting worker exit=0" "$code" "0"
+sleep 1
+pane="$(tmux capture-pane -J -t "codex-cli-$Q" -p -S -80)"
+assert "the send reached the worker" "$([[ "$pane" == *"got:$QM"* ]] && echo yes || echo no)" "yes"
+"$CODEX_TMUX" stop "$Q" >/dev/null 2>&1 || true
+
 echo "hook-trust-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
