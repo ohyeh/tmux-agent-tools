@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.10'
+const MOD_VERSION = '0.7.11'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -576,14 +576,31 @@ function sameProject(host: Host, d: TmuxDispatch): boolean {
  * both read one value and only the one it names delivers — no lock needed, no
  * result landing twice (issue #323). Whoever is named delivers on the next tick.
  */
-async function claim(host: Host, root: string, d: TmuxDispatch): Promise<void> {
+async function claim(host: Host, root: string, d: TmuxDispatch): Promise<boolean> {
   const mine = host.owner()
-  if (!mine) return
+  if (!mine) return false
   const next: TmuxDispatch = { ...d, owner: mine, adoptedFrom: d.owner ?? d.adoptedFrom }
-  await host.write(`${root}/${d.name}/dispatch.json`, JSON.stringify(next)).catch((error: unknown) => {
-    host.log(`tmux-agent: could not claim ${d.name}: ${String(error)}`)
-  })
-  host.log(`tmux-agent: claimed "${d.name}" from session ${d.owner ?? '?'} (no heartbeat for ${ORPHAN_MS / 1000}s); delivering from the next tick`)
+  return host.write(`${root}/${d.name}/dispatch.json`, JSON.stringify(next)).then(
+    () => true,
+    (error: unknown) => {
+      host.log(`tmux-agent: could not claim ${d.name}: ${String(error)}`)
+      return false
+    },
+  )
+}
+
+/**
+ * One line per scan, grouped by the session claimed from. A session that ended
+ * (or a /resume that changed this one's id) can leave dozens of records: one
+ * line each flooded the transcript with 40 (live 2026-09-26).
+ */
+function logClaims(host: Host, claimed: Map<string, string[]>): void {
+  for (const [from, names] of claimed) {
+    const shown = names.slice(0, 5).map(n => `"${n}"`).join(', ') + (names.length > 5 ? ` and ${names.length - 5} more` : '')
+    host.log(
+      `tmux-agent: claimed ${names.length} worker(s) from session ${from} (no heartbeat for ${ORPHAN_MS / 1000}s): ${shown}; delivering from the next tick`,
+    )
+  }
 }
 
 async function scan(host: Host): Promise<Scan> {
@@ -594,6 +611,7 @@ async function scan(host: Host): Promise<Scan> {
   const dispatches: TmuxDispatch[] = []
   const visible: TmuxDispatch[] = []
   const present = new Set<string>()
+  const claimed = new Map<string, string[]>()
   let entries: readonly { name: string; kind: string }[]
   try {
     entries = await host.list(root)
@@ -629,11 +647,15 @@ async function scan(host: Host): Promise<Scan> {
       visible.push(d)
       const who = await adoptable(host, root, d, now)
       if (who === 'mine') dispatches.push(d)
-      else if (who === 'orphan') await claim(host, root, d)
+      else if (who === 'orphan' && (await claim(host, root, d))) {
+        const from = d.owner ?? '?'
+        claimed.set(from, [...(claimed.get(from) ?? []), d.name])
+      }
     } catch (error) {
       host.log(`tmux-agent: skipped ${entry.name}: ${String(error)}`)
     }
   }
+  logClaims(host, claimed)
   return { dispatches, present, visible, complete }
 }
 

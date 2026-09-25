@@ -225,6 +225,27 @@ describe('ownership', () => {
     expect(store.key('tmux-agent.reported.sess-A')).toEqual(['orphan@0'])
   })
 
+  test('claiming many orphans of one session logs one line, not one per worker', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const files: Files = {}
+    for (let i = 0; i < 7; i += 1) files[`${ROOT}/o${i}/dispatch.json`] = dispatch(`o${i}`, 0, { owner: 'sess-C', ownerCwd: '/work' })
+    files[`${ROOT}/p0/dispatch.json`] = dispatch('p0', 0, { owner: 'sess-D', ownerCwd: '/work' })
+    mockFs(on, files)
+    const logs = mockQuiet(on)
+    collectorFloor(on)
+
+    await $.session.start(session())
+    const lines = logs.filter(l => l.includes('claimed'))
+    expect(lines).toHaveLength(2)
+    expect(lines.find(l => l.includes('sess-C'))).toContain('claimed 7 worker(s) from session sess-C')
+    expect(lines.find(l => l.includes('sess-C'))).toContain('and 2 more')
+    expect(lines.find(l => l.includes('sess-D'))).toContain('claimed 1 worker(s) from session sess-D (no heartbeat for 90s): "p0"')
+    expect(JSON.parse(files[`${ROOT}/o6/dispatch.json`]!)).toMatchObject({ owner: 'sess-A', adoptedFrom: 'sess-C' })
+  })
+
   test("a record another live collector already claimed is not ours: the second collector stands down", WITH_DRIVER, async ($, on) => {
     // The race of issue #323, one step later: A claimed (owner=sess-A,
     // heartbeat fresh); we are B in the same cwd. Nothing to deliver, nothing to
