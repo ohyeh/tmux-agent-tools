@@ -2307,6 +2307,25 @@ _sentinel_landed() {
   return 1
 }
 
+# Did a paste of <newlines>+1 lines arrive whole? A CLI that folds a paste
+# draws `[Pasted text #N +M lines]` instead of its text; M counts the lines (or
+# the newlines) of what it took, so M >= <newlines> covers the whole payload,
+# first line included. The pane's last prompt-glyph line is the composer: a
+# placeholder there is not submitted (see _assign_paste_unsent), so it never counts.
+_paste_submitted_whole() {
+  "$TMUX" capture-pane -J -p -S -200 -t "$1" 2>/dev/null | awk -v need="$2" '
+    { line[NR] = $0 }
+    /^[[:space:]]*(→|›|❯|>)[[:space:]]/ { box = NR }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (i == box || !match(line[i], /\[Pasted text #[0-9]+ \+[0-9]+ lines?\]/)) continue
+        n = substr(line[i], RSTART, RLENGTH); sub(/^.*\+/, "", n); sub(/ .*$/, "", n)
+        if (n + 0 >= need + 0) found = 1
+      }
+      exit !found
+    }'
+}
+
 task_scope_guard_prepend() {
   printf '%s\n\n%s' "$TASK_SCOPE_GUARD" "$1"
 }
@@ -4168,6 +4187,17 @@ assign_session() {
     ref_line="Your task is in the file $composed — read that ENTIRE file now with your file-read tool, then carry out exactly what it says. The task is not in this message; do not ask for it and do not start work before reading the file."
     echo "assign[3/5] send (file-ref) $composed" >&2
   else
+    # send_session prepends the same two instructions; their delivery is judged
+    # after confirm-processing (below), not by send's own look at the pane.
+    local _paste_payload _paste_nl
+    _paste_payload="$(cat "$prompt")"
+    if task_scope_guard_should_inject "$name" "$_paste_payload"; then
+      _paste_payload="$(task_scope_guard_prepend "$_paste_payload")"; _ref_scope_inject=1
+    fi
+    if result_path_should_inject "$name" "$_paste_payload"; then
+      _paste_payload="$(result_path_prepend "$name" "$_paste_payload")"; _ref_rp_inject=1
+    fi
+    _paste_nl="$(printf '%s' "$_paste_payload" | tr -cd '\n' | wc -c | tr -d ' ')"
     echo "assign[3/5] send --from-file $prompt" >&2
   fi
   # Readiness gate before send: `start` without initial text returns as soon
@@ -4176,18 +4206,37 @@ assign_session() {
   # is silently dropped (observed live 2026-08-08: prompt text above the
   # Codex banner, empty input box after boot). Same policy as the start
   # preflight: wait out startup_pending, fail immediately on hard prompts.
-  local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) rj rreason
+  # "No blocker" must hold on a pane that has settled: one look can land before
+  # the CLI draws its dialog. Observed 2026-09-25: agy, claude and
+  # claude-fable-gate on never-trusted dirs drew the workspace-trust dialog
+  # AFTER the brief was pasted, and the dialog ate it (claude: the first half).
+  # A dialog is never answered here — trusting a directory is the caller's
+  # call — and the brief is not sent into it.
+  # A pane that never settles (a ticking status line) is looked at for
+  # _ASSIGN_SEND_LOOK seconds, dialogs checked on every look, then sent to.
+  # ponytail: fixed windows; a CLI that sits unchanged for _ASSIGN_SEND_SETTLE,
+  # or boots longer than _ASSIGN_SEND_LOOK, before drawing its dialog still
+  # gets the paste, and the confirm step then fails `worker blocked after send`.
+  local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10
+  local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle
   while :; do
     rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
     rreason="$(printf '%s' "$rj" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
     case "$rreason" in
       permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
-        _assign_fail send "worker blocked before send: $rreason" "$name" ;;
+        _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
         (( SECONDS >= ready_deadline )) && _assign_fail send \
           "CLI still starting after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s (startup_pending) — refusing to paste into a swallowing UI" "$name"
         sleep 2 ;;
-      *) break ;;
+      *)
+        ridle="$(printf '%s' "$rj" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
+        [[ -n "$ridle" && "$ridle" -ge "$_ASSIGN_SEND_SETTLE" ]] && break
+        if (( SECONDS >= look_deadline )); then
+          echo "assign[3/5] pane still changing after ${_ASSIGN_SEND_LOOK}s with no dialog on it — sending" >&2
+          break
+        fi
+        sleep 1 ;;
     esac
   done
   # Delivery + processing check, with ONE self-heal resend. A paste that
@@ -4237,7 +4286,7 @@ assign_session() {
       # the reference line would re-introduce the newlines this shape removes.
       send_out="$( ( _PROMPT_ALREADY_COMPOSED=1 send_session "$name" "$ref_line" ) 2>&1 )" || send_rc=$?
     else
-      send_out="$( ( send_session --from-file "$prompt" "$name" ) 2>&1 )" || send_rc=$?
+      send_out="$( ( _SENTINEL_DEFER=1 send_session --from-file "$prompt" "$name" ) 2>&1 )" || send_rc=$?
     fi
     printf '%s\n' "$send_out" >&2
     if (( send_rc != 0 )) || printf '%s' "$send_out" | grep -q '"submitted":false'; then
@@ -4335,6 +4384,22 @@ assign_session() {
       '{schema_version:1,event:$event,tool:$tool,name:$name,prompt_file:$prompt_file,
         text_sha256:$text_sha256,bytes:$bytes,at:$at}')"
     echo "assign[4/5] file-ref delivered: $composed ($ref_bytes bytes, sha256 ${ref_sha[1,12]})" >&2
+  elif (( confirmed )); then
+    # Judged now, with the prompt submitted and the worker processing. At send
+    # time the composer still held the paste, and a CLI that folds a paste
+    # shows only `[Pasted text #1 +24 lines]` — in its transcript too
+    # (cursor-agent, 2026-09-25) — so the marker text never reaches the pane and
+    # every such assign warned UNCONFIRMED although the worker had its path.
+    # A submitted placeholder that covers every line of the payload is the
+    # paste arriving whole, prefixes included: proof for any family.
+    local _paste_session; _paste_session="$(session_for_name "$name")"
+    if _paste_submitted_whole "$_paste_session" "$_paste_nl"; then
+      (( _ref_scope_inject )) && { _SENTINEL_DELIVERY_PROVEN=1 task_scope_guard_mark_injected "$name" || true; }
+      (( _ref_rp_inject )) && { _SENTINEL_DELIVERY_PROVEN=1 result_path_mark_injected "$name" || true; }
+    else
+      (( _ref_scope_inject )) && { task_scope_guard_mark_injected "$name" "$_paste_session" || true; }
+      (( _ref_rp_inject )) && { result_path_mark_injected "$name" "$_paste_session" || true; }
+    fi
   fi
   (( confirmed )) || _assign_fail confirm-processing \
     "no processing activity within ${confirm_window}s of send, even after one resend — the task never reached the CLI" "$name"
@@ -5489,8 +5554,11 @@ send_session() {
     send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
       paste_and_submit "$session" "$buffer_name" "$prompt_text" || return $?
   fi
-  (( _scope_guard_inject )) && { task_scope_guard_mark_injected "$name" "$session" || true; }
-  (( _rp_inject )) && { result_path_mark_injected "$name" "$session" || true; }
+  # assign judges the two instructions itself, once the worker is processing.
+  if [[ "${_SENTINEL_DEFER:-0}" != 1 ]]; then
+    (( _scope_guard_inject )) && { task_scope_guard_mark_injected "$name" "$session" || true; }
+    (( _rp_inject )) && { result_path_mark_injected "$name" "$session" || true; }
+  fi
 
   transcript_emit_send_event "$name" "$transcript_text" "$multiline"
   if [[ -n "$from_file" ]]; then

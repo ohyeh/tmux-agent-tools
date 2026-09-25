@@ -1,0 +1,155 @@
+#!/usr/bin/env zsh
+# Smoke test for two assign defects seen live on 2026-09-25 (tmux-agent mod 0.7.6 e2e):
+#
+#  1. A workspace-trust dialog drawn AFTER assign sent the brief ate it (agy,
+#     claude, claude-fable-gate on never-trusted dirs). assign must see the
+#     dialog before sending, send nothing into it, never answer it, and leave
+#     the brief whole for a resend once the caller has answered.
+#  2. Every successful paste assign warned "result-path delivery UNCONFIRMED":
+#     cursor-agent folds the paste into `[Pasted text #1 +24 lines]`, in its
+#     transcript too, so the marker text never reaches the pane. A submitted
+#     placeholder covering the whole payload is the proof; a short one is not.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-dialog.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+export AGENT_TMUX_PREFLIGHT_TIMEOUT=5
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
+export PATH="$WORK:$PATH"
+cleanup() {
+  "$AGENT_TMUX" trustcli stop trust-smoke >/dev/null 2>&1 || true
+  "$AGENT_TMUX" foldcli stop fold-whole >/dev/null 2>&1 || true
+  "$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" got="$2" want="$3"
+  if [[ "$got" == "$want" ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: got '$got' want '$want'"; FAIL=$((FAIL+1)); fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: '$needle' not in output"; FAIL=$((FAIL+1)); fi
+}
+refute_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: '$needle' is in output"; FAIL=$((FAIL+1)); fi
+}
+
+printf 'GOAL: prove the brief survives the dialog.\nACCEPTANCE: every line arrives.\nREPORT: say done.\n' > "$WORK/brief.txt"
+
+# ---- case 1: the trust dialog comes up after boot -----------------------------
+# trustcli boots for 2 s, then draws a trust dialog whose answer is the first
+# line it reads — exactly how a paste that lands before the dialog is eaten.
+# Paths arrive as launch flags: a running tmux server hands its own env to panes.
+cat > "$WORK/trustcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "trustcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac; done
+echo "trustcli booting"
+sleep 2
+# On the alternate screen, as a TUI draws it: answered, the dialog is gone.
+printf '\033[?1049hDo you trust the files in this folder?\n  1. Yes, proceed\n  2. No, exit\n'
+IFS= read -r answer
+printf '\033[?1049l'
+printf 'dialog:%s\n' "$answer" >> "$LOG"
+echo "> ready"
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$LOG"; printf 'got:%s\n' "$line"; done
+EOF
+chmod +x "$WORK/trustcli"
+
+echo "case: a dialog drawn after boot is seen before the send, and nothing is sent into it"
+LOG="$WORK/trust.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/trust-smoke"
+code=0
+AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
+  "$AGENT_TMUX" trustcli assign --timeout 60 --confirm-window 20 --detach \
+    --prompt-delivery paste trust-smoke "$WORK" "$WORK/brief.txt" \
+    >"$WORK/trust.out" 2>"$WORK/trust.err" || code=$?
+assert "trust: assign failed" "$code" "1"
+assert "trust: the failed step is send" "$(jq -r .failed_step "$WORK/trust.out" 2>/dev/null)" "send"
+assert_contains "trust: the diagnostic says the brief was not sent" "$(jq -r .diagnostic "$WORK/trust.out" 2>/dev/null)" "the brief was NOT sent"
+assert_contains "trust: it names the dialog" "$(jq -r .diagnostic "$WORK/trust.out" 2>/dev/null)" "permission_prompt"
+assert "trust: the dialog got no input from assign" "$(cat "$LOG")" ""
+
+# The caller answers the dialog, then resends: the whole brief arrives.
+code=0; "$AGENT_TMUX" trustcli send --key enter trust-smoke >"$WORK/key.out" 2>&1 || code=$?
+assert "trust: the caller's Enter was sent ($(tail -1 "$WORK/key.out"))" "$code" "0"
+# As a caller would (peek): resend once the dialog is gone.
+for _ in {1..20}; do
+  [[ "$("$AGENT_TMUX" trustcli status --json trust-smoke 2>/dev/null | jq -r '.blocked_reason // empty')" == "" ]] && break
+  sleep 0.5
+done
+code=0; "$AGENT_TMUX" trustcli send --from-file "$WORK/brief.txt" trust-smoke >"$WORK/resend.out" 2>&1 || code=$?
+assert "trust: the resend was sent ($(tail -1 "$WORK/resend.out"))" "$code" "0"
+sleep 2
+got="$(cat "$LOG")"
+assert "trust: the dialog was answered by the caller's key, with no brief text" "$(grep '^dialog:' "$LOG")" "dialog:"
+assert_contains "trust: the brief's first line arrived" "$got" "input:GOAL: prove the brief survives the dialog."
+assert_contains "trust: the brief's last line arrived" "$got" "input:REPORT: say done."
+"$AGENT_TMUX" trustcli stop trust-smoke >/dev/null 2>&1 || true
+
+# ---- case 2: the CLI folds the paste into a placeholder ----------------------
+# foldcli reads one paste burst, draws `[Pasted text #1 +N lines]` (N = lines
+# read, or --show N), writes its result and returns to an empty composer.
+cat > "$WORK/foldcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "foldcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+RES=""; SHOW=""
+while [ $# -gt 0 ]; do case "$1" in --result) RES="$2"; shift 2 ;; --show) SHOW="$2"; shift 2 ;; *) shift ;; esac; done
+echo "> ready"
+while IFS= read -r line; do
+  n=1
+  while IFS= read -r -t 1 line; do n=$((n+1)); done
+  printf '  [Pasted text #1 +%s lines]\n' "${SHOW:-$n}"
+  [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"folded","artifacts":[],"errors":[]}\n' > "$RES"
+  printf '> \n'
+done
+EOF
+chmod +x "$WORK/foldcli"
+
+fold_assign() {  # <name> [extra launch flags]
+  mkdir -p "$TMUX_AGENT_DIR/$1"
+  code=0
+  AGENT_TMUX_LAUNCH_FLAGS="--result $TMUX_AGENT_DIR/$1/result.json ${2:-}" \
+    "$AGENT_TMUX" foldcli assign --timeout 60 --confirm-window 30 --detach \
+      --prompt-delivery paste "$1" "$WORK" "$WORK/brief.txt" \
+      >"$WORK/$1.out" 2>"$WORK/$1.err" || code=$?
+}
+
+echo
+echo "case: a folded paste that covers the whole payload confirms both instructions"
+fold_assign fold-whole
+assert "fold: assign confirmed the worker" "$code" "0"
+refute_contains "fold: no UNCONFIRMED warning" "$(cat "$WORK/fold-whole.err")" "UNCONFIRMED"
+assert "fold: result-path instruction recorded as landed" \
+  "$([[ -e "$TMUX_AGENT_DIR/fold-whole/.result-path-injected" ]] && echo yes || echo no)" "yes"
+assert "fold: scope-guard instruction recorded as landed" \
+  "$([[ -e "$TMUX_AGENT_DIR/fold-whole/scope-guard-injected" ]] && echo yes || echo no)" "yes"
+"$AGENT_TMUX" foldcli stop fold-whole >/dev/null 2>&1 || true
+
+echo
+echo "case: a placeholder shorter than the payload is no proof, and the warning stays"
+fold_assign fold-short "--show 2"
+assert "short: assign confirmed the worker" "$code" "0"
+assert_contains "short: the warning is kept" "$(cat "$WORK/fold-short.err")" "WARNING: result-path delivery UNCONFIRMED"
+assert "short: result-path instruction not recorded" \
+  "$([[ -e "$TMUX_AGENT_DIR/fold-short/.result-path-injected" ]] && echo yes || echo no)" "no"
+"$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+(( FAIL == 0 )) || exit 1
+echo "PASS: assign dialog smoke"

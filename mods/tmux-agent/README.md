@@ -36,7 +36,10 @@ claude plugin install tmux-agent
 多個 session 共用的東西只有一個：已回報集合的 store（每個 plugin 一份檔案，不是
 每個 session）。它沒有原子的 read-modify-write，所以規則是**每個 session 只寫
 自己的 key**（`tmux-agent.reported.<sessionId>`），讀的時候聯集所有 key——沒有
-人能蓋掉別人的 ack，一個 worker 不會被送第二次。已死 session 留下的 key、以及
+人能蓋掉別人的 ack，一個 worker 不會被送第二次。自己的 key 在同一個 session 裡也有
+兩個寫入者（交付與 `stop`），所以每次寫入都排進同一條序列、寫入當下重讀再改：
+`prompt.submit` 要到 turn 邊界才返回，0.7.6 的交付拿著約 80 秒前讀的清單寫回，
+蓋掉了這段時間裡兩次 `stop` 的 ack（2026-09-25 e2e；0.7.7 修）。已死 session 留下的 key、以及
 0.5.1 之前的共用 key，等它們列的目錄都不在磁碟上時才刪。
 （0.5.1 之前的剪除用「我能管的 worker」當依據，別的專案的 session 每 10 秒把你
 的 ack 剪掉、你這邊每 10 秒重送——2026-09-18 實測 131 次；0.5.1 改看磁碟，0.5.2
@@ -72,6 +75,13 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `mcp__tmux-agent__assign` | 派一個 brief 給 `<profile>`，立刻回傳；收據最後一句說 collector 會不會叫你 |
 | `mcp__tmux-agent__tell` | 對同一個 worker 再說一句（下一個任務、修正）。它會 `result init` 重設結果、把訊息連同 result 路徑送進去、把 `dispatch.json` 的 `since` 往前推——新的 id，collector 重新監看，worker 回到面板。對別的 session 派的 worker 也能用：之後它歸你，結果送你 |
 | `mcp__tmux-agent__stop` | 停掉 worker 並把它記為已回報，離開面板；之後不會再有任何投遞 |
+
+**自動 stop（0.7.7）**：終態 result 已交付給**這個** session（ack 在自己的 key）、之後 30 分鐘
+沒有 `tell` 的 worker，會在一個沒有交付的 tick 被停掉——走 `stop` 同一條路，所以離開面板、ack
+照寫——並留一行 log／toast：`auto-stopped "<名字>" — its result was delivered and it had no
+tell for 30 min`。30 分鐘從派工／最後一次 tell、result 的 `finished_at`、本次載入的交付時間三者
+最晚的那個算。不會停：別的 session 的 worker、沒有終態 result.json 的（`tell` 會把它重設，也就是
+進行中的一輪）、pane 已經不在的。每個 tick 最多停一個；session 啟動那一輪不停。
 
 `tell` 的 `since` 保證嚴格大於上一輪（`max(now, since+1)`），因為 id 是
 `<name>@<since>`；同一毫秒內的兩次 tell 或粗粒度時鐘若撞到同一個 since，新一輪
@@ -152,8 +162,15 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 外層 shell 立刻退出，它的 exit code 只代表「背景指令已排入」。真正的 launch
 收據是 child 自己寫的 `launch.exit`：
 
-- `launch.exit` 非 0 → 對帳時以 `launch-failed` 回報，附 `mod-assign.log` 尾段。
-  **不會**讓你等一個永遠不會出現的 result。
+- `launch.exit` 非 0 → 對帳時以 `launch-failed` 回報：wrapper 在 `mod-assign.log`
+  最後那個 JSON 物件裡寫的 `failed_step` 與 `diagnostic`，加上 log 路徑；全文留在檔案裡
+  （0.7.6 以前貼最多 12,000 字元的 log，真正的原因埋在 brief 回顯底下）。log 沒有 JSON
+  物件時附最後 5 行。**不會**讓你等一個永遠不會出現的 result。
+- worker 開在從沒信任過的目錄時，CLI 會在開機後才畫 workspace-trust 對話框。assign 送出前
+  要看到 pane 靜止 3 秒且沒有對話框（最多看 10 秒，每次都查對話框）；看到對話框就**不送**、
+  也不替你回答（信不信任這個目錄是你的決定），以 `failed_step: send`、`the brief was NOT sent`
+  結束。`peek` 看對話框、`keys` 回答，再把 brief 用 `tell` 送一次，整份 brief 就會到。
+  2026-09-25：agy、claude、claude-fable-gate 的 brief 都被晚出現的對話框吃掉（claude 吃掉前半）。
 - `launch.exit` 為 0 但還沒有終態 result → 保持 outstanding。
 
 工具回覆本身明說 `This is NOT proof the worker started`。

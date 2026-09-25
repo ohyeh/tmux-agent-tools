@@ -149,15 +149,15 @@ nothing; there is no result to wait for. Check a host up front with
 A `pending` result is a TERMINATING PROCEDURE, not a verdict: wait out the bound
 → still pending, re-prompt the worker ONCE with the literal path from `result
 --path <name>` and wait one more bounded round → only then may a pane capture
-stand in, labelled UNCONFIRMED and never shipped as verified. `assign`'s
-`result-path delivery UNCONFIRMED` warning is NOT evidence of a delivery
-failure: for a profile with `heuristic_family=generic` the sentinel is never
-marked by design (`_sentinel_trustworthy`), so the warning fires on every
-dispatch while the path instruction is in fact re-injected on every send.
-Diagnose a permanent `pending` from the worker's own state dir, never from
-that warning — and note that a TUI which collapses pasted input (cursor shows
-`[Pasted text #1 +N lines]`) cannot confirm or deny the marker from a pane
-capture either. Stand the proxy DOWN BEFORE stopping the worker it
+stand in, labelled UNCONFIRMED and never shipped as verified. `assign` judges
+the result-path and scope instructions after confirm-processing: the marker
+text in the pane, or a submitted paste placeholder (cursor's `[Pasted text #1
++N lines]`) that covers every line of the payload. Its `result-path delivery
+UNCONFIRMED` warning means neither was seen — for a `heuristic_family=generic`
+profile only the placeholder counts (`_sentinel_trustworthy`), so a generic
+TUI that echoes text instead of folding it still warns while the path is
+re-injected on every send. Diagnose a permanent `pending` from the worker's own
+state dir, never from that warning alone. Stand the proxy DOWN BEFORE stopping the worker it
 supervises. Never brief a proxy to return the
 worker's output verbatim — it may not read that output, so the brief is
 unsatisfiable; have the WORKER write to a declared artifact path and read it

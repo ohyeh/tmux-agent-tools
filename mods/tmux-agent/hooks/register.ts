@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.6'
+const MOD_VERSION = '0.7.7'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -331,6 +331,10 @@ type Gate = {
   probedAt: Map<string, number>
   /** Where the next collect pass starts: the worker the last one deferred or did not reach. */
   collectFrom?: string
+  /** The tail of this activation's ack writes; see `updateAcks`. */
+  acking?: Promise<void>
+  /** When this activation delivered each episode, so an auto-stop counts from the delivery. */
+  deliveredAt: Map<string, number>
 }
 
 function missingSections(brief: string): string[] {
@@ -450,6 +454,28 @@ async function readAcks(host: Host): Promise<Acks> {
     else others.set(key, ids)
   }
   return { mine, all, others }
+}
+
+/**
+ * Every write of this session's own key: re-read, change, write, one at a time.
+ *
+ * A write of a list read earlier drops whatever was acked in between. Observed
+ * 2026-09-25: a delivery waited ~80 s on `prompt.submit` (it resolves at the
+ * turn boundary), two `stop`s acked inside that wait, and the delivery then
+ * wrote its old list — both stopped workers were later notified launch-failed
+ * and exited.
+ * ponytail: serialized per activation only; a hot reload's second activation of
+ * the same session is not in this chain.
+ */
+function updateAcks(host: Host, gate: Gate, change: (mine: string[]) => string[]): Promise<void> {
+  const run = (gate.acking ?? Promise.resolve()).then(async () => {
+    const key = ownKeyOf(host)
+    const mine = asReported(await host.storeGet(key))
+    const next = change(mine)
+    if (next.length !== mine.length || next.some((id, i) => id !== mine[i])) await host.storeSet(key, next)
+  })
+  gate.acking = run.catch(() => undefined)
+  return run
 }
 
 /** Bytes, not UTF-16 units: the store's cap is a byte cap. */
@@ -632,6 +658,10 @@ async function finishedAt(host: Host, path: string, raw: unknown): Promise<numbe
     .catch(() => undefined)
 }
 
+/** A launch-failed notice's bounds: one diagnostic line, or this many log lines when there is no JSON block. */
+const LAUNCH_LINE_MAX = 500
+const LAUNCH_TAIL_LINES = 5
+
 /**
  * The launch receipt.
  *
@@ -653,8 +683,18 @@ async function launchFailure(host: Host, dir: string, since: number): Promise<Fi
   if (wrote !== undefined && wrote < since) return undefined
   const code = Number(text)
   if (!Number.isFinite(code) || code === 0) return undefined
-  const log = (await readOrEmpty(host, `${dir}/mod-assign.log`)).trim()
-  return `agent-tmux assign exited ${code}. Last output:\n${log.slice(-SUMMARY_MAX)}`
+  const logPath = `${dir}/mod-assign.log`
+  const log = (await readOrEmpty(host, logPath)).trim()
+  // The wrapper ends a failed assign with one JSON object (`failed_step`,
+  // `diagnostic`); that is the notice. The log — brief echo, pane tail — stays
+  // in the file: 12,000 chars of it buried the one line that said why.
+  const block = parseJson(log.slice(log.lastIndexOf('\n{') + 1)) as { failed_step?: unknown; diagnostic?: unknown } | undefined
+  const line = (v: unknown) => (typeof v === 'string' ? v.replace(CTRL_ALL_RE, ' ').trim().slice(0, LAUNCH_LINE_MAX) : '')
+  if (line(block?.failed_step)) {
+    return `agent-tmux assign exited ${code} at step "${line(block?.failed_step)}": ${line(block?.diagnostic) || '(no diagnostic)'}. Full log: ${logPath}`
+  }
+  const tail = log.split('\n').slice(-LAUNCH_TAIL_LINES).join('\n').slice(-LAUNCH_LINE_MAX * LAUNCH_TAIL_LINES)
+  return `agent-tmux assign exited ${code}. Last lines:\n${tail}\nFull log: ${logPath}`
 }
 
 async function collect(
@@ -1195,6 +1235,10 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
   // and is deleted here only once nothing it names is on disk any more (a
   // closed session's leftovers, or the pre-0.5.2 shared key).
   const keep = pruned(stored, present, complete)
+  // What this pass decided to prune, applied to the key as it is at write time:
+  // an ack written since the read (a stop, a worker this scan has not seen) stays.
+  const gone = new Set(stored.filter(id => !keep.includes(id)))
+  const prune = (mine: string[]) => mine.filter(id => !gone.has(id))
   if (complete) {
     for (const [key, ids] of acks.others) {
       if (ids.every(id => !present.has(episodeOf(id)))) await host.storeDelete(key).catch(() => undefined)
@@ -1215,7 +1259,9 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
 
   if (!done.length) {
     // Nothing to say, but a shrunken keep-set is still worth writing back.
-    if (keep.length !== stored.length) await host.storeSet(ownKeyOf(host), keep)
+    if (gone.size) await updateAcks(host, gate, prune)
+    // Quiet ticks only: a stop is a subprocess inside the hook's budget.
+    if (probeStalls) await autoStop(host, gate, root, dispatches, new Set(keep), now)
     return
   }
 
@@ -1265,8 +1311,44 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
 
   gate.failures = 0
   gate.nextAttemptAt = 0
-  // Only what the session actually accepted is acknowledged, in one write.
-  await host.storeSet(ownKeyOf(host), next)
+  for (const f of included) gate.deliveredAt.set(idOf(f.d), await host.now())
+  // Only what the session actually accepted is acknowledged, in one write —
+  // onto the key as it is NOW: `submit` can hold this tick for a whole turn.
+  const acked = included.map(ackOf)
+  await updateAcks(host, gate, mine => [...prune(mine).filter(id => !acked.includes(id)), ...acked])
+}
+
+/** A delivered teammate left alone this long is stopped (Q-1, decided 2026-09-25). */
+const AUTO_STOP_MS = 30 * 60_000
+
+/**
+ * Stop a teammate that is done and left alone: its terminal result was
+ * delivered to THIS session (the ack is in our own key), it has had no tell
+ * since, and nothing happened to it for AUTO_STOP_MS. The `stop` path, so it
+ * leaves the panel acked. Never a worker another session owns, one without a
+ * terminal result.json (a tell resets it: mid-episode), or one whose delivery
+ * is younger than the TTL. One per tick: a stop runs up to 8 s.
+ */
+async function autoStop(host: Host, gate: Gate, root: string, dispatches: readonly TmuxDispatch[], mine: ReadonlySet<string>, now: number): Promise<void> {
+  // `dispatches` holds only what this session may deliver (see `scan`), and an
+  // ack in OUR key is a delivery to us: another live owner's worker is in neither.
+  const quiet = dispatches.filter(d => mine.has(idOf(d)) && now - Math.max(d.since, gate.deliveredAt.get(idOf(d)) ?? d.since) >= AUTO_STOP_MS)
+  if (!quiet.length) return
+  const alive = await liveSessions(host, quiet[0]!.dir, gate)
+  for (const d of quiet) {
+    if (!hasSession(alive, d)) continue
+    const path = `${root}/${d.name}/result.json`
+    const raw = parseJson(await readOrEmpty(host, path)) as { status?: unknown; body?: { status?: unknown } } | undefined
+    const status = raw?.status ?? raw?.body?.status
+    if (typeof status !== 'string' || !TERMINAL.has(status)) continue
+    const at = await finishedAt(host, path, raw)
+    if (at !== undefined && now - at < AUTO_STOP_MS) continue
+    const out = await stopWorker(host, gate, d)
+    const line = `tmux-agent: auto-stopped "${d.name}" — its result was delivered and it had no tell for ${AUTO_STOP_MS / 60_000} min${out.ok ? '' : ` (${out.text})`}`
+    host.log(line)
+    host.toast(line)
+    return
+  }
 }
 
 type Outcome = { ok: true; text: string } | { ok: false; text: string }
@@ -1333,7 +1415,7 @@ async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch): Promise<Outc
   )
   const acks = await readAcks(host)
   const id = idOf(d)
-  if (!acks.all.has(id)) await host.storeSet(ownKeyOf(host), [...acks.mine, id])
+  if (!acks.all.has(id)) await updateAcks(host, gate, mine => (mine.includes(id) ? mine : [...mine, id]))
   gate.stalled.delete(id)
   gate.exited.delete(id)
   return run.exitCode === 0
@@ -1447,6 +1529,7 @@ export const register: Register = on => {
     exited: new Set(),
     blocked: new Map(),
     probedAt: new Map(),
+    deliveredAt: new Map(),
   }
 
   on('engine.create', async ($, e, next) => {
@@ -1532,7 +1615,11 @@ export const register: Register = on => {
           profile: { type: 'string', description: 'agent-tmux profile or cli name' },
           name: { type: 'string', description: 'worker name (tmux session)' },
           dir: { type: 'string', description: 'absolute working directory for the worker' },
-          brief: { type: 'string' },
+          brief: {
+            type: 'string',
+            description:
+              'the task, with GOAL, ACCEPTANCE and REPORT sections; the wrapper prepends the result.json path and scope instructions, so do not repeat them',
+          },
         },
         required: ['profile', 'name', 'dir', 'brief'],
       },

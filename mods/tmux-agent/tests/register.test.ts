@@ -98,8 +98,10 @@ function mockStore(
   seed: string[] = [],
   /** Which key the seed sits under: the pre-0.5.2 shared key by default, or a session's own. */
   seedKey = 'tmux-agent.reported',
+  /** More keys to seed, e.g. another session's. */
+  more: Record<string, string[]> = {},
 ): { acked: () => string[]; key: (k: string) => string[]; keys: () => string[] } {
-  const kv = new Map<string, unknown>()
+  const kv = new Map<string, unknown>(Object.entries(more))
   if (seed.length) kv.set(seedKey, seed)
   on('store.get', ($, e) => ({ value: kv.get(e.key) }))
   on('store.set', ($, e) => {
@@ -3224,5 +3226,167 @@ describe('fable review of 95f32f0', () => {
     const down = ((tree as { children?: unknown[] }).children ?? []).find(c => textOf(c).startsWith('⚠'))
     expect(textOf(down), 'the pause reason is drawn').toContain('over budget')
     expect((down as { props?: { wrap?: string } }).props?.wrap).toBe('truncate-end')
+  })
+})
+
+describe('live e2e of 0.7.6', () => {
+  /** Every argv, a live fleet a `stop` shrinks, and the logs; `status` answers running. */
+  const fleet = (on: On, alive: string[]) => {
+    const argv: string[][] = []
+    const logs: string[] = []
+    const sessions = new Set(alive.map(n => `codex-cli-${n}`))
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    on('ui.toast', () => ({ value: undefined }))
+    on('ui.log', ($, e) => {
+      logs.push(e.text)
+      return { value: undefined }
+    })
+    on('turn.complete', () => ({ text: '' }))
+    on('process.run', ($, e) => {
+      argv.push([...e.argv])
+      if (e.argv[0] === 'tmux') return { value: { exitCode: 0, stdout: [...sessions].join('\n'), stderr: '' } }
+      if (e.argv[2] === 'stop') sessions.delete(`codex-cli-${e.argv[3]}`)
+      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":5}', stderr: '' } }
+    })
+    return { argv, logs, stopped: () => argv.filter(a => a[2] === 'stop').map(a => a[3]) }
+  }
+
+  test('a stop acked while a delivery waits on submit survives the delivery\'s ack write (A)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const files: Files = {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }),
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0, { owner: 'sess-A', ownerCwd: '/work' }),
+    }
+    mockFs(on, files)
+    fleet(on, ['w1', 'w2'])
+    // `prompt.submit` resolves at the turn boundary: observed 2026-09-25, a
+    // delivery submitted at 14:34 entered at 14:35:32, and two stops ran inside.
+    const woken: string[] = []
+    let release!: () => void
+    const turnEnds = new Promise<void>(resolve => (release = resolve))
+    on('prompt.submit', async ($, e) => {
+      woken.push(e.text)
+      await turnEnds
+      return { text: e.text }
+    })
+
+    await $.session.start(session())
+    files[`${ROOT}/w1/result.json`] = finished('w1 done')
+    const tick = $.turn.complete(turn())
+    for (let i = 0; i < 100 && !woken.length; i += 1) await settle()
+    expect(woken.length, 'the delivery is waiting on submit').toEqual(1)
+
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__stop' as const, name: 'w2' }))).toContain('stopped \\"w2\\"')
+    expect(store.key('tmux-agent.reported.sess-A')).toEqual(['w2@0'])
+    release()
+    await tick
+
+    expect(store.key('tmux-agent.reported.sess-A').sort(), "the delivery's write keeps the stop's ack").toEqual(['w1@0', 'w2@0'])
+  })
+
+  test('a launch-failed notice is the failed step, its diagnostic and the log path — not the log (D)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const block = JSON.stringify(
+      { schema_version: 1, tool: 'claude', name: 'w1', assigned: false, failed_step: 'send', diagnostic: 'worker blocked before send: permission_prompt' },
+      null,
+      2,
+    )
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+      [`${ROOT}/w1/launch.exit`]: '1\n',
+      [`${ROOT}/w1/mod-assign.log`]: `assign[1/5] start\n${'BRIEF ECHO '.repeat(900)}\nassign: last pane output:\n{ "pane": "json-looking pane line" }\n${block}\n`,
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0),
+      [`${ROOT}/w2/launch.exit`]: '1\n',
+      [`${ROOT}/w2/mod-assign.log`]: Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join('\n'),
+    })
+    const woken = mockWake(on)
+
+    await $.turn.complete(turn())
+    const text = woken.join('\n')
+    expect(text).toContain('agent-tmux assign exited 1 at step "send": worker blocked before send: permission_prompt')
+    expect(text).toContain(`Full log: ${ROOT}/w1/mod-assign.log`)
+    expect(text, 'the log stays in the file').not.toContain('BRIEF ECHO')
+    expect(text, 'no JSON block: the last lines, and the path').toContain('line 20')
+    expect(text).toContain(`Full log: ${ROOT}/w2/mod-assign.log`)
+    expect(text).not.toContain('line 15')
+    expect(text.length).toBeLessThan(2_000)
+  })
+
+  test('assign describes its brief parameter (E)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, {})
+    const schemas: Record<string, unknown> = {}
+    on('tool.register', ($, e) => {
+      schemas[e.name] = e.inputSchema
+      return { value: { tool: e.name } }
+    })
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start(session())
+    const brief = (schemas.assign as { properties?: { brief?: { description?: string } } }).properties?.brief
+    expect(brief?.description).toContain('GOAL, ACCEPTANCE and REPORT')
+    expect(brief?.description).toContain('do not repeat them')
+  })
+
+  test('a delivered teammate with no tell for 30 min is stopped; another owner, mid-episode, young, gone or just delivered is not (F)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const ago = -40 * 60_000
+    const store = mockStore(on, ['done', 'adopted', 'mid', 'young', 'gone'].map(n => `${n}@${ago}`), 'tmux-agent.reported.sess-A', {
+      // sess-C is gone and delivered "orphan" before it went: we adopt it, it was never delivered to us.
+      'tmux-agent.reported.sess-C': [`orphan@${ago}`],
+    })
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const at = (ms: number) => JSON.stringify({ status: 'success', summary: 'ok', finished_at: new Date(ms).toISOString() })
+    const mine = { owner: 'sess-A', ownerCwd: '/work' }
+    const files: Files = {
+      [`${ROOT}/done/dispatch.json`]: dispatch('done', ago, mine),
+      [`${ROOT}/done/result.json`]: at(ago),
+      // sess-B took it over and is alive (heartbeat mtime = now): not ours to stop.
+      [`${ROOT}/.collector-sess-B`]: '0',
+      [`${ROOT}/adopted/dispatch.json`]: dispatch('adopted', ago, { owner: 'sess-B', ownerCwd: '/work', adoptedFrom: 'sess-A' }),
+      [`${ROOT}/adopted/result.json`]: at(ago),
+      // Mid-episode: no terminal result.json (a tell reset it, or it never came).
+      [`${ROOT}/mid/dispatch.json`]: dispatch('mid', ago, mine),
+      [`${ROOT}/young/dispatch.json`]: dispatch('young', ago, mine),
+      [`${ROOT}/young/result.json`]: at(-10 * 60_000),
+      [`${ROOT}/gone/dispatch.json`]: dispatch('gone', ago, mine),
+      [`${ROOT}/gone/result.json`]: at(ago),
+      [`${ROOT}/orphan/dispatch.json`]: dispatch('orphan', ago, { owner: 'sess-C', ownerCwd: '/work' }),
+      [`${ROOT}/orphan/result.json`]: at(ago),
+      [`${ROOT}/fresh/dispatch.json`]: dispatch('fresh', ago, mine),
+    }
+    mockFs(on, files)
+    const run = fleet(on, ['done', 'adopted', 'mid', 'young', 'orphan', 'fresh'])
+    const woken: string[] = []
+    on('prompt.submit', ($, e) => {
+      woken.push(e.text)
+      return { text: e.text }
+    })
+
+    await $.session.start(session())
+    expect(run.stopped(), 'the startup pass stops nothing').toEqual([])
+
+    files[`${ROOT}/fresh/result.json`] = at(ago)
+    await $.turn.complete(turn())
+    expect(woken.join('\n'), 'fresh is delivered now, and this tick stops nothing').toContain('"fresh"')
+    expect(run.stopped()).toEqual([])
+
+    await $.turn.complete(turn())
+    expect(run.stopped()).toEqual(['done'])
+    expect(run.logs.join('\n')).toContain('auto-stopped "done" — its result was delivered and it had no tell for 30 min')
+    expect(store.key('tmux-agent.reported.sess-A')).toContain(`done@${ago}`)
+
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(run.stopped(), 'nothing else qualifies').toEqual(['done'])
   })
 })
