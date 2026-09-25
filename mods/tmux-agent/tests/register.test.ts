@@ -3230,8 +3230,8 @@ describe('fable review of 95f32f0', () => {
 })
 
 describe('live e2e of 0.7.6', () => {
-  /** Every argv, a live fleet a `stop` shrinks, and the logs; `status` answers running. */
-  const fleet = (on: On, alive: string[]) => {
+  /** Every argv, a live fleet a `stop` shrinks, and the logs. `status` defaults to a busy pane. */
+  const fleet = (on: On, alive: string[], statusFor?: (name: string) => { exitCode: number; stdout: string; stderr?: string }) => {
     const argv: string[][] = []
     const logs: string[] = []
     const sessions = new Set(alive.map(n => `codex-cli-${n}`))
@@ -3247,6 +3247,10 @@ describe('live e2e of 0.7.6', () => {
       argv.push([...e.argv])
       if (e.argv[0] === 'tmux') return { value: { exitCode: 0, stdout: [...sessions].join('\n'), stderr: '' } }
       if (e.argv[2] === 'stop') sessions.delete(`codex-cli-${e.argv[3]}`)
+      if (e.argv[2] === 'status' && statusFor) {
+        const ans = statusFor(String(e.argv[4]))
+        return { value: { exitCode: ans.exitCode, stdout: ans.stdout, stderr: ans.stderr ?? '' } }
+      }
       return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":5}', stderr: '' } }
     })
     return { argv, logs, stopped: () => argv.filter(a => a[2] === 'stop').map(a => a[3]) }
@@ -3365,7 +3369,10 @@ describe('live e2e of 0.7.6', () => {
       [`${ROOT}/fresh/dispatch.json`]: dispatch('fresh', ago, mine),
     }
     mockFs(on, files)
-    const run = fleet(on, ['done', 'adopted', 'mid', 'young', 'orphan', 'fresh'])
+    const run = fleet(on, ['done', 'adopted', 'mid', 'young', 'orphan', 'fresh'], () => ({
+      exitCode: 0,
+      stdout: '{"exists":true,"running":true,"idle_seconds":1800}',
+    }))
     const woken: string[] = []
     on('prompt.submit', ($, e) => {
       woken.push(e.text)
@@ -3388,5 +3395,52 @@ describe('live e2e of 0.7.6', () => {
     await $.turn.complete(turn())
     await $.turn.complete(turn())
     expect(run.stopped(), 'nothing else qualifies').toEqual(['done'])
+  })
+
+  test('auto-stop skips a busy pane and a failed status read; an idle pane is stopped (F-1)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const ago = -40 * 60_000
+    mockStore(on, ['busy', 'idle', 'down'].map(n => `${n}@${ago}`), 'tmux-agent.reported.sess-A')
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const at = (ms: number) => JSON.stringify({ status: 'success', summary: 'ok', finished_at: new Date(ms).toISOString() })
+    const mine = { owner: 'sess-A', ownerCwd: '/work' }
+    mockFs(on, {
+      [`${ROOT}/busy/dispatch.json`]: dispatch('busy', ago, mine),
+      [`${ROOT}/busy/result.json`]: at(ago),
+      [`${ROOT}/idle/dispatch.json`]: dispatch('idle', ago, mine),
+      [`${ROOT}/idle/result.json`]: at(ago),
+      [`${ROOT}/down/dispatch.json`]: dispatch('down', ago, mine),
+      [`${ROOT}/down/result.json`]: at(ago),
+    })
+    const run = fleet(on, ['busy', 'idle', 'down'], name => {
+      if (name === 'down') throw new Error('status pipe broken')
+      if (name === 'busy') return { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":5}' }
+      return { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":1800}' }
+    })
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+
+    await $.session.start(session())
+    await $.turn.complete(turn())
+    expect(run.stopped(), 'the idle pane is the one stop; busy is left alone').toEqual(['idle'])
+    await $.turn.complete(turn())
+    expect(run.stopped(), 'a status error is not a stop').toEqual(['idle'])
+    expect(run.logs.join('\n'), 'the failed read is why').toContain('not auto-stopping "down" — status read failed:')
+  })
+
+  test('a markdown heading is a brief section; a brief with none of the words is not (E)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, {})
+    mockPanel(on, { running: true, idle_seconds: 60 })
+    await $.session.start(session())
+    const ok = JSON.stringify(
+      await $.tool.call({ ...assignInput(), brief: '# GOAL: x\n## ACCEPTANCE: y\n## REPORT: z' }),
+    )
+    expect(ok, '# GOAL and ## REPORT count').not.toContain('brief is missing')
+    expect(ok).toContain('collector: active')
+    const denied = JSON.stringify(await $.tool.call({ ...assignInput('w2'), brief: 'no section words here' }))
+    expect(denied).toContain('brief is missing')
   })
 })

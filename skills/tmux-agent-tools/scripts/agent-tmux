@@ -2307,11 +2307,13 @@ _sentinel_landed() {
   return 1
 }
 
-# Did a paste of <newlines>+1 lines arrive whole? A CLI that folds a paste
-# draws `[Pasted text #N +M lines]` instead of its text; M counts the lines (or
-# the newlines) of what it took, so M >= <newlines> covers the whole payload,
-# first line included. The pane's last prompt-glyph line is the composer: a
-# placeholder there is not submitted (see _assign_paste_unsent), so it never counts.
+# Did a paste arrive whole? A CLI that folds a paste draws
+# `[Pasted text #N +M lines]` instead of its text. M must be at least the
+# number of lines in the payload (newlines + 1): a count of lines that is
+# short by one used to pass `M >= newlines` and mark a partial paste injected.
+# A CLI that counts newlines instead then only hits the old false warning.
+# The pane's last prompt-glyph line is the composer: a placeholder there is
+# not submitted (see _assign_paste_unsent), so it never counts.
 _paste_submitted_whole() {
   "$TMUX" capture-pane -J -p -S -200 -t "$1" 2>/dev/null | awk -v need="$2" '
     { line[NR] = $0 }
@@ -2320,7 +2322,7 @@ _paste_submitted_whole() {
       for (i = 1; i <= NR; i++) {
         if (i == box || !match(line[i], /\[Pasted text #[0-9]+ \+[0-9]+ lines?\]/)) continue
         n = substr(line[i], RSTART, RLENGTH); sub(/^.*\+/, "", n); sub(/ .*$/, "", n)
-        if (n + 0 >= need + 0) found = 1
+        if (n + 0 >= need + 1) found = 1
       }
       exit !found
     }'
@@ -4218,7 +4220,7 @@ assign_session() {
   # or boots longer than _ASSIGN_SEND_LOOK, before drawing its dialog still
   # gets the paste, and the confirm step then fails `worker blocked after send`.
   local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10
-  local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle
+  local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle _saw_startup=0
   while :; do
     rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
     rreason="$(printf '%s' "$rj" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
@@ -4226,10 +4228,18 @@ assign_session() {
       permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
         _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
+        _saw_startup=1
         (( SECONDS >= ready_deadline )) && _assign_fail send \
           "CLI still starting after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s (startup_pending) — refusing to paste into a swallowing UI" "$name"
         sleep 2 ;;
       *)
+        # The look window is anchored at loop entry. A long "verifying your
+        # account" screen burns it, and the first settled look would then send
+        # with idle_seconds ≈ 0. Start the window over once that screen is gone.
+        if (( _saw_startup )); then
+          _saw_startup=0
+          look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK ))
+        fi
         ridle="$(printf '%s' "$rj" | "$JQ" -r '.idle_seconds // empty' 2>/dev/null || true)"
         [[ -n "$ridle" && "$ridle" -ge "$_ASSIGN_SEND_SETTLE" ]] && break
         if (( SECONDS >= look_deadline )); then

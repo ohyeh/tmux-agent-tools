@@ -22,8 +22,10 @@ export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
 export PATH="$WORK:$PATH"
 cleanup() {
   "$AGENT_TMUX" trustcli stop trust-smoke >/dev/null 2>&1 || true
+  "$AGENT_TMUX" bootcli stop boot-smoke >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-whole >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
+  "$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -100,6 +102,41 @@ assert_contains "trust: the brief's first line arrived" "$got" "input:GOAL: prov
 assert_contains "trust: the brief's last line arrived" "$got" "input:REPORT: say done."
 "$AGENT_TMUX" trustcli stop trust-smoke >/dev/null 2>&1 || true
 
+# ---- case 1b: startup screen outlasts the look window, then a dialog ---------
+# "Verifying your account" is startup_pending. It lasts longer than the 10s
+# look, then the pane clears and a trust dialog follows 1s later. The look
+# window must start over, or the brief is pasted into that dialog.
+cat > "$WORK/bootcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "bootcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac; done
+printf '\033[?1049hVerifying your account eligibility\n'
+sleep 12
+printf '\033[2J\033[H> ready\n'
+sleep 1
+printf '\033[2J\033[HDo you trust the files in this folder?\n  1. Yes, proceed\n'
+IFS= read -r answer
+printf 'dialog:%s\n' "$answer" >> "$LOG"
+EOF
+chmod +x "$WORK/bootcli"
+
+echo
+echo "case: a startup screen longer than the look window, then a dialog, gets no brief"
+LOG="$WORK/boot.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/boot-smoke"
+code=0
+AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
+  "$AGENT_TMUX" bootcli assign --timeout 60 --confirm-window 20 --detach \
+    --prompt-delivery paste boot-smoke "$WORK" "$WORK/brief.txt" \
+    >"$WORK/boot.out" 2>"$WORK/boot.err" || code=$?
+assert "boot: assign failed" "$code" "1"
+assert "boot: the failed step is send" "$(jq -r .failed_step "$WORK/boot.out" 2>/dev/null)" "send"
+assert_contains "boot: the diagnostic says the brief was not sent" "$(jq -r .diagnostic "$WORK/boot.out" 2>/dev/null)" "the brief was NOT sent"
+assert "boot: the dialog got no input from assign" "$(cat "$LOG")" ""
+"$AGENT_TMUX" bootcli stop boot-smoke >/dev/null 2>&1 || true
+
 # ---- case 2: the CLI folds the paste into a placeholder ----------------------
 # foldcli reads one paste burst, draws `[Pasted text #1 +N lines]` (N = lines
 # read, or --show N), writes its result and returns to an empty composer.
@@ -107,13 +144,15 @@ cat > "$WORK/foldcli" <<'EOF'
 #!/bin/bash
 [ "$1" = "--version" ] && { echo "foldcli 1.0"; exit 0; }
 stty -echo 2>/dev/null
-RES=""; SHOW=""
-while [ $# -gt 0 ]; do case "$1" in --result) RES="$2"; shift 2 ;; --show) SHOW="$2"; shift 2 ;; *) shift ;; esac; done
+RES=""; SHOW=""; SHORT=""
+while [ $# -gt 0 ]; do case "$1" in --result) RES="$2"; shift 2 ;; --show) SHOW="$2"; shift 2 ;; --short) SHORT="$2"; shift 2 ;; *) shift ;; esac; done
 echo "> ready"
 while IFS= read -r line; do
   n=1
   while IFS= read -r -t 1 line; do n=$((n+1)); done
-  printf '  [Pasted text #1 +%s lines]\n' "${SHOW:-$n}"
+  show="${SHOW:-$n}"
+  [ -n "$SHORT" ] && show=$((n - SHORT))
+  printf '  [Pasted text #1 +%s lines]\n' "$show"
   [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"folded","artifacts":[],"errors":[]}\n' > "$RES"
   printf '> \n'
 done
@@ -148,6 +187,15 @@ assert_contains "short: the warning is kept" "$(cat "$WORK/fold-short.err")" "WA
 assert "short: result-path instruction not recorded" \
   "$([[ -e "$TMUX_AGENT_DIR/fold-short/.result-path-injected" ]] && echo yes || echo no)" "no"
 "$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
+
+echo
+echo "case: a placeholder one line short of the payload is not accepted"
+fold_assign fold-oneline "--short 1"
+assert "oneline: assign confirmed the worker" "$code" "0"
+assert_contains "oneline: the warning is kept" "$(cat "$WORK/fold-oneline.err")" "WARNING: result-path delivery UNCONFIRMED"
+assert "oneline: result-path instruction not recorded" \
+  "$([[ -e "$TMUX_AGENT_DIR/fold-oneline/.result-path-injected" ]] && echo yes || echo no)" "no"
+"$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

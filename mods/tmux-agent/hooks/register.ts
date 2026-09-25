@@ -338,7 +338,8 @@ type Gate = {
 }
 
 function missingSections(brief: string): string[] {
-  return REQUIRED_SECTIONS.filter(s => !new RegExp(`^\\s*${s}\\b`, 'm').test(brief))
+  // A heading (`# GOAL`) or bold (`**GOAL**`) is still the section word.
+  return REQUIRED_SECTIONS.filter(s => !new RegExp(`^\\s*(?:#{1,6}\\s*|\\*\\*)?${s}\\b`, 'm').test(brief))
 }
 
 /**
@@ -913,7 +914,8 @@ function pruned(reported: readonly string[], seen: ReadonlySet<string>, complete
  * `idle_seconds` (#98). Re-deriving it in the mod would be a second, drifting
  * copy of the same measurement — this reads the one the CLI already maintains.
  *
- * Nothing is killed. A quiet pane is only logged. A worker the CLI itself stopped
+ * Nothing is killed here — a delivered worker left alone is stopped by `autoStop`.
+ * A quiet pane is only logged. A worker the CLI itself stopped
  * (a usage window, lost credentials) wakes the session ONCE per episode: nothing
  * will arrive from it until someone acts, and an owner left waiting on a result
  * that cannot come is the silence this mod exists to remove (2026-09-24: two
@@ -1324,10 +1326,12 @@ const AUTO_STOP_MS = 30 * 60_000
 /**
  * Stop a teammate that is done and left alone: its terminal result was
  * delivered to THIS session (the ack is in our own key), it has had no tell
- * since, and nothing happened to it for AUTO_STOP_MS. The `stop` path, so it
- * leaves the panel acked. Never a worker another session owns, one without a
- * terminal result.json (a tell resets it: mid-episode), or one whose delivery
- * is younger than the TTL. One per tick: a stop runs up to 8 s.
+ * since, and nothing happened to it for AUTO_STOP_MS. The pane must also have
+ * been idle that long (`status --json`): a human in the pane, or a shell
+ * `send`, keeps the worker busy while those clocks stay old. The `stop` path,
+ * so it leaves the panel acked. Never a worker another session owns, one
+ * without a terminal result.json (a tell resets it: mid-episode), or one whose
+ * delivery is younger than the TTL. One per tick: a stop runs up to 8 s.
  */
 async function autoStop(host: Host, gate: Gate, root: string, dispatches: readonly TmuxDispatch[], mine: ReadonlySet<string>, now: number): Promise<void> {
   // `dispatches` holds only what this session may deliver (see `scan`), and an
@@ -1343,6 +1347,34 @@ async function autoStop(host: Host, gate: Gate, root: string, dispatches: readon
     if (typeof status !== 'string' || !TERMINAL.has(status)) continue
     const at = await finishedAt(host, path, raw)
     if (at !== undefined && now - at < AUTO_STOP_MS) continue
+    // Same read as flagStalls. Stopping is destructive: no parseable idle clock
+    // that already covers the whole window, and no stop.
+    let probe: { exitCode: number; stdout: string; stderr: string }
+    try {
+      probe = await host.run(['agent-tmux', d.profile, 'status', '--json', d.name], d.dir, STALL_PROBE_MS)
+    } catch (error) {
+      host.log(`tmux-agent: not auto-stopping "${d.name}" — status read failed: ${String(error)}`)
+      continue
+    }
+    if (probe.exitCode !== 0) {
+      const why = (probe.stderr || probe.stdout).trim().slice(-200)
+      host.log(`tmux-agent: not auto-stopping "${d.name}" — status read failed: exit ${probe.exitCode}${why ? ` ${why}` : ''}`)
+      continue
+    }
+    const st = parseJson(probe.stdout)
+    if (typeof st !== 'object' || st === null) {
+      host.log(`tmux-agent: not auto-stopping "${d.name}" — status read failed: not JSON`)
+      continue
+    }
+    const row = st as { running?: unknown; idle_seconds?: unknown }
+    const idle = typeof row.idle_seconds === 'number' ? row.idle_seconds : undefined
+    if (idle === undefined) {
+      host.log(`tmux-agent: not auto-stopping "${d.name}" — status read failed: no idle_seconds`)
+      continue
+    }
+    // Short idle, or a live CLI whose pane has not sat still for the whole
+    // window: someone is in the turn. A prompt idle for AUTO_STOP_MS is stopped.
+    if (idle < AUTO_STOP_MS / 1000 || (row.running === true && idle < AUTO_STOP_MS / 1000)) continue
     const out = await stopWorker(host, gate, d)
     const line = `tmux-agent: auto-stopped "${d.name}" — its result was delivered and it had no tell for ${AUTO_STOP_MS / 60_000} min${out.ok ? '' : ` (${out.text})`}`
     host.log(line)
