@@ -260,5 +260,24 @@ pane="$(tmux capture-pane -J -t "codex-cli-$Q" -p -S -80)"
 assert "the send reached the worker" "$([[ "$pane" == *"got:$QM"* ]] && echo yes || echo no)" "yes"
 "$CODEX_TMUX" stop "$Q" >/dev/null 2>&1 || true
 
+# Live 2026-09-25: a brief echoed above cursor-agent's banner, before any
+# composer was drawn, read as permission_prompt from its quoted words. With no
+# composer only the last 20 non-empty lines are the CLI's UI.
+cat > "$WORK/fake-nocomposer.sh" <<'EOF'
+#!/bin/sh
+echo "Write answer.txt: Verifying your account / trust this folder / [y/n]"
+i=1; while [ $i -le 22 ]; do echo "  banner line $i"; i=$((i+1)); done
+while IFS= read -r line; do :; done
+EOF
+chmod +x "$WORK/fake-nocomposer.sh"
+
+echo "case: dialog words more than 20 lines above the bottom, no composer, are not a dialog"
+N="nocomposer"
+CODEX="$WORK/fake-nocomposer.sh" "$CODEX_TMUX" start --exact "$N" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$N")"
+assert "old words above the last 20 lines not blocked" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+"$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
+
 echo "hook-trust-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

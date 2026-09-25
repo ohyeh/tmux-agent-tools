@@ -118,7 +118,9 @@ PROMPT_VIA='paste'
 #              split one pasted prompt into 12 separate inputs on 2026-09-08,
 #              and the first one the model saw was a fragment from the middle
 #              (GOAL and CONTEXT never arrived at all).
-PROMPT_DELIVERY='paste'
+# Empty until the profile is read; then `paste`, or `file-ref` for the claude
+# family (below).
+PROMPT_DELIVERY=''
 # Argv used to prove the CLI can launch at all, before any tmux session exists.
 # Empty disables the check. Default is the near-universal `--version`.
 PREFLIGHT_FLAGS='--version'
@@ -244,6 +246,11 @@ load_cli_profile() {
   done < "$file"
 }
 load_cli_profile "$CLI"
+# claude takes a long multi-line paste as the user's pasted data, not as the
+# user's words: live 2026-09-25 a claude worker read a pasted brief, answered
+# "this message is only pasted content, you wrote no instruction of your own",
+# and did nothing. One typed line pointing at the file is the user asking.
+[[ -n "$PROMPT_DELIVERY" ]] || { [[ "$HEURISTIC_FAMILY" == claude ]] && PROMPT_DELIVERY='file-ref' || PROMPT_DELIVERY='paste'; }
 
 # Env override for the CLI's headless preset flags (#P1 headless dogfood).
 # Set-wins like LAUNCH_FLAGS: if TMUX_AGENT_TOOLS_HEADLESS_FLAGS is set at all
@@ -1131,6 +1138,7 @@ paste_and_submit() {
   local session="$1"
   local buffer_name="$2"
   local prompt_text="$3"
+  _SENTINEL_SPENT=""  # a new paste gets its own look window (_sentinel_landed)
 
   printf "%s" "$prompt_text" | "$TMUX" load-buffer -b "$buffer_name" -
   "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
@@ -1146,6 +1154,7 @@ paste_file_and_submit() {
   local session="$1"
   local buffer_name="$2"
   local payload_file="$3"
+  _SENTINEL_SPENT=""  # a new paste gets its own look window (_sentinel_landed)
   local enter_count="$4"
   local enter_delay="$5"
 
@@ -2297,13 +2306,19 @@ _sentinel_landed() {
   # from launch to reading its first message (2026-09-18), the paste sat in
   # the pty meanwhile, and a 10s window called a delivered prompt swallowed.
   rounds=$(( ${3:-10} * 5 ))
+  # One window per session per process: the injected lines share one paste, so
+  # once a look has waited out its window, a later marker gets one look. A send
+  # to claude (which shows only the tail of a long message) waited 10 s for
+  # each of its two markers: 22.6 s per tell (live 2026-09-25).
+  [[ "${_SENTINEL_SPENT:-}" == "$session" ]] && rounds=1
   for (( i = 0; i < rounds; i++ )); do
     if "$TMUX" capture-pane -J -p -S -200 -t "$session" 2>/dev/null \
          | tr -d '[:space:]' | grep -qF -- "$needle"; then
       return 0
     fi
-    sleep 0.2
+    (( i + 1 < rounds )) && sleep 0.2
   done
+  _SENTINEL_SPENT="$session"
   return 1
 }
 
@@ -4212,8 +4227,9 @@ assign_session() {
   # the CLI draws its dialog. Observed 2026-09-25: agy, claude and
   # claude-fable-gate on never-trusted dirs drew the workspace-trust dialog
   # AFTER the brief was pasted, and the dialog ate it (claude: the first half).
-  # A dialog is never answered here — trusting a directory is the caller's
-  # call — and the brief is not sent into it.
+  # The brief is never sent into a dialog. A workspace-trust dialog is answered
+  # here (user policy 2026-09-25: a worker is dispatched to that dir, so trust
+  # it); every other dialog fails the send and is left to the caller.
   # A pane that never settles (a ticking status line) is looked at for
   # _ASSIGN_SEND_LOOK seconds, dialogs checked on every look, then sent to.
   # ponytail: fixed windows; a CLI that sits unchanged for _ASSIGN_SEND_SETTLE,
@@ -4229,7 +4245,17 @@ assign_session() {
     ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null \
       | awk '/^capture: .* capture [^ ]+ 120$/ { h = NR; drew = 0; next } h && /[^[:space:]]/ { drew = 1 } END { exit !(drew || !h) }'
   }
-  local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10
+  # A workspace-trust dialog whose selected option trusts: a trust-this-folder
+  # question on screen, and the option under the cursor saying yes or trust.
+  # Live 2026-09-25: codex `› 1. Trust and continue`, agy `> Yes, I trust this
+  # folder`, claude `❯ 1. Yes, proceed`. Enter picks that option.
+  # ponytail: grok's trust screen is UNCONFIRMED; it fails the send until seen.
+  _assign_trust_dialog() {
+    local pane; pane="$( ( capture_session --strip-ansi --tail 60 "$1" ) 2>/dev/null )"
+    [[ "${pane:l}" == *"trust this folder"* || "${pane:l}" == *"trust the contents of this project"* || "${pane:l}" == *"trust the files in this folder"* ]] || return 1
+    printf '%s\n' "$pane" | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = tolower($0) } END { exit !(last ~ /^[[:space:]]*(→|›|❯|>)[[:space:]]+([0-9]+[.)][[:space:]]+)?(yes|trust)/) }'
+  }
+  local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10 _trusted=0
   local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle _saw_startup=0
   while :; do
     rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
@@ -4238,6 +4264,15 @@ assign_session() {
       update_prompt)
         _assign_fail send "worker blocked before send: update_prompt — the brief was NOT sent and no key was pressed. The CLI is offering to update itself (an Enter would run its installer): update it or skip the update by hand (peek, then keys), then send the brief again ($prompt)" "$name" ;;
       permission_prompt|hook_trust_prompt|approval_prompt|login_prompt)
+        # Twice at most: a dialog that comes back after two Enters is not one
+        # this answer clears.
+        if [[ "$rreason" == permission_prompt ]] && (( _trusted < 2 )) && _assign_trust_dialog "$name"; then
+          _trusted=$(( _trusted + 1 ))
+          echo "assign[3/5] workspace trust dialog — trusting $dir (Enter), then looking again" >&2
+          ( send_session --key enter "$name" ) >/dev/null 2>&1 || true
+          _saw_startup=1
+          sleep 1; continue
+        fi
         _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
         _saw_startup=1
@@ -4313,13 +4348,30 @@ assign_session() {
   # one-line preview of the injected first line and claude folded it (live
   # 2026-09-25), so the delivery proof below never matched, the busy and idle
   # signals behind it were never read, and the brief was pasted a second time.
+  # cursor-agent draws no elapsed time, only a token count that climbs:
+  # `⠘⠣ Running  9.63k tokens`, `⠘⠤ Reading  22.29k tokens` — the verb
+  # changes with the tool in use (live 2026-09-25, a working worker called
+  # launch-failed and its brief queued a second time as a follow-up).
   _assign_counters() {
     printf '%s' "$1" | "$JQ" -r '.last_capture_lines[]?' 2>/dev/null \
-      | grep -oE '\(([0-9]+h )?([0-9]+m )?[0-9]+s[ )]' | tr '\n' ' ' || true
+      | grep -oE '\(([0-9]+h )?([0-9]+m )?[0-9]+s[ )]|[A-Z][^[:space:]]* +[0-9.]+k? tokens' | tr '\n' ' ' || true
   }
+  # Finished-turn lines on screen: claude's `✻ Churned for 9s · done 9:38 PM`,
+  # codex's `─ Worked for 1m 02s ─`. One more than before the send is a turn the
+  # CLI ran on it. Live 2026-09-25: claude answered in 9s, its counter showed
+  # between two looks only, the idle pane never confirmed, and the brief was
+  # pasted a second time into a worker that had already answered. The verb is
+  # not ASCII-only: `✻ Sautéed for 7s` (live 2026-09-25) missed an [a-z]+ match
+  # and the brief went a second time.
+  _assign_turns_done() {
+    ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null \
+      | grep -cE '^[[:space:]]*[✻✢✳✶✽*][[:space:]]+[A-Z][^[:space:]]* for [0-9]+[hms]|^[[:space:]]*[─-]+ Worked for [0-9]' || true
+  }
+  local turns_before
   local send_out send_rc attempt sent_at now confirmed=0 st blocked busy busy_metric idle validation nudged=0 nudged_at=0 counters prev_counters
   for attempt in 1 2; do
     send_rc=0
+    turns_before="$(_assign_turns_done "$name")"
     if [[ "$delivery" == "file-ref" ]]; then
       # Injections are already inside the composed file; sending them again on
       # the reference line would re-introduce the newlines this shape removes.
@@ -4346,6 +4398,10 @@ assign_session() {
       blocked="$(printf '%s' "$st" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
       if [[ -n "$blocked" && "$blocked" != "startup_pending" ]]; then
         _assign_fail confirm-processing "worker blocked after send: $blocked" "$name"
+      fi
+      if (( $(_assign_turns_done "$name") > turns_before )); then
+        echo "assign[4/5] the CLI finished a turn since the send — the worker processed it" >&2
+        confirmed=1; break
       fi
       counters="$(_assign_counters "$st")"
       if [[ -n "$counters" && -n "$prev_counters" && "$counters" != "$prev_counters" ]] && ! _assign_paste_unsent "$name"; then
@@ -7246,14 +7302,19 @@ status_pane_text() {
 # composer: it is no boundary, so the question above it stays in the area.
 # ponytail: an unnumbered dialog cursor (`❯ Yes, proceed`) would be taken as the
 # composer and hide its question — UNCONFIRMED on any live CLI; add its shape then.
+# With no boundary the area is the last 20 non-empty lines, not the whole pane:
+# a dialog is drawn at the bottom, and text higher up is history. Live
+# 2026-09-25: a brief echoed above cursor-agent's banner before its composer
+# was drawn read as permission_prompt from its quoted "trust this folder".
 current_prompt_area_for_text() {
   local current="$1"
   awk '
     /^[[:space:]]*(→|›|❯|>)([[:space:]]|$)/ && !/^[[:space:]]*(→|›|❯|>)[[:space:]]+[0-9]+[.)]/ { boundary = NR }
     /^[[:space:]]*[─-]+ Worked for / { boundary = NR }
+    /[^[:space:]]/ { filled[++n] = NR }
     { lines[NR] = $0 }
     END {
-      start = boundary ? boundary : 1
+      start = boundary ? boundary : (n > 20 ? filled[n - 19] : 1)
       for (i = start; i <= NR; i++) print lines[i]
     }
   ' <<< "$current"

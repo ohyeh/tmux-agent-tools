@@ -79,7 +79,8 @@ follows ONE OWNER below unchanged.
    `launch failed` or `exited — no result` is a worker nobody should wait on;
    the collector delivers those once and they leave on their own.
    To look at a worker mid-flight call `mcp__tmux-agent__peek` (one snapshot,
-   never in a loop); to answer a trust/permission dialog call
+   never in a loop). `assign` answers a workspace-trust dialog itself (the
+   worker was dispatched to that dir); to answer any other permission dialog call
    `mcp__tmux-agent__keys` with whitelisted keys. `stop` with `all: true`
    closes every live worker of this project you forgot about.
 5. The worker is a teammate. Next task or a correction → `mcp__tmux-agent__tell`

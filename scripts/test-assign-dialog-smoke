@@ -27,8 +27,12 @@ cleanup() {
   "$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
   "$AGENT_TMUX" slowcli stop slow-smoke >/dev/null 2>&1 || true
+  "$AGENT_TMUX" pickcli stop pick-trust >/dev/null 2>&1 || true
+  "$AGENT_TMUX" pickcli stop pick-other >/dev/null 2>&1 || true
+  AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude stop tail-send >/dev/null 2>&1 || true
+  AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" doneclaude stop done-turn >/dev/null 2>&1 || true
   "$AGENT_TMUX" updcli stop upd-smoke >/dev/null 2>&1 || true
-  local n; for n in work-codex work-claude work-frozen; do "$AGENT_TMUX" workcli stop "$n" >/dev/null 2>&1 || true; done
+  local n; for n in work-codex work-claude work-cursor work-frozen; do "$AGENT_TMUX" workcli stop "$n" >/dev/null 2>&1 || true; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -140,6 +144,57 @@ assert_contains "boot: the diagnostic says the brief was not sent" "$(jq -r .dia
 assert "boot: the dialog got no input from assign" "$(cat "$LOG")" ""
 "$AGENT_TMUX" bootcli stop boot-smoke >/dev/null 2>&1 || true
 
+# ---- case 1c: a workspace-trust dialog is trusted, any other dialog is not ----
+# pickcli draws a dialog with its cursor on option 1, as claude does, and takes
+# the first line it reads as the answer. --other asks a non-trust question.
+cat > "$WORK/pickcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "pickcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null; RES=""; ASK="Do you trust the files in this folder?"
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; --result) RES="$2"; shift 2 ;; --other) ASK="Do you want to proceed with rm -rf build?"; shift ;; *) shift ;; esac; done
+sleep 1
+printf '\033[?1049h%s\n\xe2\x9d\xaf 1. Yes, proceed\n  2. No, exit\n' "$ASK"
+IFS= read -r answer
+printf '\033[?1049l'
+printf 'dialog:%s\n' "$answer" >> "$LOG"
+echo "> ready"
+while IFS= read -r line; do
+  printf 'input:%s\n' "$line" >> "$LOG"
+  [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"picked","artifacts":[],"errors":[]}\n' > "$RES"
+done
+EOF
+chmod +x "$WORK/pickcli"
+
+echo
+echo "case: a workspace-trust dialog is answered with Enter, then the brief is sent"
+LOG="$WORK/pick.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/pick-trust"
+code=0
+AGENT_TMUX_LAUNCH_FLAGS="--log $LOG --result $TMUX_AGENT_DIR/pick-trust/result.json" \
+  "$AGENT_TMUX" pickcli assign --timeout 60 --confirm-window 30 --detach \
+    --prompt-delivery paste pick-trust "$WORK" "$WORK/brief.txt" \
+    >"$WORK/pick.out" 2>"$WORK/pick.err" || code=$?
+assert "pick: assign confirmed the worker" "$code" "0"
+assert_contains "pick: assign says it trusted the dir" "$(cat "$WORK/pick.err")" "workspace trust dialog — trusting"
+assert "pick: the dialog got a bare Enter, no brief text" "$(grep '^dialog:' "$LOG")" "dialog:"
+assert_contains "pick: the brief arrived after the dialog" "$(cat "$LOG")" "input:GOAL: prove the brief survives the dialog."
+"$AGENT_TMUX" pickcli stop pick-trust >/dev/null 2>&1 || true
+
+echo
+echo "case: a dialog that is not a workspace trust is never answered"
+LOG="$WORK/pick2.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/pick-other"
+code=0
+AGENT_TMUX_LAUNCH_FLAGS="--log $LOG --other" \
+  "$AGENT_TMUX" pickcli assign --timeout 60 --confirm-window 20 --detach \
+    --prompt-delivery paste pick-other "$WORK" "$WORK/brief.txt" \
+    >"$WORK/pick2.out" 2>"$WORK/pick2.err" || code=$?
+assert "other: assign failed" "$code" "1"
+assert_contains "other: the brief was not sent" "$(jq -r .diagnostic "$WORK/pick2.out" 2>/dev/null)" "the brief was NOT sent"
+assert "other: the dialog got no input from assign" "$(cat "$LOG")" ""
+"$AGENT_TMUX" pickcli stop pick-other >/dev/null 2>&1 || true
+
 # ---- case 2: the CLI folds the paste into a placeholder ----------------------
 # foldcli reads one paste burst, draws `[Pasted text #1 +N lines]` (N = lines
 # read, or --show N), writes its result and returns to an empty composer.
@@ -235,6 +290,55 @@ refute_contains "slow: nothing was pasted before the CLI drew" "$(cat "$LOG")" "
 assert_contains "slow: the brief arrived after the draw" "$(cat "$LOG")" "input:GOAL: prove the brief survives the dialog."
 "$AGENT_TMUX" slowcli stop slow-smoke >/dev/null 2>&1 || true
 
+# ---- case 2c: a send whose markers never show waits one window, not two ------
+# Live 2026-09-25: claude shows only the tail of a long message, so neither
+# injected line reached the pane and send looked 10 s for each: 22.6 s a tell.
+# foldcli never echoes the text; as a claude-family profile its markers are polled.
+mkdir -p "$WORK/profiles"
+printf 'bin=%s\nheuristic_family=claude\n' "$WORK/foldcli" > "$WORK/profiles/tailclaude.conf"
+echo
+echo "case: a send with two unseen markers spends one look window"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude start --exact tail-send "$WORK" >/dev/null 2>&1
+sleep 2
+t0=$SECONDS
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude send --from-file "$WORK/brief.txt" tail-send >"$WORK/tail.out" 2>"$WORK/tail.err" || true
+took=$(( SECONDS - t0 ))
+assert "tail: both instructions are still reported unconfirmed" "$(grep -c 'delivery UNCONFIRMED' "$WORK/tail.err")" "2"
+assert "tail: the send took under 16 s (took ${took}s; two windows is 20 s+)" "$(( took < 16 ))" "1"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude stop tail-send >/dev/null 2>&1 || true
+
+# ---- case 2d: a turn that finished before two looks is processing --------------
+# Live 2026-09-25: claude answered in 9 s; its counter showed between two looks
+# only, the pane went idle, and the brief was sent again. donecli answers each
+# line with claude's finished-turn line and nothing else.
+cat > "$WORK/donecli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "donecli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac; done
+echo "❯ "
+while IFS= read -r line; do
+  printf 'input:%s\n' "$line" >> "$LOG"
+  printf '\n⏺ done\n\n✻ Sautéed for 2s · done 9:38 PM\n\n❯ \n'
+done
+EOF
+chmod +x "$WORK/donecli"
+printf 'bin=%s\nheuristic_family=claude\n' "$WORK/donecli" > "$WORK/profiles/doneclaude.conf"
+echo
+echo "case: a claude turn that finished between looks confirms, with no resend"
+LOG="$WORK/done.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/done-turn"
+code=0
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
+  "$AGENT_TMUX" doneclaude assign --timeout 60 --confirm-window 30 --detach done-turn "$WORK" "$WORK/brief.txt" \
+    >"$WORK/done.out" 2>"$WORK/done.err" || code=$?
+assert "done: assign confirmed the worker" "$code" "0"
+assert_contains "done: the finished turn confirmed it" "$(cat "$WORK/done.err")" "finished a turn since the send"
+refute_contains "done: no resend" "$(cat "$WORK/done.err")" "resending"
+assert_contains "done: the claude family got the file-ref line" "$(cat "$LOG")" "input:Your task is in the file"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" doneclaude stop done-turn >/dev/null 2>&1 || true
+
 # ---- case 3: a self-update menu at boot --------------------------------------
 # Live 2026-09-25, codex 0.156.1: the send's Enter chose "1. Update now", which
 # ran an unapproved `curl … | sh` install and the CLI exited. updcli draws that
@@ -284,6 +388,7 @@ LOG=/dev/null; SHAPE=codex; FROZEN=""
 while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; --shape) SHAPE="$2"; shift 2 ;; --frozen) FROZEN=1; shift ;; *) shift ;; esac; done
 idle() {
   if [ "$SHAPE" = codex ]; then printf '› Ask Codex to do anything\n  GPT-6-Astra medium · agent-scripts\n'
+  elif [ "$SHAPE" = cursor ]; then printf ' → Add a follow-up                ctrl+c to stop\n  [Claude Opus 5.5 300K Medium]\n'
   else printf '❯\n[Opus 5.5 ◔ medium] │ github/tmux-agent-tools git:(main* ↑3)\n'; fi
 }
 draw() {
@@ -292,6 +397,8 @@ draw() {
     printf '• Working (%dm %02ds • esc to interrupt)\n' $(($1 / 60)) $(($1 % 60))
     printf '• Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n'
     printf '  ↳ Write final JSON to this exact path: …/result.json\n'
+  elif [ "$SHAPE" = cursor ]; then
+    printf ' ⠘⠤ Reading  %d.%dk tokens\n    Tip: Use subagents to parallelize work.\n' $(($1 / 10)) $(($1 % 10))
   else
     printf '● Orbiting… (%ds · ↓ 1.4k tokens · thinking with medium effort)\n' "$1"
   fi
@@ -315,7 +422,7 @@ work_assign() {  # <name> <launch flags>
 }
 brief_count() { grep -c '^input:GOAL: prove the brief survives the dialog.' "$WORK/$1.log" || true; }
 
-for shape in codex claude; do
+for shape in codex claude cursor; do
   echo
   echo "case: a $shape pane whose elapsed counter moves is processing"
   work_assign "work-$shape" "--shape $shape"
