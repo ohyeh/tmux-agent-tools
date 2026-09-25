@@ -694,7 +694,14 @@ async function launchFailure(host: Host, dir: string, since: number): Promise<Fi
   const block = parseJson(log.slice(log.lastIndexOf('\n{') + 1)) as { failed_step?: unknown; diagnostic?: unknown } | undefined
   const line = (v: unknown) => (typeof v === 'string' ? v.replace(CTRL_ALL_RE, ' ').trim().slice(0, LAUNCH_LINE_MAX) : '')
   if (line(block?.failed_step)) {
-    return `agent-tmux assign exited ${code} at step "${line(block?.failed_step)}": ${line(block?.diagnostic) || '(no diagnostic)'}. Full log: ${logPath}`
+    // confirm-processing is judged from the pane after the brief went out, and a
+    // working worker has failed it (cursor's `Reading 22k tokens`, a 7 s claude
+    // turn: live 2026-09-25). Say so, or the reader dispatches the brief again.
+    const maybeWorking =
+      line(block?.failed_step) === 'confirm-processing'
+        ? ' The brief was sent, and this step is judged from the pane: the worker may be working. Peek at it before dispatching again; a result it writes later is still delivered.'
+        : ''
+    return `agent-tmux assign exited ${code} at step "${line(block?.failed_step)}": ${line(block?.diagnostic) || '(no diagnostic)'}.${maybeWorking} Full log: ${logPath}`
   }
   const tail = log.split('\n').slice(-LAUNCH_TAIL_LINES).join('\n').slice(-LAUNCH_LINE_MAX * LAUNCH_TAIL_LINES)
   return `agent-tmux assign exited ${code}. Last lines:\n${tail}\nFull log: ${logPath}`

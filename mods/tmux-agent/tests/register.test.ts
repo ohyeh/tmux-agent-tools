@@ -3335,6 +3335,25 @@ describe('live e2e of 0.7.6', () => {
     expect(text).toContain(`Full log: ${ROOT}/w2/mod-assign.log`)
     expect(text).not.toContain('line 15')
     expect(text.length).toBeLessThan(2_000)
+    expect(text, 'a send-step failure is not called maybe-working').not.toContain('may be working')
+  })
+
+  test('a confirm-processing launch-failed notice says the worker may be working', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const block = JSON.stringify({ schema_version: 1, tool: 'cursor', name: 'w1', assigned: false, failed_step: 'confirm-processing', diagnostic: 'no processing activity within 90s of send' })
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+      [`${ROOT}/w1/launch.exit`]: '1\n',
+      [`${ROOT}/w1/mod-assign.log`]: `assign[4/5] confirm\n${block}\n`,
+    })
+    const woken = mockWake(on)
+
+    await $.turn.complete(turn())
+    const text = woken.join('\n')
+    expect(text).toContain('at step "confirm-processing": no processing activity within 90s of send.')
+    expect(text).toContain('the worker may be working. Peek at it before dispatching again')
   })
 
   test('assign describes its brief parameter (E)', WITH_DRIVER, async ($, on) => {

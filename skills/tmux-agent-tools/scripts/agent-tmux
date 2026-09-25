@@ -8716,6 +8716,12 @@ stop_session() {
   else
     echo "Already stopped: $session"
   fi
+  # Who closed a worker: without this event a stopped session and one killed
+  # from outside looked the same in the audit log (live 2026-09-25).
+  audit_log_append "$("$JQ" -c -n --arg event stop --arg tool "$CLI" --arg name "$name" \
+    --arg session "$session" --argjson stopped "$stopped" \
+    --arg caller "$(ps -o command= -p "$PPID" 2>/dev/null | cut -c1-160)" \
+    '{event:$event,tool:$tool,name:$name,session:$session,stopped:($stopped == 1),caller:$caller}')" || true
 
   # Terminal envelope: guarantee result.json + a launch_end ledger event even
   # when the agent never wrote a result (merge preserves agent fields).

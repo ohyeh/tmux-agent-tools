@@ -57,7 +57,8 @@ run_audit() {
   "$wrapper" audit-verify "$audit_log" >/dev/null 2>&1 || code=$?
   assert "$prefix verify exit=2 on tamper" "$code" "2"
 
-  "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit_log" "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
+  assert "$prefix stop is audited" "$(jq -r 'select(.event=="wrapper.stop") | "\(.name) \(.stopped)"' "$audit_log")" "$prefix-a true"
 }
 
 run_default_log() {
