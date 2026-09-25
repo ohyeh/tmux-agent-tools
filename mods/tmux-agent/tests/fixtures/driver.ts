@@ -36,9 +36,9 @@ export const driver: Plugin = {
 }
 
 /** The engine's own `$.command.run` takes the whole input, not a plugin's short form. */
-export const run = (command: string) => ({
+export const run = (command: string, args = '') => ({
   command,
-  args: '',
+  args,
   origin: { kind: 'composer' } as const,
   presentation: { isFullscreen: false, columns: 80 },
 })

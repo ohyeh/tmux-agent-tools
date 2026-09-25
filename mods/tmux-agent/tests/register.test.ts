@@ -1801,13 +1801,14 @@ describe('regressions', () => {
 
     await $.session.start(session())
     await $.command.run(run('tmux'))
-    await $.ui.render(bandRender())
+    // Goals are drawn in the overview; a selected row gives their row to the mirror.
+    const overview = textOf(await $.ui.render(bandRender()))
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
     await clock.advance(2_000)
 
     const drawn = textOf(await $.ui.render(bandRender()))
     // A non-global replace leaves 'a b\u0002c\u0003d' and 'x y\u0002z'.
-    expect(drawn, 'the goal is clean end to end').toContain('a b c d')
+    expect(overview, 'the goal is clean end to end').toContain('a b c d')
     expect(drawn, 'and so is the mirrored pane').toContain('x y z')
   })
 
@@ -2372,7 +2373,12 @@ describe('teammates', () => {
     )
     expect(keysOf(tree)).not.toContain('tell:w2@0')
 
-    // The stop button on the selected row dismisses it.
+    // The stop button asks twice: one stray press (a letter with the band
+    // focused) stopped a worker in the 2026-09-25 live probe.
+    await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
+    await settle()
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`), 'one press only arms it').toEqual(false)
+    expect(textOf(await $.ui.render(bandRender()))).toContain('stop w1? press again')
     await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
     // The button does not hold the render hook on a subprocess; let its work land.
     await settle()
@@ -2849,5 +2855,106 @@ describe('cursor review of 4d0af09', () => {
     expect(calls.flat().includes('--output=/x')).toEqual(false)
     expect(calls.some(a => a.includes('merge-base'))).toEqual(false)
     expect(wake[0]).toContain('no dispatch base recorded')
+  })
+})
+
+describe('panel UX, 2026-09-25 live probe', () => {
+  // One top-level child is one row, except a Text that wraps: it takes as many
+  // rows as its text needs at the band's 80 columns.
+  const rowsOf = (tree: unknown) =>
+    ((tree as { children?: unknown[] }).children ?? []).slice(1).reduce<number>((n, c) => {
+      const wraps = (c as { props?: { wrap?: string } }).props?.wrap === 'wrap'
+      return n + (wraps ? Math.max(1, Math.ceil(textOf(c).length / 80)) : 1)
+    }, 0)
+
+  test('an armed stop expires: a second press after the window only arms it again', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
+    await clock.advance(6_000)
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
+    await settle()
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(false)
+  })
+
+  test('a 13-row band with eight workers stays inside maxRows, selected or not, so the digits stay armed', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = {}
+    for (let i = 1; i <= 8; i += 1) files[`${ROOT}/w${i}/dispatch.json`] = dispatch(`w${i}`, 0, { goal: `goal ${i}` })
+    files[`${ROOT}/w6/result.json`] = finished('x'.repeat(2_000))
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 }, Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'), false, undefined, true)
+
+    await $.session.start(session())
+    await clock.advance(10_000)
+    await $.command.run(run('tmux'))
+    const overview = await $.ui.render(bandRender(13))
+    expect(rowsOf(overview)).toBeLessThanOrEqual(13)
+    expect(textOf(overview)).toContain('more — /tmux N selects row N')
+
+    // Row 6 is past the cut, so it is reached by typing; it is the finished row
+    // with a long summary, the case that used to wrap six rows.
+    expect(keysOf(overview)).not.toContain('w6@0')
+    expect((await $.command.run(run('tmux', '6'))).text).toContain('"w6" selected')
+    await clock.advance(2_000)
+    const picked = await $.ui.render(bandRender(13))
+    expect(rowsOf(picked), 'selected, summary and mirror included').toBeLessThanOrEqual(13)
+    // The list gave way to the mirror (live: "band 13 rows; needs 18" with eight).
+    expect(textOf(picked)).not.toContain('too short to mirror')
+    expect(captures(panel.argv).length).toBeGreaterThan(0)
+    expect(keysOf(picked)).toEqual(expect.arrayContaining(['w6@0', 'stop:w6@0']))
+  })
+
+  test('two workers on a 13-row band still get a mirror', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { goal: 'one' }),
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0, { goal: 'two' }),
+    })
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 }, Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'))
+
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    await $.ui.render(bandRender(13))
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
+    await clock.advance(2_000)
+    const drawn = await $.ui.render(bandRender(13))
+    expect(captures(panel.argv).length, 'observed live: "band 13 rows; needs 15" with two workers').toBeGreaterThan(0)
+    expect(textOf(drawn)).not.toContain('too short to mirror')
+    expect(rowsOf(drawn)).toBeLessThanOrEqual(13)
+  })
+
+  test('/tmux subcommands work without any hotkey: N selects, stop and tell by row or name, hide', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0) })
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    expect((await $.command.run(run('tmux', '2'))).text).toContain('row 2 "w2" selected')
+    expect(keysOf(await $.ui.render(bandRender()))).toContain('stop:w2@0')
+    expect((await $.command.run(run('tmux', 'stop ghost'))).text).toContain('no worker "ghost"')
+    expect((await $.command.run(run('tmux', 'tell w1'))).text).toContain('message is missing')
+    expect((await $.command.run(run('tmux', 'stop 1'))).text).toContain('stop "w1" — ok')
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(true)
+    expect(store.acked()).toContain('w1@0')
+    expect((await $.command.run(run('tmux', 'hide'))).text).toContain('hidden')
+    expect(textOf(await $.ui.render(bandRender()))).not.toContain('w2')
   })
 })

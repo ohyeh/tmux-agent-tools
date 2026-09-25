@@ -232,7 +232,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 - 空 prompt 按 `1` → 該列選中（`› band-row`）、輸入列＋`[stop]` 出現、鏡像 5
   行（`band 13 rows`；`MIRROR_RESERVED` 6→5 之前差一行進不了 6 行門檻，面板
   印 `Band too short to mirror … (band 13 rows; needs 14)`——這行就是拿來看這個的）。
-- `ctrl+x tab` 再按 `q` → 面板關閉、composer 乾淨。
+- `ctrl+x tab` 再按 `q` → 面板關閉、composer 乾淨（0.7.5 起是 `[ hide ]`）。
 - `full` mode（`--settings` 帶 `pluginConfigs["tmux-agent@inline"].options.mode=full`）
   同一套操作再跑一次：⚠ collector 警告行消失，其餘畫面與行為相同；10 秒對帳
   時鐘與 2 秒鏡像時鐘並存，鏡像照常更新。
@@ -349,16 +349,29 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
 兩台機器都撞到。）
 
-每個 worker 一列：`1: 名字  repo  狀態  已跑多久`，底下一行是 brief 的 GOAL。
-**鍵盤操作**：
+每個 worker 一列：`1: 名字  repo  狀態  已跑多久`；總覽（沒選任何列）時底下一行是
+brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 session 自己的輸出。
+
+**任何終端機都能用的操作**（不靠字母鍵、不靠組合鍵）：
 
 - prompt 空白時直接按 `1`–`9` 選那一列（鏡像它的畫面尾巴；再按一次取消）。
-  第 10 列起沒有數字鍵，`ctrl+x tab` 聚焦後方向鍵移到它、Enter。
-- `ctrl+x tab` 把鍵盤交給 band 之後：`r` 立刻重讀、`x` 停掉選中的 worker、`q`
-  關面板；Esc 把鍵盤還給 prompt。
-- 滑鼠點也行（終端機有回報 click 時），但不要依賴它。
+- `/tmux N` 選第 N 列（第 10 列起、或被擠到 `+N more` 裡的列用這個）。
+- `/tmux stop N|名字`、`/tmux tell N|名字 <訊息>`、`/tmux hide`。打出列號或名字
+  本身就是確認。
 
-標頭有 `[refresh]`：面板每 2 秒自動重讀，但 `tmux ls` 慢或被拒時會沿用上一次
+**聚焦後的字母鍵**：`ctrl+x tab` 把鍵盤交給 band 之後 `r` 重讀、`x` 停掉選中的
+worker、`q` 隱藏面板；Esc 還給 prompt。字母鍵**只在 band 聚焦時**有效（引擎規則，
+d.ts `ButtonProps.hotkey`），prompt 聚焦時按 `x` 只會打出一個 x。`ctrl+x tab` 這個
+組合鍵要終端機原樣送進 pty：2026-09-25 在 Warp 裡按了沒反應（tmux 裡正常）。
+自己的終端機可以這樣查：`cat -v` 後按 ctrl+x、Tab，印出 `^X^I` 就是有送到。
+
+`[ stop ]` 要按兩次：第一次變成 `[ stop <名字>? press again ]` 並倒數 5 秒，時間內
+再按一次才真的停（停掉會結束 tmux session，不能復原；2026-09-25 實測 band 聚焦在
+`[ refresh ]` 上時一個誤按的 `x` 就停掉了 worker）。`[ hide ]` 放在標頭最右邊、
+離 `[ refresh ]` 遠一點；隱藏可以用 `/tmux` 復原。滑鼠點也行（終端機有回報 click
+時），但不要依賴它。
+
+標頭有 `[ refresh ]`：面板每 2 秒自動重讀，但 `tmux ls` 慢或被拒時會沿用上一次
 結果，覺得畫面不對就按它。選中的那一列底下多出兩個控制：一行輸入框（打字、Enter 就是 `tell`——同一個
 函式，不是另一條路）和一個 `stop` 按鈕。結果用 toast 回報成功或失敗。已收工
 的列選中時不鏡像 pane，改印它自己的 `status: summary`——收工的隊友你要看的是
@@ -367,8 +380,11 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 band 是所有 plugin 共用的一塊：面板關著時這個 hook 原樣放行別人畫的東西，開著
 時把自己的列疊在別人的下面；survey（`hasSurvey`）佔用 band 時讓位。整棵樹刻意
 控制在 band 的 `maxRows` 內——超過會捲動，而捲動中的 band「bare digit 不觸發任何
-hotkey」（d.ts `AbovePrompt.maxRows`），數字鍵就廢了；鏡像行數因此從
-`maxRows` 減掉列數算，不是固定值。
+hotkey」（d.ts `AbovePrompt.maxRows`），數字鍵就廢了。每一行都算進預算：選中列的
+摘要只佔一行（全文在 result.json；以前 `wrap` 最多換成 6 行卻只算 1 行，選到一個已收工的
+隊友數字鍵就失靈）；總覽放不下的列收進 `+N more — /tmux N selects row N`；選中時
+列表先讓位給鏡像的 6 行下限（13 行的 band、兩個 worker 以前印 `needs 15`，八個印
+`needs 18`，鏡像永遠出不來）。鏡像行數是 `maxRows` 減掉這些之後剩下的，不是固定值。
 
 三件事是刻意的：
 
@@ -405,7 +421,7 @@ hotkey」（d.ts `AbovePrompt.maxRows`），數字鍵就廢了；鏡像行數因
 `session.start` 吃引擎的 hook 預算，掃一排子行程正是會超時的那種事，而 15 分鐘
 等級的狀況晚一個 tick 完全來得及。整輪探測另有 4 秒上限、單次 3 秒。
 
-面板關著時鏡像時鐘不存在（`/tmux` 再按一次或 `[close]`／`q` 都走同一個
+面板關著時鏡像時鐘不存在（`/tmux` 再按一次、`/tmux hide` 或 `[ hide ]`／`q` 都走同一個
 `closePanel`，它 cancel 時鐘並換代），但**對帳時鐘照跑** —— 叫醒沒人在看的
 session 正是這個 mod 的目的。
 
