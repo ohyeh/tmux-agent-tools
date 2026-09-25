@@ -279,5 +279,25 @@ st="$("$CODEX_TMUX" status --json "$N")"
 assert "old words above the last 20 lines not blocked" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
 "$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
 
+# Live 2026-09-25: grok 1.0.41 never signed in drew a browser sign-in whose
+# "Waiting for approval..." read as approval_prompt.
+cat > "$WORK/fake-browser-login.sh" <<'EOF'
+#!/bin/sh
+echo "                  Approve in your browser to finish signing in."
+echo "                                    JZW2-3R3B"
+echo "                             Waiting for approval..."
+echo "                                  ctrl+q  quit"
+while IFS= read -r line; do :; done
+EOF
+chmod +x "$WORK/fake-browser-login.sh"
+
+echo "case: a browser sign-in screen is login_prompt, not approval_prompt"
+B="browser-login"
+CODEX="$WORK/fake-browser-login.sh" "$CODEX_TMUX" start --exact "$B" "$WORK" >/dev/null
+sleep 1
+st="$("$CODEX_TMUX" status --json "$B")"
+assert "browser sign-in is login_prompt" "$(printf '%s' "$st" | jq -r .blocked_reason)" "login_prompt"
+"$CODEX_TMUX" stop "$B" >/dev/null 2>&1 || true
+
 echo "hook-trust-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

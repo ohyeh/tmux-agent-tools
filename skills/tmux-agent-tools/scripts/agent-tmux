@@ -4294,6 +4294,8 @@ assign_session() {
           _saw_startup=1
           sleep 1; continue
         fi
+        [[ "$rreason" == login_prompt ]] && _assign_fail send \
+          "worker blocked before send: login_prompt — the brief was NOT sent. The CLI is not signed in: sign in to $CLI once by hand (run it in a terminal and follow its login), then dispatch again ($prompt)" "$name"
         _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
         _saw_startup=1
@@ -7462,6 +7464,11 @@ blocked_reason_for_text() {
     print -r -- "ssh_prompt"
   elif [[ "$lowered" == *"do you want to proceed"* || "$lowered" == *"press enter to continue"* || "$lowered" == *"permission confirmation"* || "$lowered" == *"permission prompt"* || "$lowered" == *"permission required"* || "$lowered" == *"trust this"* || "$lowered" == *"trust the contents"* || "$lowered" == *"trust the files"* ]]; then
     print -r -- "permission_prompt"
+  elif [[ "$lowered" == *"finish signing in"* || "$lowered" == *"approve in your browser"* ]]; then
+    # A browser sign-in (grok 1.0.41: "Approve in your browser to finish signing
+    # in. … Waiting for approval...", live 2026-09-25) is a login, not a dialog a
+    # key answers; its "waiting for approval" read as approval_prompt.
+    print -r -- "login_prompt"
   elif [[ "$lowered" == *"[y/n]"* || "$lowered" == *"waiting for approval"* || "$lowered" == *"your approval"* || "$lowered" == *"allow this"* || "$lowered" == *"approve?"* || "$lowered" == *"approval?"* ]]; then
     # Narrow, dialog-shaped approval phrases only (#320) — never a bare
     # "approve"/"approval" substring, which false-triggers on idle CLI chrome

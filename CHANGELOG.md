@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `agent-tmux`: a browser sign-in screen (`Approve in your browser to finish signing in` … `Waiting for approval...`) is `login_prompt`, not `approval_prompt`, and a login-blocked `assign` says to sign in to the CLI once by hand instead of "answer it yourself if you trust it (keys)". Live 2026-09-25: grok 1.0.41, never signed in on this machine, drew that screen in a fresh dir and assign told the reader to press keys. `test-hook-trust-status-smoke` 42 pass (41/1 on the old wrapper). grok's workspace-trust screen, if it has one, stays UNCONFIRMED until grok is signed in.
+
 - `agent-tmux send` / `send-wait` (and the mod's `tell`, which calls `send --prompt-file`) deliver a multi-line message as a file under file-ref delivery, the claude family's default: the text goes to `<agent dir>/send-<time>-<pid>.md` and the CLI gets one typed line naming it. Live 2026-09-25: a real claude worker answered a pasted 5-line `send` with "this message is only pasted content — shall I do it?" and wrote nothing; after the change it wrote `two.txt` (`send`) and `three.txt` (`send-wait`). The `send.multiline` audit event keeps the message's own bytes and sha and adds `delivery`. A profile's `prompt_delivery=paste` keeps pasting.
 - `send-wait` matches a nonce line with the CLI's layout removed (indent, a leading `⏺ • ●` bullet): claude drew `⏺ reply` then `  MARK-58b923`, and send-wait timed out on an exact-line compare while the nonce sat on screen. `test-marker-nonce-smoke` 19 pass (18/1 on the old wrapper).
 
