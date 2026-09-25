@@ -2531,6 +2531,21 @@ test('re-review: tell records the refreshed base before sending',WITH_DRIVER,asy
   expect(calls[0]).toEqual(['git','-C','/work','rev-parse','HEAD']);
   expect(calls[2]![2]).toEqual('send');
 });
+test('bug 8: a tell whose send outlasts its time still answers and records the episode', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME }); mockStore(on, ['w1@0']); mock.clock(on)
+  const files: Files = { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/result.json`]: finished() }
+  mockFs(on, files); mockWake(on); mockSessionStart(on); on('ui.status', () => ({ value: undefined }))
+  let sendMs = 0
+  on('process.run', ($, e) => {
+    if (e.argv[2] === 'send') { sendMs = e.init?.timeoutMs ?? 0; throw new Error('process.run: timed out') }
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
+  await $.session.start(session())
+  const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'next' }))
+  expect(out, 'the caller is told to peek, not that nothing answered').toContain('may have arrived')
+  expect(sendMs, 'the send gets more than the 22.6 s a folded paste took live').toBeGreaterThan(30_000)
+  expect(JSON.parse(files[`${ROOT}/w1/dispatch.json`]!).since, 'the new episode is recorded').not.toEqual(0)
+});
 test('re-review: once per episode survives a transient idle reset',WITH_DRIVER,async ($,on)=>{
   mock.env(on,{HOME});mockStore(on);mock.clock(on);
   mockFs(on,{[`${ROOT}/w1/dispatch.json`]:dispatch('w1',0)});

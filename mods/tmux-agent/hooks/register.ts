@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.7'
+const MOD_VERSION = '0.7.8'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -109,6 +109,8 @@ const STALL_WAKE_MAX = 3
 const SHA_RE = /^[0-9a-f]{40}$/
 /** One `git cat-file` on a local repo: instant, or the repo is not answering. */
 const COMMIT_PROBE_MS = 2_000
+/** A tell's send: the wrapper's 30 s lock wait plus a paste and its two 10 s delivery looks. */
+const TELL_SEND_MS = 60_000
 /**
  * One collect pass: its result reads and commit checks together. What does not
  * fit waits for the next tick, which starts where this one stopped. With the
@@ -1409,8 +1411,21 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
   if (init.exitCode !== 0) {
     return { ok: false, text: `result init failed for ${d.name}: ${(init.stderr || init.stdout).trim().slice(-400)}` }
   }
-  const sent = await host.run(['agent-tmux', d.profile, 'send', '--prompt-file', tellPath, d.name], d.dir, 8_000)
-  if (sent.exitCode !== 0) {
+  // The wrapper's send takes its lock (up to 30 s), pastes, then looks up to
+  // 10 s for each injected instruction; a CLI that folds the paste never shows
+  // them, so a send to claude took 22.6 s (live 2026-09-25). At 8 s the run
+  // killed the wrapper after the paste and rejected, the hook threw, and the
+  // caller read "no tool.call hook answered" for a message that had arrived.
+  // A run cut off at the deadline may have delivered: the new episode is
+  // still recorded (its row stays visible), and the answer says to peek.
+  let cut = ''
+  const sent = await host
+    .run(['agent-tmux', d.profile, 'send', '--prompt-file', tellPath, d.name], d.dir, TELL_SEND_MS)
+    .catch((error: unknown) => {
+      cut = String(error)
+      return undefined
+    })
+  if (sent && sent.exitCode !== 0) {
     return {
       ok: false,
       text:
@@ -1434,6 +1449,14 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
   }
   await host.write(`${dir}/dispatch.json`, JSON.stringify(next))
   const moved = d.owner && host.owner() && d.owner !== host.owner() ? `; it is now this session's teammate (was ${d.owner.slice(0, 8)})` : ''
+  if (cut) {
+    return {
+      ok: false,
+      text:
+        `send to "${d.name}" did not finish within ${TELL_SEND_MS / 1000}s and was stopped (${cut.slice(-200)}); ` +
+        `the message may have arrived. Peek at "${d.name}" before telling it again${moved}`,
+    }
+  }
   return { ok: true, text: `sent to "${d.name}" on ${d.profile}; its result.json was reset and it reads as outstanding again${moved}` }
 }
 
