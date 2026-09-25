@@ -389,8 +389,9 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
   `stop`／`tell` 只收名字、不收列號：列號跟著每次 refresh 移動，打字到按 Enter 之間插進
   一列就會停錯人（0.7.6，cursor d20cdcc N-2）；打數字會回 `row N is "<名字>" right now`
   讓你照名字再打一次。訊息原樣送出，換行與縮排保留。`tell` 最壞要
-  git 2 秒 + init 5 秒 + send 8 秒，會超過 hook 的 10 秒預算（UNCONFIRMED：引擎中止時
-  dispatch.json 是否已寫入）；回傳 FAILED 時先 peek 再決定要不要重送。
+  git 2 秒 + init 5 秒 + send 60 秒（`TELL_SEND_MS`；claude 的一次 send 實測 22.6 秒）。
+  這些都是 `$.process.run`，進行中的 `$` 呼叫不算進 hook 的時間預算（plugin-authoring），
+  所以不會被預算砍掉；send 超過 60 秒才會被停，這時訊息可能已送到，回傳會說 peek 後再決定要不要重送。
 
 **聚焦後的字母鍵**：`ctrl+x tab` 把鍵盤交給 band 之後 `r` 重讀、`x` 停掉選中的
 worker、`q` 隱藏面板；Esc 還給 prompt。字母鍵**只在 band 聚焦時**有效（引擎規則，
