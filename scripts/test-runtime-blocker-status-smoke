@@ -121,6 +121,21 @@ fake claude-retried <<'EOF'
   ⎿  Read 20 lines
 EOF
 
+fake api-error-prose <<'EOF'
+API Error handling for invalid api key responses is now implemented.
+› Ask Codex to do anything
+EOF
+
+fake claude-api-error <<'EOF'
+⏺ Reading the config.
+  ⎿  API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}
+EOF
+
+fake tool-api-error-prose <<'EOF'
+⏺ Update(src/client.ts)
+  ⎿  API Error handling added for invalid api key responses
+EOF
+
 fake agy-quota <<'EOF'
 ⚠ Individual quota reached
 ? for shortcuts
@@ -136,9 +151,24 @@ assert() {
 }
 
 status_of() {
-  local name="$1"
-  CODEX="$WORK/$name.sh" "$CODEX_TMUX" start --exact "$name" "$WORK" >/dev/null
-  sleep 1
+  # Unique per run: two runs at once (run-all-smokes beside a mutation run) must
+  # not share tmux sessions, or one reads the other's pane.
+  local fixture="$1" name="$1-$$"
+  CODEX="$WORK/$fixture.sh" "$CODEX_TMUX" start --exact "$name" "$WORK" >/dev/null
+  # Wait until the fixture is on screen: a `status` of a pane that has not drawn
+  # yet answers null, and every "not blocked" case would then pass vacuously.
+  local first i
+  first="$(sed -n 3p "$WORK/$fixture.sh" | tr -d '[:space:]' | cut -c1-20)"
+  for i in {1..40}; do
+    "$CODEX_TMUX" capture --strip-ansi --tail 60 "$name" 2>/dev/null | tr -d '[:space:]' | grep -qF -- "$first" && break
+    sleep 0.25
+  done
+  if (( i >= 40 )); then
+    # Not a pass by default: a case that saw no pane checked nothing.
+    print -r -- '{"blocked_reason":"FIXTURE_NEVER_DREW"}'
+    "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+    return
+  fi
   "$CODEX_TMUX" status --json "$name"
   "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
 }
@@ -200,6 +230,18 @@ assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")
 echo "case: tool output under ⎿ after an API error means claude retried"
 st="$(status_of claude-retried)"
 assert "retried not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: prose opening with API Error (no colon) is not an error line"
+st="$(status_of api-error-prose)"
+assert "api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: claude's own API error under ⎿ still counts"
+st="$(status_of claude-api-error)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a tool line under ⎿ opening with API Error (no colon) is the tool's"
+st="$(status_of tool-api-error-prose)"
+assert "tool api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
 
 echo "case: the documented agy quota banner"
 st="$(status_of agy-quota)"

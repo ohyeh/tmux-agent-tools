@@ -2460,7 +2460,7 @@ describe('astra re-review of e8704d6', () => {
       return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:''}};
     });
     await $.turn.complete(turn());
-    expect(wake.join('\n')).not.toContain('no result will arrive');
+    expect(wake.join('\n')).not.toContain('look stopped by their CLI');
   });
   test('tell without git continues and removes the previous episode base',WITH_DRIVER,async ($,on)=>{
     mock.env(on,{HOME});mockStore(on,['w1@0']);mock.clock(on);
@@ -2492,7 +2492,9 @@ test('re-review: a commit whose ancestry did not fit stays outstanding',WITH_DRI
     return {value:{exitCode:0,stdout:e.argv.includes('cat-file')?'commit\n':'',stderr:''}};
   });
   await $.turn.complete(turn());
-  expect(count).toEqual(3);
+  // 4d0af09 onward: a check that cannot fit what is left of the pass is not
+  // started at all (w1 would need 2 × 2000 ms with 1000 left), so git runs twice.
+  expect(count).toEqual(2);
   expect(store.acked()).toEqual(['w0@0']);
   expect(wake.join('\n')).not.toContain('NOT verified');
 });
@@ -2624,7 +2626,7 @@ describe('astra re-review of 3b83a9e',()=>{
   });
 });
 
-test('re-review: a claim deferred by the budget does not hold back a result that needs no git', WITH_DRIVER, async ($, on) => {
+test('re-review: a pass that ran out of budget resumes at the claim it deferred, and the rest follows', WITH_DRIVER, async ($, on) => {
   mock.env(on, { HOME })
   const store = mockStore(on)
   const clock = mock.clock(on)
@@ -2643,5 +2645,96 @@ test('re-review: a claim deferred by the budget does not hold back a result that
     return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
   })
   await $.turn.complete(turn())
-  expect(store.acked().sort()).toEqual(['w0@0', 'w2@0'])
+  // w0 is the pass's first worker, so its two git calls run whatever they cost
+  // and spend the budget; w1 and w2 wait — a bounded pass, not a same-tick promise.
+  expect(store.acked()).toEqual(['w0@0'])
+  await $.turn.complete(turn())
+  expect(store.acked().sort()).toEqual(['w0@0', 'w1@0', 'w2@0'])
+})
+
+test('re-review: a slow head that never finishes does not starve the workers after it', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  const store = mockStore(on)
+  const clock = mock.clock(on)
+  mockFs(on, {
+    [`${ROOT}/w0/dispatch.json`]: dispatch('w0', 0),
+    [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+    [`${ROOT}/w1/result.json`]: finished('behind the slow head'),
+  }, undefined, undefined, async path => {
+    // w0 has no result, and reading for it spends the whole pass every time.
+    if (path === `${ROOT}/w0/result.json`) await clock.advance(4_500)
+  })
+  mockWake(on)
+  mockStatus(on, { running: true, idle_seconds: 5 })
+  for (let t = 0; t < 3; t++) await $.turn.complete(turn())
+  expect(store.acked()).toEqual(['w1@0'])
+})
+
+test('re-review: one pass stays inside its budget however long the tail, and every result is delivered once', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  const store = mockStore(on)
+  const clock = mock.clock(on)
+  const files: Files = {}
+  for (let i = 0; i < 20; i++) {
+    files[`${ROOT}/w${i}/dispatch.json`] = dispatch('w' + i, 0, { base: 'b'.repeat(40) })
+    files[`${ROOT}/w${i}/result.json`] = JSON.stringify({ status: 'success', summary: 'done', commit: 'a'.repeat(40) })
+  }
+  mockFs(on, files, undefined, undefined, async path => {
+    if (path.endsWith('/result.json')) await clock.advance(400)
+  })
+  const wake = mockWake(on)
+  on('process.run', async ($, e) => {
+    if (e.argv[0] === 'git') await clock.advance(e.init?.timeoutMs ?? 0)
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+  })
+  const passes: number[] = []
+  for (let t = 0; t < 30 && store.acked().length < 20; t++) {
+    const before = clock.now()
+    await $.turn.complete(turn())
+    passes.push(clock.now() - before)
+  }
+  expect(store.acked().length).toEqual(20)
+  expect(new Set(store.acked()).size).toEqual(20)
+  expect(wake.join('\n')).not.toContain('NOT verified')
+  // One read (400) + both git calls (2 × 2000) of the exempt first worker, then
+  // the budget check stops the pass; nothing near the 10 s hook budget.
+  expect(Math.max(...passes)).toBeLessThanOrEqual(4_400 + 400)
+})
+
+test('re-review: the first worker of a pass is checked even when its own read spent the budget', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  const store = mockStore(on)
+  const clock = mock.clock(on)
+  mockFs(on, {
+    [`${ROOT}/w0/dispatch.json`]: dispatch('w0', 0, { base: 'b'.repeat(40) }),
+    [`${ROOT}/w0/result.json`]: JSON.stringify({ status: 'success', summary: 'done', commit: 'a'.repeat(40) }),
+  }, undefined, undefined, async path => {
+    if (path.endsWith('/result.json')) await clock.advance(1_500)
+  })
+  mockWake(on)
+  on('process.run', async ($, e) => {
+    await clock.advance(10)
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+  })
+  for (let t = 0; t < 3; t++) await $.turn.complete(turn())
+  expect(store.acked()).toEqual(['w0@0'])
+})
+
+test('a finished row stops its clock at the result, however long the pane stays open', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME })
+  mockStore(on, ['w1@0'])
+  const clock = mock.clock(on)
+  const at = new Date(clock.now() + 90_000).toISOString()
+  mockFs(on, {
+    [`${ROOT}/w1/dispatch.json`]: dispatch('w1', clock.now()),
+    [`${ROOT}/w1/result.json`]: JSON.stringify({ status: 'success', summary: 'pong', finished_at: at }),
+  })
+  mockPanel(on, { running: false, sessions: ['codex-cli-w1'] })
+  await $.session.start(session())
+  await $.command.run(run('tmux'))
+  await clock.advance(30 * 60_000)
+  const drawn = textOf(await $.ui.render(bandRender()))
+  expect(drawn).toContain('done — tell it more, or stop it')
+  expect(drawn).toContain('1:30')
+  expect(drawn).not.toContain('30:')
 })

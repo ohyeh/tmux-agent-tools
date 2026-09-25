@@ -7144,9 +7144,9 @@ runtime_blocker_phrase() {
 # usage window, a rate limit it gave up on, credentials). Three rules, each
 # from a counterexample:
 #   - the CLI's own error block only: a line that STARTS at column 0 as one
-#     (`■` banner, `⚠ Individual quota reached`, `Error:`), or claude's
-#     `⎿  API Error…`. A worker's prose ("• Implemented rate limit handling",
-#     "Error handling for invalid api key…" — no colon) and a tool's output
+#     (`■` banner, `⚠ Individual quota reached`, `Error:`, `API Error:`/`(`), or
+#     claude's `⎿  API Error:…`. A worker's prose ("• Implemented rate limit
+#     handling", "Error handling…" / "API Error handling…" — no colon) and a tool's output
 #     (under `⎿`/`└`, or indented beneath them) are not the CLI refusing work;
 #   - the LAST block only: any newer output line (`•`, `⏺`, `⎿`, `└`, `✔`, a "Worked
 #     for" rule) after the error means the worker resumed, so the banner is
@@ -7156,6 +7156,10 @@ runtime_blocker_phrase() {
 #     draws its banner above the `›` input, and an error printed right after an
 #     echoed `› prompt` is still the newest output. A `›` line is neither an
 #     error nor new output, so it changes nothing.
+# Column 0 is a layout rule, not provenance: codex and claude indent a worker's
+# prose under its `•`/`⏺` bullet, so column-0 error text is normally the CLI's
+# own — but a worker can still print a quoted `Error:` there. That is why the
+# mod words the wake-up as "looks stopped", with the line and a pointer to peek.
 # Prints "<reason><TAB><the line>", or nothing.
 # ponytail: shapes verified on a live codex banner (2026-09-24); the
 # claude/agy/cursor/grok shapes are UNCONFIRMED — add a row when one is captured.
@@ -7170,10 +7174,10 @@ runtime_blocker_for_text() {
     if [[ "$body" == '⎿'* ]]; then
       # claude nests its own API errors under ⎿; anything else there is a tool's output.
       case "$body" in
-        '⎿'*'API Error'*|'⎿'*'Claude usage limit'*|'⎿'*'Claude AI usage limit'*) hit="$(runtime_blocker_phrase "$line")" ;;
+        '⎿'*'API Error:'*|'⎿'*'API Error ('*|'⎿'*'Claude usage limit'*|'⎿'*'Claude AI usage limit'*) hit="$(runtime_blocker_phrase "$line")" ;;
         *) hit="" ;;
       esac
-    elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error')* ]]; then
+    elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error:'|'API Error (')* ]]; then
       hit="$(runtime_blocker_phrase "$line")"
     else
       case "$body" in

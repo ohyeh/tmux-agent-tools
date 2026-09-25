@@ -182,11 +182,13 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 `verified (commit object exists; no dispatch base recorded)`。不是字串、空字串、不是
 40-hex、不存在、不是 commit、是 base 本身、不在 base 之後 → 照樣交付（不吞），寫
 `success claimed, commit <sha> NOT verified: <reason>`。缺 `commit` 或 `null`（唯讀／
-review worker）→ 與以前完全相同。整批 commit 檢查共用 4 秒預算，從這一 pass 第一筆
-commit 檢查開始算；那一筆不受預算截斷，兩次 git 呼叫都拿完整的 2 秒，所以每一 pass 至少
-結清一筆，慢 repo 會被回報，不會永遠延後。預算用完後，其餘要查 commit 的（包括 cat-file
-查完、merge-base 還沒輪到的那一筆）留到下一個 tick 再查，不會被說成「查無 commit」或
-「NOT verified」；掃描照常往下走，不需要 git 的結果這一 tick 就送，不會被排在後面卡住。
+review worker）→ 與以前完全相同。一個 pass 的讀檔與 commit 檢查共用 4 秒預算（之後的
+停滯探測另有 4 秒，合起來在 engine 的 10 秒 hook 預算內）。每一 pass 從上一 pass 停下的
+那筆開始，而且那一筆不受預算限制：讀檔與兩次 git 呼叫一定做完，所以每一 pass 至少結清
+一筆，慢 repo 會被回報，不會永遠延後。其他 commit 檢查只有在剩下的時間放得下全部 git
+呼叫時才開始，開始了就不會被截斷；放不下的、以及預算用完後還沒讀到的，留到下一個 tick
+（從它開始），不會被說成「查無 commit」或「NOT verified」。所以結果是在有界的幾個 tick
+內送達，不保證同一 tick。
 已經讀到終態、只是在等 commit 檢查的 worker 也不會被停滯探測當成「沒有結果」，它之前的
 stalled／needs-input 紀錄同時清掉。`dir` 讀不到 base 時
 （不是 repo、git 沒回應）log 會寫原因。這證明的是 DAG 關係——「有一個在 base 之後的
@@ -416,14 +418,16 @@ reached」七天：沒有終態、沒有 exit，等 result 會等到天荒地老
 `quota_exhausted` 或 `login_required`（CLI 自己說停了：用量窗口、憑證失效），證據是
 同一份輸出的 `blocked_evidence`（命中的那一行）。wrapper 只認 CLI 自己的錯誤區塊：
 pane 最後 10 個非空行裡，從**第 0 欄**開始就是錯誤形狀的那一行（`■` 橫幅、
-`⚠ Individual quota reached`、`Error:`，要有冒號），或 claude 的 `⎿  API Error…`，而且
+`⚠ Individual quota reached`、`Error:`／`API Error:`，要有冒號），或 claude 的
+`⎿  API Error:…`，而且
 它之後沒有新的輸出行（`•`、`⏺`、`⎿`、`└`、`✔`、「Worked for」）——worker 自己引述的
-「invalid api key」、以「Error handling…」開頭的敘述、工具輸出（在 `⎿`／`└` 之下或縮排
+「invalid api key」、以「Error handling…」「API Error handling…」開頭的敘述、工具輸出（在 `⎿`／`└` 之下或縮排
 在它們底下）、恢復後才剛被推上去的舊橫幅都不算；
 CLI 放棄的 rate limit（`Error: rate limit exceeded`）算 `quota_exhausted`。mod 自己不留字表
 —— 0.7.3／0.7.4 在 mod 裡複製的半份字表會把 worker 自己寫的「Implemented rate limit
 handling」當成阻擋（astra 審查 F5）。pane 靜止滿 2 分鐘才算數（剛恢復時畫面上還留著
-舊橫幅，不該叫人），然後**叫醒 session 一次**：session 接受了才算說過（被拒就下一個
+舊橫幅，不該叫人），然後**叫醒 session 一次**，措辭是「看起來被 CLI 停住，等結果前先
+peek」——證據只是一行畫面文字，worker 自己在第 0 欄引述的 `Error:` 也長這樣：session 接受了才算說過（被拒就下一個
 tick 再試，連續拒 3 次就放棄並寫 log）；閒置時間中途歸零又回來不重說；記在記憶體，
 所以 hot reload 或別的 collector 認領後可能再說一次。這個 worker 不會自己交出結果，owner 空等才是這個 mod 要消除的沉默
 （2026-09-24：兩個 codex worker 停在 usage limit 一個小時，lead 不知道）。不殺。

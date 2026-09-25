@@ -109,8 +109,12 @@ const STALL_WAKE_MAX = 3
 const SHA_RE = /^[0-9a-f]{40}$/
 /** One `git cat-file` on a local repo: instant, or the repo is not answering. */
 const COMMIT_PROBE_MS = 2_000
-/** Every commit check of one collect pass together; the rest wait for the next tick. */
-const COMMIT_BUDGET_MS = 4_000
+/**
+ * One collect pass: its result reads and commit checks together. What does not
+ * fit waits for the next tick, which starts where this one stopped. With the
+ * 4 s stall sweep after it, a tick stays inside the engine's 10 s hook budget.
+ */
+const COLLECT_BUDGET_MS = 4_000
 
 /**
  * `git rev-parse HEAD` output as a dispatch base, or nothing. Without a base a
@@ -315,6 +319,8 @@ type Gate = {
    * be probed at all.
    */
   probeCursor: number
+  /** Where the next collect pass starts: the worker the last one deferred or did not reach. */
+  collectFrom?: string
 }
 
 function missingSections(brief: string): string[] {
@@ -635,23 +641,31 @@ async function collect(
   ready: TmuxDispatch[],
   exited: ReadonlySet<string> = new Set(),
   reported: ReadonlySet<string> = new Set(),
-): Promise<{ finished: Finished[]; unfinished: TmuxDispatch[]; terminal: Set<string> }> {
+  from?: string,
+): Promise<{ finished: Finished[]; unfinished: TmuxDispatch[]; terminal: Set<string>; resume?: string }> {
   const now = await host.now()
-  // Set when the pass's FIRST commit check starts, which runs outside it: that
-  // check always has full COMMIT_PROBE_MS windows, so every pass settles at least
-  // one claim and no slow repo is deferred forever (a budget set before the
-  // result reads left the ancestry call 1900 ms, every pass, for good).
-  let gitDeadline: number | undefined
+  const deadline = now + COLLECT_BUDGET_MS
+  // The pass starts where the last one stopped (`from`), and that first worker is
+  // exempt from the budget: its read and both git calls always run, so every pass
+  // settles at least one claim and nothing is deferred forever (A1: a budget spent
+  // by reads left the ancestry call 1900 ms, every pass). `resume` is the first
+  // worker this pass deferred or did not reach — the next pass starts there.
+  const start = Math.max(0, from ? ready.findIndex(d => idOf(d) === from) : 0)
+  let resume: string | undefined
   const out: Finished[] = []
   // What this pass READ and found with no terminal result: the only workers the
-  // stall sweep may call "no result will arrive". One the pass did not reach (a
+  // stall sweep may report as stopped. One the pass did not reach (a
   // batch break) is in neither set and keeps whatever state it had.
   const unfinished: TmuxDispatch[] = []
   // What this pass read as terminal, delivered now or not: its stall/dialog
   // observations are stale, whatever the pane still shows.
   const terminalIds = new Set<string>()
-  for (const d of ready) {
-    if (out.length >= BATCH_MAX) break
+  for (let i = 0; i < ready.length; i++) {
+    const d = ready[(start + i) % ready.length]!
+    if (out.length >= BATCH_MAX || (i > 0 && (await host.now()) >= deadline)) {
+      resume ??= idOf(d)
+      break
+    }
     const dir = `${root}/${d.name}`
     const path = `${dir}/result.json`
     try {
@@ -694,15 +708,14 @@ async function collect(
       // or review worker) delivers exactly as before. '' is a malformed claim.
       let commit: CommitCheck | undefined
       if (status === 'success' && sha != null) {
-        // One budget for the whole batch: twenty slow repos must not hold the
-        // tick for forty seconds. What is not checked yet stays outstanding for
-        // the next tick — never delivered as "no such commit" — and the scan
-        // goes on, so a result that needs no git is not held behind it.
-        const started = await host.now()
-        const first = gitDeadline === undefined
-        gitDeadline ??= started + COMMIT_BUDGET_MS
-        const check = await checkCommit(host, d, sha, first ? Number.POSITIVE_INFINITY : gitDeadline - started)
-        if (check === DEFERRED) continue
+        // A check that does not fit what is left of the pass is not started:
+        // it stays outstanding — never delivered as "no such commit" — and the
+        // next pass starts with it.
+        const check = await checkCommit(host, d, sha, i === 0 ? Number.POSITIVE_INFINITY : deadline - (await host.now()))
+        if (check === DEFERRED) {
+          resume ??= idOf(d)
+          continue
+        }
         commit = check
       }
       out.push({ d, path, status, summary: typeof s === 'string' ? s : '', ...(commit ? { commit } : {}) })
@@ -710,7 +723,7 @@ async function collect(
       host.log(`tmux-agent: could not read result for ${d.name}: ${String(error)}`)
     }
   }
-  return { finished: out, unfinished, terminal: terminalIds }
+  return { finished: out, unfinished, terminal: terminalIds, ...(resume ? { resume } : {}) }
 }
 
 /**
@@ -733,27 +746,15 @@ async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: 
   if (!SHA_RE.test(sha)) {
     return { sha: sha.replace(CTRL_ALL_RE, ' ').slice(0, 64), verified: false, reason: 'not a full 40-hex commit sha' }
   }
-  const deadline = (await host.now()) + budgetMs
-  // The pass's budget running out is not git's answer: that check is DEFERRED,
-  // left outstanding for the next tick. Only a call given its full
-  // COMMIT_PROBE_MS that still failed to answer is a failure to report. `collect`
-  // gives the pass's first check an unbounded budget, so both its calls get the
-  // full window and a slow repo is reported, never deferred forever.
-  const git = async (args: readonly string[]) => {
-    const left = deadline - (await host.now())
-    if (left <= 0) return DEFERRED
-    const window = Math.min(COMMIT_PROBE_MS, left)
-    return host
-      .run(['git', '-C', d.dir, ...args], d.dir, window)
-      .catch((error: unknown) =>
-        window < COMMIT_PROBE_MS
-          ? DEFERRED
-          : gitFailed(error),
-      )
-  }
+  // Started only when every call it needs fits what is left of the pass, and
+  // then each call has its full COMMIT_PROBE_MS: a check is never cut short, so
+  // a git that did not answer in that window is a failure to report, and the
+  // budget running out is DEFERRED before any call — not git's answer.
+  if (budgetMs < (d.base && sha !== d.base ? 2 : 1) * COMMIT_PROBE_MS) return DEFERRED
+  const git = (args: readonly string[]) =>
+    host.run(['git', '-C', d.dir, ...args], d.dir, COMMIT_PROBE_MS).catch(gitFailed)
   const why = (p: { stdout: string; stderr: string }) => (p.stderr || p.stdout).replace(CTRL_ALL_RE, ' ').trim().slice(0, 200)
   const type = await git(['cat-file', '-t', sha])
-  if (type === DEFERRED) return DEFERRED
   if (type.exitCode !== 0) {
     return { sha, verified: false, reason: `no such object in ${d.dir} (git cat-file exit ${type.exitCode}${why(type) ? `: ${why(type)}` : ''})` }
   }
@@ -762,7 +763,6 @@ async function checkCommit(host: Host, d: TmuxDispatch, sha: unknown, budgetMs: 
   if (!d.base) return { sha, verified: true, scope: 'commit object exists; no dispatch base recorded' }
   if (sha === d.base) return { sha, verified: false, reason: 'it is the dispatch base itself — nothing was committed on top of it' }
   const anc = await git(['merge-base', '--is-ancestor', d.base, sha])
-  if (anc === DEFERRED) return DEFERRED
   if (anc.exitCode === 0) return { sha, verified: true, scope: `descends from dispatch base ${d.base.slice(0, 12)}` }
   return {
     sha,
@@ -960,7 +960,7 @@ async function flagStalls(
         id,
         text:
           `- "${d.name}" on ${d.profile}: stalled for ${minutes} min — ${evidence}\n` +
-          `  ${shown(row.diagnostic) || 'nothing will arrive until someone acts'}\n` +
+          `  ${shown(row.diagnostic) || 'if the pane confirms it, nothing arrives until someone acts'}\n` +
           `  dir: ${d.dir}`,
       })
       continue
@@ -983,7 +983,10 @@ async function flagStalls(
   // next tick and given up on — logged, the panel still showing the row as
   // stalled — after STALL_WAKE_MAX of them.
   const text = [
-    `tmux-agent: ${woken.length} worker(s) stalled — no result will arrive until someone acts.`,
+    // "Looks": the evidence is one line of pane text, which a worker quoting an
+    // error at column 0 can also produce — the notice says what was seen and
+    // where to look, not that the result cannot come.
+    `tmux-agent: ${woken.length} worker(s) look stopped by their CLI — peek at the pane before waiting on a result.`,
     ...woken.map(w => w.text),
   ].join('\n')
   const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error) }))
@@ -1069,6 +1072,9 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
     let done = false
     let failed = false
     let summary: string | undefined
+    // A finished worker's clock stops at its result: `done — 26:23` still
+    // ticking read as work in progress (observed 2026-09-25).
+    let endedAt: number | undefined
     if (root) {
       const dir = `${root}/${d.name}`
       const path = `${dir}/result.json`
@@ -1080,6 +1086,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
         done = typeof status === 'string' && TERMINAL.has(status)
         const s = raw?.summary ?? raw?.body?.summary
         if (done && typeof s === 'string') summary = `${status}: ${s}`.replace(CTRL_ALL_RE, ' ').slice(0, SUMMARY_MAX)
+        if (done) endedAt = await finishedAt(host, path, raw)
       }
       // Same order as `collect`: a real result outranks the launch receipt, and
       // without one a launch that never took must not read as `running`.
@@ -1102,7 +1109,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
               ? 'exited'
               : 'running',
       idleSeconds: stall?.idleSeconds,
-      ageMs: now - d.since,
+      ageMs: Math.min(endedAt ?? now, now) - d.since,
       ...(summary ? { summary } : {}),
       ...(blockedReason ? { blockedReason } : {}),
     })
@@ -1155,7 +1162,8 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
   }
   const reported = new Set<string>([...keep, ...[...acks.others.values()].flat()])
   const pending = dispatches.filter(d => !reported.has(idOf(d)))
-  const { finished: done, unfinished, terminal } = await collect(host, root, pending, gate.exited, reported)
+  const { finished: done, unfinished, terminal, resume } = await collect(host, root, pending, gate.exited, reported, gate.collectFrom)
+  gate.collectFrom = resume
 
   // Only what collection read and found with no terminal result — exactly the
   // set where "running" and "stuck" look identical from disk. A worker whose
