@@ -229,6 +229,70 @@ assert "stuck: the worker ran after the nudge (result written, not confirmed on 
   "$(jq -r .status "$TMUX_AGENT_DIR/deliver-stuck/result.json" 2>/dev/null)" "success"
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" stuckclaude stop deliver-stuck >/dev/null 2>&1 || true
 
+# ---- case 5: the paste placeholder sits in the composer (cursor, 2026-09-25) --
+# cursor-agent showed `→ [Pasted text #1 +25 lines]` in its input box after the
+# composer nudge; the nudge's own redraw read as activity (idle <= 3) and assign
+# reported assigned:true for a worker that never got its task. pastecli is a
+# generic-family fake: it echoes the text, holds the placeholder in its
+# composer, ignores the first bare Enter (redraws only) and submits on the
+# second — `--enters 99` never submits at all (a flag, not an env var: a
+# session of an already-running tmux server does not inherit the caller's env).
+cat > "$WORK/pastecli" <<'EOF2'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "pastecli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+RES=""
+need=2
+while [ $# -gt 0 ]; do case "$1" in --result) RES="$2"; shift 2 ;; --enters) need="$2"; shift 2 ;; *) shift ;; esac; done
+enters=0
+echo "→ ready"
+while IFS= read -r line; do
+  if [ -z "$line" ]; then
+    enters=$((enters+1))
+    if [ "$enters" -ge "$need" ]; then
+      printf '  [Pasted text #1 +25 lines]\n\342\240\240 Working\n\342\206\222 Add a follow-up\n'
+      [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"submitted","artifacts":[],"errors":[]}\n' > "$RES"
+      i=0; while [ $i -lt 8 ]; do printf 'Working %ss\r' "$i"; i=$((i+1)); sleep 1; done
+    else
+      printf 'Usage plan 78%%\r'
+    fi
+  else
+    printf '%s\n\342\206\222 [Pasted text #1 +25 lines]\n' "$line"
+    i=0; while [ $i -lt 5 ]; do printf 'Usage plan 78%% %ss\r' "$i"; i=$((i+1)); sleep 2; done
+  fi
+done
+EOF2
+chmod +x "$WORK/pastecli"
+printf 'bin=%s\nheuristic_family=generic\n' "$WORK/pastecli" > "$WORK/profiles/pastecursor.conf"
+
+echo
+echo "case: a paste placeholder left in the composer is pressed again, never confirmed on the nudge's redraw"
+mkdir -p "$TMUX_AGENT_DIR/deliver-paste"
+code=0
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" \
+AGENT_TMUX_LAUNCH_FLAGS="--result $TMUX_AGENT_DIR/deliver-paste/result.json" \
+  "$AGENT_TMUX" pastecursor assign --timeout 90 --confirm-window 75 --detach \
+    --prompt-delivery file-ref deliver-paste "$WORK" "$WORK/multi.txt" \
+    >"$WORK/paste.out" 2>"$WORK/paste.err" || code=$?
+assert "paste: assign confirmed the worker" "$code" "0"
+assert_contains "paste: the second Enter was pressed" "$(cat "$WORK/paste.err")" "composer nudge 2/2"
+assert "paste: the worker ran (result written)" \
+  "$(jq -r .status "$TMUX_AGENT_DIR/deliver-paste/result.json" 2>/dev/null)" "success"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" pastecursor stop deliver-paste >/dev/null 2>&1 || true
+
+echo
+echo "case: a paste that never leaves the composer fails assign by name"
+mkdir -p "$TMUX_AGENT_DIR/deliver-unsent"
+code=0
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" \
+AGENT_TMUX_LAUNCH_FLAGS="--result $TMUX_AGENT_DIR/deliver-unsent/result.json --enters 99" \
+  "$AGENT_TMUX" pastecursor assign --timeout 90 --confirm-window 75 --detach \
+    --prompt-delivery file-ref deliver-unsent "$WORK" "$WORK/multi.txt" \
+    >"$WORK/unsent.out" 2>"$WORK/unsent.err" || code=$?
+assert "unsent: assign failed" "$([[ $code -ne 0 ]] && echo nonzero || echo 0)" "nonzero"
+assert_contains "unsent: the reason names the composer" "$(cat "$WORK/unsent.err")" "still sitting unsent in the composer"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" pastecursor stop deliver-unsent >/dev/null 2>&1 || true
+
 echo
 echo "summary: $PASS passed, $FAIL failed"
 (( FAIL == 0 )) || exit 1

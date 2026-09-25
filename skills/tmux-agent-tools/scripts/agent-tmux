@@ -4218,7 +4218,18 @@ assign_session() {
   _assign_delivered() {
     ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null | tr -d '[:space:]' | grep -qF "$proof"
   }
-  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy busy_metric idle validation nudged=0
+  # The composer still holds the paste: the pane's LAST prompt-glyph line (the
+  # input box, below every transcript line) is a paste placeholder. Observed
+  # 2026-09-25 on cursor: `→ [Pasted text #1 +25 lines]` sat unsent after the
+  # composer nudge, and the nudge's own redraw read as activity (idle <= 3), so
+  # assign reported assigned:true for a worker that never got its task. Nothing
+  # else on screen can overrule this line: an unsent composer is not processing.
+  _assign_paste_unsent() {
+    ( capture_session --strip-ansi --tail 60 "$1" ) 2>/dev/null \
+      | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = $0 } END { print last }' \
+      | grep -qE '^[[:space:]]*(→|›|❯|>)[[:space:]]+\[Pasted (text|Content)'
+  }
+  local send_out send_rc attempt sent_at now confirmed=0 st blocked busy busy_metric idle validation nudged=0 nudged_at=0
   for attempt in 1 2; do
     send_rc=0
     if [[ "$delivery" == "file-ref" ]]; then
@@ -4257,7 +4268,18 @@ assign_session() {
       # paste still sitting in the scrollback before the TUI's alt-screen
       # takes over — the 20s floor gives the alt-screen time to wipe it, so
       # a surviving proof line means the CLI really echoed the prompt.
-      if (( now - sent_at > 20 )) && _assign_delivered "$name"; then
+      if (( now - sent_at > 20 )) && _assign_paste_unsent "$name"; then
+        # Never a resend (it would paste the brief twice): Enter, at most twice,
+        # 10s apart, then a named failure instead of a false assigned:true.
+        if (( nudged >= 2 )) && (( now - nudged_at >= 10 )); then
+          _assign_fail confirm-processing "the prompt is still sitting unsent in the composer after ${nudged} Enter presses" "$name"
+        fi
+        if (( now - nudged_at >= 10 )); then
+          nudged=$(( nudged + 1 )); nudged_at="$now"
+          echo "assign[4/5] the composer still holds the paste — pressing Enter (composer nudge ${nudged}/2)" >&2
+          ( send_session --key enter "$name" ) >/dev/null 2>&1 || echo "assign[4/5] composer nudge: send --key enter failed" >&2
+        fi
+      elif (( now - sent_at > 20 )) && _assign_delivered "$name"; then
         # The busy metric is the family's own, not a `busy` alias: `probe` has
         # no metric by that name and answered "Unknown metric" here since the
         # day this was written, so the "preferred signal" never fired and every
@@ -4285,7 +4307,7 @@ assign_session() {
         # on startup redraws). One mapped Enter, once, under the send lock, is
         # that hand — never a resend, which would paste the prompt a second time.
         if (( ! nudged )) && [[ -n "$idle" && "$idle" -ge 10 ]]; then
-          nudged=1
+          nudged=1; nudged_at="$now"
           echo "assign[4/5] prompt is on screen but nothing is running after ${idle}s — pressing Enter once (composer nudge)" >&2
           ( send_session --key enter "$name" ) >/dev/null 2>&1 || echo "assign[4/5] composer nudge: send --key enter failed" >&2
         fi
