@@ -4219,6 +4219,16 @@ assign_session() {
   # ponytail: fixed windows; a CLI that sits unchanged for _ASSIGN_SEND_SETTLE,
   # or boots longer than _ASSIGN_SEND_LOOK, before drawing its dialog still
   # gets the paste, and the confirm step then fails `worker blocked after send`.
+  # A still pane is not a ready CLI: cursor-agent drew nothing under the
+  # launcher header for over 3s while it booted (live 2026-09-25), the paste
+  # was echoed there by the tty, the TUI later took it into its composer
+  # unsubmitted, and the echoed brief ("trust this folder") read as a dialog.
+  # So the CLI must first draw a line below the header; a header scrolled off
+  # the capture counts as drawn.
+  _assign_cli_drew() {
+    ( capture_session --strip-ansi --tail 200 "$1" ) 2>/dev/null \
+      | awk '/^capture: .* capture [^ ]+ 120$/ { h = NR; drew = 0; next } h && /[^[:space:]]/ { drew = 1 } END { exit !(drew || !h) }'
+  }
   local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10
   local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle _saw_startup=0
   while :; do
@@ -4235,6 +4245,12 @@ assign_session() {
           "CLI still starting after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s (startup_pending) — refusing to paste into a swallowing UI" "$name"
         sleep 2 ;;
       *)
+        if ! _assign_cli_drew "$name"; then
+          (( SECONDS >= ready_deadline )) && _assign_fail send \
+            "CLI drew nothing after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s — refusing to paste into a UI that is not up" "$name"
+          _saw_startup=1
+          sleep 1; continue
+        fi
         # The look window is anchored at loop entry. A long "verifying your
         # account" screen burns it, and the first settled look would then send
         # with idle_seconds ≈ 0. Start the window over once that screen is gone.

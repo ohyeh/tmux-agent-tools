@@ -26,6 +26,7 @@ cleanup() {
   "$AGENT_TMUX" foldcli stop fold-whole >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-short >/dev/null 2>&1 || true
   "$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
+  "$AGENT_TMUX" slowcli stop slow-smoke >/dev/null 2>&1 || true
   "$AGENT_TMUX" updcli stop upd-smoke >/dev/null 2>&1 || true
   local n; for n in work-codex work-claude work-frozen; do "$AGENT_TMUX" workcli stop "$n" >/dev/null 2>&1 || true; done
   rm -rf "$WORK"
@@ -198,6 +199,41 @@ assert_contains "oneline: the warning is kept" "$(cat "$WORK/fold-oneline.err")"
 assert "oneline: result-path instruction not recorded" \
   "$([[ -e "$TMUX_AGENT_DIR/fold-oneline/.result-path-injected" ]] && echo yes || echo no)" "no"
 "$AGENT_TMUX" foldcli stop fold-oneline >/dev/null 2>&1 || true
+
+# ---- case 2b: a CLI that draws nothing while it boots ------------------------
+# Live 2026-09-25, cursor-agent: the pane sat still under the launcher header
+# while node booted, the brief was pasted there, and the TUI kept it unsent.
+# slowcli is silent for 15 s with the tty echo on, then logs any input already
+# waiting (stale) before it reads.
+cat > "$WORK/slowcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "slowcli 1.0"; exit 0; }
+LOG=/dev/null; RES=""
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; --result) RES="$2"; shift 2 ;; *) shift ;; esac; done
+sleep 15
+stty -echo 2>/dev/null
+while IFS= read -r -t 1 s; do printf 'stale:%s\n' "$s" >> "$LOG"; done
+echo "> ready"
+while IFS= read -r line; do
+  printf 'input:%s\n' "$line" >> "$LOG"
+  [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"slow","artifacts":[],"errors":[]}\n' > "$RES"
+done
+EOF
+chmod +x "$WORK/slowcli"
+
+echo
+echo "case: a CLI that draws nothing while it boots gets the brief only after it draws"
+LOG="$WORK/slow.log"; : > "$LOG"
+mkdir -p "$TMUX_AGENT_DIR/slow-smoke"
+code=0
+AGENT_TMUX_LAUNCH_FLAGS="--log $LOG --result $TMUX_AGENT_DIR/slow-smoke/result.json" \
+  "$AGENT_TMUX" slowcli assign --timeout 60 --confirm-window 30 --detach \
+    --prompt-delivery paste slow-smoke "$WORK" "$WORK/brief.txt" \
+    >"$WORK/slow.out" 2>"$WORK/slow.err" || code=$?
+assert "slow: assign confirmed the worker" "$code" "0"
+refute_contains "slow: nothing was pasted before the CLI drew" "$(cat "$LOG")" "stale:"
+assert_contains "slow: the brief arrived after the draw" "$(cat "$LOG")" "input:GOAL: prove the brief survives the dialog."
+"$AGENT_TMUX" slowcli stop slow-smoke >/dev/null 2>&1 || true
 
 # ---- case 3: a self-update menu at boot --------------------------------------
 # Live 2026-09-25, codex 0.156.1: the send's Enter chose "1. Update now", which
