@@ -187,7 +187,9 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 object-format 的 repo（64-hex）目前一律記不到 base、驗不過。`base` 與 result.json 放在
 同一個 worker 可寫的目錄：這個檢查是抓「幻覺出來的 commit」，不是防惡意 worker。缺 `commit` 或 `null`（唯讀／
 review worker）→ 與以前完全相同。一個 pass 的讀檔與 commit 檢查共用 4 秒預算（之後的
-停滯探測另有 4 秒，合起來在 engine 的 10 秒 hook 預算內）。每一 pass 從上一 pass 停下的
+停滯探測另有 4 秒，正常情況下合起來在 engine 的 10 秒 hook 預算內——不是硬上限：下面說的
+第一筆不受預算限制，一次很慢的讀檔加兩次 git 就會超過；引擎丟掉那次 hook 時下一個 tick
+重來，ack 在交付之後才寫，所以代價是重報，不是漏報）。每一 pass 從上一 pass 停下的
 那筆開始，而且那一筆不受預算限制：讀檔與兩次 git 呼叫一定做完，所以每一 pass 至少結清
 一筆，慢 repo 會被回報，不會永遠延後。其他 commit 檢查只有在剩下的時間放得下全部 git
 呼叫時才開始，開始了就不會被截斷；放不下的、以及預算用完後還沒讀到的，留到下一個 tick
@@ -357,7 +359,10 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 - prompt 空白時直接按 `1`–`9` 選那一列（鏡像它的畫面尾巴；再按一次取消）。
 - `/tmux N` 選第 N 列（第 10 列起、或被擠到 `+N more` 裡的列用這個）。
 - `/tmux stop N|名字`、`/tmux tell N|名字 <訊息>`、`/tmux hide`。打出列號或名字
-  本身就是確認。
+  本身就是確認。列號對的是**上一次畫出來**的面板（之後 refresh 插進新列也不會停錯人）；
+  面板隱藏時沒有畫出來的列，只收名字。訊息原樣送出，換行與縮排保留。`tell` 最壞要
+  git 2 秒 + init 5 秒 + send 8 秒，會超過 hook 的 10 秒預算（UNCONFIRMED：引擎中止時
+  dispatch.json 是否已寫入）；回傳 FAILED 時先 peek 再決定要不要重送。
 
 **聚焦後的字母鍵**：`ctrl+x tab` 把鍵盤交給 band 之後 `r` 重讀、`x` 停掉選中的
 worker、`q` 隱藏面板；Esc 還給 prompt。字母鍵**只在 band 聚焦時**有效（引擎規則，
@@ -366,7 +371,8 @@ d.ts `ButtonProps.hotkey`），prompt 聚焦時按 `x` 只會打出一個 x。`c
 自己的終端機可以這樣查：`cat -v` 後按 ctrl+x、Tab，印出 `^X^I` 就是有送到。
 
 `[ stop ]` 要按兩次：第一次變成 `[ stop <名字>? press again ]` 並倒數 5 秒，時間內
-再按一次才真的停（停掉會結束 tmux session，不能復原；2026-09-25 實測 band 聚焦在
+再按一次才真的停（兩次間隔不到 0.4 秒算按住鍵的重複，不算確認；選中的 worker 離開清單時
+選取自動取消）（停掉會結束 tmux session，不能復原；2026-09-25 實測 band 聚焦在
 `[ refresh ]` 上時一個誤按的 `x` 就停掉了 worker）。`[ hide ]` 放在標頭最右邊、
 離 `[ refresh ]` 遠一點；隱藏可以用 `/tmux` 復原。滑鼠點也行（終端機有回報 click
 時），但不要依賴它。
@@ -385,6 +391,8 @@ hotkey」（d.ts `AbovePrompt.maxRows`），數字鍵就廢了。每一行都算
 隊友數字鍵就失靈）；總覽放不下的列收進 `+N more — /tmux N selects row N`；選中時
 列表先讓位給鏡像的 6 行下限（13 行的 band、兩個 worker 以前印 `needs 15`，八個印
 `needs 18`，鏡像永遠出不來）。鏡像行數是 `maxRows` 減掉這些之後剩下的，不是固定值。
+band 連「一列加它的控制」都放不下時只畫標題列和一行指令提示（`/tmux N · /tmux stop N …`），
+不溢位。
 
 三件事是刻意的：
 
@@ -466,8 +474,8 @@ stalled 紀錄，面板、log、`$.tmux.stalled()` 三者一致。閒置時鐘�
 picker，brief 變成背景 session，結果照樣寫出來）。所以 launch-failed 通知另記一個
 ack（`<name>@<since>#launch`），episode 不關；同一 episode 之後寫出的 terminal result
 一律優先於收據，照常交付一次。以前這種結果會被永遠丟掉。通知之後這個 worker 照一般
-worker 看：pane 已經不在就以 `exited` 交付並關閉 episode（不存在的 profile 名稱不會永遠
-掛在面板上），pane 還活著就照樣探測，停在 quota 或對話框時一樣會被發現。
+worker 看：pane 已經不在就以 `exited` 通知一次、離開面板與 `outstanding()`（不存在的
+profile 名稱不會永遠掛在面板上），pane 還活著就照樣探測，停在 quota 或對話框時一樣會被發現。
 
 面板最上面一行說 collector 現在會不會投遞：連續三次投遞被拒而
 暫停、或已回報集合超出預算而暫停，都會印出原因與解法；沒有這一行就表示
@@ -476,8 +484,12 @@ collector 活著。同一個判斷也寫進 `assign` 工具的回傳最後一句
 `skills/using-tmux-agent-tools/SKILL.md` 的 COLLECTOR 一節就是拿這一句當分支條件。
 
 同一輪探測還負責第四種狀態 `exited`：status 回 `exists:false`（session 沒了），但磁碟上沒有終態
-result；下一個 tick 會以 `exited` 交付一次並記帳。光看磁碟，這種 worker 跟「還在想」長得一模一樣，所以面板以前一路畫成
+result；下一個 tick 會以 `exited` 通知一次，記在自己的 ack（`<name>@<since>#exited`，跟
+`#launch` 一樣只關通知、不關 episode）：列離開面板，但之後如果還有遲到的 result（背景
+寫入者、延遲 flush）照樣交付一次。光看磁碟，這種 worker 跟「還在想」長得一模一樣，所以面板以前一路畫成
 `running` —— 那是在叫人去等一個永遠不會來的結果。狀態探測是這個 mod 裡唯一會
 問 pane 死活的東西，所以答案記在那裡。與 `stalled` 同樣是 best-effort：探測
-每輪最多探 8 個，預算（4 秒）用完就停；下一輪從第一個沒探到的開始，所以排在前面的
-慢探測不會讓後面的 worker 永遠探不到。沒被探到的 worker 下一輪才會改狀態。
+每輪最多探 8 個，最久沒探過的先探（沒探過的最先），預算（4 秒）用完就停——被跳過的正好
+排在下一輪最前面。順序跟著 worker 本身，不是它在這一輪清單裡的位置：collect 每輪交過來的
+子集合不一樣，用位置輪替時八個裡有四個永遠探不到（astra，34e2a1e）。沒被探到的 worker
+下一輪才會改狀態。

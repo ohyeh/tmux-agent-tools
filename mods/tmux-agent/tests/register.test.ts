@@ -1200,8 +1200,14 @@ describe('stall detection', () => {
     expect(woken.length).toEqual(1)
     expect(woken[0]).toContain('"w1" on codex: exited')
     expect(woken[0]).toContain('no terminal result.json')
-    expect(store.acked(), 'delivered, so it never sits on /tmux for hours').toEqual(['w1@0'])
-    void clock
+    expect(store.acked(), 'delivered, so it never sits on /tmux for hours').toEqual(['w1@0#exited'])
+    // The episode stays open for a late result, but the notice is not repeated.
+    for (let i = 0; i < 3; i += 1) {
+      await clock.advance(10_000)
+      await $.turn.complete(turn())
+    }
+    expect(woken.length, 'exited is said once').toEqual(1)
+    expect(namesIn((await $.command.run(run('outstanding'))).text)).toEqual([])
   })
 
   test('a session that does not exist YET is not exited: the launch receipt gates the verdict', WITH_DRIVER, async ($, on) => {
@@ -1226,7 +1232,7 @@ describe('stall detection', () => {
     await $.turn.complete(turn())
     expect(woken.length, 'receipt written, pane still gone: now it is exited, once').toEqual(1)
     expect(woken[0]).toContain('"w1" on codex: exited')
-    expect(store.acked()).toEqual(['w1@0'])
+    expect(store.acked()).toEqual(['w1@0#exited'])
   })
 
   test('a pane that is idle at its prompt is alive, not exited', WITH_DRIVER, async ($, on) => {
@@ -2379,6 +2385,12 @@ describe('teammates', () => {
     await settle()
     expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`), 'one press only arms it').toEqual(false)
     expect(textOf(await $.ui.render(bandRender()))).toContain('stop w1? press again')
+    // A press at once is a held key repeating: still only armed.
+    await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
+    await settle()
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`), 'a key repeat does not confirm').toEqual(false)
+    await clock.advance(500)
+    await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
     // The button does not hold the render hook on a subprocess; let its work land.
     await settle()
@@ -2790,7 +2802,7 @@ describe('cursor review of 4d0af09', () => {
     expect(wake.length, 'the launch notice, then exited').toEqual(2)
     expect(wake[0]).toContain('launch-failed')
     expect(wake[1]).toContain('"w1" on codex: exited')
-    expect(store.acked().sort()).toEqual(['w1@0', 'w1@0#launch'])
+    expect(store.acked().sort()).toEqual(['w1@0#exited', 'w1@0#launch'])
     expect(namesIn((await $.command.run(run('outstanding'))).text)).toEqual([])
   })
 
@@ -2956,5 +2968,165 @@ describe('panel UX, 2026-09-25 live probe', () => {
     expect(store.acked()).toContain('w1@0')
     expect((await $.command.run(run('tmux', 'hide'))).text).toContain('hidden')
     expect(textOf(await $.ui.render(bandRender()))).not.toContain('w2')
+  })
+})
+
+describe('astra review of 34e2a1e', () => {
+  test('rotating collect windows eventually probe every unfinished worker (C1)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = {}
+    for (let i = 0; i < 8; i++) files[`${ROOT}/l${i}/dispatch.json`] = dispatch(`l${i}`, 0)
+    mockFs(on, files, undefined, undefined, async path => {
+      if (path.endsWith('/result.json')) await clock.advance(1000)
+    })
+    mockWake(on)
+    const probed: string[] = []
+    on('process.run', async ($, e) => {
+      probed.push(e.argv[e.argv.length - 1] ?? '')
+      await clock.advance(2000)
+      return { value: { exitCode: 0, stdout: JSON.stringify({ running: true, idle_seconds: 5 }), stderr: '' } }
+    })
+    for (let i = 0; i < 8; i++) await $.turn.complete(turn())
+    expect([...new Set(probed)].sort()).toEqual(['l0', 'l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7'])
+  })
+
+  test('a late terminal result after launch failure and a missing pane is delivered once (C2)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/launch.exit`]: '1\n' }
+    mockFs(on, files)
+    const wake = mockWake(on)
+    mockStatus(on, { exists: false, running: false })
+    for (let i = 0; i < 4; i++) {
+      await $.turn.complete(turn())
+      await clock.advance(60000)
+    }
+    expect(namesIn((await $.command.run(run('outstanding'))).text), 'the exited notice takes it off the list').toEqual([])
+    files[`${ROOT}/w1/result.json`] = finished('late background result')
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(wake.join('\n')).toContain('late background result')
+    expect(wake.filter(w => w.includes('late background result')).length, 'once').toEqual(1)
+    expect(store.acked().sort()).toEqual(['w1@0', 'w1@0#exited', 'w1@0#launch'])
+  })
+
+  test('a panel on a band smaller than one row and its controls stays inside it (C3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    await $.command.run(run('tmux', '1'))
+    for (let rows = 1; rows <= 13; rows += 1) {
+      const tree = await $.ui.render(bandRender(rows))
+      const count = ((tree as { children?: unknown[] }).children ?? []).slice(1).length
+      expect(count, `maxRows ${rows}`).toBeLessThanOrEqual(rows)
+    }
+    expect(textOf(await $.ui.render(bandRender(3)))).toContain('/tmux stop N')
+  })
+})
+
+describe('cursor review of 34e2a1e', () => {
+  test('a probe cut short by the budget does not count as probed: the seventh of seven is answered (P2-1)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = {}
+    for (let i = 0; i < 7; i += 1) files[`${ROOT}/l${i}/dispatch.json`] = dispatch(`l${i}`, 0)
+    mockFs(on, files)
+    const wake = mockWake(on)
+    on('process.run', async ($, e) => {
+      const name = e.argv[e.argv.length - 1] ?? ''
+      const limit = e.init?.timeoutMs ?? 0
+      // 600 ms of work; a ceiling below that is the engine cutting it short.
+      if (limit < 600) {
+        await clock.advance(limit)
+        throw new Error('timed out')
+      }
+      await clock.advance(600)
+      const body =
+        name === 'l6'
+          ? { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' }
+          : { running: true, idle_seconds: 5 }
+      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+    })
+    for (let i = 0; i < 4; i += 1) await $.turn.complete(turn())
+    expect(wake.join('\n')).toContain('"l6" on codex: stalled')
+  })
+
+  test('stopping the selected row clears the selection, and the band stays inside maxRows (P2-2)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0) })
+    mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    await $.ui.render(bandRender(10))
+    await $.command.run(run('tmux', '1'))
+    await $.ui.render(bandRender(10))
+    await $.command.run(run('tmux', 'stop w1'))
+    await clock.advance(2_000)
+    const tree = await $.ui.render(bandRender(10))
+    const rows = ((tree as { children?: unknown[] }).children ?? []).slice(1).length
+    expect(rows).toBeLessThanOrEqual(10)
+    expect(textOf(tree)).not.toContain('too short to mirror')
+    expect(keysOf(tree)).not.toContain('stop:w2@0')
+  })
+
+  test('/tmux stop N stops the row N the person saw, not the one a refresh moved there (P2-3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = { [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0), [`${ROOT}/w3/dispatch.json`]: dispatch('w3', 0) }
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    const before = textOf(await $.ui.render(bandRender()))
+    expect(before.indexOf('w2'), 'drawn: row 1 w2, row 2 w3').toBeLessThan(before.indexOf('w3'))
+    // A new worker sorts in front after a refresh the person has not seen drawn.
+    files[`${ROOT}/w1/dispatch.json`] = dispatch('w1', 0)
+    await clock.advance(2_000)
+    expect((await $.command.run(run('tmux', 'stop 2'))).text).toContain('stop "w3"')
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w3`)).toEqual(true)
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w2`)).toEqual(false)
+    // With the panel hidden there is no drawn row: a number names nothing.
+    await $.command.run(run('tmux', 'hide'))
+    expect((await $.command.run(run('tmux', 'stop 1'))).text).toContain('the panel is hidden')
+  })
+
+  test('/tmux tell keeps the message as typed, newlines and indentation included (P3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const files: Files = { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) }
+    mockFs(on, files)
+    mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    expect((await $.command.run(run('tmux', 'tell w1 line one\n  indented two'))).text).toContain('tell "w1" — ok')
+    const brief = Object.entries(files).find(([k]) => k.includes('/w1/tell-'))?.[1] ?? ''
+    expect(brief).toContain('line one\n  indented two')
+  })
+
+  test('[ hide ] stays clear of the engine [-] at 80 columns (P3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    const tree = await $.ui.render(bandRender())
+    const header = (tree as { children?: unknown[] }).children?.[1] as { children?: unknown[] }
+    const cells = (header.children ?? []).map(c => {
+      const p = (c as { props?: { label?: string } }).props ?? {}
+      return p.label !== undefined ? `[ ${p.label} ]`.length : textOf(c).length
+    })
+    expect(cells.reduce((a, b) => a + b, 0), 'title bar plus the engine\'s " [-]" fit 80 columns').toBeLessThanOrEqual(80 - ' [-]'.length)
   })
 })

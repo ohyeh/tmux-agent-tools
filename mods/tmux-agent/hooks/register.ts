@@ -112,7 +112,11 @@ const COMMIT_PROBE_MS = 2_000
 /**
  * One collect pass: its result reads and commit checks together. What does not
  * fit waits for the next tick, which starts where this one stopped. With the
- * 4 s stall sweep after it, a tick stays inside the engine's 10 s hook budget.
+ * 4 s stall sweep after it, a tick normally stays inside the engine's 10 s hook
+ * budget. Not a hard bound: the pass's first worker is exempt (see `collect`),
+ * so one slow read plus its two git calls can overrun it (astra, 34e2a1e: 7 s +
+ * 2 × 2 s). A hook the engine drops is retried next tick; acks are written only
+ * after delivery, so the cost is a repeat, never a loss.
  */
 const COLLECT_BUDGET_MS = 4_000
 
@@ -149,6 +153,8 @@ const hasSession = (alive: ReadonlySet<string>, d: TmuxDispatch) =>
 const MIRROR_ROWS = 12
 /** How long a first press on [stop] stays armed for the second. */
 const STOP_CONFIRM_MS = 5_000
+/** Presses closer than this are a held key repeating, not a confirmation. */
+const STOP_REPEAT_MS = 400
 /** The panel's title-bar colour. */
 const PANEL_ACCENT = 'cyan'
 /**
@@ -257,7 +263,13 @@ type Panel = {
    * `until` stops it. Stopping ends a tmux session and cannot be undone, and one
    * stray `x` with the band focused did it (2026-09-25, live probe).
    */
-  armedStop?: { id: string; until: number }
+  armedStop?: { id: string; from: number; until: number }
+  /**
+   * The row ids in the order the last render numbered them. `/tmux stop N`
+   * resolves N against what the person saw, not against a list a refresh may
+   * have shifted since (cursor, 34e2a1e: `stop 2` ended w3 while row 2 read w2).
+   */
+  drawn?: string[]
   rows: PanelRow[]
   mirror?: { id: string; lines: string[] }
   timer?: { cancel: () => void }
@@ -316,11 +328,12 @@ type Gate = {
    */
   exited: Set<string>
   /**
-   * Where the next sweep starts. Without it `slice(0, MAX)` is not sampling, it
-   * is a permanent window: with nine long-running workers the ninth would never
-   * be probed at all.
+   * When each worker was last probed. The sweep probes the longest-unprobed
+   * first, so every worker is reached however the set it is handed changes: a
+   * position in that set was not stable, since the collect pass hands over a
+   * different subset each tick (astra, 34e2a1e: l2–l5 of eight never probed).
    */
-  probeCursor: number
+  probedAt: Map<string, number>
   /** Where the next collect pass starts: the worker the last one deferred or did not reach. */
   collectFrom?: string
 }
@@ -396,9 +409,21 @@ const idOf = (d: TmuxDispatch) => `${d.name}@${d.since}`
 /** The ack of a launch-failed notice: it closes the notice, not the episode (see `collect`). */
 const LAUNCH_ACK = '#launch'
 const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
-const ackOf = (f: Finished) => (f.status === LAUNCH_FAILED ? launchIdOf(f.d) : idOf(f.d))
+/**
+ * The ack of an `exited` notice. Like the launch notice it closes the notice,
+ * not the episode: a result written after the pane went (a background writer, a
+ * late flush) is still delivered once (astra, 34e2a1e). The row leaves /tmux and
+ * `outstanding()` as soon as the notice is acked.
+ */
+const EXITED_ACK = '#exited'
+const exitedIdOf = (d: TmuxDispatch) => `${idOf(d)}${EXITED_ACK}`
+const ackOf = (f: Finished) =>
+  f.status === LAUNCH_FAILED ? launchIdOf(f.d) : f.status === EXITED ? exitedIdOf(f.d) : idOf(f.d)
 /** The episode an ack belongs to: a launch notice's ack names its episode plus the suffix. */
-const episodeOf = (ack: string) => (ack.endsWith(LAUNCH_ACK) ? ack.slice(0, -LAUNCH_ACK.length) : ack)
+const episodeOf = (ack: string) =>
+  ack.endsWith(LAUNCH_ACK) ? ack.slice(0, -LAUNCH_ACK.length) : ack.endsWith(EXITED_ACK) ? ack.slice(0, -EXITED_ACK.length) : ack
+/** Told everything it will ever say unless a late result lands: delivered, or its exit noticed. */
+const settled = (reported: ReadonlySet<string>, d: TmuxDispatch) => reported.has(idOf(d)) || reported.has(exitedIdOf(d))
 
 /**
  * The acknowledged set, one key PER SESSION: `tmux-agent.reported.<sessionId>`.
@@ -596,7 +621,7 @@ async function scan(host: Host): Promise<Scan> {
 async function outstanding(host: Host): Promise<TmuxDispatch[]> {
   const reported = (await readAcks(host)).all
   const { dispatches } = await scan(host)
-  return dispatches.filter(d => !reported.has(idOf(d)))
+  return dispatches.filter(d => !settled(reported, d))
 }
 
 /** A result is in the window by ITS OWN finish time; a long job is not expired by age. */
@@ -691,6 +716,7 @@ async function collect(
           if (!reported.has(launchIdOf(d))) out.push({ d, path: `${dir}/mod-assign.log`, status: LAUNCH_FAILED, summary: failure })
           // After the notice the worker is watched like any other: a pane that is
           // gone closes the episode as `exited`, a live one is probed for a stop.
+          else if (reported.has(exitedIdOf(d))) continue // gone and said so; only a late result is news
           else if (exited.has(idOf(d))) {
             out.push({ d, path, status: EXITED, summary: 'the launch failed, the tmux session is gone and no terminal result.json was written' })
           } else unfinished.push(d)
@@ -702,6 +728,9 @@ async function collect(
         // `exited` and acknowledged, so it leaves /tmux instead of sitting there
         // until someone presses stop (observed 2026-09-17: two dead fixtures on
         // the panel for hours).
+        // ponytail: an exited episode's result.json is re-read every tick until its
+        // directory goes; one small read each, for a result that may still land.
+        if (reported.has(exitedIdOf(d))) continue
         if (exited.has(idOf(d))) {
           out.push({ d, path, status: EXITED, summary: 'the tmux session is gone and no terminal result.json was written' })
         } else unfinished.push(d)
@@ -875,20 +904,14 @@ async function flagStalls(
   for (const id of [...gate.stallDrops.keys()]) if (!seen.has(id)) gate.stallDrops.delete(id)
   for (const id of [...gate.exited]) if (!seen.has(id)) gate.exited.delete(id)
   for (const id of [...gate.blocked.keys()]) if (!seen.has(id)) gate.blocked.delete(id)
+  for (const id of [...gate.probedAt.keys()]) if (!seen.has(id)) gate.probedAt.delete(id)
   if (!live.length) return
 
-  // Rotate, so the window moves over the whole fleet instead of pinning the
-  // first eight. The cursor is per activation; where it resumes does not matter,
-  // only that it moves.
-  const start = gate.probeCursor % live.length
-  const window = Array.from(
-    { length: Math.min(STALL_PROBE_MAX, live.length) },
-    (_, i) => live[(start + i) % live.length]!,
-  )
-  // The cursor moves past what was PROBED, not what was planned: a sweep that
-  // runs out of budget resumes at the first worker it skipped, so a slow head
-  // cannot keep the tail from ever being probed.
-  let probed = 0
+  // Longest-unprobed first (never probed before any), so the window moves over
+  // the whole fleet instead of pinning the first eight, and a sweep that runs out
+  // of budget leaves exactly the workers it skipped at the front of the next one.
+  const last = (d: TmuxDispatch) => gate.probedAt.get(idOf(d)) ?? Number.NEGATIVE_INFINITY
+  const window = [...live].sort((a, b) => last(a) - last(b)).slice(0, STALL_PROBE_MAX)
   for (const d of window) {
     // Stalls are not urgent — a worker frozen for 15 minutes is still frozen in
     // 10 seconds — so the sweep yields the hook rather than finishing the list.
@@ -898,7 +921,6 @@ async function flagStalls(
     // the harness cannot tell this return from that refusal. It stays because
     // exiting the loop beats issuing four more calls we know will be rejected.
     if (left <= 0) break
-    probed += 1
     const id = idOf(d)
     let probe: { exitCode: number; stdout: string }
     try {
@@ -910,8 +932,13 @@ async function flagStalls(
         Math.min(STALL_PROBE_MS, left),
       )
     } catch {
-      continue // a probe that cannot run says nothing about the worker
+      // A probe that cannot run — or was cut short by what was left of the
+      // budget — says nothing about the worker, and does not count as probed:
+      // it stays at the front, where the next sweep gives it its full time
+      // (cursor, 34e2a1e: the seventh of seven 600 ms probes, cut every tick).
+      continue
     }
+    gate.probedAt.set(id, await host.now())
     if (probe.exitCode !== 0) continue
     const st = parseJson(probe.stdout)
     if (typeof st !== 'object' || st === null) continue
@@ -995,7 +1022,6 @@ async function flagStalls(
         `Find its session with: agent-tmux ${d.profile} list`,
     )
   }
-  gate.probeCursor = (start + probed) % live.length
   if (!woken.length) return
   // Once per episode per activation: the notice set lives in memory, so a reload
   // or an adopting collector may say it once more. A refusal is retried on the
@@ -1078,9 +1104,9 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
   // its pane is alive you can tell it more or stop it, so it stays listed as
   // `delivered`. Once the pane is gone (stopped, or exited on its own) the row
   // goes with it — that, not delivery, is what ends a worker's presence here.
-  const delivered = dispatches.filter(d => reported.has(idOf(d)))
+  const delivered = dispatches.filter(d => settled(reported, d))
   const alive = delivered.length ? await liveSessions(host, delivered[0]!.dir, gate) : new Set<string>()
-  const live = dispatches.filter(d => !reported.has(idOf(d)) || hasSession(alive, d))
+  const live = dispatches.filter(d => !settled(reported, d) || hasSession(alive, d))
   const rows: PanelRow[] = []
   for (const d of live) {
     const id = idOf(d)
@@ -1425,7 +1451,7 @@ export const register: Register = on => {
     stallDrops: new Map(),
     exited: new Set(),
     blocked: new Map(),
-    probeCursor: 0,
+    probedAt: new Map(),
   }
 
   on('engine.create', async ($, e, next) => {
@@ -1651,6 +1677,7 @@ export const register: Register = on => {
     // Goals show only in the overview (no row selected); a selected row adds its
     // tell line and a one-line summary. A fleet longer than the band is cut, the
     // selected row kept, with a "+N more" line.
+    panel.drawn = panel.rows.map(r => r.id)
     const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
     const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
     const layout = (sel: PanelRow | undefined) => {
@@ -1677,8 +1704,14 @@ export const register: Register = on => {
     // cannot fit even one line of work under the target's own chrome.
     panel.rows_available = room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
     const children: RenderElement[] = []
+    // Smaller than the least full layout (one row and its controls): only the
+    // title bar and, room permitting, what still works — the typed commands.
+    // Overflowing would scroll the band and disarm the digits (astra, 34e2a1e:
+    // maxRows 3 drew 4).
+    const compact = used > e.props.maxRows
+    if (compact) panel.rows_available = 0
 
-    if (down) children.push(Text({ dimColor: true, children: `⚠ ${down}` }))
+    if (down && !compact) children.push(Text({ dimColor: true, children: `⚠ ${down}` }))
     // The header names the keys: this is the only place a person learns them.
     // `r`/`x`/`q` press only while the band is focused; digits from an empty
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
@@ -1699,7 +1732,7 @@ export const register: Register = on => {
         children: [
           Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: ` tmux workers v${MOD_VERSION} ` }),
           Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
-          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: hint.padEnd(Math.max(0, width - titleCells)) }),
+          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: hint.slice(0, Math.max(0, width - titleCells)).padEnd(Math.max(0, width - titleCells)) }),
           // Last and apart from refresh: hiding is undone by /tmux, but it should
           // not sit one key away from the button people press most.
           Button({ key: 'close', label: 'hide', hotkey: 'q', onPress: () => void panel.close?.() }),
@@ -1707,6 +1740,18 @@ export const register: Register = on => {
       }),
     )
 
+    if (compact) {
+      if (e.props.maxRows >= 2) {
+        children.push(
+          Text({
+            dimColor: true,
+            wrap: 'truncate-end',
+            children: `${panel.rows.length} worker(s); band too short (${e.props.maxRows} rows) — /tmux N · /tmux stop N · /tmux tell N <text>`,
+          }),
+        )
+      }
+      return Box({ flexDirection: 'column', children: [below, ...children] })
+    }
     if (!panel.rows.length) {
       children.push(Text({ dimColor: true, children: 'No workers outstanding.' }))
     }
@@ -1803,12 +1848,14 @@ export const register: Register = on => {
               onPress: async () => {
                 const at = await $.clock.now()
                 const was = panel.armedStop
-                if (was?.id === r.id && at < was.until) {
+                // A second press, not a held key's repeat: the confirm needs a beat.
+                if (was?.id === r.id && at < was.until && at - was.from >= STOP_REPEAT_MS) {
                   panel.armedStop = undefined
                   void act(`stop ${r.d.name}`, host => stopWorker(host, gate, r.d))
                   return
                 }
-                panel.armedStop = { id: r.id, until: at + STOP_CONFIRM_MS }
+                if (was?.id === r.id && at < was.until) return // a repeat inside the beat
+                panel.armedStop = { id: r.id, from: at, until: at + STOP_CONFIRM_MS }
                 $.ui.invalidate('ui.render')
               },
             }),
@@ -1828,7 +1875,10 @@ export const register: Register = on => {
     if (hidden) children.push(Text({ dimColor: true, children: `  +${hidden} more — /tmux N selects row N` }))
 
     const shown = panel.mirror && panel.mirror.id === panel.selected ? panel.mirror : undefined
-    if (!shown && panel.selected && panel.rows_available === 0) {
+    // `selected`, not `panel.selected`: a worker that left the list (stopped,
+    // exited) is no selection, and its stale id drew a "too short" line past
+    // maxRows (cursor, 34e2a1e).
+    if (!shown && selected && panel.rows_available === 0) {
       // The numbers are the message: "too short" alone cannot be acted on, and
       // the first person to hit this asked whether some cap they never set was
       // the cause. Printing both ends the guessing in one look.
@@ -1883,7 +1933,11 @@ export const register: Register = on => {
     // Typed forms of the panel's controls. They work in any terminal: a letter
     // hotkey presses only while the band is focused, and the chord that focuses
     // it (ctrl+x tab) may never reach the pty — observed 2026-09-25 in Warp.
-    const [verb = '', target = '', ...words] = e.args.trim().split(/\s+/)
+    const parsed = /^(\S+)(?:\s+(\S+))?(?:\s([\s\S]*))?$/.exec(e.args.trim())
+    const verb = parsed?.[1] ?? ''
+    const target = parsed?.[2] ?? ''
+    // The message as typed: newlines and indentation are the person's.
+    const message = parsed?.[3] ?? ''
     if (verb) {
       const bound = world
       if (!bound) return { text: 'unavailable — the mod did not bind.' }
@@ -1892,9 +1946,17 @@ export const register: Register = on => {
         return { text: 'tmux panel hidden; /tmux shows it again.' }
       }
       const rows = panel.open ? panel.rows : await panelRows(bound, gate, await rootOf(bound))
-      const pick = (key: string) => (/^[0-9]+$/.test(key) ? rows[Number(key) - 1] : rows.find(r => r.d.name === key))
+      // A number is a row of the panel as last drawn; with the panel hidden
+      // there is no drawn row, so only a name names a worker.
+      const pick = (key: string) => {
+        if (!/^[0-9]+$/.test(key)) return rows.find(r => r.d.name === key)
+        const id = panel.open ? panel.drawn?.[Number(key) - 1] : undefined
+        return id ? rows.find(r => r.id === id) : undefined
+      }
       if (/^[0-9]+$/.test(verb)) {
-        const row = pick(verb)
+        // Selecting is harmless, so a hidden panel opens on row N of the list it
+        // is about to draw.
+        const row = panel.open && panel.drawn ? pick(verb) : rows[Number(verb) - 1]
         if (!row) return { text: `no row ${verb} (${rows.length} shown).` }
         panel.selected = row.id
         panel.mirror = undefined
@@ -1905,13 +1967,16 @@ export const register: Register = on => {
         }
       } else if (verb === 'stop' || verb === 'tell') {
         const row = pick(target)
-        if (!row) return { text: `no worker "${target}" — give a row number or a name (${rows.map(r => r.d.name).join(', ') || 'none'}).` }
+        if (!row) {
+          const why = /^[0-9]+$/.test(target) && !panel.open ? ' (the panel is hidden — row numbers need it open; use the name)' : ''
+          return { text: `no worker "${target}"${why} — give a drawn row number or a name (${rows.map(r => r.d.name).join(', ') || 'none'}).` }
+        }
         let out: Outcome
         if (verb === 'stop') {
           // Typing the row or name is the confirmation; the button asks twice.
           out = await stopWorker(bound, gate, row.d)
         } else {
-          const text = words.join(' ').trim()
+          const text = message.trim() ? message : ''
           if (!text) return { text: '/tmux tell N <text> — the message is missing.' }
           const root = await rootOf(bound)
           out = root ? await tellWorker(bound, root, row.d, text) : { ok: false, text: 'no state root' }
