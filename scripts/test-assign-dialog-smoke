@@ -294,8 +294,9 @@ assert_contains "slow: the brief arrived after the draw" "$(cat "$LOG")" "input:
 # Live 2026-09-25: claude shows only the tail of a long message, so neither
 # injected line reached the pane and send looked 10 s for each: 22.6 s a tell.
 # foldcli never echoes the text; as a claude-family profile its markers are polled.
+# prompt_delivery=paste: this case measures the paste path's marker looks.
 mkdir -p "$WORK/profiles"
-printf 'bin=%s\nheuristic_family=claude\n' "$WORK/foldcli" > "$WORK/profiles/tailclaude.conf"
+printf 'bin=%s\nheuristic_family=claude\nprompt_delivery=paste\n' "$WORK/foldcli" > "$WORK/profiles/tailclaude.conf"
 echo
 echo "case: a send with two unseen markers spends one look window"
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude start --exact tail-send "$WORK" >/dev/null 2>&1

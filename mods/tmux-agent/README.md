@@ -157,6 +157,11 @@ result_required_fields=status,summary
 `$.tmux.outstanding()`／`stalled()` 與停滯探測仍只看自己的 worker——探測是每個
 worker 一個子行程，每個 session 都去探別人的會倍增。
 
+## 更新 mod：`reload`
+
+`claude plugin update tmux-agent@tmux-agent-tools` 之後，呼叫 `reload` tool：它在這一輪結束時執行
+`/reload-plugins`，面板標題會顯示新版號。不必等人手打 `/reload-plugins`。
+
 ## launch requested ≠ worker started
 
 外層 shell 立刻退出，它的 exit code 只代表「背景指令已排入」。真正的 launch
@@ -167,10 +172,14 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
   （0.7.6 以前貼最多 12,000 字元的 log，真正的原因埋在 brief 回顯底下）。log 沒有 JSON
   物件時附最後 5 行。**不會**讓你等一個永遠不會出現的 result。
 - worker 開在從沒信任過的目錄時，CLI 會在開機後才畫 workspace-trust 對話框。assign 送出前
-  要看到 pane 靜止 3 秒且沒有對話框（最多看 10 秒，每次都查對話框）；看到對話框就**不送**、
-  也不替你回答（信不信任這個目錄是你的決定），以 `failed_step: send`、`the brief was NOT sent`
+  要看到 pane 靜止 3 秒且沒有對話框（最多看 10 秒，每次都查對話框）。workspace-trust 對話框
+  （選項停在 yes／trust）由 assign 按 Enter 信任，最多兩次，再送 brief：worker 被派到這個目錄，
+  就信任它。其他對話框一律**不送**、不替你回答，以 `failed_step: send`、`the brief was NOT sent`
   結束。`peek` 看對話框、`keys` 回答，再把 brief 用 `tell` 送一次，整份 brief 就會到。
   2026-09-25：agy、claude、claude-fable-gate 的 brief 都被晚出現的對話框吃掉（claude 吃掉前半）。
+- `failed_step: confirm-processing` 是 brief 已送出、之後從 pane 判斷「沒在處理」。在工作中的
+  worker 也曾被判失敗（cursor `Reading 22k tokens`、claude 7 秒的回合），所以通知會提醒先
+  `peek` 再重派；它之後寫的 result 照樣送達。
 - `launch.exit` 為 0 但還沒有終態 result → 保持 outstanding。
 
 工具回覆本身明說 `This is NOT proof the worker started`。

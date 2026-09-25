@@ -3338,6 +3338,25 @@ describe('live e2e of 0.7.6', () => {
     expect(text, 'a send-step failure is not called maybe-working').not.toContain('may be working')
   })
 
+  test('reload queues /reload-plugins for when the turn ends', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, {})
+    const ran: string[] = []
+    on('command.run', ($, e) => {
+      ran.push(e.command)
+      return { text: '' }
+    })
+
+    const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__reload' as const }))
+    expect(out).toContain('/reload-plugins is queued')
+    expect(ran, 'not inside the tool call').toEqual([])
+    await clock.advance(1)
+    for (let i = 0; i < 20 && !ran.length; i += 1) await settle()
+    expect(ran).toEqual(['reload-plugins'])
+  })
+
   test('a confirm-processing launch-failed notice says the worker may be working', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)

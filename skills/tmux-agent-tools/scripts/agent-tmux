@@ -1691,6 +1691,22 @@ ensure_agent_dir() {
   printf '%s' "$dir"
 }
 
+# The one line a file-ref delivery types. claude read a pasted multi-line
+# message as the user's pasted data and asked before acting ("this message is
+# only pasted content" — assign, send and send-wait alike, live 2026-09-25).
+file_ref_line() {
+  printf '%s' "Your task is in the file $1 — read that ENTIRE file now with your file-read tool, then carry out exactly what it says. The task is not in this message; do not ask for it and do not start work before reading the file."
+}
+
+# Writes <text> to a new file under the agent dir; prints the line to type.
+file_ref_compose() {
+  local dir ref_path
+  dir="$(ensure_agent_dir "$1")"
+  ref_path="$dir/send-$(date +%Y%m%dT%H%M%S)-$$.md"
+  printf '%s\n' "$2" > "$ref_path" || { echo "could not write the message to $ref_path" >&2; return 1; }
+  file_ref_line "$ref_path"
+}
+
 # --- Managed fresh worktree (issue #187) ----------------------------------
 # Allocate a managed git worktree with:
 #   branch:  tmux-agent/<sanitized-name>-<uuid8>
@@ -4206,7 +4222,7 @@ assign_session() {
       body="$(result_path_prepend "$name" "$body")"; _ref_rp_inject=1
     fi
     printf '%s\n' "$body" > "$composed" || _assign_fail send "could not write the composed prompt to $composed" "$name"
-    ref_line="Your task is in the file $composed — read that ENTIRE file now with your file-read tool, then carry out exactly what it says. The task is not in this message; do not ask for it and do not start work before reading the file."
+    ref_line="$(file_ref_line "$composed")"
     echo "assign[3/5] send (file-ref) $composed" >&2
   else
     # send_session prepends the same two instructions; their delivery is judged
@@ -5645,6 +5661,15 @@ send_session() {
   if [[ "$raw" != true ]] && result_path_should_inject "$name" "$prompt_text"; then
     prompt_text="$(result_path_prepend "$name" "$prompt_text")"; _rp_inject=1
   fi
+  # A multi-line message under file-ref delivery (the claude family's default)
+  # goes into a file and the CLI gets one typed line naming it; the two
+  # instructions are inside that file, which is their delivery proof.
+  local _file_ref=0 _multi_audit=0 audit_text="$prompt_text"
+  [[ -n "$from_file" ]] && _multi_audit=1
+  if [[ "$PROMPT_DELIVERY" == file-ref && "$raw" != true && "${_PROMPT_ALREADY_COMPOSED:-0}" != 1 && "$prompt_text" == *$'\n'* ]]; then
+    prompt_text="$(file_ref_compose "$name" "$prompt_text")" || exit 1
+    from_file=""; _file_ref=1; _multi_audit=1
+  fi
   if [[ -n "$from_file" ]]; then
     payload_file="$(mktemp -t agent-tmux-send.XXXXXX)"
     printf '%s' "$prompt_text" > "$payload_file"
@@ -5667,24 +5692,28 @@ send_session() {
       paste_and_submit "$session" "$buffer_name" "$prompt_text" || return $?
   fi
   # assign judges the two instructions itself, once the worker is processing.
-  if [[ "${_SENTINEL_DEFER:-0}" != 1 ]]; then
+  if (( _file_ref )); then
+    (( _scope_guard_inject )) && { _SENTINEL_DELIVERY_PROVEN=1 task_scope_guard_mark_injected "$name" || true; }
+    (( _rp_inject )) && { _SENTINEL_DELIVERY_PROVEN=1 result_path_mark_injected "$name" || true; }
+  elif [[ "${_SENTINEL_DEFER:-0}" != 1 ]]; then
     (( _scope_guard_inject )) && { task_scope_guard_mark_injected "$name" "$session" || true; }
     (( _rp_inject )) && { result_path_mark_injected "$name" "$session" || true; }
   fi
 
   transcript_emit_send_event "$name" "$transcript_text" "$multiline"
-  if [[ -n "$from_file" ]]; then
+  if (( _multi_audit )); then
     local audit_line text_sha
-    text_sha="$(printf '%s' "$prompt_text" | sha256_text)"
+    text_sha="$(printf '%s' "$audit_text" | sha256_text)"
     audit_line="$("$JQ" -c -n \
       --arg event send.multiline --arg name "$name" \
       --arg text_sha256 "$text_sha" \
       --arg at "$(transcript_iso_now)" \
-      --argjson bytes "${#prompt_text}" \
+      --argjson bytes "${#audit_text}" \
       --argjson enter_count "$enter_count" \
+      --arg delivery "$( (( _file_ref )) && echo file-ref || echo paste )" \
       '{schema_version: 1, event: $event, name: $name, multiline: true,
         bytes: $bytes, text_bytes: $bytes, text_sha256: $text_sha256,
-        enter_count: $enter_count, at: $at}')"
+        enter_count: $enter_count, delivery: $delivery, at: $at}')"
     audit_log_append "$audit_line"
   fi
 
@@ -5705,12 +5734,17 @@ count_literal_occurrences() {
   echo "$count"
 }
 
+# A line that is <needle> once the CLI's own layout is removed: the indent and
+# reply bullet claude draws (`⏺ reply` then `  MARK-58b923`, live 2026-09-25:
+# the nonce was printed and send-wait timed out on an exact-line compare).
 count_literal_line_occurrences() {
   local haystack="$1"
   local needle="$2"
   local count=0
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    line="${line#[⏺•●] }"
     [[ "$line" == "$needle" ]] && count=$((count + 1))
   done <<< "$haystack"
   echo "$count"
@@ -5790,11 +5824,17 @@ send_wait_session() {
     prompt_text="$(result_path_prepend "$name" "$prompt_text")"; _rp_inject=1
   fi
   local augmented_prompt="${prompt_text}"$'\n\n'"End your reply with this exact nonce on its own line: ${nonce}"
+  # Always multi-line (the nonce line), so under file-ref it always goes as a file.
+  local _proven=0
+  if [[ "$PROMPT_DELIVERY" == file-ref ]]; then
+    augmented_prompt="$(file_ref_compose "$name" "$augmented_prompt")" || exit 1
+    _proven=1
+  fi
   # Pass the inject flag INTO the locked helper; it marks the sentinel right
   # after the paste so a wait-timeout still counts as delivered. Marking here
   # after send_lock_around would be skipped by `set -e` on a non-zero return,
   # and would wrongly mark on a lock-acquisition timeout (#283).
-  send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
+  _SEND_WAIT_FILE_REF="$_proven" send_guarded_lock_around "$name" "$session" "$SEND_LOCK_DEFAULT_TIMEOUT" \
     _send_wait_nonce_locked "$name" "$session" "$augmented_prompt" "$nonce" "$timeout_seconds" "$_rp_inject" "$_scope_guard_inject" "$transcript_text" "$transcript_multiline"
 }
 
@@ -5813,8 +5853,13 @@ _send_wait_nonce_locked() {
   # pane) so a later wait-timeout still counts them as delivered. Doing this in
   # the caller after send_lock_around would be skipped by `set -e` on the
   # helper's non-zero timeout return (#283).
-  (( inject_scope_guard )) && { task_scope_guard_mark_injected "$name" "$session" || true; }
-  (( inject_rp )) && { result_path_mark_injected "$name" "$session" || true; }
+  if [[ "${_SEND_WAIT_FILE_REF:-0}" == 1 ]]; then
+    (( inject_scope_guard )) && { _SENTINEL_DELIVERY_PROVEN=1 task_scope_guard_mark_injected "$name" || true; }
+    (( inject_rp )) && { _SENTINEL_DELIVERY_PROVEN=1 result_path_mark_injected "$name" || true; }
+  else
+    (( inject_scope_guard )) && { task_scope_guard_mark_injected "$name" "$session" || true; }
+    (( inject_rp )) && { result_path_mark_injected "$name" "$session" || true; }
+  fi
   transcript_emit_send_event "$name" "$transcript_text" "$transcript_multiline"
   audit_log_append "$("$JQ" -c -n --arg event send --arg tool "$CLI" --arg name "$name" --arg text_len "${#prompt_text}" --arg marker "$nonce" \
     '{event:$event, tool:$tool, name:$name, text_len:($text_len|tonumber), marker:$marker}')"
@@ -8716,12 +8761,6 @@ stop_session() {
   else
     echo "Already stopped: $session"
   fi
-  # Who closed a worker: without this event a stopped session and one killed
-  # from outside looked the same in the audit log (live 2026-09-25).
-  audit_log_append "$("$JQ" -c -n --arg event stop --arg tool "$CLI" --arg name "$name" \
-    --arg session "$session" --argjson stopped "$stopped" \
-    --arg caller "$(ps -o command= -p "$PPID" 2>/dev/null | cut -c1-160)" \
-    '{event:$event,tool:$tool,name:$name,session:$session,stopped:($stopped == 1),caller:$caller}')" || true
 
   # Terminal envelope: guarantee result.json + a launch_end ledger event even
   # when the agent never wrote a result (merge preserves agent fields).
@@ -8739,6 +8778,13 @@ stop_session() {
         stopped: ($stopped == 1), at: $at}')"
     transcript_append "$transcript_path" "$stop_line"
   fi
+  # Who closed a worker: without this event a stopped session and one killed
+  # from outside looked the same in the audit log (live 2026-09-25). Last, so
+  # a failed append (it fails the command, as on start) skips no teardown.
+  audit_log_append "$("$JQ" -c -n --arg event stop --arg tool "$CLI" --arg name "$name" \
+    --arg session "$session" --argjson stopped "$stopped" \
+    --arg caller "$(ps -o command= -p "$PPID" 2>/dev/null | cut -c1-160)" \
+    '{event:$event,tool:$tool,name:$name,session:$session,stopped:($stopped == 1),caller:$caller}')"
 }
 
 # Allow test harnesses (issue #102 smoke) to source the wrapper purely for

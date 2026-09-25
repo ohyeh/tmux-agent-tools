@@ -21,12 +21,22 @@ trap 'rm -rf "$WORK"' EXIT
 cat > "$WORK/fake-nonce-agent.sh" <<'EOF'
 #!/bin/sh
 printf 'fake nonce agent ready\n'
-while IFS= read -r line; do
-  printf 'saw:%s\n' "$line"
-  nonce="$(printf '%s\n' "$line" | sed -nE 's/.*(MARK-[0-9a-fA-F]{6}).*/\1/p' | tail -1)"
+handle() {
+  printf 'saw:%s\n' "$1"
+  nonce="$(printf '%s\n' "$1" | sed -nE 's/.*(MARK-[0-9a-fA-F]{6}).*/\1/p' | tail -1)"
   if [ -n "$nonce" ]; then
     printf '%s\n' "$nonce"
   fi
+}
+while IFS= read -r line; do
+  case "$line" in
+    # A file-ref line (claude's delivery): read the named file like the CLI.
+    'Your task is in the file '*)
+      f="${line#Your task is in the file }"; f="${f%% — *}"
+      while IFS= read -r l; do handle "$l"; done < "$f"
+      printf '> \n' ;; # the prompt a CLI draws after its reply
+    *) handle "$line" ;;
+  esac
 done
 EOF
 chmod +x "$WORK/fake-nonce-agent.sh"
@@ -105,6 +115,29 @@ run_case() {
 
 run_case "$CODEX_TMUX"  "CODEX"  "nonce-codex"
 run_case "$CLAUDE_TMUX" "CLAUDE" "nonce-claude"
+
+# claude draws its reply as `⏺ text` with continuation lines indented; the
+# nonce line reads `  MARK-xxxxxx` (live 2026-09-25: printed, and send-wait
+# timed out on an exact-line compare).
+echo "case: nonce-indented (a reply-laid-out nonce matches)"
+cat > "$WORK/fake-indent.sh" <<'EOF'
+printf 'fake nonce agent ready\n'
+while IFS= read -r line; do
+  case "$line" in
+    'Your task is in the file '*) f="${line#Your task is in the file }"; f="${f%% — *}"; body="$(cat "$f")" ;;
+    *) body="$line" ;;
+  esac
+  nonce="$(printf '%s\n' "$body" | sed -nE 's/.*(MARK-[0-9a-fA-F]{6}).*/\1/p' | tail -1)"
+  [ -n "$nonce" ] && printf '⏺ reply\n  %s\n> \n' "$nonce"
+done
+EOF
+chmod +x "$WORK/fake-indent.sh"
+env CLAUDE="$WORK/fake-indent.sh" "$CLAUDE_TMUX" start --exact nonce-indent "$WORK" >/dev/null
+"$CLAUDE_TMUX" wait-text nonce-indent "fake nonce agent ready" 8 >/dev/null 2>&1 || true
+ind_code=0
+"$CLAUDE_TMUX" send-wait nonce-indent "indented request" 10 >/dev/null 2>&1 || ind_code=$?
+assert "nonce-indented send-wait matched" "$ind_code" "0"
+"$CLAUDE_TMUX" stop nonce-indent >/dev/null 2>&1 || true
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

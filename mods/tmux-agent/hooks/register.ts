@@ -12,12 +12,13 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.8'
+const MOD_VERSION = '0.7.9'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
 const PEEK_TOOL = 'mcp__tmux-agent__peek' as const
 const KEYS_TOOL = 'mcp__tmux-agent__keys' as const
+const RELOAD_TOOL = 'mcp__tmux-agent__reload' as const
 /** What `keys` may press: enough to answer a trust/permission dialog, nothing that types text. */
 const KEYS_ALLOWED = new Set(['Enter', 'Escape', 'Tab', 'Space', 'Up', 'Down', 'Left', 'Right', 'y', 'n'])
 const PEEK_DEFAULT = 40
@@ -1735,6 +1736,15 @@ export const register: Register = on => {
     })
 
     await $.tool.register({
+      name: 'reload',
+      description:
+        'Reload this session\'s plugins, so an update already installed with `claude plugin update` takes ' +
+        'effect without a restart. Runs /reload-plugins once the current turn ends; the panel title then ' +
+        'shows the new mod version.',
+      inputSchema: { type: 'object', properties: {} },
+    })
+
+    await $.tool.register({
       name: 'keys',
       description:
         'Press keys in a worker pane to answer a trust/permission/login dialog it is parked on. ' +
@@ -2390,6 +2400,19 @@ export const register: Register = on => {
     const keys = Array.isArray(input.keys) ? input.keys.filter((k): k is string => typeof k === 'string') : []
     const out = await pressKeys(host, d, keys)
     return out.ok ? { result: `${out.text}.` } : { deny: `tmux-agent: ${out.text}` }
+  })
+
+  // /reload-plugins cannot run inside the tool call (the turn waits on it and
+  // $.command.run rejects there); a timer queues it for when the session is idle.
+  // Before this, every update waited for the person to type /reload-plugins.
+  on('tool.call', { tool: RELOAD_TOOL }, async $ => {
+    $.clock.after(0, () =>
+      $.command.run({ command: 'reload-plugins' }).then(
+        () => undefined,
+        err => $.ui.log(`tmux-agent: /reload-plugins failed: ${String(err)}`),
+      ),
+    )
+    return { result: `/reload-plugins is queued for when this turn ends (mod ${MOD_VERSION} now).` }
   })
 
   // While this mod is loaded the wrapper verbs have tools, and the collector owns
