@@ -155,6 +155,8 @@ const MIRROR_ROWS = 12
  * the 6-row mirror floor.
  */
 const MIRROR_RESERVED = 5
+/** The panel's title-bar colour. */
+const PANEL_ACCENT = 'cyan'
 /**
  * Below this the mirror is chrome and nothing else. Measured 2026-09-17 against
  * a live agy pane: `--tail 3` came back with 0 lines of actual work (that TUI's
@@ -687,6 +689,11 @@ async function collect(
         const failure = await launchFailure(host, dir, d.since)
         if (failure) {
           if (!reported.has(launchIdOf(d))) out.push({ d, path: `${dir}/mod-assign.log`, status: LAUNCH_FAILED, summary: failure })
+          // After the notice the worker is watched like any other: a pane that is
+          // gone closes the episode as `exited`, a live one is probed for a stop.
+          else if (exited.has(idOf(d))) {
+            out.push({ d, path, status: EXITED, summary: 'the launch failed, the tmux session is gone and no terminal result.json was written' })
+          } else unfinished.push(d)
           continue
         }
       }
@@ -788,15 +795,23 @@ function payloadOf(done: readonly Finished[]): { text: string; included: Finishe
   const included: Finished[] = []
   const parts: string[] = [head]
   let size = head.length
-  for (const f of done) {
-    const block = [
+  const blockOf = (f: Finished, summary: string) =>
+    [
       `- "${f.d.name}" on ${f.d.profile}: ${statusOf(f)}`,
       ...(f.d.adoptedFrom ? [`  adopted from session ${f.d.adoptedFrom} (it stopped collecting)`] : []),
       `  dir: ${f.d.dir}`,
       `  result: ${f.path}`,
-      fence(f.summary, f.path),
+      fence(summary, f.path),
     ].join('\n')
-    if (size + block.length + 1 > PAYLOAD_MAX) break
+  for (const f of done) {
+    let block = blockOf(f, f.summary)
+    if (size + block.length + 1 > PAYLOAD_MAX) {
+      if (included.length) break
+      // A block that cannot fit even alone (a summary that grows when fenced, a
+      // long dir) would otherwise stop every later delivery: send it without the
+      // summary, which stays on disk.
+      block = blockOf(f, `(summary too long for one prompt — read it in ${f.path})`)
+    }
     parts.push(block)
     size += block.length + 1
     included.push(f)
@@ -870,8 +885,10 @@ async function flagStalls(
     { length: Math.min(STALL_PROBE_MAX, live.length) },
     (_, i) => live[(start + i) % live.length]!,
   )
-  gate.probeCursor = (start + window.length) % live.length
-
+  // The cursor moves past what was PROBED, not what was planned: a sweep that
+  // runs out of budget resumes at the first worker it skipped, so a slow head
+  // cannot keep the tail from ever being probed.
+  let probed = 0
   for (const d of window) {
     // Stalls are not urgent — a worker frozen for 15 minutes is still frozen in
     // 10 seconds — so the sweep yields the hook rather than finishing the list.
@@ -881,6 +898,7 @@ async function flagStalls(
     // the harness cannot tell this return from that refusal. It stays because
     // exiting the loop beats issuing four more calls we know will be rejected.
     if (left <= 0) break
+    probed += 1
     const id = idOf(d)
     let probe: { exitCode: number; stdout: string }
     try {
@@ -977,6 +995,7 @@ async function flagStalls(
         `Find its session with: agent-tmux ${d.profile} list`,
     )
   }
+  gate.probeCursor = (start + probed) % live.length
   if (!woken.length) return
   // Once per episode per activation: the notice set lives in memory, so a reload
   // or an adopting collector may say it once more. A refusal is retried on the
@@ -1637,15 +1656,22 @@ export const register: Register = on => {
     // The header names the keys: this is the only place a person learns them.
     // `r`/`x`/`q` press only while the band is focused; digits from an empty
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
+    // The title and both buttons (`[ refresh ]`, ` `, `[ close ]`); the hint is
+    // padded to the band's width so the bar spans the whole row.
+    const titleCells = ` tmux workers v${MOD_VERSION} `.length + '[ refresh ]'.length + 1 + '[ close ]'.length
+    // A coloured title bar marks where the panel starts, so its rows do not read
+    // as the session's own output. Background, not a border: a border costs two
+    // of the band's few rows, and the mirror needs them.
     children.push(
       Box({
         flexDirection: 'row',
+        backgroundColor: PANEL_ACCENT,
         children: [
-          Text({ bold: true, children: `tmux workers v${MOD_VERSION} ` }),
+          Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: ` tmux workers v${MOD_VERSION} ` }),
           Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
-          Text({ children: ' ' }),
+          Text({ backgroundColor: PANEL_ACCENT, children: ' ' }),
           Button({ key: 'close', label: 'close', hotkey: 'q', onPress: () => void panel.close?.() }),
-          Text({ dimColor: true, children: '  1-9 row · ctrl+x tab focus, then r/x/q' }),
+          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: '  1-9 row · ctrl+x tab focus, then r/x/q'.padEnd(Math.max(0, width - titleCells)) }),
         ],
       }),
     )

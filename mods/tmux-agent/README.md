@@ -163,7 +163,9 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 先送達、後記帳：
 
 1. 掃描 → 收集終態 result（或 launch 失敗）
-2. 組一則 prompt（上限 20 個 worker / 16,000 字元），送出
+2. 組一則 prompt（上限 20 個 worker / 16,000 字元），送出。第一筆自己就放不下時
+   （摘要 fence 後變長、dir 很長），這一筆改成不帶摘要送出（摘要留在 result.json），
+   不會卡住之後所有的交付
 3. **session 接受之後**才把這批寫進自己的 `tmux-agent.reported.<sessionId>`
 
 `prompt.submit` 可能 throw，也可能正常回傳 `{ drop }` —— 兩者都不算送達。
@@ -181,7 +183,9 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 或 0.7.5 以前的紀錄沒有 base → 只能證明物件存在，狀態行照實寫
 `verified (commit object exists; no dispatch base recorded)`。不是字串、空字串、不是
 40-hex、不存在、不是 commit、是 base 本身、不在 base 之後 → 照樣交付（不吞），寫
-`success claimed, commit <sha> NOT verified: <reason>`。缺 `commit` 或 `null`（唯讀／
+`success claimed, commit <sha> NOT verified: <reason>`。只收 40-hex：SHA-256
+object-format 的 repo（64-hex）目前一律記不到 base、驗不過。`base` 與 result.json 放在
+同一個 worker 可寫的目錄：這個檢查是抓「幻覺出來的 commit」，不是防惡意 worker。缺 `commit` 或 `null`（唯讀／
 review worker）→ 與以前完全相同。一個 pass 的讀檔與 commit 檢查共用 4 秒預算（之後的
 停滯探測另有 4 秒，合起來在 engine 的 10 秒 hook 預算內）。每一 pass 從上一 pass 停下的
 那筆開始，而且那一筆不受預算限制：讀檔與兩次 git 呼叫一定做完，所以每一 pass 至少結清
@@ -418,12 +422,17 @@ reached」七天：沒有終態、沒有 exit，等 result 會等到天荒地老
 `quota_exhausted` 或 `login_required`（CLI 自己說停了：用量窗口、憑證失效），證據是
 同一份輸出的 `blocked_evidence`（命中的那一行）。wrapper 只認 CLI 自己的錯誤區塊：
 pane 最後 10 個非空行裡，從**第 0 欄**開始就是錯誤形狀的那一行（`■` 橫幅、
-`⚠ Individual quota reached`、`Error:`／`API Error:`，要有冒號），或 claude 的
-`⎿  API Error:…`，而且
+`⚠ Individual quota reached`、`Error:`／`API Error:`，要有冒號、`You've hit your …`），或 claude
+在 `⎿` 後**緊接著**寫的錯誤（`API Error:…`、`You've hit your session/weekly limit · resets …`、
+`Credit balance is too low`），而且
 它之後沒有新的輸出行（`•`、`⏺`、`⎿`、`└`、`✔`、「Worked for」）——worker 自己引述的
 「invalid api key」、以「Error handling…」「API Error handling…」開頭的敘述、工具輸出（在 `⎿`／`└` 之下或縮排
 在它們底下）、恢復後才剛被推上去的舊橫幅都不算；
-CLI 放棄的 rate limit（`Error: rate limit exceeded`）算 `quota_exhausted`。mod 自己不留字表
+CLI 放棄的 rate limit（`Error: rate limit exceeded`）算 `quota_exhausted`。字表收的是從
+本機 transcript 與各 CLI binary 找到的真實字串：claude 的 session／weekly limit 與
+credit balance、codex 的「access token could not be refreshed」（`login_required`）、agy
+的「exhausted your quota」、grok 的「hit your free usage limit」。`⚠` 開頭的行只有
+quota 字樣才算：`⚠ MCP client … authentication required` 是警告，不是停工。mod 自己不留字表
 —— 0.7.3／0.7.4 在 mod 裡複製的半份字表會把 worker 自己寫的「Implemented rate limit
 handling」當成阻擋（astra 審查 F5）。pane 靜止滿 2 分鐘才算數（剛恢復時畫面上還留著
 舊橫幅，不該叫人），然後**叫醒 session 一次**，措辭是「看起來被 CLI 停住，等結果前先
@@ -440,7 +449,9 @@ stalled 紀錄，面板、log、`$.tmux.stalled()` 三者一致。閒置時鐘�
 可能收下了 brief 卻沒顯示在 pane 上（2026-09-24：claude-fable-gate 開進 session
 picker，brief 變成背景 session，結果照樣寫出來）。所以 launch-failed 通知另記一個
 ack（`<name>@<since>#launch`），episode 不關；同一 episode 之後寫出的 terminal result
-一律優先於收據，照常交付一次。以前這種結果會被永遠丟掉。
+一律優先於收據，照常交付一次。以前這種結果會被永遠丟掉。通知之後這個 worker 照一般
+worker 看：pane 已經不在就以 `exited` 交付並關閉 episode（不存在的 profile 名稱不會永遠
+掛在面板上），pane 還活著就照樣探測，停在 quota 或對話框時一樣會被發現。
 
 面板最上面一行說 collector 現在會不會投遞：連續三次投遞被拒而
 暫停、或已回報集合超出預算而暫停，都會印出原因與解法；沒有這一行就表示
@@ -452,4 +463,5 @@ collector 活著。同一個判斷也寫進 `assign` 工具的回傳最後一句
 result；下一個 tick 會以 `exited` 交付一次並記帳。光看磁碟，這種 worker 跟「還在想」長得一模一樣，所以面板以前一路畫成
 `running` —— 那是在叫人去等一個永遠不會來的結果。狀態探測是這個 mod 裡唯一會
 問 pane 死活的東西，所以答案記在那裡。與 `stalled` 同樣是 best-effort：探測
-每輪只抽樣 8 個，沒被抽到的 worker 下一輪才會改狀態。
+每輪最多探 8 個，預算（4 秒）用完就停；下一輪從第一個沒探到的開始，所以排在前面的
+慢探測不會讓後面的 worker 永遠探不到。沒被探到的 worker 下一輪才會改狀態。

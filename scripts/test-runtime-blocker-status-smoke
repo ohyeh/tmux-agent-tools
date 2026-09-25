@@ -142,6 +142,46 @@ fake agy-quota <<'EOF'
 >
 EOF
 
+# The cursor review of 4d0af09 (2026-09-25, O1/O7): real stop strings from
+# claude transcripts and the codex/agy/grok binaries, and a ⚠ that is only a warning.
+fake claude-session-limit <<'EOF'
+⏺ Reading the config.
+  ⎿  You've hit your session limit · resets 2:10pm (Asia/Taipei)
+EOF
+
+fake claude-credit <<'EOF'
+⏺ Reading the config.
+  ⎿  Credit balance is too low
+EOF
+
+fake tool-session-limit-prose <<'EOF'
+⏺ Bash(rg "session limit" src)
+  ⎿  src/ui.ts: You've hit your session limit · resets soon
+EOF
+
+fake codex-token <<'EOF'
+■ Your access token could not be refreshed. Please log out and sign in again.
+› Ask Codex to do anything
+EOF
+
+fake agy-exhausted <<'EOF'
+⚠ You have exhausted your quota on this model.
+? for shortcuts
+>
+EOF
+
+fake grok-free <<'EOF'
+Error: You hit your free usage limit.
+>
+EOF
+
+fake mcp-warning <<'EOF'
+⚠ MCP client for `linear` failed to start: authentication required
+› GOAL: port the poller
+  and keep the tests green
+  GPT-6-Astra low · tmux-agent-tools
+EOF
+
 PASS=0
 FAIL=0
 assert() {
@@ -246,6 +286,34 @@ assert "tool api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <
 echo "case: the documented agy quota banner"
 st="$(status_of agy-quota)"
 assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: claude's session limit under ⎿"
+st="$(status_of claude-session-limit)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: claude's credit balance under ⎿"
+st="$(status_of claude-credit)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a tool line quoting the session-limit text is the tool's"
+st="$(status_of tool-session-limit-prose)"
+assert "tool quote not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: codex lost its token"
+st="$(status_of codex-token)"
+assert "blocked_reason login_required" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "login_required"
+
+echo "case: agy exhausted its model quota"
+st="$(status_of agy-exhausted)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: grok's free usage limit"
+st="$(status_of grok-free)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a ⚠ MCP auth warning is not a stop"
+st="$(status_of mcp-warning)"
+assert "warning not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
 
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

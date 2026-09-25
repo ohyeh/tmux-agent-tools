@@ -2738,3 +2738,116 @@ test('a finished row stops its clock at the result, however long the pane stays 
   expect(drawn).toContain('1:30')
   expect(drawn).not.toContain('30:')
 })
+
+describe('cursor review of 4d0af09', () => {
+  test('a sweep out of budget resumes at the first worker it skipped (O2)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = {}
+    for (let i = 0; i < 8; i += 1) files[`${ROOT}/l${i}/dispatch.json`] = dispatch(`l${i}`, 0)
+    mockFs(on, files)
+    const wake = mockWake(on)
+    const probed: string[] = []
+    on('process.run', async ($, e) => {
+      const name = e.argv[e.argv.length - 1] ?? ''
+      probed.push(name)
+      await clock.advance(1_200)
+      const body =
+        name === 'l7'
+          ? { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' }
+          : { running: true, idle_seconds: 5 }
+      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+    })
+
+    // Four 1.2 s probes fit a 4 s sweep: a cursor that jumps the whole window
+    // would probe l0–l3 every pass and never reach l7.
+    for (let round = 0; round < 3; round += 1) await $.turn.complete(turn())
+
+    expect(new Set(probed).has('l7'), 'the tail is probed').toEqual(true)
+    expect(wake.join('\n')).toContain('"l7" on codex: stalled')
+  })
+
+  test('a failed launch whose pane is gone closes as exited (O3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/launch.exit`]: '127\n' })
+    const wake = mockWake(on)
+    mockStatus(on, { exists: false, running: false })
+
+    for (let round = 0; round < 4; round += 1) {
+      await $.turn.complete(turn())
+      await clock.advance(60_000)
+    }
+
+    expect(wake.length, 'the launch notice, then exited').toEqual(2)
+    expect(wake[0]).toContain('launch-failed')
+    expect(wake[1]).toContain('"w1" on codex: exited')
+    expect(store.acked().sort()).toEqual(['w1@0', 'w1@0#launch'])
+    expect(namesIn((await $.command.run(run('outstanding'))).text)).toEqual([])
+  })
+
+  test('a failed launch whose CLI is alive is still probed for a stop (O3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w1/launch.exit`]: '1\n' })
+    const wake = mockWake(on)
+    const status = mockStatus(on, { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' })
+
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+
+    expect(status.calls.some(a => a.includes('status')), 'the worker is probed').toEqual(true)
+    expect(wake.length).toEqual(2)
+    expect(wake[1]).toContain('look stopped by their CLI')
+  })
+
+  test('a first block too large to fit alone is sent without its summary, and the rest follows (O4)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    const dir = '/w/' + 'd'.repeat(1_000)
+    mockFs(on, {
+      [`${ROOT}/big/dispatch.json`]: dispatch('big', 0, { dir }),
+      // A commit the repo does not have: the NOT-verified reason names the dir again.
+      [`${ROOT}/big/result.json`]: JSON.stringify({ status: 'success', summary: '<worker-output'.repeat(857), commit: 'c'.repeat(40) }),
+      [`${ROOT}/small/dispatch.json`]: dispatch('small', 0),
+      [`${ROOT}/small/result.json`]: finished('small done'),
+    })
+    const wake = mockWake(on)
+    on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: Not a valid object name' } }))
+
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+
+    const all = wake.join('\n')
+    expect(all).toContain('summary too long for one prompt')
+    expect(all).toContain('small done')
+    expect(store.acked().sort()).toEqual(['big@0', 'small@0'])
+  })
+
+  test('a base that is not 40-hex never reaches git argv (O5)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const SHA = 'a'.repeat(40)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { base: '--output=/x' }),
+      [`${ROOT}/w1/result.json`]: JSON.stringify({ status: 'success', summary: 'done', commit: SHA }),
+    })
+    const wake = mockWake(on)
+    const calls: (readonly string[])[] = []
+    on('process.run', ($, e) => {
+      calls.push(e.argv)
+      return { value: { exitCode: 0, stdout: 'commit\n', stderr: '' } }
+    })
+
+    await $.turn.complete(turn())
+
+    expect(calls.flat().includes('--output=/x')).toEqual(false)
+    expect(calls.some(a => a.includes('merge-base'))).toEqual(false)
+    expect(wake[0]).toContain('no dispatch base recorded')
+  })
+})
