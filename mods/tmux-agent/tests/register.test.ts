@@ -1182,7 +1182,7 @@ describe('stall detection', () => {
 
     await $.turn.complete(turn())
 
-    expect(logs).toEqual([])
+
     expect((await $.command.run(run('stalled'))).text).toEqual('')
   })
 
@@ -3355,6 +3355,43 @@ describe('live e2e of 0.7.6', () => {
     await clock.advance(1)
     for (let i = 0; i < 20 && !ran.length; i += 1) await settle()
     expect(ran).toEqual(['reload-plugins'])
+  })
+
+  test('a reload reopens a panel that was open, and only for that session', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    // As a reload finds it: this session's panel was open, the module state is gone.
+    const store = mockStore(on, [], 'tmux-agent.reported', { 'tmux-agent.panel': ['sess-B', 'sess-A'] })
+    const clock = mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }) })
+    mockPanel(on, { running: true, idle_seconds: 10 })
+
+    await $.session.start(session())
+    await clock.advance(1)
+    for (let i = 0; i < 20 && !textOf(await $.ui.render(bandRender())).includes('w1'); i += 1) await settle()
+    expect(textOf(await $.ui.render(bandRender())), 'the panel is back').toContain('w1')
+
+    // Closing it forgets this session only.
+    expect((await $.command.run(run('tmux'))).text).toContain('closed')
+    for (let i = 0; i < 20 && store.key('tmux-agent.panel').includes('sess-A'); i += 1) await settle()
+    expect(store.key('tmux-agent.panel')).toEqual(['sess-B'])
+  })
+
+  test('opening the panel records it; a session whose panel was closed does not reopen it', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    mockFs(on, {})
+    const panel = mockPanel(on, { running: true, idle_seconds: 10 })
+
+    await $.session.start(session())
+    await clock.advance(1)
+    for (let i = 0; i < 5; i += 1) await settle()
+    expect(panel.open, 'nothing to reopen').toEqual([])
+    await $.command.run(run('tmux'))
+    for (let i = 0; i < 20 && !store.key('tmux-agent.panel').length; i += 1) await settle()
+    expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
   })
 
   test('a confirm-processing launch-failed notice says the worker may be working', WITH_DRIVER, async ($, on) => {

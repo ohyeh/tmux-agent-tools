@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.9'
+const MOD_VERSION = '0.7.10'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -43,6 +43,8 @@ const BASH_GATE_RE =
 const HELP_RE = /(^|\s)--help(\s|$)/
 /** Workers already DELIVERED for, as `<name>@<since>`. Survives sessions; see `reconcile`. */
 const STORE_KEY = 'tmux-agent.reported'
+/** Sessions whose panel is open, newest first: a reload drops the module's state, and session.start reopens it. */
+const PANEL_KEY = 'tmux-agent.panel'
 const POLL_MS = 10_000
 /**
  * A collector proves it is alive by touching `<root>/.collector-<sessionId>`
@@ -1405,6 +1407,15 @@ type Outcome = { ok: true; text: string } | { ok: false; text: string }
  * same-since episode would inherit the old "delivered" mark and never be
  * collected.
  */
+/** Record whether this session's panel is open, so `/reload-plugins` (which closes it) can reopen it. */
+async function rememberPanel(host: Host, open: boolean): Promise<void> {
+  const id = host.owner()
+  if (!id) return
+  const prev = await host.storeGet(PANEL_KEY)
+  const others = Array.isArray(prev) ? prev.filter((x): x is string => typeof x === 'string' && x !== id) : []
+  await host.storeSet(PANEL_KEY, open ? [id, ...others].slice(0, 20) : others)
+}
+
 async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: string): Promise<Outcome> {
   const dir = `${root}/${d.name}`
   const body =
@@ -1779,6 +1790,23 @@ export const register: Register = on => {
     // condition measured in quarter-hours.
     await reconcileOnce(host, gate, false)
 
+    // A reload closed this session's panel (the module's state went with it):
+    // open it again, through the same code /tmux runs.
+    const open = await host.storeGet(PANEL_KEY).catch((error: unknown) => {
+      host.log(`tmux-agent: panel state unreadable: ${String(error)}`)
+      return undefined
+    })
+    if (Array.isArray(open) && open.includes(sessionId)) {
+      $.clock.after(0, async () => {
+        if (panel.open) return
+        const failed = await openPanel(
+          () => void $.ui.invalidate('ui.render'),
+          (ms, fn) => $.clock.every(ms, fn),
+        ).catch((err: unknown) => String(err))
+        if (failed) host.log(`tmux-agent: reopening the panel failed: ${failed}`)
+      })
+    }
+
     return next(e)
   })
 
@@ -2077,6 +2105,8 @@ export const register: Register = on => {
   // only functions declared at the top of the file. The redraw comes as a closure.
   const closePanel = (redraw: () => void) => {
     panel.open = false
+    const w = world
+    if (w) void rememberPanel(w, false).catch(err => w.log(`tmux-agent: panel state not saved: ${String(err)}`))
     panel.selected = undefined
     panel.mirror = undefined
     panel.generation += 1
@@ -2085,6 +2115,91 @@ export const register: Register = on => {
     panel.refresh = undefined
     panel.close = undefined
     redraw()
+  }
+
+  // Opens the panel: the /tmux toggle, and session.start after a reload closed it
+  // (a plugin's own $.command.run skips its own command hook, so /tmux cannot be
+  // replayed). `$` stays out, per the static rule above: its two uses come as closures.
+  const openPanel = async (
+    redraw: () => void,
+    every: (ms: number, fn: () => Promise<void>) => { cancel: () => void },
+  ): Promise<string | undefined> => {
+    const bound = world
+    if (!bound) return 'tmux panel unavailable: the mod did not bind.'
+    // Mark it open BEFORE the first await. A close landing during that await
+    // would otherwise be undone here, and the timer installed below would
+    // outlive the panel — a second /tmux then installing another one.
+    panel.open = true
+    panel.close = () => closePanel(redraw)
+    redraw()
+    void rememberPanel(bound, true).catch(err => bound.log(`tmux-agent: panel state not saved: ${String(err)}`))
+    const mine = panel.generation
+    const first = await panelRows(bound, gate, await rootOf(bound))
+    if (panel.generation !== mine || !panel.open) return 'tmux panel closed.'
+    panel.rows = first
+    // The pane drew once, empty, while the rows were being read; without this
+    // the first real frame waits for the 2s clock and the person sees
+    // "No workers outstanding" over a fleet that is there (observed 2026-09-17).
+    redraw()
+    // One re-read of the rows, shared by the clock and the [refresh] button.
+    // Single-flight: a `tmux ls` slower than the tick is not joined by the next.
+    const refresh = async (): Promise<boolean> => {
+      if (panel.refreshing) return false
+      panel.refreshing = true
+      try {
+        const rows = await panelRows(bound, gate, await rootOf(bound))
+        if (panel.generation !== mine || !panel.open) return false
+        panel.rows = rows
+        return true
+      } finally {
+        panel.refreshing = false
+      }
+    }
+    // A refresh that throws is logged, never lost: a silent panel is the one
+    // failure the person cannot tell from an empty fleet.
+    panel.refresh = async () => {
+      try {
+        if (await refresh()) redraw()
+      } catch (error) {
+        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
+      }
+    }
+    if (panel.timer) panel.timer.cancel()
+    panel.timer = every(MIRROR_MS, async () => {
+      if (!panel.open || panel.generation !== mine) return
+      // Single-flight: a capture slower than the 2s tick must not start a second
+      // subprocess on top of itself, and two in-flight captures could land out of
+      // order and show older output than what is already on screen.
+      if (panel.capturing) return
+      let fresh = false
+      try {
+        fresh = await refresh()
+      } catch (error) {
+        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
+      }
+      if (!fresh) return
+      const row = panel.rows.find(r => r.id === panel.selected)
+      // No selection, no capture: the mirror is the only thing here that costs a
+      // process, and it costs it for one worker at a time.
+      // A zero here is the render telling us the pane is too short to mirror
+      // usefully; spending a subprocess on it would buy an empty box.
+      if (row && (panel.rows_available ?? MIRROR_ROWS) > 0) {
+        panel.capturing = true
+        try {
+          const lines = await mirrorOf(bound, row.d, panel.rows_available ?? MIRROR_ROWS)
+          // The selection may have moved, or the panel closed, while this ran.
+          if (panel.generation === mine && panel.open && panel.selected === row.id) {
+            panel.mirror = { id: row.id, lines }
+          }
+        } finally {
+          panel.capturing = false
+        }
+      } else {
+        panel.mirror = undefined
+      }
+      redraw()
+    })
+    return undefined
   }
 
   on('command.run', { command: 'tmux' }, async ($, e) => {
@@ -2153,80 +2268,8 @@ export const register: Register = on => {
       closePanel(redraw)
       return { text: 'tmux panel closed.' }
     }
-    const bound = world
-    if (!bound) return { text: 'tmux panel unavailable: the mod did not bind.' }
-    // Mark it open BEFORE the first await. A close landing during that await
-    // would otherwise be undone here, and the timer installed below would
-    // outlive the panel — a second /tmux then installing another one.
-    panel.open = true
-    panel.close = () => closePanel(redraw)
-    redraw()
-    const mine = panel.generation
-    const first = await panelRows(bound, gate, await rootOf(bound))
-    if (panel.generation !== mine || !panel.open) return { text: 'tmux panel closed.' }
-    panel.rows = first
-    // The pane drew once, empty, while the rows were being read; without this
-    // the first real frame waits for the 2s clock and the person sees
-    // "No workers outstanding" over a fleet that is there (observed 2026-09-17).
-    $.ui.invalidate('ui.render')
-    // One re-read of the rows, shared by the clock and the [refresh] button.
-    // Single-flight: a `tmux ls` slower than the tick is not joined by the next.
-    const refresh = async (): Promise<boolean> => {
-      if (panel.refreshing) return false
-      panel.refreshing = true
-      try {
-        const rows = await panelRows(bound, gate, await rootOf(bound))
-        if (panel.generation !== mine || !panel.open) return false
-        panel.rows = rows
-        return true
-      } finally {
-        panel.refreshing = false
-      }
-    }
-    // A refresh that throws is logged, never lost: a silent panel is the one
-    // failure the person cannot tell from an empty fleet.
-    panel.refresh = async () => {
-      try {
-        if (await refresh()) $.ui.invalidate('ui.render')
-      } catch (error) {
-        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
-      }
-    }
-    if (panel.timer) panel.timer.cancel()
-    panel.timer = $.clock.every(MIRROR_MS, async () => {
-      if (!panel.open || panel.generation !== mine) return
-      // Single-flight: a capture slower than the 2s tick must not start a second
-      // subprocess on top of itself, and two in-flight captures could land out of
-      // order and show older output than what is already on screen.
-      if (panel.capturing) return
-      let fresh = false
-      try {
-        fresh = await refresh()
-      } catch (error) {
-        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
-      }
-      if (!fresh) return
-      const row = panel.rows.find(r => r.id === panel.selected)
-      // No selection, no capture: the mirror is the only thing here that costs a
-      // process, and it costs it for one worker at a time.
-      // A zero here is the render telling us the pane is too short to mirror
-      // usefully; spending a subprocess on it would buy an empty box.
-      if (row && (panel.rows_available ?? MIRROR_ROWS) > 0) {
-        panel.capturing = true
-        try {
-          const lines = await mirrorOf(bound, row.d, panel.rows_available ?? MIRROR_ROWS)
-          // The selection may have moved, or the panel closed, while this ran.
-          if (panel.generation === mine && panel.open && panel.selected === row.id) {
-            panel.mirror = { id: row.id, lines }
-          }
-        } finally {
-          panel.capturing = false
-        }
-      } else {
-        panel.mirror = undefined
-      }
-      $.ui.invalidate('ui.render')
-    })
+    const failed = await openPanel(redraw, (ms, fn) => $.clock.every(ms, fn))
+    if (failed) return { text: failed }
     return {
       text:
         'tmux panel opened above the prompt. 1-9 on an empty prompt selects a row; ' +

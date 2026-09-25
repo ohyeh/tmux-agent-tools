@@ -161,6 +161,7 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 
 `claude plugin update tmux-agent@tmux-agent-tools` 之後，呼叫 `reload` tool：它在這一輪結束時執行
 `/reload-plugins`，面板標題會顯示新版號。不必等人手打 `/reload-plugins`。
+reload 會重跑 module，面板原本會跟著關掉；0.7.10 起開著的面板會自己重新打開（記在 store 的 `tmux-agent.panel`，只記這個 session），但選中的列不會保留。
 
 ## launch requested ≠ worker started
 
