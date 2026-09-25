@@ -326,11 +326,12 @@ EOF
 chmod +x "$WORK/donecli"
 printf 'bin=%s\nheuristic_family=claude\n' "$WORK/donecli" > "$WORK/profiles/doneclaude.conf"
 echo
-echo "case: a claude turn that finished between looks confirms, with no resend"
+echo "case: a claude turn that finished between looks confirms, with no resend (C locale caller)"
 LOG="$WORK/done.log"; : > "$LOG"
 mkdir -p "$TMUX_AGENT_DIR/done-turn"
 code=0
-AGENT_TMUX_PROFILE_DIR="$WORK/profiles" AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
+# LC_ALL=C: a caller with no UTF-8 locale (launchd, cron) made `✻` a byte class.
+LC_ALL=C AGENT_TMUX_PROFILE_DIR="$WORK/profiles" AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
   "$AGENT_TMUX" doneclaude assign --timeout 60 --confirm-window 30 --detach done-turn "$WORK" "$WORK/brief.txt" \
     >"$WORK/done.out" 2>"$WORK/done.err" || code=$?
 assert "done: assign confirmed the worker" "$code" "0"

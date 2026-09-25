@@ -1,5 +1,10 @@
 #!/usr/bin/env zsh
 set -euo pipefail
+# The pane scans match multibyte glyphs (✻ ❯ → ⠘) in bracket classes; under the
+# C locale those are byte classes and never match, so every dialog, counter and
+# finished-turn check reads "nothing". A caller with no UTF-8 locale (launchd,
+# cron, env -i) gets one.
+[[ "$(locale charmap 2>/dev/null)" == UTF-8 ]] || export LC_ALL=C.UTF-8
 
 SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
