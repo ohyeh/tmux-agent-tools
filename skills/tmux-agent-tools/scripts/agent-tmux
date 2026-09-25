@@ -7256,7 +7256,7 @@ diagnostic_for_blocked_reason() {
       echo "session is blocked on a hook-trust prompt; inspect the hook and, only if you trust it, answer with a raw key (e.g. agent-tmux <cli> send --raw <name> t)"
       ;;
     permission_prompt|approval_prompt|ssh_prompt|login_prompt)
-      echo "session may be waiting for interactive confirmation; capture the pane to read the choices, then answer with a MAPPED key: agent-tmux <cli> send --key up|down|enter <name>. Do NOT use send --raw <name> Enter — --raw is literal, so that types the word \"Enter\" into the prompt and the menu never moves (observed 2026-09-17 on an agy workspace-trust dialog)"
+      echo "session may be waiting for interactive confirmation; capture the pane to read the choices, then answer with a mapped key (the keys tool, or agent-tmux <cli> send --key up|down|enter <name>); send --raw is literal and types the word \"Enter\" instead of pressing it"
       ;;
     startup_pending)
       echo "CLI is still on a transient startup/verification screen; text sent now would be swallowed — wait for it to clear (status --json) before sending"

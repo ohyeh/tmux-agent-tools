@@ -111,17 +111,16 @@ Keep the long supervise off the expensive main context: host that one blocking
 `assign` in a cheap general-purpose sub-agent (model override, e.g. Sonnet), or
 in a background task. The host still makes exactly one `assign` call — it hosts,
 it does not proxy. Exception — a harness that reaps long-running tasks (local
-Claude Code moves a foreground call to the background at ~600s; a background
-task spawning its own tmux server was killed at ~10 min with exit 144,
-2026-08-08) cannot hold the blocking wait in a sub-agent at all: a reaped
-sub-agent has no `TaskOutput` to wait on its own task and can only report
-in-flight (measured 2026-08-30). There, split dispatch from the wait: the PROXY
+Claude Code moves a foreground call to the background at ~600s and kills a
+background task that spawns its own tmux server at ~10 min, exit 144) cannot
+hold the blocking wait in a sub-agent at all: a reaped sub-agent has no
+`TaskOutput` to wait on its own task and can only report in-flight. There, split dispatch from the wait: the PROXY
 sub-agent runs `assign --detach` — a short call that returns as soon as the
 worker is started and sent, so nothing can reap it — and the PARENT owns the
 wait, harvesting with bounded `result wait-required --fields <csv> --wait <s>
 --json` calls it runs itself as background tasks. Never host a BLOCKING
 `assign` in a sub-agent under such a harness: it is reaped mid-wait and can
-only report in-flight (three times, 2026-09-03). Never run `assign`, with or
+only report in-flight. Never run `assign`, with or
 without `--detach`, in the parent's own foreground — a dispatch gate blocks
 it. Never leave a non-terminal report unattended: only a parent-owned task
 re-invokes the session, one orphaned by a terminated
@@ -134,9 +133,8 @@ Harvest the fields the PRODUCER writes. `--fields` names keys inside the
 worker's `result.json` (`status`, `summary`, `artifacts`, `errors`, or the
 profile's `result_required_fields`), and the payload lives under `.body` —
 `.status` at the top level reads `null`. Never name a field from a prompt
-template placeholder: on 2026-09-08 two workers finished and the parent waited
-on `artifact_path`, which no worker writes, burning ~24 minutes until a human
-asked. `wait-required` now exits **3** (`event:"contract-mismatch"`, with the
+template placeholder such as `artifact_path`, which no worker writes: the
+parent waits on a field that never arrives. `wait-required` exits **3** (`event:"contract-mismatch"`, with the
 worker's `body` attached) the moment a terminal result lacks a requested field
 — that is a caller bug to fix, not a worker failure and not a timeout. Ask for
 a produced artifact as `.body.artifacts`.
