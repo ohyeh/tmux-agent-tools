@@ -1705,7 +1705,7 @@ export const register: Register = on => {
     const compact = used > e.props.maxRows
     if (compact) panel.rows_available = 0
 
-    if (down && !compact) children.push(Text({ dimColor: true, children: `⚠ ${down}` }))
+    if (down && !compact) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `⚠ ${down}` }))
     // The header names the keys: this is the only place a person learns them.
     // `r`/`x`/`q` press only while the band is focused; digits from an empty
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
@@ -1980,7 +1980,7 @@ export const register: Register = on => {
           out = await stopWorker(bound, gate, row.d)
         } else {
           const text = message.trim() ? message : ''
-          if (!text) return { text: '/tmux tell N <text> — the message is missing.' }
+          if (!text) return { text: '/tmux tell <name> <text> — the message is missing.' }
           const root = await rootOf(bound)
           out = root ? await tellWorker(bound, root, row.d, text) : { ok: false, text: 'no state root' }
         }

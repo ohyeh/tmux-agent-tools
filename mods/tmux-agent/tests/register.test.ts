@@ -3190,7 +3190,7 @@ describe('cursor review of d20cdcc', () => {
     await $.ui.render(bandRender(30))
     await clock.advance(2_000)
     const count = (t: unknown) => ((t as { children?: unknown[] }).children ?? []).slice(1).length
-    for (const rows of [13, 9, 6]) expect(count(await $.ui.render(bandRender(rows))), `shrunk to ${rows}`).toBeLessThanOrEqual(rows)
+    for (const rows of [13, 9, 7, 6, 5, 4]) expect(count(await $.ui.render(bandRender(rows))), `shrunk to ${rows}`).toBeLessThanOrEqual(rows)
   })
 
   test('an empty list on a one-row band stays inside it (N-4)', WITH_DRIVER, async ($, on) => {
@@ -3203,5 +3203,26 @@ describe('cursor review of d20cdcc', () => {
     await $.command.run(run('tmux'))
     const tree = await $.ui.render(bandRender(1))
     expect(((tree as { children?: unknown[] }).children ?? []).slice(1).length).toBeLessThanOrEqual(1)
+  })
+})
+
+describe('fable review of 95f32f0', () => {
+  test('the collector-down line is one row: a long pause reason is cut, not wrapped past the budget', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on, ['keep@0', 'y'.repeat(3 * 1024 * 1024)], 'tmux-agent.reported.other-session')
+    mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+      [`${ROOT}/w1/result.json`]: finished(),
+      [`${ROOT}/keep/dispatch.json`]: dispatch('keep', 0),
+    })
+    mockPanel(on, { running: true })
+    await $.session.start(session())
+    await $.turn.complete(turn())
+    await $.command.run(run('tmux'))
+    const tree = await $.ui.render(bandRender(13))
+    const down = ((tree as { children?: unknown[] }).children ?? []).find(c => textOf(c).startsWith('⚠'))
+    expect(textOf(down), 'the pause reason is drawn').toContain('over budget')
+    expect((down as { props?: { wrap?: string } }).props?.wrap).toBe('truncate-end')
   })
 })
