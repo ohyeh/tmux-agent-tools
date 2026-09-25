@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.5'
+const MOD_VERSION = '0.7.6'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -264,12 +264,7 @@ type Panel = {
    * stray `x` with the band focused did it (2026-09-25, live probe).
    */
   armedStop?: { id: string; from: number; until: number }
-  /**
-   * The row ids in the order the last render numbered them. `/tmux stop N`
-   * resolves N against what the person saw, not against a list a refresh may
-   * have shifted since (cursor, 34e2a1e: `stop 2` ended w3 while row 2 read w2).
-   */
-  drawn?: string[]
+
   rows: PanelRow[]
   mirror?: { id: string; lines: string[] }
   timer?: { cancel: () => void }
@@ -922,20 +917,20 @@ async function flagStalls(
     // exiting the loop beats issuing four more calls we know will be rejected.
     if (left <= 0) break
     const id = idOf(d)
+    // The probe's own ceiling is whatever is LEFT of the sweep's budget, so the
+    // sweep cannot overrun by a whole probe the way a fixed 3s did.
+    const limit = Math.min(STALL_PROBE_MS, left)
     let probe: { exitCode: number; stdout: string }
     try {
-      probe = await host.run(
-        ['agent-tmux', d.profile, 'status', '--json', d.name],
-        d.dir,
-        // The probe's own ceiling is whatever is LEFT of the sweep's budget, so
-        // the sweep cannot overrun by a whole probe the way a fixed 3s did.
-        Math.min(STALL_PROBE_MS, left),
-      )
+      probe = await host.run(['agent-tmux', d.profile, 'status', '--json', d.name], d.dir, limit)
     } catch {
-      // A probe that cannot run — or was cut short by what was left of the
-      // budget — says nothing about the worker, and does not count as probed:
-      // it stays at the front, where the next sweep gives it its full time
-      // (cursor, 34e2a1e: the seventh of seven 600 ms probes, cut every tick).
+      // A probe cut short by what was left of the budget does not count as
+      // probed: it stays at the front, where the next sweep gives it its full
+      // time (cursor, 34e2a1e: the seventh of seven 600 ms probes, cut every
+      // tick). One that failed with its full window did get its turn — left at
+      // the front, a worker whose status always times out took the whole
+      // sweep every tick (cursor, d20cdcc).
+      if (limit >= STALL_PROBE_MS) gate.probedAt.set(id, await host.now())
       continue
     }
     gate.probedAt.set(id, await host.now())
@@ -1519,7 +1514,7 @@ export const register: Register = on => {
 
     await $.command.register({
       name: 'tmux',
-      description: 'Show or hide the tmux worker panel; /tmux N selects row N, /tmux stop N, /tmux tell N <text>, /tmux hide',
+      description: 'Show or hide the tmux worker panel; /tmux N selects row N, /tmux stop <name>, /tmux tell <name> <text>, /tmux hide',
     })
 
     await $.tool.register({
@@ -1677,13 +1672,12 @@ export const register: Register = on => {
     // Goals show only in the overview (no row selected); a selected row adds its
     // tell line and a one-line summary. A fleet longer than the band is cut, the
     // selected row kept, with a "+N more" line.
-    panel.drawn = panel.rows.map(r => r.id)
     const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
     const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
     const layout = (sel: PanelRow | undefined) => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (down ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0)
+      const fixed = 1 + (down ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
       const perRow = sel ? 1 : 2
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
@@ -1717,7 +1711,7 @@ export const register: Register = on => {
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
     // The hint names the slash commands: they work in any terminal, where a
     // letter hotkey needs the band focused and ctrl+x tab may never arrive.
-    const hint = '  1-9 select · /tmux stop N · /tmux tell N <text> '
+    const hint = '  1-9 select · /tmux stop <name> · /tmux tell <name> <text> '
     // The title, `[ refresh ]` and `[ hide ]`; the hint is padded so the bar
     // spans the row up to the engine's own `[-]` collapse control, which the band
     // draws over its last cells (observed live: it covered `[ hide ]`).
@@ -1746,7 +1740,7 @@ export const register: Register = on => {
           Text({
             dimColor: true,
             wrap: 'truncate-end',
-            children: `${panel.rows.length} worker(s); band too short (${e.props.maxRows} rows) — /tmux N · /tmux stop N · /tmux tell N <text>`,
+            children: `${panel.rows.length} worker(s); band too short (${e.props.maxRows} rows) — /tmux N · /tmux stop <name> · /tmux tell <name> <text>`,
           }),
         )
       }
@@ -1854,7 +1848,11 @@ export const register: Register = on => {
                   void act(`stop ${r.d.name}`, host => stopWorker(host, gate, r.d))
                   return
                 }
-                if (was?.id === r.id && at < was.until) return // a repeat inside the beat
+                // A repeat inside the beat slides it: a held key never confirms.
+                if (was?.id === r.id && at < was.until) {
+                  panel.armedStop = { ...was, from: at }
+                  return
+                }
                 panel.armedStop = { id: r.id, from: at, until: at + STOP_CONFIRM_MS }
                 $.ui.invalidate('ui.render')
               },
@@ -1874,7 +1872,8 @@ export const register: Register = on => {
 
     if (hidden) children.push(Text({ dimColor: true, children: `  +${hidden} more — /tmux N selects row N` }))
 
-    const shown = panel.mirror && panel.mirror.id === panel.selected ? panel.mirror : undefined
+    // No room this render, no mirror: its rule, lines and hint would overflow.
+    const shown = panel.mirror && panel.mirror.id === panel.selected && (panel.rows_available ?? 0) > 0 ? panel.mirror : undefined
     // `selected`, not `panel.selected`: a worker that left the list (stopped,
     // exited) is no selection, and its stale id drew a "too short" line past
     // maxRows (cursor, 34e2a1e).
@@ -1894,7 +1893,8 @@ export const register: Register = on => {
     if (shown) {
       const row = panel.rows.find(r => r.id === shown.id)
       children.push(Text({ dimColor: true, children: '─'.repeat(Math.max(3, Math.min(width, 60))) }))
-      for (const line of shown.lines) {
+      // The capture was sized by an earlier render; this one may have less room.
+      for (const line of shown.lines.slice(Math.max(0, shown.lines.length - (panel.rows_available ?? 0)))) {
         children.push(Text({ wrap: 'truncate-end', children: line.slice(0, Math.max(10, width)) || ' ' }))
       }
       if (row) {
@@ -1946,17 +1946,10 @@ export const register: Register = on => {
         return { text: 'tmux panel hidden; /tmux shows it again.' }
       }
       const rows = panel.open ? panel.rows : await panelRows(bound, gate, await rootOf(bound))
-      // A number is a row of the panel as last drawn; with the panel hidden
-      // there is no drawn row, so only a name names a worker.
-      const pick = (key: string) => {
-        if (!/^[0-9]+$/.test(key)) return rows.find(r => r.d.name === key)
-        const id = panel.open ? panel.drawn?.[Number(key) - 1] : undefined
-        return id ? rows.find(r => r.id === id) : undefined
-      }
+
       if (/^[0-9]+$/.test(verb)) {
-        // Selecting is harmless, so a hidden panel opens on row N of the list it
-        // is about to draw.
-        const row = panel.open && panel.drawn ? pick(verb) : rows[Number(verb) - 1]
+        // Selecting is harmless, so N is simply row N of the current list.
+        const row = rows[Number(verb) - 1]
         if (!row) return { text: `no row ${verb} (${rows.length} shown).` }
         panel.selected = row.id
         panel.mirror = undefined
@@ -1966,11 +1959,21 @@ export const register: Register = on => {
           return { text: `row ${verb} "${row.d.name}" selected.` }
         }
       } else if (verb === 'stop' || verb === 'tell') {
-        const row = pick(target)
-        if (!row) {
-          const why = /^[0-9]+$/.test(target) && !panel.open ? ' (the panel is hidden — row numbers need it open; use the name)' : ''
-          return { text: `no worker "${target}"${why} — give a drawn row number or a name (${rows.map(r => r.d.name).join(', ') || 'none'}).` }
+        // Names only. Row numbers move whenever the list refreshes — the engine
+        // redraws right after — so `stop 2` ended a worker other than the one the
+        // person read as row 2 (cursor, 34e2a1e and d20cdcc). A number answers
+        // with the name it stands for now, to type back.
+        if (/^[0-9]+$/.test(target)) {
+          const now = rows[Number(target) - 1]
+          const hint = verb === 'tell' ? ' <text>' : ''
+          return {
+            text: now
+              ? `row ${target} is "${now.d.name}" right now — ${verb} takes a name: /tmux ${verb} ${now.d.name}${hint}`
+              : `no row ${target}; ${verb} takes a name (${rows.map(r => r.d.name).join(', ') || 'none'}).`,
+          }
         }
+        const row = rows.find(r => r.d.name === target)
+        if (!row) return { text: `no worker "${target}" (${rows.map(r => r.d.name).join(', ') || 'none'}).` }
         let out: Outcome
         if (verb === 'stop') {
           // Typing the row or name is the confirmation; the button asks twice.
@@ -1984,7 +1987,7 @@ export const register: Register = on => {
         if (panel.open) void panel.refresh?.()
         return { text: `${verb} "${row.d.name}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 300)}` }
       } else {
-        return { text: '/tmux [N | stop N|name | tell N|name <text> | hide]' }
+        return { text: '/tmux [N | stop <name> | tell <name> <text> | hide]' }
       }
     }
     if (panel.open) {
@@ -2068,7 +2071,7 @@ export const register: Register = on => {
     return {
       text:
         'tmux panel opened above the prompt. 1-9 on an empty prompt selects a row; ' +
-        '/tmux stop N, /tmux tell N <text>, /tmux hide work anywhere (letter keys r/x/q need the band focused).',
+        '/tmux stop <name>, /tmux tell <name> <text>, /tmux hide work anywhere (letter keys r/x/q need the band focused).',
     }
   })
 

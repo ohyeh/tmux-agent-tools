@@ -358,9 +358,10 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 
 - prompt 空白時直接按 `1`–`9` 選那一列（鏡像它的畫面尾巴；再按一次取消）。
 - `/tmux N` 選第 N 列（第 10 列起、或被擠到 `+N more` 裡的列用這個）。
-- `/tmux stop N|名字`、`/tmux tell N|名字 <訊息>`、`/tmux hide`。打出列號或名字
-  本身就是確認。列號對的是**上一次畫出來**的面板（之後 refresh 插進新列也不會停錯人）；
-  面板隱藏時沒有畫出來的列，只收名字。訊息原樣送出，換行與縮排保留。`tell` 最壞要
+- `/tmux stop <名字>`、`/tmux tell <名字> <訊息>`、`/tmux hide`。打出名字本身就是確認。
+  `stop`／`tell` 只收名字、不收列號：列號跟著每次 refresh 移動，打字到按 Enter 之間插進
+  一列就會停錯人（0.7.6，cursor d20cdcc N-2）；打數字會回 `row N is "<名字>" right now`
+  讓你照名字再打一次。訊息原樣送出，換行與縮排保留。`tell` 最壞要
   git 2 秒 + init 5 秒 + send 8 秒，會超過 hook 的 10 秒預算（UNCONFIRMED：引擎中止時
   dispatch.json 是否已寫入）；回傳 FAILED 時先 peek 再決定要不要重送。
 
@@ -391,7 +392,7 @@ hotkey」（d.ts `AbovePrompt.maxRows`），數字鍵就廢了。每一行都算
 隊友數字鍵就失靈）；總覽放不下的列收進 `+N more — /tmux N selects row N`；選中時
 列表先讓位給鏡像的 6 行下限（13 行的 band、兩個 worker 以前印 `needs 15`，八個印
 `needs 18`，鏡像永遠出不來）。鏡像行數是 `maxRows` 減掉這些之後剩下的，不是固定值。
-band 連「一列加它的控制」都放不下時只畫標題列和一行指令提示（`/tmux N · /tmux stop N …`），
+band 連「一列加它的控制」都放不下時只畫標題列和一行指令提示（`/tmux N · /tmux stop <name> …`），
 不溢位。
 
 三件事是刻意的：

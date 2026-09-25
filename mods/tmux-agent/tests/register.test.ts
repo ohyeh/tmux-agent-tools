@@ -2963,7 +2963,10 @@ describe('panel UX, 2026-09-25 live probe', () => {
     expect(keysOf(await $.ui.render(bandRender()))).toContain('stop:w2@0')
     expect((await $.command.run(run('tmux', 'stop ghost'))).text).toContain('no worker "ghost"')
     expect((await $.command.run(run('tmux', 'tell w1'))).text).toContain('message is missing')
-    expect((await $.command.run(run('tmux', 'stop 1'))).text).toContain('stop "w1" — ok')
+    // A number is never enough to stop: it answers with the name it stands for.
+    expect((await $.command.run(run('tmux', 'stop 1'))).text).toContain('row 1 is "w1" right now')
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(false)
+    expect((await $.command.run(run('tmux', 'stop w1'))).text).toContain('stop "w1" — ok')
     expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(true)
     expect(store.acked()).toContain('w1@0')
     expect((await $.command.run(run('tmux', 'hide'))).text).toContain('hidden')
@@ -3026,7 +3029,7 @@ describe('astra review of 34e2a1e', () => {
       const count = ((tree as { children?: unknown[] }).children ?? []).slice(1).length
       expect(count, `maxRows ${rows}`).toBeLessThanOrEqual(rows)
     }
-    expect(textOf(await $.ui.render(bandRender(3)))).toContain('/tmux stop N')
+    expect(textOf(await $.ui.render(bandRender(3)))).toContain('/tmux stop <name>')
   })
 })
 
@@ -3078,7 +3081,7 @@ describe('cursor review of 34e2a1e', () => {
     expect(keysOf(tree)).not.toContain('stop:w2@0')
   })
 
-  test('/tmux stop N stops the row N the person saw, not the one a refresh moved there (P2-3)', WITH_DRIVER, async ($, on) => {
+  test('/tmux stop N stops nothing: row numbers move with every refresh, so stop takes a name (P2-3, d20cdcc N-2)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mock.clock(on)
@@ -3092,12 +3095,10 @@ describe('cursor review of 34e2a1e', () => {
     // A new worker sorts in front after a refresh the person has not seen drawn.
     files[`${ROOT}/w1/dispatch.json`] = dispatch('w1', 0)
     await clock.advance(2_000)
-    expect((await $.command.run(run('tmux', 'stop 2'))).text).toContain('stop "w3"')
-    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w3`)).toEqual(true)
-    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w2`)).toEqual(false)
-    // With the panel hidden there is no drawn row: a number names nothing.
-    await $.command.run(run('tmux', 'hide'))
-    expect((await $.command.run(run('tmux', 'stop 1'))).text).toContain('the panel is hidden')
+    await $.ui.render(bandRender())
+    expect((await $.command.run(run('tmux', 'stop 2'))).text).toMatch(/row 2 is "w\d" right now — stop takes a name/)
+    expect((await $.command.run(run('tmux', 'tell 2 hi'))).text).toContain('tell takes a name')
+    expect(panel.argv.some(a => a.includes('stop')), 'no number stops anyone').toEqual(false)
   })
 
   test('/tmux tell keeps the message as typed, newlines and indentation included (P3)', WITH_DRIVER, async ($, on) => {
@@ -3128,5 +3129,79 @@ describe('cursor review of 34e2a1e', () => {
       return p.label !== undefined ? `[ ${p.label} ]`.length : textOf(c).length
     })
     expect(cells.reduce((a, b) => a + b, 0), 'title bar plus the engine\'s " [-]" fit 80 columns').toBeLessThanOrEqual(80 - ' [-]'.length)
+  })
+})
+
+describe('cursor review of d20cdcc', () => {
+  test('a worker whose status always times out does not take the sweep every tick (N-1)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    const files: Files = {}
+    for (let i = 0; i < 4; i += 1) files[`${ROOT}/l${i}/dispatch.json`] = dispatch(`l${i}`, 0)
+    mockFs(on, files)
+    const wake = mockWake(on)
+    const answered = new Set<string>()
+    on('process.run', async ($, e) => {
+      const name = e.argv[e.argv.length - 1] ?? ''
+      const limit = e.init?.timeoutMs ?? 0
+      if (name === 'l0' || limit < 1200) {
+        await clock.advance(limit)
+        throw new Error('timed out')
+      }
+      await clock.advance(1200)
+      answered.add(name)
+      const body =
+        name === 'l3'
+          ? { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' }
+          : { running: true, idle_seconds: 5 }
+      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+    })
+    for (let i = 0; i < 8; i += 1) await $.turn.complete(turn())
+    expect([...answered].sort()).toEqual(['l1', 'l2', 'l3'])
+    expect(wake.join('\n')).toContain('"l3" on codex: stalled')
+  })
+
+  test('a held key sliding inside the beat never confirms the stop (N-3)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    await $.command.run(run('tmux', '1'))
+    for (let t = 0; t < 12; t += 1) {
+      await $.ui.render(bandRender())
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
+      await clock.advance(100)
+    }
+    await settle()
+    expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(false)
+  })
+
+  test('the mirror is cut to this render\'s room, and an empty list fits a one-row band (N-4)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 5 }, Array.from({ length: 40 }, (_, i) => `L${i}`).join('\n'))
+    await $.session.start(session())
+    await $.command.run(run('tmux', '1'))
+    await $.ui.render(bandRender(30))
+    await clock.advance(2_000)
+    const count = (t: unknown) => ((t as { children?: unknown[] }).children ?? []).slice(1).length
+    for (const rows of [13, 9, 6]) expect(count(await $.ui.render(bandRender(rows))), `shrunk to ${rows}`).toBeLessThanOrEqual(rows)
+  })
+
+  test('an empty list on a one-row band stays inside it (N-4)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, {})
+    mockPanel(on, { running: true })
+    await $.session.start(session())
+    await $.command.run(run('tmux'))
+    const tree = await $.ui.render(bandRender(1))
+    expect(((tree as { children?: unknown[] }).children ?? []).slice(1).length).toBeLessThanOrEqual(1)
   })
 })
