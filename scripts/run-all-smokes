@@ -6,6 +6,14 @@ repo_root="${script_dir:h}"
 # Smokes still exercise the deprecated per-CLI shims until their v0.39 removal;
 # silence the shim deprecation warning so it doesn't pollute captured output.
 export AGENT_TMUX_SUPPRESS_DEPRECATION=1
+# The smokes run on a tmux server of their own. On the operator's server they
+# opened 100+ sessions (claude-cli-live-claude, claude-cli-a-claude-a, …) next
+# to real workers: a name that matched was killed, and leftovers showed up in
+# the /tmux panel (live 2026-09-25). $TMUX, set inside a tmux pane, would
+# outrank TMUX_TMPDIR, so it goes too.
+unset TMUX
+export TMUX_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/tas-tmux.XXXXXX")"
+trap 'tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
 timeout_seconds=240
 kill_after_seconds=15
 
