@@ -200,6 +200,30 @@ describe('ownership', () => {
     expect(text, 'a silent owner is a gone owner').toContain('"theirs"')
   })
 
+  test('a delivered orphan is not claimed: its owner stays the session that dispatched it', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    // sess-C delivered "done" and acked it under its own key, then went quiet.
+    mockStore(on, ['done@0'], 'tmux-agent.reported.sess-C')
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const files: Files = {
+      [`${ROOT}/done/dispatch.json`]: dispatch('done', 0, { owner: 'sess-C', ownerCwd: '/work' }),
+      [`${ROOT}/done/result.json`]: finished('done'),
+      [`${ROOT}/open/dispatch.json`]: dispatch('open', 0, { owner: 'sess-C', ownerCwd: '/work' }),
+      [`${ROOT}/open/result.json`]: finished('open'),
+    }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    collectorFloor(on)
+
+    await $.session.start(session())
+    await $.turn.complete(turn())
+
+    expect(JSON.parse(files[`${ROOT}/done/dispatch.json`]!), 'nothing left to deliver, nothing to claim').toMatchObject({ owner: 'sess-C' })
+    expect(JSON.parse(files[`${ROOT}/open/dispatch.json`]!), 'an undelivered orphan is still adopted').toMatchObject({ owner: 'sess-A' })
+    expect(woken.join('\n')).not.toContain('"done"')
+  })
+
   test('the heartbeat keeps beating while a reconcile pass hangs', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)

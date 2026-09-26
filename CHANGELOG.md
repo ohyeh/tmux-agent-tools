@@ -4,6 +4,7 @@
 
 - `mods/tmux-agent` 0.8.0 — the panel command is `/workers` (no `/tmux` alias). The title is `workers v0.8.0 · tmux N · 內部 M`: `tmux N` counts panel rows that have no terminal result (`success` / `failed` / `blocked` / `needs-input`), and `內部 M` counts `$.agent.list()` entries with `status === 'running'` (teammates included), read on the 2s clock only while the panel is open. `list()` rejecting shows `內部 ?` and logs once. Title and hint width count CJK/fullwidth characters as 2 cells and `·` as 2, so the bar does not run past `[ hide ]`. Zeros are shown. design opinions from codex, agy and cursor; decided and reviewed by the commander (Opus 5.5).
 - The collector heartbeat runs on its own 10s clock. Before, it rode `reconcileOnce`, which joins an in-flight pass, so one pass slower than 90s stopped the beat and another session in the same repo adopted this live session's workers and took their delivery (observed 2026-09-26: five workers re-owned by an idle session). A paused collector still stops beating on purpose. Reply strings say `workers panel`. Mod tests 152 pass; the new heartbeat test fails with the old wiring.
+- An orphan whose current episode is already acknowledged (by any session) is not claimed: it has nothing left to deliver, and claiming it only moved `owner` away from the session that dispatched it (the five above were all delivered). A `tell` starts a new episode, which is claimable again. Mod tests 153 pass; the new test fails without the guard.
 
 ## Unreleased
 

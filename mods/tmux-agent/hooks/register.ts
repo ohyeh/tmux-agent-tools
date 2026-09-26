@@ -708,6 +708,7 @@ async function scan(host: Host): Promise<Scan> {
   const visible: TmuxDispatch[] = []
   const present = new Set<string>()
   const claimed = new Map<string, string[]>()
+  let reported: Set<string> | undefined
   let entries: readonly { name: string; kind: string }[]
   try {
     entries = await host.list(root)
@@ -743,7 +744,11 @@ async function scan(host: Host): Promise<Scan> {
       visible.push(d)
       const who = await adoptable(host, root, d, now)
       if (who === 'mine') dispatches.push(d)
-      else if (who === 'orphan' && (await claim(host, root, d))) {
+      // A settled record has nothing left to deliver: claiming it only moved the
+      // owner, so the live session that dispatched it lost it after one slow
+      // heartbeat (observed 2026-09-26: five delivered workers re-owned by a peer).
+      // A tell starts a new episode, which is unsettled and claimable again.
+      else if (who === 'orphan' && !settled((reported ??= (await readAcks(host)).all), d) && (await claim(host, root, d))) {
         const from = d.owner ?? '?'
         claimed.set(from, [...(claimed.get(from) ?? []), d.name])
       }
