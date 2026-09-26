@@ -42,7 +42,8 @@ function mockFs(
   })
   on('fs.exists', ($, e) => {
     seen.exists.push(e.path)
-    return { value: e.path in files || Object.keys(files).some(p => p.startsWith(`${e.path}/`)) }
+    // `/work` is the fixtures' worker dir and session cwd: a real directory.
+    return { value: e.path === '/work' || e.path in files || Object.keys(files).some(p => p.startsWith(`${e.path}/`)) }
   })
   on('fs.list', ($, e) => {
     seen.lists.push(e.path)
@@ -198,6 +199,59 @@ describe('ownership', () => {
     await $.turn.complete(turn())
     text = woken.join('\n')
     expect(text, 'a silent owner is a gone owner').toContain('"theirs"')
+  })
+
+  test('a row names its holder: a live session by id, a silent one as @unknown, ours not at all', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    // All three are delivered, so nobody claims them and each keeps its owner.
+    mockStore(on, ['mine@0', 'live@0', 'dead@0'])
+    const clock = mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    mockFs(on, {
+      [`${ROOT}/.collector-sess-B`]: '0',
+      [`${ROOT}/mine/dispatch.json`]: dispatch('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
+      [`${ROOT}/mine/result.json`]: finished(),
+      [`${ROOT}/live/dispatch.json`]: dispatch('live', 0, { owner: 'sess-B', ownerCwd: '/work' }),
+      [`${ROOT}/live/result.json`]: finished(),
+      [`${ROOT}/dead/dispatch.json`]: dispatch('dead', 0, { owner: 'sess-C', ownerCwd: '/work' }),
+      [`${ROOT}/dead/result.json`]: finished(),
+    })
+    mockPanel(on, { running: true, sessions: ['codex-cli-mine', 'codex-cli-live', 'codex-cli-dead'] })
+    await clock.advance(1_000)
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const drawn = textOf(await $.ui.render(bandRender()))
+    expect(drawn, 'the title names this session').toContain('@sess-A · tmux')
+    expect(drawn).toContain('live  @sess-B')
+    expect(drawn, 'no heartbeat file: nobody collects it').toContain('dead  @unknown')
+    expect(drawn, 'ours carries no tag').not.toMatch(/mine  @/)
+  })
+
+  test("a worker whose dir is gone is still reached by name, from /, logged once", WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    // A worktree removed after its branch merged: the record names a dir that is no more.
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { owner: 'sess-A', ownerCwd: '/work', dir: '/gone/wt' }) })
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    const cwds: string[] = []
+    on('process.run', ($, e) => {
+      cwds.push(String((e as { cwd?: unknown }).cwd))
+      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":1}', stderr: '' } }
+    })
+    const logs: string[] = []
+    on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
+
+    await $.session.start(session())
+    await $.tool.call({ tool: 'mcp__tmux-agent__peek' as const, name: 'w1' })
+    await $.tool.call({ tool: 'mcp__tmux-agent__peek' as const, name: 'w1' })
+
+    expect(cwds.length, 'the peeks did run').toBeGreaterThan(0)
+    expect(cwds, 'no spawn from a missing cwd').not.toContain('/gone/wt')
+    expect(logs.filter(l => l.includes('/gone/wt is gone')).length, 'said once, not per call').toEqual(1)
   })
 
   test('a delivered orphan is not claimed: its owner stays the session that dispatched it', WITH_DRIVER, async ($, on) => {
@@ -2350,7 +2404,7 @@ describe('teammates', () => {
     await clock.advance(2_000)
 
     let drawn = textOf(await $.ui.render(bandRender()))
-    expect(drawn, 'the title names the code that drew it').toMatch(/workers v\d+\.\d+\.\d+ · tmux \d+ · 內部 \d+/)
+    expect(drawn, 'the title names the code that drew it').toMatch(/workers v\d+\.\d+\.\d+ · @\S+ · tmux \d+ · 內部 \d+/)
     expect(drawn, 'delivery does not end a teammate').toContain('w1')
     expect(drawn).toContain('done — tell it more, or stop it')
     expect(drawn, 'no pane, no row').not.toContain('w2')
@@ -2384,7 +2438,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toContain('workers v0.9.1 · tmux 1 · 內部 2 · 專案 0')
+    expect(drawn).toMatch(/workers v0\.9\.1 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -2415,7 +2469,7 @@ describe('teammates', () => {
 
     for (const columns of [80, 60]) {
       const tree = await $.ui.render(bandRender(40, 39, columns))
-      expect(textOf(tree)).toContain('tmux 0 · 內部 0 · 專案 0')
+      expect(textOf(tree)).toContain('tmux 0 · 內部 0')
       // The full title + buttons is 69 cells: at 60 the name and version go, the counts stay.
       expect(textOf(tree).includes('workers v'), `${columns} columns`).toBe(columns === 80)
       expect(headerBarCells(tree), `${columns} columns`).toBe(columns)
@@ -3853,7 +3907,6 @@ describe('project sessions', () => {
     expect(drawn).toContain('sub-job  專案  0:00')
     expect(drawn, 'a sibling directory is a different project').not.toContain('sib')
     expect(drawn, 'an empty session path is not a project row').not.toContain('blank')
-    expect(drawn).toContain('專案 2')
     expect(panel.argv.filter(a => a[1] === 'list-sessions').map(a => a.join(' '))).toEqual([
       'tmux list-sessions -F #{session_name}\t#{session_path}\t#{session_created}',
     ])
@@ -3879,7 +3932,6 @@ describe('project sessions', () => {
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('priv  專案')
     expect(drawn).not.toContain('other')
-    expect(drawn).toContain('專案 1')
   })
 
   test('a worker session is excluded; peek fences a project row and refuses anything else; tell is read-only', WITH_DRIVER, async ($, on) => {
@@ -3906,7 +3958,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toContain('workers v0.9.1 · tmux 1 · 內部 0 · 專案 1')
+    expect(drawn).toMatch(/workers v0\.9\.1 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

@@ -339,6 +339,22 @@ async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?: string
   return { bin: 'agent-tmux', missing: `agent-tmux is not on PATH, nor at ${paths.join(' or ') || '~/' + AGENT_TMUX_HOMES[0]}` }
 }
 
+/**
+ * A worker's dir can be gone while its pane lives: a worktree removed after its
+ * branch merged (live 2026-09-26). spawn then fails ENOENT and every status,
+ * capture and stop of that worker failed each tick. agent-tmux and tmux find a
+ * worker by name, not by cwd, so a missing cwd runs from `/`, logged once per dir.
+ */
+const goneDirs = new Set<string>()
+async function runnableCwd(host: Host, cwd: string): Promise<string> {
+  if (await host.exists(cwd).catch(() => false)) return cwd
+  if (!goneDirs.has(cwd)) {
+    goneDirs.add(cwd)
+    host.log(`tmux-agent: ${cwd} is gone; running this worker's commands from /`)
+  }
+  return '/'
+}
+
 async function withAgentTmux(host: Host, argv: readonly string[]): Promise<readonly string[]> {
   return argv[0] === 'agent-tmux' ? [(await agentTmuxBin(host)).bin, ...argv.slice(1)] : argv
 }
@@ -403,6 +419,8 @@ type PanelRow = {
   blockedReason?: string
   idleSeconds?: number
   ageMs: number
+  /** Whose teammate this is, as the row tags it: another live session's id, or `unknown`; absent when ours. */
+  holder?: string
   /** A finished row's own words, so the panel can show what it did without a mirror. */
   summary?: string
   /** result.json status is in `TERMINAL`. Still listed, but not "running now". */
@@ -1335,8 +1353,24 @@ async function liveSessions(host: Host, cwd: string, gate?: Gate): Promise<Set<s
   return alive
 }
 
+/**
+ * The row's tag. Ours: none. Another session's: its id while its heartbeat is
+ * fresh, `unknown` once it is not (an orphan nobody collects — a settled one is
+ * never claimed, so it keeps a dead owner). One stat per owner per build.
+ */
+async function holderOf(host: Host, root: string | undefined, d: TmuxDispatch, now: number, beats: Map<string, boolean>): Promise<string | undefined> {
+  const me = host.owner()
+  if (!d.owner || !me || d.owner === me) return undefined
+  if (!beats.has(d.owner)) {
+    const beat = root ? await host.stat(heartbeatOf(root, d.owner)).catch(() => undefined) : undefined
+    beats.set(d.owner, !!beat && now - beat.mtimeMs <= ORPHAN_MS)
+  }
+  return beats.get(d.owner) ? d.owner.slice(0, 8) : 'unknown'
+}
+
 async function panelRows(host: Host, gate: Gate, root: string | undefined): Promise<PanelRow[]> {
   const now = await host.now()
+  const beats = new Map<string, boolean>()
   const reported = (await readAcks(host)).all
   // Every teammate of this repo, whoever dispatched it: see `Scan.visible`.
   const { visible: dispatches } = await scan(host)
@@ -1377,6 +1411,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
       // without one a launch that never took must not read as `running`.
       failed = !done && (await launchFailure(host, dir, d.since).catch(() => undefined)) !== undefined
     }
+    const holder = await holderOf(host, root, d, now, beats)
     rows.push({
       id,
       d,
@@ -1395,6 +1430,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
               : 'running',
       idleSeconds: stall?.idleSeconds,
       ageMs: Math.min(endedAt ?? now, now) - d.since,
+      ...(holder ? { holder } : {}),
       ...(summary ? { summary } : {}),
       ...(blockedReason ? { blockedReason } : {}),
       terminal: done,
@@ -1880,7 +1916,8 @@ export const register: Register = on => {
       submit: text => beneath.prompt.submit({ text }),
       toast: text => beneath.ui.toast(text),
       log: text => beneath.ui.log(text),
-      run: async (argv, cwd, timeoutMs) => beneath.process.run(await withAgentTmux(host, argv), { cwd, timeoutMs }),
+      run: async (argv, cwd, timeoutMs) =>
+        beneath.process.run(await withAgentTmux(host, argv), { cwd: await runnableCwd(host, cwd), timeoutMs }),
       agentList: () => listAgents(),
     }
     world = host
@@ -1922,7 +1959,8 @@ export const register: Register = on => {
       submit: text => $.prompt.submit({ text }),
       toast: text => $.ui.toast(text),
       log: text => $.ui.log(text),
-      run: async (argv, cwd, timeoutMs) => $.process.run(await withAgentTmux(host, argv), { cwd, timeoutMs }),
+      run: async (argv, cwd, timeoutMs) =>
+        $.process.run(await withAgentTmux(host, argv), { cwd: await runnableCwd(host, cwd), timeoutMs }),
       agentList: () => listAgents(),
     }
 
@@ -2186,8 +2224,11 @@ export const register: Register = on => {
     // spans the row up to the engine's own `[-]` collapse control, which the band
     // draws over its last cells (observed live: it covered `[ hide ]`).
     const tmuxRunning = panel.rows.filter(r => !r.project && !r.terminal).length
-    const projectCount = panel.rows.filter(r => r.project).length
-    const counts = `tmux ${tmuxRunning} · 內部 ${panel.internal} · 專案 ${projectCount}`
+    // Which session this panel belongs to, so a row's `@<id>` reads against it
+    // (asked 2026-09-26: the 專案 count told less than whose panel it is; the
+    // project rows still say 專案 themselves).
+    const me = world?.owner()
+    const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning} · 內部 ${panel.internal}`
     const buttonCells = displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
     // Too narrow for the name and version (60 columns: 69 cells): the counts are
     // what the bar is for, so the name goes first, never a count.
@@ -2277,10 +2318,9 @@ export const register: Register = on => {
                 : r.idleSeconds !== undefined
                   ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
                   : 'running'
-      // Another session's teammate is tagged with that session's id, so two
-      // sessions in one repo can tell whose is whose; an adopted one says so.
-      const me = world?.owner()
-      const tag = r.d.owner && me && r.d.owner !== me ? `  @${r.d.owner.slice(0, 8)}` : r.d.adoptedFrom ? `  adopted@${r.d.adoptedFrom.slice(0, 8)}` : ''
+      // Whose it is: the title names this session, a row names only another
+      // holder — a live session's id, or `unknown` for an orphan.
+      const tag = r.holder ? `  @${r.holder}` : ''
       // The state before the repo: a narrow band cuts from the right, and the
       // state is what the person reads the panel for.
       const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}${tag}  ${mark}  ${elapsed(r.ageMs)}  ${repo}`

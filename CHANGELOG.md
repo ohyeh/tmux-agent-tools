@@ -3,6 +3,8 @@
 ## 0.9.1
 
 - `mods/tmux-agent` 0.9.1 — a project row's mirror and `peek` drop the blank rows under the pane's last output before taking the tail. Raw `tmux capture-pane` prints the whole pane height; live 2026-09-26 a session with one line of output at the top peeked as five blank lines. Worker rows go through `agent-tmux capture --tail`, which already trims. Mod tests 156 pass; the changed test fails without the trim.
+- The title names the session the panel belongs to instead of a project count: `workers v0.9.1 · @<session> · tmux N · 內部 M` (asked 2026-09-26; project rows still say 專案). A row names its holder only when it is not this session: `@<id>` while that session's heartbeat is fresh, `@unknown` once it is not — an orphan nobody collects (a settled one is never claimed, so it keeps its dead owner). `adopted@…` is gone: an adopted row is ours. One heartbeat stat per owner per panel build.
+- Every `agent-tmux` / `tmux` call runs from `/` when the worker's dir no longer exists, logged once per dir. Live 2026-09-26: a worker worktree removed after its branch merged made every status read fail `ENOENT posix_spawn 'agent-tmux'`, logged again each tick; agent-tmux finds a worker by name, not cwd. Mod tests 158 pass; each new test fails without its change.
 
 ## 0.9.0
 
