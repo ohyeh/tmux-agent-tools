@@ -57,14 +57,18 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | 面 | 用途 |
 |---|---|
 | `process.run` | 五條：派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（`agent-tmux <profile> capture --strip-ansi --tail N`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`） |
-| `fs.read/write/list/stat/exists` | 只在 state root 底下：`brief.md`、`dispatch.json`、`launch.exit`、`mod-assign.log`、`result.json`、`tell-<ts>.md` |
+| `fs.read/write/list/stat` | 只在 state root 底下：`brief.md`、`dispatch.json`、`launch.exit`、`mod-assign.log`、`result.json`、`tell-<ts>.md`、`.collector-*` 心跳 |
+| `fs.exists` | state root 之外只有一種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；只問「在不在」，不讀內容 |
 | `store.get/set/keys/delete` | 已回報集合：每個 session 自己的 key `tmux-agent.reported.<sessionId>`，讀時聯集全部（`stop` 也寫它，讓被停掉的 worker 離開面板；`delete` 只清已死 session 留下、且目錄全不在的 key） |
-| `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事）。這是 mod 唯一會動到別的工具的地方 |
+| `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
+| `agent.spawn` | **攔截**：Agent tool 的 brief 若寫明 runtime `tmux/<profile>`，拒絕並指向 `assign`。會動到別的工具的只有這條和上面的 `Bash` |
 | `prompt.submit` | worker 收工時喚醒 session —— 這個 mod 唯一不可取代的能力 |
 | `clock.every` | 兩條時鐘：10 秒對帳（永遠跑），2 秒面板鏡像（只在面板開著時存在） |
 | `ui.render/resolve/invalidate` | `/tmux` 面板（畫在 `AbovePrompt` band；沒有 pane，所以沒有 `ui.open/close`） |
 | `ui.toast/status/log` | 狀態與診斷，不開 turn |
-| `env.get` | 只讀三個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME` |
+| `env.get` | 只讀四個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME`、`PATH`（找 `agent-tmux`） |
+
+**它不做的事**：沒有 `http.fetch`，不連網；不讀 credentials、shell history 或 state root 以外的檔案內容；不寫任何環境變數（pin 裡 `env writes: nothing`）；不改 `AskUserQuestion` 或其他工具的輸出。以上都能從下面那份 pin 對出來——pin 沒列的 API，mod 就沒有呼叫。
 
 `claude plugin validate mods/tmux-agent` 會把以上逐條印出來對帳。那份輸出釘在
 [`permissions.txt`](./permissions.txt)，`scripts/test-mod-permissions-smoke` 在 CI
