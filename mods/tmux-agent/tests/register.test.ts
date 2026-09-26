@@ -3415,6 +3415,27 @@ describe('live e2e of 0.7.6', () => {
     expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
   })
 
+  test('the panel tool opens and closes the panel the way /tmux does, and records it for reopen', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }) })
+    mockPanel(on, { running: true, idle_seconds: 10 })
+
+    await $.session.start(session())
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const }))).toContain('opened above the prompt (1 worker row(s))')
+    expect(textOf(await $.ui.render(bandRender())), 'drawn').toContain('w1')
+    for (let i = 0; i < 20 && !store.key('tmux-agent.panel').length; i += 1) await settle()
+    expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const }))).toContain('already open')
+
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('tmux panel closed.')
+    expect((await $.command.run(run('tmux'))).text, 'a typed /tmux now opens it').toContain('opened')
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('tmux panel closed.')
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('already closed')
+  })
+
   test('a confirm-processing launch-failed notice says the worker may be working', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)

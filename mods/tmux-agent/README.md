@@ -157,6 +157,11 @@ result_required_fields=status,summary
 `$.tmux.outstanding()`／`stalled()` 與停滯探測仍只看自己的 worker——探測是每個
 worker 一個子行程，每個 session 都去探別人的會倍增。
 
+## 從 model 開關面板：`panel`
+
+`panel` tool（`action`: `open` 預設，或 `close`）跟人打 `/tmux` 走同一段程式，reload 後一樣會自己重開。
+已經開著／關著時只回報，不會反過來切換。派完 worker 後開面板，讓人看得到進度。
+
 ## 更新 mod：`reload`
 
 `claude plugin update tmux-agent@tmux-agent-tools` 之後，呼叫 `reload` tool：它在這一輪結束時執行

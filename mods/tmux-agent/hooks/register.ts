@@ -12,13 +12,14 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.11'
+const MOD_VERSION = '0.7.12'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
 const PEEK_TOOL = 'mcp__tmux-agent__peek' as const
 const KEYS_TOOL = 'mcp__tmux-agent__keys' as const
 const RELOAD_TOOL = 'mcp__tmux-agent__reload' as const
+const PANEL_TOOL = 'mcp__tmux-agent__panel' as const
 /** What `keys` may press: enough to answer a trust/permission dialog, nothing that types text. */
 const KEYS_ALLOWED = new Set(['Enter', 'Escape', 'Tab', 'Space', 'Up', 'Down', 'Left', 'Right', 'y', 'n'])
 const PEEK_DEFAULT = 40
@@ -1520,7 +1521,7 @@ async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch): Promise<Outc
         ok: false,
         text:
           `stop for "${d.name}" exited ${run.exitCode} (${(run.stderr || run.stdout).trim().slice(-300)}); ` +
-          `the row was dropped from /tmux anyway. If the tmux session is still alive: agent-tmux ${d.profile} stop ${d.name}`,
+          `the row was dropped from /tmux anyway. If the tmux session is still alive, call ${STOP_TOOL} with all: true`,
       }
 }
 
@@ -1709,7 +1710,10 @@ export const register: Register = on => {
         type: 'object',
         properties: {
           profile: { type: 'string', description: 'agent-tmux profile or cli name' },
-          name: { type: 'string', description: 'worker name (tmux session)' },
+          name: {
+            type: 'string',
+            description: 'worker base name; a 4-character suffix is added (e.g. review → review-k3x9) — use the name the receipt returns for every later call',
+          },
           dir: { type: 'string', description: 'absolute working directory for the worker' },
           brief: {
             type: 'string',
@@ -1775,6 +1779,17 @@ export const register: Register = on => {
         'effect without a restart. Runs /reload-plugins once the current turn ends; the panel title then ' +
         'shows the new mod version.',
       inputSchema: { type: 'object', properties: {} },
+    })
+
+    await $.tool.register({
+      name: 'panel',
+      description:
+        'Open or close the /tmux worker panel above the prompt, the same as the person typing /tmux. ' +
+        'Open it after assigning workers so the person can watch them.',
+      inputSchema: {
+        type: 'object',
+        properties: { action: { type: 'string', enum: ['open', 'close'], description: 'default open' } },
+      },
     })
 
     await $.tool.register({
@@ -2375,7 +2390,7 @@ export const register: Register = on => {
     // not turn that into a failed dispatch. The snapshot is the fallback then.
     const down = collectorDown(gate)
     const collector = down
-      ? `collector: NONE — ${down}. Harvest yourself: agent-tmux ${input.profile} result wait-required --json ${name}`
+      ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read ${stateDir}/result.json with the Read tool`
       : 'collector: active in this session — end the turn; a prompt arrives when the worker finishes or the launch fails'
     return {
       result:
@@ -2403,7 +2418,7 @@ export const register: Register = on => {
     const root = await rootOf(host)
     const d = root && (await dispatchNamed(host, input.name))
     if (!root || !d) {
-      return { deny: `tmux-agent: no worker "${input.name}" was dispatched by this mod (check /tmux or the assign receipt for the exact name)` }
+      return { deny: `tmux-agent: no worker "${input.name}" was dispatched by this mod (use the exact name the assign receipt returned, suffix included)` }
     }
     const told = await tellWorker(host, root, d, text)
     if (!told.ok) return { deny: `tmux-agent: ${told.text}` }
@@ -2412,7 +2427,7 @@ export const register: Register = on => {
       result:
         `${told.text}. ` +
         (down
-          ? `collector: NONE — ${down}. Harvest yourself: agent-tmux ${d.profile} result wait-required --json ${d.name}`
+          ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read ${root}/${d.name}/result.json with the Read tool`
           : 'collector: active — end the turn; a prompt arrives when it answers') +
         '.',
     }
@@ -2465,6 +2480,21 @@ export const register: Register = on => {
     const keys = Array.isArray(input.keys) ? input.keys.filter((k): k is string => typeof k === 'string') : []
     const out = await pressKeys(host, d, keys)
     return out.ok ? { result: `${out.text}.` } : { deny: `tmux-agent: ${out.text}` }
+  })
+
+  // The panel from the model's side: the same openPanel /tmux runs, so it is
+  // recorded for reopen after a reload exactly like a typed /tmux.
+  on('tool.call', { tool: PANEL_TOOL }, async ($, e) => {
+    const close = (e as unknown as { action?: unknown }).action === 'close'
+    const redraw = () => void $.ui.invalidate('ui.render')
+    if (close) {
+      if (!panel.open) return { result: 'tmux panel is already closed.' }
+      closePanel(redraw)
+      return { result: 'tmux panel closed.' }
+    }
+    if (panel.open) return { result: 'tmux panel is already open.' }
+    const failed = await openPanel(redraw, (ms, fn) => $.clock.every(ms, fn))
+    return { result: failed ?? `tmux panel opened above the prompt (${panel.rows.length} worker row(s)).` }
   })
 
   // /reload-plugins cannot run inside the tool call (the turn waits on it and
