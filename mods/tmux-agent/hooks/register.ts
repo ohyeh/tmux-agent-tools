@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.10.4'
+const MOD_VERSION = '0.10.5'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -484,6 +484,8 @@ type PanelRow = {
   terminal: boolean
   /** A detached tmux session of this cwd, not a worker this mod dispatched. */
   project?: boolean
+  /** A project row that is a shell-started agent-tmux worker: its result status. */
+  shell?: string
 }
 
 /** Per-activation delivery state. A reload drops it; losing it only costs attempts. */
@@ -1349,8 +1351,13 @@ function collectorDown(gate: Gate): string | undefined {
   return undefined
 }
 
-/** One project-row session: tmux name and `session_created` (epoch seconds). */
-type ProjectSession = { name: string; created: number }
+/**
+ * One project-row session: tmux name and `session_created` (epoch seconds).
+ * `shell` is the result status of an agent-tmux worker started from a shell
+ * (`pending` until it writes one): read-only like a project row, since its
+ * caller harvests it, but named as the worker it is.
+ */
+type ProjectSession = { name: string; created: number; shell?: string }
 
 /**
  * Project rows from one `list-sessions` answer. A worker session is excluded
@@ -1387,7 +1394,21 @@ async function refreshProjects(host: Host, gate: Gate, visible: readonly TmuxDis
     )
     .catch(() => undefined)
   if (!run) return
-  gate.projects = run.exitCode === 0 ? projectSessionsOf(run.stdout, cwd, visible) : []
+  const projects = run.exitCode === 0 ? projectSessionsOf(run.stdout, cwd, visible) : []
+  // agent-tmux names a session `<cli>-cli-<name>` and records `cli` in
+  // `<root>/<name>/launch-meta.json`; both must agree (live 2026-09-26: an e2e
+  // script's `cursor-cli-cclaim` drew as 專案). A custom profile's session
+  // name has no `-cli-` and stays a project row.
+  const root = await rootOf(host)
+  for (const p of projects) {
+    const m = /^(.+)-cli-(.+)$/.exec(p.name)
+    if (!root || !m) continue
+    const meta = parseJson(await readOrEmpty(host, `${root}/${m[2]}/launch-meta.json`)) as { cli?: unknown } | undefined
+    if (meta?.cli !== m[1]) continue
+    const result = parseJson(await readOrEmpty(host, `${root}/${m[2]}/result.json`)) as { status?: unknown } | undefined
+    p.shell = typeof result?.status === 'string' && TERMINAL.has(result.status) ? result.status : 'pending'
+  }
+  gate.projects = projects
 }
 
 /** m:ss up to an hour, then h:mm — a row is one line, so the unit is implicit. */
@@ -1511,6 +1532,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
       ageMs: now - p.created * 1000,
       terminal: false,
       project: true,
+      ...(p.shell ? { shell: p.shell } : {}),
     })
   }
   return rows
@@ -2573,7 +2595,7 @@ export const register: Register = on => {
     for (const [i, r] of panel.rows.entries()) {
       if (i < first || i >= first + shownRows) continue
       if (r.project) {
-        const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}  專案  ${elapsed(r.ageMs)}`
+        const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}  ${r.shell ? `shell · ${r.shell}` : '專案'}  ${elapsed(r.ageMs)}`
         children.push(
           Box({
             flexDirection: 'row',

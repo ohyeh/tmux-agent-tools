@@ -407,7 +407,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v0.10.4 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.10.5 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17

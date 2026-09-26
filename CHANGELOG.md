@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.5
+
+- `mods/tmux-agent` 0.10.5 — `/workers` shows a shell-started agent-tmux worker as the worker it is, not as 專案. Live 2026-09-26: an e2e script's `agent-tmux cursor start` session `cursor-cli-cclaim` drew as `cursor-cli-cclaim  專案` in every panel in the repo. It has no `dispatch.json`, so it stays read-only like a project row (its caller harvests it, and nothing is delivered or auto-stopped). Its row now reads `<session>  shell · <status>`, where the status is its result.json status, or `pending`. It qualifies only when the session is `<cli>-cli-<name>` and `<root>/<name>/launch-meta.json` says the same `cli`. A custom profile's session name has no `-cli-`, so it stays a project row. Mod tests 172 pass; the new assertion fails without the change.
+
 ## 0.10.4
 
 - `mods/tmux-agent` 0.10.4 — a dead session's delivered workers are auto-stopped. A settled orphan is never claimed (0.9.1), and `autoStop` took only workers acked in this session's own key, so nobody ever stopped them: live 2026-09-26 four finished workers stayed as `@unknown` rows after their session closed. `scan` now hands a settled orphan to this session unclaimed (the record keeps its dead owner; `pending` still skips it, so nothing is delivered twice), and `autoStop` accepts an ack from any key, with the same 30-minute result, tell and pane-idle checks. `/workers stop <name>` reaches such a row too. A live owner's worker is still never stopped by a peer. Mod tests 172 pass; the auto-stop test fails with the own-key filter put back.

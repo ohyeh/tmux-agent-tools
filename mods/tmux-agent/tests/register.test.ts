@@ -2479,7 +2479,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.10\.4 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.10\.5 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4009,13 +4009,20 @@ describe('project sessions', () => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mock.clock(on)
-    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+      // Started by a shell script: agent-tmux wrote its dir, the mod has no dispatch.json.
+      [`${ROOT}/cc/launch-meta.json`]: '{"cli":"cursor"}',
+      [`${ROOT}/cc/result.json`]: '{"status":"success"}',
+      // A `-cli-` name whose dir says another CLI is not that worker.
+      [`${ROOT}/xx/launch-meta.json`]: '{"cli":"codex"}',
+    })
     const panel = mockPanel(
       on,
       {
         running: true,
         sessions: ['codex-cli-w1'],
-        listed: ['codex-cli-w1\t/work\t0', 'hg-android\t/work\t0'],
+        listed: ['codex-cli-w1\t/work\t0', 'hg-android\t/work\t0', 'cursor-cli-cc\t/work\t0', 'agy-cli-xx\t/work\t0'],
       },
       // Raw capture-pane prints the full pane height: output on top, blank rows under it.
       'hello\nfrom-pane' + '\n'.repeat(20),
@@ -4028,8 +4035,10 @@ describe('project sessions', () => {
     expect(drawn, 'the worker row stays').toContain('w1')
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
+    expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
+    expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.10\.4 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.10\.5 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
