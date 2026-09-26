@@ -294,6 +294,23 @@ assert_contains "unsent: the reason names the composer" "$(cat "$WORK/unsent.err
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" pastecursor stop deliver-unsent >/dev/null 2>&1 || true
 
 echo
+echo "case: a plain multi-line send that the composer holds after two Enters is pressed again (cursor, 2026-09-26)"
+mkdir -p "$TMUX_AGENT_DIR/deliver-send"
+# No prefixes: their blank lines would reach pastecli as Enters and hide the bug.
+: > "$TMUX_AGENT_DIR/deliver-send/scope-guard-injected"
+: > "$TMUX_AGENT_DIR/deliver-send/.result-path-injected"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" \
+AGENT_TMUX_LAUNCH_FLAGS="--result $TMUX_AGENT_DIR/deliver-send/result.json --enters 3" \
+  "$AGENT_TMUX" pastecursor start --exact deliver-send "$WORK" >/dev/null 2>&1
+sleep 2
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" \
+  "$AGENT_TMUX" pastecursor send deliver-send $'line one\nline two' >/dev/null 2>&1 || true
+for _i in {1..60}; do [[ -f "$TMUX_AGENT_DIR/deliver-send/result.json" ]] && break; sleep 1; done
+assert "send: the held paste was submitted (result written)" \
+  "$(jq -r .status "$TMUX_AGENT_DIR/deliver-send/result.json" 2>/dev/null)" "success"
+AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" pastecursor stop deliver-send >/dev/null 2>&1 || true
+
+echo
 echo "summary: $PASS passed, $FAIL failed"
 (( FAIL == 0 )) || exit 1
 echo "PASS: dispatch delivery smoke"

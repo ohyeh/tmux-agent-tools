@@ -1152,6 +1152,17 @@ paste_and_submit() {
   if [[ "$prompt_text" == *$'\n'* ]]; then
     sleep "$SUBMIT_DELAY"
     "$TMUX" send-keys -t "$session" Enter
+    # cursor-agent 2026.09.26 keeps `→ [Pasted text #1 +9 lines]` in its
+    # composer after both Enters (live 2026-09-26: send-wait timed out, one
+    # later Enter submitted it). assign had its own nudge; every send path
+    # routes here, so the check lives here.
+    # ponytail: fixed 1s look, 2 presses; make it a profile knob if a CLI needs more.
+    local _nudge
+    for _nudge in 1 2; do
+      sleep 1
+      _composer_holds_paste "$session" || break
+      "$TMUX" send-keys -t "$session" Enter
+    done
   fi
 }
 
@@ -2350,6 +2361,13 @@ _sentinel_landed() {
 # A CLI that counts newlines instead then only hits the old false warning.
 # The pane's last prompt-glyph line is the composer: a placeholder there is
 # not submitted (see _assign_paste_unsent), so it never counts.
+# The composer (the pane's LAST prompt-glyph line) still holds a paste placeholder.
+_composer_holds_paste() {
+  "$TMUX" capture-pane -J -p -S -60 -t "$1" 2>/dev/null \
+    | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = $0 } END { print last }' \
+    | grep -qE '^[[:space:]]*(→|›|❯|>)[[:space:]]+\[Pasted (text|Content)'
+}
+
 _paste_submitted_whole() {
   "$TMUX" capture-pane -J -p -S -200 -t "$1" 2>/dev/null | awk -v need="$2" '
     { line[NR] = $0 }
@@ -4378,11 +4396,7 @@ assign_session() {
   # composer nudge, and the nudge's own redraw read as activity (idle <= 3), so
   # assign reported assigned:true for a worker that never got its task. Nothing
   # else on screen can overrule this line: an unsent composer is not processing.
-  _assign_paste_unsent() {
-    ( capture_session --strip-ansi --tail 60 "$1" ) 2>/dev/null \
-      | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = $0 } END { print last }' \
-      | grep -qE '^[[:space:]]*(→|›|❯|>)[[:space:]]+\[Pasted (text|Content)'
-  }
+  _assign_paste_unsent() { _composer_holds_paste "$(session_for_name "$1")"; }
   # The elapsed counters on screen: claude's spinner row `● Orbiting… (27s ·` and
   # codex's `• Working (3m 01s •`. The verb is random and CLI-specific, the
   # counter is not. One that moves between two looks is the CLI working, whether
