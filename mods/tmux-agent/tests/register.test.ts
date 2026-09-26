@@ -4149,6 +4149,30 @@ describe('native mirror', () => {
     expect(Object.keys(files).some(p => p.endsWith('/dispatch.json') || p.endsWith('/brief.md'))).toBe(false)
   })
 
+  test('a downstream spawn refusal says the worker was dispatched anyway', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    on('ui.log', () => ({ value: undefined }))
+    on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    // Another plugin's spawn hook below this one refuses the waiter.
+    on('agent.spawn', () => ({ deny: 'policy not admitted' }))
+
+    await $.session.start(session())
+    const out = await $.agent.spawn(spawnOf({ cwd: '/work', description: 'job' }))
+
+    expect(out.deny).toContain('policy not admitted')
+    expect(out.deny).toContain('dispatched anyway')
+    expect(out.deny).toContain('Do not dispatch it again')
+    const record = Object.keys(files).find(p => /\/dispatch\.json$/.test(p))
+    expect(record, 'the worker is on disk for the collector').toBeDefined()
+    expect(JSON.parse(files[record!]!).waiter, 'no waiter to wait for').toBeUndefined()
+  })
+
   test('a runtime spawn dispatches the brief without the runtime line and starts the waiter', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mock.store(on)
@@ -4256,6 +4280,52 @@ describe('native mirror', () => {
 
     expect(woken).toEqual([])
     expect(store.acked()).toEqual(['w1@0'])
+  })
+
+  test('a waiter that ended before the result is released, so the later result still wakes', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    // The waiter hit its cap (completed) while the worker was still going.
+    const files: Files = { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { waiter: 'agt-1' }) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('agent.list', () => ({
+      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'completed' }],
+    }))
+
+    await $.session.start(session())
+    expect(JSON.parse(files[`${ROOT}/w1/dispatch.json`]!).waiter, 'released on disk').toBeUndefined()
+
+    files[`${ROOT}/w1/result.json`] = finished('late')
+    await $.turn.complete(turn())
+    expect(woken.join('\n'), 'the collector delivers what the waiter never saw').toContain('late')
+    expect(store.acked()).toEqual(['w1@0'])
+  })
+
+  test('a pane that exited with no result is delivered now, not held behind a running waiter', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { waiter: 'agt-1' }),
+      [`${ROOT}/w1/launch.exit`]: '0',
+    })
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    // The launch took, then the worker's tmux session went away with no result:
+    // `exited`, which the waiter's poll (result.json / a failed launch.exit) never sees.
+    mockStatus(on, { exists: false, running: false })
+    on('agent.list', () => ({
+      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'running' }],
+    }))
+
+    await $.session.start(session())
+    await $.turn.complete(turn()) // probes: the pane is gone
+    await $.turn.complete(turn()) // delivers it, waiter or not
+    expect(woken.join('\n')).toContain('"w1" on codex: exited')
   })
 
   test('a killed or absent waiter delivers once', WITH_DRIVER, async ($, on) => {

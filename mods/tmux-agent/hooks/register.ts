@@ -1580,15 +1580,38 @@ async function partitionWaiters(
       deliver.push(f)
       continue
     }
+    // What the waiter can see: a result.json or a failed launch.exit. A pane
+    // that exited with neither is invisible to it, so that notice goes now.
+    const waiterSees = TERMINAL.has(f.status) || f.status === LAUNCH_FAILED
     const status = byId.get(waiter)
-    if (status === 'running') continue
-    if (status === 'completed' && TERMINAL.has(f.status)) {
+    if (waiterSees && status === 'running') continue
+    if (waiterSees && status === 'completed') {
       silent.push(f)
       continue
     }
     deliver.push(f)
   }
   return { deliver, silent }
+}
+
+/**
+ * A waiter that ended before its worker's result (its 60-minute cap, a crash)
+ * said nothing about that result, so a later `completed` must not ack it
+ * silently. Dropping `waiter` from the record makes the collector the delivery
+ * again — on disk, so a reload keeps it.
+ */
+async function releaseEndedWaiters(host: Host, gate: Gate, root: string, waiting: readonly TmuxDispatch[]): Promise<void> {
+  if (!waiting.length) return
+  const listed = await host.agentList().catch(() => undefined)
+  if (!listed) return
+  const running = new Set(listed.filter(a => a.status === 'running').map(a => a.id))
+  for (const d of waiting) {
+    if (running.has(d.waiter!)) continue
+    const { waiter: _ended, ...rest } = d
+    await host.write(`${root}/${d.name}/dispatch.json`, JSON.stringify(rest)).catch((error: unknown) => {
+      host.log(`tmux-agent: could not release the waiter of ${d.name}: ${String(error)}`)
+    })
+  }
 }
 
 async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<void> {
@@ -1633,6 +1656,7 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
     await flagStalls(host, gate, root, pending.filter(d => !finished.has(idOf(d)) && !terminal.has(idOf(d))), unfinished)
   }
 
+  await releaseEndedWaiters(host, gate, root, pending.filter(d => d.waiter && !finished.has(idOf(d))))
   // Held waiters (still running) are in neither list: not acked, not submitted.
   const { deliver, silent } = await partitionWaiters(host, gate, done)
   if (!deliver.length && !silent.length) {
@@ -3150,6 +3174,12 @@ export const register: Register = on => {
       description: assigned.name,
       prompt: waiterPrompt(assigned.stateDir, assigned.name),
     })
+    // Refused downstream (another plugin's spawn hook): the worker is already
+    // running, so say so — a bare deny reads as "nothing started" and invites a
+    // second dispatch. Without a waiter the collector delivers it as usual.
+    if (r.deny) {
+      return { deny: `${r.deny} — tmux worker "${assigned.name}" was dispatched anyway; the collector will deliver its result. Do not dispatch it again.` }
+    }
     if (r.agentId) {
       const d = asDispatch(parseJson(await $.fs.read(`${assigned.stateDir}/dispatch.json`)))
       if (d) await $.fs.write(`${assigned.stateDir}/dispatch.json`, JSON.stringify({ ...d, waiter: r.agentId }))
