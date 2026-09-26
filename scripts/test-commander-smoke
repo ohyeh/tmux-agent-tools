@@ -482,9 +482,9 @@ assert "real agent-tmux session name with tenant" \
 
 count_matching() {
   local pat="$1" n=0 line
-  local -a lines
-  lines=("${(@f)$(ps -ax -o command=)}")
-  for line in "${lines[@]}"; do
+  local -a ps_lines
+  ps_lines=("${(@f)$(ps -ax -o command=)}")
+  for line in "${ps_lines[@]}"; do
     [[ "$line" == *"$pat"* ]] && n=$((n + 1))
   done
   print -r -- "$n"
