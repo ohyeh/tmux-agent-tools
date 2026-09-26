@@ -2479,7 +2479,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.10\.3 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.10\.4 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -3845,11 +3845,11 @@ describe('live e2e of 0.7.6', () => {
     expect(brief?.description).toContain('do not repeat them')
   })
 
-  test('a delivered teammate with no tell for 30 min is stopped; another owner, mid-episode, young, gone or just delivered is not (F)', WITH_DRIVER, async ($, on) => {
+  test('a delivered teammate with no tell for 30 min is stopped, a dead owner\'s too; another live owner, mid-episode, young, gone or just delivered is not (F)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const ago = -40 * 60_000
     const store = mockStore(on, ['done', 'adopted', 'mid', 'young', 'gone'].map(n => `${n}@${ago}`), 'tmux-agent.reported.sess-A', {
-      // sess-C is gone and delivered "orphan" before it went: we adopt it, it was never delivered to us.
+      // sess-C is gone and delivered "orphan" before it went: settled, so not claimed, but ours to stop.
       'tmux-agent.reported.sess-C': [`orphan@${ago}`],
     })
     mock.clock(on)
@@ -3898,8 +3898,13 @@ describe('live e2e of 0.7.6', () => {
     expect(store.key('tmux-agent.reported.sess-A')).toContain(`done@${ago}`)
 
     await $.turn.complete(turn())
+    expect(run.stopped(), 'the dead owner\'s delivered worker is next: one stop per tick').toEqual(['done', 'orphan'])
+    expect(store.key('tmux-agent.reported.sess-C'), 'stopped, not claimed').toEqual([`orphan@${ago}`])
+    expect(files[`${ROOT}/orphan/dispatch.json`], 'still the dead owner\'s record').toContain('sess-C')
+
     await $.turn.complete(turn())
-    expect(run.stopped(), 'nothing else qualifies').toEqual(['done'])
+    await $.turn.complete(turn())
+    expect(run.stopped(), 'nothing else qualifies').toEqual(['done', 'orphan'])
   })
 
   test('auto-stop skips a busy pane and a failed status read; an idle pane is stopped (F-1)', WITH_DRIVER, async ($, on) => {
@@ -4024,7 +4029,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.10\.3 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.10\.4 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

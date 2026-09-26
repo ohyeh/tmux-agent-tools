@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.10.3'
+const MOD_VERSION = '0.10.4'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -849,13 +849,19 @@ async function scan(host: Host): Promise<Scan> {
       visible.push(d)
       const who = await adoptable(host, root, d, now)
       if (who === 'mine') dispatches.push(d)
-      // A settled record has nothing left to deliver: claiming it only moved the
-      // owner, so the live session that dispatched it lost it after one slow
-      // heartbeat (observed 2026-09-26: five delivered workers re-owned by a peer).
-      // A tell starts a new episode, which is unsettled and claimable again.
-      else if (who === 'orphan' && !settled((reported ??= (await readAcks(host)).all), d) && (await claim(host, root, d))) {
-        const from = d.owner ?? '?'
-        claimed.set(from, [...(claimed.get(from) ?? []), d.name])
+      else if (who === 'orphan') {
+        // A settled record has nothing left to deliver: claiming it only moved the
+        // owner, so the live session that dispatched it lost it after one slow
+        // heartbeat (observed 2026-09-26: five delivered workers re-owned by a peer).
+        // It is still ours to stop, unclaimed: `pending` skips it (it is acked),
+        // and `autoStop` asks for the same 30 idle minutes the owner would.
+        // Without this nobody stopped it (live 2026-09-26: four `@unknown` rows).
+        // A tell starts a new episode, which is unsettled and claimable again.
+        if (settled((reported ??= (await readAcks(host)).all), d)) dispatches.push(d)
+        else if (await claim(host, root, d)) {
+          const from = d.owner ?? '?'
+          claimed.set(from, [...(claimed.get(from) ?? []), d.name])
+        }
       }
     } catch (error) {
       host.log(`tmux-agent: skipped ${entry.name}: ${String(error)}`)
@@ -1666,7 +1672,7 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
     // Nothing to say, but a shrunken keep-set is still worth writing back.
     if (gone.size) await updateAcks(host, gate, prune)
     // Quiet ticks only: a stop is a subprocess inside the hook's budget.
-    if (probeStalls) await autoStop(host, gate, root, dispatches, new Set(keep), now)
+    if (probeStalls) await autoStop(host, gate, root, dispatches, reported, now)
     return
   }
 
@@ -1734,18 +1740,18 @@ const AUTO_STOP_MS = 30 * 60_000
 
 /**
  * Stop a teammate that is done and left alone: its terminal result was
- * delivered to THIS session (the ack is in our own key), it has had no tell
+ * delivered (to us, or to a dead owner whose settled orphan `scan` hands us), it has had no tell
  * since, and nothing happened to it for AUTO_STOP_MS. The pane must also have
  * been idle that long (`status --json`): a human in the pane, or a shell
  * `send`, keeps the worker busy while those clocks stay old. The `stop` path,
- * so it leaves the panel acked. Never a worker another session owns, one
+ * so it leaves the panel acked. Never a worker another LIVE session owns, one
  * without a terminal result.json (a tell resets it: mid-episode), or one whose
  * delivery is younger than the TTL. One per tick: a stop runs up to 8 s.
  */
-async function autoStop(host: Host, gate: Gate, root: string, dispatches: readonly TmuxDispatch[], mine: ReadonlySet<string>, now: number): Promise<void> {
-  // `dispatches` holds only what this session may deliver (see `scan`), and an
-  // ack in OUR key is a delivery to us: another live owner's worker is in neither.
-  const quiet = dispatches.filter(d => mine.has(idOf(d)) && now - Math.max(d.since, gate.deliveredAt.get(idOf(d)) ?? d.since) >= AUTO_STOP_MS)
+async function autoStop(host: Host, gate: Gate, root: string, dispatches: readonly TmuxDispatch[], delivered: ReadonlySet<string>, now: number): Promise<void> {
+  // `dispatches` holds ours plus orphans (see `scan`); another live owner's
+  // worker is never in it. `delivered` is every key's acks, a dead owner's too.
+  const quiet = dispatches.filter(d => delivered.has(idOf(d)) && now - Math.max(d.since, gate.deliveredAt.get(idOf(d)) ?? d.since) >= AUTO_STOP_MS)
   if (!quiet.length) return
   const alive = await liveSessions(host, quiet[0]!.dir, gate)
   for (const d of quiet) {

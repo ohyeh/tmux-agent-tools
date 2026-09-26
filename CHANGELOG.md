@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.4
+
+- `mods/tmux-agent` 0.10.4 — a dead session's delivered workers are auto-stopped. A settled orphan is never claimed (0.9.1), and `autoStop` took only workers acked in this session's own key, so nobody ever stopped them: live 2026-09-26 four finished workers stayed as `@unknown` rows after their session closed. `scan` now hands a settled orphan to this session unclaimed (the record keeps its dead owner; `pending` still skips it, so nothing is delivered twice), and `autoStop` accepts an ack from any key, with the same 30-minute result, tell and pane-idle checks. `/workers stop <name>` reaches such a row too. A live owner's worker is still never stopped by a peer. Mod tests 172 pass; the auto-stop test fails with the own-key filter put back.
+
 ## 0.10.3
 
 - `mods/tmux-agent` 0.10.3 — the waiter waits for a final result. agent-tmux writes `result.json` as `pending` at launch, and the waiter's poll stopped as soon as the file existed: live 2026-09-26 a waiter answered `pending` 14 s after the dispatch while its worker was still reading code (the collector released it and delivered later, as designed). The poll now ends only on a terminal status (`success`, `failed`, `blocked`, `needs-input`, built from `TERMINAL`) or a failed launch. Checked in a shell: a `pending` file keeps it waiting, a `success` file ends it. Mod tests 172 pass; the prompt test fails with the bare file test put back.
