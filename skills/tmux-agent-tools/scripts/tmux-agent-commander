@@ -343,6 +343,12 @@ cmd_start() {
     fi
   fi
   agent_tmux "$cli" start --exact "$name" "$dir"
+  # The host is not a worker: it must never receive the worker scope guard or a
+  # result-path instruction. Mark both delivered so no later send (the user's or
+  # the collector's) prepends them — on untrusted families they re-inject forever.
+  mkdir -p "$root/$name"
+  : > "$root/$name/scope-guard-injected"
+  : > "$root/$name/.result-path-injected"
   if (( ! no_panel )); then
     install_worker_panel "$session"
   fi

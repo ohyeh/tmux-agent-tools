@@ -312,6 +312,8 @@ SSESSION="${PREFIX}-${SNAME}"
 "$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start.out" 2>"$WORK/start.err"
 PIDFILE="$TMUX_AGENT_DIR/.commander-${SSESSION}.pid"
 assert "start wrote a pid file" "$([[ -f "$PIDFILE" ]] && echo yes || echo no)" "yes"
+assert "start marks the host result-path delivered" "$([[ -f "$TMUX_AGENT_DIR/$SNAME/.result-path-injected" ]] && echo yes || echo no)" "yes"
+assert "start marks the host scope guard delivered" "$([[ -f "$TMUX_AGENT_DIR/$SNAME/scope-guard-injected" ]] && echo yes || echo no)" "yes"
 SPID="$(tr -d '[:space:]' < "$PIDFILE")"
 assert "start collector is alive" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "yes"
 have_start_hb() { [[ -f "$TMUX_AGENT_DIR/.collector-$SSESSION" ]]; }
