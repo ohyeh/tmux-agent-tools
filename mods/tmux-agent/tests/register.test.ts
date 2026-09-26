@@ -200,6 +200,34 @@ describe('ownership', () => {
     expect(text, 'a silent owner is a gone owner').toContain('"theirs"')
   })
 
+  test('the heartbeat keeps beating while a reconcile pass hangs', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const files: Files = {
+      [`${ROOT}/live/dispatch.json`]: dispatch('live', 0, { owner: 'sess-A', ownerCwd: '/work' }),
+    }
+    mockFs(on, files)
+    mockWake(on)
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    const held = { hang: false, release: [] as (() => void)[] }
+    on('process.run', () => held.hang
+      ? new Promise(resolve => held.release.push(() => resolve({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' } })))
+      : ({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' } }))
+
+    await $.session.start(session())
+    // Every subprocess from here on hangs, so the next reconcile pass never ends.
+    held.hang = true
+    for (let i = 0; i < 12; i++) await clock.advance(10_000)
+
+    expect(held.release.length, 'a reconcile pass is stuck in flight').toBeGreaterThan(0)
+    // 2 minutes on, past ORPHAN_MS: a peer must still read this session as alive.
+    expect(files[`${ROOT}/.collector-sess-A`]).toEqual('120000')
+    held.release.forEach(r => r())
+  })
+
   test('an orphan is claimed on one tick and delivered on the next, never both in one', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)
@@ -3621,9 +3649,9 @@ describe('live e2e of 0.7.6', () => {
     expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const }))).toContain('already open')
 
-    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('tmux panel closed.')
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('workers panel closed.')
     expect((await $.command.run(run('workers'))).text, 'a typed /workers now opens it').toContain('opened')
-    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('tmux panel closed.')
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('workers panel closed.')
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('already closed')
   })
 

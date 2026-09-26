@@ -1925,6 +1925,14 @@ export const register: Register = on => {
     $.clock.every(POLL_MS, async () => {
       await reconcileOnce(host, gate)
     })
+    // The heartbeat on its own clock: reconcileOnce joins an in-flight pass, so
+    // one pass slower than ORPHAN_MS (stall probes over a busy fleet) stopped the
+    // beat, and a second session in this repo adopted — and took the delivery of
+    // — workers this live session dispatched (observed 2026-09-26). A paused
+    // collector still goes quiet on purpose, so its workers can be adopted.
+    $.clock.every(POLL_MS, async () => {
+      if (!gate.paused) await heartbeat(host)
+    })
 
     // Catch up on whatever finished while no collector was alive, through the same
     // gate the tick uses: a slow startup scan is joined, never duplicated.
@@ -2311,7 +2319,7 @@ export const register: Register = on => {
     every: (ms: number, fn: () => Promise<void>) => { cancel: () => void },
   ): Promise<string | undefined> => {
     const bound = world
-    if (!bound) return 'tmux panel unavailable: the mod did not bind.'
+    if (!bound) return 'workers panel unavailable: the mod did not bind.'
     // Mark it open BEFORE the first await. A close landing during that await
     // would otherwise be undone here, and the timer installed below would
     // outlive the panel — a second /workers then installing another one.
@@ -2322,7 +2330,7 @@ export const register: Register = on => {
     const mine = panel.generation
     const root = await rootOf(bound)
     const [first] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
-    if (panel.generation !== mine || !panel.open) return 'tmux panel closed.'
+    if (panel.generation !== mine || !panel.open) return 'workers panel closed.'
     panel.rows = first
     // The pane drew once, empty, while the rows were being read; without this
     // the first real frame waits for the 2s clock and the person sees
@@ -2405,7 +2413,7 @@ export const register: Register = on => {
       if (!bound) return { text: 'unavailable — the mod did not bind.' }
       if (verb === 'hide') {
         if (panel.open) closePanel(redraw)
-        return { text: 'tmux panel hidden; /workers shows it again.' }
+        return { text: 'workers panel hidden; /workers shows it again.' }
       }
       const rows = panel.open ? panel.rows : await panelRows(bound, gate, await rootOf(bound))
 
@@ -2454,13 +2462,13 @@ export const register: Register = on => {
     }
     if (panel.open) {
       closePanel(redraw)
-      return { text: 'tmux panel closed.' }
+      return { text: 'workers panel closed.' }
     }
     const failed = await openPanel(redraw, (ms, fn) => $.clock.every(ms, fn))
     if (failed) return { text: failed }
     return {
       text:
-        'tmux panel opened above the prompt. 1-9 on an empty prompt selects a row; ' +
+        'workers panel opened above the prompt. 1-9 on an empty prompt selects a row; ' +
         '/workers stop <name>, /workers tell <name> <text>, /workers hide work anywhere (letter keys r/x/q need the band focused).',
     }
   })
@@ -2645,13 +2653,13 @@ export const register: Register = on => {
     const close = (e as unknown as { action?: unknown }).action === 'close'
     const redraw = () => void $.ui.invalidate('ui.render')
     if (close) {
-      if (!panel.open) return { result: 'tmux panel is already closed.' }
+      if (!panel.open) return { result: 'workers panel is already closed.' }
       closePanel(redraw)
-      return { result: 'tmux panel closed.' }
+      return { result: 'workers panel closed.' }
     }
-    if (panel.open) return { result: 'tmux panel is already open.' }
+    if (panel.open) return { result: 'workers panel is already open.' }
     const failed = await openPanel(redraw, (ms, fn) => $.clock.every(ms, fn))
-    return { result: failed ?? `tmux panel opened above the prompt (${panel.rows.length} worker row(s)).` }
+    return { result: failed ?? `workers panel opened above the prompt (${panel.rows.length} worker row(s)).` }
   })
 
   // /reload-plugins cannot run inside the tool call (the turn waits on it and
