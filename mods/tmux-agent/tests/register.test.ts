@@ -2472,7 +2472,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.10\.0 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.10\.1 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4017,7 +4017,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.10\.0 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.10\.1 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -4064,7 +4064,7 @@ describe('native mirror', () => {
     ...over,
   })
 
-  test('session.start registers tmux-waiter and the offer hook hides it', WITH_DRIVER, async ($, on) => {
+  test('session.start registers tmux-waiter and leaves it offered, since a hidden type is refused at dispatch', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mock.store(on)
     mock.clock(on)
@@ -4078,25 +4078,26 @@ describe('native mirror', () => {
     })
     on('session.start', ($, e) => ({ cwd: e.cwd }))
     on('ui.log', () => ({ value: undefined }))
+    on('agent.offer', () => ({ isOffered: true }))
 
     await $.session.start(session())
 
     expect(specs).toHaveLength(1)
     expect(specs[0]).toMatchObject({
       name: 'tmux-waiter',
-      description: 'Waits for one tmux worker result (tmux-agent internal)',
+      description: 'tmux-agent internal: waits for one tmux worker result. The mod dispatches it for a `runtime: tmux/<profile>` brief; never call it directly',
       tools: ['Bash'],
       model: 'haiku',
       omitClaudeMd: true,
     })
     expect(JSON.stringify(specs[0])).toContain('one Bash poll at a time')
-    const hidden = await $.agent.offer({
+    const offer = await $.agent.offer({
       agent: 'tmux-agent:tmux-waiter',
-      description: 'Waits for one tmux worker result (tmux-agent internal)',
+      description: 'tmux-agent internal: waits for one tmux worker result. The mod dispatches it for a `runtime: tmux/<profile>` brief; never call it directly',
       source: 'plugin',
       provider: { plugin: 'tmux-agent', tier: 'user' },
     })
-    expect(hidden).toEqual({ isOffered: false })
+    expect(offer, 'the rewritten Agent call dispatches it').toEqual({ isOffered: true })
   })
 
   test('a rejected waiter register is logged once and the spawn hook denies as before', WITH_DRIVER, async ($, on) => {

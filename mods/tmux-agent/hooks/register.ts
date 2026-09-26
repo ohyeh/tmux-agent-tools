@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.10.0'
+const MOD_VERSION = '0.10.1'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -2206,7 +2206,7 @@ export const register: Register = on => {
     try {
       await $.agent.register({
         name: 'tmux-waiter',
-        description: 'Waits for one tmux worker result (tmux-agent internal)',
+        description: 'tmux-agent internal: waits for one tmux worker result. The mod dispatches it for a `runtime: tmux/<profile>` brief; never call it directly',
         prompt: WAITER_SYSTEM,
         tools: ['Bash'],
         model: 'haiku',
@@ -3143,8 +3143,9 @@ export const register: Register = on => {
     }
   })
 
-  on('agent.offer', { agent: WAITER_TYPE }, () => ({ isOffered: false }))
-
+  // The waiter stays offered: `isOffered: false` hides a type at dispatch as
+  // well as in the listing, and the rewrite below is a model-facing dispatch —
+  // live 2026-09-26 every runtime brief was refused, its worker already started.
   on('agent.spawn', async ($, e, next) => {
     const m = RUNTIME_LINE.exec(e.prompt)
     if (!m) return next(e)

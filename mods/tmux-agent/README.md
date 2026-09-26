@@ -61,8 +61,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `fs.exists` | state root 之外只有一種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；只問「在不在」，不讀內容 |
 | `store.get/set/keys/delete` | 已回報集合：每個 session 自己的 key `tmux-agent.reported.<sessionId>`，讀時聯集全部（`stop` 也寫它，讓被停掉的 worker 離開面板；`delete` 只清已死 session 留下、且目錄全不在的 key） |
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
-| `agent.spawn` | brief 有一行 `runtime: tmux/<profile>` 時派工，並把這次 Agent 呼叫改成隱藏的 `tmux-waiter`（haiku、背景）。設了 `name` 則拒絕。waiter 沒註冊成功時，維持舊的拒絕。沒有那一行則原樣放行 |
-| `agent.offer` | 對 `tmux-agent:tmux-waiter` 回 `isOffered: false`，模型的清單裡看不到它，也不能自己選它 |
+| `agent.spawn` | brief 有一行 `runtime: tmux/<profile>` 時派工，並把這次 Agent 呼叫改成 `tmux-waiter`（haiku、背景；清單裡看得到——`isOffered: false` 連派工也擋）。設了 `name` 則拒絕。waiter 沒註冊成功時，維持舊的拒絕。沒有那一行則原樣放行 |
 | `$.agent.register` | `session.start` 註冊 `tmux-waiter`（只有 Bash、haiku、不帶 CLAUDE.md）。失敗 log 一次，之後 runtime spawn 改回拒絕 |
 | `$.agent.list` | 面板開著時，跟 2 秒時鐘一起讀本 session 的 agent（含 teammate），數 `status === 'running'`，寫進標題的 `內部 M`。collector 也用同一份清單對 `dispatch.json` 的 `waiter` id。失敗顯示 `內部 ?`（面板）並 log 一次；對帳時失敗則改走 `prompt.submit` |
 | `prompt.submit` | worker 收工時喚醒 session —— 這個 mod 唯一不可取代的能力 |
@@ -79,7 +78,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 ## 原生 sub-agent 列 (0.10.0)
 
-Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會照 `assign` 派出 tmux worker，同時讓這次 Agent 呼叫繼續跑一個隱藏的 haiku sub-agent（`tmux-agent:tmux-waiter`）。它只用 Bash，一次一個迴圈、每次不超過 540 秒（Bash timeout `600000`），每 5 秒看一次絕對路徑的 `result.json` 與 `launch.exit`，總共最多 60 分鐘，然後只回答 worker 名字、狀態、摘要和 result 路徑。
+Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會照 `assign` 派出 tmux worker，同時讓這次 Agent 呼叫繼續跑一個 haiku sub-agent（`tmux-agent:tmux-waiter`）。它只用 Bash，一次一個迴圈、每次不超過 540 秒（Bash timeout `600000`），每 5 秒看一次絕對路徑的 `result.json` 與 `launch.exit`，總共最多 60 分鐘，然後只回答 worker 名字、狀態、摘要和 result 路徑。
 
 原生 sub-agent 列，以及只看主 transcript 裡名為 `Agent`／`Task` 的 tool_use 的 claude-hud，因此跟 worker 同時存在。`dispatch.json` 上記下 waiter 的 id 之後，collector 的規則是：
 
@@ -408,7 +407,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v0.10.0 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.10.1 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
