@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.14'
+const MOD_VERSION = '0.8.0'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -233,6 +233,40 @@ type Host = {
     cwd: string,
     timeoutMs: number,
   ) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+  /** `$.agent.list()`: subagents and in-process teammates. The panel counts `running`. */
+  agentList: () => Promise<readonly { status: string }[]>
+}
+
+/**
+ * Terminal display cells. CJK and other fullwidth ranges count 2.
+ * `·` is ambiguous width; count it 2 so a hint cannot spill past `[ hide ]`.
+ */
+function displayCells(text: string): number {
+  let n = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    n += ch === '·' || isFullwidth(cp) ? 2 : 1
+  }
+  return n
+}
+
+function isFullwidth(cp: number): boolean {
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  )
+}
+
+function padCells(text: string, width: number): string {
+  const gap = width - displayCells(text)
+  return gap > 0 ? text + ' '.repeat(gap) : text
 }
 
 /**
@@ -327,6 +361,10 @@ type Panel = {
   armedStop?: { id: string; from: number; until: number }
 
   rows: PanelRow[]
+  /** Running in-process agents, or `?` when `agent.list` rejected. */
+  internal: number | '?'
+  /** Set once a list() failure is logged, so the 2s clock does not log every tick. */
+  internalMissLogged: boolean
   mirror?: { id: string; lines: string[] }
   timer?: { cancel: () => void }
 }
@@ -347,6 +385,8 @@ type PanelRow = {
   ageMs: number
   /** A finished row's own words, so the panel can show what it did without a mirror. */
   summary?: string
+  /** result.json status is in `TERMINAL`. Still listed, but not "running now". */
+  terminal: boolean
 }
 
 /** Per-activation delivery state. A reload drops it; losing it only costs attempts. */
@@ -473,7 +513,7 @@ const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
 /**
  * The ack of an `exited` notice. Like the launch notice it closes the notice,
  * not the episode: a result written after the pane went (a background writer, a
- * late flush) is still delivered once (astra, 34e2a1e). The row leaves /tmux and
+ * late flush) is still delivered once (astra, 34e2a1e). The row leaves /workers and
  * `outstanding()` as soon as the notice is acked.
  */
 const EXITED_ACK = '#exited'
@@ -596,7 +636,7 @@ type Scan = {
   present: Set<string>
   /**
    * Every valid record of THIS cwd, whoever owns it and whether or not that
-   * owner is alive: what `/tmux`, `tell`, `stop` and `peek` work on. Two
+   * owner is alive: what `/workers`, `tell`, `stop` and `peek` work on. Two
    * sessions in one repo see and drive the same teammates; only delivery is
    * the owner's (`dispatches`).
    */
@@ -851,7 +891,7 @@ async function collect(
       }
       if (!terminal || !raw || typeof status !== 'string') {
         // No result and no pane: nothing will ever arrive. Delivered once as
-        // `exited` and acknowledged, so it leaves /tmux instead of sitting there
+        // `exited` and acknowledged, so it leaves /workers instead of sitting there
         // until someone presses stop (observed 2026-09-17: two dead fixtures on
         // the panel for hours).
         // ponytail: an exited episode's result.json is re-read every tick until its
@@ -1212,7 +1252,7 @@ function elapsed(ms: number): string {
  * stayed listed after the whole tmux server was gone, because exit 1 was
  * read as "slow"). Only a rejection says nothing about the fleet; then the
  * last answer stands rather than hide every delivered teammate for one slow
- * tick (observed 2026-09-17: two live workers vanished from /tmux mid-turn).
+ * tick (observed 2026-09-17: two live workers vanished from /workers mid-turn).
  */
 async function liveSessions(host: Host, cwd: string, gate?: Gate): Promise<Set<string>> {
   const run = await host.run(['tmux', 'ls', '-F', '#S'], cwd, LIVE_PROBE_MS).catch(() => undefined)
@@ -1284,6 +1324,7 @@ async function panelRows(host: Host, gate: Gate, root: string | undefined): Prom
       ageMs: Math.min(endedAt ?? now, now) - d.since,
       ...(summary ? { summary } : {}),
       ...(blockedReason ? { blockedReason } : {}),
+      terminal: done,
     })
   }
   return rows
@@ -1571,12 +1612,12 @@ async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch): Promise<Outc
   gate.stalled.delete(id)
   gate.exited.delete(id)
   return run.exitCode === 0
-    ? { ok: true, text: `stopped "${d.name}" on ${d.profile}; it no longer appears in /tmux and nothing will be delivered for it` }
+    ? { ok: true, text: `stopped "${d.name}" on ${d.profile}; it no longer appears in /workers and nothing will be delivered for it` }
     : {
         ok: false,
         text:
           `stop for "${d.name}" exited ${run.exitCode} (${(run.stderr || run.stdout).trim().slice(-300)}); ` +
-          `the row was dropped from /tmux anyway. If the tmux session is still alive, call ${STOP_TOOL} with all: true`,
+          `the row was dropped from /workers anyway. If the tmux session is still alive, call ${STOP_TOOL} with all: true`,
       }
 }
 
@@ -1662,12 +1703,18 @@ function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promise<void
 
 export const register: Register = on => {
   // Per activation, shared by every entry point below.
-  const panel: Panel = { open: false, rows: [], generation: 0 }
+  const panel: Panel = { open: false, rows: [], generation: 0, internal: 0, internalMissLogged: false }
   /**
    * The bound world, kept at activation scope because the panel's command hook
    * needs it too and `engine.create` is the only place it can be built.
    */
   let world: Host | undefined
+  /**
+   * `$.agent.list` is on the session `$`, not on `engine.create`'s `$`
+   * (`NoEngineInterface`). The panel's host is built at `engine.create`, so it
+   * calls through this slot, which `session.start` fills.
+   */
+  let listAgents: Host['agentList'] = () => Promise.reject(new Error('tmux-agent: agent.list before the session binds'))
   let sessionCwd: string | undefined
   let sessionId: string | undefined
   const gate: Gate = {
@@ -1707,6 +1754,7 @@ export const register: Register = on => {
       toast: text => beneath.ui.toast(text),
       log: text => beneath.ui.log(text),
       run: async (argv, cwd, timeoutMs) => beneath.process.run(await withAgentTmux(host, argv), { cwd, timeoutMs }),
+      agentList: () => listAgents(),
     }
     world = host
     // A hot reload re-runs engine.create but not session.start, so the ids
@@ -1726,6 +1774,7 @@ export const register: Register = on => {
     // The transcript's name; a harness without one gets a per-activation id.
     sessionId = await $.session.id().catch(() => undefined)
     sessionId ||= `local-${Math.random().toString(36).slice(2, 10)}`
+    listAgents = () => $.agent.list()
     const host: Host = {
       now: () => $.clock.now(),
       owner: () => sessionId,
@@ -1747,11 +1796,12 @@ export const register: Register = on => {
       toast: text => $.ui.toast(text),
       log: text => $.ui.log(text),
       run: async (argv, cwd, timeoutMs) => $.process.run(await withAgentTmux(host, argv), { cwd, timeoutMs }),
+      agentList: () => listAgents(),
     }
 
     await $.command.register({
-      name: 'tmux',
-      description: 'Show or hide the tmux worker panel; /tmux N selects row N, /tmux stop <name>, /tmux tell <name> <text>, /tmux hide',
+      name: 'workers',
+      description: 'Show or hide the workers panel; /workers N selects row N, /workers stop <name>, /workers tell <name> <text>, /workers hide',
     })
 
     await $.tool.register({
@@ -1785,7 +1835,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'tell',
       description:
-        'Send a follow-up to a worker this session dispatched (the name assign returned, or a /tmux row). ' +
+        'Send a follow-up to a worker this session dispatched (the name assign returned, or a /workers row). ' +
         'Starts a new episode: its result.json is reset and the collector wakes you again when the worker ' +
         'answers. Use it to give a teammate its next task or a correction.',
       inputSchema: {
@@ -1841,7 +1891,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'panel',
       description:
-        'Open or close the /tmux worker panel above the prompt, the same as the person typing /tmux. ' +
+        'Open or close the workers panel above the prompt, the same as the person typing /workers. ' +
         'Open it after assigning workers so the person can watch them.',
       inputSchema: {
         type: 'object',
@@ -1885,7 +1935,7 @@ export const register: Register = on => {
     await reconcileOnce(host, gate, false)
 
     // A reload closed this session's panel (the module's state went with it):
-    // open it again, through the same code /tmux runs.
+    // open it again, through the same code /workers runs.
     const open = await host.storeGet(PANEL_KEY).catch((error: unknown) => {
       host.log(`tmux-agent: panel state unreadable: ${String(error)}`)
       return undefined
@@ -1999,13 +2049,16 @@ export const register: Register = on => {
     // The title, `[ refresh ]` and `[ hide ]`; the hint is padded so the bar
     // spans the row up to the engine's own `[-]` collapse control, which the band
     // draws over its last cells (observed live: it covered `[ hide ]`).
-    const titleCells = ` tmux workers v${MOD_VERSION} `.length + '[ refresh ]'.length + '[ hide ]'.length + ' [-]'.length
+    const tmuxRunning = panel.rows.filter(r => !r.terminal).length
+    const titleText = ` workers v${MOD_VERSION} · tmux ${tmuxRunning} · 內部 ${panel.internal} `
+    const titleCells =
+      displayCells(titleText) + displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
     const hintRoom = Math.max(0, width - titleCells)
     // Whole pieces, dropped from the right: a sliced hint ended mid-command
-    // ("· /tmux stop <" at 72 columns).
+    // ("· /workers stop <" at 72 columns).
     let hint = ''
-    for (const piece of ['  1-9 select', ' · /tmux stop <name>', ' · /tmux tell <name> <text>']) {
-      if (hint.length + piece.length + 1 > hintRoom) break
+    for (const piece of ['  1-9 select', ' · /workers stop <name>', ' · /workers tell <name> <text>']) {
+      if (displayCells(hint) + displayCells(piece) + 1 > hintRoom) break
       hint += piece
     }
     // A coloured title bar marks where the panel starts, so its rows do not read
@@ -2016,10 +2069,10 @@ export const register: Register = on => {
         flexDirection: 'row',
         backgroundColor: PANEL_ACCENT,
         children: [
-          Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: ` tmux workers v${MOD_VERSION} ` }),
+          Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: titleText }),
           Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
-          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: hint.padEnd(hintRoom) }),
-          // Last and apart from refresh: hiding is undone by /tmux, but it should
+          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
+          // Last and apart from refresh: hiding is undone by /workers, but it should
           // not sit one key away from the button people press most.
           Button({ key: 'close', label: 'hide', hotkey: 'q', onPress: () => void panel.close?.() }),
         ],
@@ -2032,7 +2085,7 @@ export const register: Register = on => {
           Text({
             dimColor: true,
             wrap: 'truncate-end',
-            children: `${panel.rows.length} worker(s); band too short (${e.props.maxRows} rows) — /tmux N · /tmux stop <name> · /tmux tell <name> <text>`,
+            children: `${panel.rows.length} worker(s); band too short (${e.props.maxRows} rows) — /workers N · /workers stop <name> · /workers tell <name> <text>`,
           }),
         )
       }
@@ -2168,7 +2221,7 @@ export const register: Register = on => {
 
     // Every fixed line truncates: a wrapped line is a row the budget above
     // never counted, and one row past maxRows scrolls the band and disarms the digits.
-    if (hidden) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  +${hidden} more — /tmux N selects row N` }))
+    if (hidden) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  +${hidden} more — /workers N selects row N` }))
 
     // No room this render, no mirror: its rule, lines and hint would overflow.
     const shown = panel.mirror && panel.mirror.id === panel.selected && (panel.rows_available ?? 0) > 0 ? panel.mirror : undefined
@@ -2212,7 +2265,7 @@ export const register: Register = on => {
     return Box({ flexDirection: 'column', children: [below, ...children] })
   })
 
-  // The one way the panel closes — `/tmux` again, `/tmux hide` or the `[ hide ]` button. There
+  // The one way the panel closes — `/workers` again, `/workers hide` or the `[ hide ]` button. There
   // is no engine close for a band, so the teardown lives here and both paths call
   // it: no route can leave the mirror clock running against rows nobody sees.
   // `$` itself is never passed here: the engine's static rule lets `$` reach
@@ -2231,8 +2284,27 @@ export const register: Register = on => {
     redraw()
   }
 
-  // Opens the panel: the /tmux toggle, and session.start after a reload closed it
-  // (a plugin's own $.command.run skips its own command hook, so /tmux cannot be
+  /**
+   * Running in-process agents. A rejection becomes `內部 ?` and one log line;
+   * it must not fail the row refresh or the render.
+   */
+  const readInternal = async (host: Host): Promise<void> => {
+    try {
+      const listed = await host.agentList()
+      panel.internal = listed.filter(a => a.status === 'running').length
+      panel.internalMissLogged = false
+    } catch (error) {
+      panel.internal = '?'
+      if (!panel.internalMissLogged) {
+        panel.internalMissLogged = true
+        const kind = error instanceof Error ? error.name : typeof error
+        host.log(`tmux-agent: agent.list failed: ${kind}: ${String(error)}`)
+      }
+    }
+  }
+
+  // Opens the panel: the /workers toggle, and session.start after a reload closed it
+  // (a plugin's own $.command.run skips its own command hook, so /workers cannot be
   // replayed). `$` stays out, per the static rule above: its two uses come as closures.
   const openPanel = async (
     redraw: () => void,
@@ -2242,13 +2314,14 @@ export const register: Register = on => {
     if (!bound) return 'tmux panel unavailable: the mod did not bind.'
     // Mark it open BEFORE the first await. A close landing during that await
     // would otherwise be undone here, and the timer installed below would
-    // outlive the panel — a second /tmux then installing another one.
+    // outlive the panel — a second /workers then installing another one.
     panel.open = true
     panel.close = () => closePanel(redraw)
     redraw()
     void rememberPanel(bound, true).catch(err => bound.log(`tmux-agent: panel state not saved: ${String(err)}`))
     const mine = panel.generation
-    const first = await panelRows(bound, gate, await rootOf(bound))
+    const root = await rootOf(bound)
+    const [first] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
     if (panel.generation !== mine || !panel.open) return 'tmux panel closed.'
     panel.rows = first
     // The pane drew once, empty, while the rows were being read; without this
@@ -2261,7 +2334,8 @@ export const register: Register = on => {
       if (panel.refreshing) return false
       panel.refreshing = true
       try {
-        const rows = await panelRows(bound, gate, await rootOf(bound))
+        const root = await rootOf(bound)
+        const [rows] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
         if (panel.generation !== mine || !panel.open) return false
         panel.rows = rows
         return true
@@ -2316,7 +2390,7 @@ export const register: Register = on => {
     return undefined
   }
 
-  on('command.run', { command: 'tmux' }, async ($, e) => {
+  on('command.run', { command: 'workers' }, async ($, e) => {
     const redraw = () => void $.ui.invalidate('ui.render')
     // Typed forms of the panel's controls. They work in any terminal: a letter
     // hotkey presses only while the band is focused, and the chord that focuses
@@ -2331,7 +2405,7 @@ export const register: Register = on => {
       if (!bound) return { text: 'unavailable — the mod did not bind.' }
       if (verb === 'hide') {
         if (panel.open) closePanel(redraw)
-        return { text: 'tmux panel hidden; /tmux shows it again.' }
+        return { text: 'tmux panel hidden; /workers shows it again.' }
       }
       const rows = panel.open ? panel.rows : await panelRows(bound, gate, await rootOf(bound))
 
@@ -2356,7 +2430,7 @@ export const register: Register = on => {
           const hint = verb === 'tell' ? ' <text>' : ''
           return {
             text: now
-              ? `row ${target} is "${now.d.name}" right now — ${verb} takes a name: /tmux ${verb} ${now.d.name}${hint}`
+              ? `row ${target} is "${now.d.name}" right now — ${verb} takes a name: /workers ${verb} ${now.d.name}${hint}`
               : `no row ${target}; ${verb} takes a name (${rows.map(r => r.d.name).join(', ') || 'none'}).`,
           }
         }
@@ -2368,14 +2442,14 @@ export const register: Register = on => {
           out = await stopWorker(bound, gate, row.d)
         } else {
           const text = message.trim() ? message : ''
-          if (!text) return { text: '/tmux tell <name> <text> — the message is missing.' }
+          if (!text) return { text: '/workers tell <name> <text> — the message is missing.' }
           const root = await rootOf(bound)
           out = root ? await tellWorker(bound, root, row.d, text) : { ok: false, text: 'no state root' }
         }
         if (panel.open) void panel.refresh?.()
         return { text: `${verb} "${row.d.name}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 300)}` }
       } else {
-        return { text: '/tmux [N | stop <name> | tell <name> <text> | hide]' }
+        return { text: '/workers [N | stop <name> | tell <name> <text> | hide]' }
       }
     }
     if (panel.open) {
@@ -2387,7 +2461,7 @@ export const register: Register = on => {
     return {
       text:
         'tmux panel opened above the prompt. 1-9 on an empty prompt selects a row; ' +
-        '/tmux stop <name>, /tmux tell <name> <text>, /tmux hide work anywhere (letter keys r/x/q need the band focused).',
+        '/workers stop <name>, /workers tell <name> <text>, /workers hide work anywhere (letter keys r/x/q need the band focused).',
     }
   })
 
@@ -2565,8 +2639,8 @@ export const register: Register = on => {
     return out.ok ? { result: `${out.text}.` } : { deny: `tmux-agent: ${out.text}` }
   })
 
-  // The panel from the model's side: the same openPanel /tmux runs, so it is
-  // recorded for reopen after a reload exactly like a typed /tmux.
+  // The panel from the model's side: the same openPanel /workers runs, so it is
+  // recorded for reopen after a reload exactly like a typed /workers.
   on('tool.call', { tool: PANEL_TOOL }, async ($, e) => {
     const close = (e as unknown as { action?: unknown }).action === 'close'
     const redraw = () => void $.ui.invalidate('ui.render')
@@ -2614,7 +2688,7 @@ export const register: Register = on => {
     return {
       deny:
         `tmux-agent: do not run \`agent-tmux … ${verb}\` from Bash while the tmux-agent mod is loaded — ` +
-        (route ? `use ${route}.` : 'the collector wakes this session when the worker finishes; /tmux shows its state now.'),
+        (route ? `use ${route}.` : 'the collector wakes this session when the worker finishes; /workers shows its state now.'),
     }
   })
 

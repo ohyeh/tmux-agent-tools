@@ -62,9 +62,10 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `store.get/set/keys/delete` | 已回報集合：每個 session 自己的 key `tmux-agent.reported.<sessionId>`，讀時聯集全部（`stop` 也寫它，讓被停掉的 worker 離開面板；`delete` 只清已死 session 留下、且目錄全不在的 key） |
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
 | `agent.spawn` | **攔截**：Agent tool 的 brief 若寫明 runtime `tmux/<profile>`，拒絕並指向 `assign`。會動到別的工具的只有這條和上面的 `Bash` |
+| `$.agent.list` | 面板開著時，跟 2 秒時鐘一起讀本 session 的 agent（含 teammate），數 `status === 'running'`，寫進標題的 `內部 M`。失敗顯示 `內部 ?` 並 log 一次；面板關著不讀 |
 | `prompt.submit` | worker 收工時喚醒 session —— 這個 mod 唯一不可取代的能力 |
 | `clock.every` | 兩條時鐘：10 秒對帳（永遠跑），2 秒面板鏡像（只在面板開著時存在） |
-| `ui.render/resolve/invalidate` | `/tmux` 面板（畫在 `AbovePrompt` band；沒有 pane，所以沒有 `ui.open/close`） |
+| `ui.render/resolve/invalidate` | `/workers` 面板（畫在 `AbovePrompt` band；沒有 pane，所以沒有 `ui.open/close`） |
 | `ui.toast/status/log` | 狀態與診斷，不開 turn |
 | `env.get` | 只讀四個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME`、`PATH`（找 `agent-tmux`） |
 
@@ -86,7 +87,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `mcp__tmux-agent__stop` | 停掉 worker 並把它記為已回報，離開面板；之後不會再有任何投遞 |
 | `mcp__tmux-agent__peek` | 卡住時先看：pane 最後幾行，加上 running／idle／gone／needs input |
 | `mcp__tmux-agent__keys` | 回答 worker 停著的信任／權限對話框（只收白名單鍵）；答完用 `tell` 重送 brief |
-| `mcp__tmux-agent__panel` | 開或關 `/tmux` 面板，和人打 `/tmux` 同一條路 |
+| `mcp__tmux-agent__panel` | 開或關 `/workers` 面板，和人打 `/workers` 同一條路 |
 | `mcp__tmux-agent__reload` | `claude plugin update` 之後，本輪結束時跑 `/reload-plugins` |
 
 **自動 stop（0.7.7）**：終態 result 已交付給**這個** session（ack 在自己的 key）、之後 30 分鐘
@@ -133,7 +134,7 @@ result_required_fields=status,summary
 ### mod 載入時不要用 Bash 打 agent-tmux
 
 `tool.call` 攔 `Bash`：`agent-tmux <cli> assign|send|send-wait|stop|status|capture|probe|result`
-會被拒絕，訊息指向該用的工具（或說「collector 會叫你、`/tmux` 看得到」）。
+會被拒絕，訊息指向該用的工具（或說「collector 會叫你、`/workers` 看得到」）。
 理由是兩個：只有工具會寫 `dispatch.json`，手打的 assign collector 永遠聽不到；
 而 status／capture／result 是第二個監督者。`--help` 放行。這個 gate 跟
 `~/.agents/hooks/tmux-assign-host-gate.sh` 守的是同一件事——那個 shell hook 是給
@@ -161,7 +162,7 @@ result_required_fields=status,summary
 
 | 範圍 | 規則 |
 |---|---|
-| `/tmux` 列表、`tell`、`stop`、`peek` | **同一個 repo**（`ownerCwd` 等於本 session 的 cwd，字串相等）的所有 worker，不管誰派的、派它的 session 活著沒。別人派的列上標 `@<sid 前 8 碼>`。別的 repo 的看不到。 |
+| `/workers` 列表、`tell`、`stop`、`peek` | **同一個 repo**（`ownerCwd` 等於本 session 的 cwd，字串相等）的所有 worker，不管誰派的、派它的 session 活著沒。別人派的列上標 `@<sid 前 8 碼>`。別的 repo 的看不到。 |
 | 結果投遞 | 只送給 `owner`。owner 的心跳（`<root>/.collector-<sid>`）停超過 90 秒才算它死了，同 repo 的 collector 這時**認領**：把 `dispatch.json` 改成 `owner = 我`、`adoptedFrom = 舊 sid`，這一 tick 不送，下一 tick 只有紀錄上寫的那個 session 送。兩個 collector 同時看到同一個孤兒會各寫一次，下一 tick 讀到同一個值，只有被點名的送——不用鎖，結果只落一次（#323）。 |
 | `tell` | **誰最後對它下指令，它就歸誰**：別的 session 對你的 worker `tell`，`owner` 改成它，答案送它、不送你。 |
 | resume | `claude --resume` 回來的 session id 不變（實測：transcript 每份只有一個 sessionId，resume 寫回同一份），所以 owner 不變、零等待。只有「關掉、另開新 session」才走 90 秒認領。 |
@@ -172,7 +173,7 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 
 ## 從 model 開關面板：`panel`
 
-`panel` tool（`action`: `open` 預設，或 `close`）跟人打 `/tmux` 走同一段程式，reload 後一樣會自己重開。
+`panel` tool（`action`: `open` 預設，或 `close`）跟人打 `/workers` 走同一段程式，reload 後一樣會自己重開。
 已經開著／關著時只回報，不會反過來切換。派完 worker 後開面板，讓人看得到進度。
 
 ## 更新 mod：`reload`
@@ -390,9 +391,9 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 - 跨 process 的 exactly-once 做不到：引擎沒有把 `prompt.submit` 與 `store.set`
   綁成一筆 transaction 的 API。本 mod 的取捨是「可能重報，絕不漏報」。
 
-## `/tmux` 面板
+## `/workers` 面板
 
-`/tmux` 開關面板。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.8.0 · tmux N · 內部 M`：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
@@ -404,8 +405,8 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 **任何終端機都能用的操作**（不靠字母鍵、不靠組合鍵）：
 
 - prompt 空白時直接按 `1`–`9` 選那一列（鏡像它的畫面尾巴；再按一次取消）。
-- `/tmux N` 選第 N 列（第 10 列起、或被擠到 `+N more` 裡的列用這個）。
-- `/tmux stop <名字>`、`/tmux tell <名字> <訊息>`、`/tmux hide`。打出名字本身就是確認。
+- `/workers N` 選第 N 列（第 10 列起、或被擠到 `+N more` 裡的列用這個）。
+- `/workers stop <名字>`、`/workers tell <名字> <訊息>`、`/workers hide`。打出名字本身就是確認。
   `stop`／`tell` 只收名字、不收列號：列號跟著每次 refresh 移動，打字到按 Enter 之間插進
   一列就會停錯人（0.7.6，cursor d20cdcc N-2）；打數字會回 `row N is "<名字>" right now`
   讓你照名字再打一次。訊息原樣送出，換行與縮排保留。`tell` 最壞要
@@ -423,7 +424,7 @@ d.ts `ButtonProps.hotkey`），prompt 聚焦時按 `x` 只會打出一個 x。`c
 再按一次才真的停（兩次間隔不到 0.4 秒算按住鍵的重複，不算確認；選中的 worker 離開清單時
 選取自動取消）（停掉會結束 tmux session，不能復原；2026-09-25 實測 band 聚焦在
 `[ refresh ]` 上時一個誤按的 `x` 就停掉了 worker）。`[ hide ]` 放在標頭最右邊、
-離 `[ refresh ]` 遠一點；隱藏可以用 `/tmux` 復原。滑鼠點也行（終端機有回報 click
+離 `[ refresh ]` 遠一點；隱藏可以用 `/workers` 復原。滑鼠點也行（終端機有回報 click
 時），但不要依賴它。
 
 標頭有 `[ refresh ]`：面板每 2 秒自動重讀，但 `tmux ls` 慢或被拒時會沿用上一次
@@ -437,10 +438,10 @@ band 是所有 plugin 共用的一塊：面板關著時這個 hook 原樣放行�
 控制在 band 的 `maxRows` 內——超過會捲動，而捲動中的 band「bare digit 不觸發任何
 hotkey」（d.ts `AbovePrompt.maxRows`），數字鍵就廢了。每一行都算進預算：選中列的
 摘要只佔一行（全文在 result.json；以前 `wrap` 最多換成 6 行卻只算 1 行，選到一個已收工的
-隊友數字鍵就失靈）；總覽放不下的列收進 `+N more — /tmux N selects row N`；選中時
+隊友數字鍵就失靈）；總覽放不下的列收進 `+N more — /workers N selects row N`；選中時
 列表先讓位給鏡像的 6 行下限（13 行的 band、兩個 worker 以前印 `needs 15`，八個印
 `needs 18`，鏡像永遠出不來）。鏡像行數是 `maxRows` 減掉這些之後剩下的，不是固定值。
-band 連「一列加它的控制」都放不下時只畫標題列和一行指令提示（`/tmux N · /tmux stop <name> …`），
+band 連「一列加它的控制」都放不下時只畫標題列和一行指令提示（`/workers N · /workers stop <name> …`），
 不溢位。
 
 三件事是刻意的：
@@ -452,7 +453,7 @@ band 連「一列加它的控制」都放不下時只畫標題列和一行指令
   比對；session 名稱前綴是 profile 自己的，mod 不猜）。收工的隊友選中後印
   `success: <summary>`，同一列仍有輸入列與 `[stop]`。**列消失的條件是 pane 沒了**
   （你按了 stop，或它自己退出），不是「已投遞」。2026-09-17 實測：舊行為下
-  assign→tell→投遞完，使用者開 `/tmux` 只看到 `No workers outstanding.`，隊友明明還開著。
+  assign→tell→投遞完，使用者開 `/workers` 只看到 `No workers outstanding.`，隊友明明還開著。
 - **只認自己 session 的隊友；別人的只在它死了之後接手。** assign 把 `$.session.id()`
   寫進 dispatch.json 的 `owner`、session cwd 寫進 `ownerCwd`。每次對帳 collector 都
   touch `<root>/.collector-<sessionId>` 當心跳；另一個 session 的 worker，只有在它的
@@ -478,7 +479,7 @@ band 連「一列加它的控制」都放不下時只畫標題列和一行指令
 `session.start` 吃引擎的 hook 預算，掃一排子行程正是會超時的那種事，而 15 分鐘
 等級的狀況晚一個 tick 完全來得及。整輪探測另有 4 秒上限、單次 3 秒。
 
-面板關著時鏡像時鐘不存在（`/tmux` 再按一次、`/tmux hide` 或 `[ hide ]`／`q` 都走同一個
+面板關著時鏡像時鐘不存在（`/workers` 再按一次、`/workers hide` 或 `[ hide ]`／`q` 都走同一個
 `closePanel`，它 cancel 時鐘並換代），但**對帳時鐘照跑** —— 叫醒沒人在看的
 session 正是這個 mod 的目的。
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.0
+
+- `mods/tmux-agent` 0.8.0 — the panel command is `/workers` (no `/tmux` alias). The title is `workers v0.8.0 · tmux N · 內部 M`: `tmux N` counts panel rows that have no terminal result (`success` / `failed` / `blocked` / `needs-input`), and `內部 M` counts `$.agent.list()` entries with `status === 'running'` (teammates included), read on the 2s clock only while the panel is open. `list()` rejecting shows `內部 ?` and logs once. Title and hint width count CJK/fullwidth characters as 2 cells and `·` as 2, so the bar does not run past `[ hide ]`. Zeros are shown. design opinions from codex, agy and cursor; decided and reviewed by the commander (Opus 5.5).
+
 ## Unreleased
 
 - `tmux-agent-commander assign` starts that session's collector from the tmux server (`run-shell -b`), so a CLI shell tool cannot reap it when the call returns. `collect` owns the pid file (a live pid that is not this process exits quietly; the file is removed on exit) and `start` no longer writes it. A session name that matches no known cli prints one hint and `assign` still exits 0. Live 2026-09-26: a codex CLI ran the commander from its pane; `nohup sleep 300 &` did not survive the tool call, and `(nohup tmux-agent-commander collect ... &)` was gone minutes later, while a foreground collector did deliver the worker result into the pane.

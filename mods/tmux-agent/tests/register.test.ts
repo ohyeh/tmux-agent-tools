@@ -270,7 +270,7 @@ describe('ownership', () => {
     expect(JSON.parse(files[`${ROOT}/orphan/dispatch.json`]!), 'B rewrites nothing').toMatchObject({ owner: 'sess-A', adoptedFrom: 'sess-C' })
   })
 
-  test("a second session in the same repo sees the first one's teammate on /tmux, tagged, and can tell it — which moves it", WITH_DRIVER, async ($, on) => {
+  test("a second session in the same repo sees the first one's teammate on /workers, tagged, and can tell it — which moves it", WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     mock.clock(on)
@@ -284,7 +284,7 @@ describe('ownership', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 10 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, "the other session's live teammate is listed").toContain('w1')
     expect(drawn, 'tagged with its owner').toContain('@sess-A')
@@ -1278,7 +1278,7 @@ describe('stall detection', () => {
     expect(woken.length).toEqual(1)
     expect(woken[0]).toContain('"w1" on codex: exited')
     expect(woken[0]).toContain('no terminal result.json')
-    expect(store.acked(), 'delivered, so it never sits on /tmux for hours').toEqual(['w1@0#exited'])
+    expect(store.acked(), 'delivered, so it never sits on /workers for hours').toEqual(['w1@0#exited'])
     // The episode stays open for a late result, but the notice is not repeated.
     for (let i = 0; i < 3; i += 1) {
       await clock.advance(10_000)
@@ -1303,7 +1303,7 @@ describe('stall detection', () => {
     await $.turn.complete(turn())
     expect(woken, 'no launch receipt yet: assign still owns the pane').toEqual([])
     expect(store.acked()).toEqual([])
-    expect((await $.command.run(run('tmux'))).text).not.toContain('exited')
+    expect((await $.command.run(run('workers'))).text).not.toContain('exited')
 
     files[`${ROOT}/w1/launch.exit`] = '0\n'
     await $.turn.complete(turn())
@@ -1355,10 +1355,13 @@ function mockPanel(
   gate?: { release?: () => void; pending: number; used?: boolean },
   /** Set to refuse every delivery, leaving a terminal result undelivered. */
   refuseWake = false,
-): { argv: (readonly string[])[]; open: string[]; closed: string[] } {
+  /** What `$.agent.list()` answers while the panel is open. `'reject'` throws. */
+  agents: 'reject' | readonly { id: string; description: string; type: string; status: string }[] = [],
+): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[] } {
   const argv: (readonly string[])[] = []
   const open: string[] = []
   const closed: string[] = []
+  const logs: string[] = []
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('command.run', () => ({ text: '' }))
   on('ui.status', () => ({ value: undefined }))
@@ -1380,7 +1383,14 @@ function mockPanel(
   // The band's floor, as core answers it: its own (empty) drawing. The mod's
   // `next(e)` resolves to this and nests it under its rows.
   on('ui.render', () => ({ type: 'engine', ref: 0 }))
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', ($, e) => {
+    logs.push(e.text)
+    return { value: undefined }
+  })
+  on('agent.list', () => {
+    if (agents === 'reject') throw new Error('agent.list refused')
+    return { value: [...agents] }
+  })
   on('ui.toast', () => ({ value: undefined }))
   on('turn.complete', () => ({ text: '' }))
   on('prompt.submit', ($, e) => {
@@ -1416,7 +1426,7 @@ function mockPanel(
       },
     }
   })
-  return { argv, open, closed }
+  return { argv, open, closed, logs }
 }
 
 const captures = (argv: (readonly string[])[]) => argv.filter(a => a.includes('capture'))
@@ -1447,7 +1457,7 @@ describe('panel', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     expect(panel.open, 'a band is drawn, never opened as a pane').toEqual([])
     expect(textOf(await $.ui.render(bandRender()))).toContain('w1')
 
@@ -1465,8 +1475,8 @@ describe('panel', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
+    await $.command.run(run('workers'))
 
     expect(panel.closed, 'a band has no pane to close').toEqual([])
     // Closed: the hook yields the band to whatever is below (the mock draws nothing).
@@ -1480,20 +1490,82 @@ describe('panel', () => {
 })
 
 /** The band above the prompt as the engine would ask for it; `maxRows` is the room it has. */
-const bandRender = (maxRows = 40, bodyRows = maxRows - 1) => ({
+const bandRender = (maxRows = 40, bodyRows = maxRows - 1, columns = 80) => ({
   surface: 'terminal' as const,
   component: 'AbovePrompt' as const,
   requestId: 'above-prompt',
-  viewport: { columns: 100, rows: maxRows + 10 },
+  viewport: { columns: Math.max(100, columns), rows: maxRows + 10 },
   props: {
     hasSurvey: false,
     isWorking: false,
     maxRows,
-    bodyColumns: 80,
+    bodyColumns: columns,
     scroll: { offset: 0, bodyRows },
     view: {},
   },
 })
+
+/** Same cell widths the panel uses: CJK/fullwidth and `·` count 2. */
+function termCells(text: string): number {
+  let n = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    const wide =
+      ch === '·' ||
+      (cp >= 0x1100 && cp <= 0x115f) ||
+      (cp >= 0x2e80 && cp <= 0xa4cf) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe10 && cp <= 0xfe19) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6) ||
+      (cp >= 0x20000 && cp <= 0x3fffd)
+    n += wide ? 2 : 1
+  }
+  return n
+}
+
+function nodeKids(node: unknown): unknown[] {
+  if (!node || typeof node !== 'object') return []
+  const el = node as { children?: unknown; props?: { children?: unknown } }
+  const raw = el.children ?? el.props?.children
+  if (typeof raw === 'string') return [raw]
+  return Array.isArray(raw) ? raw : []
+}
+
+function field(node: unknown, name: string): unknown {
+  if (!node || typeof node !== 'object') return undefined
+  const el = node as { props?: Record<string, unknown> } & Record<string, unknown>
+  if (el.props && name in el.props) return el.props[name]
+  return el[name]
+}
+
+/**
+ * Display cells of the title bar, including the engine's `[-]` which is not in the tree.
+ * Undefined when the header row was not drawn.
+ */
+function headerBarCells(node: unknown): number | undefined {
+  let found: unknown[] | undefined
+  const visit = (current: unknown) => {
+    const kids = nodeKids(current)
+    const hide = kids.some(k => field(k, 'key') === 'close')
+    const titled = kids.some(k => nodeKids(k).some(c => typeof c === 'string' && c.includes('內部')))
+    if (hide && titled) found = kids
+    for (const kid of kids) visit(kid)
+  }
+  visit(node)
+  if (!found) return undefined
+  let n = termCells(' [-]')
+  for (const child of found) {
+    if (field(child, 'type') === 'Button') {
+      n += termCells(`[ ${String(field(child, 'label') ?? '')} ]`)
+      continue
+    }
+    n += termCells(nodeKids(child).filter((c): c is string => typeof c === 'string').join(''))
+  }
+  return n
+}
 
 /** Flattens a render tree to its text, so an assertion reads what a person sees. */
 function textOf(node: unknown): string {
@@ -1547,7 +1619,7 @@ describe('panel rendering', () => {
 
     await $.session.start(session())
     await clock.advance(10_000) // reconcile probes, both come back stalled
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('w1')
@@ -1565,7 +1637,7 @@ describe('panel rendering', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('running · idle 30m')
@@ -1580,7 +1652,7 @@ describe('panel rendering', () => {
     mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     expect(textOf(await $.ui.render(bandRender()))).toContain('No workers outstanding')
   })
@@ -1600,7 +1672,7 @@ describe('panel mirror', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 }, '編譯完成 ✅\n等待輸入')
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
 
@@ -1652,7 +1724,7 @@ describe('probe budget', () => {
     expect(probes.length, 'the sweep is capped, whatever the fleet size').toEqual(8)
   })
 
-  test('the [close] button closes the panel and stops its clock, like /tmux does', WITH_DRIVER, async ($, on) => {
+  test('the [close] button closes the panel and stops its clock, like /workers does', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mock.clock(on)
@@ -1660,7 +1732,7 @@ describe('probe budget', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -1672,8 +1744,8 @@ describe('probe budget', () => {
     await clock.advance(2_000)
     expect(captures(panel.argv).length, 'closed: no more captures').toEqual(1)
     expect(textOf(await $.ui.render(bandRender())), 'closed: the band is yielded').not.toContain('w1')
-    // /tmux now OPENS again rather than toggling the wrong way.
-    const answer = await $.command.run(run('tmux'))
+    // /workers now OPENS again rather than toggling the wrong way.
+    const answer = await $.command.run(run('workers'))
     expect(String((answer as { text?: string }).text)).toContain('opened')
   })
 
@@ -1687,7 +1759,7 @@ describe('probe budget', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 }, Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'))
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const tree = await $.ui.render(bandRender(40))
     const hot = hotkeysOf(tree)
     // Rows 1–9 on digits (a bare digit presses from an empty prompt); the tenth has none.
@@ -1716,7 +1788,7 @@ describe('probe budget', () => {
     mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const ask = bandRender()
     expect(textOf(await $.ui.render(ask))).toContain('w1')
     expect(textOf(await $.ui.render({ ...ask, props: { ...ask.props, hasSurvey: true } }))).not.toContain('w1')
@@ -1739,7 +1811,7 @@ describe('regressions', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 }, 'MIRRORED', false, held)
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
 
@@ -1770,13 +1842,13 @@ describe('regressions', () => {
     }
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await select()
     await clock.advance(2_000) // capture for w1 leaves, and hangs
     expect(held.pending, 'a frame is in flight').toEqual(1)
 
-    await $.command.run(run('tmux')) // close: this generation is over
-    await $.command.run(run('tmux')) // reopen
+    await $.command.run(run('workers')) // close: this generation is over
+    await $.command.run(run('workers')) // reopen
     await select() // same worker, new generation
     pane.v = 'FRESH-FRAME'
 
@@ -1884,7 +1956,7 @@ describe('regressions', () => {
     mockPanel(on, { running: true, idle_seconds: 60 }, 'x\u0001y\u0002z')
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     // Goals are drawn in the overview; a selected row gives their row to the mirror.
     const overview = textOf(await $.ui.render(bandRender()))
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
@@ -1909,7 +1981,7 @@ describe('regressions', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('w1')
@@ -1927,7 +1999,7 @@ describe('regressions', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('w1')
@@ -1942,7 +2014,7 @@ describe('regressions', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     // A 10-row surface, less this one row's 2 and the mirror's own 6 of chrome,
     // leaves 2 — under the target TUI's own chrome, so every captured line would
     // be chrome and none of it work.
@@ -1968,7 +2040,7 @@ describe('regressions', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     // The body reports 5 rows because 5 rows is all this hook has drawn so far —
     // it is the window over our own tree, not the room we have. Sizing the mirror
     // from it latches the mirror off: off keeps the tree short, and a short tree
@@ -2007,7 +2079,7 @@ describe('honest states', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -2035,7 +2107,7 @@ describe('honest states', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('w1')
@@ -2071,7 +2143,7 @@ describe('honest states', () => {
     await clock.advance(10_000)
     await clock.advance(10_000)
     await clock.advance(60_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     expect(textOf(await $.ui.render(bandRender()))).toContain('collector paused after 3 delivery refusals')
     const out = JSON.stringify(await $.tool.call(assignInput()))
@@ -2195,7 +2267,7 @@ describe('teammates', () => {
     expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`), 'the wrapper does the stopping').toEqual(true)
     expect(store.acked(), 'acknowledged, so it never reads as exited forever').toEqual(['w1@0'])
 
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await clock.advance(2_000)
     expect(textOf(await $.ui.render(bandRender()))).toContain('No workers outstanding')
   })
@@ -2215,11 +2287,11 @@ describe('teammates', () => {
     mockPanel(on, { running: false, sessions: ['codex-cli-w1', 'hg-agent-proxy'] })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await clock.advance(2_000)
 
     let drawn = textOf(await $.ui.render(bandRender()))
-    expect(drawn, 'the title names the code that drew it').toMatch(/tmux workers v\d+\.\d+\.\d+/)
+    expect(drawn, 'the title names the code that drew it').toMatch(/workers v\d+\.\d+\.\d+ · tmux \d+ · 內部 \d+/)
     expect(drawn, 'delivery does not end a teammate').toContain('w1')
     expect(drawn).toContain('done — tell it more, or stop it')
     expect(drawn, 'no pane, no row').not.toContain('w2')
@@ -2231,6 +2303,63 @@ describe('teammates', () => {
     expect(keysOf(tree)).toEqual(expect.arrayContaining(['tell:w1@0', 'stop:w1@0']))
     drawn = textOf(tree)
     expect(drawn).toContain('success: pong')
+  })
+
+  test('the title counts running panel workers and running in-process agents', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.clock(on)
+    mockStore(on, ['w2@0'])
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0),
+      [`${ROOT}/w2/result.json`]: finished('done'),
+    })
+    mockPanel(on, { running: true, sessions: ['codex-cli-w2'] }, 'hello\nworld', false, undefined, false, [
+      { id: 'a', description: 'a', type: 'general-purpose', status: 'running' },
+      { id: 'b', description: 'b', type: 'teammate', status: 'running' },
+      { id: 'c', description: 'c', type: 'Explore', status: 'completed' },
+    ])
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+
+    const drawn = textOf(await $.ui.render(bandRender()))
+    expect(drawn, 'the done worker stays listed').toContain('w2')
+    expect(drawn).toContain('workers v0.8.0 · tmux 1 · 內部 2')
+  })
+
+  test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, {})
+    const panel = mockPanel(on, { running: true }, 'hello\nworld', false, undefined, false, 'reject')
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    expect(textOf(await $.ui.render(bandRender()))).toContain('內部 ?')
+
+    await clock.advance(2_000)
+    await clock.advance(2_000)
+    expect(panel.logs.filter(line => line.includes('agent.list failed')).length).toBe(1)
+  })
+
+  test('the title and hint stay within 80 and 60 columns', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, {})
+    mockPanel(on, { running: true })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+
+    for (const columns of [80, 60]) {
+      const tree = await $.ui.render(bandRender(40, 39, columns))
+      expect(textOf(tree)).toContain('tmux 0 · 內部 0')
+      expect(headerBarCells(tree), `${columns} columns`).toBe(columns)
+      expect(keysOf(tree)).toContain('close')
+    }
   })
 
   test('peek returns the pane tail as fenced data plus the worker state, once, on demand', WITH_DRIVER, async ($, on) => {
@@ -2290,7 +2419,7 @@ describe('teammates', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn).toContain('needs input — hook_trust_prompt')
     expect(drawn).not.toContain('stalled')
@@ -2348,7 +2477,7 @@ describe('teammates', () => {
     mockPanel(on, { exists: true, running: true, idle_seconds: 1, sessions: ['codex-cli-w2'] })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await clock.advance(2_000)
     const tree = JSON.stringify(await $.ui.render(bandRender()))
     expect(tree).toContain('"color":"green"')
@@ -2365,7 +2494,7 @@ describe('teammates', () => {
     mockPanel(on, { running: true })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     let tree = await $.ui.render(bandRender())
     expect(keysOf(tree)).toContain('refresh')
     expect(textOf(tree)).not.toContain('w2')
@@ -2387,7 +2516,7 @@ describe('teammates', () => {
     mockPanel(on, probe)
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await clock.advance(2_000)
     expect(textOf(await $.ui.render(bandRender()))).toContain('w1')
 
@@ -2406,7 +2535,7 @@ describe('teammates', () => {
     mockPanel(on, probe)
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await clock.advance(2_000)
     expect(textOf(await $.ui.render(bandRender()))).toContain('w1')
 
@@ -2435,7 +2564,7 @@ describe('teammates', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
 
     // Nothing selected: no controls drawn, so a stray Enter cannot message anyone.
     let drawn = textOf(await $.ui.render(bandRender()))
@@ -2842,7 +2971,7 @@ test('a finished row stops its clock at the result, however long the pane stays 
   })
   mockPanel(on, { running: false, sessions: ['codex-cli-w1'] })
   await $.session.start(session())
-  await $.command.run(run('tmux'))
+  await $.command.run(run('workers'))
   await clock.advance(30 * 60_000)
   const drawn = textOf(await $.ui.render(bandRender()))
   expect(drawn).toContain('done — tell it more, or stop it')
@@ -2980,7 +3109,7 @@ describe('panel UX, 2026-09-25 live probe', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 5 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
     await $.ui.render(bandRender())
@@ -3004,17 +3133,17 @@ describe('panel UX, 2026-09-25 live probe', () => {
 
     await $.session.start(session())
     await clock.advance(10_000)
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const overview = await $.ui.render(bandRender(13))
     expect(rowsOf(overview)).toBeLessThanOrEqual(13)
-    expect(textOf(overview)).toContain('more — /tmux N selects row N')
+    expect(textOf(overview)).toContain('more — /workers N selects row N')
     // Not every worker fits with its goal line, so no goal is drawn.
     expect(textOf(overview)).not.toContain('goal 1')
 
     // Row 13 is past the cut, so it is reached by typing; it is the finished row
     // with a long summary, the case that used to wrap six rows.
     expect(keysOf(overview)).not.toContain('w13@0')
-    expect((await $.command.run(run('tmux', '13'))).text).toContain('"w13" selected')
+    expect((await $.command.run(run('workers', '13'))).text).toContain('"w13" selected')
     await clock.advance(2_000)
     const picked = await $.ui.render(bandRender(13))
     expect(rowsOf(picked), 'selected, summary and mirror included').toBeLessThanOrEqual(13)
@@ -3035,7 +3164,7 @@ describe('panel UX, 2026-09-25 live probe', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 5 }, Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'))
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     // Both workers fit with their goal lines, so the goals are drawn.
     const overview = textOf(await $.ui.render(bandRender(13)))
     expect(overview).toContain('    one')
@@ -3050,7 +3179,7 @@ describe('panel UX, 2026-09-25 live probe', () => {
     expect(rowsOf(drawn)).toBeLessThanOrEqual(13)
   })
 
-  test('/tmux subcommands work without any hotkey: N selects, stop and tell by row or name, hide', WITH_DRIVER, async ($, on) => {
+  test('/workers subcommands work without any hotkey: N selects, stop and tell by row or name, hide', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mock.clock(on)
@@ -3058,18 +3187,18 @@ describe('panel UX, 2026-09-25 live probe', () => {
     const panel = mockPanel(on, { running: true, idle_seconds: 5 })
 
     await $.session.start(session())
-    await $.command.run(run('tmux'))
-    expect((await $.command.run(run('tmux', '2'))).text).toContain('row 2 "w2" selected')
+    await $.command.run(run('workers'))
+    expect((await $.command.run(run('workers', '2'))).text).toContain('row 2 "w2" selected')
     expect(keysOf(await $.ui.render(bandRender()))).toContain('stop:w2@0')
-    expect((await $.command.run(run('tmux', 'stop ghost'))).text).toContain('no worker "ghost"')
-    expect((await $.command.run(run('tmux', 'tell w1'))).text).toContain('message is missing')
+    expect((await $.command.run(run('workers', 'stop ghost'))).text).toContain('no worker "ghost"')
+    expect((await $.command.run(run('workers', 'tell w1'))).text).toContain('message is missing')
     // A number is never enough to stop: it answers with the name it stands for.
-    expect((await $.command.run(run('tmux', 'stop 1'))).text).toContain('row 1 is "w1" right now')
+    expect((await $.command.run(run('workers', 'stop 1'))).text).toContain('row 1 is "w1" right now')
     expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(false)
-    expect((await $.command.run(run('tmux', 'stop w1'))).text).toContain('stop "w1" — ok')
+    expect((await $.command.run(run('workers', 'stop w1'))).text).toContain('stop "w1" — ok')
     expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(true)
     expect(store.acked()).toContain('w1@0')
-    expect((await $.command.run(run('tmux', 'hide'))).text).toContain('hidden')
+    expect((await $.command.run(run('workers', 'hide'))).text).toContain('hidden')
     expect(textOf(await $.ui.render(bandRender()))).not.toContain('w2')
   })
 })
@@ -3123,13 +3252,13 @@ describe('astra review of 34e2a1e', () => {
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
     mockPanel(on, { running: true, idle_seconds: 5 })
     await $.session.start(session())
-    await $.command.run(run('tmux', '1'))
+    await $.command.run(run('workers', '1'))
     for (let rows = 1; rows <= 13; rows += 1) {
       const tree = await $.ui.render(bandRender(rows))
       const count = ((tree as { children?: unknown[] }).children ?? []).slice(1).length
       expect(count, `maxRows ${rows}`).toBeLessThanOrEqual(rows)
     }
-    expect(textOf(await $.ui.render(bandRender(3)))).toContain('/tmux stop <name>')
+    expect(textOf(await $.ui.render(bandRender(3)))).toContain('/workers stop <name>')
   })
 })
 
@@ -3168,11 +3297,11 @@ describe('cursor review of 34e2a1e', () => {
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0), [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0) })
     mockPanel(on, { running: true, idle_seconds: 5 })
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     await $.ui.render(bandRender(10))
-    await $.command.run(run('tmux', '1'))
+    await $.command.run(run('workers', '1'))
     await $.ui.render(bandRender(10))
-    await $.command.run(run('tmux', 'stop w1'))
+    await $.command.run(run('workers', 'stop w1'))
     await clock.advance(2_000)
     const tree = await $.ui.render(bandRender(10))
     const rows = ((tree as { children?: unknown[] }).children ?? []).slice(1).length
@@ -3181,7 +3310,7 @@ describe('cursor review of 34e2a1e', () => {
     expect(keysOf(tree)).not.toContain('stop:w2@0')
   })
 
-  test('/tmux stop N stops nothing: row numbers move with every refresh, so stop takes a name (P2-3, d20cdcc N-2)', WITH_DRIVER, async ($, on) => {
+  test('/workers stop N stops nothing: row numbers move with every refresh, so stop takes a name (P2-3, d20cdcc N-2)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mock.clock(on)
@@ -3189,19 +3318,19 @@ describe('cursor review of 34e2a1e', () => {
     mockFs(on, files)
     const panel = mockPanel(on, { running: true, idle_seconds: 5 })
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const before = textOf(await $.ui.render(bandRender()))
     expect(before.indexOf('w2'), 'drawn: row 1 w2, row 2 w3').toBeLessThan(before.indexOf('w3'))
     // A new worker sorts in front after a refresh the person has not seen drawn.
     files[`${ROOT}/w1/dispatch.json`] = dispatch('w1', 0)
     await clock.advance(2_000)
     await $.ui.render(bandRender())
-    expect((await $.command.run(run('tmux', 'stop 2'))).text).toMatch(/row 2 is "w\d" right now — stop takes a name/)
-    expect((await $.command.run(run('tmux', 'tell 2 hi'))).text).toContain('tell takes a name')
+    expect((await $.command.run(run('workers', 'stop 2'))).text).toMatch(/row 2 is "w\d" right now — stop takes a name/)
+    expect((await $.command.run(run('workers', 'tell 2 hi'))).text).toContain('tell takes a name')
     expect(panel.argv.some(a => a.includes('stop')), 'no number stops anyone').toEqual(false)
   })
 
-  test('/tmux tell keeps the message as typed, newlines and indentation included (P3)', WITH_DRIVER, async ($, on) => {
+  test('/workers tell keeps the message as typed, newlines and indentation included (P3)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     mock.clock(on)
@@ -3209,7 +3338,7 @@ describe('cursor review of 34e2a1e', () => {
     mockFs(on, files)
     mockPanel(on, { running: true, idle_seconds: 5 })
     await $.session.start(session())
-    expect((await $.command.run(run('tmux', 'tell w1 line one\n  indented two'))).text).toContain('tell "w1" — ok')
+    expect((await $.command.run(run('workers', 'tell w1 line one\n  indented two'))).text).toContain('tell "w1" — ok')
     const brief = Object.entries(files).find(([k]) => k.includes('/w1/tell-'))?.[1] ?? ''
     expect(brief).toContain('line one\n  indented two')
   })
@@ -3221,7 +3350,7 @@ describe('cursor review of 34e2a1e', () => {
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
     mockPanel(on, { running: true, idle_seconds: 5 })
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const tree = await $.ui.render(bandRender())
     const header = (tree as { children?: unknown[] }).children?.[1] as { children?: unknown[] }
     const cells = (header.children ?? []).map(c => {
@@ -3269,7 +3398,7 @@ describe('cursor review of d20cdcc', () => {
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
     const panel = mockPanel(on, { running: true, idle_seconds: 5 })
     await $.session.start(session())
-    await $.command.run(run('tmux', '1'))
+    await $.command.run(run('workers', '1'))
     for (let t = 0; t < 12; t += 1) {
       await $.ui.render(bandRender())
       await $.ui.press({ plugin: 'tmux-agent', key: 'stop:w1@0', requestId: 'above-prompt' })
@@ -3286,7 +3415,7 @@ describe('cursor review of d20cdcc', () => {
     mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
     mockPanel(on, { running: true, idle_seconds: 5 }, Array.from({ length: 40 }, (_, i) => `L${i}`).join('\n'))
     await $.session.start(session())
-    await $.command.run(run('tmux', '1'))
+    await $.command.run(run('workers', '1'))
     await $.ui.render(bandRender(30))
     await clock.advance(2_000)
     const count = (t: unknown) => ((t as { children?: unknown[] }).children ?? []).slice(1).length
@@ -3300,7 +3429,7 @@ describe('cursor review of d20cdcc', () => {
     mockFs(on, {})
     mockPanel(on, { running: true })
     await $.session.start(session())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const tree = await $.ui.render(bandRender(1))
     expect(((tree as { children?: unknown[] }).children ?? []).slice(1).length).toBeLessThanOrEqual(1)
   })
@@ -3319,7 +3448,7 @@ describe('fable review of 95f32f0', () => {
     mockPanel(on, { running: true })
     await $.session.start(session())
     await $.turn.complete(turn())
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     const tree = await $.ui.render(bandRender(13))
     const down = ((tree as { children?: unknown[] }).children ?? []).find(c => textOf(c).startsWith('⚠'))
     expect(textOf(down), 'the pause reason is drawn').toContain('over budget')
@@ -3455,7 +3584,7 @@ describe('live e2e of 0.7.6', () => {
     expect(textOf(await $.ui.render(bandRender())), 'the panel is back').toContain('w1')
 
     // Closing it forgets this session only.
-    expect((await $.command.run(run('tmux'))).text).toContain('closed')
+    expect((await $.command.run(run('workers'))).text).toContain('closed')
     for (let i = 0; i < 20 && store.key('tmux-agent.panel').includes('sess-A'); i += 1) await settle()
     expect(store.key('tmux-agent.panel')).toEqual(['sess-B'])
   })
@@ -3472,12 +3601,12 @@ describe('live e2e of 0.7.6', () => {
     await clock.advance(1)
     for (let i = 0; i < 5; i += 1) await settle()
     expect(panel.open, 'nothing to reopen').toEqual([])
-    await $.command.run(run('tmux'))
+    await $.command.run(run('workers'))
     for (let i = 0; i < 20 && !store.key('tmux-agent.panel').length; i += 1) await settle()
     expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
   })
 
-  test('the panel tool opens and closes the panel the way /tmux does, and records it for reopen', WITH_DRIVER, async ($, on) => {
+  test('the panel tool opens and closes the panel the way /workers does, and records it for reopen', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mock.clock(on)
@@ -3493,7 +3622,7 @@ describe('live e2e of 0.7.6', () => {
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const }))).toContain('already open')
 
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('tmux panel closed.')
-    expect((await $.command.run(run('tmux'))).text, 'a typed /tmux now opens it').toContain('opened')
+    expect((await $.command.run(run('workers'))).text, 'a typed /workers now opens it').toContain('opened')
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('tmux panel closed.')
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('already closed')
   })

@@ -142,7 +142,7 @@ skill resolves the bundled scripts from its own directory when they are not on `
 agent-tmux worker into a teammate of one Claude Code session: `assign` dispatches a
 brief, `tell` gives the same worker its next task or a correction, `stop` dismisses
 it, `peek` looks at a pane mid-flight, `keys` answers a dialog it is parked on, and
-`/tmux` shows this project's teammates while their sessions live. Every session that has it
+`/workers` shows this project's teammates while their sessions live. Every session that has it
 reconciles each worker's `result.json` and submits a prompt when a worker finishes —
 so a detached worker never finishes into silence, even when nobody is watching the pane.
 The worker can be codex, agy, cursor, a second claude on a provider gateway, or a CLI
