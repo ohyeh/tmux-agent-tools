@@ -133,6 +133,7 @@ const session = () => ({ cwd: '/work', surface: 'terminal' as const, isInteracti
 function mockSessionStart(on: On): void {
   on('tool.register', ($, e) => ({ value: { tool: e.name } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('agent.register', ($, e) => ({ value: { agent: `tmux-agent:${e.name}` } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
 }
 
@@ -1504,6 +1505,7 @@ function mockPanel(
   on('command.run', () => ({ text: '' }))
   on('ui.status', () => ({ value: undefined }))
   on('tool.register', ($, e) => ({ value: { tool: e.name } }))
+  on('agent.register', ($, e) => ({ value: { agent: `tmux-agent:${e.name}` } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('ui.open', ($, e) => {
     open.push(e.id)
@@ -2470,7 +2472,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.9\.1 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.10\.0 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -3828,6 +3830,7 @@ describe('live e2e of 0.7.6', () => {
       return { value: { tool: e.name } }
     })
     on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('agent.register', ($, e) => ({ value: { agent: `tmux-agent:${e.name}` } }))
     on('session.start', ($, e) => ({ cwd: e.cwd }))
     await $.session.start(session())
     const brief = (schemas.assign as { properties?: { brief?: { description?: string } } }).properties?.brief
@@ -4014,7 +4017,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.9\.1 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.10\.0 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -4044,5 +4047,272 @@ describe('project sessions', () => {
     const keyed = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__keys' as const, name: 'hg-android', keys: ['Enter'] }))
     expect(keyed).toContain('read-only project session')
     expect(panel.argv.filter(a => a[1] === 'send-keys').length, 'keys does not press').toEqual(0)
+  })
+})
+
+describe('native mirror', () => {
+  const BRIEF = 'GOAL: ship it\nruntime: tmux/cursor\nACCEPTANCE: tests pass\nREPORT: the sha'
+  const spawnOf = (over: Record<string, unknown> = {}) => ({
+    tool_use_id: 'tu1',
+    prompt: BRIEF,
+    description: 'review',
+    subagentType: 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' as const },
+    parentModel: 'opus',
+    background: false,
+    fork: false,
+    ...over,
+  })
+
+  test('session.start registers tmux-waiter and the offer hook hides it', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    mockFs(on, {})
+    const specs: Record<string, unknown>[] = []
+    on('tool.register', ($, e) => ({ value: { tool: e.name } }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('agent.register', ($, e) => {
+      specs.push(e)
+      return { value: { agent: `tmux-agent:${e.name}` } }
+    })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('ui.log', () => ({ value: undefined }))
+
+    await $.session.start(session())
+
+    expect(specs).toHaveLength(1)
+    expect(specs[0]).toMatchObject({
+      name: 'tmux-waiter',
+      description: 'Waits for one tmux worker result (tmux-agent internal)',
+      tools: ['Bash'],
+      model: 'haiku',
+      omitClaudeMd: true,
+    })
+    expect(JSON.stringify(specs[0])).toContain('one Bash poll at a time')
+    const hidden = await $.agent.offer({
+      agent: 'tmux-agent:tmux-waiter',
+      description: 'Waits for one tmux worker result (tmux-agent internal)',
+      source: 'plugin',
+      provider: { plugin: 'tmux-agent', tier: 'user' },
+    })
+    expect(hidden).toEqual({ isOffered: false })
+  })
+
+  test('a rejected waiter register is logged once and the spawn hook denies as before', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    mockFs(on, {})
+    on('tool.register', ($, e) => ({ value: { tool: e.name } }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('agent.register', () => {
+      throw new Error('schema refused')
+    })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    const logs: string[] = []
+    on('ui.log', ($, e) => {
+      logs.push(e.text)
+      return { value: undefined }
+    })
+    on('agent.spawn', () => ({ model: 'haiku', agentId: 'should-not-start' }))
+
+    await $.session.start(session())
+    await $.session.start(session())
+    const out = JSON.stringify(await $.agent.spawn(spawnOf()))
+
+    expect(out).toContain('call mcp__tmux-agent__assign')
+    expect(out).toContain('instead of the Agent tool')
+    expect(logs.filter(l => l.includes('tmux-waiter register failed'))).toHaveLength(1)
+  })
+
+  test('a runtime spawn that sets name is denied and dispatches nothing', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    mockSessionStart(on)
+    const argvs: string[][] = []
+    on('process.run', ($, e) => {
+      argvs.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    })
+    on('agent.spawn', () => ({ model: 'haiku', agentId: 'should-not-start' }))
+
+    await $.session.start(session())
+    const out = JSON.stringify(await $.agent.spawn(spawnOf({ name: 'teammate' })))
+
+    expect(out).toContain('must not set name')
+    expect(out).toContain('drop name')
+    expect(argvs.some(a => a.join(' ').includes(' assign '))).toBe(false)
+    expect(Object.keys(files).some(p => p.endsWith('/dispatch.json') || p.endsWith('/brief.md'))).toBe(false)
+  })
+
+  test('a runtime spawn dispatches the brief without the runtime line and starts the waiter', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    on('ui.log', () => ({ value: undefined }))
+    const head = 'a'.repeat(40)
+    on('process.run', ($, e) => ({
+      value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '' },
+    }))
+    let seen: { subagentType?: string; model?: string; background?: boolean; description?: string; prompt?: string } | undefined
+    on('agent.spawn', ($, e) => {
+      seen = e
+      return { model: 'haiku', agentId: 'waiter-9' }
+    })
+
+    await $.session.start(session())
+    const out = await $.agent.spawn(spawnOf({ cwd: '/work', description: 'Fix the bug!' }))
+
+    expect(out).toMatchObject({ model: 'haiku', agentId: 'waiter-9' })
+    const fresh = Object.keys(files).filter(p => /\/dispatch\.json$/.test(p))
+    expect(fresh).toHaveLength(1)
+    const record = JSON.parse(files[fresh[0] ?? ''] ?? '{}') as { name: string; waiter?: string; profile?: string; dir?: string }
+    const brief = files[`${ROOT}/${record.name}/brief.md`] ?? ''
+    expect(brief).toContain('GOAL: ship it')
+    expect(brief).toContain('ACCEPTANCE: tests pass')
+    expect(brief).not.toMatch(/runtime:\s*tmux/)
+    expect(record).toMatchObject({ profile: 'cursor', dir: '/work', base: head, waiter: 'waiter-9' })
+    expect(record.name.startsWith('Fixthebug-')).toBe(true)
+    expect(seen).toMatchObject({
+      subagentType: 'tmux-agent:tmux-waiter',
+      model: 'haiku',
+      background: true,
+      description: record.name,
+    })
+    expect(seen?.prompt).toContain(`${ROOT}/${record.name}/result.json`)
+    expect(seen?.prompt).toContain(`${ROOT}/${record.name}/launch.exit`)
+    expect(seen?.prompt).toContain('seq 1 108')
+    expect(seen?.prompt).toContain('600000')
+    expect(seen?.prompt).toContain('60 minutes')
+  })
+
+  test('a spawn without the runtime line is passed through untouched', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    mockSessionStart(on)
+    let seen = ''
+    on('agent.spawn', ($, e) => {
+      seen = e.prompt
+      return { model: 'sonnet', agentId: 'native-1' }
+    })
+
+    await $.session.start(session())
+    const prompt = 'GOAL: x\nACCEPTANCE: y\nREPORT: z'
+    const out = await $.agent.spawn(spawnOf({ prompt }))
+
+    expect(out).toEqual({ model: 'sonnet', agentId: 'native-1' })
+    expect(seen).toBe(prompt)
+    expect(Object.keys(files).filter(p => p.endsWith('dispatch.json'))).toEqual([])
+  })
+
+  test('a running waiter is not woken and not acked; a later tick still waits', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { waiter: 'agt-1' }),
+      [`${ROOT}/w1/result.json`]: finished(),
+    })
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('agent.list', () => ({
+      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'running' }],
+    }))
+
+    await $.session.start(session())
+    await $.turn.complete(turn())
+
+    expect(woken).toEqual([])
+    expect(store.acked()).toEqual([])
+  })
+
+  test('a completed waiter with a terminal result is acked and never woken', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { waiter: 'agt-1' }),
+      [`${ROOT}/w1/result.json`]: finished('shipped'),
+    })
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('agent.list', () => ({
+      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'completed' }],
+    }))
+
+    await $.session.start(session())
+    await $.turn.complete(turn())
+
+    expect(woken).toEqual([])
+    expect(store.acked()).toEqual(['w1@0'])
+  })
+
+  test('a killed or absent waiter delivers once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { waiter: 'agt-killed' }),
+      [`${ROOT}/w1/result.json`]: finished('from killed'),
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0, { waiter: 'agt-gone' }),
+      [`${ROOT}/w2/result.json`]: finished('from gone'),
+    })
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('agent.list', () => ({
+      value: [{ id: 'agt-killed', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'killed' }],
+    }))
+
+    await $.session.start(session())
+    await $.turn.complete(turn())
+
+    expect(woken).toHaveLength(1)
+    expect(woken[0]).toContain('w1')
+    expect(woken[0]).toContain('w2')
+    expect(store.acked().sort()).toEqual(['w1@0', 'w2@0'])
+  })
+
+  test('agent.list rejecting delivers the mirrored result and logs once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0, { waiter: 'agt-1' }),
+      [`${ROOT}/w1/result.json`]: finished(),
+    })
+    const logs: string[] = []
+    on('ui.toast', () => ({ value: undefined }))
+    on('ui.log', ($, e) => {
+      logs.push(e.text)
+      return { value: undefined }
+    })
+    on('turn.complete', () => ({ text: '' }))
+    const woken: string[] = []
+    on('prompt.submit', ($, e) => {
+      woken.push(e.text)
+      return { text: e.text }
+    })
+    mockSessionStart(on)
+    on('agent.list', () => {
+      throw new Error('agent.list refused')
+    })
+
+    await $.session.start(session())
+    await $.turn.complete(turn())
+
+    expect(woken).toHaveLength(1)
+    expect(store.acked()).toEqual(['w1@0'])
+    expect(logs.filter(l => l.includes('agent.list failed'))).toHaveLength(1)
   })
 })

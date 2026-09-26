@@ -40,6 +40,11 @@ export type TmuxDispatch = {
   adoptedFrom?: string
   /** `git rev-parse HEAD` of `dir` when the episode began; a claimed commit must descend from it. Absent when `dir` was not a repo. */
   base?: string
+  /**
+   * The native waiter subagent's id (`$.agent.list`), when this dispatch was mirrored
+   * from an Agent call. Absent on records written before 0.10.0, and on tool assigns.
+   */
+  waiter?: string
 }
 
 declare module 'claude-code' {

@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.9.1'
+const MOD_VERSION = '0.10.0'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -212,6 +212,55 @@ const CTRL_RE = /[\x00-\x1f\x7f]/
 const CTRL_ALL_RE = /[\x00-\x1f\x7f]/g
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 type AssignInput = { profile: string; name: string; dir: string; brief: string }
+/** What the tool and the spawn hook share besides `$` and the brief. Both are closed over inside `register`. */
+type AssignExtra = {
+  owner?: string
+  ownerCwd?: string
+  /** Bound host for the binary lookup. Absent (no `engine.create` yet): run the bare name. */
+  lookup?: Host
+  /** Read after the launch, so the receipt names the gate as it is then. */
+  down?: () => string | undefined
+}
+const WAITER_TYPE = 'tmux-agent:tmux-waiter'
+const WAITER_SYSTEM = [
+  'You wait for one tmux worker this plugin already launched. You do not do the task.',
+  'You have Bash only. Do not edit files and do not talk to the worker.',
+  'Follow the user message: one Bash poll at a time, then answer with the worker name, status, summary, and result path. Nothing else.',
+].join('\n')
+
+function stripRuntimeLine(prompt: string): string {
+  return prompt.split('\n').filter(line => !RUNTIME_LINE.test(line)).join('\n')
+}
+
+/** A spawn's description, reduced to a worker base name. Empty or illegal → `worker`. */
+function workerBase(description: string): string {
+  const raw = description.replace(/[^A-Za-z0-9_.-]/g, '').replace(/^[^A-Za-z0-9]+/, '').slice(0, 64)
+  return NAME_RE.test(raw) ? raw : 'worker'
+}
+
+/**
+ * The waiter's one user turn. Paths are absolute.
+ * ponytail: the 60-minute cap is this instruction, not a timer in the mod. A waiter
+ * that ignores it stays until the engine ends it; the collector then delivers with prompt.submit.
+ */
+function waiterPrompt(stateDir: string, name: string): string {
+  const result = `${stateDir}/result.json`
+  const exit = `${stateDir}/launch.exit`
+  const log = `${stateDir}/mod-assign.log`
+  const poll = `for i in $(seq 1 108); do [ -f ${shq(result)} ] && break; [ -f ${shq(exit)} ] && [ "$(cat ${shq(exit)})" != 0 ] && break; sleep 5; done`
+  return [
+    `Wait for tmux worker "${name}".`,
+    `Result file: ${result}`,
+    `Launch exit file: ${exit}`,
+    `Launch log: ${log}`,
+    'Run ONE Bash call at a time. Each call must finish within 540 seconds. Set the Bash tool timeout to 600000.',
+    'The command is:',
+    poll,
+    'Repeat that Bash call until one of the files exists. Stop after 60 minutes even if neither exists.',
+    `Then cat ${shq(result)}. If the launch failed (launch.exit exists and is not 0, or result.json is missing), cat the tail of ${shq(log)} instead.`,
+    `Answer with only: worker name ${name}, status, summary, and result path ${result}. Nothing else.`,
+  ].join('\n')
+}
 type TellInput = { name: string; text: string }
 type StopInput = { name?: string; all?: boolean }
 type PeekInput = { name: string; lines?: number }
@@ -220,9 +269,9 @@ type KeysInput = { name: string; keys: string[] }
 /**
  * The world beneath this mod, one method per call.
  *
- * The indirection is not decoration: the engine refuses a hooks module that
- * passes `$` (or what `next(e)` resolved to at `engine.create`) into a helper —
- * every call must be spelled `$.noun.event(...)` at its own site.
+ * The indirection is not decoration: the engine follows `$` only into a function
+ * declared at the top of this file (`assignWorker`). A nested helper, a spread,
+ * or an import is refused. Inside that function every call is still `$.noun.event`.
  */
 type Host = {
   now: () => Promise<number>
@@ -253,8 +302,8 @@ type Host = {
     cwd: string,
     timeoutMs: number,
   ) => Promise<{ exitCode: number; stdout: string; stderr: string }>
-  /** `$.agent.list()`: subagents and in-process teammates. The panel counts `running`. */
-  agentList: () => Promise<readonly { status: string }[]>
+  /** `$.agent.list()`: subagents and in-process teammates. The panel counts `running`; the collector matches a waiter by `id`. */
+  agentList: () => Promise<readonly { id: string; status: string }[]>
 }
 
 /**
@@ -486,6 +535,8 @@ type Gate = {
   acking?: Promise<void>
   /** When this activation delivered each episode, so an auto-stop counts from the delivery. */
   deliveredAt: Map<string, number>
+  /** `$.agent.list` failed while matching a waiter. Logged once per activation; deliveries then fall back to prompt.submit. */
+  waiterListLogged?: boolean
 }
 
 function missingSections(brief: string): string[] {
@@ -532,7 +583,7 @@ const isName = (v: unknown): v is string => typeof v === 'string' && NAME_RE.tes
  */
 function asDispatch(v: unknown): TmuxDispatch | undefined {
   if (!v || typeof v !== 'object') return undefined
-  const { profile, name, dir, since, goal, owner, ownerCwd, adoptedFrom, base } = v as Record<string, unknown>
+  const { profile, name, dir, since, goal, owner, ownerCwd, adoptedFrom, base, waiter } = v as Record<string, unknown>
   if (!isName(name) || !isName(profile)) return undefined
   if (typeof dir !== 'string' || !dir.startsWith('/') || CTRL_RE.test(dir)) return undefined
   if (typeof since !== 'number' || !Number.isFinite(since)) return undefined
@@ -548,6 +599,7 @@ function asDispatch(v: unknown): TmuxDispatch | undefined {
     ...(legacyCwd ? { ownerCwd: owner } : clean(ownerCwd) && ownerCwd.startsWith('/') ? { ownerCwd } : {}),
     ...(clean(adoptedFrom) ? { adoptedFrom } : {}),
     ...(typeof base === 'string' && SHA_RE.test(base) ? { base } : {}),
+    ...(clean(waiter) ? { waiter } : {}),
   }
   return { profile, name, dir, since, ...(line ? { goal: line } : {}), ...own }
 }
@@ -1497,6 +1549,48 @@ async function mirrorProject(host: Host, name: string, rows: number): Promise<st
   return paneTail(probe.stdout, rows)
 }
 
+/**
+ * A mirrored worker's waiter is the delivery while that row lives.
+ * running → say nothing, do not ack. completed + terminal result → ack, no prompt.
+ * failed / killed / absent → deliver as before. list() rejecting → deliver as before, log once.
+ */
+async function partitionWaiters(
+  host: Host,
+  gate: Gate,
+  done: readonly Finished[],
+): Promise<{ deliver: Finished[]; silent: Finished[] }> {
+  if (!done.some(f => f.d.waiter)) return { deliver: [...done], silent: [] }
+  let listed: readonly { id: string; status: string }[]
+  try {
+    listed = await host.agentList()
+  } catch (error) {
+    if (!gate.waiterListLogged) {
+      gate.waiterListLogged = true
+      const kind = error instanceof Error ? error.name : typeof error
+      host.log(`tmux-agent: agent.list failed: ${kind}: ${String(error)}`)
+    }
+    return { deliver: [...done], silent: [] }
+  }
+  const byId = new Map(listed.map(a => [a.id, a.status]))
+  const deliver: Finished[] = []
+  const silent: Finished[] = []
+  for (const f of done) {
+    const waiter = f.d.waiter
+    if (!waiter) {
+      deliver.push(f)
+      continue
+    }
+    const status = byId.get(waiter)
+    if (status === 'running') continue
+    if (status === 'completed' && TERMINAL.has(f.status)) {
+      silent.push(f)
+      continue
+    }
+    deliver.push(f)
+  }
+  return { deliver, silent }
+}
+
 async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<void> {
   if (gate.paused || gate.capacityPaused) return
   const now = await host.now()
@@ -1539,7 +1633,9 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
     await flagStalls(host, gate, root, pending.filter(d => !finished.has(idOf(d)) && !terminal.has(idOf(d))), unfinished)
   }
 
-  if (!done.length) {
+  // Held waiters (still running) are in neither list: not acked, not submitted.
+  const { deliver, silent } = await partitionWaiters(host, gate, done)
+  if (!deliver.length && !silent.length) {
     // Nothing to say, but a shrunken keep-set is still worth writing back.
     if (gone.size) await updateAcks(host, gate, prune)
     // Quiet ticks only: a stop is a subprocess inside the hook's budget.
@@ -1547,10 +1643,11 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
     return
   }
 
-  const { text, included } = payloadOf(done)
-  if (!included.length) return
+  const { text, included } = deliver.length ? payloadOf(deliver) : { text: '', included: [] as Finished[] }
+  if (!included.length && !silent.length) return
 
-  const next = [...keep, ...included.map(ackOf)]
+  const acknowledging = [...silent, ...included]
+  const next = [...keep, ...acknowledging.map(ackOf)]
   // The cap is on the whole store, so the budget is judged over every key.
   if (byteLength([...next, ...[...acks.others.values()].flat()]) > STORE_BUDGET) {
     // Refusing to deliver beats delivering and then failing to remember it: the
@@ -1564,39 +1661,44 @@ async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<
     return
   }
 
-  try {
-    host.toast(`tmux-agent: ${included.length} worker(s) finished`)
-  } catch {
-    // headless, or a surface with no toast: the delivery below is what matters
-  }
-
-  let refusal: string | undefined
-  try {
-    const answer = await host.submit(text)
-    if (answer?.drop) refusal = `refused: ${answer.drop}`
-  } catch (error) {
-    refusal = String(error)
-  }
-  if (refusal) {
-    gate.failures += 1
-    gate.nextAttemptAt = now + (BACKOFF_MS[gate.failures - 1] ?? 0)
-    if (gate.failures >= FAIL_MAX) {
-      gate.paused = true
-      host.log(
-        `tmux-agent: delivery paused after ${FAIL_MAX} refusals (${refusal}); ` +
-          `${done.length} result(s) still on disk under ${root}. ` +
-          'Restart the collector session to resume.',
-      )
+  // A completed waiter already spoke (its turn.complete). Ack it with no prompt.
+  // A submit is only the fallback set. A refusal acks neither, so the next tick retries both.
+  if (included.length) {
+    try {
+      host.toast(`tmux-agent: ${included.length} worker(s) finished`)
+    } catch {
+      // headless, or a surface with no toast: the delivery below is what matters
     }
-    return
+
+    let refusal: string | undefined
+    try {
+      const answer = await host.submit(text)
+      if (answer?.drop) refusal = `refused: ${answer.drop}`
+    } catch (error) {
+      refusal = String(error)
+    }
+    if (refusal) {
+      gate.failures += 1
+      gate.nextAttemptAt = now + (BACKOFF_MS[gate.failures - 1] ?? 0)
+      if (gate.failures >= FAIL_MAX) {
+        gate.paused = true
+        host.log(
+          `tmux-agent: delivery paused after ${FAIL_MAX} refusals (${refusal}); ` +
+            `${done.length} result(s) still on disk under ${root}. ` +
+            'Restart the collector session to resume.',
+        )
+      }
+      return
+    }
   }
 
   gate.failures = 0
   gate.nextAttemptAt = 0
-  for (const f of included) gate.deliveredAt.set(idOf(f.d), await host.now())
+  for (const f of acknowledging) gate.deliveredAt.set(idOf(f.d), await host.now())
   // Only what the session actually accepted is acknowledged, in one write —
   // onto the key as it is NOW: `submit` can hold this tick for a whole turn.
-  const acked = included.map(ackOf)
+  // A silent waiter ack is the same write: its turn.complete was the delivery.
+  const acked = acknowledging.map(ackOf)
   await updateAcks(host, gate, mine => [...prune(mine).filter(id => !acked.includes(id)), ...acked])
 }
 
@@ -1896,6 +1998,108 @@ function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promise<void
   return run
 }
 
+/**
+ * The assign tool's body, shared with the runtime-tmux spawn hook.
+ * Top-level so the engine will follow `$` into it. `extra` carries the
+ * activation's owner and binary lookup; the tool and the hook pass the same ones.
+ */
+async function assignWorker(
+  $: EngineInterface,
+  input: AssignInput,
+  extra?: AssignExtra,
+): Promise<{ receipt: string; name: string; stateDir: string } | { deny: string }> {
+  const missing = missingSections(input.brief ?? '')
+  if (missing.length) return { deny: `tmux-agent: brief is missing ${missing.join(', ')}` }
+  if (!NAME_RE.test(input.name ?? '')) {
+    return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
+  }
+  if (!NAME_RE.test(input.profile ?? '')) {
+    return { deny: 'tmux-agent: profile must match [A-Za-z0-9_.-], max 64 chars' }
+  }
+  if (typeof input.dir !== 'string' || !input.dir.startsWith('/') || CTRL_RE.test(input.dir)) {
+    return { deny: 'tmux-agent: dir must be an absolute path with no control characters' }
+  }
+  const tool = extra?.lookup ? await agentTmuxBin(extra.lookup) : { bin: 'agent-tmux' }
+  if (tool.missing) {
+    return {
+      deny: `tmux-agent: ${tool.missing}. Install the wrapper with: claude plugin marketplace add ohyeh/tmux-agent-tools (or put agent-tmux on PATH), then assign again.`,
+    }
+  }
+
+  const since = await $.clock.now()
+  // A FRESH directory per dispatch is the ownership test: a result.json in it
+  // cannot predate this dispatch, so re-assigning a name can never collect the
+  // previous generation's result. No producer-side protocol needed.
+  const name = `${input.name}-${since.toString(36).slice(-4)}`.slice(0, 64)
+  const override = (await $.env.get('TMUX_AGENT_DIR')) ?? ''
+  const xdg = (await $.env.get('XDG_STATE_HOME')) ?? ''
+  const home = (await $.env.get('HOME')) ?? '/tmp'
+  const stateRoot = override.startsWith('/')
+    ? override
+    : xdg.startsWith('/')
+      ? `${xdg}/tmux-agent-tools`
+      : `${home}${STATE_SUFFIX}`
+  const stateDir = `${stateRoot}/${name}`
+  const briefPath = `${stateDir}/brief.md`
+  const logPath = `${stateDir}/mod-assign.log`
+  const exitPath = `${stateDir}/launch.exit`
+  await $.fs.write(briefPath, input.brief)
+  // Read before the worker starts: a success's commit must descend from
+  // this (checkCommit), and a worker that commits fast must not move it.
+  const head = await $.process
+    .run(['git', '-C', input.dir, 'rev-parse', 'HEAD'], { cwd: input.dir, timeoutMs: COMMIT_PROBE_MS })
+    .catch(gitFailed)
+
+  // Every hook has a budget and `assign` (start + result init + send + confirm)
+  // outlasts it, so it runs detached from a shell that exits at once. The outer
+  // shell's exit code only says the child was backgrounded, so the child writes
+  // its OWN exit code to launch.exit — that file is the launch receipt the
+  // collector reads, and it is why a failed launch reaches the session instead
+  // of becoming a worker nobody is waiting for.
+  // ponytail: shell-level detach; upgrade when the engine offers a spawn op.
+  const argv = [tool.bin, input.profile, 'assign', '--detach', name, input.dir, briefPath]
+  const child = `${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
+  const run = await $.process.run(['sh', '-c', `nohup sh -c ${shq(child)} >/dev/null 2>&1 &`], {
+    cwd: input.dir,
+    timeoutMs: 5_000,
+  })
+  if (run.exitCode !== 0) {
+    return {
+      deny: `tmux-agent: could not launch assign: ${(run.stderr || run.stdout).trim().slice(-400)}`,
+    }
+  }
+  const goal = goalOf(input.brief)
+  const dispatch: TmuxDispatch = {
+    profile: input.profile,
+    name,
+    dir: input.dir,
+    since,
+    ...(goal ? { goal } : {}),
+    ...baseFrom(head, input.dir, text => $.ui.log(text)),
+    ...(extra?.owner ? { owner: extra.owner } : {}),
+    ...(extra?.ownerCwd ? { ownerCwd: extra.ownerCwd } : {}),
+  }
+  await $.fs.write(`${stateDir}/dispatch.json`, JSON.stringify(dispatch))
+  $.ui.status(`tmux-agent: dispatched ${name}`)
+  // The receipt says who will deliver. A caller reading "collector: active" may
+  // end its turn and wait to be woken; anything else means nobody is listening
+  // and the caller must harvest itself — the SKILL's proxy/harvest path.
+  // The worker is already launched above; a surface with no settings rows must
+  // not turn that into a failed dispatch. The snapshot is the fallback then.
+  const down = extra?.down?.()
+  const collector = down
+    ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read ${stateDir}/result.json with the Read tool`
+    : 'collector: active in this session — end the turn; a prompt arrives when the worker finishes or the launch fails'
+  return {
+    receipt:
+      `launch requested for "${name}" on ${input.profile} (launch log: ${logPath}). ` +
+      'This is NOT proof the worker started; the collector reports either the launch ' +
+      `failure or the terminal result, whichever lands in ${stateDir}. ${collector}.`,
+    name,
+    stateDir,
+  }
+}
+
 export const register: Register = on => {
   // Per activation, shared by every entry point below.
   const panel: Panel = { open: false, rows: [], all: [], showAll: false, generation: 0, internal: 0, internalMissLogged: false }
@@ -1912,6 +2116,9 @@ export const register: Register = on => {
   let listAgents: Host['agentList'] = () => Promise.reject(new Error('tmux-agent: agent.list before the session binds'))
   let sessionCwd: string | undefined
   let sessionId: string | undefined
+  /** False after a failed `$.agent.register`: the spawn hook then denies, as 0.9 did. */
+  let waiterReady = false
+  let waiterRegisterLogged = false
   const gate: Gate = {
     failures: 0,
     nextAttemptAt: 0,
@@ -1972,6 +2179,27 @@ export const register: Register = on => {
     sessionId = await $.session.id().catch(() => undefined)
     sessionId ||= `local-${Math.random().toString(36).slice(2, 10)}`
     listAgents = () => $.agent.list()
+    try {
+      await $.agent.register({
+        name: 'tmux-waiter',
+        description: 'Waits for one tmux worker result (tmux-agent internal)',
+        prompt: WAITER_SYSTEM,
+        tools: ['Bash'],
+        model: 'haiku',
+        omitClaudeMd: true,
+      })
+      waiterReady = true
+    } catch (error) {
+      if (!waiterRegisterLogged) {
+        waiterRegisterLogged = true
+        const kind = error instanceof Error ? error.name : typeof error
+        try {
+          await $.ui.log(`tmux-agent: tmux-waiter register failed: ${kind}: ${String(error)}`)
+        } catch {
+          // The spawn hook still denies. A surface with no log does not take the session down.
+        }
+      }
+    }
     const host: Host = {
       now: () => $.clock.now(),
       owner: () => sessionId,
@@ -2737,95 +2965,14 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
-    const input = e as unknown as AssignInput
-    const missing = missingSections(input.brief ?? '')
-    if (missing.length) return { deny: `tmux-agent: brief is missing ${missing.join(', ')}` }
-    if (!NAME_RE.test(input.name ?? '')) {
-      return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
-    }
-    if (!NAME_RE.test(input.profile ?? '')) {
-      return { deny: 'tmux-agent: profile must match [A-Za-z0-9_.-], max 64 chars' }
-    }
-    if (typeof input.dir !== 'string' || !input.dir.startsWith('/') || CTRL_RE.test(input.dir)) {
-      return { deny: 'tmux-agent: dir must be an absolute path with no control characters' }
-    }
-    const tool = world ? await agentTmuxBin(world) : { bin: 'agent-tmux' }
-    if (tool.missing) {
-      return {
-        deny: `tmux-agent: ${tool.missing}. Install the wrapper with: claude plugin marketplace add ohyeh/tmux-agent-tools (or put agent-tmux on PATH), then assign again.`,
-      }
-    }
-
-    const since = await $.clock.now()
-    // A FRESH directory per dispatch is the ownership test: a result.json in it
-    // cannot predate this dispatch, so re-assigning a name can never collect the
-    // previous generation's result. No producer-side protocol needed.
-    const name = `${input.name}-${since.toString(36).slice(-4)}`.slice(0, 64)
-    const override = (await $.env.get('TMUX_AGENT_DIR')) ?? ''
-    const xdg = (await $.env.get('XDG_STATE_HOME')) ?? ''
-    const home = (await $.env.get('HOME')) ?? '/tmp'
-    const stateRoot = override.startsWith('/')
-      ? override
-      : xdg.startsWith('/')
-        ? `${xdg}/tmux-agent-tools`
-        : `${home}${STATE_SUFFIX}`
-    const stateDir = `${stateRoot}/${name}`
-    const briefPath = `${stateDir}/brief.md`
-    const logPath = `${stateDir}/mod-assign.log`
-    const exitPath = `${stateDir}/launch.exit`
-    await $.fs.write(briefPath, input.brief)
-    // Read before the worker starts: a success's commit must descend from
-    // this (checkCommit), and a worker that commits fast must not move it.
-    const head = await $.process
-      .run(['git', '-C', input.dir, 'rev-parse', 'HEAD'], { cwd: input.dir, timeoutMs: COMMIT_PROBE_MS })
-      .catch(gitFailed)
-
-    // Every hook has a budget and `assign` (start + result init + send + confirm)
-    // outlasts it, so it runs detached from a shell that exits at once. The outer
-    // shell's exit code only says the child was backgrounded, so the child writes
-    // its OWN exit code to launch.exit — that file is the launch receipt the
-    // collector reads, and it is why a failed launch reaches the session instead
-    // of becoming a worker nobody is waiting for.
-    // ponytail: shell-level detach; upgrade when the engine offers a spawn op.
-    const argv = [tool.bin, input.profile, 'assign', '--detach', name, input.dir, briefPath]
-    const child = `${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
-    const run = await $.process.run(['sh', '-c', `nohup sh -c ${shq(child)} >/dev/null 2>&1 &`], {
-      cwd: input.dir,
-      timeoutMs: 5_000,
+    const out = await assignWorker($, e as unknown as AssignInput, {
+      owner: sessionId,
+      ownerCwd: sessionCwd,
+      lookup: world,
+      down: () => collectorDown(gate),
     })
-    if (run.exitCode !== 0) {
-      return {
-        deny: `tmux-agent: could not launch assign: ${(run.stderr || run.stdout).trim().slice(-400)}`,
-      }
-    }
-    const goal = goalOf(input.brief)
-    const dispatch: TmuxDispatch = {
-      profile: input.profile,
-      name,
-      dir: input.dir,
-      since,
-      ...(goal ? { goal } : {}),
-      ...baseFrom(head, input.dir, text => $.ui.log(text)),
-      ...(sessionId ? { owner: sessionId } : {}),
-      ...(sessionCwd ? { ownerCwd: sessionCwd } : {}),
-    }
-    await $.fs.write(`${stateDir}/dispatch.json`, JSON.stringify(dispatch))
-    $.ui.status(`tmux-agent: dispatched ${name}`)
-    // The receipt says who will deliver. A caller reading "collector: active" may
-    // end its turn and wait to be woken; anything else means nobody is listening
-    // and the caller must harvest itself — the SKILL's proxy/harvest path.
-    // The worker is already launched above; a surface with no settings rows must
-    // not turn that into a failed dispatch. The snapshot is the fallback then.
-    const down = collectorDown(gate)
-    const collector = down
-      ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read ${stateDir}/result.json with the Read tool`
-      : 'collector: active in this session — end the turn; a prompt arrives when the worker finishes or the launch fails'
-    return {
-      result:
-        `launch requested for "${name}" on ${input.profile} (launch log: ${logPath}). ` +
-        'This is NOT proof the worker started; the collector reports either the launch ' +
-        `failure or the terminal result, whichever lands in ${stateDir}. ${collector}.`,
-    }
+    if ('deny' in out) return { deny: out.deny }
+    return { result: out.receipt }
   })
 
   /**
@@ -2972,11 +3119,41 @@ export const register: Register = on => {
     }
   })
 
-  on('agent.spawn', ($, e, next) => {
+  on('agent.offer', { agent: WAITER_TYPE }, () => ({ isOffered: false }))
+
+  on('agent.spawn', async ($, e, next) => {
     const m = RUNTIME_LINE.exec(e.prompt)
     if (!m) return next(e)
-    return {
-      deny: `tmux-agent: this brief names runtime tmux/${m[1]}; call ${TOOL} with profile "${m[1]}" instead of the Agent tool.`,
+    const profile = m[1] ?? ''
+    if (!waiterReady) {
+      return {
+        deny: `tmux-agent: this brief names runtime tmux/${profile}; call ${TOOL} with profile "${profile}" instead of the Agent tool.`,
+      }
     }
+    if (e.name) {
+      return {
+        deny: `tmux-agent: a runtime tmux/${profile} Agent call must not set name (a named spawn becomes an idle teammate); drop name`,
+      }
+    }
+    const brief = stripRuntimeLine(e.prompt)
+    const assigned = await assignWorker(
+      $,
+      { profile, name: workerBase(e.description), dir: e.cwd ?? sessionCwd ?? '', brief },
+      { owner: sessionId, ownerCwd: sessionCwd, lookup: world, down: () => collectorDown(gate) },
+    )
+    if ('deny' in assigned) return { deny: assigned.deny }
+    const r = await next({
+      ...e,
+      subagentType: WAITER_TYPE,
+      model: 'haiku',
+      background: true,
+      description: assigned.name,
+      prompt: waiterPrompt(assigned.stateDir, assigned.name),
+    })
+    if (r.agentId) {
+      const d = asDispatch(parseJson(await $.fs.read(`${assigned.stateDir}/dispatch.json`)))
+      if (d) await $.fs.write(`${assigned.stateDir}/dispatch.json`, JSON.stringify({ ...d, waiter: r.agentId }))
+    }
+    return r
   })
 }

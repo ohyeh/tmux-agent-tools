@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.0
+
+- `mods/tmux-agent` 0.10.0 — an Agent brief with a line `runtime: tmux/<profile>` dispatches that tmux worker and lets the Agent call continue as a hidden haiku `tmux-waiter` subagent, so the native sub-agent row (and claude-hud) lasts exactly as long as the worker. The waiter polls `result.json` and `launch.exit` with one Bash call at a time (≤ 540 s, Bash timeout 600000, 60 min overall). While the waiter is `running` the collector does not submit; when it is `completed` and the result is terminal the collector acks silently; when it is `failed`, `killed`, or gone the collector delivers as before. A runtime spawn that sets `name` is denied. Written by a cursor worker; reviewed by the commander (Opus 5.5).
+
 ## 0.9.1
 
 - `mods/tmux-agent` 0.9.1 — a project row's mirror and `peek` drop the blank rows under the pane's last output before taking the tail. Raw `tmux capture-pane` prints the whole pane height; live 2026-09-26 a session with one line of output at the top peeked as five blank lines. Worker rows go through `agent-tmux capture --tail`, which already trims. Mod tests 156 pass; the changed test fails without the trim.
