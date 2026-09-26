@@ -31,7 +31,7 @@
       "name": "tmux-agent",
       "source": "./mods/tmux-agent",
       "description": "Function-hook mod for tmux-agent-tools: dispatches a worker from an MCP tool and wakes this session when its result — or its launch failure — lands, so a supervised worker never finishes into silence. Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; see mods/tmux-agent/README.md.",
-      "version": "0.7.13",
+      "version": "0.7.14",
       "author": {
         "name": "PaulYeh"
       },

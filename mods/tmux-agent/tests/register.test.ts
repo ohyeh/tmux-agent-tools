@@ -906,6 +906,61 @@ describe('assign', () => {
     expect(argvs).toEqual([])
   })
 
+  test('agent-tmux off PATH: assign runs the copy in the marketplace checkout, no install step', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME, PATH: '/usr/bin:/bin' })
+    mock.store(on)
+    mock.clock(on)
+    const bin = `${HOME}/.claude/plugins/marketplaces/tmux-agent-tools/skills/tmux-agent-tools/scripts/agent-tmux`
+    const files: Files = { [bin]: '#!/bin/zsh\n' }
+    mockFs(on, files)
+    const argvs: string[][] = []
+    on('process.run', ($, e) => {
+      argvs.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    })
+
+    const out = await $.tool.call({
+      tool: 'mcp__tmux-agent__assign',
+      profile: 'codex',
+      name: 'w1',
+      dir: '/work',
+      brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+    })
+
+    expect(JSON.stringify(out)).toContain('launch requested')
+    const launch = argvs.find(a => a[0] === 'sh')?.join(' ') ?? ''
+    // Nothing else in the launch names this path: it is argv[0].
+    expect(launch).toContain(bin)
+  })
+
+  test('agent-tmux nowhere: assign is denied with where it looked, before anything is written', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME, PATH: '/usr/bin:/bin' })
+    mock.store(on)
+    mock.clock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    const argvs: string[][] = []
+    on('process.run', ($, e) => {
+      argvs.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    })
+
+    const out = JSON.stringify(
+      await $.tool.call({
+        tool: 'mcp__tmux-agent__assign',
+        profile: 'codex',
+        name: 'w1',
+        dir: '/work',
+        brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+      }),
+    )
+
+    expect(out).toContain('agent-tmux is not on PATH')
+    expect(out).toContain('.agents/skills/tmux-agent-tools/scripts/agent-tmux')
+    expect(argvs).toEqual([])
+    expect(Object.keys(files)).toEqual([])
+  })
+
   test('each dispatch gets a fresh directory, so a reused name cannot collect a stale result', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mock.store(on)

@@ -12,7 +12,6 @@ cursor 等沒有這個 mod 的 runtime。
 
 - **function hooks 要開**：`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`。沒開的話這個
   plugin 不會載入，`assign` 工具不會出現。
-- `agent-tmux` 在 `PATH` 上。
 - state root 必須是絕對路徑（見下）。
 
 ## 安裝
@@ -25,15 +24,10 @@ claude plugin install tmux-agent
 
 開發時直接掛目錄：`claude --plugin-dir mods/tmux-agent`。
 
-裝完先驗：
-
-```sh
-which agent-tmux && tmux -V            # 兩個都要有；沒有 agent-tmux 就跑 tmux-agent-tools 的 install-bin
-echo $CLAUDE_CODE_ENABLE_FUNCTION_HOOKS  # 1；改了要重開 session
-```
-
-重開 session 後工具列表要看得到 `mcp__tmux-agent__assign`，打 `/tmux` 要開出面板
-（標題寫著 mod 版本）。都沒有就是 hooks 沒開或 plugin 沒載入。
+裝完就能用，不用再跑 install-bin：`agent-tmux` 不在 `PATH` 上時，mod 自己用同一個
+marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-tools/…`），
+其次是 `npx skills` 裝的 `~/.agents/skills/tmux-agent-tools/…`，用了哪一份會 log 一行。
+都找不到時 `assign` 直接 deny，訊息寫出找過的位置——讀它的是 model，它自己就能補裝。
 
 ## 收集端：每個 session 都是
 

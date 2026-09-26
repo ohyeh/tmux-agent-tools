@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.13'
+const MOD_VERSION = '0.7.14'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -214,6 +214,7 @@ type Host = {
   envTmuxAgentDir: () => Promise<string | undefined>
   envXdgStateHome: () => Promise<string | undefined>
   envHome: () => Promise<string | undefined>
+  envPath: () => Promise<string | undefined>
   read: (path: string) => Promise<string>
   write: (path: string, text: string) => Promise<void>
   stat: (path: string) => Promise<{ mtimeMs: number }>
@@ -232,6 +233,60 @@ type Host = {
     cwd: string,
     timeoutMs: number,
   ) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+}
+
+/**
+ * Where `agent-tmux` lives, relative to HOME, when it is not on PATH: the
+ * checkout of the marketplace this mod came from (it ships the wrapper beside
+ * the mod), then an `npx skills` install. Installing the mod is the whole
+ * setup; nobody has to find and run install-bin first (asked 2026-09-26).
+ */
+const AGENT_TMUX_HOMES = [
+  '.claude/plugins/marketplaces/tmux-agent-tools/skills/tmux-agent-tools/scripts/agent-tmux',
+  '.agents/skills/tmux-agent-tools/scripts/agent-tmux',
+] as const
+/**
+ * Once found, per environment (HOME + PATH): both hosts of a session share it,
+ * so the fallback is logged once. A miss is looked up again, so an install
+ * mid-session is picked up.
+ */
+const agentTmuxFound = new Map<string, string>()
+/** The last one found, for text shown to the person (the panel renders synchronously). */
+let agentTmuxShown = 'agent-tmux'
+
+/**
+ * `agent-tmux` as argv[0]: the bare name when PATH has it (a developer's own
+ * checkout wins), else the first install that exists. `missing` lists where it
+ * looked, so the tool that fails can say so to the model.
+ */
+async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?: string }> {
+  const pathVar = await host.envPath()
+  // No PATH to read (a bare test harness): nothing to decide, run the name.
+  if (pathVar === undefined) return { bin: 'agent-tmux' }
+  const home = await host.envHome()
+  const key = `${home}\0${pathVar}`
+  const found = agentTmuxFound.get(key)
+  if (found) return { bin: (agentTmuxShown = found) }
+  const has = (path: string) => host.exists(path).catch(() => false)
+  for (const dir of pathVar.split(':').filter(Boolean)) {
+    if (await has(`${dir}/agent-tmux`)) {
+      agentTmuxFound.set(key, 'agent-tmux')
+      return { bin: (agentTmuxShown = 'agent-tmux') }
+    }
+  }
+  const paths = home ? AGENT_TMUX_HOMES.map(rel => `${home}/${rel}`) : []
+  for (const path of paths) {
+    if (await has(path)) {
+      agentTmuxFound.set(key, path)
+      host.log(`tmux-agent: agent-tmux is not on PATH; using ${path}`)
+      return { bin: (agentTmuxShown = path) }
+    }
+  }
+  return { bin: 'agent-tmux', missing: `agent-tmux is not on PATH, nor at ${paths.join(' or ') || '~/' + AGENT_TMUX_HOMES[0]}` }
+}
+
+async function withAgentTmux(host: Host, argv: readonly string[]): Promise<readonly string[]> {
+  return argv[0] === 'agent-tmux' ? [(await agentTmuxBin(host)).bin, ...argv.slice(1)] : argv
 }
 
 /**
@@ -1638,6 +1693,7 @@ export const register: Register = on => {
       envTmuxAgentDir: () => beneath.env.get('TMUX_AGENT_DIR'),
       envXdgStateHome: () => beneath.env.get('XDG_STATE_HOME'),
       envHome: () => beneath.env.get('HOME'),
+      envPath: () => beneath.env.get('PATH'),
       read: path => beneath.fs.read(path),
       write: (path, text) => beneath.fs.write(path, text),
       stat: path => beneath.fs.stat(path),
@@ -1650,7 +1706,7 @@ export const register: Register = on => {
       submit: text => beneath.prompt.submit({ text }),
       toast: text => beneath.ui.toast(text),
       log: text => beneath.ui.log(text),
-      run: (argv, cwd, timeoutMs) => beneath.process.run(argv, { cwd, timeoutMs }),
+      run: async (argv, cwd, timeoutMs) => beneath.process.run(await withAgentTmux(host, argv), { cwd, timeoutMs }),
     }
     world = host
     // A hot reload re-runs engine.create but not session.start, so the ids
@@ -1677,6 +1733,7 @@ export const register: Register = on => {
       envTmuxAgentDir: () => $.env.get('TMUX_AGENT_DIR'),
       envXdgStateHome: () => $.env.get('XDG_STATE_HOME'),
       envHome: () => $.env.get('HOME'),
+      envPath: () => $.env.get('PATH'),
       read: path => $.fs.read(path),
       write: (path, text) => $.fs.write(path, text),
       stat: path => $.fs.stat(path),
@@ -1689,7 +1746,7 @@ export const register: Register = on => {
       submit: text => $.prompt.submit({ text }),
       toast: text => $.ui.toast(text),
       log: text => $.ui.log(text),
-      run: (argv, cwd, timeoutMs) => $.process.run(argv, { cwd, timeoutMs }),
+      run: async (argv, cwd, timeoutMs) => $.process.run(await withAgentTmux(host, argv), { cwd, timeoutMs }),
     }
 
     await $.command.register({
@@ -2109,7 +2166,9 @@ export const register: Register = on => {
       }
     }
 
-    if (hidden) children.push(Text({ dimColor: true, children: `  +${hidden} more — /tmux N selects row N` }))
+    // Every fixed line truncates: a wrapped line is a row the budget above
+    // never counted, and one row past maxRows scrolls the band and disarms the digits.
+    if (hidden) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  +${hidden} more — /tmux N selects row N` }))
 
     // No room this render, no mirror: its rule, lines and hint would overflow.
     const shown = panel.mirror && panel.mirror.id === panel.selected && (panel.rows_available ?? 0) > 0 ? panel.mirror : undefined
@@ -2123,6 +2182,7 @@ export const register: Register = on => {
       children.push(
         Text({
           dimColor: true,
+          wrap: 'truncate-end',
           children:
             `Band too short to mirror — enlarge the window. ` +
             `(band ${e.props.maxRows} rows; needs ${used + 1 + MIRROR_MIN_ROWS})`,
@@ -2140,7 +2200,9 @@ export const register: Register = on => {
         children.push(
           Text({
             dimColor: true,
-            children: `See it whole: agent-tmux ${row.d.profile} attach ${row.d.name}`,
+            wrap: 'truncate-end',
+            // The binary the mod itself runs: off PATH, a bare name would not resolve.
+            children: `See it whole: ${agentTmuxShown} ${row.d.profile} attach ${row.d.name}`,
           }),
         )
       }
@@ -2342,6 +2404,12 @@ export const register: Register = on => {
     if (typeof input.dir !== 'string' || !input.dir.startsWith('/') || CTRL_RE.test(input.dir)) {
       return { deny: 'tmux-agent: dir must be an absolute path with no control characters' }
     }
+    const tool = world ? await agentTmuxBin(world) : { bin: 'agent-tmux' }
+    if (tool.missing) {
+      return {
+        deny: `tmux-agent: ${tool.missing}. Install the wrapper with: claude plugin marketplace add ohyeh/tmux-agent-tools (or put agent-tmux on PATH), then assign again.`,
+      }
+    }
 
     const since = await $.clock.now()
     // A FRESH directory per dispatch is the ownership test: a result.json in it
@@ -2374,7 +2442,7 @@ export const register: Register = on => {
     // collector reads, and it is why a failed launch reaches the session instead
     // of becoming a worker nobody is waiting for.
     // ponytail: shell-level detach; upgrade when the engine offers a spawn op.
-    const argv = ['agent-tmux', input.profile, 'assign', '--detach', name, input.dir, briefPath]
+    const argv = [tool.bin, input.profile, 'assign', '--detach', name, input.dir, briefPath]
     const child = `${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
     const run = await $.process.run(['sh', '-c', `nohup sh -c ${shq(child)} >/dev/null 2>&1 &`], {
       cwd: input.dir,
