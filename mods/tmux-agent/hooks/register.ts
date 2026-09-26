@@ -396,7 +396,12 @@ type Panel = {
    */
   armedStop?: { id: string; from: number; until: number }
 
+  /** The rows drawn: `all`, or only this session's and the project's while `showAll` is off. */
   rows: PanelRow[]
+  /** Every row of this cwd, whoever holds it. */
+  all: PanelRow[]
+  /** Other sessions' workers listed row by row; off = one summary line (asked 2026-09-26: clean, but aware). */
+  showAll: boolean
   /** Running in-process agents, or `?` when `agent.list` rejected. */
   internal: number | '?'
   /** Set once a list() failure is logged, so the 2s clock does not log every tick. */
@@ -1671,6 +1676,34 @@ type Outcome = { ok: true; text: string } | { ok: false; text: string }
  * collected.
  */
 /** Record whether this session's panel is open, so `/reload-plugins` (which closes it) can reopen it. */
+/** Keep every row; draw others' only when asked. A hidden selection is dropped with its row. */
+function setRows(panel: Panel, rows: PanelRow[]): void {
+  panel.all = rows
+  panel.rows = panel.showAll ? rows : rows.filter(r => !r.holder)
+  if (panel.selected && !panel.rows.some(r => r.id === panel.selected)) panel.selected = undefined
+}
+
+/** `其他 session 運行中 1：@a 5 · @unknown 1`, or undefined when no other session holds a row here. */
+function othersLine(all: readonly PanelRow[]): { text: string; running: number } | undefined {
+  const theirs = all.filter(r => r.holder)
+  if (!theirs.length) return undefined
+  const by = new Map<string, number>()
+  for (const r of theirs) by.set(r.holder!, (by.get(r.holder!) ?? 0) + 1)
+  const running = theirs.filter(r => !r.terminal).length
+  return { text: `其他 session 運行中 ${running}：${[...by].map(([h, n]) => `@${h} ${n}`).join(' · ')}`, running }
+}
+
+/** `text` cut to `max` display cells, `…` marking the cut. */
+function fitCells(text: string, max: number): string {
+  if (displayCells(text) <= max) return text
+  let out = ''
+  for (const ch of text) {
+    if (displayCells(out + ch) > max - 1) break
+    out += ch
+  }
+  return `${out}…`
+}
+
 async function rememberPanel(host: Host, open: boolean): Promise<void> {
   const id = host.owner()
   if (!id) return
@@ -1865,7 +1898,7 @@ function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promise<void
 
 export const register: Register = on => {
   // Per activation, shared by every entry point below.
-  const panel: Panel = { open: false, rows: [], generation: 0, internal: 0, internalMissLogged: false }
+  const panel: Panel = { open: false, rows: [], all: [], showAll: false, generation: 0, internal: 0, internalMissLogged: false }
   /**
    * The bound world, kept at activation scope because the panel's command hook
    * needs it too and `engine.create` is the only place it can be built.
@@ -2177,12 +2210,13 @@ export const register: Register = on => {
     // Goals show only in the overview (no row selected); a selected row adds its
     // tell line and a one-line summary. A fleet longer than the band is cut, the
     // selected row kept, with a "+N more" line.
+    const others = othersLine(panel.all)
     const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
     const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
     const layout = (sel: PanelRow | undefined) => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (down ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
+      const fixed = 1 + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
       const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
@@ -2426,6 +2460,31 @@ export const register: Register = on => {
     // Every fixed line truncates: a wrapped line is a row the budget above
     // never counted, and one row past maxRows scrolls the band and disarms the digits.
     if (hidden) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  +${hidden} more — /workers N selects row N` }))
+    // Others' workers as one line that is also the filter: `a` lists them row by
+    // row and back. Display only — tell, stop and peek reach every row either way.
+    if (others) {
+      children.push(
+        Box({
+          flexDirection: 'row',
+          children: [
+            Text({ color: others.running ? 'green' : undefined, dimColor: !others.running, children: '◌ ' }),
+            Button({
+              key: 'others',
+              // The toggle word leads so a narrow band cuts holders, never the action.
+              // `◌ ` and the button's `[ ]` take 6 cells; one more wraps the band.
+              label: fitCells(`${panel.showAll ? '只看自己' : '展開'} · ${others.text}`, Math.max(10, width - 6)),
+              hotkey: 'a',
+              onPress: () => {
+                panel.showAll = !panel.showAll
+                setRows(panel, panel.all)
+                panel.mirror = undefined
+                $.ui.invalidate('ui.render')
+              },
+            }),
+          ],
+        }),
+      )
+    }
 
     // No room this render, no mirror: its rule, lines and hint would overflow.
     const shown = panel.mirror && panel.mirror.id === panel.selected && (panel.rows_available ?? 0) > 0 ? panel.mirror : undefined
@@ -2529,7 +2588,7 @@ export const register: Register = on => {
     const root = await rootOf(bound)
     const [first] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
     if (panel.generation !== mine || !panel.open) return 'workers panel closed.'
-    panel.rows = first
+    setRows(panel, first)
     // The pane drew once, empty, while the rows were being read; without this
     // the first real frame waits for the 2s clock and the person sees
     // "No workers outstanding" over a fleet that is there (observed 2026-09-17).
@@ -2543,7 +2602,7 @@ export const register: Register = on => {
         const root = await rootOf(bound)
         const [rows] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
         if (panel.generation !== mine || !panel.open) return false
-        panel.rows = rows
+        setRows(panel, rows)
         return true
       } finally {
         panel.refreshing = false
@@ -2615,7 +2674,10 @@ export const register: Register = on => {
         if (panel.open) closePanel(redraw)
         return { text: 'workers panel hidden; /workers shows it again.' }
       }
-      const rows = panel.open ? panel.rows : await panelRows(bound, gate, await rootOf(bound))
+      const fresh = panel.open ? undefined : await panelRows(bound, gate, await rootOf(bound))
+      // Numbers index what is drawn; names reach every row, folded ones too.
+      const rows = fresh ?? panel.rows
+      const named = fresh ?? panel.all
 
       if (/^[0-9]+$/.test(verb)) {
         // Selecting is harmless, so N is simply row N of the current list.
@@ -2642,8 +2704,8 @@ export const register: Register = on => {
               : `no row ${target}; ${verb} takes a name (${rows.map(r => r.d.name).join(', ') || 'none'}).`,
           }
         }
-        const row = rows.find(r => r.d.name === target)
-        if (!row) return { text: `no worker "${target}" (${rows.map(r => r.d.name).join(', ') || 'none'}).` }
+        const row = named.find(r => r.d.name === target)
+        if (!row) return { text: `no worker "${target}" (${named.map(r => r.d.name).join(', ') || 'none'}).` }
         if (row.project) return { text: 'read-only project session' }
         let out: Outcome
         if (verb === 'stop') {

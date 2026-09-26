@@ -201,7 +201,7 @@ describe('ownership', () => {
     expect(text, 'a silent owner is a gone owner').toContain('"theirs"')
   })
 
-  test('a row names its holder: a live session by id, a silent one as @unknown, ours not at all', WITH_DRIVER, async ($, on) => {
+  test("others' rows fold into one line that toggles them: a live session by id, a silent one as @unknown, ours untagged", WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     // All three are delivered, so nobody claims them and each keeps its owner.
     mockStore(on, ['mine@0', 'live@0', 'dead@0'])
@@ -221,11 +221,38 @@ describe('ownership', () => {
 
     await $.session.start(session())
     await $.command.run(run('workers'))
+    const folded = textOf(await $.ui.render(bandRender()))
+    expect(folded, 'the title names this session').toContain('@sess-A · tmux')
+    expect(folded, 'ours is listed, untagged').toMatch(/mine(?!  @)/)
+    expect(folded, 'theirs by holder, one line; no heartbeat file = @unknown').toContain('展開 · 其他 session 運行中 0：@sess-B 1 · @unknown 1')
+    expect(folded, 'their rows are folded away').not.toContain('live  @sess-B')
+
+    await $.ui.press({ plugin: 'tmux-agent', key: 'others', requestId: 'above-prompt' })
+    const all = textOf(await $.ui.render(bandRender()))
+    expect(all).toContain('live  @sess-B')
+    expect(all).toContain('dead  @unknown')
+    expect(all, 'the same line folds them back').toContain('只看自己')
+
+    await $.ui.press({ plugin: 'tmux-agent', key: 'others', requestId: 'above-prompt' })
+    expect(textOf(await $.ui.render(bandRender()))).not.toContain('live  @sess-B')
+  })
+
+  test('with no other session here there is no others line', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on, ['mine@0'])
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    mockFs(on, {
+      [`${ROOT}/mine/dispatch.json`]: dispatch('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
+      [`${ROOT}/mine/result.json`]: finished(),
+    })
+    mockPanel(on, { running: true, sessions: ['codex-cli-mine'] })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
     const drawn = textOf(await $.ui.render(bandRender()))
-    expect(drawn, 'the title names this session').toContain('@sess-A · tmux')
-    expect(drawn).toContain('live  @sess-B')
-    expect(drawn, 'no heartbeat file: nobody collects it').toContain('dead  @unknown')
-    expect(drawn, 'ours carries no tag').not.toMatch(/mine  @/)
+    expect(drawn).toContain('mine')
+    expect(drawn).not.toContain('其他 session')
   })
 
   test("a worker whose dir is gone is still reached by name, from /, logged once", WITH_DRIVER, async ($, on) => {
@@ -391,10 +418,15 @@ describe('ownership', () => {
 
     await $.session.start(session())
     await $.command.run(run('workers'))
-    const drawn = textOf(await $.ui.render(bandRender()))
-    expect(drawn, "the other session's live teammate is listed").toContain('w1')
-    expect(drawn, 'tagged with its owner').toContain('@sess-A')
-    expect(drawn, "another repo's worker is not").not.toContain('far')
+    const folded = textOf(await $.ui.render(bandRender()))
+    expect(folded, "the other session's live teammate is counted as running").toContain('運行中 1：@sess-A 1')
+    expect(folded, "another repo's worker is not").not.toContain('far')
+    const told = await $.command.run(run('workers', 'tell w1 first, while folded'))
+    expect(told.text, 'a folded row is still reached by name').not.toContain('no worker')
+    await $.ui.press({ plugin: 'tmux-agent', key: 'refresh', requestId: 'above-prompt' })
+    const after = textOf(await $.ui.render(bandRender()))
+    expect(after, 'telling it made it ours: an untagged row').toContain('w1  running')
+    expect(after, 'and nobody else holds a row here').not.toContain('其他 session')
 
     await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'now do the tests' })
     expect(JSON.parse(files[`${ROOT}/w1/dispatch.json`]!), 'the teller owns the next episode').toMatchObject({ owner: 'sess-B', ownerCwd: '/work' })
@@ -2475,6 +2507,30 @@ describe('teammates', () => {
       expect(headerBarCells(tree), `${columns} columns`).toBe(columns)
       expect(keysOf(tree)).toContain('close')
     }
+  })
+
+  test('the others line fits 60 columns with real ids, cutting holders, never the toggle', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    mockFs(on, {
+      [`${ROOT}/.collector-286cedc4-f039`]: '0',
+      [`${ROOT}/.collector-169a198a-2927`]: '0',
+      [`${ROOT}/.collector-9f00aa11-0000`]: '0',
+      [`${ROOT}/p1/dispatch.json`]: dispatch('p1', 0, { owner: '286cedc4-f039', ownerCwd: '/work' }),
+      [`${ROOT}/p2/dispatch.json`]: dispatch('p2', 0, { owner: '169a198a-2927', ownerCwd: '/work' }),
+      [`${ROOT}/p3/dispatch.json`]: dispatch('p3', 0, { owner: '9f00aa11-0000', ownerCwd: '/work' }),
+    })
+    mockPanel(on, { running: true })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const line = textOf(await $.ui.render(bandRender(40, 39, 60))).split('\n').find(l => l.includes('其他 session'))
+    expect(line, 'drawn').toBeDefined()
+    expect(line).toContain('展開 · 其他 session 運行中 3')
+    expect(line, 'the holder list is cut').toContain('…')
+    expect(termCells(`◌ [ ${line} ]`), 'one row, no wrap').toBeLessThanOrEqual(60)
   })
 
   test('peek returns the pane tail as fenced data plus the worker state, once, on demand', WITH_DRIVER, async ($, on) => {
