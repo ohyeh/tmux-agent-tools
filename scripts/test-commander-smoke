@@ -6,6 +6,9 @@
 #   3. a dispatch owned by someone else is never sent
 #   4. the heartbeat file is refreshed each tick
 #   5. collect exits when the commander session is gone
+#   6. panel prints no workers, running/success/failed marks, delivered rows,
+#      drops whole entries at --width, and hides a foreign owner
+#   7. start sets a per-session second status line; --no-panel does not
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
@@ -110,6 +113,15 @@ assert_excludes() {
   else
     print -r -- "  FAIL $label: '$needle' was present"
     FAIL=$((FAIL + 1))
+  fi
+}
+index_of() {
+  local needle="$1" hay="$2" prefix
+  prefix="${hay%%"$needle"*}"
+  if [[ "$prefix" == "$hay" ]]; then
+    print -r -- -1
+  else
+    print -r -- "${#prefix}"
   fi
 }
 
@@ -294,6 +306,16 @@ assert "start collector is alive" "$(kill -0 "$SPID" 2>/dev/null && echo yes || 
 have_start_hb() { [[ -f "$TMUX_AGENT_DIR/.collector-$SSESSION" ]]; }
 poll 25 have_start_hb || { echo "start collector wrote no heartbeat" >&2; cat "$WORK/start.err"; exit 1; }
 assert "start heartbeat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$TMUX_AGENT_DIR/.collector-$SSESSION")" == <-> ]] && echo yes || echo no)" "yes"
+ST_STATUS="$(command tmux show-options -t "$SSESSION" -v status)"
+assert "start sets per-session status 2" "$ST_STATUS" "2"
+ST_INT="$(command tmux show-options -t "$SSESSION" -v status-interval)"
+assert "start sets per-session status-interval 2" "$ST_INT" "2"
+ST_FMT="$(command tmux show-options -t "$SSESSION" -v 'status-format[1]')"
+assert_contains "start status line runs panel" "$ST_FMT" " panel "
+assert_contains "start status line quotes the session" "$ST_FMT" "'$SSESSION'"
+assert_contains "start status line names this script" "$ST_FMT" "tmux-agent-commander"
+G_FMT="$(command tmux show-options -g -v 'status-format[1]' 2>/dev/null || true)"
+assert_excludes "panel command is not a global option" "$G_FMT" "tmux-agent-commander"
 code=0
 "$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start2.out" 2>"$WORK/start2.err" || code=$?
 assert "second start exits 1" "$code" "1"
@@ -301,6 +323,131 @@ assert_contains "second start names the live collector" "$(<"$WORK/start2.err")"
 "$COMMANDER" stop codex "$SNAME" >"$WORK/stop.out"
 assert "stop removed the pid file" "$([[ -e "$PIDFILE" ]] && echo yes || echo no)" "no"
 assert "stop killed the collector" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "no"
+
+echo
+echo "case: start --no-panel does not install the status line"
+NPNAME="nopanel$$"
+NPSESSION="${PREFIX}-${NPNAME}"
+np_code=0
+"$COMMANDER" start codex "$NPNAME" "$WORK" --no-attach --no-panel >"$WORK/np.out" 2>"$WORK/np.err" || np_code=$?
+assert "--no-panel start exits 0" "$np_code" "0"
+if (( np_code == 0 )); then
+  NPOPTS="$(command tmux show-options -t "$NPSESSION" 2>/dev/null || true)"
+  assert_excludes "--no-panel does not set the panel command" "$NPOPTS" "tmux-agent-commander"
+  "$COMMANDER" stop codex "$NPNAME" >"$WORK/np-stop.out"
+fi
+
+echo
+echo "case: panel with no owned workers"
+EMPTY_SESSION="panel-empty-$$"
+eline="$("$COMMANDER" panel "$EMPTY_SESSION" --width 80)"
+assert "panel with no owned workers" "$eline" "tmux-agent: no workers"
+
+echo
+echo "case: panel marks running, success, failed, delivered; hides foreign owners"
+MSESSION="panel-marks-$$"
+NOW_MS="$(perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000')"
+s_bad=$(( NOW_MS - (5 * 3600 + 120) * 1000 ))
+s_ok=$(( NOW_MS - (3 * 3600 + 120) * 1000 ))
+s_run=$(( NOW_MS - (12 * 60 + 30) * 1000 ))
+s_sec=$(( NOW_MS - 45000 ))
+s_new=$(( NOW_MS - (4 * 3600 + 120) * 1000 ))
+s_midb=$(( NOW_MS - (6 * 3600 + 120) * 1000 ))
+s_mida=$(( NOW_MS - (8 * 3600 + 120) * 1000 ))
+s_old=$(( NOW_MS - (10 * 3600 + 120) * 1000 ))
+write_dispatch() {
+  local dir="$1" kind="$2" profile="$3" name="$4" since="$5" owner="$6"
+  mkdir -p "$TMUX_AGENT_DIR/$dir"
+  jq -n \
+    --arg profile "$profile" --arg name "$name" --arg dir "$REPO" \
+    --argjson since "$since" --arg owner "$owner" --arg ownerCwd "$WORK" \
+    '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd}' \
+    > "$TMUX_AGENT_DIR/$dir/$kind"
+}
+write_dispatch p-bad dispatch.json agy bad1 "$s_bad" "$MSESSION"
+write_dispatch p-ok dispatch.json codex ok1 "$s_ok" "$MSESSION"
+write_dispatch p-run dispatch.json codex run1 "$s_run" "$MSESSION"
+write_dispatch p-sec dispatch.json codex secw "$s_sec" "$MSESSION"
+write_dispatch p-new dispatch.delivered.json codex newD "$s_new" "$MSESSION"
+write_dispatch p-midb dispatch.delivered.json codex midB "$s_midb" "$MSESSION"
+write_dispatch p-mida dispatch.delivered.json codex midA "$s_mida" "$MSESSION"
+write_dispatch p-old dispatch.delivered.json codex oldD "$s_old" "$MSESSION"
+write_dispatch p-foreign dispatch.json agy FOREIGNTOKEN 1700000000000 someone-else
+write_dispatch p-fordel dispatch.delivered.json agy FOREIGNDELIV 1700000000003 someone-else
+jq -n '{schema_version:1,status:"failed",summary:"nope",artifacts:[],errors:[]}' \
+  > "$TMUX_AGENT_DIR/p-bad/result.json"
+jq -n '{schema_version:1,status:"success",summary:"ok",artifacts:[],errors:[]}' \
+  > "$TMUX_AGENT_DIR/p-ok/result.json"
+jq -n '{schema_version:1,status:"success",summary:"delivered anyway",artifacts:[],errors:[]}' \
+  > "$TMUX_AGENT_DIR/p-new/result.json"
+jq -n '{schema_version:1,status:"success",summary:"FOREIGNWORKERTOKEN",artifacts:[],errors:[]}' \
+  > "$TMUX_AGENT_DIR/p-foreign/result.json"
+mline="$("$COMMANDER" panel "$MSESSION" --width 400)"
+assert_contains "running mark" "$mline" "run1 codex 12m ▶"
+assert_contains "success mark" "$mline" "ok1 codex 3h ✓ success"
+assert_contains "failed mark" "$mline" "bad1 agy 5h ✗ failed"
+assert_contains "newest delivered" "$mline" "newD codex 4h ✓ delivered"
+assert_contains "middle delivered" "$mline" "midB codex 6h ✓ delivered"
+assert_contains "older delivered kept" "$mline" "midA codex 8h ✓ delivered"
+assert_excludes "fourth delivered is not shown" "$mline" "oldD"
+assert_excludes "foreign owner is not shown" "$mline" "FOREIGNTOKEN"
+assert_excludes "foreign delivered is not shown" "$mline" "FOREIGNDELIV"
+assert_excludes "wide panel does not truncate" "$mline" "more"
+sec_tok="${mline#*secw codex }"
+sec_tok="${sec_tok%% ▶*}"
+case "$sec_tok" in
+  45s|46s|47s|48s|49s) sec_ok=yes ;;
+  *) sec_ok="no:$sec_tok" ;;
+esac
+assert "running seconds mark" "$sec_ok" "yes"
+prev=""
+order_ok=yes
+for token in "bad1 " "ok1 " "run1 " "secw " "newD " "midB " "midA "; do
+  here="$(index_of "$token" "$mline")"
+  if [[ "$here" == -1 ]]; then
+    order_ok="missing:$token"
+    break
+  fi
+  if [[ -n "$prev" && "$here" -le "$prev" ]]; then
+    order_ok="out-of-order:$token"
+    break
+  fi
+  prev="$here"
+done
+assert "active oldest-first, then newest delivered" "$order_ok" "yes"
+delivered_n=0
+rest="$mline"
+while [[ "$rest" == *'✓ delivered'* ]]; do
+  delivered_n=$(( delivered_n + 1 ))
+  rest="${rest#*✓ delivered}"
+done
+assert "exactly three delivered records" "$delivered_n" "3"
+
+echo
+echo "case: panel --width drops whole entries and prints +N more"
+WSESSION="panel-width-$$"
+NOW_MS="$(perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000')"
+s_w=$(( NOW_MS - (9 * 3600 + 1800) * 1000 ))
+for wname in aaaa bbbb cccc dddd; do
+  write_dispatch "w-$wname" dispatch.json zz "$wname" "$s_w" "$WSESSION"
+done
+e1="aaaa zz 9h ▶"
+e2="bbbb zz 9h ▶"
+e3="cccc zz 9h ▶"
+e4="dddd zz 9h ▶"
+two="$e1 $e2"
+two_more="$two +2 more"
+one_more="$e1 +3 more"
+wline="$("$COMMANDER" panel "$WSESSION" --width "${#two_more}")"
+assert "width fits two entries plus +2 more" "$wline" "$two_more"
+assert_excludes "third entry was dropped whole" "$wline" "cccc"
+assert_excludes "fourth entry was dropped whole" "$wline" "dddd"
+wline="$("$COMMANDER" panel "$WSESSION" --width "${#two}")"
+assert "no room for the suffix drops another whole entry" "$wline" "$one_more"
+assert_excludes "dropped entry is not cut mid-word" "$wline" "bbbb"
+wline="$("$COMMANDER" panel "$WSESSION" --width 1)"
+assert "narrower than one entry prints +N more" "$wline" "+4 more"
+assert_excludes "narrow line does not contain an entry" "$wline" "aaaa"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

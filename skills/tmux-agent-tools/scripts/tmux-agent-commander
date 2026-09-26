@@ -17,16 +17,19 @@ usage() {
 tmux-agent-commander — collect worker results into a non-Claude pane
 
 Usage:
-  tmux-agent-commander start <cli> <name> <dir> [--no-attach]
+  tmux-agent-commander start <cli> <name> <dir> [--no-attach] [--no-panel]
   tmux-agent-commander assign <profile> <worker> <dir> <brief-file>
   tmux-agent-commander collect <cli> <name>
   tmux-agent-commander stop <cli> <name>
   tmux-agent-commander status
+  tmux-agent-commander panel <session> [--width N]
 
 start launches `agent-tmux <cli> start --exact`, then a detached collector,
-then attach (unless --no-attach). assign runs inside that pane: it records
-dispatch.json, then `agent-tmux <profile> assign --detach`. collect is the
-loop start runs in the background.
+then attach (unless --no-attach). Unless --no-panel, it also sets a second
+status line on that session that runs `panel <session>`. assign runs inside
+that pane: it records dispatch.json, then `agent-tmux <profile> assign
+--detach`. collect is the loop start runs in the background. panel prints
+one line of workers whose dispatch owner is the tmux session name.
 EOF
   exit 2
 }
@@ -138,6 +141,17 @@ read_pid() {
   print -r -- "$pid"
 }
 
+# Exact .owner string. deliver_once matches it to the tmux session; the
+# heartbeat file is the one that sanitizes. panel uses owner_matches on the
+# owner from its single jq pass, not one jq per worker.
+owner_of() {
+  "$JQ" -r '.owner // empty' "$1" 2>/dev/null || true
+}
+
+owner_matches() {
+  [[ "$1" == "$2" ]]
+}
+
 # Terminal statuses the mod delivers (register.ts TERMINAL) plus the
 # underscore spelling in SPEC.md. Alias words such as "done" are not
 # terminal for the mod, so they are not terminal here.
@@ -202,8 +216,8 @@ deliver_once() {
   for dispatch in "${dispatches[@]}"; do
     [[ -f "$dispatch" ]] || continue
     worker_dir="${dispatch:h}"
-    owner="$("$JQ" -r '.owner // empty' "$dispatch" 2>/dev/null || true)"
-    [[ "$owner" == "$session" ]] || continue
+    owner="$(owner_of "$dispatch")"
+    owner_matches "$owner" "$session" || continue
     since="$("$JQ" -r '.since // empty' "$dispatch" 2>/dev/null || true)"
     [[ "$since" == <-> ]] || continue
     if [[ -f "$worker_dir/delivered" ]]; then
@@ -261,7 +275,7 @@ undelivered_count() {
   for dispatch in "${dispatches[@]}"; do
     [[ -f "$dispatch" ]] || continue
     worker_dir="${dispatch:h}"
-    owner="$("$JQ" -r '.owner // empty' "$dispatch" 2>/dev/null || true)"
+    owner="$(owner_of "$dispatch")"
     [[ "$(sanitize_owner "$owner")" == "$(sanitize_owner "$session")" ]] || continue
     since="$("$JQ" -r '.since // empty' "$dispatch" 2>/dev/null || true)"
     [[ "$since" == <-> ]] || continue
@@ -279,14 +293,26 @@ undelivered_count() {
   print -r -- "$n"
 }
 
+# A split pane is a pane: agent-tmux -t <session> would type into whichever
+# pane is active. This line is not a pane.
+install_worker_panel() {
+  local session="$1" fmt
+  fmt="#(${(qq)SELF} panel ${(qq)session})"
+  command tmux set-option -t "$session" status 2
+  command tmux set-option -t "$session" 'status-format[1]' "$fmt"
+  command tmux set-option -t "$session" status-interval 2
+}
+
 cmd_start() {
-  local no_attach=0
+  local no_attach=0 no_panel=0
   local -a pos
   pos=()
   local arg
   for arg in "$@"; do
     if [[ "$arg" == "--no-attach" ]]; then
       no_attach=1
+    elif [[ "$arg" == "--no-panel" ]]; then
+      no_panel=1
     else
       pos+=("$arg")
     fi
@@ -306,6 +332,9 @@ cmd_start() {
     fi
   fi
   agent_tmux "$cli" start --exact "$name" "$dir"
+  if (( ! no_panel )); then
+    install_worker_panel "$session"
+  fi
   log="$root/.commander-$(sanitize_owner "$session").log"
   # agent-tmux drops $TMUX before new-session, so the collector must too.
   # TMUX_TMPDIR still selects the server.
@@ -426,6 +455,226 @@ cmd_status() {
   done
 }
 
+# 45s / 12m / 3h. Floor of whole seconds; a since in the future is 0s.
+format_elapsed() {
+  local since="$1" now="$2" delta
+  delta=$(( (now - since) / 1000 ))
+  if (( delta < 0 )); then
+    delta=0
+  fi
+  if (( delta < 60 )); then
+    print -r -- "${delta}s"
+  elif (( delta < 3600 )); then
+    print -r -- "$(( delta / 60 ))m"
+  else
+    print -r -- "$(( delta / 3600 ))h"
+  fi
+}
+
+# running (no terminal result yet) ▶; success ✓ <status>; any other terminal ✗ <status>.
+# A retired record is ✓ delivered, not the result's own status.
+panel_mark() {
+  # Not named status: zsh's $status is read-only (it is $?).
+  local kind="$1" result_status="$2"
+  if [[ "$kind" == delivered ]]; then
+    print -r -- "✓ delivered"
+    return 0
+  fi
+  if [[ -n "$result_status" ]] && is_terminal_status "$result_status"; then
+    if [[ "$result_status" == success ]]; then
+      print -r -- "✓ success"
+    else
+      print -r -- "✗ ${result_status}"
+    fi
+  else
+    print -r -- "▶"
+  fi
+}
+
+# One jq for every dispatch and result under root. Prints owned entries, active
+# oldest-first, then the three newest delivered records.
+collect_panel_entries() {
+  local root="$1" session="$2" now="$3"
+  local -a files
+  files=(
+    "$root"/*/dispatch.json(N)
+    "$root"/*/dispatch.delivered.json(N)
+    "$root"/*/result.json(N)
+  )
+  (( ${#files} )) || return 0
+  local raw line kind owner name profile since result_status
+  local elapsed mark entry
+  local -a active_keys=() delivered_keys=()
+  raw="$("$JQ" -n -r '
+    def field($s):
+      $s | gsub("[\t\r\n\u001f]"; " ");
+    def as_text($v):
+      if $v == null or $v == false then ""
+      elif ($v|type) == "string" then $v
+      elif ($v|type) == "number" or $v == true then ($v|tostring)
+      else ""
+      end;
+    def since_text($v):
+      if ($v|type) == "number" and ($v|floor) == $v then ($v|floor|tostring)
+      else ""
+      end;
+    def status_of($doc):
+      if $doc == null or ($doc|type) != "object" then ""
+      elif ($doc.status|type) == "string" then $doc.status
+      elif ($doc.body|type) == "object" and ($doc.body.status|type) == "string" then $doc.body.status
+      else ""
+      end;
+    def worker_name($path; $doc):
+      if ($doc.name|type) == "string" and ($doc.name|length) > 0 then $doc.name
+      else ($path | split("/") | if length >= 2 then .[-2] else "worker" end)
+      end;
+    def kind_of($path):
+      if $path | endswith("/dispatch.delivered.json") then "delivered"
+      elif $path | endswith("/dispatch.json") then "active"
+      else ""
+      end;
+    [inputs | {path: input_filename, doc: .}] as $rows
+    | ($rows | map({key: .path, value: .doc}) | from_entries) as $by
+    | $rows[]
+    | .path as $path
+    | .doc as $doc
+    | select(($doc|type) == "object")
+    | kind_of($path) as $kind
+    | select($kind != "")
+    | (if $kind == "delivered"
+       then ($path | sub("/dispatch\\.delivered\\.json$"; "/result.json"))
+       else ($path | sub("/dispatch\\.json$"; "/result.json"))
+       end) as $rpath
+    | [
+        $kind,
+        field(as_text($doc.owner)),
+        field(worker_name($path; $doc)),
+        field(as_text($doc.profile)),
+        since_text($doc.since),
+        field(status_of($by[$rpath]))
+      ]
+    | join("\u001f")
+  ' "${files[@]}" </dev/null)"
+  [[ -n "$raw" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS=$'\u001f' read -r kind owner name profile since result_status <<< "$line"
+    owner_matches "$owner" "$session" || continue
+    [[ "$since" == <-> ]] || continue
+    [[ -n "$name" ]] || continue
+    elapsed="$(format_elapsed "$since" "$now")"
+    mark="$(panel_mark "$kind" "$result_status")"
+    entry="${name} ${profile} ${elapsed} ${mark}"
+    if [[ "$kind" == delivered ]]; then
+      delivered_keys+=("$(printf '%016d\t%s\t%s' "$since" "$name" "$entry")")
+    else
+      active_keys+=("$(printf '%016d\t%s\t%s' "$since" "$name" "$entry")")
+    fi
+  done <<< "$raw"
+  local row
+  if (( ${#active_keys} )); then
+    local -a asorted
+    asorted=("${(@o)active_keys}")
+    for row in "${asorted[@]}"; do
+      print -r -- "${row##*$'\t'}"
+    done
+  fi
+  if (( ${#delivered_keys} )); then
+    local -a dsorted
+    local i take
+    dsorted=("${(@O)delivered_keys}")
+    take=${#dsorted}
+    if (( take > 3 )); then
+      take=3
+    fi
+    for (( i = 1; i <= take; i++ )); do
+      row="${dsorted[i]}"
+      print -r -- "${row##*$'\t'}"
+    done
+  fi
+}
+
+# Drop whole entries from the end. Never cut one mid-word; if nothing fits,
+# the line is "+N more".
+fit_panel_line() {
+  local width="$1"
+  shift
+  local -a entries=("$@")
+  local n=${#entries} i dropped line k
+  if (( n == 0 )); then
+    print -r -- "tmux-agent: no workers"
+    return 0
+  fi
+  for (( i = n; i >= 0; i-- )); do
+    dropped=$(( n - i ))
+    if (( i == 0 )); then
+      line="+${dropped} more"
+    else
+      line="${entries[1]}"
+      for (( k = 2; k <= i; k++ )); do
+        line+=" ${entries[k]}"
+      done
+      if (( dropped > 0 )); then
+        line+=" +${dropped} more"
+      fi
+    fi
+    if (( ${#line} <= width )); then
+      print -r -- "$line"
+      return 0
+    fi
+  done
+  print -r -- "$line"
+}
+
+cmd_panel() {
+  local session="" width="" width_set=0 arg
+  while (( $# )); do
+    arg="$1"
+    shift
+    case "$arg" in
+      --width)
+        (( $# )) || usage
+        width="$1"
+        shift
+        width_set=1
+        ;;
+      -h|--help) usage ;;
+      --*) usage ;;
+      *)
+        [[ -z "$session" ]] || usage
+        session="$arg"
+        ;;
+    esac
+  done
+  [[ -n "$session" ]] || usage
+  if (( width_set )); then
+    [[ "$width" == <-> ]] || die "width must be a non-negative integer"
+  else
+    local tw
+    tw="$(command tmux display -p '#{client_width}' 2>/dev/null || true)"
+    tw="${tw//[[:space:]]/}"
+    if [[ "$tw" == <-> && "$tw" -gt 0 ]]; then
+      width="$tw"
+    else
+      width=120
+    fi
+  fi
+  width=$(( 10#$width ))
+  local root now out line
+  local -a entries=()
+  root="$(state_root)"
+  now="$(now_ms)"
+  if [[ -d "$root" ]]; then
+    out="$(collect_panel_entries "$root" "$session" "$now")"
+    if [[ -n "$out" ]]; then
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && entries+=("$line")
+      done <<< "$out"
+    fi
+  fi
+  fit_panel_line "$width" "${entries[@]}"
+}
+
 main() {
   (( $# > 0 )) || usage
   local cmd="$1"
@@ -436,6 +685,7 @@ main() {
     assign) require_jq; cmd_assign "$@" ;;
     collect) require_jq; cmd_collect "$@" ;;
     stop) cmd_stop "$@" ;;
+    panel) require_jq; cmd_panel "$@" ;;
     status) cmd_status "$@" ;;
     *) usage ;;
   esac

@@ -109,6 +109,9 @@ its pane, then end the turn. Results arrive as a prompt.
     tmux-agent-commander start <cli> <name> <dir>
     tmux-agent-commander assign <profile> <worker> <dir> <brief-file>
 
+`start` sets a second tmux status line that runs `panel <session>` every 2s,
+listing this commander's workers. It is not a split pane, so `agent-tmux -t <session>` still hits the active pane. `--no-panel` skips it.
+
 `assign` prints the worker name (your name plus a 4-character suffix; use
 that name for any follow-up) and tells you to end the turn. The prompt
 names each finished worker, its profile, status, a short summary, and the
