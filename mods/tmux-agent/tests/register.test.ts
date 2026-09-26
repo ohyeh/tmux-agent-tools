@@ -2937,13 +2937,13 @@ describe('panel UX, 2026-09-25 live probe', () => {
     expect(panel.argv.some(a => a.join(' ') === `${WRAPPER} codex stop w1`)).toEqual(false)
   })
 
-  test('a 13-row band with eight workers stays inside maxRows, selected or not, so the digits stay armed', WITH_DRIVER, async ($, on) => {
+  test('a 13-row band with fourteen workers stays inside maxRows, selected or not, so the digits stay armed', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mock.clock(on)
     const files: Files = {}
-    for (let i = 1; i <= 8; i += 1) files[`${ROOT}/w${i}/dispatch.json`] = dispatch(`w${i}`, 0, { goal: `goal ${i}` })
-    files[`${ROOT}/w6/result.json`] = finished('x'.repeat(2_000))
+    for (let i = 1; i <= 14; i += 1) files[`${ROOT}/w${i}/dispatch.json`] = dispatch(`w${i}`, 0, { goal: `goal ${i}` })
+    files[`${ROOT}/w13/result.json`] = finished('x'.repeat(2_000))
     mockFs(on, files)
     const panel = mockPanel(on, { running: true, idle_seconds: 5 }, Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'), false, undefined, true)
 
@@ -2953,18 +2953,20 @@ describe('panel UX, 2026-09-25 live probe', () => {
     const overview = await $.ui.render(bandRender(13))
     expect(rowsOf(overview)).toBeLessThanOrEqual(13)
     expect(textOf(overview)).toContain('more — /tmux N selects row N')
+    // Not every worker fits with its goal line, so no goal is drawn.
+    expect(textOf(overview)).not.toContain('goal 1')
 
-    // Row 6 is past the cut, so it is reached by typing; it is the finished row
+    // Row 13 is past the cut, so it is reached by typing; it is the finished row
     // with a long summary, the case that used to wrap six rows.
-    expect(keysOf(overview)).not.toContain('w6@0')
-    expect((await $.command.run(run('tmux', '6'))).text).toContain('"w6" selected')
+    expect(keysOf(overview)).not.toContain('w13@0')
+    expect((await $.command.run(run('tmux', '13'))).text).toContain('"w13" selected')
     await clock.advance(2_000)
     const picked = await $.ui.render(bandRender(13))
     expect(rowsOf(picked), 'selected, summary and mirror included').toBeLessThanOrEqual(13)
     // The list gave way to the mirror (live: "band 13 rows; needs 18" with eight).
     expect(textOf(picked)).not.toContain('too short to mirror')
     expect(captures(panel.argv).length).toBeGreaterThan(0)
-    expect(keysOf(picked)).toEqual(expect.arrayContaining(['w6@0', 'stop:w6@0']))
+    expect(keysOf(picked)).toEqual(expect.arrayContaining(['w13@0', 'stop:w13@0']))
   })
 
   test('two workers on a 13-row band still get a mirror', WITH_DRIVER, async ($, on) => {
@@ -2979,7 +2981,12 @@ describe('panel UX, 2026-09-25 live probe', () => {
 
     await $.session.start(session())
     await $.command.run(run('tmux'))
-    await $.ui.render(bandRender(13))
+    // Both workers fit with their goal lines, so the goals are drawn.
+    const overview = textOf(await $.ui.render(bandRender(13)))
+    expect(overview).toContain('    one')
+    expect(overview).toContain('    two')
+    // The state comes before the repo, so a narrow band cuts the repo first.
+    expect(overview).toMatch(/w1 {2}running.* {2}work/)
     await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
     await clock.advance(2_000)
     const drawn = await $.ui.render(bandRender(13))

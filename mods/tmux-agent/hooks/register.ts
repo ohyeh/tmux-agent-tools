@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.7.12'
+const MOD_VERSION = '0.7.13'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -1902,16 +1902,20 @@ export const register: Register = on => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
       const fixed = 1 + (down ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
-      const perRow = sel ? 1 : 2
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
       const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
-      const fits = (n: number) => fixed + n * perRow + (n < panel.rows.length ? 1 : 0) + reserve <= e.props.maxRows
+      const fitsAt = (perRow: number, n: number) =>
+        fixed + n * perRow + (n < panel.rows.length ? 1 : 0) + reserve <= e.props.maxRows
+      // Each goal line costs a worker row: goals are drawn only when every
+      // worker fits with its goal, so they never push a worker off the band.
+      const goals = !sel && fitsAt(2, panel.rows.length)
+      const perRow = goals ? 2 : 1
       let shown = panel.rows.length
-      while (shown > 1 && !fits(shown)) shown -= 1
-      return { shown, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
+      while (shown > 1 && !fitsAt(perRow, shown)) shown -= 1
+      return { shown, goals, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
     }
-    const { shown: shownRows, used } = layout(selected)
+    const { shown: shownRows, goals, used } = layout(selected)
     const first = selected ? Math.max(0, Math.min(selIndex - shownRows + 1, panel.rows.length - shownRows)) : 0
     const hidden = panel.rows.length - shownRows
     // The mirror is sized for the layout a selection draws — before the press
@@ -1935,11 +1939,18 @@ export const register: Register = on => {
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
     // The hint names the slash commands: they work in any terminal, where a
     // letter hotkey needs the band focused and ctrl+x tab may never arrive.
-    const hint = '  1-9 select · /tmux stop <name> · /tmux tell <name> <text> '
     // The title, `[ refresh ]` and `[ hide ]`; the hint is padded so the bar
     // spans the row up to the engine's own `[-]` collapse control, which the band
     // draws over its last cells (observed live: it covered `[ hide ]`).
     const titleCells = ` tmux workers v${MOD_VERSION} `.length + '[ refresh ]'.length + '[ hide ]'.length + ' [-]'.length
+    const hintRoom = Math.max(0, width - titleCells)
+    // Whole pieces, dropped from the right: a sliced hint ended mid-command
+    // ("· /tmux stop <" at 72 columns).
+    let hint = ''
+    for (const piece of ['  1-9 select', ' · /tmux stop <name>', ' · /tmux tell <name> <text>']) {
+      if (hint.length + piece.length + 1 > hintRoom) break
+      hint += piece
+    }
     // A coloured title bar marks where the panel starts, so its rows do not read
     // as the session's own output. Background, not a border: a border costs two
     // of the band's few rows, and the mirror needs them.
@@ -1950,7 +1961,7 @@ export const register: Register = on => {
         children: [
           Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: ` tmux workers v${MOD_VERSION} ` }),
           Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
-          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: hint.slice(0, Math.max(0, width - titleCells)).padEnd(Math.max(0, width - titleCells)) }),
+          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: hint.padEnd(hintRoom) }),
           // Last and apart from refresh: hiding is undone by /tmux, but it should
           // not sit one key away from the button people press most.
           Button({ key: 'close', label: 'hide', hotkey: 'q', onPress: () => void panel.close?.() }),
@@ -1996,7 +2007,9 @@ export const register: Register = on => {
       // sessions in one repo can tell whose is whose; an adopted one says so.
       const me = world?.owner()
       const tag = r.d.owner && me && r.d.owner !== me ? `  @${r.d.owner.slice(0, 8)}` : r.d.adoptedFrom ? `  adopted@${r.d.adoptedFrom.slice(0, 8)}` : ''
-      const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}${tag}  ${repo}  ${mark}  ${elapsed(r.ageMs)}`
+      // The state before the repo: a narrow band cuts from the right, and the
+      // state is what the person reads the panel for.
+      const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}${tag}  ${mark}  ${elapsed(r.ageMs)}  ${repo}`
       // A Button takes no colour, so the state is coloured beside it: a dot before
       // the row and, on the selected row, its state word restated in that colour.
       const color = STATE_COLOR[r.state]
@@ -2004,7 +2017,8 @@ export const register: Register = on => {
         Box({
           flexDirection: 'row',
           children: [
-            Text({ color, bold: true, children: r.state === 'needs-input' ? '? ' : '● ' }),
+            // finished and delivered share cyan; the glyph tells "reported" apart.
+            Text({ color, bold: true, children: r.state === 'needs-input' ? '? ' : r.state === 'delivered' ? '✓ ' : '● ' }),
             Button({
               key: r.id,
               label: label.slice(0, Math.max(10, width - 5)),
@@ -2023,7 +2037,7 @@ export const register: Register = on => {
           ],
         }),
       )
-      if (r.d.goal && !selected) {
+      if (r.d.goal && goals) {
         children.push(
           Text({
             dimColor: true,
@@ -2045,7 +2059,8 @@ export const register: Register = on => {
               ? [
                   Input({
                     key: `tell:${r.id}`,
-                    placeholder: `message to ${r.d.name} — Enter sends`,
+                    placeholder: 'message — Enter sends',
+                    submitLabel: 'send',
                     onSubmit: (value: string) => {
                       const text = value.trim()
                       if (!text) return
@@ -2125,7 +2140,7 @@ export const register: Register = on => {
         children.push(
           Text({
             dimColor: true,
-            children: `See it whole: agent-tmux ${row.d.profile} list, then tmux attach -t <session>`,
+            children: `See it whole: agent-tmux ${row.d.profile} attach ${row.d.name}`,
           }),
         )
       }

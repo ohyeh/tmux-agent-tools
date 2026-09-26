@@ -65,8 +65,9 @@ follows ONE OWNER below unchanged.
    - `collector: NONE — …` (the collector paused itself: three delivery
      refusals, or the acknowledged set over budget) → nobody will wake you.
      Fix the cause the receipt names (restart the session; clear old worker
-     directories) OR harvest yourself with the ONE OWNER procedure, using the
-     harvest command the receipt prints.
+     directories) OR harvest yourself as the receipt says: `peek` until the
+     worker is idle, then Read the `result.json` path it prints. A Bash
+     `agent-tmux … result` is denied while the mod is loaded.
    - a `deny` → the launch never happened (brief shape, name, dir, or the
      launch itself). Report it; there is nothing to wait for.
 3. The prompt the collector submits contains the worker's own output inside

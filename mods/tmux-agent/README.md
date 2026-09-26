@@ -25,6 +25,16 @@ claude plugin install tmux-agent
 
 開發時直接掛目錄：`claude --plugin-dir mods/tmux-agent`。
 
+裝完先驗：
+
+```sh
+which agent-tmux && tmux -V            # 兩個都要有；沒有 agent-tmux 就跑 tmux-agent-tools 的 install-bin
+echo $CLAUDE_CODE_ENABLE_FUNCTION_HOOKS  # 1；改了要重開 session
+```
+
+重開 session 後工具列表要看得到 `mcp__tmux-agent__assign`，打 `/tmux` 要開出面板
+（標題寫著 mod 版本）。都沒有就是 hooks 沒開或 plugin 沒載入。
+
 ## 收集端：每個 session 都是
 
 沒有設定。裝了就收：每個 session 起 10 秒時鐘，對帳**自己派的** worker，收工
@@ -68,13 +78,18 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 ## 隊友：assign → tell → stop
 
-目標是「只開一個 Claude Code，其他 coding agent 當隊友」。三個工具就是全部：
+目標是「只開一個 Claude Code，其他 coding agent 當隊友」。派工三個工具，卡住時兩個，
+面板與更新各一個：
 
 | 工具 | 做什麼 |
 |---|---|
 | `mcp__tmux-agent__assign` | 派一個 brief 給 `<profile>`，立刻回傳；收據最後一句說 collector 會不會叫你 |
 | `mcp__tmux-agent__tell` | 對同一個 worker 再說一句（下一個任務、修正）。它會 `result init` 重設結果、把訊息連同 result 路徑送進去、把 `dispatch.json` 的 `since` 往前推——新的 id，collector 重新監看，worker 回到面板。對別的 session 派的 worker 也能用：之後它歸你，結果送你 |
 | `mcp__tmux-agent__stop` | 停掉 worker 並把它記為已回報，離開面板；之後不會再有任何投遞 |
+| `mcp__tmux-agent__peek` | 卡住時先看：pane 最後幾行，加上 running／idle／gone／needs input |
+| `mcp__tmux-agent__keys` | 回答 worker 停著的信任／權限對話框（只收白名單鍵）；答完用 `tell` 重送 brief |
+| `mcp__tmux-agent__panel` | 開或關 `/tmux` 面板，和人打 `/tmux` 同一條路 |
+| `mcp__tmux-agent__reload` | `claude plugin update` 之後，本輪結束時跑 `/reload-plugins` |
 
 **自動 stop（0.7.7）**：終態 result 已交付給**這個** session（ack 在自己的 key）、之後 30 分鐘
 沒有 `tell` 的 worker，會在一個沒有交付的 tick 被停掉——走 `stop` 同一條路，所以離開面板、ack
@@ -204,7 +219,9 @@ reload 會重跑 module，面板原本會跟著關掉；0.7.10 起開著的面�
 因此 store 掉了最多多報一次，永遠不會靜默漏報。
 
 連續 3 次被拒（backoff 10 秒、60 秒）後**暫停自動交付**，寫一次 log 告訴你還有
-幾筆留在磁碟上；修好原因後重啟收集端 session 即恢復。
+幾筆留在磁碟上；修好原因後重啟收集端 session 即恢復。暫停期間：面板第一行寫原因；
+要立刻拿結果，用 `peek` 看 worker 閒置了沒，再用 Read 讀 `<state dir>/<name>/result.json`。
+mod 載入時從 Claude 的 Bash 跑 `agent-tmux … result` 會被 mod 自己的 gate 擋掉。
 
 `success` 的 result 若帶 `commit`（完整 40-hex sha），交付前在 worker 的 `dir` 驗兩件事：
 `git cat-file -t <sha>` 必須是 `commit`（tag id 也解析得到 `^{commit}`，所以不能只看
@@ -514,7 +531,7 @@ profile 名稱不會永遠掛在面板上），pane 還活著就照樣探測，�
 面板最上面一行說 collector 現在會不會投遞：連續三次投遞被拒而
 暫停、或已回報集合超出預算而暫停，都會印出原因與解法；沒有這一行就表示
 collector 活著。同一個判斷也寫進 `assign` 工具的回傳最後一句
-（`collector: active …` 或 `collector: NONE — …` 加上自行收割的指令），
+（`collector: active …` 或 `collector: NONE — …` 加上 `peek` 後讀 `result.json` 的路徑），
 `skills/using-tmux-agent-tools/SKILL.md` 的 COLLECTOR 一節就是拿這一句當分支條件。
 
 同一輪探測還負責第四種狀態 `exited`：status 回 `exists:false`（session 沒了），但磁碟上沒有終態
