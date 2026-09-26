@@ -56,7 +56,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 | 面 | 用途 |
 |---|---|
-| `process.run` | 五條：派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（`agent-tmux <profile> capture --strip-ansi --tail N`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`） |
+| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上） |
 | `fs.read/write/list/stat` | 只在 state root 底下：`brief.md`、`dispatch.json`、`launch.exit`、`mod-assign.log`、`result.json`、`tell-<ts>.md`、`.collector-*` 心跳 |
 | `fs.exists` | state root 之外只有一種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；只問「在不在」，不讀內容 |
 | `store.get/set/keys/delete` | 已回報集合：每個 session 自己的 key `tmux-agent.reported.<sessionId>`，讀時聯集全部（`stop` 也寫它，讓被停掉的 worker 離開面板；`delete` 只清已死 session 留下、且目錄全不在的 key） |
@@ -393,7 +393,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v0.8.0 · tmux N · 內部 M`：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.9.0 · tmux N · 內部 M · 專案 K`：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀；`專案 K` 是下面那節的 detached session 數。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
@@ -401,6 +401,10 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 每個 worker 一列：`1: 名字  repo  狀態  已跑多久`；總覽（沒選任何列）時底下一行是
 brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 session 自己的輸出。
+
+### 專案 session
+
+這個 cwd 裡、不是 worker 的 detached tmux session（例如 fastlane 的 `hg-android`）列在 worker 後面：名字、`專案`、從 `session_created` 算的時間。每 10 秒對帳跑一次 `tmux list-sessions`，2 秒鏡像時鐘不跑。路徑等於 cwd 或在它底下才算；`/private/tmp`、`/private/var` 先對成 `/tmp`、`/var`，結尾的 `/` 拿掉，空路徑不算。worker 自己的 session 用跟 `hasSession` 一樣的 `-<name>` 規則排除。選中只鏡像那一個 pane（`tmux capture-pane -p -J -t <name>`）。`peek` 可以看，包在跟 worker 一樣的 `<worker-pane>` 裡；不是 worker、也不是目前專案列的名字直接拒絕。`tell`、`stop`、`keys` 回 `read-only project session`。
 
 **任何終端機都能用的操作**（不靠字母鍵、不靠組合鍵）：
 

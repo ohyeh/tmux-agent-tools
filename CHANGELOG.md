@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.0
+
+- `mods/tmux-agent` 0.9.0 — `/workers` lists this project's detached tmux sessions after the worker rows (a fastlane `hg-android` you would otherwise switch windows to see). Each reconcile pass runs one `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'` (`session_created` is epoch seconds); the 2s mirror clock does not. A session is a project row when its path is this session's cwd or a directory under it (`/private/tmp` and `/private/var` fold to `/tmp` and `/var`; a trailing slash is stripped; an empty path is not a row). Worker sessions are excluded with the same `-<name>` rule as `hasSession`, over `Scan.visible`. The title is `workers v0.9.0 · tmux N · 內部 M · 專案 K` (zeros shown; the hint still drops from the right). A project row is the session name, 專案, and age from `session_created`. Selecting it mirrors that one pane through the existing single-flight path, `tmux capture-pane -p -J -t <name>`. `peek` of a current project row returns the same untrusted `<worker-pane>` fence; any other name is refused. `tell`, `stop`, and `keys` refuse a project row with `read-only project session`. written by a cursor worker; reviewed by the commander (Opus 5.5).
+
 ## 0.8.0
 
 - `mods/tmux-agent` 0.8.0 — the panel command is `/workers` (no `/tmux` alias). The title is `workers v0.8.0 · tmux N · 內部 M`: `tmux N` counts panel rows that have no terminal result (`success` / `failed` / `blocked` / `needs-input`), and `內部 M` counts `$.agent.list()` entries with `status === 'running'` (teammates included), read on the 2s clock only while the panel is open. `list()` rejecting shows `內部 ?` and logs once. Title and hint width count CJK/fullwidth characters as 2 cells and `·` as 2, so the bar does not run past `[ hide ]`. Zeros are shown. design opinions from codex, agy and cursor; decided and reviewed by the commander (Opus 5.5).
