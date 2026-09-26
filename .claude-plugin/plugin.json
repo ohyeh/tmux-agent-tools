@@ -18,5 +18,7 @@
     "session",
     "supervision"
   ],
-  "skills": "./skills/"
+  "skills": "./skills/",
+  "displayName": "tmux Agent Tools",
+  "license": "MIT"
 }

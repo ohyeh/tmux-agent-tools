@@ -15,5 +15,7 @@
     "agent",
     "orchestration"
   ],
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "displayName": "tmux Agent Workers",
+  "license": "MIT"
 }
