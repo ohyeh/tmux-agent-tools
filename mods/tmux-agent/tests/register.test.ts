@@ -2384,7 +2384,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toContain('workers v0.9.0 · tmux 1 · 內部 2 · 專案 0')
+    expect(drawn).toContain('workers v0.9.1 · tmux 1 · 內部 2 · 專案 0')
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -3894,7 +3894,8 @@ describe('project sessions', () => {
         sessions: ['codex-cli-w1'],
         listed: ['codex-cli-w1\t/work\t0', 'hg-android\t/work\t0'],
       },
-      'hello\nfrom-pane',
+      // Raw capture-pane prints the full pane height: output on top, blank rows under it.
+      'hello\nfrom-pane' + '\n'.repeat(20),
     )
 
     await $.session.start(session())
@@ -3905,7 +3906,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toContain('workers v0.9.0 · tmux 1 · 內部 0 · 專案 1')
+    expect(drawn).toContain('workers v0.9.1 · tmux 1 · 內部 0 · 專案 1')
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

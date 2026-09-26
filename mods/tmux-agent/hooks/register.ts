@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.9.0'
+const MOD_VERSION = '0.9.1'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -1434,6 +1434,17 @@ async function mirrorOf(host: Host, d: TmuxDispatch, rows: number): Promise<stri
   return probe.stdout.split('\n').slice(-rows).map(l => l.replace(CTRL_ALL_RE, ' '))
 }
 
+/**
+ * Raw `capture-pane` prints the whole pane height, blank rows under the last
+ * output included: a tail of it was all blanks for a pane with one line of
+ * output at the top (live 2026-09-26). `agent-tmux capture --tail` trims; this does too.
+ */
+function paneTail(stdout: string, n: number): string[] {
+  const lines = stdout.split('\n').map(l => l.replace(CTRL_ALL_RE, ' '))
+  while (lines.length && !lines[lines.length - 1]!.trim()) lines.pop()
+  return lines.slice(-n)
+}
+
 /** The selected project row's pane. Same cap as the worker mirror; one row at a time. */
 async function mirrorProject(host: Host, name: string, rows: number): Promise<string[]> {
   const cwd = host.cwd()
@@ -1442,7 +1453,7 @@ async function mirrorProject(host: Host, name: string, rows: number): Promise<st
     .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${name}:`], cwd, MIRROR_PROBE_MS)
     .catch(() => undefined)
   if (!probe || probe.exitCode !== 0) return []
-  return probe.stdout.split('\n').slice(-rows).map(l => l.replace(CTRL_ALL_RE, ' '))
+  return paneTail(probe.stdout, rows)
 }
 
 async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<void> {
@@ -1772,7 +1783,7 @@ async function peekProject(host: Host, name: string, lines: number): Promise<Out
   if (pane.exitCode !== 0) {
     return { ok: false, text: `capture for "${name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
   }
-  const body = pane.stdout.split('\n').slice(-n).map(l => l.replace(CTRL_ALL_RE, ' ')).join('\n')
+  const body = paneTail(pane.stdout, n).join('\n')
   return { ok: true, text: untrustedPane(`"${name}" project session. Last ${n} pane lines:`, body) }
 }
 

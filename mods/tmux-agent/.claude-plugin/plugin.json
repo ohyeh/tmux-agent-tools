@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Dispatch an agent-tmux worker and let the mod own the wait: every session reconciles its own workers' result.json on a clock and submits a prompt when one reaches a terminal state.",
   "author": {
     "name": "PaulYeh",
