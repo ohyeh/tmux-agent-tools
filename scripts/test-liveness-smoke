@@ -21,6 +21,22 @@ sleep 60
 EOF
 chmod +x "$WORK/fake-live.sh"
 
+# A CLI at rest whose footer below the composer redraws every second (cursor's
+# usage countdown, claude's statusline): not activity.
+cat > "$WORK/fake-footer.sh" <<'EOF'
+clear; while :; do printf '\033[H'; echo "answer: done"; echo "→ Add a follow-up"; echo "Usage 9% ($(date +%s))"; sleep 1; done
+EOF
+# The same redraw with the changing line ABOVE the composer: activity.
+cat > "$WORK/fake-output.sh" <<'EOF'
+clear; while :; do printf '\033[H'; echo "working $(date +%s)"; echo "→ Add a follow-up"; echo "Usage 9%"; sleep 1; done
+EOF
+# A `> ` quote high in the output, 13 changing lines below it and no composer:
+# not a composer, so the whole pane counts and the change is activity.
+cat > "$WORK/fake-quote.sh" <<'EOF'
+clear; while :; do printf '\033[H'; echo "> quoted"; for i in $(seq 1 13); do echo "line $i $(date +%s)"; done; sleep 1; done
+EOF
+chmod +x "$WORK/fake-footer.sh" "$WORK/fake-output.sh" "$WORK/fake-quote.sh"
+
 PASS=0
 FAIL=0
 
@@ -149,6 +165,28 @@ run_invariants() {
   "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
 }
 
+run_footer_is_not_activity() {
+  local wrapper="$1" cli_env="$2" prefix="$3" idle
+  echo "case: $prefix-footer ($wrapper, idle_seconds ignores what redraws below the composer)"
+  for kind in footer output quote; do
+    env "$cli_env=$WORK/fake-$kind.sh" "$wrapper" start --exact "$prefix-$kind" "$WORK" >/dev/null
+  done
+  # The baseline is taken on the fixture's own screen, not the launch banner.
+  "$wrapper" wait-literal "$prefix-footer" "Add a follow-up" 10 >/dev/null
+  "$wrapper" wait-literal "$prefix-output" "Add a follow-up" 10 >/dev/null
+  "$wrapper" wait-literal "$prefix-quote" "line 13" 10 >/dev/null
+  sleep 1
+  for kind in footer output quote; do "$wrapper" status --json "$prefix-$kind" >/dev/null; done
+  sleep 4
+  idle="$("$wrapper" status --json "$prefix-footer" | jq -r .idle_seconds)"
+  assert_gt "$prefix a footer-only redraw leaves the pane idle" "$idle" "2"
+  idle="$("$wrapper" status --json "$prefix-output" | jq -r .idle_seconds)"
+  assert "$prefix a change above the composer is activity" "$(( idle <= 1 ))" "1"
+  idle="$("$wrapper" status --json "$prefix-quote" | jq -r .idle_seconds)"
+  assert "$prefix a quote high in the output is not a composer" "$(( idle <= 1 ))" "1"
+  for kind in footer output quote; do "$wrapper" stop "$prefix-$kind" >/dev/null 2>&1 || true; done
+}
+
 run_missing_session_defaults() {
   local wrapper="$1" prefix="$2"
   echo "case: $prefix-missing ($wrapper, no session → null liveness fields)"
@@ -172,6 +210,7 @@ run_liveness "$CODEX_TMUX"  "CODEX"  "live-codex"
 run_liveness "$CLAUDE_TMUX" "CLAUDE" "live-claude"
 run_invariants "$CODEX_TMUX"  "CODEX"  "inv-codex"
 run_invariants "$CLAUDE_TMUX" "CLAUDE" "inv-claude"
+run_footer_is_not_activity "$CODEX_TMUX" "CODEX" "idle-codex"
 run_missing_session_defaults "$CODEX_TMUX"  "codex"
 run_missing_session_defaults "$CLAUDE_TMUX" "claude"
 

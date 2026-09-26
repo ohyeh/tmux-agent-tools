@@ -3708,6 +3708,25 @@ marker_seen_list_json() {
   fi
 }
 
+# The pane minus what a CLI redraws on its own below the composer: claude's
+# statusline, cursor's usage countdown and `git:(main ↑1)`, codex's context
+# meter. Live 2026-09-26 that footer reset idle_seconds every hour and on every
+# commit in the worker's repo, so a delivered worker never sat idle 30 min and
+# the mod's auto-stop never fired. Kept: everything down to and including the
+# composer line, so output above it and typing into it still count. Only when
+# that line is among the last 12 non-empty ones — a `> ` quote higher up in the
+# output is not a composer — else the whole pane.
+pane_activity_text() {
+  awk "$PROMPT_BOUNDARY_AWK"'
+    /[^[:space:]]/ { last = NR; filled[++n] = NR }
+    { lines[NR] = $0 }
+    END {
+      cut = (boundary && n >= 1 && boundary >= filled[n > 12 ? n - 11 : 1]) ? boundary : NR
+      for (i = 1; i <= cut; i++) print lines[i]
+    }
+  ' <<< "$1"
+}
+
 update_pane_hash() {
   local name="$1" pane_text="$2"
   local subdir
@@ -7358,11 +7377,17 @@ status_pane_text() {
 # a dialog is drawn at the bottom, and text higher up is history. Live
 # 2026-09-25: a brief echoed above cursor-agent's banner before its composer
 # was drawn read as permission_prompt from its quoted "trust this folder".
-current_prompt_area_for_text() {
-  local current="$1"
-  awk '
+# The composer (prompt) line, as awk rules that set `boundary`: the last glyph
+# line that is not a numbered menu, or a turn's "Worked for" rule. One copy,
+# spliced into every awk that needs it, so the rules cannot drift.
+PROMPT_BOUNDARY_AWK='
     /^[[:space:]]*(→|›|❯|>)([[:space:]]|$)/ && !/^[[:space:]]*(→|›|❯|>)[[:space:]]+[0-9]+[.)]/ { boundary = NR }
     /^[[:space:]]*[─-]+ Worked for / { boundary = NR }
+'
+
+current_prompt_area_for_text() {
+  local current="$1"
+  awk "$PROMPT_BOUNDARY_AWK"'
     /[^[:space:]]/ { filled[++n] = NR }
     { lines[NR] = $0 }
     END {
@@ -8259,7 +8284,7 @@ status_session() {
         confirmation_detected=true
         ;;
     esac
-    last_change_at="$(update_pane_hash "$name" "$current")"
+    last_change_at="$(update_pane_hash "$name" "$(pane_activity_text "$current")")"
     bytes_in_pane=$(printf '%s' "$current" | wc -c | tr -d ' ')
   fi
   local started_at
