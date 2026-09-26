@@ -49,8 +49,8 @@ No exception fired → inline, receipt `no-delegate-trigger`.
 
 Applies ONLY when the tool `mcp__tmux-agent__assign` is present in this session
 (the `mods/tmux-agent` function-hook mod is loaded). Every other runtime
-(Codex, Cursor, a Claude session without the mod) skips this section and
-follows ONE OWNER below unchanged.
+(Codex, agy, Cursor, a Claude session without the mod) skips this section
+and uses "commander is not Claude Code" below.
 
 1. Dispatch with the tool, not the shell: `mcp__tmux-agent__assign` with
    `profile`, `name`, `dir`, and a `brief` carrying GOAL / ACCEPTANCE / REPORT.
@@ -99,6 +99,21 @@ follows ONE OWNER below unchanged.
    defaults and only dies at assign step 0 if no binary of that name exists.
    `ls ~/.config/agent-tmux/profiles/` is the live list; a profile is how you
    tune a CLI, not code.
+
+## commander is not Claude Code
+
+Codex, agy, and Cursor have no `mods/tmux-agent` collector, so a finished
+worker never wakes them. Start a commander session, dispatch from inside
+its pane, then end the turn. Results arrive as a prompt.
+
+    tmux-agent-commander start <cli> <name> <dir>
+    tmux-agent-commander assign <profile> <worker> <dir> <brief-file>
+
+`assign` prints the worker name (your name plus a 4-character suffix; use
+that name for any follow-up) and tells you to end the turn. The prompt
+names each finished worker, its profile, status, a short summary, and the
+`result.json` path. Do not also block on `result wait-required` for that
+worker — that is a second supervisor.
 
 ## ONE OWNER — `assign` is the supervision boundary
 

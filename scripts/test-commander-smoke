@@ -1,0 +1,307 @@
+#!/usr/bin/env zsh
+# Smoke for tmux-agent-commander (SPEC.md §Tests).
+# Five cases, each with an explicit assertion:
+#   1. assign writes dispatch.json (owner = session) before the launch
+#   2. a terminal result is sent once; the next tick sends nothing; delivered holds since
+#   3. a dispatch owned by someone else is never sent
+#   4. the heartbeat file is refreshed each tick
+#   5. collect exits when the commander session is gone
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
+COMMANDER="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-commander"
+
+WORK="$(mktemp -d -t tmux-agent-commander.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+export XDG_CONFIG_HOME="$WORK/xdg"
+export AGENT_TMUX_PROFILE_DIR="$WORK/noprofiles"
+export XDG_STATE_HOME="$WORK/xdg-state"
+unset TMUX AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX CLAUDE_TMUX_PREFIX AGY_TMUX_PREFIX
+unset CURSOR_TMUX_PREFIX GROK_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
+# macOS socket paths top out near 104 bytes; the mktemp dir is already long.
+export TMUX_TMPDIR="/tmp/tcmd-$$"
+mkdir -p "$TMUX_AGENT_DIR" "$XDG_CONFIG_HOME" "$AGENT_TMUX_PROFILE_DIR" "$TMUX_TMPDIR" "$WORK/bin"
+
+PREFIX="$(awk -F= '/^prefix=/{print $2; exit}' "$REPO_ROOT/skills/tmux-agent-tools/scripts/profiles/codex.conf")"
+[[ -n "$PREFIX" ]] || { echo "codex profile has no prefix" >&2; exit 1; }
+export COMMANDER_PREFIX="$PREFIX"
+
+export FAKE_LOG="$WORK/fake.log"
+export FAKE_SNAP="$WORK/dispatch-at-launch.json"
+export FAKE_PROMPTS="$WORK/prompts.list"
+: > "$FAKE_LOG"
+: > "$FAKE_PROMPTS"
+
+cleanup() {
+  local pid
+  if [[ -n "${COLLECT_PID:-}" ]]; then
+    kill "$COLLECT_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${TIMER_PID:-}" ]]; then
+    kill "$TIMER_PID" 2>/dev/null || true
+  fi
+  command tmux kill-server 2>/dev/null || true
+  rm -rf "$WORK" "$TMUX_TMPDIR"
+}
+trap cleanup EXIT
+
+cat > "$WORK/bin/agent-tmux" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_LOG"
+case "$2" in
+  start)
+    # agent-tmux <cli> start --exact <name> <dir>
+    command tmux new-session -d -s "${COMMANDER_PREFIX}-$4" "sleep 180"
+    ;;
+  assign)
+    worker="$4"
+    if [ -f "$TMUX_AGENT_DIR/$worker/dispatch.json" ]; then
+      cp "$TMUX_AGENT_DIR/$worker/dispatch.json" "$FAKE_SNAP"
+      printf '%s\n' "dispatch-before-launch:$worker" >> "$FAKE_LOG"
+    else
+      printf '%s\n' "dispatch-missing:$worker" >> "$FAKE_LOG"
+    fi
+    ;;
+  send)
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--prompt-file" ]; then
+        printf '%s\n' "$a" >> "$FAKE_PROMPTS"
+        # The commander deletes its prompt file once send returns; keep the text.
+        cp "$a" "$a.copy"
+      fi
+      prev=$a
+    done
+    ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/agent-tmux" "$COMMANDER"
+export PATH="$WORK/bin:$PATH"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" got="$2" want="$3"
+  if [[ "$got" == "$want" ]]; then
+    print -r -- "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    print -r -- "  FAIL $label: got '$got' want '$want'"
+    FAIL=$((FAIL + 1))
+  fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    print -r -- "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    print -r -- "  FAIL $label: '$needle' not in output"
+    FAIL=$((FAIL + 1))
+  fi
+}
+assert_excludes() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    print -r -- "  ok   $label"
+    PASS=$((PASS + 1))
+  else
+    print -r -- "  FAIL $label: '$needle' was present"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+poll() {
+  local tries="$1"
+  shift
+  local i
+  for (( i = 0; i < tries; i++ )); do
+    if "$@"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+prompt_lines() {
+  wc -l < "$FAKE_PROMPTS" | tr -d ' '
+}
+
+echo "case: assign outside tmux is refused"
+code=0
+out="$("$COMMANDER" assign codex worker "$WORK" "$WORK/nope" 2>&1)" || code=$?
+assert "assign outside tmux exits 1" "$code" "1"
+assert_contains "assign outside tmux says why" "$out" "not inside tmux"
+
+echo
+echo "case 1: assign writes dispatch.json with owner = session name before the launch"
+ASSIGN_SESSION="commander-smoke-assign-$$"
+ASSIGN_CWD="$WORK/pane"
+REPO="$WORK/repo"
+BRIEF="$WORK/brief.md"
+WORKER="worker$$"
+mkdir -p "$ASSIGN_CWD" "$REPO"
+git -C "$REPO" init -q
+git -C "$REPO" -c user.email=t@example.com -c user.name=t commit --allow-empty -q -m init
+HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
+printf 'GOAL: ship the commander\nACCEPTANCE: tests pass\nREPORT: done\n' > "$BRIEF"
+ASSIGN_OUT="$WORK/assign.out"
+ASSIGN_ERR="$WORK/assign.err"
+ASSIGN_CODE="$WORK/assign.code"
+cat > "$WORK/run-assign.zsh" <<EOF
+#!/usr/bin/env zsh
+set -euo pipefail
+export PATH=${(q)WORK}/bin:\$PATH
+export TMUX_AGENT_DIR=${(q)TMUX_AGENT_DIR}
+export XDG_CONFIG_HOME=${(q)XDG_CONFIG_HOME}
+export AGENT_TMUX_PROFILE_DIR=${(q)AGENT_TMUX_PROFILE_DIR}
+export FAKE_LOG=${(q)FAKE_LOG}
+export FAKE_SNAP=${(q)FAKE_SNAP}
+export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
+export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
+unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
+cd ${(q)ASSIGN_CWD}
+${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)ASSIGN_OUT} 2>${(q)ASSIGN_ERR}
+print -r -- \$? > ${(q)ASSIGN_CODE}
+EOF
+chmod +x "$WORK/run-assign.zsh"
+command tmux new-session -d -s "$ASSIGN_SESSION" "$WORK/run-assign.zsh"
+assign_done() { [[ -f "$ASSIGN_CODE" ]]; }
+poll 50 assign_done || { echo "assign did not finish" >&2; echo "--- err ---"; cat "$ASSIGN_ERR" 2>/dev/null || true; echo "--- log ---"; cat "$FAKE_LOG"; exit 1; }
+assert "assign inside tmux exits 0" "$(<"$ASSIGN_CODE")" "0"
+assert_contains "fake saw dispatch.json before launch" "$(<"$FAKE_LOG")" "dispatch-before-launch:$WORKER"
+assert "owner is the tmux session name" "$(jq -r '.owner' "$FAKE_SNAP")" "$ASSIGN_SESSION"
+assert "profile recorded" "$(jq -r '.profile' "$FAKE_SNAP")" "codex"
+RECORDED="$(jq -r '.name' "$FAKE_SNAP")"
+assert "worker name is the given name plus a 4-char suffix" "$([[ "$RECORDED" == ${WORKER}-[0-9a-z][0-9a-z][0-9a-z][0-9a-z] ]] && echo yes || echo "$RECORDED")" "yes"
+assert "dir recorded" "$(jq -r '.dir' "$FAKE_SNAP")" "${REPO:A}"
+assert "since is a number" "$(jq -r '.since|type' "$FAKE_SNAP")" "number"
+assert "goal is the GOAL line" "$(jq -r '.goal' "$FAKE_SNAP")" "ship the commander"
+assert "base is git HEAD" "$(jq -r '.base' "$FAKE_SNAP")" "$HEAD_SHA"
+assert "ownerCwd is the pane cwd" "$(jq -r '.ownerCwd' "$FAKE_SNAP")" "${ASSIGN_CWD:A}"
+assert_contains "launch argv is assign --detach" "$(<"$FAKE_LOG")" "assign --detach"
+assert_contains "stdout names the worker" "$(<"$ASSIGN_OUT")" "$WORKER"
+assert_contains "stdout tells the commander to end the turn" "$(<"$ASSIGN_OUT")" "the collector will send the result into this pane; end your turn"
+# Same name again: a fresh directory, so the first run's result.json can never
+# be read as the second run's answer.
+rm -f "$ASSIGN_CODE"
+sleep 0.01
+command tmux new-session -d -s "${ASSIGN_SESSION}b" "$WORK/run-assign.zsh"
+poll 50 assign_done || { echo "second assign did not finish" >&2; exit 1; }
+SECOND="$(jq -r '.name' "$FAKE_SNAP")"
+assert "a reused worker name gets a new directory" "$([[ "$SECOND" != "$RECORDED" && -d "$TMUX_AGENT_DIR/$SECOND" ]] && echo yes || echo no)" "yes"
+
+echo
+echo "case 2-5: collect delivers owned terminal results once, refreshes heartbeat, then exits"
+CNAME="smokeboss$$"
+SESSION="${PREFIX}-${CNAME}"
+OWNED="owned$$"
+OTHER="other$$"
+SINCE=1700000000001
+LONG="$(perl -e 'print "OWNEDOK" . ("x" x 693)')"
+mkdir -p "$TMUX_AGENT_DIR/$OWNED" "$TMUX_AGENT_DIR/$OTHER" "$REPO"
+jq -n \
+  --arg profile codex --arg name "$OWNED" --arg dir "$REPO" \
+  --argjson since "$SINCE" --arg goal ship --arg owner "$SESSION" --arg ownerCwd "$ASSIGN_CWD" \
+  '{profile:$profile,name:$name,dir:$dir,since:$since,goal:$goal,owner:$owner,ownerCwd:$ownerCwd}' \
+  > "$TMUX_AGENT_DIR/$OWNED/dispatch.json"
+jq -n --arg summary "$LONG" \
+  '{schema_version:1,status:"success",summary:$summary,artifacts:[],errors:[]}' \
+  > "$TMUX_AGENT_DIR/$OWNED/result.json"
+jq -n \
+  --arg profile agy --arg name "$OTHER" --arg dir "$REPO" \
+  --argjson since 1700000000002 --arg owner "someone-else" --arg ownerCwd "$ASSIGN_CWD" \
+  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd}' \
+  > "$TMUX_AGENT_DIR/$OTHER/dispatch.json"
+jq -n '{schema_version:1,status:"success",summary:"OTHERWORKERTOKEN",artifacts:[],errors:[]}' \
+  > "$TMUX_AGENT_DIR/$OTHER/result.json"
+
+command tmux new-session -d -s "$SESSION" "sleep 180"
+"$COMMANDER" collect codex "$CNAME" >"$WORK/collect.out" 2>"$WORK/collect.err" &
+COLLECT_PID=$!
+
+have_prompt() { [[ "$(prompt_lines)" -ge 1 ]]; }
+poll 75 have_prompt || {
+  echo "no send within 15s" >&2
+  echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
+  echo "--- fake log ---"; cat "$FAKE_LOG"
+  exit 1
+}
+assert "case 2: sent once on the first tick" "$(prompt_lines)" "1"
+PROMPT_FILE="$(head -1 "$FAKE_PROMPTS")"
+BODY="$(<"$PROMPT_FILE.copy")"
+assert "case 2: the prompt file is removed after a send" "$([[ -e "$PROMPT_FILE" ]] && echo yes || echo no)" "no"
+assert_contains "case 2: prompt names the worker" "$BODY" "name: $OWNED"
+assert_contains "case 2: prompt names the status" "$BODY" "status: success"
+assert_contains "case 2: prompt names result.json" "$BODY" "$TMUX_AGENT_DIR/$OWNED/result.json"
+SUMMARY_LINE="${BODY##*$'summary: '}"
+SUMMARY_LINE="${SUMMARY_LINE%%$'\n'*}"
+assert "case 2: summary truncated to 600 chars" "${#SUMMARY_LINE}" "600"
+assert_contains "case 2: summary keeps its prefix" "$SUMMARY_LINE" "OWNEDOK"
+HB="$TMUX_AGENT_DIR/.collector-$SESSION"
+[[ -f "$HB" ]] || { echo "heartbeat missing after first tick" >&2; exit 1; }
+HB1="$(tr -d '[:space:]' < "$HB")"
+assert "case 4: first heartbeat is numeric ms" "$([[ "$HB1" == <-> ]] && echo yes || echo no)" "yes"
+
+hb_changed() { [[ "$(tr -d '[:space:]' < "$HB")" != "$HB1" ]]; }
+poll 125 hb_changed || {
+  echo "heartbeat did not refresh within 25s" >&2
+  echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
+  exit 1
+}
+sleep 1
+HB2="$(tr -d '[:space:]' < "$HB")"
+assert "case 4: heartbeat refreshed on the next tick" "$([[ "$HB1" != "$HB2" ]] && echo yes || echo no)" "yes"
+assert "case 2: second tick sends nothing" "$(prompt_lines)" "1"
+DELIVERED="$(tr -d '[:space:]' < "$TMUX_AGENT_DIR/$OWNED/delivered")"
+assert "case 2: delivered marker holds since" "$DELIVERED" "$SINCE"
+# Retired, so the Claude mod (which reads only dispatch.json) never adopts and
+# re-delivers it after this commander's heartbeat goes stale.
+assert "case 2: delivered dispatch is retired" "$([[ ! -e "$TMUX_AGENT_DIR/$OWNED/dispatch.json" && -f "$TMUX_AGENT_DIR/$OWNED/dispatch.delivered.json" ]] && echo yes || echo no)" "yes"
+assert "case 3: other owner's dispatch is untouched" "$([[ -f "$TMUX_AGENT_DIR/$OTHER/dispatch.json" ]] && echo yes || echo no)" "yes"
+assert_excludes "case 3: other owner's worker is not in the prompt" "$BODY" "$OTHER"
+assert_excludes "case 3: other owner's summary is not sent" "$BODY" "OTHERWORKERTOKEN"
+assert "case 3: other owner has no delivered marker" "$([[ -e "$TMUX_AGENT_DIR/$OTHER/delivered" ]] && echo yes || echo no)" "no"
+
+echo
+echo "case 5: collect exits when the commander session is gone"
+command tmux kill-session -t "$SESSION"
+ec=0
+(
+  sleep 20
+  kill "$COLLECT_PID" 2>/dev/null || true
+) &
+TIMER_PID=$!
+wait "$COLLECT_PID" || ec=$?
+kill "$TIMER_PID" 2>/dev/null || true
+wait "$TIMER_PID" 2>/dev/null || true
+COLLECT_PID=""
+TIMER_PID=""
+assert "case 5: collect exits 0" "$ec" "0"
+
+echo
+echo "extra: start --no-attach refuses a live collector; stop clears it"
+SNAME="startboss$$"
+SSESSION="${PREFIX}-${SNAME}"
+"$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start.out" 2>"$WORK/start.err"
+PIDFILE="$TMUX_AGENT_DIR/.commander-${SSESSION}.pid"
+assert "start wrote a pid file" "$([[ -f "$PIDFILE" ]] && echo yes || echo no)" "yes"
+SPID="$(tr -d '[:space:]' < "$PIDFILE")"
+assert "start collector is alive" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "yes"
+have_start_hb() { [[ -f "$TMUX_AGENT_DIR/.collector-$SSESSION" ]]; }
+poll 25 have_start_hb || { echo "start collector wrote no heartbeat" >&2; cat "$WORK/start.err"; exit 1; }
+assert "start heartbeat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$TMUX_AGENT_DIR/.collector-$SSESSION")" == <-> ]] && echo yes || echo no)" "yes"
+code=0
+"$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start2.out" 2>"$WORK/start2.err" || code=$?
+assert "second start exits 1" "$code" "1"
+assert_contains "second start names the live collector" "$(<"$WORK/start2.err")" "already running"
+"$COMMANDER" stop codex "$SNAME" >"$WORK/stop.out"
+assert "stop removed the pid file" "$([[ -e "$PIDFILE" ]] && echo yes || echo no)" "no"
+assert "stop killed the collector" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "no"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ "$FAIL" -eq 0 ]]
