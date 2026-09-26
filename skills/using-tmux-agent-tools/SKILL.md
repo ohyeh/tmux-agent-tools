@@ -104,7 +104,10 @@ and uses "commander is not Claude Code" below.
 
 Codex, agy, and Cursor have no `mods/tmux-agent` collector, so a finished
 worker never wakes them. Start a commander session, dispatch from inside
-its pane, then end the turn. Results arrive as a prompt.
+its pane, then end the turn. `assign` starts the collector for that session
+from the tmux server when none is live. Do not background `collect`
+yourself — the CLI's shell tool reaps that child when the call returns.
+Results arrive as a prompt.
 
     tmux-agent-commander start <cli> <name> <dir>
     tmux-agent-commander assign <profile> <worker> <dir> <brief-file>

@@ -9,6 +9,10 @@
 #   6. panel prints no workers, running/success/failed marks, delivered rows,
 #      drops whole entries at --width, and hides a foreign owner
 #   7. start sets a per-session second status line; --no-panel does not
+#   8. assign in a <cli prefix>-<name> pane starts one server-owned collector
+#   9. a second assign does not start another collector
+#  10. a session matching no cli prints the hint and exits 0
+#  11. collect exits 0 without writing when a live collector owns the pid file
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
@@ -40,6 +44,9 @@ cleanup() {
   local pid
   if [[ -n "${COLLECT_PID:-}" ]]; then
     kill "$COLLECT_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${DCOLLECT_PID:-}" ]]; then
+    kill "$DCOLLECT_PID" 2>/dev/null || true
   fi
   if [[ -n "${TIMER_PID:-}" ]]; then
     kill "$TIMER_PID" 2>/dev/null || true
@@ -184,6 +191,10 @@ command tmux new-session -d -s "$ASSIGN_SESSION" "$WORK/run-assign.zsh"
 assign_done() { [[ -f "$ASSIGN_CODE" ]]; }
 poll 50 assign_done || { echo "assign did not finish" >&2; echo "--- err ---"; cat "$ASSIGN_ERR" 2>/dev/null || true; echo "--- log ---"; cat "$FAKE_LOG"; exit 1; }
 assert "assign inside tmux exits 0" "$(<"$ASSIGN_CODE")" "0"
+NOCLI_HINT="no collector for ${ASSIGN_SESSION}: run \`tmux-agent-commander collect <cli> <name>\` from a shell outside this CLI"
+assert "no cli match prints the hint" "$(tr -d '\n' < "$ASSIGN_ERR")" "$NOCLI_HINT"
+assert_excludes "no cli match does not start a collector" "$(<"$ASSIGN_OUT")" "collector started"
+assert "no cli match writes no pid file" "$([[ -e "$TMUX_AGENT_DIR/.commander-${ASSIGN_SESSION}.pid" ]] && echo yes || echo no)" "no"
 assert_contains "fake saw dispatch.json before launch" "$(<"$FAKE_LOG")" "dispatch-before-launch:$WORKER"
 assert "owner is the tmux session name" "$(jq -r '.owner' "$FAKE_SNAP")" "$ASSIGN_SESSION"
 assert "profile recorded" "$(jq -r '.profile' "$FAKE_SNAP")" "codex"
@@ -330,6 +341,10 @@ NPNAME="nopanel$$"
 NPSESSION="${PREFIX}-${NPNAME}"
 np_code=0
 "$COMMANDER" start codex "$NPNAME" "$WORK" --no-attach --no-panel >"$WORK/np.out" 2>"$WORK/np.err" || np_code=$?
+if (( np_code != 0 )); then
+  echo "--- np.err ---" >&2
+  cat "$WORK/np.err" >&2 || true
+fi
 assert "--no-panel start exits 0" "$np_code" "0"
 if (( np_code == 0 )); then
   NPOPTS="$(command tmux show-options -t "$NPSESSION" 2>/dev/null || true)"
@@ -464,6 +479,167 @@ real_session() {
 assert "real agent-tmux session name" "$(real_session pin$$)" "${PREFIX}-pin$$"
 assert "real agent-tmux session name with tenant" \
   "$(TMUX_AGENT_TOOLS_TENANT=t1 real_session pin$$)" "${PREFIX}-t1-pin$$"
+
+count_matching() {
+  local pat="$1" n=0 line
+  local -a lines
+  lines=("${(@f)$(ps -ax -o command=)}")
+  for line in "${lines[@]}"; do
+    [[ "$line" == *"$pat"* ]] && n=$((n + 1))
+  done
+  print -r -- "$n"
+}
+
+proc_gone() {
+  [[ "$(count_matching "$1")" == 0 ]]
+}
+
+has_tmux_ancestor() {
+  local pid="$1" i ppid comm
+  for (( i = 0; i < 6; i++ )); do
+    ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$ppid" == <-> && "$ppid" -gt 1 ]] || return 1
+    comm="$(ps -p "$ppid" -o comm= 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$comm" == tmux ]] && return 0
+    pid="$ppid"
+  done
+  return 1
+}
+
+dump_ancestors() {
+  local pid="$1" i ppid
+  for (( i = 0; i < 6; i++ )); do
+    ps -p "$pid" -o pid=,comm=,args= 2>/dev/null || true
+    ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$ppid" == <-> && "$ppid" -gt 1 ]] || break
+    pid="$ppid"
+  done
+}
+
+run_assign_in() {
+  local session="$1" out="$2" err="$3" code="$4" script="$5"
+  rm -f "$code"
+  cat > "$script" <<EOF
+#!/usr/bin/env zsh
+set -euo pipefail
+export PATH=${(q)WORK}/bin:\$PATH
+export TMUX_AGENT_DIR=${(q)TMUX_AGENT_DIR}
+export XDG_CONFIG_HOME=${(q)XDG_CONFIG_HOME}
+export AGENT_TMUX_PROFILE_DIR=${(q)AGENT_TMUX_PROFILE_DIR}
+export FAKE_LOG=${(q)FAKE_LOG}
+export FAKE_SNAP=${(q)FAKE_SNAP}
+export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
+export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
+unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
+cd ${(q)ASSIGN_CWD}
+${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)out} 2>${(q)err}
+print -r -- \$? > ${(q)code}
+EOF
+  chmod +x "$script"
+  command tmux split-window -d -t "$session" "$script"
+}
+
+echo
+echo "case: assign starts one collector from the tmux server"
+ANAME="autocol$$"
+ASESSION="${PREFIX}-${ANAME}"
+AC_OUT="$WORK/ac.out"
+AC_ERR="$WORK/ac.err"
+AC_CODE="$WORK/ac.code"
+AC_SCRIPT="$WORK/run-ac.zsh"
+command tmux new-session -d -s "$ASESSION" "sleep 180"
+run_assign_in "$ASESSION" "$AC_OUT" "$AC_ERR" "$AC_CODE" "$AC_SCRIPT"
+ac_done() { [[ -f "$AC_CODE" ]]; }
+poll 50 ac_done || {
+  echo "assign in prefixed session did not finish" >&2
+  echo "--- err ---"; cat "$AC_ERR" 2>/dev/null || true
+  exit 1
+}
+assert "prefixed assign exits 0" "$(<"$AC_CODE")" "0"
+assert_contains "prefixed assign says collector started" "$(<"$AC_OUT")" "collector started for ${ASESSION}"
+AC_PIDFILE="$TMUX_AGENT_DIR/.commander-${ASESSION}.pid"
+have_ac_pid() {
+  [[ -f "$AC_PIDFILE" ]] || return 1
+  local p
+  p="$(tr -d '[:space:]' < "$AC_PIDFILE")"
+  [[ "$p" == <-> ]] && kill -0 "$p" 2>/dev/null
+}
+poll 50 have_ac_pid || {
+  echo "assign did not leave a live collector pid" >&2
+  echo "--- err ---"; cat "$AC_ERR" 2>/dev/null || true
+  echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${ASESSION}.log" 2>/dev/null || true
+  exit 1
+}
+poll 25 proc_gone "$AC_SCRIPT" || { echo "assign pane script still running" >&2; exit 1; }
+ACPID="$(tr -d '[:space:]' < "$AC_PIDFILE")"
+assert "collector still alive after the assign pane exits" "$(kill -0 "$ACPID" 2>/dev/null && echo yes || echo no)" "yes"
+AC_ARGS="$(ps -p "$ACPID" -o args= 2>/dev/null || true)"
+assert_contains "pid file is a collect process" "$AC_ARGS" " collect "
+assert_contains "collect process names the worker" "$AC_ARGS" "$ANAME"
+if has_tmux_ancestor "$ACPID"; then
+  anc=yes
+else
+  anc=no
+  echo "--- ancestor chain ---" >&2
+  dump_ancestors "$ACPID" >&2
+fi
+assert "collector is owned by the tmux server" "$anc" "yes"
+have_ac_hb() { [[ -f "$TMUX_AGENT_DIR/.collector-$ASESSION" ]]; }
+poll 50 have_ac_hb || {
+  echo "assign collector wrote no heartbeat" >&2
+  echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${ASESSION}.log" 2>/dev/null || true
+  exit 1
+}
+assert "assign heartbeat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$TMUX_AGENT_DIR/.collector-$ASESSION")" == <-> ]] && echo yes || echo no)" "yes"
+
+echo
+echo "case: a second assign does not start a second collector"
+AC_OUT2="$WORK/ac2.out"
+AC_ERR2="$WORK/ac2.err"
+AC_CODE2="$WORK/ac2.code"
+AC_SCRIPT2="$WORK/run-ac2.zsh"
+run_assign_in "$ASESSION" "$AC_OUT2" "$AC_ERR2" "$AC_CODE2" "$AC_SCRIPT2"
+ac2_done() { [[ -f "$AC_CODE2" ]]; }
+poll 50 ac2_done || {
+  echo "second prefixed assign did not finish" >&2
+  echo "--- err ---"; cat "$AC_ERR2" 2>/dev/null || true
+  exit 1
+}
+assert "second prefixed assign exits 0" "$(<"$AC_CODE2")" "0"
+assert_excludes "second assign does not say collector started" "$(<"$AC_OUT2")" "collector started"
+assert "second assign keeps the same pid" "$(tr -d '[:space:]' < "$AC_PIDFILE")" "$ACPID"
+assert "first collector still alive" "$(kill -0 "$ACPID" 2>/dev/null && echo yes || echo no)" "yes"
+# The collector's argv is "<script> collect codex <name>". run-shell's sh -c quotes those words.
+assert "only one collect process" "$(count_matching " collect codex ${ANAME}")" "1"
+
+echo
+echo "case: collect exits 0 without writing when a live collector owns the pid"
+DNAME="ownedcol$$"
+DSESSION="${PREFIX}-${DNAME}"
+command tmux new-session -d -s "$DSESSION" "sleep 180"
+"$COMMANDER" collect codex "$DNAME" >"$WORK/down.out" 2>"$WORK/derr.err" &
+DCOLLECT_PID=$!
+DPIDFILE="$TMUX_AGENT_DIR/.commander-${DSESSION}.pid"
+have_dp() { [[ -f "$DPIDFILE" ]]; }
+poll 25 have_dp || {
+  echo "owner collect wrote no pid" >&2
+  echo "--- err ---"; cat "$WORK/derr.err" 2>/dev/null || true
+  exit 1
+}
+assert "owner collect recorded its own pid" "$(tr -d '[:space:]' < "$DPIDFILE")" "$DCOLLECT_PID"
+dcode=0
+"$COMMANDER" collect codex "$DNAME" >"$WORK/d2.out" 2>"$WORK/d2.err" || dcode=$?
+assert "second collect exits 0" "$dcode" "0"
+assert "second collect writes nothing to stdout" "$(<"$WORK/d2.out")" ""
+assert "second collect writes nothing to stderr" "$(<"$WORK/d2.err")" ""
+assert "second collect leaves the owner's pid" "$(tr -d '[:space:]' < "$DPIDFILE")" "$DCOLLECT_PID"
+assert "owner collect still alive" "$(kill -0 "$DCOLLECT_PID" 2>/dev/null && echo yes || echo no)" "yes"
+command tmux kill-session -t "$DSESSION"
+dec=0
+wait "$DCOLLECT_PID" || dec=$?
+DCOLLECT_PID=""
+assert "owner collect exits 0 when its session is gone" "$dec" "0"
+assert "owner collect removes its pid file" "$([[ -e "$DPIDFILE" ]] && echo yes || echo no)" "no"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

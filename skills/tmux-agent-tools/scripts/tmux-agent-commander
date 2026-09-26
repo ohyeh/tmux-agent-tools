@@ -28,8 +28,10 @@ start launches `agent-tmux <cli> start --exact`, then a detached collector,
 then attach (unless --no-attach). Unless --no-panel, it also sets a second
 status line on that session that runs `panel <session>`. assign runs inside
 that pane: it records dispatch.json, then `agent-tmux <profile> assign
---detach`. collect is the loop start runs in the background. panel prints
-one line of workers whose dispatch owner is the tmux session name.
+--detach`. If that session has no live collector, assign starts one from the
+tmux server. collect is that loop and owns the pid file — do not background
+it yourself. panel prints one line of workers whose dispatch owner is the
+tmux session name.
 EOF
   exit 2
 }
@@ -118,6 +120,26 @@ session_name() {
     prefix="${prefix}-${TMUX_AGENT_TOOLS_TENANT}"
   fi
   print -r -- "${prefix}-${worker_name}"
+}
+
+# Map a tmux session back to (cli, name) using session_name's own prefix.
+# Probe worker "X" and strip that trailing X; the rest is the prefix.
+# No known cli matches → return 1.
+session_cli_name() {
+  local session="$1" cli full prefix name
+  local -a clis=(codex agy cursor claude grok)
+  for cli in "${clis[@]}"; do
+    full="$(session_name "$cli" X)"
+    [[ "$full" == *X ]] || continue
+    prefix="${full%X}"
+    [[ -n "$prefix" && "$session" == "${prefix}"* ]] || continue
+    name="${session#"$prefix"}"
+    [[ -n "$name" ]] || continue
+    print -r -- "$cli"
+    print -r -- "$name"
+    return 0
+  done
+  return 1
 }
 
 heartbeat_path() {
@@ -324,13 +346,32 @@ cmd_start() {
   if (( ! no_panel )); then
     install_worker_panel "$session"
   fi
+  tmux_has "$session" || die "session ${session} is not up after start"
   log="$root/.commander-$(sanitize_owner "$session").log"
   # agent-tmux drops $TMUX before new-session, so the collector must too.
-  # TMUX_TMPDIR still selects the server.
+  # TMUX_TMPDIR still selects the server. collect writes the pid file.
+  local bgpid i claimed="" detail
   env -u TMUX nohup "$SELF" collect "$cli" "$name" >>"$log" 2>&1 &
-  pid="$!"
-  disown "$pid" 2>/dev/null || true
-  print -r -- "$pid" > "$pidfile"
+  bgpid="$!"
+  disown "$bgpid" 2>/dev/null || true
+  for (( i = 0; i < 200; i++ )); do
+    if [[ -f "$pidfile" ]]; then
+      pid="$(read_pid "$pidfile" || true)"
+      if pid_alive "$pid"; then
+        claimed=1
+        break
+      fi
+    fi
+    sleep 0.05
+  done
+  if [[ -z "$claimed" ]]; then
+    detail="no pid"
+    if [[ -s "$log" ]]; then
+      detail+="; $(tail -n 3 "$log" | tr '\n' ' ')"
+    fi
+    kill "$bgpid" 2>/dev/null || true
+    die "collector for ${session} exited before it wrote a pid (${detail})"
+  fi
   if (( no_attach )); then
     print -r -- "commander ${session} collector pid ${pid}"
     return 0
@@ -379,22 +420,66 @@ cmd_assign() {
      + (if $goal != "" then {goal:$goal} else {} end)
      + (if $base != "" then {base:$base} else {} end)' > "$tmp"
   mv -f "$tmp" "$worker_dir/dispatch.json"
+  start_collector_from_server "$session" "$root"
   agent_tmux "$profile" assign --detach "$worker" "$abs_dir" "$brief"
   print -r -- "$worker"
   print -r -- "the collector will send the result into this pane; end your turn"
 }
 
+# One collector per session. A live pid that is not us exits quietly.
+# We remove the file on exit only when it still names us.
 cmd_collect() {
   (( $# == 2 )) || usage
   local cli="$1" name="$2"
-  local session root
+  local session root pidfile existing
   session="$(session_name "$cli" "$name")"
   root="$(state_root)"
   mkdir -p "$root"
+  pidfile="$(pid_path "$root" "$session")"
+  if [[ -f "$pidfile" ]]; then
+    existing="$(read_pid "$pidfile" || true)"
+    if pid_alive "$existing" && [[ "$existing" != "$$" ]]; then
+      exit 0
+    fi
+  fi
+  print -r -- "$$" > "$pidfile"
+  COLLECTOR_PIDFILE="$pidfile"
+  trap '
+    cur="$(tr -d "[:space:]" < "$COLLECTOR_PIDFILE" 2>/dev/null || true)"
+    if [[ "$cur" == "$$" ]]; then
+      rm -f "$COLLECTOR_PIDFILE"
+    fi
+  ' EXIT
   while tmux_has "$session"; do
     deliver_once "$cli" "$name" "$session" "$root"
     sleep "$TICK_SECONDS"
   done
+}
+
+# The tmux server owns this process, so a CLI shell tool cannot reap it.
+start_collector_from_server() {
+  local session="$1" root="$2"
+  local pidfile existing mapped cli name log cmd
+  pidfile="$(pid_path "$root" "$session")"
+  if [[ -f "$pidfile" ]]; then
+    existing="$(read_pid "$pidfile" || true)"
+    if pid_alive "$existing"; then
+      return 0
+    fi
+  fi
+  if ! mapped="$(session_cli_name "$session")"; then
+    print -r -- "no collector for ${session}: run \`tmux-agent-commander collect <cli> <name>\` from a shell outside this CLI" >&2
+    return 0
+  fi
+  cli="${mapped%%$'\n'*}"
+  name="${mapped#*$'\n'}"
+  log="$root/.commander-$(sanitize_owner "$session").log"
+  # tmux expands % and # as formats before /bin/sh sees the command.
+  cmd="env -u TMUX ${(qq)SELF} collect ${(qq)cli} ${(qq)name} >> ${(qq)log} 2>&1"
+  cmd="${cmd//\%/%%}"
+  cmd="${cmd//\#/##}"
+  command tmux run-shell -b -t "$session" "$cmd"
+  print -r -- "collector started for ${session}"
 }
 
 cmd_stop() {
