@@ -1,0 +1,4 @@
+{
+  "description": "Adds $.tmux and an assign tool over agent-tmux; the collector session reconciles result.json on a clock and wakes the session when a worker finishes.",
+  "modules": ["./register.ts"]
+}

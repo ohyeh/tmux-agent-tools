@@ -58,7 +58,8 @@ assert "dag missing manifest exit=2" "$code" "2"
 # #114 approval gate: --pause-until-file flag is recognized in
 # wait-and-capture; just check arg parsing.
 echo "case: #114 --pause-until-file flag recognized"
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 code=0
 "$CODEX_TMUX" wait-and-capture --marker X --pause-until-file >/dev/null 2>&1 || code=$?
 assert "missing pause-until-file value exit=2" "$code" "2"

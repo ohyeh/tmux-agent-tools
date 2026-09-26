@@ -2,7 +2,7 @@ const { execFile } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 
 const REQUIRED_RESULT_LINE =
-  "Result JSON must include schema_version, status, summary, artifacts, and errors.";
+  "Result JSON must include schema_version, status, summary, artifacts, and errors. If you committed, add commit: the full 40-hex sha of your final commit.";
 const REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
 const NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
 const NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";

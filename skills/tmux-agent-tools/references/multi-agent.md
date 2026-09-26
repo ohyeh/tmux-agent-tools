@@ -8,7 +8,7 @@ These tools are for **long-running supervised tasks**, not for unbounded agent s
 
 1. **Ask the user for tool + model + effort per worker before any `start`/`start-ssh`/`fanout run`.** Do not assume defaults. Example: "Worker A: claude or codex? which model tier? what reasoning effort?"
 2. **Declare an explicit worker upper bound up front** (e.g., "I will run at most 3 workers; if one is insufficient I will report back, not spawn helpers").
-3. **Forbid cascade spawning inside worker prompts.** Add a literal instruction to each worker's prompt body: "Do not call `claude-tmux`, `codex-tmux`, `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH to other hosts. Reason only from the provided context and write your conclusion to <the literal path from `result --path <name>`>." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
+3. **Forbid cascade spawning inside worker prompts.** Add a literal instruction to each worker's prompt body: "Do not call `agent-tmux` (or its deprecated `*-tmux` shims), `tmux-agent-fanout`, or `tmux-agent-dialogue`. Do not start background jobs. Do not SSH to other hosts. Reason only from the provided context and write your conclusion to <the literal path from `result --path <name>`>." The wrappers have no kernel-level sandbox; this prompt-level barrier is the only stopgap.
 4. **Bound the dialogue length.** `critic` and `debate` require positive even `--turns`. Pick a small number (2–6). Unbounded debate is a smell.
 5. **Stop and report instead of spawning more workers.** If a task is not making progress, surface that to the user. Do not "try with more workers".
 
@@ -61,13 +61,13 @@ A common pattern is: spawn two workers in parallel, then have them review each o
 
 ```bash
 # 1. Start workers
-claude-tmux start --exact wA ~/repo 'Refactor src/auth/. Write final JSON to the literal result path from result --path wA with summary+diff path.'
-claude-tmux start --exact wB ~/repo 'Run tests for src/auth/. Write final JSON to the literal result path from result --path wB with pass/fail+failing-test list.'
+agent-tmux claude start --exact wA ~/repo 'Refactor src/auth/. Write final JSON to the literal result path from result --path wA with summary+diff path.'
+agent-tmux claude start --exact wB ~/repo 'Run tests for src/auth/. Write final JSON to the literal result path from result --path wB with pass/fail+failing-test list.'
 
 # 2. Wait for both workers with one bounded watcher, then read results
-claude-tmux watch --all --timeout 600 --json wA wB > /tmp/watch.json
-claude-tmux result --json wA > /tmp/wA.json
-claude-tmux result --json wB > /tmp/wB.json
+agent-tmux claude watch --all --timeout 600 --json wA wB > /tmp/watch.json
+agent-tmux claude result --json wA > /tmp/wA.json
+agent-tmux claude result --json wB > /tmp/wB.json
 
 # 3. Build a review prompt that includes both results
 cat > /tmp/review-prompt.md <<EOF
@@ -92,15 +92,15 @@ remaining=(w1 w2 w3)
 while (( ${#remaining[@]} )); do
   absent=()
   for n in "${remaining[@]}"; do
-    if codex-tmux result --json "$n" | jq -e '.present' >/dev/null; then
-      codex-tmux result --json "$n" > "/tmp/$n.result.json"
-      codex-tmux stop "$n"
+    if agent-tmux codex result --json "$n" | jq -e '.present' >/dev/null; then
+      agent-tmux codex result --json "$n" > "/tmp/$n.result.json"
+      agent-tmux codex stop "$n"
     else
       absent+=("$n")
     fi
   done
   (( ${#absent[@]} == 0 )) && break
-  codex-tmux watch --any --timeout 600 --json "${absent[@]}"
+  agent-tmux codex watch --any --timeout 600 --json "${absent[@]}"
   remaining=("${absent[@]}")
 done
 ```

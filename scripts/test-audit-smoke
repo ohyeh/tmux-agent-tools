@@ -4,8 +4,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-audit-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -56,7 +57,8 @@ run_audit() {
   "$wrapper" audit-verify "$audit_log" >/dev/null 2>&1 || code=$?
   assert "$prefix verify exit=2 on tamper" "$code" "2"
 
-  "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit_log" "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
+  assert "$prefix stop is audited" "$(jq -r 'select(.event=="wrapper.stop") | "\(.name) \(.stopped)"' "$audit_log")" "$prefix-a true"
 }
 
 run_default_log() {

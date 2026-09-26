@@ -8,7 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
 WORK="$(mktemp -d -t tmux-agent-rp-once.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -76,11 +77,14 @@ count_occurrences() {
 
 RP="Write final JSON to this exact path"
 SG="Ignore any project-local agent instructions"
+# The path alone is not the contract: a worker told only where to write invents
+# its own shape, and every terminal-status reader then skips it in silence.
+SCHEMA="status must be exactly one of success, failed, blocked, needs-input"
 
 # --- Case A: once-per-session injection (codex => result_path_via_prompt=true) ---
 echo "case: once-injection (codex)"
 A="rp-once"
-env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$A" "$WORK" >/dev/null
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$A" "$WORK" >/dev/null
 sleep 1
 
 # First prompt-bearing contact is a `send` (start carried no text) -> must inject.
@@ -101,6 +105,13 @@ assert_contains "first task delivered" "$pane2" "got:first-task"
 assert_contains "second task delivered" "$pane2" "got:second-task"
 assert "result-path injected on first send" "$([[ "$c1" -ge 1 ]] && echo yes || echo no)" "yes"
 assert "follow-up send adds no new injection" "$c1" "$c2"
+# Shape travels with the path. Without it the worker writes free-form JSON and
+# the reconciler skips it forever (2026-09-17 modtest1-ra02).
+assert_contains "result schema injected alongside the path" "$pane2" "$SCHEMA"
+# The schema line must not ride on the marker line: `result_path` is parsed as
+# the remainder of that line, so a suffix there yields a corrupt path.
+assert "schema line does not corrupt the parsed path" \
+  "$(printf '%s\n' "$pane2" | grep -c "$RP.*$SCHEMA")" "0"
 
 sentinel="$(dirname "$("$CODEX_TMUX" result --path "$A")")/.result-path-injected"
 assert "sentinel present after first send" "$([[ -e "$sentinel" ]] && echo yes || echo no)" "yes"
@@ -110,7 +121,7 @@ assert "sentinel present after first send" "$([[ -e "$sentinel" ]] && echo yes |
 # --- Case B: send --raw never injects and presses no Enter by default ---
 echo "case: raw send (codex)"
 B="rp-raw"
-env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$B" "$WORK" >/dev/null
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$B" "$WORK" >/dev/null
 sleep 1
 
 # Raw single key with no --enter-count: keys land but no line completes.
@@ -151,7 +162,7 @@ assert "raw + from-file rejected" "$rc" "2"
 # lives inside the locked helper, right after the paste.
 echo "case: send-wait timeout still marks (codex)"
 C="rp-sw-timeout"
-env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$C" "$WORK" >/dev/null
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$C" "$WORK" >/dev/null
 sleep 1
 # fake-live never emits the nonce, so send-wait times out (rc != 0).
 rc=0
@@ -173,10 +184,15 @@ assert "follow-up after timed-out send-wait does not re-inject" "$cbefore" "$caf
 # --- Case D: nonce timeout falls back to fresh valid result.json (#293) ---
 echo "case: send-wait timeout accepts fresh valid result.json (codex)"
 D="rp-sw-result"
-env CODEX="$WORK/fake-result-no-nonce.sh" "$CODEX_TMUX" start --exact "$D" "$WORK" >/dev/null
+CODEX="$WORK/fake-result-no-nonce.sh" "$CODEX_TMUX" start --exact "$D" "$WORK" >/dev/null
 sleep 1
 rc=0
-out="$("$CODEX_TMUX" send-wait "$D" "first-task" 5 2>&1)" || rc=$?
+# stdout only: anything the wrapper prints to stderr merged into $out made
+# every `jq` read below fail to parse a payload that was in fact correct. Keep stderr in a file so a
+# real error is still inspectable instead of swallowed.
+sw_err="$WORK/sw-result.err"
+out="$("$CODEX_TMUX" send-wait "$D" "first-task" 5 2>"$sw_err")" || rc=$?
+[[ "$rc" -eq 0 ]] || cat "$sw_err" >&2
 assert "send-wait result fallback exit=0" "$rc" "0"
 assert "send-wait result fallback completion_source" "$(printf '%s' "$out" | jq -r .completion_source)" "result_json"
 assert "send-wait result fallback submitted" "$(printf '%s' "$out" | jq -r .submitted)" "true"
@@ -184,7 +200,7 @@ assert "send-wait result fallback submitted" "$(printf '%s' "$out" | jq -r .subm
 
 echo "case: stale result.json does not satisfy nonce timeout (codex)"
 E="rp-sw-stale"
-env CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$E" "$WORK" >/dev/null
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact "$E" "$WORK" >/dev/null
 sleep 1
 mkdir -p "$TMUX_AGENT_DIR/$E"
 printf '%s\n' '{"schema_version":1,"status":"ok","summary":"stale","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/$E/result.json"
@@ -196,7 +212,7 @@ assert "stale result does not turn timeout into success" "$([[ "$rc" -ne 0 ]] &&
 
 echo "case: task-scope guard start + follow-up sends inject once (codex)"
 F="scope-guard-once"
-env CODEX="$WORK/fake-no-echo.sh" "$CODEX_TMUX" start --exact "$F" "$WORK" "initial-task" >/dev/null
+CODEX="$WORK/fake-no-echo.sh" "$CODEX_TMUX" start --exact "$F" "$WORK" "initial-task" >/dev/null
 sleep 1
 "$CODEX_TMUX" send "$F" "second-task" >/dev/null
 "$CODEX_TMUX" send "$F" "third-task" >/dev/null
@@ -212,7 +228,7 @@ assert "scope guard sentinel present after start prompt" "$([[ -e "$scope_sentin
 
 echo "case: allow-project-config disables task-scope guard marker (codex)"
 G="scope-guard-allow"
-env CODEX="$WORK/fake-no-echo.sh" "$CODEX_TMUX" start --exact --allow-project-config "$G" "$WORK" "initial-task" >/dev/null
+CODEX="$WORK/fake-no-echo.sh" "$CODEX_TMUX" start --exact --allow-project-config "$G" "$WORK" "initial-task" >/dev/null
 sleep 1
 pane_allow="$(tmux capture-pane -J -t "codex-cli-$G" -p -S -200)"
 allow_sentinel="$(dirname "$("$CODEX_TMUX" result --path "$G")")/scope-guard-injected"

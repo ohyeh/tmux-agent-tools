@@ -1,0 +1,84 @@
+#!/usr/bin/env zsh
+# The mod's permission surface is a contract with whoever installs it: the
+# events it hooks, the engine calls it makes, the env it reads and writes. The
+# community's first reaction to function-hook mods was to scan them for exactly
+# this (r/ClaudeCode, 2026-09-15), so a change here must be a visible diff in a
+# reviewed file, never a side effect of a refactor.
+#
+# `claude plugin validate` derives that surface from the source. This smoke
+# pins its output to mods/tmux-agent/permissions.txt: a drift FAILS and prints
+# the diff; an intended change is committed by refreshing the file with
+# `scripts/test-mod-permissions-smoke --update`.
+#
+# Also runs the mod's own test suite (`claude plugin test`), which nothing else
+# in CI did before this: 54 mocked tests only ever ran on a developer's machine.
+#
+# CLAUDE_BIN names the real Claude Code binary when a stub `claude` shadows it
+# on PATH (CI installs sleep-stubs for the tmux smokes).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+CLAUDE="${CLAUDE_BIN:-claude}"
+MOD=mods/tmux-agent
+PINNED="$MOD/permissions.txt"
+
+pass=0
+fail=0
+ok()   { echo "  ok   $1"; pass=$((pass + 1)); }
+bad()  { echo "  FAIL $1" >&2; fail=$((fail + 1)); }
+
+if ! command -v "$CLAUDE" >/dev/null 2>&1; then
+  bad "Claude Code binary not found ($CLAUDE); set CLAUDE_BIN"
+  echo "$pass passed, $fail failed" >&2
+  exit 1
+fi
+if ! "$CLAUDE" plugin validate --help >/dev/null 2>&1; then
+  bad "$CLAUDE is not a Claude Code that knows 'plugin validate' (a stub on PATH?) — set CLAUDE_BIN"
+  echo "$pass passed, $fail failed" >&2
+  exit 1
+fi
+
+actual="$(mktemp)"
+trap 'rm -f "$actual"' EXIT
+# Only the derived surface lines; the header carries an absolute path.
+"$CLAUDE" plugin validate "$MOD" 2>&1 | grep '❯' | sed 's/^[[:space:]]*❯ //' > "$actual"
+if [[ ! -s "$actual" ]]; then
+  bad "plugin validate printed no surface lines"
+  "$CLAUDE" plugin validate "$MOD" >&2 || true
+  echo "$pass passed, $fail failed" >&2
+  exit 1
+fi
+
+if [[ "${1:-}" == "--update" ]]; then
+  cp "$actual" "$PINNED"
+  echo "  wrote $PINNED"
+fi
+
+if [[ ! -f "$PINNED" ]]; then
+  bad "$PINNED missing — run: scripts/test-mod-permissions-smoke --update"
+elif diff -u "$PINNED" "$actual"; then
+  ok "permission surface matches $PINNED"
+else
+  bad "permission surface drifted from $PINNED (diff above). Intended? Review, then --update"
+fi
+
+echo "running the mod's test suite"
+if out="$("$CLAUDE" plugin test "$MOD" 2>&1)"; then
+  summary="$(printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail)$' | tr -s ' ' | paste -sd, -)"
+  if printf '%s\n' "$out" | grep -qE '^ *0 fail$'; then
+    ok "plugin test:${summary}"
+  else
+    bad "plugin test reported failures:${summary}"
+    printf '%s\n' "$out" | grep -E '\(fail\)' >&2 || true
+  fi
+else
+  bad "plugin test exited non-zero"
+  printf '%s\n' "$out" | tail -20 >&2
+fi
+
+echo "$pass passed, $fail failed"
+[[ $fail -eq 0 ]]

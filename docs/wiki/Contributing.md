@@ -9,8 +9,7 @@ tmux-agent-tools/
 ├── skills/tmux-agent-tools/
 │   ├── SKILL.md                       # canonical command reference
 │   └── scripts/
-│       ├── claude-tmux                # main wrapper for Claude Code
-│       ├── codex-tmux                 # main wrapper for Codex CLI
+│       ├── agent-tmux                 # unified wrapper engine (agent-tmux <cli> <command>)
 │       ├── tmux-agent-dialogue        # bounded two-agent dialogue
 │       ├── tmux-agent-sessions        # cross-agent inventory
 │       ├── tmux-agent-fanout          # parallel run across agents
@@ -26,7 +25,6 @@ tmux-agent-tools/
 │   └── lint-no-path-tied-locals.test  # lint smoke
 ├── schemas/                           # JSON schemas for stable surfaces
 ├── docs/                              # design docs (one per issue / batch)
-├── Formula/                           # Homebrew formula
 ├── CHANGELOG.md                       # release-by-release narrative
 └── .github/workflows/                 # CI + release workflows
 ```

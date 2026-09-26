@@ -3,8 +3,6 @@
 # other AND with the latest released version in CHANGELOG.md. This makes version
 # drift a CI failure instead of something noticed releases later.
 #
-# Formula/tmux-agent-tools.rb is intentionally NOT checked here: it is bumped in a
-# separate post-release PR (the `release(formula): ...` pattern), so it lags the
 # tag by design in the window between release and formula bump.
 
 set -euo pipefail
@@ -33,6 +31,35 @@ for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json .cursor-plu
   v="$(jq -r '.version' "$manifest")"
   assert "$manifest matches CHANGELOG" "$v" "$changelog_version"
 done
+
+# AGENT_TMUX_VERSION is what `--version` and `doctor` print — the offline signal
+# for multi-machine skill-copy drift. It lagged the CHANGELOG by a full release
+# (0.38.0 vs 0.39.0) because nothing compared it, so compare it here too.
+script_version="$(sed -n "s/^AGENT_TMUX_VERSION='\\(.*\\)'$/\\1/p" \
+  skills/tmux-agent-tools/scripts/agent-tmux)"
+assert "agent-tmux AGENT_TMUX_VERSION matches CHANGELOG" "$script_version" "$changelog_version"
+
+# marketplace.json was the hole this smoke used to have: it passed 4/4 while
+# metadata.version sat a whole release behind (0.38.0 vs 0.39.0). It is what the
+# marketplace listing shows, so a lag there is drift users can see.
+MARKET=.claude-plugin/marketplace.json
+assert "$MARKET metadata.version matches CHANGELOG" \
+  "$(jq -r '.metadata.version' "$MARKET")" "$changelog_version"
+assert "$MARKET tmux-agent-tools entry matches CHANGELOG" \
+  "$(jq -r '.plugins[] | select(.name == "tmux-agent-tools") | .version' "$MARKET")" \
+  "$changelog_version"
+
+# The mod ships on its own version line (it is a separate plugin), so it is held
+# to its OWN manifest rather than to the CHANGELOG.
+assert "$MARKET tmux-agent entry matches the mod manifest" \
+  "$(jq -r '.plugins[] | select(.name == "tmux-agent") | .version' "$MARKET")" \
+  "$(jq -r '.version' mods/tmux-agent/.claude-plugin/plugin.json)"
+
+# The panel title prints MOD_VERSION so a running session shows which code it
+# loaded; a constant that lags the manifest would lie exactly when it matters.
+assert "mods/tmux-agent MOD_VERSION matches the mod manifest" \
+  "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" mods/tmux-agent/hooks/register.ts)" \
+  "$(jq -r '.version' mods/tmux-agent/.claude-plugin/plugin.json)"
 
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

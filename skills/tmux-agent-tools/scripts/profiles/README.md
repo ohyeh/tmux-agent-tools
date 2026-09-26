@@ -13,7 +13,7 @@ profiles, not as code.
 3. `~/.config/agent-tmux/profiles` (or `$XDG_CONFIG_HOME/agent-tmux/profiles`)
 4. this directory (bundled defaults)
 
-`agent-tmux <cli> --profile <file> ...` bypasses the search and loads that
+`agent-tmux <cli> --profile <path-or-name> ...` loads that profile: a path is used as-is; a bare name is resolved as `<name>.conf` (then `<name>`) through the same search order. It bypasses the `<cli>.conf` lookup and loads the named
 exact file. The first match wins and overrides the built-in preset for that
 CLI.
 Files are plain `key=value` (never sourced, so they cannot execute code).
@@ -40,6 +40,8 @@ take precedence over profile values.
 | `pattern_login_prompt` | ERE → `login_prompt` | |
 | `session_id_pattern` | grep-compatible ERE to extract the CLI's internal session UUID from pane output; enables `resume` when matched. **Sensitive** — UUID is a resume capability; treat as non-shareable. Leave unset when the CLI output format is unknown or unstable; resume falls back to tmux supervision only. | `session_id_pattern=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}` |
 | `exec_mode` | `interactive` (default) or `oneshot`. `interactive` starts the CLI in a tmux pane as usual. `oneshot` runs the CLI once headlessly: completion = process exit, and a contract-valid `result.json` (status, summary, exit_code, stdout_path) is synthesized at exit unless the worker wrote its own. | `exec_mode=oneshot` |
+| `prompt_delivery` | `paste` (default) or `file-ref`. How `assign` hands over the task in interactive mode. `file-ref` composes scope-guard + result-path + body into `$TMUX_AGENT_DIR/<name>/prompt.md` and sends ONE line naming it — for TUIs that submit on every newline (agy split one pasted prompt into 12 inputs, 2026-09-08). | `prompt_delivery=file-ref` |
+| `preflight_flags` | argv for the launch probe run by `preflight` and `assign` step 0 (default `--version`; empty disables). Must be side-effect-free and must exit. | `preflight_flags=--version` |
 | `prompt_via` | `paste` (default) or `argv`. How the prompt is delivered in oneshot mode. `paste` sends via tmux send-keys; `argv` passes the prompt as a shell-quoted positional argument. Ignored in interactive mode. | `prompt_via=argv` |
 | `prompt_flag` | Optional string. Flag prepended to the prompt argv in oneshot mode (e.g. `-p`, `--print`). May be empty; when empty the prompt is the bare positional argument. Ignored in interactive mode. | `prompt_flag=-p` |
 | `headless_flags` | Flags used **instead of** `launch_flags` when the caller passes `start --headless`, so one profile serves both interactive and headless starts. Built in for claude (`--dangerously-skip-permissions` + `-p`) and codex (`exec --dangerously-bypass-approvals-and-sandbox`); any other CLI must set `headless_flags` and/or `headless_prompt_flag` or `start --headless` exits 2. | `headless_flags=exec --noninteractive-flag` |

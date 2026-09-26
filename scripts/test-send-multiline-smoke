@@ -6,8 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-send-multiline.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -15,9 +16,16 @@ trap 'rm -rf "$WORK"' EXIT
 
 cat > "$WORK/fake-live.sh" <<'EOF'
 #!/bin/sh
+# A file-ref line (claude's delivery) is read the way the real CLI reads it:
+# the named file, line by line.
 echo "ready"
 while IFS= read -r line; do
-  echo "got:$line"
+  case "$line" in
+    'Your task is in the file '*)
+      f="${line#Your task is in the file }"; f="${f%% — *}"
+      while IFS= read -r l; do echo "got:$l"; done < "$f" ;;
+    *) echo "got:$line" ;;
+  esac
 done
 EOF
 chmod +x "$WORK/fake-live.sh"
@@ -71,9 +79,16 @@ run_one() {
   sleep 1
 
   local pane send_line audit_line
-  pane="$(tmux capture-pane -J -t "$session_prefix-$prefix" -p -S -120)"
+  # -S -2000: a file-ref read prints the 17000-char line whole (a paste was cut at the tty line limit).
+  pane="$(tmux capture-pane -J -t "$session_prefix-$prefix" -p -S -2000)"
   assert_contains "$prefix pane got first line" "$pane" "got:alpha"
   assert_contains "$prefix pane got second line" "$pane" "got:beta: with colon"
+  # claude's default delivery is file-ref: one typed line, the text in a file.
+  if [[ "$cli_env" == CLAUDE ]]; then
+    assert_contains "$prefix got one file-ref line" "$pane" "Your task is in the file"
+  else
+    assert "$prefix codex still pastes" "$([[ "$pane" == *"Your task is in the file"* ]] && echo ref || echo paste)" "paste"
+  fi
 
   send_line="$(grep '"event":"send"' "$transcript" | tail -1)"
   assert "$prefix transcript multiline=true" "$(printf '%s' "$send_line" | jq -r .multiline)" "true"

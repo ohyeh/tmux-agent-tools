@@ -1,11 +1,12 @@
 #!/usr/bin/env zsh
-# Smoke test for Claude/Anthropic env inheritance into claude-tmux sessions.
+# Smoke test for Claude/Anthropic env inheritance into agent-tmux claude sessions.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-claude-env.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"

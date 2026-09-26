@@ -7,8 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-prompt-file-smoke.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -243,10 +244,19 @@ run_positional_ordering_real() {
   cat > "$WORK/fake-pos-$prefix.sh" <<'FAKEOF'
 #!/bin/sh
 printf 'fake cli ready\n'
-while IFS= read -r line; do
-  nonce="$(printf '%s\n' "$line" | sed -nE 's/.*(MARK-[0-9a-fA-F]+).*/\1/p' | tail -1)"
+handle() {
+  nonce="$(printf '%s\n' "$1" | sed -nE 's/.*(MARK-[0-9a-fA-F]+).*/\1/p' | tail -1)"
   [ -n "$nonce" ] && printf '%s\n' "$nonce"
-  case "$line" in *'[SWLDONE]'*) printf '[SWLDONE]\n' ;; esac
+  case "$1" in *'[SWLDONE]'*) printf '[SWLDONE]\n' ;; esac
+}
+while IFS= read -r line; do
+  case "$line" in
+    # A file-ref line (claude's delivery): read the named file like the CLI.
+    'Your task is in the file '*)
+      f="${line#Your task is in the file }"; f="${f%% — *}"
+      while IFS= read -r l; do printf 'read:%s\n' "$l"; handle "$l"; done < "$f" ;;
+    *) handle "$line" ;;
+  esac
 done
 FAKEOF
   chmod +x "$WORK/fake-pos-$prefix.sh"

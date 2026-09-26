@@ -129,6 +129,22 @@ assert "lifecycle terminal_reason=stopped" "$(jq -r .terminal_reason "$rj")" "st
 assert "lifecycle finished_at present" \
   "$([[ -n "$(jq -r '.finished_at // ""' "$rj")" ]] && echo yes || echo no)" "yes"
 
+echo "case: stop SUPPLIES an outcome when the agent's valid JSON names none"
+# The gap between the two cases either side: bytes that parse but carry no
+# status. The agent wrote its ANSWER as "final JSON" instead of the contract,
+# so the merge produced terminal_reason with no outcome and every
+# terminal-status reader skipped the worker in silence (2026-09-17
+# modtest1-ra02). Its own keys must survive; only the missing outcome is added.
+mkfake_launch lsc 'lsc-x-cccc' '2026-07-10T00:00:00Z'
+jq -n '{repo_root:"/tmp/x",ls_la:"total 0",note:"free-form, no status"}' \
+  > "$TMUX_AGENT_DIR/lsc/result.json"
+"$AGENT" claude stop lsc >/dev/null 2>&1 || true
+cj="$TMUX_AGENT_DIR/lsc/result.json"
+assert "statusless result gets a terminal status" "$(jq -r .status "$cj")" "failed"
+assert "statusless result gets schema_version" "$(jq -r .schema_version "$cj")" "1"
+assert "agent's own keys preserved" "$(jq -r .note "$cj")" "free-form, no status"
+assert "statusless terminal_reason=stopped" "$(jq -r .terminal_reason "$cj")" "stopped"
+
 echo "case: stop with NO result synthesizes a skeleton (terminal_reason=stopped)"
 mkfake_launch lsn 'lsn-x-bbbb' '2026-07-10T00:00:00Z'
 "$AGENT" claude stop lsn >/dev/null 2>&1 || true
@@ -165,16 +181,16 @@ assert "still exactly one launch_end" \
 echo "case: stats --json launches block is self-consistent"
 sjson="$("$AGENT" claude stats --json)"
 # total = every usage_init carrying a launch_id: linit(2)+lsr(1)+lsn(1)+lexit(1)
-assert "launches.total counts inits" "$(printf '%s' "$sjson" | jq -r .launches.total)" "5"
-assert "by_terminal_reason.stopped=2" \
-  "$(printf '%s' "$sjson" | jq -r '.launches.by_terminal_reason.stopped')" "2"
+assert "launches.total counts inits" "$(printf '%s' "$sjson" | jq -r .launches.total)" "6"
+assert "by_terminal_reason.stopped=3" \
+  "$(printf '%s' "$sjson" | jq -r '.launches.by_terminal_reason.stopped')" "3"
 assert "name_reuse=1 (linit restarted)" "$(printf '%s' "$sjson" | jq -r .launches.name_reuse)" "1"
 assert "ended >= 2" \
   "$([[ "$(printf '%s' "$sjson" | jq -r .launches.ended)" -ge 2 ]] && echo yes || echo no)" "yes"
 
 echo "case: text stats renders a launches line"
 stext="$("$AGENT" claude stats)"
-assert_contains "text launches line" "$stext" "launches: 5 total"
+assert_contains "text launches line" "$stext" "launches: 6 total"
 
 echo "case: empty/ledger-less state dir → zero launches block (no error)"
 empty_json="$(TMUX_AGENT_DIR="$WORK/empty" "$AGENT" claude stats --json)"

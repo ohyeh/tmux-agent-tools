@@ -1,0 +1,319 @@
+#!/usr/bin/env zsh
+# Smoke test: `status --json` names a worker the CLI stopped on a usage limit or
+# lost credentials for (blocked_reason quota_exhausted / login_required, with
+# the matching line in blocked_evidence), and does NOT fire on a worker's own
+# prose or on a banner that is old history. The quota pane is the live codex
+# screen of 2026-09-24 (banner above the `›` input, outside the prompt area).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+
+WORK="$(mktemp -d -t tmux-agent-runtime-blocker.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+fake() {
+  local file="$WORK/$1.sh"
+  { print -r -- '#!/bin/sh'; print -r -- 'cat <<'"'"'PANE'"'"''; cat; print -r -- 'PANE'; print -r -- 'while IFS= read -r line; do : ; done'; } > "$file"
+  chmod +x "$file"
+}
+
+fake codex-quota <<'EOF'
+  Do not spawn additional tmux sessions or delegate further.
+↳ Hook · PONYTAIL:FULL
+• Hook failed
+  └ hook returned invalid session start JSON output
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),
+visit https://chatgpt.com/codex/settings/usage to purchase more credits or try
+again at Sep 25th, 2026 12:32 AM.
+
+
+› Ask Codex to do anything
+
+  GPT-6-Astra low · tmux-agent-tools · ⚠ 1 warning · f2 to view
+EOF
+
+fake prose <<'EOF'
+• Implemented rate limit handling and a usage limit counter in api/client.ts.
+• Error handling now covers quota errors from the upstream.
+› Ask Codex to do anything
+EOF
+
+fake old-banner <<'EOF'
+■ You’ve hit your usage limit. try again at 12:32 AM.
+• resumed after the reset
+• step 1
+• step 2
+• step 3
+• step 4
+• step 5
+• step 6
+• step 7
+• step 8
+• step 9
+• step 10
+› Ask Codex to do anything
+EOF
+
+fake auth <<'EOF'
+Error: invalid api key — check your credentials.
+› Ask Codex to do anything
+EOF
+
+fake no-boundary <<'EOF'
+⏺ Working on the migration.
+  ⎿  Claude usage limit reached. Your limit will reset at 3am.
+────────────────────────────────────────
+  ? for shortcuts
+EOF
+
+# The astra re-review's counterexamples (2026-09-25), each once a wrong answer.
+fake quoted <<'EOF'
+Added a test for "invalid api key" responses.
+› Ask Codex to do anything
+EOF
+
+fake resumed-recent <<'EOF'
+■ You’ve hit your usage limit.
+• resumed after reset
+• Running slow build
+› Ask Codex to do anything
+EOF
+
+fake rate-limit <<'EOF'
+Error: rate limit exceeded
+› Ask Codex to do anything
+EOF
+
+fake after-boundary <<'EOF'
+› run tests
+■ You’ve hit your usage limit.
+EOF
+
+fake tool-output <<'EOF'
+⏺ Bash(rg "usage limit" src)
+  ⎿  src/client.ts: // usage limit reached → back off
+  ⎿  Error: invalid api key
+────────────────────────────────────────
+  ? for shortcuts
+EOF
+
+# The re-review of 3b83a9e (2026-09-25): "Error" without its colon is prose; a
+# tool's multi-line output indents its lines; the agy banner starts with ⚠.
+fake error-word-prose <<'EOF'
+Error handling for invalid api key responses is now implemented.
+› Ask Codex to do anything
+EOF
+
+fake multiline-tool-output <<'EOF'
+⏺ Bash(cat error-fixture.txt)
+  ⎿  Expected error text:
+     Error: invalid api key
+? for shortcuts
+EOF
+
+fake claude-retried <<'EOF'
+⏺ Reading the config.
+  ⎿  API Error: 429 rate limit exceeded
+  ⎿  Read 20 lines
+EOF
+
+fake api-error-prose <<'EOF'
+API Error handling for invalid api key responses is now implemented.
+› Ask Codex to do anything
+EOF
+
+fake claude-api-error <<'EOF'
+⏺ Reading the config.
+  ⎿  API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}
+EOF
+
+fake tool-api-error-prose <<'EOF'
+⏺ Update(src/client.ts)
+  ⎿  API Error handling added for invalid api key responses
+EOF
+
+fake agy-quota <<'EOF'
+⚠ Individual quota reached
+? for shortcuts
+>
+EOF
+
+# The cursor review of 4d0af09 (2026-09-25, O1/O7): real stop strings from
+# claude transcripts and the codex/agy/grok binaries, and a ⚠ that is only a warning.
+fake claude-session-limit <<'EOF'
+⏺ Reading the config.
+  ⎿  You've hit your session limit · resets 2:10pm (Asia/Taipei)
+EOF
+
+fake claude-credit <<'EOF'
+⏺ Reading the config.
+  ⎿  Credit balance is too low
+EOF
+
+fake tool-session-limit-prose <<'EOF'
+⏺ Bash(rg "session limit" src)
+  ⎿  src/ui.ts: You've hit your session limit · resets soon
+EOF
+
+fake codex-token <<'EOF'
+■ Your access token could not be refreshed. Please log out and sign in again.
+› Ask Codex to do anything
+EOF
+
+fake agy-exhausted <<'EOF'
+⚠ You have exhausted your quota on this model.
+? for shortcuts
+>
+EOF
+
+fake grok-free <<'EOF'
+Error: You hit your free usage limit.
+>
+EOF
+
+fake mcp-warning <<'EOF'
+⚠ MCP client for `linear` failed to start: authentication required
+› GOAL: port the poller
+  and keep the tests green
+  GPT-6-Astra low · tmux-agent-tools
+EOF
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+
+status_of() {
+  # Unique per run: two runs at once (run-all-smokes beside a mutation run) must
+  # not share tmux sessions, or one reads the other's pane.
+  local fixture="$1" name="$1-$$"
+  CODEX="$WORK/$fixture.sh" "$CODEX_TMUX" start --exact "$name" "$WORK" >/dev/null
+  # Wait until the fixture is on screen: a `status` of a pane that has not drawn
+  # yet answers null, and every "not blocked" case would then pass vacuously.
+  local first i
+  first="$(sed -n 3p "$WORK/$fixture.sh" | tr -d '[:space:]' | cut -c1-20)"
+  for i in {1..40}; do
+    "$CODEX_TMUX" capture --strip-ansi --tail 60 "$name" 2>/dev/null | tr -d '[:space:]' | grep -qF -- "$first" && break
+    sleep 0.25
+  done
+  if (( i >= 40 )); then
+    # Not a pass by default: a case that saw no pane checked nothing.
+    print -r -- '{"blocked_reason":"FIXTURE_NEVER_DREW"}'
+    "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+    return
+  fi
+  "$CODEX_TMUX" status --json "$name"
+  "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+}
+
+echo "case: live codex usage-limit banner above the prompt"
+st="$(status_of codex-quota)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the banner line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),"
+assert "not a confirmation dialog" "$(jq -r .confirmation_detected <<< "$st")" "false"
+assert "diagnostic names the limit" "$(jq -r '.diagnostic // ""' <<< "$st" | grep -c 'usage/quota limit')" "1"
+
+echo "case: a worker's own prose about rate/usage limits is not a blocker"
+st="$(status_of prose)"
+assert "prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "prose has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
+
+echo "case: a banner pushed out of the last output lines is history"
+st="$(status_of old-banner)"
+assert "old banner not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: lost credentials mid-run"
+st="$(status_of auth)"
+assert "blocked_reason login_required" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "login_required"
+assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "Error: invalid api key — check your credentials."
+
+echo "case: a pane with no prompt boundary reads its last lines (shape UNCONFIRMED on a live claude pane)"
+st="$(status_of no-boundary)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a worker's own line quoting an error phrase is not the CLI's error"
+st="$(status_of quoted)"
+assert "quoted not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: output after a recent banner means the worker resumed"
+st="$(status_of resumed-recent)"
+assert "resumed not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: a rate limit the CLI stopped on"
+st="$(status_of rate-limit)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "Error: rate limit exceeded"
+
+echo "case: an error printed after an echoed prompt is the newest output"
+st="$(status_of after-boundary)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a tool's output under ⎿ is the tool's, not the CLI's"
+st="$(status_of tool-output)"
+assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: prose that opens with the word Error is not an error line"
+st="$(status_of error-word-prose)"
+assert "prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: an error line inside a tool's multi-line output is the tool's"
+st="$(status_of multiline-tool-output)"
+assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: tool output under ⎿ after an API error means claude retried"
+st="$(status_of claude-retried)"
+assert "retried not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: prose opening with API Error (no colon) is not an error line"
+st="$(status_of api-error-prose)"
+assert "api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: claude's own API error under ⎿ still counts"
+st="$(status_of claude-api-error)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a tool line under ⎿ opening with API Error (no colon) is the tool's"
+st="$(status_of tool-api-error-prose)"
+assert "tool api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: the documented agy quota banner"
+st="$(status_of agy-quota)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: claude's session limit under ⎿"
+st="$(status_of claude-session-limit)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: claude's credit balance under ⎿"
+st="$(status_of claude-credit)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a tool line quoting the session-limit text is the tool's"
+st="$(status_of tool-session-limit-prose)"
+assert "tool quote not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: codex lost its token"
+st="$(status_of codex-token)"
+assert "blocked_reason login_required" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "login_required"
+
+echo "case: agy exhausted its model quota"
+st="$(status_of agy-exhausted)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: grok's free usage limit"
+st="$(status_of grok-free)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+
+echo "case: a ⚠ MCP auth warning is not a stop"
+st="$(status_of mcp-warning)"
+assert "warning not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

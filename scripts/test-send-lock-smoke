@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Smoke test for issue #102 advisory send lock.
 #
-# Validates that `send_lock_around` in claude-tmux and codex-tmux:
+# Validates that `send_lock_around` in agent-tmux claude and codex:
 #   - serializes concurrent acquirers on the same agent name
 #   - recovers from a stale PID written into the lock dir
 #   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
@@ -18,8 +18,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CLAUDE_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/claude-tmux"
-CODEX_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/codex-tmux"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
 WORK="$(mktemp -d -t tmux-agent-send-lock-smoke.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -127,4 +128,4 @@ for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   run_case "$wrapper" "$tool-rc"           "$WORK/case-rc.zsh"
 done
 
-echo "OK: send-lock smoke passed for claude-tmux and codex-tmux."
+echo "OK: send-lock smoke passed for agent-tmux claude and codex."

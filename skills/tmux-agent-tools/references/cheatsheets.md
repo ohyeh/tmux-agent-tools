@@ -6,10 +6,7 @@ Read this when picking a subcommand for a specific scenario, choosing the right 
 
 | Name | One-line purpose | When to reach for it |
 | --- | --- | --- |
-| `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets, `doctor --json`, `setup`, and declarative profiles. | Use directly for CLIs without a dedicated shim (gemini, cursor, grok, in-house tools), when scripting across multiple CLIs, or when running JSON preflight via `agent-tmux <cli> setup`. |
-| `agy-tmux` | Thin shim for the bundled `agy` profile over `agent-tmux agy`. | Use when supervising Antigravity/agy with the same wrapper contract as Claude and Codex. |
-| `claude-tmux` | Manage a Claude Code CLI worker in tmux with start/resume, send, wait, capture, status, ping, result, and cleanup helpers. | Use for long-running Claude Code work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
-| `codex-tmux` | Manage a Codex CLI worker in tmux with the same wrapper contract as `claude-tmux`. | Use for long-running Codex work that needs supervision, structured result files, markers, active liveness, or later diagnostic capture. |
+| `agent-tmux` | Unified engine: manage any AI coding CLI as a tmux worker (`agent-tmux <cli> <command>`), with per-CLI presets (claude, codex, agy), `doctor --json`, `setup`, and declarative profiles for other CLIs (gemini, cursor, grok, in-house tools). | The single entry point for every worker: start/resume, send, wait, capture, status, ping, result, supervision, and cleanup, for long-running work that needs structured result files, markers, or active liveness. |
 | `install-bin` | Install or link the bundled scripts into a chosen bin directory. | Use during local setup when the scripts are not already on `PATH`. |
 | `tmux-agent-audit` | Query and verify wrapper audit logs. | Use when you need an operator-facing record of wrapper events, secret use, approvals, or posting actions. |
 | `tmux-agent-cron` | Run scheduled/periodic tmux-agent-tool jobs from a manifest. | Use for repeatable local automation where a manifest should drive wrapper invocations. |
@@ -26,7 +23,7 @@ Read this when picking a subcommand for a specific scenario, choosing the right 
 
 ## Scenario → command
 
-Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focused per-subcommand cheatsheet instead of dumping the full usage.
+Use `agent-tmux claude help <subcommand>` or `agent-tmux codex help <subcommand>` for a focused per-subcommand cheatsheet instead of dumping the full usage.
 
 | Scenario | Command |
 | --- | --- |
@@ -35,6 +32,7 @@ Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focu
 | Wait for first/all worker completions | `watch --any|--all --timeout 600 --json <n1> <n2>` |
 | Read the agent's structured result | `result --field '.status' --wait 30 --json <name>` |
 | Wait until required result fields exist | `result wait-required <name> --fields status,summary --wait 60 --json` |
+| Supervise one asynchronous worker without model polling | `supervise --result-required --silent-while-unchanged --json <name>` |
 | Validate the structured result contract | `result validate <name> --json` |
 | Fleet usage snapshot (adoption/status health) | `stats --json` — add `--exclude-selftest` to drop self-test workers (reports `excluded_selftest` count); top-level `by_task_shape` / `task_shape_coverage` fill in when launches carry `start --task-shape` |
 | Launch lifecycle audit (completion coverage, name reuse) | `stats --json` then read `.launches` — `total` launches vs `ended` (`end_coverage_pct`), `by_terminal_reason` (`agent-result`/`process-exit`/`stopped`/`max-runtime`/`unknown`), and `name_reuse`; sourced from the append-only per-worker `usage.jsonl` ledger, so restarts of one name each count as a distinct launch |
@@ -48,7 +46,7 @@ Use `claude-tmux help <subcommand>` or `codex-tmux help <subcommand>` for a focu
 | Get fallback pane evidence | `capture --strip-ansi <name> 80` |
 | Record every wrapper event to disk | `start --transcript /tmp/run.jsonl` |
 | Hold a worker for a human-controlled next round | `wait-and-capture --marker '[READY]' --timeout 300 --wait-for-human --cancel-file /tmp/cancel <name>` |
-| Per-subcommand cheatsheet | `claude-tmux help <subcommand>` |
+| Per-subcommand cheatsheet | `agent-tmux claude help <subcommand>` |
 
 > **Timeout layering rule**: any outer execution limit (agent Bash-tool timeout, CI step timeout, `timeout(1)`) must be LONGER than the `--timeout`/`--wait` you pass to `watch`/`wait`/`result`. If the outer layer kills the call first you get a generic "execution timed out" with no wrapper diagnostics — seen in the field as `watch --timeout 600` dying inside a 120s outer shell.
 
@@ -60,6 +58,7 @@ Default capture dumps raw scrollback — most of those tokens are ANSI escapes, 
 | --- | --- |
 | Agent writes the wrapper-injected literal result path, parent reads with `result --wait` | Parent never reads pane scrollback. Token cost = result body, not pane history. |
 | `watch --any|--all --timeout 600 --json w1 w2` | One blocking call supervises many workers; no orchestrator polling loop. |
+| `supervise --result-required --silent-while-unchanged --json worker` | One blocking call waits for a valid terminal result or confirmed process loss; unchanged state emits nothing. |
 | `status --json` + `ping --json --timeout 5` | Passive + active liveness without reading pane history. |
 | `send-wait worker '...' 300` | Generates a fresh nonce marker and waits for it, so old pane text cannot satisfy the new turn. |
 | `wait-and-capture --marker '[DONE]' --timeout 300 --tail 80 --strip-ansi --json` | Diagnostic fallback when branch logic needs nearby pane text. |
@@ -127,14 +126,14 @@ Raw waits scan the current pane. If `[DONE]` is still visible from a previous tu
 Bad:
 
 ```bash
-codex-tmux send worker 'Do the next task and end with [DONE].'
-codex-tmux wait-text worker '[DONE]' 300
+agent-tmux codex send worker 'Do the next task and end with [DONE].'
+agent-tmux codex wait-text worker '[DONE]' 300
 ```
 
 Good:
 
 ```bash
-codex-tmux send-wait worker 'Do the next task.' 300
+agent-tmux codex send-wait worker 'Do the next task.' 300
 ```
 
 `send-wait` generates a fresh unique nonce for that turn, injects the "end with <nonce>" instruction, and waits on that nonce. Prefer fresh unique markers per turn; do not reuse `[DONE]` across an orchestration loop.
@@ -146,16 +145,16 @@ Most CLIs echo the submitted prompt into the pane. If the literal marker appears
 Bad:
 
 ```bash
-codex-tmux send worker 'Review the diff and end with [REVIEW-DONE].'
-codex-tmux wait-text worker '[REVIEW-DONE]' 300
+agent-tmux codex send worker 'Review the diff and end with [REVIEW-DONE].'
+agent-tmux codex wait-text worker '[REVIEW-DONE]' 300
 ```
 
 Good options:
 
 ```bash
-codex-tmux send-wait worker 'Review the diff and write a verdict block.' 300
-codex-tmux send worker 'Review the diff and end with the marker formed by joining [REVIEW- and DONE].'
-codex-tmux wait-text worker '[REVIEW-DONE]' 300
+agent-tmux codex send-wait worker 'Review the diff and write a verdict block.' 300
+agent-tmux codex send worker 'Review the diff and end with the marker formed by joining [REVIEW- and DONE].'
+agent-tmux codex wait-text worker '[REVIEW-DONE]' 300
 ```
 
 Use the split-marker wording only when you intentionally manage the marker yourself. Otherwise prefer `send-wait`.
@@ -165,13 +164,13 @@ Use the split-marker wording only when you intentionally manage the marker yours
 Literal markers with metacharacters work without escaping:
 
 ```bash
-codex-tmux wait-text worker '[DONE]' 300
+agent-tmux codex wait-text worker '[DONE]' 300
 ```
 
 Use `--regex` only for actual regular expressions:
 
 ```bash
-codex-tmux wait-text --regex worker 'DONE|Need approval' 300
+agent-tmux codex wait-text --regex worker 'DONE|Need approval' 300
 ```
 
 ### Alternation marker like `[DONE]` OR `Need approval`
@@ -181,7 +180,7 @@ When you need to wait for one of several markers and one contains regex metachar
 Correct approach:
 
 ```bash
-codex-tmux wait-and-capture \
+agent-tmux codex wait-and-capture \
   --regex \
   --marker '\[DONE\]|Need approval' \
   --timeout 300 \
