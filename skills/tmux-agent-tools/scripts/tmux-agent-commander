@@ -141,17 +141,6 @@ read_pid() {
   print -r -- "$pid"
 }
 
-# Exact .owner string. deliver_once matches it to the tmux session; the
-# heartbeat file is the one that sanitizes. panel uses owner_matches on the
-# owner from its single jq pass, not one jq per worker.
-owner_of() {
-  "$JQ" -r '.owner // empty' "$1" 2>/dev/null || true
-}
-
-owner_matches() {
-  [[ "$1" == "$2" ]]
-}
-
 # Terminal statuses the mod delivers (register.ts TERMINAL) plus the
 # underscore spelling in SPEC.md. Alias words such as "done" are not
 # terminal for the mod, so they are not terminal here.
@@ -216,8 +205,8 @@ deliver_once() {
   for dispatch in "${dispatches[@]}"; do
     [[ -f "$dispatch" ]] || continue
     worker_dir="${dispatch:h}"
-    owner="$(owner_of "$dispatch")"
-    owner_matches "$owner" "$session" || continue
+    owner="$("$JQ" -r '.owner // empty' "$dispatch" 2>/dev/null || true)"
+    [[ "$owner" == "$session" ]] || continue
     since="$("$JQ" -r '.since // empty' "$dispatch" 2>/dev/null || true)"
     [[ "$since" == <-> ]] || continue
     if [[ -f "$worker_dir/delivered" ]]; then
@@ -275,7 +264,7 @@ undelivered_count() {
   for dispatch in "${dispatches[@]}"; do
     [[ -f "$dispatch" ]] || continue
     worker_dir="${dispatch:h}"
-    owner="$(owner_of "$dispatch")"
+    owner="$("$JQ" -r '.owner // empty' "$dispatch" 2>/dev/null || true)"
     [[ "$(sanitize_owner "$owner")" == "$(sanitize_owner "$session")" ]] || continue
     since="$("$JQ" -r '.since // empty' "$dispatch" 2>/dev/null || true)"
     [[ "$since" == <-> ]] || continue
@@ -293,8 +282,8 @@ undelivered_count() {
   print -r -- "$n"
 }
 
-# A split pane is a pane: agent-tmux -t <session> would type into whichever
-# pane is active. This line is not a pane.
+# Not a split pane: agent-tmux sends to the session's active pane, so a pane
+# the user focuses would swallow the delivery. A status line is not a pane.
 install_worker_panel() {
   local session="$1" fmt
   fmt="#(${(qq)SELF} panel ${(qq)session})"
@@ -492,7 +481,7 @@ panel_mark() {
 }
 
 # One jq for every dispatch and result under root. Prints owned entries, active
-# oldest-first, then the three newest delivered records.
+# newest-first (truncation drops the stalest), then the three newest delivered.
 collect_panel_entries() {
   local root="$1" session="$2" now="$3"
   local -a files
@@ -559,7 +548,7 @@ collect_panel_entries() {
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     IFS=$'\u001f' read -r kind owner name profile since result_status <<< "$line"
-    owner_matches "$owner" "$session" || continue
+    [[ "$owner" == "$session" ]] || continue
     [[ "$since" == <-> ]] || continue
     [[ -n "$name" ]] || continue
     elapsed="$(format_elapsed "$since" "$now")"
@@ -574,7 +563,7 @@ collect_panel_entries() {
   local row
   if (( ${#active_keys} )); then
     local -a asorted
-    asorted=("${(@o)active_keys}")
+    asorted=("${(@O)active_keys}")
     for row in "${asorted[@]}"; do
       print -r -- "${row##*$'\t'}"
     done

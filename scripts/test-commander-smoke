@@ -402,7 +402,7 @@ esac
 assert "running seconds mark" "$sec_ok" "yes"
 prev=""
 order_ok=yes
-for token in "bad1 " "ok1 " "run1 " "secw " "newD " "midB " "midA "; do
+for token in "secw " "run1 " "ok1 " "bad1 " "newD " "midB " "midA "; do
   here="$(index_of "$token" "$mline")"
   if [[ "$here" == -1 ]]; then
     order_ok="missing:$token"
@@ -414,7 +414,7 @@ for token in "bad1 " "ok1 " "run1 " "secw " "newD " "midB " "midA "; do
   fi
   prev="$here"
 done
-assert "active oldest-first, then newest delivered" "$order_ok" "yes"
+assert "active newest-first, then newest delivered" "$order_ok" "yes"
 delivered_n=0
 rest="$mline"
 while [[ "$rest" == *'✓ delivered'* ]]; do
@@ -428,8 +428,11 @@ echo "case: panel --width drops whole entries and prints +N more"
 WSESSION="panel-width-$$"
 NOW_MS="$(perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000')"
 s_w=$(( NOW_MS - (9 * 3600 + 1800) * 1000 ))
+# aaaa is newest, so it survives truncation (newest-first).
+w_age=0
 for wname in aaaa bbbb cccc dddd; do
-  write_dispatch "w-$wname" dispatch.json zz "$wname" "$s_w" "$WSESSION"
+  write_dispatch "w-$wname" dispatch.json zz "$wname" "$(( s_w - w_age ))" "$WSESSION"
+  w_age=$(( w_age + 60000 ))
 done
 e1="aaaa zz 9h ▶"
 e2="bbbb zz 9h ▶"
@@ -448,6 +451,19 @@ assert_excludes "dropped entry is not cut mid-word" "$wline" "bbbb"
 wline="$("$COMMANDER" panel "$WSESSION" --width 1)"
 assert "narrower than one entry prints +N more" "$wline" "+4 more"
 assert_excludes "narrow line does not contain an entry" "$wline" "aaaa"
+
+echo
+echo "case: commander session name matches real agent-tmux (tenant too)"
+# The fake above names sessions the way session_name does; pin that to the
+# real wrapper so a prefix change in agent-tmux fails here, not in a live pane.
+REAL_AT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+real_session() {
+  "$REAL_AT" codex start --dry-run --exact "$1" "$WORK" 2>/dev/null \
+    | jq -r '.invocation.session // empty' 2>/dev/null || true
+}
+assert "real agent-tmux session name" "$(real_session pin$$)" "${PREFIX}-pin$$"
+assert "real agent-tmux session name with tenant" \
+  "$(TMUX_AGENT_TOOLS_TENANT=t1 real_session pin$$)" "${PREFIX}-t1-pin$$"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"
