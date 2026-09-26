@@ -619,6 +619,27 @@ Size-based rotation triggers at `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default
 `audit.rotation` HEAD-link record preserves the chain across rotations.
 Schema documented in `docs/design-issue-188-audit-surface.md`.
 
+## Privacy and Data Handling
+
+tmux-agent-tools runs entirely on your machine. It has no server and collects
+no telemetry; nothing is sent to the plugin author or to Anthropic.
+
+- **What it stores:** worker briefs, `result.json` files, launch metadata and
+  audit logs under the state root (default `~/.local/state/tmux-agent-tools`),
+  plus the tmux sessions it starts. You can delete that directory at any time.
+- **Credentials:** a worker CLI (`claude`, `codex`, `cursor-agent`, …) signs
+  in with its own configuration. The tools read a credential only when you
+  pass `--secret KEY=URI`: they resolve that one secret from the backend you
+  name (a file, an env file, 1Password `op read`, or the macOS Keychain), put
+  it in that worker's tmux environment, and redact it from captures and logs.
+  The value never leaves your machine.
+- **Outbound traffic:** only when you ask for it. `tmux-agent-notify` posts a
+  JSON summary (worker name, exit code, the context flags you pass) to a
+  webhook URL you supply, such as Slack; an `--on-exit`/`--on-start` hook runs
+  the command you give it. Without those, the tools make no network calls.
+- **Retention:** local files stay until you remove them; the audit log rotates
+  (see above).
+
 ## Requirements
 
 - `zsh`
