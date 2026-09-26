@@ -2416,9 +2416,9 @@ describe('teammates', () => {
     for (const columns of [80, 60]) {
       const tree = await $.ui.render(bandRender(40, 39, columns))
       expect(textOf(tree)).toContain('tmux 0 · 內部 0 · 專案 0')
-      // Title + buttons is 69 cells. At 80 the empty hint is padded to the row.
-      // At 60 the hint is already dropped and the title is wider than the row.
-      expect(headerBarCells(tree), `${columns} columns`).toBe(columns === 80 ? 80 : 69)
+      // The full title + buttons is 69 cells: at 60 the name and version go, the counts stay.
+      expect(textOf(tree).includes('workers v'), `${columns} columns`).toBe(columns === 80)
+      expect(headerBarCells(tree), `${columns} columns`).toBe(columns)
       expect(keysOf(tree)).toContain('close')
     }
   })
@@ -3910,7 +3910,7 @@ describe('project sessions', () => {
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
     expect(panel.argv.filter(a => a[1] === 'capture-pane')).toEqual([
-      ['tmux', 'capture-pane', '-p', '-J', '-t', 'hg-android'],
+      ['tmux', 'capture-pane', '-p', '-J', '-t', '=hg-android:'],
     ])
     expect(textOf(await $.ui.render(bandRender()))).toContain('from-pane')
 

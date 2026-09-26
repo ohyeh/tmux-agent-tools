@@ -1439,7 +1439,7 @@ async function mirrorProject(host: Host, name: string, rows: number): Promise<st
   const cwd = host.cwd()
   if (!cwd) return []
   const probe = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', name], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${name}:`], cwd, MIRROR_PROBE_MS)
     .catch(() => undefined)
   if (!probe || probe.exitCode !== 0) return []
   return probe.stdout.split('\n').slice(-rows).map(l => l.replace(CTRL_ALL_RE, ' '))
@@ -1767,7 +1767,7 @@ async function peekProject(host: Host, name: string, lines: number): Promise<Out
   const cwd = host.cwd()
   if (!cwd) return { ok: false, text: `no cwd; cannot capture "${name}"` }
   const pane = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', name], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${name}:`], cwd, MIRROR_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (pane.exitCode !== 0) {
     return { ok: false, text: `capture for "${name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
@@ -2176,9 +2176,13 @@ export const register: Register = on => {
     // draws over its last cells (observed live: it covered `[ hide ]`).
     const tmuxRunning = panel.rows.filter(r => !r.project && !r.terminal).length
     const projectCount = panel.rows.filter(r => r.project).length
-    const titleText = ` workers v${MOD_VERSION} · tmux ${tmuxRunning} · 內部 ${panel.internal} · 專案 ${projectCount} `
-    const titleCells =
-      displayCells(titleText) + displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
+    const counts = `tmux ${tmuxRunning} · 內部 ${panel.internal} · 專案 ${projectCount}`
+    const buttonCells = displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
+    // Too narrow for the name and version (60 columns: 69 cells): the counts are
+    // what the bar is for, so the name goes first, never a count.
+    const full = ` workers v${MOD_VERSION} · ${counts} `
+    const titleText = displayCells(full) + buttonCells <= width ? full : ` ${counts} `
+    const titleCells = displayCells(titleText) + buttonCells
     const hintRoom = Math.max(0, width - titleCells)
     // Whole pieces, dropped from the right: a sliced hint ended mid-command
     // ("· /workers stop <" at 72 columns).
