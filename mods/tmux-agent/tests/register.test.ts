@@ -2479,7 +2479,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.10\.2 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.10\.3 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4024,7 +4024,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.10\.2 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.10\.3 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -4222,6 +4222,8 @@ describe('native mirror', () => {
     expect(seen?.prompt).toContain(`${ROOT}/${record.name}/result.json`)
     expect(seen?.prompt).toContain(`${ROOT}/${record.name}/launch.exit`)
     expect(seen?.prompt).toContain('seq 1 108')
+    expect(seen?.prompt, 'the placeholder result.json (pending) does not end the wait').toContain('(success|failed|blocked|needs-input)')
+    expect(seen?.prompt, 'a bare file test would stop on the placeholder').not.toMatch(/\[ -f [^\]]*result\.json'? \] && break/)
     expect(seen?.prompt).toContain('600000')
     expect(seen?.prompt).toContain('60 minutes')
   })

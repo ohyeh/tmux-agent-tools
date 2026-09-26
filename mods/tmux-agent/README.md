@@ -78,7 +78,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 ## 原生 sub-agent 列 (0.10.0)
 
-Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會照 `assign` 派出 tmux worker，同時讓這次 Agent 呼叫繼續跑一個 haiku sub-agent（`tmux-agent:tmux-waiter`）。它只用 Bash，一次一個迴圈、每次不超過 540 秒（Bash timeout `600000`），每 5 秒看一次絕對路徑的 `result.json` 與 `launch.exit`，總共最多 60 分鐘，然後只回答 worker 名字、狀態、摘要和 result 路徑。
+Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會照 `assign` 派出 tmux worker，同時讓這次 Agent 呼叫繼續跑一個 haiku sub-agent（`tmux-agent:tmux-waiter`）。它只用 Bash，一次一個迴圈、每次不超過 540 秒（Bash timeout `600000`），每 5 秒看一次絕對路徑的 `result.json`（要到終態 status；agent-tmux 開工時先寫一份 `pending`）與 `launch.exit`，總共最多 60 分鐘，然後只回答 worker 名字、狀態、摘要和 result 路徑。
 
 原生 sub-agent 列，以及只看主 transcript 裡名為 `Agent`／`Task` 的 tool_use 的 claude-hud，因此跟 worker 同時存在。`dispatch.json` 上記下 waiter 的 id 之後，collector 的規則是：
 
@@ -407,7 +407,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v0.10.2 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.10.3 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17

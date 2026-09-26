@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.3
+
+- `mods/tmux-agent` 0.10.3 — the waiter waits for a final result. agent-tmux writes `result.json` as `pending` at launch, and the waiter's poll stopped as soon as the file existed: live 2026-09-26 a waiter answered `pending` 14 s after the dispatch while its worker was still reading code (the collector released it and delivered later, as designed). The poll now ends only on a terminal status (`success`, `failed`, `blocked`, `needs-input`, built from `TERMINAL`) or a failed launch. Checked in a shell: a `pending` file keeps it waiting, a `success` file ends it. Mod tests 172 pass; the prompt test fails with the bare file test put back.
+
 ## 0.10.2
 
 - `mods/tmux-agent` 0.10.2 — a dispatch no longer pins a status line. The engine draws a plugin's status as `⚠ tmux-agent: <text>` and keeps it until the next call replaces it; the mod's `tmux-agent: dispatched <name>` read `⚠ tmux-agent: tmux-agent: dispatched …` and stayed under the prompt long after that worker was done (live 2026-09-26). The receipt and `/workers` already say it. Mod tests 172 pass; the new assertion fails with the line put back.

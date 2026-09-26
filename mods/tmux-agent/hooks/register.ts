@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.10.2'
+const MOD_VERSION = '0.10.3'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -247,7 +247,10 @@ function waiterPrompt(stateDir: string, name: string): string {
   const result = `${stateDir}/result.json`
   const exit = `${stateDir}/launch.exit`
   const log = `${stateDir}/mod-assign.log`
-  const poll = `for i in $(seq 1 108); do [ -f ${shq(result)} ] && break; [ -f ${shq(exit)} ] && [ "$(cat ${shq(exit)})" != 0 ] && break; sleep 5; done`
+  // agent-tmux writes result.json as `pending` at launch: only a terminal status ends
+  // the wait (live 2026-09-26 a waiter saw the placeholder and answered `pending`).
+  const done = `grep -Eq '"status"[[:space:]]*:[[:space:]]*"(${[...TERMINAL].join('|')})"' ${shq(result)} 2>/dev/null`
+  const poll = `for i in $(seq 1 108); do ${done} && break; [ -f ${shq(exit)} ] && [ "$(cat ${shq(exit)})" != 0 ] && break; sleep 5; done`
   return [
     `Wait for tmux worker "${name}".`,
     `Result file: ${result}`,
@@ -256,7 +259,7 @@ function waiterPrompt(stateDir: string, name: string): string {
     'Run ONE Bash call at a time. Each call must finish within 540 seconds. Set the Bash tool timeout to 600000.',
     'The command is:',
     poll,
-    'Repeat that Bash call until one of the files exists. Stop after 60 minutes even if neither exists.',
+    'Repeat that Bash call until result.json has a final status (success, failed, blocked, needs-input) or the launch failed. A `pending` status is not final. Stop after 60 minutes regardless.',
     `Then cat ${shq(result)}. If the launch failed (launch.exit exists and is not 0, or result.json is missing), cat the tail of ${shq(log)} instead.`,
     `Answer with only: worker name ${name}, status, summary, and result path ${result}. Nothing else.`,
   ].join('\n')
