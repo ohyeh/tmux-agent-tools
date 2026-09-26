@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.2
+
+- `mods/tmux-agent` 0.10.2 — a dispatch no longer pins a status line. The engine draws a plugin's status as `⚠ tmux-agent: <text>` and keeps it until the next call replaces it; the mod's `tmux-agent: dispatched <name>` read `⚠ tmux-agent: tmux-agent: dispatched …` and stayed under the prompt long after that worker was done (live 2026-09-26). The receipt and `/workers` already say it. Mod tests 172 pass; the new assertion fails with the line put back.
+
 ## 0.10.1
 
 - `mods/tmux-agent` 0.10.1 — the `tmux-waiter` agent is offered again. 0.10.0 hid it with `agent.offer` → `isOffered: false`, which hides a type at dispatch as well as in the listing; the runtime rewrite is a model-facing dispatch, so live 2026-09-26 every `runtime: tmux/<profile>` Agent call was refused (`a hook's subagentType 'tmux-agent:tmux-waiter' names no agent this call can dispatch`) after its worker had started — the collector still delivered it. The waiter now shows in the model's agent listing, its description saying the mod dispatches it and it is never called directly. The engine's refusal comes after the hook chain, so the `dispatched anyway` wording never reached it; the mocked tests never met the engine's check. Mod tests 172 pass; the offer test fails with the hide put back.

@@ -1496,14 +1496,18 @@ function mockPanel(
   refuseWake = false,
   /** What `$.agent.list()` answers while the panel is open. `'reject'` throws. */
   agents: 'reject' | readonly { id: string; description: string; type: string; status: string }[] = [],
-): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[] } {
+): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[] } {
   const argv: (readonly string[])[] = []
+  const statuses: unknown[] = []
   const open: string[] = []
   const closed: string[] = []
   const logs: string[] = []
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('command.run', () => ({ text: '' }))
-  on('ui.status', () => ({ value: undefined }))
+  on('ui.status', ($, e) => {
+    statuses.push(e)
+    return { value: undefined }
+  })
   on('tool.register', ($, e) => ({ value: { tool: e.name } }))
   on('agent.register', ($, e) => ({ value: { agent: `tmux-agent:${e.name}` } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -1570,7 +1574,7 @@ function mockPanel(
       },
     }
   })
-  return { argv, open, closed, logs }
+  return { argv, open, closed, logs, statuses }
 }
 
 const captures = (argv: (readonly string[])[]) => argv.filter(a => a.includes('capture'))
@@ -2267,12 +2271,15 @@ describe('honest states', () => {
     mockStore(on)
     mock.clock(on)
     mockFs(on, {})
-    mockPanel(on, { running: true, idle_seconds: 60 })
+    const panel = mockPanel(on, { running: true, idle_seconds: 60 })
 
     await $.session.start(session())
     const out = JSON.stringify(await $.tool.call(assignInput()))
     expect(out).toContain('collector: active')
     expect(out).not.toContain('collector: NONE')
+    // The engine pins a plugin's status as `⚠ tmux-agent: …` until replaced:
+    // live 2026-09-26 "dispatched X" stayed under the prompt long after X was done.
+    expect(panel.statuses, 'a dispatch pins no status line').toEqual([])
   })
 
   test('a collector paused by refusals says so instead of drawing rows as if it would deliver', WITH_DRIVER, async ($, on) => {
@@ -2472,7 +2479,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.10\.1 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.10\.2 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4017,7 +4024,7 @@ describe('project sessions', () => {
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.10\.1 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.10\.2 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

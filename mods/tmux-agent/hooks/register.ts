@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.10.1'
+const MOD_VERSION = '0.10.2'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -2104,7 +2104,6 @@ async function assignWorker(
     ...(extra?.ownerCwd ? { ownerCwd: extra.ownerCwd } : {}),
   }
   await $.fs.write(`${stateDir}/dispatch.json`, JSON.stringify(dispatch))
-  $.ui.status(`tmux-agent: dispatched ${name}`)
   // The receipt says who will deliver. A caller reading "collector: active" may
   // end its turn and wait to be woken; anything else means nobody is listening
   // and the caller must harvest itself — the SKILL's proxy/harvest path.
