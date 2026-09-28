@@ -34,6 +34,7 @@ Use `agent-tmux claude help <subcommand>` or `agent-tmux codex help <subcommand>
 | Wait until required result fields exist | `result wait-required <name> --fields status,summary --wait 60 --json` |
 | Supervise one asynchronous worker without model polling | `supervise --result-required --silent-while-unchanged --json <name>` |
 | Validate the structured result contract | `result validate <name> --json` |
+| Record whether a worker's result actually met the brief (commander's label, joined by `sha256(result.json)`) | `outcome <name> met\|not-met\|unknown [--note <text>]` |
 | Fleet usage snapshot (adoption/status health) | `stats --json` — add `--exclude-selftest` to drop self-test workers (reports `excluded_selftest` count); top-level `by_task_shape` / `task_shape_coverage` fill in when launches carry `start --task-shape` |
 | Launch lifecycle audit (completion coverage, name reuse) | `stats --json` then read `.launches` — `total` launches vs `ended` (`end_coverage_pct`), `by_terminal_reason` (`agent-result`/`process-exit`/`stopped`/`max-runtime`/`unknown`), and `name_reuse`; sourced from the append-only per-worker `usage.jsonl` ledger, so restarts of one name each count as a distinct launch |
 | Passive liveness check | `status --json <name>` then read `running`, `idle_seconds`, and `diagnostic` |

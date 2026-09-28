@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `agent-tmux <cli> outcome <name> met|not-met|unknown [--note <text>]` — the commander records whether a worker's delivered work met the brief. The worker's `status`/`summary` is a judge output (agent-scripts `judgment-rubrics` §9); this is the outcome label it can be checked against later. Written to a sidecar `<agent dir>/outcome.json` (never into `result.json`, which the worker writes and which is `additionalProperties: false`), bound to `sha256(result.json)` so a result reset by a later send does not inherit the old label; `unknown` is stored, not implied by a missing file. Observability only: nothing reads it to gate or route. Not in the mod's Bash deny list. Smoke: `scripts/test-outcome-smoke` 5/5.
+
 ## 0.10.5
 
 - `mods/tmux-agent` 0.10.5 — `/workers` shows a shell-started agent-tmux worker as the worker it is, not as 專案. Live 2026-09-26: an e2e script's `agent-tmux cursor start` session `cursor-cli-cclaim` drew as `cursor-cli-cclaim  專案` in every panel in the repo. It has no `dispatch.json`, so it stays read-only like a project row (its caller harvests it, and nothing is delivered or auto-stopped). Its row now reads `<session>  shell · <status>`, where the status is its result.json status, or `pending`. It qualifies only when the session is `<cli>-cli-<name>` and `<root>/<name>/launch-meta.json` says the same `cli`. A custom profile's session name has no `-cli-`, so it stays a project row. Mod tests 172 pass; the new assertion fails without the change.

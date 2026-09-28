@@ -363,6 +363,7 @@ Usage:
   agent-tmux <cli> result path <name>
   agent-tmux <cli> result init <name>
   agent-tmux <cli> result validate <name> --json
+  agent-tmux <cli> outcome <name> met|not-met|unknown [--note <text>]
   agent-tmux <cli> result wait-required <name> --fields <csv> --wait <seconds> --json
   agent-tmux <cli> supervise [--timeout <seconds>] [--interval <seconds>] [--result-required] [--silent-while-unchanged] --json <name>
   agent-tmux <cli> list
@@ -6242,6 +6243,73 @@ capture_session() {
   fi
 }
 
+# The commander's outcome label for one worker result (agent-scripts
+# judgment-rubrics §9): the worker's status/summary is the judge output; this
+# records whether the delivered work met the brief, so the two can be joined
+# later. A sidecar, never a result.json field — the worker writes result.json
+# (additionalProperties: false) and cannot adjudicate itself. Bound to
+# sha256(result.json), so a result reset by a later send does not inherit an
+# old label; `unknown` is a stored value, not a missing file.
+# ponytail: per-worker sidecar is deleted with the worker dir; append to audit.jsonl if outcomes must outlive cleanup.
+outcome_session() {
+  local name="${1:-}" label="${2:-}" note=""
+  if [[ -z "$name" || -z "$label" ]]; then
+    echo "Usage: agent-tmux <cli> outcome <name> met|not-met|unknown [--note <text>]" >&2
+    exit 2
+  fi
+  shift 2
+  while (( $# )); do
+    case "$1" in
+      --note)
+        if (( $# < 2 )); then echo "--note requires a value" >&2; exit 2; fi
+        note="$2"; shift 2 ;;
+      *) echo "outcome: unknown argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  case "$label" in
+    met|not-met|unknown) ;;
+    *) echo "outcome: label must be met, not-met or unknown (got: $label)" >&2; exit 2 ;;
+  esac
+  if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ || "$name" == .* ]]; then
+    echo "outcome: invalid worker name: $name" >&2
+    exit 2
+  fi
+  local dir result sha reported
+  dir="$(agent_root_dir)/$name"   # no mkdir: a result implies the dir, and a refusal must not create one
+  result="$dir/result.json"
+  if [[ ! -s "$result" ]]; then
+    echo "outcome: no result.json for $name at $result — nothing to label" >&2
+    exit 1
+  fi
+  # Hash and status come from ONE byte snapshot, so a result rewritten mid-call
+  # cannot pair one version's hash with another version's status. Per-call
+  # temp files keep concurrent labels from sharing a staging path.
+  local snap tmp
+  snap="$(mktemp "$dir/.result-snapshot.XXXXXX")" || exit 1
+  cp "$result" "$snap"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha="$(sha256sum "$snap" | awk '{print $1}')"
+  else
+    sha="$(shasum -a 256 "$snap" | awk '{print $1}')"
+  fi
+  if ! reported="$(jq -r '.status // ""' "$snap")"; then
+    rm -f "$snap"
+    echo "outcome: $result is not valid JSON — nothing to label" >&2
+    exit 1
+  fi
+  tmp="$(mktemp "$dir/outcome.json.tmp.XXXXXX")" || { rm -f "$snap"; exit 1; }
+  if ! jq -n --arg name "$name" --arg profile "$CLI" --arg sha "$sha" --arg status "$reported" \
+    --arg outcome "$label" --arg note "$note" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{schema_version: 1, name: $name, profile: $profile, result_sha256: $sha,
+      status_reported: $status, outcome: $outcome, note: $note, at: $at}' > "$tmp"; then
+    rm -f "$tmp" "$snap"
+    exit 1
+  fi
+  rm -f "$snap"
+  mv "$tmp" "$dir/outcome.json"
+  printf '%s\n' "$dir/outcome.json"
+}
+
 result_session() {
   # Read the structured result an agent wrote to its conventional path
   # (see #97 design doc). Path resolution:
@@ -9382,6 +9450,9 @@ case "$command" in
     ;;
   result)
     result_session "$@"
+    ;;
+  outcome)
+    outcome_session "$@"
     ;;
   audit-verify)
     audit_log_verify "${1:-}"
