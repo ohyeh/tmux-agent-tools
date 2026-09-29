@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.11.1'
+const MOD_VERSION = '0.11.2'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -2789,7 +2789,20 @@ export const register: Register = on => {
               $.ui.invalidate('ui.render')
             },
           }),
-          Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
+          // Refresh returns to the overview: an open row closes, as pressing the row
+          // again would (asked 2026-09-29), and a pending confirm is dropped.
+          Button({
+            key: 'refresh',
+            label: 'refresh',
+            hotkey: 'r',
+            onPress: () => {
+              panel.selected = undefined
+              panel.mirror = undefined
+              panel.armedStop = undefined
+              $.ui.invalidate('ui.render')
+              void panel.refresh?.()
+            },
+          }),
           ...(clearable
             ? [
                 Button({

@@ -1838,6 +1838,33 @@ describe('panel mirror', () => {
     expect(drawn).toContain('編譯完成 ✅')
     expect(drawn).toContain('等待輸入')
   })
+
+  test('[ refresh ] closes an open row, as pressing the row again would', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const panel = mockPanel(on, { running: true, idle_seconds: 60 }, 'mirror line')
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
+    await clock.advance(2_000)
+    const open = textOf(await $.ui.render(bandRender()))
+    expect(open, 'the row is open and mirrored').toContain('mirror line')
+    expect(open).toContain('›')
+
+    await $.ui.press({ plugin: 'tmux-agent', key: 'refresh', requestId: 'above-prompt' })
+    const after = textOf(await $.ui.render(bandRender()))
+    expect(after, 'refresh returns to the overview').not.toContain('mirror line')
+    expect(after, 'no row is selected').not.toContain('›')
+    expect(after, 'the row itself is still listed').toContain('w1')
+
+    const shots = captures(panel.argv).length
+    await clock.advance(2_000)
+    expect(captures(panel.argv).length, 'a closed row is not captured any more').toEqual(shots)
+  })
 })
 
 describe('probe budget', () => {
@@ -2481,7 +2508,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.11\.1 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.11\.2 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4081,7 +4108,7 @@ describe('project sessions', () => {
     expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
     expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.11\.1 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.11\.2 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
