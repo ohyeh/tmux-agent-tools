@@ -1543,6 +1543,8 @@ function mockPanel(
   })
   on('process.run', async ($, e) => {
     argv.push(e.argv)
+    // grep over a session log (resume's cwd lookup): `probe.grep` is its stdout.
+    if (e.argv[0] === 'grep') return { value: { exitCode: typeof probe.grep === 'string' ? 0 : 1, stdout: typeof probe.grep === 'string' ? probe.grep : '', stderr: '' } }
     const isList = e.argv[0] === 'tmux' && e.argv[1] === 'list-sessions'
     const isCapturePane = e.argv[0] === 'tmux' && e.argv[1] === 'capture-pane'
     const isCapture = e.argv.includes('capture') || isCapturePane
@@ -2479,7 +2481,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender()))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.10\.5 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.11\.0 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4038,7 +4040,7 @@ describe('project sessions', () => {
     expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
     expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.10\.5 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.11\.0 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -4408,5 +4410,117 @@ describe('native mirror', () => {
     expect(woken).toHaveLength(1)
     expect(store.acked()).toEqual(['w1@0'])
     expect(logs.filter(l => l.includes('agent.list failed'))).toHaveLength(1)
+  })
+})
+
+describe('resume', () => {
+  const ID = '5ea32e6e-a9c1-41d1-98f8-16d9ea5d3dff'
+  const resumeArgv = (argv: (readonly string[])[]) => argv.filter(a => a.includes('resume'))
+
+  test('an id alone finds its cursor chat, resumes it under its cwd and makes it a teammate', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    on('session.id', () => ({ value: 'sess-A' }))
+    const files: Files = { [`${HOME}/.cursor/chats/b974ad48/${ID}/meta.json`]: JSON.stringify({ cwd: '/work' }) }
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    const out = await $.command.run(run('workers', `resume ${ID}`))
+    expect(out.text).toContain('resume — ok')
+    expect(out.text, 'the answer says nothing wakes it until a tell').toContain('/workers tell cursor-5ea32e6e')
+    expect(resumeArgv(panel.argv)).toEqual([['agent-tmux', 'cursor', 'resume', '--exact', 'cursor-5ea32e6e', '/work', ID]])
+    expect(JSON.parse(files[`${ROOT}/cursor-5ea32e6e/dispatch.json`]!)).toMatchObject({ profile: 'cursor', name: 'cursor-5ea32e6e', dir: '/work', owner: 'sess-A', ownerCwd: '/work' })
+    expect(files[`${ROOT}/cursor-5ea32e6e/launch.exit`], 'a launch receipt, so a dead pane reads as exited').toEqual('0\n')
+    const told = await $.command.run(run('workers', 'tell cursor-5ea32e6e write the tests'))
+    expect(told.text, 'it is a worker tell reaches, not a read-only shell row').toContain('— ok')
+  })
+
+  test('a claude id takes its cwd from the log, not the lossy project slug', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const files: Files = { [`${HOME}/.claude/projects/-work-x/${ID}.jsonl`]: '{"type":"summary"}\n' }
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5, grep: '"cwd":"/work"\n' })
+
+    await $.session.start(session())
+    const out = await $.command.run(run('workers', `resume ${ID} rev`))
+    expect(out.text).toContain('resume — ok')
+    expect(resumeArgv(panel.argv)).toEqual([['agent-tmux', 'claude', 'resume', '--exact', 'rev', '/work', ID]])
+  })
+
+  test('an id two stores hold is refused until a profile picks one; agy with no cached cwd runs in the session cwd', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const files: Files = {
+      [`${HOME}/.cursor/chats/b974ad48/${ID}/meta.json`]: JSON.stringify({ cwd: '/work' }),
+      [`${HOME}/.gemini/antigravity-cli/conversations/${ID}.db`]: '',
+    }
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    const both = await $.command.run(run('workers', `resume ${ID}`))
+    expect(both.text).toContain('FAILED')
+    expect(both.text).toContain('cursor and agy')
+    expect(resumeArgv(panel.argv), 'nothing launched on a guess').toEqual([])
+    const picked = await $.command.run(run('workers', `resume agy ${ID}`))
+    expect(picked.text).toContain("this session's cwd")
+    expect(resumeArgv(panel.argv)).toEqual([['agent-tmux', 'agy', 'resume', '--exact', 'agy-5ea32e6e', '/work', ID]])
+  })
+
+  test('a typed name already taken is refused; bad words say the grammar', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const files: Files = { [`${ROOT}/taken/dispatch.json`]: dispatch('taken', 0) }
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    expect((await $.command.run(run('workers', `resume cursor ${ID} taken`))).text).toContain('"taken" is taken')
+    expect((await $.command.run(run('workers', 'resume cursor not-an-id'))).text).toContain('[profile] <session-id> [name]')
+    expect((await $.command.run(run('workers', `resume ${ID}`))).text, 'found nowhere and no profile').toContain('name its profile')
+    expect(resumeArgv(panel.argv)).toEqual([])
+  })
+
+  test('[ + ] opens a field on the band; Enter resumes and closes it; Enter on nothing just closes it', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    const files: Files = { [`${HOME}/.cursor/chats/b974ad48/${ID}/meta.json`]: JSON.stringify({ cwd: '/work' }) }
+    mockFs(on, files)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const closed = await $.ui.render(bandRender())
+    expect(keysOf(closed)).toContain('add')
+    expect(hotkeysOf(closed), 'n presses it').toContain('n')
+    expect(keysOf(closed)).not.toContain('resume-input')
+
+    // An Input is typed into only while a render has drawn it: render, then input.
+    // `$.ui.input` is in the engine the tests run on, not in the committed
+    // declarations (2.1.274); regenerating them is its own change.
+    type TypeInto = (t: { plugin: string; key: string; text: string; requestId: string; surface: 'terminal' }) => Promise<unknown>
+    const typeInto = ($.ui as unknown as { input: TypeInto }).input
+    const input = async (text: string) => {
+      await $.ui.render(bandRender())
+      await typeInto({ plugin: 'tmux-agent', key: 'resume-input', text, requestId: 'above-prompt', surface: 'terminal' })
+    }
+    await $.ui.press({ plugin: 'tmux-agent', key: 'add', requestId: 'above-prompt' })
+    expect(keysOf(await $.ui.render(bandRender()))).toContain('resume-input')
+    await input('')
+    expect(keysOf(await $.ui.render(bandRender())), 'empty Enter closes the field').not.toContain('resume-input')
+
+    await $.ui.press({ plugin: 'tmux-agent', key: 'add', requestId: 'above-prompt' })
+    await input(`cursor ${ID} fix-it`)
+    await settle()
+    expect(resumeArgv(panel.argv)).toEqual([['agent-tmux', 'cursor', 'resume', '--exact', 'fix-it', '/work', ID]])
+    expect(files[`${ROOT}/fix-it/dispatch.json`]).toBeDefined()
+    expect(keysOf(await $.ui.render(bandRender())), 'a resumed session closes the field').not.toContain('resume-input')
   })
 })

@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.10.5'
+const MOD_VERSION = '0.11.0'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -460,6 +460,8 @@ type Panel = {
   internalMissLogged: boolean
   mirror?: { id: string; lines: string[] }
   timer?: { cancel: () => void }
+  /** The `[ + ]` field is open: one row, `[profile] <session-id> [name]`. */
+  adding?: boolean
 }
 
 type PanelRow = {
@@ -2154,6 +2156,170 @@ async function assignWorker(
   }
 }
 
+/** A session id as `agent-tmux resume` takes it (agent-tmux: `Invalid session id`). */
+const SESSION_ID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/
+/** `resume` returns once the tmux session is up: under 2 s live, 2026-09-29. */
+const RESUME_MS = 20_000
+const RESUME_USAGE = 'resume takes [profile] <session-id> [name]'
+
+type SessionHit = { profile: string; cwd?: string }
+
+const absPath = (v: unknown): { cwd?: string } =>
+  typeof v === 'string' && v.startsWith('/') && !CTRL_RE.test(v) ? { cwd: v } : {}
+
+async function dirsIn(host: Host, path: string): Promise<string[]> {
+  const entries = await host.list(path).catch(() => [])
+  return entries.filter(e => e.kind === 'dir').map(e => e.name)
+}
+
+/**
+ * The first `"cwd":"…"` in a session log. grep, not a read: `$.fs.read` refuses
+ * a file over 4 MiB, and a long claude or codex session's log is bigger.
+ */
+async function cwdIn(host: Host, path: string): Promise<{ cwd?: string }> {
+  const r = await host.run(['grep', '-m1', '-o', '"cwd":"[^"]*"', path], path.slice(0, path.lastIndexOf('/')), 5_000).catch(() => undefined)
+  const line = r?.exitCode === 0 ? r.stdout.trim().split('\n')[0] : undefined
+  return line ? absPath((parseJson(`{${line}}`) as { cwd?: unknown } | undefined)?.cwd) : {}
+}
+
+/**
+ * Which CLI a session id belongs to, and where it ran. Each store is looked up
+ * by the id itself, the way that CLI lays it out (live 2026-09-29):
+ * - claude: `~/.claude/projects/<cwd slug>/<id>.jsonl`. The slug is lossy (`.`
+ *   and `/` both become `-`), so the cwd comes from the log, never the slug.
+ * - cursor: `~/.cursor/chats/<md5 of cwd>/<id>/meta.json`, which names the cwd.
+ * - agy: `~/.gemini/antigravity-cli/conversations/<id>.db`, one flat store. The
+ *   cwd sits only in a protobuf blob; the metadata cache names it but went
+ *   stale (last written in July here), so a miss leaves the cwd to the caller.
+ * - codex: `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`, its first
+ *   line carrying the cwd.
+ */
+async function findSession(host: Host, home: string, id: string): Promise<SessionHit[]> {
+  const hits: SessionHit[] = []
+  const projects = `${home}/.claude/projects`
+  for (const dir of await dirsIn(host, projects)) {
+    const path = `${projects}/${dir}/${id}.jsonl`
+    if (!(await host.exists(path))) continue
+    hits.push({ profile: 'claude', ...(await cwdIn(host, path)) })
+    break
+  }
+  const chats = `${home}/.cursor/chats`
+  for (const dir of await dirsIn(host, chats)) {
+    const path = `${chats}/${dir}/${id}/meta.json`
+    if (!(await host.exists(path))) continue
+    hits.push({ profile: 'cursor', ...absPath((parseJson(await readOrEmpty(host, path)) as { cwd?: unknown } | undefined)?.cwd) })
+    break
+  }
+  const agy = `${home}/.gemini/antigravity-cli`
+  if (await host.exists(`${agy}/conversations/${id}.db`)) {
+    const meta = parseJson(await readOrEmpty(host, `${agy}/cache/conversation_metadata.json`)) as
+      | { conversations?: Record<string, { summary?: { WorkspaceURIs?: unknown } } | undefined> }
+      | undefined
+    const uris = meta?.conversations?.[id]?.summary?.WorkspaceURIs
+    const uri = Array.isArray(uris) && typeof uris[0] === 'string' && uris[0].startsWith('file://') ? uris[0].slice(7) : undefined
+    let cwd: string | undefined
+    try {
+      cwd = uri === undefined ? undefined : decodeURIComponent(uri)
+    } catch {
+      cwd = undefined
+    }
+    hits.push({ profile: 'agy', ...absPath(cwd) })
+  }
+  const sessions = `${home}/.codex/sessions`
+  codex: for (const y of await dirsIn(host, sessions)) {
+    for (const m of await dirsIn(host, `${sessions}/${y}`)) {
+      for (const d of await dirsIn(host, `${sessions}/${y}/${m}`)) {
+        const day = `${sessions}/${y}/${m}/${d}`
+        const file = (await host.list(day).catch(() => [])).find(e => e.kind === 'file' && e.name.endsWith(`-${id}.jsonl`))
+        if (!file) continue
+        hits.push({ profile: 'codex', ...(await cwdIn(host, `${day}/${file.name}`)) })
+        break codex
+      }
+    }
+  }
+  return hits
+}
+
+/** `[profile] <session-id> [name]`: the band's `[ + ]` field and `/workers resume` read the same words. */
+function parseResume(text: string): { profile?: string; id: string; name?: string } | { deny: string } {
+  const words = text.trim().split(/\s+/).filter(Boolean)
+  const at = words.findIndex(w => SESSION_ID_RE.test(w))
+  if (at < 0 || at > 1 || words.length > at + 2) return { deny: RESUME_USAGE }
+  const profile = at === 1 ? words[0] : undefined
+  const name = words[at + 1]
+  if (profile !== undefined && !NAME_RE.test(profile)) return { deny: 'profile must match [A-Za-z0-9_.-], max 64 chars' }
+  if (name !== undefined && !NAME_RE.test(name)) return { deny: 'name must match [A-Za-z0-9_.-], max 64 chars' }
+  return { id: words[at]!, ...(profile ? { profile } : {}), ...(name ? { name } : {}) }
+}
+
+/**
+ * Resume a CLI session by id and make it this session's teammate.
+ *
+ * A session resumed by hand is a read-only `shell` row: no `dispatch.json`, so
+ * `tell`/`peek`/`stop` cannot find it (live 2026-09-29: `cursor-2084`). This
+ * writes the record `assign` writes, so the row is a worker like any other.
+ * It has no brief, so its result stays unwritten and nothing wakes the session
+ * until a `tell` gives it a task: the answer says so.
+ */
+async function resumeWorker(host: Host, text: string): Promise<Outcome> {
+  const input = parseResume(text)
+  if ('deny' in input) return { ok: false, text: input.deny }
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const home = (await host.envHome()) ?? ''
+  const hits = home.startsWith('/') ? await findSession(host, home, input.id) : []
+  let hit: SessionHit
+  if (input.profile) {
+    // A named profile wins: a gateway profile runs claude's binary under another name.
+    hit = hits.find(h => h.profile === input.profile) ?? { profile: input.profile }
+  } else if (hits.length === 1) {
+    hit = hits[0]!
+  } else if (hits.length) {
+    return { ok: false, text: `${input.id} is a session of ${hits.map(h => h.profile).join(' and ')}; name one: <profile> ${input.id}` }
+  } else {
+    return { ok: false, text: `no claude, cursor, agy or codex session ${input.id} here; name its profile: <profile> ${input.id}` }
+  }
+  const dir = hit.cwd ?? host.cwd()
+  if (!dir) return { ok: false, text: 'no directory to resume in: the session has no cwd yet' }
+  if (!(await host.exists(dir))) return { ok: false, text: `${dir}, where that session ran, is gone` }
+  const since = await host.now()
+  // A fresh directory is the ownership test (see assignWorker): a name the person
+  // typed is refused when taken, the default one takes a suffix.
+  let name = input.name ?? `${hit.profile}-${input.id.slice(0, 8)}`
+  if (await host.exists(`${root}/${name}`)) {
+    if (input.name) return { ok: false, text: `"${name}" is taken; pick another name` }
+    name = `${name}-${since.toString(36).slice(-4)}`
+  }
+  const head = await host.run(['git', '-C', dir, 'rev-parse', 'HEAD'], dir, COMMIT_PROBE_MS).catch(gitFailed)
+  // `--exact` keeps the typed name as the tmux name.
+  const run = await host
+    .run(['agent-tmux', hit.profile, 'resume', '--exact', name, dir, input.id], dir, RESUME_MS)
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  if (run.exitCode !== 0) {
+    return { ok: false, text: `agent-tmux ${hit.profile} resume exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-400)}` }
+  }
+  const owner = host.owner()
+  const ownerCwd = host.cwd()
+  const dispatch: TmuxDispatch = {
+    profile: hit.profile,
+    name,
+    dir,
+    since,
+    ...baseFrom(head, dir, host.log),
+    ...(owner ? { owner } : {}),
+    ...(ownerCwd ? { ownerCwd } : {}),
+  }
+  await host.write(`${root}/${name}/dispatch.json`, JSON.stringify(dispatch))
+  // The launch receipt: without it a pane that dies reads as "not started yet"
+  // forever (flagStalls), never as exited.
+  await host.write(`${root}/${name}/launch.exit`, '0\n')
+  const where = hit.cwd ? dir : `${dir} (this session's cwd: the store did not name one)`
+  return {
+    ok: true,
+    text: `resumed ${hit.profile} session ${input.id.slice(0, 8)} as "${name}" in ${where}. It has no task, so nothing wakes you until you give it one: /workers tell ${name} <text>`,
+  }
+}
+
 export const register: Register = on => {
   // Per activation, shared by every entry point below.
   const panel: Panel = { open: false, rows: [], all: [], showAll: false, generation: 0, internal: 0, internalMissLogged: false }
@@ -2498,7 +2664,7 @@ export const register: Register = on => {
     const layout = (sel: PanelRow | undefined) => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
+      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
       const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
@@ -2545,7 +2711,7 @@ export const register: Register = on => {
     // project rows still say 專案 themselves).
     const me = world?.owner()
     const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning} · 內部 ${panel.internal}`
-    const buttonCells = displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
+    const buttonCells = displayCells('[ + ]') + displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
     // Too narrow for the name and version (60 columns: 69 cells): the counts are
     // what the bar is for, so the name goes first, never a count.
     const full = ` workers v${MOD_VERSION} · ${counts} `
@@ -2568,6 +2734,16 @@ export const register: Register = on => {
         backgroundColor: PANEL_ACCENT,
         children: [
           Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: titleText }),
+          // Resume a CLI session by id as a teammate; the field is one row below.
+          Button({
+            key: 'add',
+            label: '+',
+            hotkey: 'n',
+            onPress: () => {
+              panel.adding = !panel.adding
+              $.ui.invalidate('ui.render')
+            },
+          }),
           Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
           Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
           // Last and apart from refresh: hiding is undone by /workers, but it should
@@ -2588,6 +2764,34 @@ export const register: Register = on => {
         )
       }
       return Box({ flexDirection: 'column', children: [below, ...children] })
+    }
+    // Enter resumes; a refusal leaves the field open with a toast saying why;
+    // Enter on nothing closes it (grok-bot-watch's `[ + ]`).
+    if (panel.adding && Input) {
+      children.push(
+        Input({
+          key: 'resume-input',
+          label: '  + ',
+          placeholder: '[profile] <session-id> [name]',
+          submitLabel: 'resume',
+          autoFocus: true,
+          onSubmit: (value: string) => {
+            if (!value.trim()) {
+              panel.adding = false
+              $.ui.invalidate('ui.render')
+              return
+            }
+            void act('resume', async host => {
+              const out = await resumeWorker(host, value)
+              if (out.ok) {
+                panel.adding = false
+                void panel.refresh?.()
+              }
+              return out
+            })
+          },
+        }),
+      )
     }
     if (!panel.rows.length) {
       children.push(Text({ dimColor: true, children: 'No workers outstanding.' }))
@@ -2819,6 +3023,7 @@ export const register: Register = on => {
   // only functions declared at the top of the file. The redraw comes as a closure.
   const closePanel = (redraw: () => void) => {
     panel.open = false
+    panel.adding = false
     const w = world
     if (w) void rememberPanel(w, false).catch(err => w.log(`tmux-agent: panel state not saved: ${String(err)}`))
     panel.selected = undefined
@@ -2956,6 +3161,13 @@ export const register: Register = on => {
         if (panel.open) closePanel(redraw)
         return { text: 'workers panel hidden; /workers shows it again.' }
       }
+      if (verb === 'resume') {
+        // The `[ + ]` field's typed form: surfaces with no Input (mobile), and
+        // terminals where the band's focus chord never arrives.
+        const out = await resumeWorker(bound, e.args.trim().slice(verb.length))
+        if (out.ok && panel.open) void panel.refresh?.()
+        return { text: `resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}` }
+      }
       const fresh = panel.open ? undefined : await panelRows(bound, gate, await rootOf(bound))
       // Numbers index what is drawn; names reach every row, folded ones too.
       const rows = fresh ?? panel.rows
@@ -3002,7 +3214,7 @@ export const register: Register = on => {
         if (panel.open) void panel.refresh?.()
         return { text: `${verb} "${row.d.name}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 300)}` }
       } else {
-        return { text: '/workers [N | stop <name> | tell <name> <text> | hide]' }
+        return { text: '/workers [N | stop <name> | tell <name> <text> | resume [profile] <session-id> [name] | hide]' }
       }
     }
     if (panel.open) {

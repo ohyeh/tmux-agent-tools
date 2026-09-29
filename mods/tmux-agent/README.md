@@ -56,9 +56,9 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 | 面 | 用途 |
 |---|---|
-| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上） |
-| `fs.read/write/list/stat` | 只在 state root 底下：`brief.md`、`dispatch.json`、`launch.exit`、`mod-assign.log`、`result.json`、`tell-<ts>.md`、`.collector-*` 心跳 |
-| `fs.exists` | state root 之外只有一種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；只問「在不在」，不讀內容 |
+| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上） |
+| `fs.read/write/list/stat` | 寫只在 state root 底下：`brief.md`、`dispatch.json`、`launch.exit`、`mod-assign.log`、`result.json`、`tell-<ts>.md`、`.collector-*` 心跳。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
+| `fs.exists` | state root 之外兩種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；以及 `resume` 找 session id 在哪個 CLI 的 store（下面 `[ + ]` 那節列的路徑）。只問「在不在」 |
 | `store.get/set/keys/delete` | 已回報集合：每個 session 自己的 key `tmux-agent.reported.<sessionId>`，讀時聯集全部（`stop` 也寫它，讓被停掉的 worker 離開面板；`delete` 只清已死 session 留下、且目錄全不在的 key） |
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
 | `agent.spawn` | brief 有一行 `runtime: tmux/<profile>` 時派工，並把這次 Agent 呼叫改成 `tmux-waiter`（haiku、背景；清單裡看得到——`isOffered: false` 連派工也擋）。設了 `name` 則拒絕。waiter 沒註冊成功時，維持舊的拒絕。沒有那一行則原樣放行 |
@@ -407,7 +407,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v0.10.5 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.11.0 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
@@ -415,6 +415,31 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 每個 worker 一列：`1: 名字  repo  狀態  已跑多久`；總覽（沒選任何列）時底下一行是
 brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 session 自己的輸出。
+
+### `[ + ]`：按 session id 接回成隊友 (0.11.0)
+
+標題列的 `[ + ]`（hotkey `n`）打開一行輸入框，填 `[profile] <session-id> [name]`，Enter
+接回；空的 Enter 關掉。沒有 Input 的地方（手機）或 band 拿不到焦點的終端機，用
+`/workers resume [profile] <session-id> [name]`，同一套字。
+
+- **只給 id**：mod 用 id 去各 CLI 自己的 store 找，找到的就是 profile，連它原本的 cwd
+  一起帶回——resume 要回到原本的目錄，不然 claude 和 cursor 找不到那段對話：
+  - claude：`~/.claude/projects/<slug>/<id>.jsonl`，cwd 從 log 裡 grep（slug 會把 `.`
+    和 `/` 都變成 `-`，反推不回來；log 可能超過 `fs.read` 的 4 MiB 上限，所以用 grep）
+  - cursor：`~/.cursor/chats/<cwd 的 md5>/<id>/meta.json` 的 `cwd`
+  - agy：`~/.gemini/antigravity-cli/conversations/<id>.db`。cwd 只在 protobuf blob
+    裡；metadata cache 有記就用，沒記（cache 會停更）就用這個 session 的 cwd
+  - codex：`~/.codex/sessions/<年>/<月>/<日>/rollout-…-<id>.jsonl` 第一行的 `cwd`
+- **兩個 store 都有這個 id**：拒絕，請你加上 profile。**都沒有**：拒絕，請你給 profile
+  （自訂 profile、grok 走這條，cwd 用這個 session 的）。**給了 profile**：以你給的為準，
+  它的 store 有就用那裡的 cwd。
+- **name**：沒給用 `<profile>-<id 前 8 碼>`，撞名就加尾碼；給了就原樣當 tmux 名
+  （`--exact`），撞名拒絕——跟 `assign` 一樣，每個 worker 一個新目錄。
+
+接回後寫 `dispatch.json`（跟 `assign` 同形）和 `launch.exit`（`0`），所以它是一般的 worker
+列，`tell`／`peek`／`stop` 都找得到，不是唯讀的 `shell` 列；pane 死了會照常以 `exited`
+回報。它沒有 brief，`result.json` 不會自己寫，所以**在你 `tell` 它第一件事之前，什麼都
+不會叫醒你**，回覆裡會寫這句。
 
 ### 專案 session
 
