@@ -1139,6 +1139,29 @@ describe('assign', () => {
     // The reply does not claim the worker started, only that a launch was requested.
     expect(JSON.stringify(out)).toContain('NOT proof the worker started')
   })
+  test('a 64-char name keeps its -xxxx suffix (P0 F4-4)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mock.clock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+
+    await $.tool.call({
+      tool: 'mcp__tmux-agent__assign',
+      profile: 'codex',
+      name: 'a'.repeat(58) + '.abcde',
+      dir: '/work',
+      brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+    })
+
+    const made = Object.keys(files).filter(p => p.endsWith('/dispatch.json'))
+    expect(made.length).toEqual(1)
+    const name: string = JSON.parse(files[made[0] ?? ''] ?? '{}').name
+    // The mock clock starts at 0, so the suffix is short here; live it is 4 chars.
+    expect(name).toMatch(/-[0-9a-z]+$/)
+    expect(name.length).toBeLessThanOrEqual(64)
+  })
 })
 
 describe('launch receipt', () => {
@@ -2556,7 +2579,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.11\.3 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.11\.4 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4156,7 +4179,7 @@ describe('project sessions', () => {
     expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
     expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.11\.3 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.11\.4 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
@@ -4598,6 +4621,7 @@ describe('resume', () => {
 
     await $.session.start(session())
     expect((await $.command.run(run('workers', `resume cursor ${ID} taken`))).text).toContain('"taken" is taken')
+    expect((await $.command.run(run('workers', `resume cursor ${ID} w.abcde`))).text, 'the v5 name form is refused (P0 F4-4)').toContain('ends in .xxxxx')
     expect((await $.command.run(run('workers', 'resume cursor not-an-id'))).text).toContain('[profile] <session-id> [name]')
     expect((await $.command.run(run('workers', `resume ${ID}`))).text, 'found nowhere and no profile').toContain('name its profile')
     expect(resumeArgv(panel.argv)).toEqual([])

@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.11.3'
+const MOD_VERSION = '0.11.4'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -204,6 +204,8 @@ const EXITED = 'exited'
 // agent-tmux has no `--` terminator (assign_session's flag loop has no `--)` case),
 // so this anchored allowlist IS the guard against argv flag smuggling.
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+/** The v5 core's worker-name suffix (P0 contract §2). Legacy names never take it. */
+const V5_NAME_RE = /\.[0-9a-z]{5}$/
 /** A path reaching a prompt must not carry line breaks or other control characters. */
 const CTRL_RE = /[\x00-\x1f\x7f]/
 /**
@@ -2131,7 +2133,9 @@ async function assignWorker(
   // A FRESH directory per dispatch is the ownership test: a result.json in it
   // cannot predate this dispatch, so re-assigning a name can never collect the
   // previous generation's result. No producer-side protocol needed.
-  const name = `${input.name}-${since.toString(36).slice(-4)}`.slice(0, 64)
+  // Cut the base, never the suffix (as commander:409 does): a 64-char input kept no
+  // suffix, and a suffix-less name can take the v5 form `<base>.<5 base36>` (P0 F4-4).
+  const name = `${input.name.slice(0, 59)}-${since.toString(36).slice(-4)}`
   const override = (await $.env.get('TMUX_AGENT_DIR')) ?? ''
   const xdg = (await $.env.get('XDG_STATE_HOME')) ?? ''
   const home = (await $.env.get('HOME')) ?? '/tmp'
@@ -2330,6 +2334,9 @@ async function resumeWorker(host: Host, text: string): Promise<Outcome> {
   // A fresh directory is the ownership test (see assignWorker): a name the person
   // typed is refused when taken, the default one takes a suffix.
   let name = input.name ?? `${hit.profile}-${input.id.slice(0, 8)}`
+  // `.` + 5 base36 is the v5 core's name form; a legacy pane under it could be killed
+  // by a v5 start of the same tmux name (P0 F4-4).
+  if (input.name && V5_NAME_RE.test(input.name)) return { ok: false, text: `"${input.name}" ends in .xxxxx, a form this mod keeps for its next version; pick another name` }
   if (await host.exists(`${root}/${name}`)) {
     if (input.name) return { ok: false, text: `"${name}" is taken; pick another name` }
     name = `${name}-${since.toString(36).slice(-4)}`
