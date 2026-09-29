@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.11.2'
+const MOD_VERSION = '0.11.3'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -2052,6 +2052,33 @@ async function pressKeys(host: Host, d: TmuxDispatch, keys: readonly string[]): 
   return { ok: true, text: `pressed ${keys.join(' ')} in ${session}; peek to see what it did` }
 }
 
+/** What a CLI prints while a turn runs: claude/codex `esc to interrupt`, agy `esc to cancel`, cursor-agent `ctrl+c to stop`. */
+const INTERRUPT_HINT_RE = /\b(esc|ctrl\s*\+\s*c)\s+to\s+(?:interrupt|stop|cancel)\b/i
+
+/**
+ * Stop the worker's current turn with the key its own CLI advertises on screen.
+ * No hint = not mid-turn, and C-c at an idle prompt quits some CLIs, so nothing
+ * is sent. The CLI then waits at its prompt with no result.json: the next message
+ * steers it, and a stall notice two minutes later is expected, not a fault.
+ */
+async function interruptWorker(host: Host, d: TmuxDispatch): Promise<Outcome> {
+  const alive = await liveSessions(host, d.dir)
+  const session = [...alive].find(sname => sname.endsWith(`-${d.name}`))
+  if (!session) return { ok: false, text: `no tmux session for "${d.name}" — it is not running` }
+  const pane = await host
+    .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${session}:`], d.dir, MIRROR_PROBE_MS)
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  if (pane.exitCode !== 0) return { ok: false, text: `capture for "${d.name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
+  const hint = paneTail(pane.stdout, 15).join('\n').match(INTERRUPT_HINT_RE)
+  if (!hint) return { ok: false, text: `"${d.name}" shows no "esc/ctrl+c to interrupt" hint — it is not mid-turn; nothing sent` }
+  const key = /^esc/i.test(hint[1]!) ? 'Escape' : 'C-c'
+  const run = await host
+    .run(['tmux', 'send-keys', '-t', session, key], d.dir, LIVE_PROBE_MS)
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  if (run.exitCode !== 0) return { ok: false, text: `send-keys exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
+  return { ok: true, text: `interrupted ${d.name} with ${key} (its screen said "${hint[0]}"); the next message steers it` }
+}
+
 /** Touch this collector's heartbeat; a failure is logged once per tick, never fatal. */
 async function heartbeat(host: Host): Promise<void> {
   const id = host.owner()
@@ -2979,6 +3006,18 @@ export const register: Register = on => {
                         return tellWorker(host, root, r.d, text)
                       })
                     },
+                  }),
+                ]
+              : []),
+            // Interrupt, then type: that is steering. Only a turn in flight has one to stop.
+            ...(r.state === 'running' || r.state === 'stalled'
+              ? [
+                  Text({ children: '  ' }),
+                  Button({
+                    key: `interrupt:${r.id}`,
+                    label: 'interrupt',
+                    hotkey: 'i',
+                    onPress: () => void act(`interrupt ${r.d.name}`, host => interruptWorker(host, r.d)),
                   }),
                 ]
               : []),

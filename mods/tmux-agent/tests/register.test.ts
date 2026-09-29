@@ -1865,6 +1865,54 @@ describe('panel mirror', () => {
     await clock.advance(2_000)
     expect(captures(panel.argv).length, 'a closed row is not captured any more').toEqual(shots)
   })
+
+  test('[ interrupt ] sends the key the pane advertises, and nothing without a hint', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0) })
+    const pane = { v: '• Working (12s • esc to interrupt)' }
+    const panel = mockPanel(on, { running: true, idle_seconds: 5, sessions: ['codex-cli-w1'] }, pane)
+    const sent = () => panel.argv.filter(a => a[0] === 'tmux' && a[1] === 'send-keys').map(a => a.join(' '))
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1@0', requestId: 'above-prompt' })
+    await clock.advance(2_000)
+    expect(keysOf(await $.ui.render(bandRender())), 'a running row can be interrupted').toContain('interrupt:w1@0')
+
+    await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:w1@0', requestId: 'above-prompt' })
+    await settle()
+    expect(sent()).toEqual(['tmux send-keys -t codex-cli-w1 Escape'])
+
+    pane.v = '  → Add a follow-up                ctrl+c to stop'
+    await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:w1@0', requestId: 'above-prompt' })
+    await settle()
+    expect(sent().at(-1), 'cursor-agent advertises ctrl+c').toEqual('tmux send-keys -t codex-cli-w1 C-c')
+
+    pane.v = '› '
+    await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:w1@0', requestId: 'above-prompt' })
+    await settle()
+    expect(sent().length, 'an idle prompt gets no keystroke: C-c there can quit the CLI').toEqual(2)
+  })
+
+  test('[ interrupt ] is absent on a finished row', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mock.clock(on)
+    mockFs(on, { [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0), [`${ROOT}/w2/result.json`]: finished('done') })
+    mockPanel(on, { running: true, idle_seconds: 5 }, 'hello', false, undefined, true)
+
+    await $.session.start(session())
+    await clock.advance(10_000)
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w2@0', requestId: 'above-prompt' })
+    const tree = await $.ui.render(bandRender())
+    expect(keysOf(tree)).toContain('stop:w2@0')
+    expect(keysOf(tree), 'nothing in flight to interrupt').not.toContain('interrupt:w2@0')
+  })
 })
 
 describe('probe budget', () => {
@@ -2508,7 +2556,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.11\.2 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.11\.3 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4108,7 +4156,7 @@ describe('project sessions', () => {
     expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
     expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.11\.2 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.11\.3 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

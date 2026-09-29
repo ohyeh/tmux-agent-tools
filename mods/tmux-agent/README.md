@@ -407,7 +407,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v0.11.2 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v0.11.3 · @<本 session> · tmux N · 內部 M`（列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
@@ -469,6 +469,13 @@ worker、`q` 隱藏面板；Esc 還給 prompt。字母鍵**只在 band 聚焦時
 d.ts `ButtonProps.hotkey`），prompt 聚焦時按 `x` 只會打出一個 x。`ctrl+x tab` 這個
 組合鍵要終端機原樣送進 pty：2026-09-25 在 Warp 裡按了沒反應（tmux 裡正常）。
 自己的終端機可以這樣查：`cat -v` 後按 ctrl+x、Tab，印出 `^X^I` 就是有送到。
+
+`[ interrupt ]`（hotkey `i`）只畫在 running／stalled 的列上：它打斷 worker 正在跑的那一輪，
+按的是 CLI 自己在畫面上提示的鍵：`esc to interrupt|cancel` 就送 `Escape`（claude、codex、
+agy），`ctrl+c to stop` 就送 `C-c`（cursor-agent）。畫面上沒有這種提示就代表它沒在跑，這時
+什麼都不送，因為在閒置的 prompt 上按 C-c 有些 CLI 會直接退出。打斷後 CLI 停在 prompt，
+不會寫 result.json：接著在輸入框打字送出就是 steer（`tell` 本身只是貼上並按 Enter，
+忙碌時會排隊還是插隊由 CLI 決定）。兩分鐘後出現的「stopped by their CLI」通知是預期行為。
 
 `[ stop ]` 要按兩次：第一次變成 `[ stop <名字>? press again ]` 並倒數 5 秒，時間內
 再按一次才真的停（兩次間隔不到 0.4 秒算按住鍵的重複，不算確認；選中的 worker 離開清單時
