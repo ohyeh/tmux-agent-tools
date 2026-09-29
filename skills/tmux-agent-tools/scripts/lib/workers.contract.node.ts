@@ -285,3 +285,88 @@ test('activation: two first beats of one gate register once', async () => {
   assert.equal(await heartbeat(w.host, g), true)
   assert.equal(g.paused, undefined)
 })
+
+test('observation identity: a byte- and metadata-preserving rewrite is no notice; same bytes with a moved mtime is one; other bytes with the same size and mtime is one (R3-1, F4-2)', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const launch = `${r.stateDir}/result.json`
+  const T = Math.floor(Date.now() / 1000) - 60
+  writeFileSync(launch, result({ episode: 1 }))
+  utimesSync(launch, T, T)
+  const gate = newGate()
+  await reconcile(w.host, gate, false)
+  await tellWorker(w.host, (await scan(w.host, { claim: false })).visible[0]!, 'next') // E2 open
+  writeFileSync(launch, readFileSync(launch))
+  utimesSync(launch, T, T)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1, 'not observable, as documented (F4-2)')
+  utimesSync(launch, T + 5, T + 5)
+  await reconcile(w.host, gate, false)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 2, 'a moved mtime is a new snapshot: one notice')
+  assert.match(w.woken[1]!, /unattributed/)
+  writeFileSync(launch, readFileSync(launch, 'utf8').replace('did it', 'did IT'))
+  utimesSync(launch, T + 5, T + 5)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 3, 'same size and mtime, other bytes: the sha256 differs')
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks/done`), 'E2 stays open throughout')
+})
+
+test('recovery then a new tell: the recovered episode is still delivered (RECOVERY_OVERTAKEN); the tell takes the next seq', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const ep2 = `${r.stateDir}/episodes/2`
+  // A tell crashed after publishing E2's descriptor, before `sent`.
+  mkdirSync(ep2, { recursive: true })
+  writeFileSync(`${ep2}/dispatch.json`, JSON.stringify({ seq: 2, since: Date.now(), owner: 'me', resultPath: `${ep2}/result.json`, origin: 'tell' }))
+  const gate = newGate()
+  await reconcile(w.host, gate, false)
+  assert.ok(existsSync(`${ep2}/uncertain`) && existsSync(`${ep2}/sent`), 'recovered as uncertain + sent, never re-sent')
+  await tellWorker(w.host, (await scan(w.host, { claim: false })).visible[0]!, 'three')
+  assert.ok(existsSync(`${r.stateDir}/episodes/3/sent`))
+  writeFileSync(`${ep2}/result.json`, result({ episode: 2 }))
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1)
+  assert.ok(existsSync(`${ep2}/acks/done`))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/3/acks`), 'E3 is untouched')
+})
+
+test('a waiter binds its own episode only: a running E1 waiter holds E1, and E2 (no waiter) is delivered by submit', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ agentId: 'ag1' }))
+  const host: Host = { ...w.host, agentList: async () => [{ id: 'ag1', status: 'running' }] }
+  const gate = newGate()
+  await tellWorker(host, (await scan(host, { claim: false })).visible[0]!, 'two')
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  writeFileSync(`${r.stateDir}/episodes/2/result.json`, result({ episode: 2, summary: 'second' }))
+  await reconcile(host, gate, false)
+  assert.equal(w.woken.length, 1)
+  assert.match(w.woken[0]!, /second/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks`), 'E1 waits for its waiter')
+  assert.ok(existsSync(`${r.stateDir}/episodes/2/acks/done`))
+})
+
+test('tell during a collect pass: the pass acks only the episode it read; the new episode stays open', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  let told = false
+  const host: Host = {
+    ...w.host,
+    read: async path => {
+      if (!told && path === `${r.stateDir}/result.json`) {
+        told = true
+        await tellWorker(w.host, (await scan(w.host, { claim: false })).visible[0]!, 'two')
+      }
+      return w.host.read(path)
+    },
+  }
+  await reconcile(host, newGate(), false)
+  assert.ok(told)
+  assert.equal(w.woken.length, 1)
+  assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/done`))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks`))
+  const s = await scan(w.host, { claim: false })
+  assert.deepEqual(s.dispatches.filter(d => !s.reported.has(`${d.name}#${d.seq}`)).map(d => d.seq), [2])
+})

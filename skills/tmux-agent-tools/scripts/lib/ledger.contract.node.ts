@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -179,4 +179,15 @@ test('recovery: no descriptor → aborted; descriptor without sent → uncertain
   assert.ok(!existsSync(join(w, 'episodes', '2', 'uncertain')))
   assert.deepEqual(await recoverEpisodes(h, w), [])
   assert.equal((await openEpisode(h, w, 't', desc))?.seq, 5)
+})
+
+test('liveness: a registration dir that cannot be listed (EACCES) is unknown, never non-live', async () => {
+  const s = fresh()
+  mkdirSync(join(s, 'act', '1'), { recursive: true })
+  chmodSync(join(s, 'act'), 0o000)
+  try {
+    assert.equal(await sessionLiveness(host(), s, Date.now()), 'unknown')
+  } finally {
+    chmodSync(join(s, 'act'), 0o755)
+  }
 })
