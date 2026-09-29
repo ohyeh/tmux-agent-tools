@@ -70,22 +70,24 @@ Node entry points (not Claude plugin paths):
 
 ### Release workflow (landed here)
 
-Before this prep, `.github/workflows/release.yml` `validate` did not set up Node 22.18.0 and did not run the contract smoke, typecheck, or plugin test. P6 TUI tests (`tui.contract.node.ts`) and P7 launcher tests (`launcher.contract.node.ts`) are now in the tree and executed by `test-core-contract-smoke` (`*.contract.node.ts`). Release workflow now also runs the full smoke suite (`scripts/run-all-smokes`) with private tmux isolation, and ties publish to the tested candidate SHA.
+Before this prep, `.github/workflows/release.yml` `validate` did not set up Node 22.18.0 and did not run the contract smoke, typecheck, or plugin test. P6 TUI tests (`tui.contract.node.ts`) and P7 launcher tests (`launcher.contract.node.ts`) are now in the tree and executed by `test-core-contract-smoke` (`*.contract.node.ts`). Release workflow now also runs `cd mcp-adapter && npm ci && npm test` on Node 22.18.0, the full smoke suite (`scripts/run-all-smokes`) with private tmux isolation, and ties publish to the tested candidate SHA.
 
 | gate | file:line |
 |---|---|
 | job timeout | `release.yml:31` `timeout-minutes: 30` |
 | Candidate SHA recording | `release.yml:42–46` `record_sha` output |
 | Node `22.18.0` | `release.yml:56–59` |
-| Core contract (includes collector, launcher, and TUI contracts) | `release.yml:61–62` |
-| Typecheck | `release.yml:64–65` |
-| Claude install | `release.yml:67–71` |
-| Permission surface + `claude plugin test .` | `release.yml:73–74` `scripts/test-mod-permissions-smoke` |
-| Smoke CLI stubs + full smoke suite (private tmux isolation) | `release.yml:76–90` `scripts/run-all-smokes` |
-| Existing candidate checks (version regex, tag absent, wrapper self-test, version-sync, session-meta, oneshot, dialogue with isolated tmux) | `release.yml:92–124` |
-| CHANGELOG section for the tag | `release.yml:126–140` |
-| Checkout tested candidate SHA & refuse if main moved | `release.yml:151–167` |
-| Publish (tag + GitHub release on tested SHA) only when `dry_run` is false | `release.yml:180–201` |
+| mcp-adapter `npm ci` + `npm test` | `release.yml:61–62` `cd mcp-adapter && npm ci && npm test` |
+| Socket isolation guard | `release.yml:64–65` |
+| Core contract (includes collector, launcher, and TUI contracts) | `release.yml:67–68` |
+| Typecheck | `release.yml:70–71` |
+| Claude install | `release.yml:73–77` |
+| Permission surface + `claude plugin test .` | `release.yml:79–80` `scripts/test-mod-permissions-smoke` |
+| Smoke CLI stubs + full smoke suite (private tmux isolation) | `release.yml:82–96` `scripts/run-all-smokes` |
+| Existing candidate checks (version regex, tag absent, wrapper self-test, version-sync, session-meta, oneshot, dialogue with isolated tmux) | `release.yml:98–129` |
+| CHANGELOG section for the tag | `release.yml:131–145` |
+| Checkout tested candidate SHA & refuse if main moved | `release.yml:164–179` |
+| Publish (tag + GitHub release on tested SHA) only when `dry_run` is false | `release.yml:196–211` |
 
 `publish` does not re-run tests. `needs: validate` is the gate, and publish checks out the tested SHA and tags it explicitly. Formula syntax is not a gate: the Homebrew formula was removed (`CHANGELOG.md:112`). `docs/wiki/Contributing.md:85` still mentions it. `docs/release-process.md` is not in the tree; `docs/wiki/Contributing.md:81` still points at it.
 
@@ -211,6 +213,11 @@ UNVERIFIED. No login was attempted.
 ## Local commands for the new release steps
 
 Contract smoke on Node 22.18.0. A login zsh reads `~/.zshenv`, which prepends `/opt/homebrew/bin` (Node 26.8.2 on this machine) and hides a PATH prefix. `zsh -f` skips that file. GitHub-hosted runners do not have this `~/.zshenv`.
+
+```text
+cd mcp-adapter && npm ci && npm test
+adapter smoke ok
+```
 
 ```text
 zsh -f scripts/test-core-contract-smoke

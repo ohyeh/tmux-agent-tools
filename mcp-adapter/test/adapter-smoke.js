@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
 
@@ -11,21 +11,226 @@ const {
   NO_CASCADE_GUARD,
   NO_EXTERNAL_SIDE_EFFECTS_GUARD,
   closeTmuxAgent,
-  deliveries,
-  ensureAdapterLive,
   getHost,
   readTmuxAgent,
-  resolveCoreModule,
   sendTmuxAgent,
   spawnTmuxAgent,
   stopHeartbeat,
   waitTmuxAgent,
 } = require("../src/adapter");
 
-const { newGate, reconcileOnce } = resolveCoreModule("workers.ts");
-const { nodeHost } = resolveCoreModule("host.node.ts");
+function childEnv(dir, extra = {}) {
+  const env = {
+    ...process.env,
+    ...extra,
+    TMUX_AGENT_DIR: dir,
+    FAKE_AGENT_TMUX_ROOT: dir,
+  };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  if (!Object.prototype.hasOwnProperty.call(extra, "TMUX_AGENT_SESSION")) {
+    delete env.TMUX_AGENT_SESSION;
+  }
+  return env;
+}
+
+function runAdapterChild(dir, args, extra) {
+  const stdout = execFileSync(process.execPath, [__filename, "--child", ...args], {
+    encoding: "utf8",
+    env: childEnv(dir, extra),
+    cwd: path.resolve(__dirname, ".."),
+  });
+  return JSON.parse(stdout.trim());
+}
+
+function runAdapterChildRaw(dir, args, extra) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [__filename, "--child", ...args], {
+      env: childEnv(dir, extra),
+      cwd: path.resolve(__dirname, ".."),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      err += chunk;
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`adapter child ${args.join(" ")} exited ${code}: ${err}`));
+        return;
+      }
+      resolve(out.trim());
+    });
+  });
+}
+
+// Both creators pass the missing-file check, then block inside write until the
+// peer is there. That is the concurrent first-create window.
+function installIdWriteBarrier() {
+  const barrier = process.env.RACE_BARRIER;
+  if (!barrier) {
+    throw new Error("RACE_BARRIER is required");
+  }
+  const realWrite = fs.writeFileSync;
+  let passed = false;
+  fs.writeFileSync = (file, data, options) => {
+    const target = typeof file === "string" ? file : "";
+    if (!passed && target.endsWith(`${path.sep}.mcp-session-id`)) {
+      passed = true;
+      realWrite(path.join(barrier, `ready-${process.pid}`), "1");
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const ready = fs.readdirSync(barrier).filter((name) => name.startsWith("ready-")).length;
+        if (ready >= 2) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+      const ready = fs.readdirSync(barrier).filter((name) => name.startsWith("ready-")).length;
+      if (ready < 2) {
+        throw new Error("session id create barrier timed out");
+      }
+    }
+    return realWrite(file, data, options);
+  };
+}
+
+function ageSessionBeats(dir) {
+  const sessions = path.join(dir, ".v3", ".sessions");
+  const old = (Date.now() - 90_000 - 10 * 60 * 1000) / 1000;
+  let count = 0;
+  const walk = (current) => {
+    for (const ent of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, ent.name);
+      if (ent.isDirectory()) {
+        walk(full);
+      } else if (ent.name.endsWith(".beat")) {
+        fs.utimesSync(full, old, old);
+        count += 1;
+      }
+    }
+  };
+  walk(sessions);
+  return count;
+}
+
+async function runChild(kind, args) {
+  const repo = path.resolve(__dirname, "..");
+  if (kind === "spawn-wait") {
+    const spawned = await spawnTmuxAgent({
+      cli: "fake",
+      repoPath: repo,
+      task: "deliver once",
+      name: "adapter-once",
+    });
+    fs.writeFileSync(spawned.result_path, JSON.stringify({
+      schema_version: 1,
+      status: "success",
+      summary: "once",
+      artifacts: [],
+      errors: [],
+    }));
+    const waited = await waitTmuxAgent(spawned.agent_id, 1);
+    process.stdout.write(JSON.stringify({ agent_id: spawned.agent_id, waited }));
+    return;
+  }
+  if (kind === "wait") {
+    const waited = await waitTmuxAgent(args[0], 1);
+    process.stdout.write(JSON.stringify(waited));
+    return;
+  }
+  if (kind === "persist") {
+    try {
+      await spawnTmuxAgent({
+        cli: "fake",
+        repoPath: repo,
+        task: "persist",
+        name: "adapter-persist",
+      });
+      process.stdout.write(JSON.stringify({ threw: false, code: null, owner: getHost(repo).owner() }));
+    } catch (err) {
+      process.stdout.write(JSON.stringify({
+        threw: true,
+        code: err.code || null,
+        message: err.message,
+        owner: null,
+      }));
+    }
+    return;
+  }
+  if (kind === "race-id") {
+    installIdWriteBarrier();
+    process.stdout.write(getHost(repo).owner());
+    return;
+  }
+  throw new Error(`unknown child ${kind}`);
+}
+
+async function testSharedSessionDeliversOnce() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-shared-id-"));
+  const first = runAdapterChild(dir, ["spawn-wait"]);
+  assert.equal(first.waited.status, "completed");
+  assert.equal(first.waited.body && first.waited.body.summary, "once");
+  const second = runAdapterChild(dir, ["wait", first.agent_id]);
+  assert.equal(second.status, "already_acked");
+  assert.equal(second.body, undefined);
+}
+
+async function testClosedEpisodeNotClaimedByOtherOwner() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-closed-claim-"));
+  const first = runAdapterChild(dir, ["spawn-wait"], { TMUX_AGENT_SESSION: "owner-a" });
+  assert.equal(first.waited.status, "completed");
+  assert.ok(fs.existsSync(path.join(dir, ".v3", first.agent_id, "episodes", "1", "acks", "done")));
+  assert.ok(ageSessionBeats(dir) >= 1);
+  const second = runAdapterChild(dir, ["wait", first.agent_id], { TMUX_AGENT_SESSION: "owner-b" });
+  assert.equal(second.status, "already_acked");
+  assert.equal(second.body, undefined);
+  assert.equal(fs.existsSync(path.join(dir, ".v3", first.agent_id, "episodes", "1", "claims")), false);
+}
+
+async function testPersistFailureIsToolError() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-persist-"));
+  fs.writeFileSync(path.join(dir, ".v3"), "not-a-directory\n");
+  const out = runAdapterChild(dir, ["persist"]);
+  assert.equal(out.threw, true, `persist failure must fail the tool call, owner=${out.owner} code=${out.code}`);
+  assert.equal(out.code, "EEXIST");
+  assert.equal(out.owner, null);
+  assert.doesNotMatch(JSON.stringify(out), /ephemeral/);
+}
+
+async function testConcurrentSessionId() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-id-race-"));
+  const barrier = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-id-barrier-"));
+  const [left, right] = await Promise.all([
+    runAdapterChildRaw(dir, ["race-id"], { RACE_BARRIER: barrier }),
+    runAdapterChildRaw(dir, ["race-id"], { RACE_BARRIER: barrier }),
+  ]);
+  assert.equal(left, right);
+  assert.equal(fs.readFileSync(path.join(dir, ".v3", ".mcp-session-id"), "utf8").trim(), left);
+}
 
 async function main() {
+  if (process.argv[2] === "--child") {
+    await runChild(process.argv[3], process.argv.slice(4));
+    stopHeartbeat();
+    return;
+  }
+  if (process.argv[2] === "--findings") {
+    const fixtures = path.join(__dirname, "fixtures/bin");
+    process.env.PATH = `${fixtures}${path.delimiter}${process.env.PATH}`;
+    const which = process.argv[3] || "abcd";
+    if (which.includes("a")) await testSharedSessionDeliversOnce();
+    if (which.includes("b")) await testClosedEpisodeNotClaimedByOtherOwner();
+    if (which.includes("c")) await testPersistFailureIsToolError();
+    if (which.includes("d")) await testConcurrentSessionId();
+    console.log(`findings ${which} ok`);
+    return;
+  }
+
   const repo = path.resolve(__dirname, "..");
   assert.ok(
     fs.existsSync(path.resolve(repo, "../skills/tmux-agent-tools/scripts/lib/workers.ts")),
@@ -277,73 +482,11 @@ async function main() {
   assert.equal(restartRead.structuredContent.summary, "survived restart");
   await restartClient2.close();
 
-  // 14. Dual-install test: two adapter processes on one root do not both own or double-deliver
-  process.env.TMUX_AGENT_SESSION = "adapter-session-alpha";
-  const alphaHost = getHost(repo);
-  await ensureAdapterLive(alphaHost);
-  const alphaSpawned = await spawnTmuxAgent({
-    cli: "fake",
-    repoPath: repo,
-    task: "dual-install worker",
-    name: "adapter-dual",
-  });
-  const dualId = alphaSpawned.agent_id;
-  const workerJsonPath = path.join(tmp, ".v3", dualId, "worker.json");
-  const dispatchJsonPath = path.join(tmp, ".v3", dualId, "episodes", "1", "dispatch.json");
-  const workerRec = JSON.parse(fs.readFileSync(workerJsonPath, "utf8"));
-  const dispatchRec = JSON.parse(fs.readFileSync(dispatchJsonPath, "utf8"));
-  assert.equal(workerRec.owner, "adapter-session-alpha");
-  assert.equal(dispatchRec.owner, "adapter-session-alpha");
-
-  // Write valid result
-  fs.writeFileSync(alphaSpawned.result_path, JSON.stringify({
-    schema_version: 1,
-    status: "success",
-    summary: "dual ok",
-    artifacts: [],
-    errors: [],
-    episode: 1,
-  }));
-
-  // Alpha waits and completes delivery into ledger
-  const before = deliveries();
-  const alphaWaited = await waitTmuxAgent(dualId, 1);
-  assert.equal(alphaWaited.status, "completed");
-  const alphaDeliveries = deliveries() - before;
-  assert.equal(alphaDeliveries, 1);
-
-  // Verify acks/done was written by waitTmuxAgent
-  const ackDoneDir = path.join(tmp, ".v3", dualId, "episodes", "1", "acks", "done");
-  assert.ok(fs.existsSync(ackDoneDir), "acks/done must exist in ledger after waitTmuxAgent completes");
-
-  // Process beta with distinct session and its own submission tracker
-  process.env.TMUX_AGENT_SESSION = "adapter-session-beta";
-  let betaDeliveries = 0;
-  const betaHost = nodeHost({
-    owner: "adapter-session-beta",
-    cwd: repo,
-    log: () => {},
-    submit: async () => {
-      betaDeliveries += 1;
-      return {};
-    },
-  });
-  const betaGate = newGate();
-
-  // A claim lands on the first pass and the delivery on the next (§3). Two passes
-  // are what shows a second install delivering the same episode.
-  await reconcileOnce(betaHost, betaGate);
-  await reconcileOnce(betaHost, betaGate);
-
-  assert.equal(alphaDeliveries + betaDeliveries, 1, "exactly one delivery of one finished episode across two sessions");
-  assert.equal(betaDeliveries, 0, "Beta must not deliver episode already acknowledged and closed by Alpha");
-
-  // Also verify beta reading does not alter original ownership
-  const betaRead = await readTmuxAgent(dualId);
-  assert.equal(betaRead.status, "success");
-  const dispatchCheck = JSON.parse(fs.readFileSync(dispatchJsonPath, "utf8"));
-  assert.equal(dispatchCheck.owner, "adapter-session-alpha");
   delete process.env.TMUX_AGENT_SESSION;
+  await testSharedSessionDeliversOnce();
+  await testClosedEpisodeNotClaimedByOtherOwner();
+  await testPersistFailureIsToolError();
+  await testConcurrentSessionId();
 
   stopHeartbeat();
   console.log("adapter smoke ok");

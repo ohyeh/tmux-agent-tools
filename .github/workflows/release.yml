@@ -58,6 +58,9 @@ jobs:
         with:
           node-version: 22.18.0
 
+      - name: mcp-adapter tests (node 22.18.0)
+        run: cd mcp-adapter && npm ci && npm test
+
       - name: Guard tmux socket isolation
         run: scripts/check-tmux-socket-isolation
 

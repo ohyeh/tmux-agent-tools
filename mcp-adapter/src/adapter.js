@@ -80,6 +80,16 @@ function getStateRoot() {
   return path.resolve(dir);
 }
 
+function readPersistedSessionId(idFile) {
+  try {
+    return fs.readFileSync(idFile, "utf8").trim();
+  } catch (err) {
+    // ENOTDIR: `.v3` is a file. Fall through so mkdir reports that EEXIST.
+    if (err && (err.code === "ENOENT" || err.code === "ENOTDIR")) return "";
+    throw err;
+  }
+}
+
 function getStableSessionId(root) {
   if (process.env.TMUX_AGENT_SESSION) {
     return process.env.TMUX_AGENT_SESSION;
@@ -89,24 +99,27 @@ function getStableSessionId(root) {
   }
   const v3 = v3Of(root);
   const idFile = path.join(v3, ".mcp-session-id");
+  const existing = readPersistedSessionId(idFile);
+  if (existing) {
+    cachedSessionId = existing;
+    return existing;
+  }
+  fs.mkdirSync(v3, { recursive: true });
+  const newId = `mcp-session-${crypto.randomUUID()}`;
   try {
-    if (fs.existsSync(idFile)) {
-      const id = fs.readFileSync(idFile, "utf8").trim();
-      if (id) {
-        cachedSessionId = id;
-        return id;
+    fs.writeFileSync(idFile, `${newId}\n`, { encoding: "utf8", flag: "wx" });
+  } catch (err) {
+    if (err && err.code === "EEXIST") {
+      const winner = readPersistedSessionId(idFile);
+      if (winner) {
+        cachedSessionId = winner;
+        return winner;
       }
     }
-    fs.mkdirSync(v3, { recursive: true });
-    const newId = `mcp-session-${crypto.randomUUID()}`;
-    fs.writeFileSync(idFile, `${newId}\n`, "utf8");
-    cachedSessionId = newId;
-    return newId;
-  } catch (err) {
-    process.stderr.write(`[mcp-adapter] could not persist session id: ${err}\n`);
-    cachedSessionId = `mcp-session-ephemeral-${process.pid}`;
-    return cachedSessionId;
+    throw err;
   }
+  cachedSessionId = newId;
+  return newId;
 }
 
 function getHost(cwd) {
@@ -369,6 +382,10 @@ async function closedAcks(host, episodeDir) {
 }
 
 async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body) {
+  // Closed ack first: never claim, and never hand the body out as a new completion.
+  if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
+    return { status: "already_acked" };
+  }
   const me = host.owner();
   const gate = me ? gateFor(me) : undefined;
   if (!me || !gate || gate.activation === undefined) {
@@ -392,9 +409,6 @@ async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, result
     if (!cur || !cur.complete || cur.session !== me) {
       return { status: "failed", reason: "not_owner", detail: { claim: claimResult, owner: cur && cur.session } };
     }
-  }
-  if ((await closedAcks(host, episodeDir)).some((n) => CLOSED_ACKS.includes(n))) {
-    return { status: "completed", body };
   }
   const observation = await observationOf(host, resultPath, text);
   const finished = {
