@@ -343,7 +343,7 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
-  agent-tmux <cli> assign [--timeout N] [--confirm-window N] [--detach] [--prompt-delivery paste|file-ref] <name> <directory> <prompt-file>
+  agent-tmux <cli> assign [--timeout N] [--confirm-window N] [--detach] [--prompt-delivery paste|file-ref] [--result-path <abs> [--episode <n>]] <name> <directory> <prompt-file>
   agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
   agent-tmux <cli> start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux <cli> resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
@@ -4144,9 +4144,14 @@ _extract_prompt_file_prepass() {
         ;;
     esac
   done
-  # Producer route (workers-core P0 contract v5 §8): the caller names THIS prompt's
-  # result file and episode. Both or neither; the path is absolute and has no
-  # control characters, because it is pasted into the pane on its own line.
+  _check_result_route
+}
+
+# Producer route (workers-core P0 contract §8): the caller names THIS prompt's
+# result file and episode. Both or neither; the path is absolute and has no
+# control characters, because it is pasted into the pane on its own line.
+# Shared by the prepass (start/send…) and assign's own flag loop.
+_check_result_route() {
   if [[ -n "$RESULT_EPISODE" && -z "$RESULT_PATH_OVERRIDE" ]]; then
     echo "--episode requires --result-path" >&2; return 2
   fi
@@ -4241,6 +4246,8 @@ assign_session() {
       --timeout)        timeout="${2:-}"; shift 2 ;;
       --confirm-window) confirm_window="${2:-}"; shift 2 ;;
       --detach)         detach=1; shift ;;
+      --result-path)    RESULT_PATH_OVERRIDE="${2:-}"; shift 2 ;;
+      --episode)        RESULT_EPISODE="${2:-}"; shift 2 ;;
       --prompt-delivery)
         case "${2:-}" in
           paste|file-ref) PROMPT_DELIVERY="$2" ;;
@@ -4250,8 +4257,9 @@ assign_session() {
       *) echo "assign: unknown flag: $1" >&2; return 2 ;;
     esac
   done
+  _check_result_route || return 2
   local name="${1:-}" dir="${2:-}" prompt="${3:-}"
-  local usage_msg="Usage: agent-tmux assign [--timeout N] [--confirm-window N] [--detach] <name> <directory> <prompt-file>"
+  local usage_msg="Usage: agent-tmux assign [--timeout N] [--confirm-window N] [--detach] [--result-path <abs> [--episode <n>]] <name> <directory> <prompt-file>"
   if [[ -z "$name" || -z "$dir" || -z "$prompt" ]]; then
     echo "$usage_msg" >&2; return 2
   fi

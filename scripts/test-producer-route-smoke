@@ -12,7 +12,7 @@ CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
 WORK="$(mktemp -d -t tmux-agent-producer.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
-trap 'tmux kill-session -t codex-cli-pr-route 2>/dev/null || true; rm -rf "$WORK"' EXIT
+trap 'tmux kill-session -t codex-cli-pr-route 2>/dev/null || true; tmux kill-session -t codex-cli-pr-assign 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 cat > "$WORK/fake-live.sh" <<'EOF'
 #!/bin/sh
@@ -89,6 +89,20 @@ printf '%s\n' '{"schema_version":1,"status":"success","summary":"s","artifacts":
 rc=0; "$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 2 >/dev/null 2>&1 || rc=$?
 assert "a result without episode is not attributed" "$rc" "1"
 
+"$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
+
+echo "case: assign carries the launch episode on its send step"
+N="pr-assign"
+PA="$WORK/eps/a/result.json"
+printf 'GOAL: g\nACCEPTANCE: a\nREPORT: r\n' > "$WORK/brief.md"
+rc=0; "$CODEX_TMUX" assign --episode 1 "$N" "$WORK" "$WORK/brief.md" >/dev/null 2>&1 || rc=$?
+assert "assign --episode without --result-path" "$rc" "2"
+rc=0; "$CODEX_TMUX" assign --result-path rel/r.json "$N" "$WORK" "$WORK/brief.md" >/dev/null 2>&1 || rc=$?
+assert "assign relative --result-path" "$rc" "2"
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" assign --confirm-window 3 --result-path "$PA" --episode 1 "$N" "$WORK" "$WORK/brief.md" >/dev/null 2>&1 || true
+p="$(pane)"
+assert "assign names the given path" "$([[ "$p" == *"$RP $PA"* ]] && echo yes || echo no)" "yes"
+assert "assign asks for episode 1" "$([[ "$p" == *"episode: the number 1"* ]] && echo yes || echo no)" "yes"
 "$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
 echo "producer-route smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
