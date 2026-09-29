@@ -2446,7 +2446,7 @@ describe('teammates', () => {
     await $.command.run(run('workers'))
     await clock.advance(2_000)
 
-    let drawn = textOf(await $.ui.render(bandRender()))
+    let drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the title names the code that drew it').toMatch(/workers v\d+\.\d+\.\d+ · @\S+ · tmux \d+ · 內部 \d+/)
     expect(drawn, 'delivery does not end a teammate').toContain('w1')
     expect(drawn).toContain('done — tell it more, or stop it')
@@ -2479,9 +2479,9 @@ describe('teammates', () => {
     await $.session.start(session())
     await $.command.run(run('workers'))
 
-    const drawn = textOf(await $.ui.render(bandRender()))
+    const drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.11\.0 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.11\.1 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -2645,6 +2645,47 @@ describe('teammates', () => {
     const stops = panel.argv.filter(a => a.includes('stop')).map(a => a[a.length - 1])
     expect(stops.sort(), 'w3 has no session; hg-agent-proxy is not ours').toEqual(['w1', 'w2'])
     expect(store.acked().sort()).toEqual(['w1@0', 'w2@0'])
+  })
+
+  test('[ clear ] stops every worker of this project on a second press, and is absent with none', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on, ['w2@0'])
+    const clock = mock.clock(on)
+    mockFs(on, {
+      [`${ROOT}/w1/dispatch.json`]: dispatch('w1', 0),
+      [`${ROOT}/w2/dispatch.json`]: dispatch('w2', 0),
+    })
+    const panel = mockPanel(on, { running: true, sessions: ['codex-cli-w1', 'codex-cli-w2', 'hg-agent-proxy'] })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const tree = await $.ui.render(bandRender())
+    expect(keysOf(tree)).toContain('clear')
+    expect(hotkeysOf(tree), 'c presses it').toContain('c')
+
+    const stops = () => panel.argv.filter(a => a.includes('stop')).map(a => a[a.length - 1]).sort()
+    await $.ui.press({ plugin: 'tmux-agent', key: 'clear', requestId: 'above-prompt' })
+    await settle()
+    expect(stops(), 'one press only arms it').toEqual([])
+    expect(textOf(await $.ui.render(bandRender()))).toContain('clear all? press again')
+    await clock.advance(500)
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'clear', requestId: 'above-prompt' })
+    await settle()
+    expect(stops(), 'hg-agent-proxy is not ours').toEqual(['w1', 'w2'])
+    expect(store.acked().sort()).toEqual(['w1@0', 'w2@0'])
+  })
+
+  test('[ clear ] is not drawn when no worker is outstanding', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mock.clock(on)
+    mockFs(on, {})
+    mockPanel(on, { running: true })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    expect(keysOf(await $.ui.render(bandRender()))).not.toContain('clear')
   })
 
   test('rows carry a state colour: green running, cyan delivered, red exited', WITH_DRIVER, async ($, on) => {
@@ -4033,14 +4074,14 @@ describe('project sessions', () => {
     await $.session.start(session())
     await $.command.run(run('workers'))
 
-    let drawn = textOf(await $.ui.render(bandRender()))
+    let drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the worker row stays').toContain('w1')
     expect(drawn.indexOf('w1'), 'project rows follow worker rows').toBeLessThan(drawn.indexOf('hg-android'))
     expect(drawn).toContain('hg-android  專案  0:00')
     expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
     expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.11\.0 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.11\.1 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

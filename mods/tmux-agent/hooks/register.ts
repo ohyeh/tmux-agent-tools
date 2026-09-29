@@ -12,7 +12,7 @@ import type { TmuxDispatch } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.11.0'
+const MOD_VERSION = '0.11.1'
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -181,6 +181,8 @@ const MIRROR_ROWS = 12
 const STOP_CONFIRM_MS = 5_000
 /** Presses closer than this are a held key repeating, not a confirmation. */
 const STOP_REPEAT_MS = 400
+/** `armedStop` id for the title bar's `[ clear ]`; a row id is `<name>@<n>`, never this. */
+const CLEAR_ID = '*clear'
 /** The panel's title-bar colour. */
 const PANEL_ACCENT = 'cyan'
 /**
@@ -1938,6 +1940,21 @@ async function tellWorker(host: Host, root: string, d: TmuxDispatch, text: strin
  * Dismiss a worker. Acknowledged whatever the stop's outcome: a worker nobody
  * will wait for must leave the panel, or it sits there as `exited` forever.
  */
+/**
+ * Stop every worker of this project that still has a pane. Only this project's
+ * dispatches: `stop` is scoped to what this mod started, never to whatever else
+ * lives in tmux (a shell-started row stays).
+ */
+async function stopAll(host: Host, gate: Gate): Promise<Outcome> {
+  const { dispatches } = await scan(host)
+  const alive = dispatches.length ? await liveSessions(host, dispatches[0]!.dir) : new Set<string>()
+  const live = dispatches.filter(d => hasSession(alive, d))
+  if (!live.length) return { ok: true, text: 'nothing to stop: no worker of this project has a tmux session' }
+  const outs = [] as Outcome[]
+  for (const d of live) outs.push(await stopWorker(host, gate, d))
+  return { ok: outs.every(o => o.ok), text: outs.map(o => o.text).join('\n') }
+}
+
 async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch): Promise<Outcome> {
   const run = await host.run(['agent-tmux', d.profile, 'stop', d.name], d.dir, 8_000).catch(
     (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }),
@@ -2653,6 +2670,25 @@ export const register: Register = on => {
     // AbovePrompt.maxRows) — overflow would take the row hotkeys with it.
     const now = await $.clock.now()
     const down = collectorDown(gate)
+    // A stop asks twice: one stray press (a letter with the band focused)
+    // stopped a worker in the 2026-09-25 live probe.
+    const pressTwice = async (id: string, fire: () => void) => {
+      const at = await $.clock.now()
+      const was = panel.armedStop
+      // A second press, not a held key's repeat: the confirm needs a beat.
+      if (was?.id === id && at < was.until && at - was.from >= STOP_REPEAT_MS) {
+        panel.armedStop = undefined
+        fire()
+        return
+      }
+      // A repeat inside the beat slides it: a held key never confirms.
+      if (was?.id === id && at < was.until) {
+        panel.armedStop = { ...was, from: at }
+        return
+      }
+      panel.armedStop = { id, from: at, until: at + STOP_CONFIRM_MS }
+      $.ui.invalidate('ui.render')
+    }
     // Every row the tree draws is counted here, so it stays inside `maxRows`: a
     // taller tree scrolls, and a scrolling band arms none of its digit hotkeys.
     // Goals show only in the overview (no row selected); a selected row adds its
@@ -2711,7 +2747,16 @@ export const register: Register = on => {
     // project rows still say 專案 themselves).
     const me = world?.owner()
     const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning} · 內部 ${panel.internal}`
-    const buttonCells = displayCells('[ + ]') + displayCells('[ refresh ]') + displayCells('[ hide ]') + displayCells(' [-]')
+    // `[ clear ]` stops every worker this mod started; drawn only when there is one.
+    const clearable = panel.rows.some(r => !r.project)
+    const clearArmed = panel.armedStop?.id === CLEAR_ID && now < panel.armedStop.until
+    const clearLabel = clearArmed ? 'clear all? press again' : 'clear'
+    const buttonCells =
+      displayCells('[ + ]') +
+      displayCells('[ refresh ]') +
+      (clearable ? displayCells(`[ ${clearLabel} ]`) : 0) +
+      displayCells('[ hide ]') +
+      displayCells(' [-]')
     // Too narrow for the name and version (60 columns: 69 cells): the counts are
     // what the bar is for, so the name goes first, never a count.
     const full = ` workers v${MOD_VERSION} · ${counts} `
@@ -2721,7 +2766,7 @@ export const register: Register = on => {
     // Whole pieces, dropped from the right: a sliced hint ended mid-command
     // ("· /workers stop <" at 72 columns).
     let hint = ''
-    for (const piece of ['  1-9 select', ' · /workers stop <name>', ' · /workers tell <name> <text>']) {
+    for (const piece of ['  /workers stop <name>', ' · /workers tell <name> <text>']) {
       if (displayCells(hint) + displayCells(piece) + 1 > hintRoom) break
       hint += piece
     }
@@ -2745,6 +2790,23 @@ export const register: Register = on => {
             },
           }),
           Button({ key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void panel.refresh?.() }),
+          ...(clearable
+            ? [
+                Button({
+                  key: 'clear',
+                  label: clearLabel,
+                  hotkey: 'c',
+                  onPress: () =>
+                    pressTwice(CLEAR_ID, () =>
+                      void act('clear', async host => {
+                        const out = await stopAll(host, gate)
+                        void panel.refresh?.()
+                        return out
+                      }),
+                    ),
+                }),
+              ]
+            : []),
           Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
           // Last and apart from refresh: hiding is undone by /workers, but it should
           // not sit one key away from the button people press most.
@@ -2912,23 +2974,7 @@ export const register: Register = on => {
               key: `stop:${r.id}`,
               label: armed ? `stop ${r.d.name}? press again` : 'stop',
               hotkey: 'x',
-              onPress: async () => {
-                const at = await $.clock.now()
-                const was = panel.armedStop
-                // A second press, not a held key's repeat: the confirm needs a beat.
-                if (was?.id === r.id && at < was.until && at - was.from >= STOP_REPEAT_MS) {
-                  panel.armedStop = undefined
-                  void act(`stop ${r.d.name}`, host => stopWorker(host, gate, r.d))
-                  return
-                }
-                // A repeat inside the beat slides it: a held key never confirms.
-                if (was?.id === r.id && at < was.until) {
-                  panel.armedStop = { ...was, from: at }
-                  return
-                }
-                panel.armedStop = { id: r.id, from: at, until: at + STOP_CONFIRM_MS }
-                $.ui.invalidate('ui.render')
-              },
+              onPress: () => pressTwice(r.id, () => void act(`stop ${r.d.name}`, host => stopWorker(host, gate, r.d))),
             }),
             ...(armed ? [Text({ color: 'red', children: `  ends its tmux session · ${Math.ceil((panel.armedStop!.until - now) / 1000)}s` })] : []),
           ],
@@ -3281,17 +3327,7 @@ export const register: Register = on => {
     const input = e as unknown as StopInput
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
-    if (input.all === true) {
-      // Only this project's dispatches, and only those with a pane: `stop` is
-      // scoped to what this mod started, never to whatever else lives in tmux.
-      const { dispatches } = await scan(host)
-      const alive = dispatches.length ? await liveSessions(host, dispatches[0]!.dir) : new Set<string>()
-      const live = dispatches.filter(d => hasSession(alive, d))
-      if (!live.length) return { result: 'nothing to stop: no worker of this project has a tmux session.' }
-      const lines: string[] = []
-      for (const d of live) lines.push((await stopWorker(host, gate, d)).text)
-      return { result: `${lines.join('\n')}.` }
-    }
+    if (input.all === true) return { result: `${(await stopAll(host, gate)).text}.` }
     if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars, or pass all: true' }
     const d = await dispatchNamed(host, input.name!)
     if (!d && projectNamed(input.name!)) return READONLY_PROJECT
