@@ -6,7 +6,7 @@
 # reviewed file, never a side effect of a refactor.
 #
 # `claude plugin validate` derives that surface from the source. This smoke
-# pins its output to mods/tmux-agent/permissions.txt: a drift FAILS and prints
+# pins its output to permissions.txt: a drift FAILS and prints
 # the diff; an intended change is committed by refreshing the file with
 # `scripts/test-mod-permissions-smoke --update`.
 #
@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 CLAUDE="${CLAUDE_BIN:-claude}"
-MOD=mods/tmux-agent
+MOD=.
 PINNED="$MOD/permissions.txt"
 
 pass=0
@@ -45,10 +45,10 @@ fi
 actual="$(mktemp)"
 trap 'rm -f "$actual"' EXIT
 # Only the derived surface lines; the header carries an absolute path.
-"$CLAUDE" plugin validate "$MOD" 2>&1 | grep '❯' | sed 's/^[[:space:]]*❯ //' > "$actual"
+"$CLAUDE" plugin validate "$MOD/.claude-plugin/plugin.json" 2>&1 | grep '❯' | sed 's/^[[:space:]]*❯ //' > "$actual"
 if [[ ! -s "$actual" ]]; then
   bad "plugin validate printed no surface lines"
-  "$CLAUDE" plugin validate "$MOD" >&2 || true
+  "$CLAUDE" plugin validate "$MOD/.claude-plugin/plugin.json" >&2 || true
   echo "$pass passed, $fail failed" >&2
   exit 1
 fi

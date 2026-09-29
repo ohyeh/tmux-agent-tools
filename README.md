@@ -130,14 +130,37 @@ npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools --global
 
 The repository doubles as a plugin for agent CLIs. Every manifest points at the same
 `./skills/` directory, so the skill content is identical across CLIs — only the wrapper
-manifest differs. No MCP server or hooks are involved; this is a skill plus shell wrappers.
+manifest differs.
 
-Claude Code (the repository is its own marketplace):
+Claude Code (the repository is its own marketplace, with one plugin, `tmux-agent`):
 
 ```bash
 /plugin marketplace add ohyeh/tmux-agent-tools
-/plugin install tmux-agent-tools@tmux-agent-tools
+/plugin install tmux-agent@tmux-agent-tools
 ```
+
+That one plugin carries the skills, the Bash dispatch gate and the `tmux-agent`
+function-hook mod. The mod turns any agent-tmux worker into a teammate of one Claude Code
+session: `assign` dispatches a brief, `tell` gives the same worker its next task or a
+correction, `stop` dismisses it, `peek` looks at a pane mid-flight, `keys` answers a dialog
+it is parked on, and `/workers` shows this project's teammates while their sessions live.
+Every session that has it reconciles each worker's `result.json` and submits a prompt when
+a worker finishes — so a detached worker never finishes into silence, even when nobody is
+watching the pane. The worker can be codex, agy, cursor, a second claude on a provider
+gateway, or a CLI that does not exist yet: `profile` is an agent-tmux profile name. See
+[`docs/tmux-agent-mod.md`](docs/tmux-agent-mod.md) for the permission surface, the
+state-root rules and the known boundaries. It does not replace the shell path:
+`assign` + `result wait-required` stay the route for Codex, Cursor and anything else
+without function hooks.
+
+Upgrading from the two-plugin layout (until 0.41.0 the marketplace listed
+`tmux-agent-tools` and `tmux-agent`):
+
+- had `tmux-agent@tmux-agent-tools`: `claude plugin update tmux-agent@tmux-agent-tools`.
+  Same plugin id, so tools, the waiter type and stored delivery marks carry over.
+- had only `tmux-agent-tools@tmux-agent-tools`: it now reports "failed to load … not found
+  in marketplace". Run `claude plugin uninstall tmux-agent-tools@tmux-agent-tools` and
+  `claude plugin install tmux-agent@tmux-agent-tools`.
 
 Codex CLI and Cursor read `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json`
 respectively from a clone of this repository; both expose the same skill.
@@ -145,27 +168,6 @@ respectively from a clone of this repository; both expose the same skill.
 The plugin installs the skill, not the `*-tmux` binaries. To get `agent-tmux`
 and the helpers on `PATH`, use `install-bin` below; the
 skill resolves the bundled scripts from its own directory when they are not on `PATH`.
-
-### Optional: the `tmux-agent` function-hook mod (Claude Code only)
-
-`mods/tmux-agent/` is a second, separate plugin in the same marketplace. It turns any
-agent-tmux worker into a teammate of one Claude Code session: `assign` dispatches a
-brief, `tell` gives the same worker its next task or a correction, `stop` dismisses
-it, `peek` looks at a pane mid-flight, `keys` answers a dialog it is parked on, and
-`/workers` shows this project's teammates while their sessions live. Every session that has it
-reconciles each worker's `result.json` and submits a prompt when a worker finishes —
-so a detached worker never finishes into silence, even when nobody is watching the pane.
-The worker can be codex, agy, cursor, a second claude on a provider gateway, or a CLI
-that does not exist yet: `profile` is an agent-tmux profile name.
-
-```bash
-/plugin install tmux-agent@tmux-agent-tools
-```
-
-It needs `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, and it does not replace the shell path:
-`assign` + `result wait-required` stay the route for Codex, Cursor and anything else
-without function hooks. See [`mods/tmux-agent/README.md`](mods/tmux-agent/README.md) for
-the permission surface, the state-root rules and the known boundaries.
 
 ## Install Commands
 

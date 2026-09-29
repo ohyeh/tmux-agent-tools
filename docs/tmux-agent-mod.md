@@ -17,12 +17,12 @@ cursor 等沒有這個 mod 的 runtime。
 ## 安裝
 
 ```sh
-# marketplace 已含兩個 entry：tmux-agent-tools（shell）與 tmux-agent（mod）
+# marketplace 只有一個 plugin：tmux-agent（skills + Bash gate + mod）
 claude plugin marketplace add ohyeh/tmux-agent-tools
-claude plugin install tmux-agent
+claude plugin install tmux-agent@tmux-agent-tools
 ```
 
-開發時直接掛目錄：`claude --plugin-dir mods/tmux-agent`。
+開發時直接掛 repo 根目錄：`claude --plugin-dir .`。
 
 裝完就能用，不用再跑 install-bin：`agent-tmux` 不在 `PATH` 上時，mod 自己用同一個
 marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-tools/…`），
@@ -72,8 +72,8 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 **它不做的事**：沒有 `http.fetch`，不連網；不讀 credentials、shell history 或 state root 以外的檔案內容；不寫任何環境變數（pin 裡 `env writes: nothing`）；不改 `AskUserQuestion` 或其他工具的輸出。以上都能從下面那份 pin 對出來——pin 沒列的 API，mod 就沒有呼叫。
 
-`claude plugin validate mods/tmux-agent` 會把以上逐條印出來對帳。那份輸出釘在
-[`permissions.txt`](./permissions.txt)，`scripts/test-mod-permissions-smoke` 在 CI
+`claude plugin validate .claude-plugin/plugin.json` 會把以上逐條印出來對帳（對 repo 根目錄跑 `validate .` 只會驗 marketplace）。那份輸出釘在
+[`permissions.txt`](../permissions.txt)，`scripts/test-mod-permissions-smoke` 在 CI
 比對：權限面任何變動都必須是一個看得見、被 review 過的 diff，不能是重構的副作用。
 
 ## 原生 sub-agent 列 (0.10.0)

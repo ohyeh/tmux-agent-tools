@@ -13,17 +13,17 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-if [[ ! -f mods/tsconfig.json ]]; then
-  echo "  FAIL mods/tsconfig.json not found — the mods tree moved" >&2
+if [[ ! -f tsconfig.json ]]; then
+  echo "  FAIL tsconfig.json not found — the mod tree moved" >&2
   exit 1
 fi
 
-echo "typechecking mods/ against mods/tsconfig.json"
-if npx -p typescript tsc --noEmit -p mods/tsconfig.json; then
-  echo "  ok   mods typecheck clean"
+echo "typechecking the mod (hooks, tests, types, scripts/lib) against tsconfig.json"
+if npx -p typescript tsc --noEmit -p tsconfig.json; then
+  echo "  ok   mod typecheck clean"
   echo "1 passed, 0 failed"
 else
-  echo "  FAIL mods typecheck reported errors (above)" >&2
+  echo "  FAIL mod typecheck reported errors (above)" >&2
   echo "0 passed, 1 failed" >&2
   exit 1
 fi

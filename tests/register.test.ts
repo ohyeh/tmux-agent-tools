@@ -2579,7 +2579,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v0\.11\.4 · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v0\.41\.0 · @\S+ · tmux 1 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {
@@ -4179,7 +4179,7 @@ describe('project sessions', () => {
     expect(drawn, 'a shell-started worker names itself and its result').toContain('cursor-cli-cc  shell · success  0:00')
     expect(drawn, 'launch-meta must agree with the name').toContain('agy-cli-xx  專案  0:00')
     expect(drawn, 'the worker session is not also a project row').not.toContain('codex-cli-w1')
-    expect(drawn).toMatch(/workers v0\.11\.4 · @\S+ · tmux 1 · 內部 0 /)
+    expect(drawn).toMatch(/workers v0\.41\.0 · @\S+ · tmux 1 · 內部 0 /)
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)

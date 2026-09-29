@@ -45,21 +45,17 @@ assert "agent-tmux AGENT_TMUX_VERSION matches CHANGELOG" "$script_version" "$cha
 MARKET=.claude-plugin/marketplace.json
 assert "$MARKET metadata.version matches CHANGELOG" \
   "$(jq -r '.metadata.version' "$MARKET")" "$changelog_version"
-assert "$MARKET tmux-agent-tools entry matches CHANGELOG" \
-  "$(jq -r '.plugins[] | select(.name == "tmux-agent-tools") | .version' "$MARKET")" \
-  "$changelog_version"
-
-# The mod ships on its own version line (it is a separate plugin), so it is held
-# to its OWN manifest rather than to the CHANGELOG.
-assert "$MARKET tmux-agent entry matches the mod manifest" \
+assert "$MARKET tmux-agent entry matches CHANGELOG" \
   "$(jq -r '.plugins[] | select(.name == "tmux-agent") | .version' "$MARKET")" \
-  "$(jq -r '.version' mods/tmux-agent/.claude-plugin/plugin.json)"
+  "$changelog_version"
+assert "$MARKET lists exactly one plugin (the mod is part of the root plugin)" \
+  "$(jq -r '.plugins | length' "$MARKET")" "1"
 
 # The panel title prints MOD_VERSION so a running session shows which code it
 # loaded; a constant that lags the manifest would lie exactly when it matters.
-assert "mods/tmux-agent MOD_VERSION matches the mod manifest" \
-  "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" mods/tmux-agent/hooks/register.ts)" \
-  "$(jq -r '.version' mods/tmux-agent/.claude-plugin/plugin.json)"
+assert "hooks/register.ts MOD_VERSION matches the plugin manifest" \
+  "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" hooks/register.ts)" \
+  "$(jq -r '.version' .claude-plugin/plugin.json)"
 
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
