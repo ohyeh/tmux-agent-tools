@@ -535,177 +535,6 @@ cmd_status() {
   done
 }
 
-# 45s / 12m / 3h. Floor of whole seconds; a since in the future is 0s.
-format_elapsed() {
-  local since="$1" now="$2" delta
-  delta=$(( (now - since) / 1000 ))
-  if (( delta < 0 )); then
-    delta=0
-  fi
-  if (( delta < 60 )); then
-    print -r -- "${delta}s"
-  elif (( delta < 3600 )); then
-    print -r -- "$(( delta / 60 ))m"
-  else
-    print -r -- "$(( delta / 3600 ))h"
-  fi
-}
-
-# running (no terminal result yet) ▶; success ✓ <status>; any other terminal ✗ <status>.
-# A retired record is ✓ delivered, not the result's own status.
-panel_mark() {
-  # Not named status: zsh's $status is read-only (it is $?).
-  local kind="$1" result_status="$2"
-  if [[ "$kind" == delivered ]]; then
-    print -r -- "✓ delivered"
-    return 0
-  fi
-  if [[ -n "$result_status" ]] && is_terminal_status "$result_status"; then
-    if [[ "$result_status" == success ]]; then
-      print -r -- "✓ success"
-    else
-      print -r -- "✗ ${result_status}"
-    fi
-  else
-    print -r -- "▶"
-  fi
-}
-
-# One jq for every dispatch and result under root. Prints owned entries, active
-# newest-first (truncation drops the stalest), then the three newest delivered.
-collect_panel_entries() {
-  local root="$1" session="$2" now="$3"
-  local -a files
-  files=(
-    "$root"/*/dispatch.json(N)
-    "$root"/*/dispatch.delivered.json(N)
-    "$root"/*/result.json(N)
-  )
-  (( ${#files} )) || return 0
-  local raw line kind owner name profile since result_status
-  local elapsed mark entry
-  local -a active_keys=() delivered_keys=()
-  raw="$("$JQ" -n -r '
-    def field($s):
-      $s | gsub("[\t\r\n\u001f]"; " ");
-    def as_text($v):
-      if $v == null or $v == false then ""
-      elif ($v|type) == "string" then $v
-      elif ($v|type) == "number" or $v == true then ($v|tostring)
-      else ""
-      end;
-    def since_text($v):
-      if ($v|type) == "number" and ($v|floor) == $v then ($v|floor|tostring)
-      else ""
-      end;
-    def status_of($doc):
-      if $doc == null or ($doc|type) != "object" then ""
-      elif ($doc.status|type) == "string" then $doc.status
-      elif ($doc.body|type) == "object" and ($doc.body.status|type) == "string" then $doc.body.status
-      else ""
-      end;
-    def worker_name($path; $doc):
-      if ($doc.name|type) == "string" and ($doc.name|length) > 0 then $doc.name
-      else ($path | split("/") | if length >= 2 then .[-2] else "worker" end)
-      end;
-    def kind_of($path):
-      if $path | endswith("/dispatch.delivered.json") then "delivered"
-      elif $path | endswith("/dispatch.json") then "active"
-      else ""
-      end;
-    [inputs | {path: input_filename, doc: .}] as $rows
-    | ($rows | map({key: .path, value: .doc}) | from_entries) as $by
-    | $rows[]
-    | .path as $path
-    | .doc as $doc
-    | select(($doc|type) == "object")
-    | kind_of($path) as $kind
-    | select($kind != "")
-    | (if $kind == "delivered"
-       then ($path | sub("/dispatch\\.delivered\\.json$"; "/result.json"))
-       else ($path | sub("/dispatch\\.json$"; "/result.json"))
-       end) as $rpath
-    | [
-        $kind,
-        field(as_text($doc.owner)),
-        field(worker_name($path; $doc)),
-        field(as_text($doc.profile)),
-        since_text($doc.since),
-        field(status_of($by[$rpath]))
-      ]
-    | join("\u001f")
-  ' "${files[@]}" </dev/null)"
-  [[ -n "$raw" ]] || return 0
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    IFS=$'\u001f' read -r kind owner name profile since result_status <<< "$line"
-    [[ "$owner" == "$session" ]] || continue
-    [[ "$since" == <-> ]] || continue
-    [[ -n "$name" ]] || continue
-    elapsed="$(format_elapsed "$since" "$now")"
-    mark="$(panel_mark "$kind" "$result_status")"
-    entry="${name} ${profile} ${elapsed} ${mark}"
-    if [[ "$kind" == delivered ]]; then
-      delivered_keys+=("$(printf '%016d\t%s\t%s' "$since" "$name" "$entry")")
-    else
-      active_keys+=("$(printf '%016d\t%s\t%s' "$since" "$name" "$entry")")
-    fi
-  done <<< "$raw"
-  local row
-  if (( ${#active_keys} )); then
-    local -a asorted
-    asorted=("${(@O)active_keys}")
-    for row in "${asorted[@]}"; do
-      print -r -- "${row##*$'\t'}"
-    done
-  fi
-  if (( ${#delivered_keys} )); then
-    local -a dsorted
-    local i take
-    dsorted=("${(@O)delivered_keys}")
-    take=${#dsorted}
-    if (( take > 3 )); then
-      take=3
-    fi
-    for (( i = 1; i <= take; i++ )); do
-      row="${dsorted[i]}"
-      print -r -- "${row##*$'\t'}"
-    done
-  fi
-}
-
-# Drop whole entries from the end. Never cut one mid-word; if nothing fits,
-# the line is "+N more".
-fit_panel_line() {
-  local width="$1"
-  shift
-  local -a entries=("$@")
-  local n=${#entries} i dropped line k
-  if (( n == 0 )); then
-    print -r -- "tmux-agent: no workers"
-    return 0
-  fi
-  for (( i = n; i >= 0; i-- )); do
-    dropped=$(( n - i ))
-    if (( i == 0 )); then
-      line="+${dropped} more"
-    else
-      line="${entries[1]}"
-      for (( k = 2; k <= i; k++ )); do
-        line+=" ${entries[k]}"
-      done
-      if (( dropped > 0 )); then
-        line+=" +${dropped} more"
-      fi
-    fi
-    if (( ${#line} <= width )); then
-      print -r -- "$line"
-      return 0
-    fi
-  done
-  print -r -- "$line"
-}
-
 cmd_panel() {
   local session="" width="" width_set=0 arg
   while (( $# )); do
@@ -740,19 +569,9 @@ cmd_panel() {
     fi
   fi
   width=$(( 10#$width ))
-  local root now out line
-  local -a entries=()
-  root="$(state_root)"
-  now="$(now_ms)"
-  if [[ -d "$root" ]]; then
-    out="$(collect_panel_entries "$root" "$session" "$now")"
-    if [[ -n "$out" ]]; then
-      while IFS= read -r line; do
-        [[ -n "$line" ]] && entries+=("$line")
-      done <<< "$out"
-    fi
-  fi
-  fit_panel_line "$width" "${entries[@]}"
+  local node_bin="${NODE:-$(command -v node 2>/dev/null || true)}"
+  [[ -n "$node_bin" && -x "$node_bin" ]] || die "node not found"
+  "$node_bin" "$SCRIPT_DIR/lib/snapshot.node.ts" panel "$session" --width "$width"
 }
 
 main() {
@@ -765,7 +584,7 @@ main() {
     assign) require_jq; cmd_assign "$@" ;;
     collect) require_jq; cmd_collect "$@" ;;
     stop) cmd_stop "$@" ;;
-    panel) require_jq; cmd_panel "$@" ;;
+    panel) cmd_panel "$@" ;;
     status) cmd_status "$@" ;;
     *) usage ;;
   esac

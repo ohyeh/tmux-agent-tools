@@ -1,0 +1,471 @@
+// Contract tests for snapshot.node.ts (p0-contract.md §6, workers-core plan P4).
+//
+// Verifies:
+// 1. Panel line formatting, ordering, elapsed time, status marks, truncation, and empty state.
+// 2. Dashboard JSON schema and fixture compliance: all required keys, types, and totals.
+// 3. Observing mutates nothing: taking a full snapshot of the state root (path + mtime + content hash)
+//    before and after panel/dashboard over an orphan whose owner is dead proves identical state,
+//    and no claims/ directory appears.
+// 4. Verification that scan with { claim: true } would mutate and fail this check.
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { nodeHost } from './host.node.ts'
+import {
+  dashboard,
+  fitPanelLine,
+  formatElapsed,
+  panel,
+  type DashboardSnapshot,
+} from './snapshot.node.ts'
+import { scan, v3Of } from './workers.ts'
+
+type DirSnapshotEntry = {
+  type: 'file' | 'dir'
+  mtimeMs: number
+  hash: string
+}
+
+type DirSnapshot = Map<string, DirSnapshotEntry>
+
+function captureDir(root: string, rel = ''): DirSnapshot {
+  const map: DirSnapshot = new Map()
+  const dir = rel ? `${root}/${rel}` : root
+  if (!existsSync(dir)) return map
+  const entries = readdirSync(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    const entryRel = rel ? `${rel}/${entry.name}` : entry.name
+    const full = `${dir}/${entry.name}`
+    const st = statSync(full)
+    if (entry.isDirectory()) {
+      map.set(entryRel, { type: 'dir', mtimeMs: st.mtimeMs, hash: '' })
+      const sub = captureDir(root, entryRel)
+      for (const [k, v] of sub) map.set(k, v)
+    } else {
+      const content = readFileSync(full)
+      const hash = createHash('sha256').update(content).digest('hex')
+      map.set(entryRel, { type: 'file', mtimeMs: st.mtimeMs, hash })
+    }
+  }
+  return map
+}
+
+test('formatElapsed: units and bounds (45s, 12m, 3h, negative is 0s)', () => {
+  const now = 1000000000000
+  assert.equal(formatElapsed(now + 5000, now), '0s')
+  assert.equal(formatElapsed(now, now), '0s')
+  assert.equal(formatElapsed(now - 45000, now), '45s')
+  assert.equal(formatElapsed(now - 59000, now), '59s')
+  assert.equal(formatElapsed(now - 60000, now), '1m')
+  assert.equal(formatElapsed(now - 12 * 60 * 1000 - 30000, now), '12m')
+  assert.equal(formatElapsed(now - 3599000, now), '59m')
+  assert.equal(formatElapsed(now - 3600000, now), '1h')
+  assert.equal(formatElapsed(now - 3 * 3600 * 1000 - 120000, now), '3h')
+  assert.equal(formatElapsed(now - 10 * 3600 * 1000, now), '10h')
+})
+
+test('fitPanelLine: drops whole entries from the end and handles edge widths', () => {
+  const entries = ['aaaa zz 9h ▶', 'bbbb zz 9h ▶', 'cccc zz 9h ▶', 'dddd zz 9h ▶']
+  // Empty
+  assert.equal(fitPanelLine([], 120), 'tmux-agent: no workers')
+
+  // Full fits
+  const all = entries.join(' ')
+  assert.equal(fitPanelLine(entries, all.length), all)
+  assert.equal(fitPanelLine(entries, 400), all)
+
+  // Two plus suffix
+  const twoMore = 'aaaa zz 9h ▶ bbbb zz 9h ▶ +2 more'
+  assert.equal(fitPanelLine(entries, twoMore.length), twoMore)
+
+  // No room for suffix drops another whole entry
+  const oneMore = 'aaaa zz 9h ▶ +3 more'
+  assert.equal(fitPanelLine(entries, twoMore.length - 1), oneMore)
+
+  // Narrower than one entry prints +N more
+  assert.equal(fitPanelLine(entries, 1), '+4 more')
+  assert.equal(fitPanelLine(entries, 0), '+4 more')
+})
+
+test('panel fixture: full panel ordering, status marks, 3-delivered cap, and foreign exclusions', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'panel-fixture-'))
+  const v3 = v3Of(root)
+  mkdirSync(v3, { recursive: true })
+  const MSESSION = 'msession-test'
+  const now = 1700000000000
+
+  // Helper to set up a worker in .v3
+  const setupWorker = (opts: {
+    name: string
+    profile: string
+    since: number
+    owner: string
+    delivered?: boolean
+    resultStatus?: string
+  }) => {
+    const wdir = `${v3}/${opts.name}`
+    mkdirSync(`${wdir}/episodes/1`, { recursive: true })
+    writeFileSync(
+      `${wdir}/worker.json`,
+      JSON.stringify({
+        profile: opts.profile,
+        name: opts.name,
+        dir: '/tmp/repo',
+        since: opts.since,
+        owner: opts.owner,
+        ownerCwd: '/tmp/repo',
+        origin: 'assign',
+      }),
+    )
+    const resultPath = `${wdir}/episodes/1/result.json`
+    writeFileSync(
+      `${wdir}/episodes/1/dispatch.json`,
+      JSON.stringify({
+        seq: 1,
+        since: opts.since,
+        owner: opts.owner,
+        goal: 'test',
+        resultPath,
+        origin: 'launch',
+      }),
+    )
+    writeFileSync(`${wdir}/episodes/1/sent`, '')
+    if (opts.delivered) {
+      mkdirSync(`${wdir}/episodes/1/acks/done`, { recursive: true })
+    }
+    if (opts.resultStatus) {
+      writeFileSync(
+        resultPath,
+        JSON.stringify({
+          schema_version: 1,
+          status: opts.resultStatus,
+          summary: 'test summary',
+          episode: 1,
+          artifacts: [],
+          errors: [],
+        }),
+      )
+    }
+  }
+
+  // Active workers
+  setupWorker({ name: 'secw', profile: 'codex', since: now - 45000, owner: MSESSION })
+  setupWorker({ name: 'run1', profile: 'codex', since: now - (12 * 60 + 30) * 1000, owner: MSESSION })
+  setupWorker({ name: 'ok1', profile: 'codex', since: now - (3 * 3600 + 120) * 1000, owner: MSESSION, resultStatus: 'success' })
+  setupWorker({ name: 'bad1', profile: 'agy', since: now - (5 * 3600 + 120) * 1000, owner: MSESSION, resultStatus: 'failed' })
+
+  // Delivered workers
+  setupWorker({ name: 'newD', profile: 'codex', since: now - (4 * 3600 + 120) * 1000, owner: MSESSION, delivered: true, resultStatus: 'success' })
+  setupWorker({ name: 'midB', profile: 'codex', since: now - (6 * 3600 + 120) * 1000, owner: MSESSION, delivered: true, resultStatus: 'success' })
+  setupWorker({ name: 'midA', profile: 'codex', since: now - (8 * 3600 + 120) * 1000, owner: MSESSION, delivered: true, resultStatus: 'success' })
+  setupWorker({ name: 'oldD', profile: 'codex', since: now - (10 * 3600 + 120) * 1000, owner: MSESSION, delivered: true, resultStatus: 'success' })
+
+  // Foreign session workers (must be excluded)
+  setupWorker({ name: 'foreignAct', profile: 'agy', since: now - 1000, owner: 'other-session' })
+  setupWorker({ name: 'foreignDel', profile: 'agy', since: now - 2000, owner: 'other-session', delivered: true })
+
+  const host = nodeHost({ owner: MSESSION, cwd: '/tmp/repo' })
+  process.env.TMUX_AGENT_DIR = root
+
+  try {
+    const line = await panel({ host, session: MSESSION, width: 400, now })
+
+    // Verify marks
+    assert.ok(line.includes('secw codex 45s ▶'))
+    assert.ok(line.includes('run1 codex 12m ▶'))
+    assert.ok(line.includes('ok1 codex 3h ✓ success'))
+    assert.ok(line.includes('bad1 agy 5h ✗ failed'))
+    assert.ok(line.includes('newD codex 4h ✓ delivered'))
+    assert.ok(line.includes('midB codex 6h ✓ delivered'))
+    assert.ok(line.includes('midA codex 8h ✓ delivered'))
+
+    // 4th delivered is capped/excluded
+    assert.ok(!line.includes('oldD'))
+
+    // Foreign workers excluded
+    assert.ok(!line.includes('foreignAct'))
+    assert.ok(!line.includes('foreignDel'))
+
+    // Active newest-first, then delivered newest-first
+    const order = ['secw ', 'run1 ', 'ok1 ', 'bad1 ', 'newD ', 'midB ', 'midA ']
+    let prevIndex = -1
+    for (const token of order) {
+      const idx = line.indexOf(token)
+      assert.ok(idx > prevIndex, `token ${token} out of order in line: ${line}`)
+      prevIndex = idx
+    }
+
+    // Exactly 3 delivered entries shown
+    const deliveredCount = (line.match(/✓ delivered/g) || []).length
+    assert.equal(deliveredCount, 3)
+
+    // Truncation check with narrow width
+    const shortLine = await panel({ host, session: MSESSION, width: 60, now })
+    assert.ok(shortLine.includes('more'))
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('dashboard fixture and schema: keys, totals, and values match contract', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dash-fixture-'))
+  const v3 = v3Of(root)
+  mkdirSync(v3, { recursive: true })
+  const now = 1700000000000
+
+  // Empty snapshot check
+  const hostEmpty = nodeHost({ cwd: '/tmp/repo' })
+  process.env.TMUX_AGENT_DIR = root
+  try {
+    const emptySnap = await dashboard({ host: hostEmpty, now })
+    assert.equal(emptySnap.schema_version, 1)
+    assert.equal(typeof emptySnap.at, 'string')
+    assert.deepEqual(emptySnap.totals, { running: 0, exited: 0, stopped: 0, total: 0 })
+    assert.deepEqual(emptySnap.sessions, [])
+
+    // Add running, exited, and stopped workers
+    const setup = (name: string, profile: string, since: number, status?: string) => {
+      const wdir = `${v3}/${name}`
+      mkdirSync(`${wdir}/episodes/1`, { recursive: true })
+      writeFileSync(
+        `${wdir}/worker.json`,
+        JSON.stringify({
+          profile,
+          name,
+          dir: '/tmp/repo',
+          since,
+          owner: 'owner-1',
+          ownerCwd: '/tmp/repo',
+          origin: 'assign',
+        }),
+      )
+      const resultPath = `${wdir}/episodes/1/result.json`
+      writeFileSync(
+        `${wdir}/episodes/1/dispatch.json`,
+        JSON.stringify({
+          seq: 1,
+          since,
+          owner: 'owner-1',
+          goal: 'goal',
+          resultPath,
+          origin: 'launch',
+        }),
+      )
+      writeFileSync(`${wdir}/episodes/1/sent`, '')
+      if (status) {
+        writeFileSync(
+          resultPath,
+          JSON.stringify({
+            schema_version: 1,
+            status,
+            summary: 'summary',
+            episode: 1,
+            artifacts: [],
+            errors: [],
+          }),
+        )
+      }
+    }
+
+    setup('w-run', 'codex', now - 10000)
+    setup('w-bad', 'agy', now - 20000, 'failed')
+    setup('w-ok', 'claude', now - 30000, 'success')
+
+    const snap = await dashboard({ host: hostEmpty, now })
+    assert.equal(snap.schema_version, 1)
+    assert.equal(snap.totals.total, 3)
+    assert.equal(snap.sessions.length, 3)
+
+    // Check all 30 keys on each session object
+    const requiredKeys = [
+      'schema_version',
+      'tool',
+      'name',
+      'session',
+      'prefix',
+      'exists',
+      'running',
+      'exit_detected',
+      'exit_code',
+      'local_or_remote',
+      'diagnostic',
+      'last_capture_lines',
+      'confirmation_detected',
+      'blocked_reason',
+      'blocked_evidence',
+      'started_at',
+      'last_change_at',
+      'idle_seconds',
+      'bytes_in_pane',
+      'marker_seen',
+      'state',
+      'wrapper',
+      'agent_name',
+      'tmux_session',
+      'cwd',
+      'result_path',
+      'created_at',
+      'created_epoch',
+      'age_seconds',
+      'age',
+    ]
+
+    for (const sess of snap.sessions) {
+      assert.equal(sess.schema_version, 1)
+      for (const k of requiredKeys) {
+        assert.ok(k in sess, `missing key: ${k} in session ${sess.name}`)
+      }
+      assert.ok(['running', 'exited', 'stopped'].includes(sess.state))
+      assert.equal(sess.tool, sess.name === 'w-bad' ? 'agy' : sess.name === 'w-ok' ? 'claude' : 'codex')
+      assert.equal(sess.wrapper, `agent-tmux ${sess.tool}`)
+    }
+
+    // Totals match sum of session states
+    assert.equal(
+      snap.totals.running + snap.totals.exited + snap.totals.stopped,
+      snap.totals.total,
+    )
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('no-mutation: panel and dashboard over an orphan with dead owner mutate nothing and create no claims', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'snapshot-no-mutation-'))
+  const v3 = v3Of(root)
+  mkdirSync(`${v3}/orphan-worker/episodes/1`, { recursive: true })
+
+  writeFileSync(
+    `${v3}/orphan-worker/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name: 'orphan-worker',
+      dir: '/tmp/repo',
+      since: 1700000000000,
+      owner: 'dead-session',
+      ownerCwd: '/tmp/repo',
+      origin: 'assign',
+    }),
+  )
+
+  const resultPath = `${v3}/orphan-worker/result.json`
+  writeFileSync(
+    `${v3}/orphan-worker/episodes/1/dispatch.json`,
+    JSON.stringify({
+      seq: 1,
+      since: 1700000000000,
+      owner: 'dead-session',
+      goal: 'orphan goal',
+      resultPath,
+      origin: 'launch',
+    }),
+  )
+  writeFileSync(`${v3}/orphan-worker/episodes/1/sent`, '')
+
+  process.env.TMUX_AGENT_DIR = root
+  const host = nodeHost({ owner: 'live-viewer', cwd: '/tmp/repo' })
+
+  try {
+    // Capture state root before observing
+    const before = captureDir(root)
+    assert.ok(before.size > 0)
+
+    // Call panel
+    const panelLine = await panel({ host, session: 'live-viewer', width: 120 })
+    assert.ok(typeof panelLine === 'string')
+
+    // Call dashboard
+    const dashSnap = await dashboard({ host })
+    assert.ok(dashSnap.totals.total >= 0)
+
+    // Capture state root after observing
+    const after = captureDir(root)
+
+    // Deep equality: every path, type, mtime, and content hash must match
+    assert.equal(after.size, before.size)
+    for (const [path, entry] of before) {
+      const afterEntry = after.get(path)
+      assert.ok(afterEntry, `path missing after snapshot: ${path}`)
+      assert.equal(afterEntry.type, entry.type, `type changed for ${path}`)
+      assert.equal(afterEntry.mtimeMs, entry.mtimeMs, `mtime changed for ${path}`)
+      assert.equal(afterEntry.hash, entry.hash, `content hash changed for ${path}`)
+    }
+
+    // Explicit check: no claims/ directory was created
+    assert.ok(
+      !existsSync(`${v3}/orphan-worker/episodes/1/claims`),
+      'claims/ directory must never be created by read-only snapshot',
+    )
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('mutation proof: scan with claim:true mutates and creates claims/ for a dead owner orphan', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'scan-claim-mutation-'))
+  const v3 = v3Of(root)
+  mkdirSync(`${v3}/orphan-worker/episodes/1`, { recursive: true })
+
+  writeFileSync(
+    `${v3}/orphan-worker/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name: 'orphan-worker',
+      dir: '/tmp/repo',
+      since: 1700000000000,
+      owner: 'dead-session',
+      ownerCwd: '/tmp/repo',
+      origin: 'assign',
+    }),
+  )
+
+  const resultPath = `${v3}/orphan-worker/result.json`
+  writeFileSync(
+    `${v3}/orphan-worker/episodes/1/dispatch.json`,
+    JSON.stringify({
+      seq: 1,
+      since: 1700000000000,
+      owner: 'dead-session',
+      goal: 'orphan goal',
+      resultPath,
+      origin: 'launch',
+    }),
+  )
+  writeFileSync(`${v3}/orphan-worker/episodes/1/sent`, '')
+
+  process.env.TMUX_AGENT_DIR = root
+  const host = nodeHost({ owner: 'live-collector', cwd: '/tmp/repo' })
+
+  try {
+    const before = captureDir(root)
+    // Invoking scan with claim: true actively contests and mutates the ledger
+    await scan(host, { claim: true })
+    const after = captureDir(root)
+
+    // Proves that claim:true mutates the root and creates claims/
+    assert.notEqual(after.size, before.size)
+    assert.ok(
+      existsSync(`${v3}/orphan-worker/episodes/1/claims`),
+      'scan with claim: true creates claims directory',
+    )
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})

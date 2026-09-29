@@ -1,15 +1,13 @@
 #!/usr/bin/env zsh
-# tmux-agent-dashboard (issue #123 v1 JSON-snapshot slice).
+# tmux-agent-dashboard (issue #123 v1 JSON-snapshot slice, workers-core P4).
 #
-# v1 ships a JSON snapshot of all live agent sessions. Consumers render
-# their own UI (htop-style, tmux statusbar widget, web). The ncurses TUI
-# half is intentionally deferred per docs/design-remaining-backlog.md.
+# Emits a JSON snapshot of all live agent sessions and fleet totals from the
+# core read-only snapshot (snapshot.node.ts).
 
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
-SESSIONS="$SCRIPT_DIR/tmux-agent-sessions"
-JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
+NODE="${NODE:-$(command -v node 2>/dev/null || true)}"
 
 usage() {
   cat <<'EOF'
@@ -22,8 +20,8 @@ Emits a single JSON object per snapshot:
   {
     "schema_version": 1,
     "at": "<ISO-8601 UTC>",
-    "sessions": [<status --json per session>],
-    "totals": {"running": N, "exited": M, "stopped": K}
+    "sessions": [<session objects>],
+    "totals": {"running": N, "exited": M, "stopped": K, "total": L}
   }
 
 Flags:
@@ -33,31 +31,13 @@ Flags:
 EOF
 }
 
-require_jq() {
-  [[ -n "$JQ" && -x "$JQ" ]] || { echo "jq not found" >&2; exit 1; }
+require_node() {
+  [[ -n "$NODE" && -x "$NODE" ]] || { echo "node not found" >&2; exit 1; }
 }
 
-iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-
 emit_snapshot() {
-  require_jq
-  local sessions_json totals_json
-  # `set -e + pipefail` would kill the script if either side of the pipe
-  # exits non-zero (e.g. no sessions present). Force success with `|| true`.
-  sessions_json="$( ( "$SESSIONS" list --json 2>/dev/null || true ) | "$JQ" -c -s '.' 2>/dev/null || echo '[]')"
-  if [[ -z "$sessions_json" ]]; then
-    sessions_json='[]'
-  fi
-  totals_json="$("$JQ" -c -n --argjson s "$sessions_json" '
-    {
-      running: ($s | map(select(.state=="running")) | length),
-      exited:  ($s | map(select(.state=="exited"))  | length),
-      stopped: ($s | map(select(.state=="stopped")) | length),
-      total:   ($s | length)
-    }')"
-  "$JQ" -c -n --argjson sessions "$sessions_json" --argjson totals "$totals_json" \
-    --arg at "$(iso_now)" \
-    '{schema_version: 1, at: $at, totals: $totals, sessions: $sessions}'
+  require_node
+  "$NODE" "$SCRIPT_DIR/lib/snapshot.node.ts" dashboard
 }
 
 # argv parse
