@@ -191,3 +191,128 @@ export async function claim(
   const mv = await op(host, ['mv', tmp, `${next}/owner`], next)
   return mv.exitCode === 0 ? 'claimed' : 'unknown'
 }
+
+// ── activation writer (§4) ─────────────────────────────────────────────────────
+
+export type ActivationRecord = { pid: number; pidStart: string; host: string; token: string }
+
+/**
+ * Register one activation (module load, node process start) of a session:
+ * contest `act/<max+1>`, then write its sibling record. The dir stays empty so its
+ * mtime is its creation time (the R2-4 grace). `undefined` = could not register.
+ */
+export async function registerActivation(host: Host, sessionDir: string, record: ActivationRecord): Promise<number | undefined> {
+  const mk = await op(host, ['mkdir', '-p', `${sessionDir}/act`], parent(sessionDir))
+  if (mk.exitCode !== 0) {
+    host.log(`tmux-agent: mkdir ${sessionDir}/act: ${mk.stderr.trim() || `exit ${mk.exitCode}`}`)
+    return undefined
+  }
+  const n = await allocateNext(host, `${sessionDir}/act`)
+  if (n === undefined) return undefined
+  await host.write(`${sessionDir}/act/${n}.json`, JSON.stringify(record))
+  return n
+}
+
+/** This activation's own liveness beat: only its mtime is read. */
+export async function beat(host: Host, sessionDir: string, n: number, now: number): Promise<void> {
+  await host.write(`${sessionDir}/act/${n}.beat`, String(now))
+}
+
+/** A higher registration fences this one for good. `undefined` = unknown (never "not superseded"). */
+export async function superseded(host: Host, sessionDir: string, n: number): Promise<boolean | undefined> {
+  const acts = await numericChildren(host, `${sessionDir}/act`)
+  return acts ? (acts.at(-1) ?? 0) > n : undefined
+}
+
+// ── episodes (§2, §8): allocation, immutable descriptor, markers, recovery ──────
+
+export type Descriptor = {
+  profile: string
+  name: string
+  dir: string
+  since: number
+  seq: number
+  owner: string
+  ownerCwd: string
+  goal?: string
+  resultPath: string
+  origin: 'launch' | 'tell'
+}
+
+export type Marker = 'sent' | 'uncertain' | 'aborted'
+
+let published = 0
+
+/** Whole-content publication: unique tmp in the same dir, then one rename. */
+async function publish(host: Host, path: string, text: string, token: string): Promise<boolean> {
+  const tmp = `${path}.${token}.${++published}`
+  await host.write(tmp, text)
+  const mv = await op(host, ['mv', tmp, path], parent(path))
+  if (mv.exitCode !== 0) host.log(`tmux-agent: publish ${path}: ${mv.stderr.trim() || `exit ${mv.exitCode}`}`)
+  return mv.exitCode === 0
+}
+
+/** A complete descriptor parses and names its own seq; anything else is incomplete. */
+export async function readDescriptor(host: Host, episodeDir: string): Promise<Descriptor | undefined | 'unknown'> {
+  let text: string
+  try {
+    text = await host.read(`${episodeDir}/dispatch.json`)
+  } catch {
+    return (await host.exists(`${episodeDir}/dispatch.json`).catch(() => true)) ? 'unknown' : undefined
+  }
+  try {
+    const d = JSON.parse(text) as Descriptor
+    return typeof d?.seq === 'number' && typeof d.resultPath === 'string' ? d : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Markers are create-once directories, like acks. */
+export const mark = (host: Host, episodeDir: string, m: Marker) => mkdirExclusive(host, `${episodeDir}/${m}`)
+export const hasMark = (host: Host, episodeDir: string, m: Marker) => host.exists(`${episodeDir}/${m}`)
+
+/**
+ * Allocate the next episode of a worker and publish its immutable descriptor.
+ * The CALLER holds the worker's action lock (§5). seq = max(listed)+1; EEXIST under
+ * the lock means a writer outside the protocol: re-list and retry once, then refuse.
+ */
+export async function openEpisode(
+  host: Host,
+  workerDir: string,
+  token: string,
+  make: (seq: number) => Descriptor,
+): Promise<Descriptor | undefined> {
+  if ((await mkdirExclusive(host, `${workerDir}/episodes`)) === 'unknown') return undefined
+  const seq = await allocateNext(host, `${workerDir}/episodes`, 2)
+  if (seq === undefined) return undefined
+  const d = make(seq)
+  if (d.seq !== seq) throw new Error(`descriptor seq ${d.seq} is not the allocated ${seq}`)
+  return (await publish(host, `${workerDir}/episodes/${seq}/dispatch.json`, JSON.stringify(d), token)) ? d : undefined
+}
+
+/**
+ * Recovery (§8), run by the next action-lock holder: an episode dir without a
+ * complete descriptor is `aborted`; a descriptor without `sent` gets `uncertain`
+ * then `sent` (never re-sent). Returns what it changed, for the log.
+ */
+export async function recoverEpisodes(host: Host, workerDir: string): Promise<string[] | undefined> {
+  const seqs = await numericChildren(host, `${workerDir}/episodes`)
+  if (!seqs) return undefined
+  const changed: string[] = []
+  for (const seq of seqs) {
+    const dir = `${workerDir}/episodes/${seq}`
+    if (await hasMark(host, dir, 'aborted').catch(() => false)) continue
+    const d = await readDescriptor(host, dir)
+    if (d === 'unknown') return undefined
+    if (!d) {
+      if ((await mark(host, dir, 'aborted')) === 'won') changed.push(`${seq}: aborted`)
+      continue
+    }
+    if (!(await hasMark(host, dir, 'sent').catch(() => true))) {
+      await mark(host, dir, 'uncertain')
+      if ((await mark(host, dir, 'sent')) === 'won') changed.push(`${seq}: uncertain`)
+    }
+  }
+  return changed
+}

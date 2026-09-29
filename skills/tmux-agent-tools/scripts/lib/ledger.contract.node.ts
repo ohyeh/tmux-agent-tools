@@ -3,10 +3,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtempSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ack, acquireLock, allocateNext, claim, currentOwner, ORPHAN_MS, releaseLock, sessionKey, sessionLiveness } from './ledger.ts'
+import {
+  ack, acquireLock, allocateNext, claim, currentOwner, hasMark, mark, openEpisode, ORPHAN_MS, readDescriptor, recoverEpisodes,
+  registerActivation, releaseLock, sessionKey, sessionLiveness, superseded, type Descriptor,
+} from './ledger.ts'
 import { nodeHost } from './host.node.ts'
 
 const RACE = new URL('./ledger.race.node.ts', import.meta.url).pathname
@@ -120,4 +123,50 @@ test('claim: an incomplete max gen is waited out for ORPHAN_MS, never promoted e
 
 test('sessionKey is injective where the legacy slug was not', () => {
   assert.notEqual(sessionKey('a/b'), sessionKey('a_b'))
+})
+
+test('activation: 8 processes register 8 distinct numbers, each with its record; only the max is not superseded', async () => {
+  const dir = fresh()
+  const ns = ((await race(8, i => ['activate', dir, `p${i}`])) as number[]).sort((a, b) => a - b)
+  assert.deepEqual(ns, [1, 2, 3, 4, 5, 6, 7, 8])
+  for (const n of ns) assert.ok(JSON.parse(readFileSync(join(dir, 'act', `${n}.json`), 'utf8')).token.startsWith('p'))
+  assert.equal(await superseded(host(), dir, 8), false)
+  assert.equal(await superseded(host(), dir, 7), true)
+  assert.equal(await registerActivation(host(), dir, { pid: 1, pidStart: 'x', host: 'h', token: 't' }), 9)
+  assert.equal(await superseded(host(), dir, 8), true)
+})
+
+const desc = (seq: number, resultPath = `/r/${seq}.json`): Descriptor =>
+  ({ profile: 'codex', name: 'w', dir: '/d', since: 1, seq, owner: 'me', ownerCwd: '/d', resultPath, origin: seq === 1 ? 'launch' : 'tell' })
+
+test('episode: seq = max+1, the descriptor is published whole and names its own seq', async () => {
+  const w = fresh()
+  assert.equal((await openEpisode(host(), w, 't', desc))?.seq, 1)
+  assert.equal((await openEpisode(host(), w, 't', desc))?.seq, 2)
+  assert.deepEqual(await readDescriptor(host(), join(w, 'episodes', '2')), desc(2))
+  await assert.rejects(openEpisode(host(), w, 't', () => desc(9)), /not the allocated 3/)
+})
+
+test('markers: create-once', async () => {
+  const e = fresh()
+  assert.equal(await mark(host(), e, 'sent'), 'won')
+  assert.equal(await mark(host(), e, 'sent'), 'lost')
+  assert.equal(await hasMark(host(), e, 'sent'), true)
+  assert.equal(await hasMark(host(), e, 'uncertain'), false)
+})
+
+test('recovery: no descriptor → aborted; descriptor without sent → uncertain+sent; sent → untouched; idempotent', async () => {
+  const w = fresh()
+  const h = host()
+  await openEpisode(h, w, 't', desc) // 1: descriptor, never sent
+  await openEpisode(h, w, 't', desc) // 2: sent
+  await mark(h, join(w, 'episodes', '2'), 'sent')
+  mkdirSync(join(w, 'episodes', '3')) // 3: crash between mkdir and publish
+  mkdirSync(join(w, 'episodes', '4'))
+  writeFileSync(join(w, 'episodes', '4', 'dispatch.json'), '{"seq":') // 4: torn write outside the protocol
+  assert.deepEqual(await recoverEpisodes(h, w), ['1: uncertain', '3: aborted', '4: aborted'])
+  assert.ok(existsSync(join(w, 'episodes', '1', 'uncertain')) && existsSync(join(w, 'episodes', '1', 'sent')))
+  assert.ok(!existsSync(join(w, 'episodes', '2', 'uncertain')))
+  assert.deepEqual(await recoverEpisodes(h, w), [])
+  assert.equal((await openEpisode(h, w, 't', desc))?.seq, 5)
 })
