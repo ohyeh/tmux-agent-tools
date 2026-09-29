@@ -106,6 +106,15 @@ test('assignWorker writes the brief and the dispatch record, and launches throug
   assert.match(runs[1]!.argv[2]!, /agent-tmux.*assign.*--detach/)
 })
 
+test('assignWorker keeps its -xxxx suffix on a 64-char name (P0 F4-4)', async () => {
+  const { host, files } = fakeHost({ owner: 'me' })
+  const r = await assignWorker(host, { profile: 'astra', name: 'a'.repeat(58) + '.abcde', dir: REPO, brief: BRIEF }, { owner: 'me', ownerCwd: REPO })
+  if ('deny' in r) assert.fail(r.deny)
+  const name: string = JSON.parse(files.get(`${r.stateDir}/dispatch.json`)!).name
+  assert.match(name, /-[0-9a-z]{4}$/)
+  assert.ok(name.length <= 64, name)
+})
+
 test('assignWorker refuses a bad name before any write or launch', async () => {
   const { host, writes, runs } = fakeHost({ owner: 'me' })
   const r = await assignWorker(host, { profile: 'astra', name: 'bad name', dir: REPO, brief: BRIEF })
