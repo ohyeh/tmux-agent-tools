@@ -4,6 +4,8 @@ const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio
 const { z } = require("zod");
 const {
   closeTmuxAgent,
+  ensureAdapterLive,
+  getHost,
   readTmuxAgent,
   sendTmuxAgent,
   spawnTmuxAgent,
@@ -73,6 +75,7 @@ function createServer() {
 }
 
 async function main() {
+  await ensureAdapterLive(getHost());
   const server = createServer();
   await server.connect(new StdioServerTransport());
 }

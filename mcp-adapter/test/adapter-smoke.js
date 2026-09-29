@@ -11,14 +11,26 @@ const {
   NO_CASCADE_GUARD,
   NO_EXTERNAL_SIDE_EFFECTS_GUARD,
   closeTmuxAgent,
+  deliveries,
+  ensureAdapterLive,
+  getHost,
   readTmuxAgent,
+  resolveCoreModule,
   sendTmuxAgent,
   spawnTmuxAgent,
+  stopHeartbeat,
   waitTmuxAgent,
 } = require("../src/adapter");
 
+const { newGate, reconcileOnce } = resolveCoreModule("workers.ts");
+const { nodeHost } = resolveCoreModule("host.node.ts");
+
 async function main() {
   const repo = path.resolve(__dirname, "..");
+  assert.ok(
+    fs.existsSync(path.resolve(repo, "../skills/tmux-agent-tools/scripts/lib/workers.ts")),
+    "repo launch path must resolve the core next to mcp-adapter"
+  );
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tmux-adapter-smoke-"));
   process.env.TMUX_AGENT_DIR = tmp;
   process.env.FAKE_AGENT_TMUX_ROOT = tmp;
@@ -163,19 +175,53 @@ async function main() {
   assert.equal(sendBlocked.blocked_reason, "login_prompt");
   delete process.env.FAKE_SEND_BLOCKED;
 
-  process.env.FAKE_INVALID_RESULT = "1";
-  const invalid = await waitTmuxAgent(missing.agent_id, 0);
-  assert.equal(invalid.status, "failed");
-  assert.equal(invalid.reason, "invalid_result");
-  delete process.env.FAKE_INVALID_RESULT;
-
   process.env.FAKE_DEAD_SESSION = "1";
   const dead = await waitTmuxAgent(missing.agent_id, 0);
   assert.equal(dead.status, "failed");
   assert.equal(dead.reason, "dead_session");
   delete process.env.FAKE_DEAD_SESSION;
 
-  // 11. Server restart test: spawn with server 1, kill it, read with fresh server 2 from ledger
+  process.env.FAKE_STATUS_DEADLINE = "1";
+  const deadline = await waitTmuxAgent(missing.agent_id, 0);
+  assert.equal(deadline.status, "timed_out");
+  assert.notEqual(deadline.reason, "dead_session");
+  delete process.env.FAKE_STATUS_DEADLINE;
+
+  const invalid = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "invalid result", name: "adapter-invalid" });
+  fs.writeFileSync(invalid.result_path, "{ corrupt json");
+  const invalidWaited = await waitTmuxAgent(invalid.agent_id, 0);
+  assert.equal(invalidWaited.status, "failed");
+  assert.equal(invalidWaited.reason, "invalid_result");
+
+  // 11. Prefix matching ambiguity check (Finding 6)
+  const prefixA = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "prefix 1", name: "adapter-multi" });
+  const prefixB = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "prefix 2", name: "adapter-multi" });
+  assert.notEqual(prefixA.agent_id, prefixB.agent_id);
+  await assert.rejects(
+    async () => {
+      await waitTmuxAgent("adapter-multi", 0);
+    },
+    (err) => {
+      assert.equal(err.code, "AMBIGUOUS_AGENT");
+      assert.ok(err.message.includes("ambiguous agent_id"));
+      assert.ok(Array.isArray(err.matches) && err.matches.length >= 2);
+      return true;
+    }
+  );
+
+  // 12. IO error vs unknown agent check (Finding 3: unknown ≠ absent)
+  await assert.rejects(
+    async () => {
+      await waitTmuxAgent("nonexistent-worker", 0);
+    },
+    (err) => {
+      assert.equal(err.code, "UNKNOWN_AGENT");
+      return true;
+    }
+  );
+
+  // 13. Server restart test: spawn with server 1, kill it, read with fresh server 2 from ledger
+  delete process.env.TMUX_AGENT_SESSION;
   const restartClient1 = new Client({ name: "restart-client-1", version: "1.0.0" });
   const restartTransport1 = new StdioClientTransport({
     command: process.execPath,
@@ -198,6 +244,13 @@ async function main() {
     artifacts: [],
     errors: [],
   }));
+
+  // Verify stable session id was recorded on disk
+  const stableIdPath = path.join(tmp, ".v3", ".mcp-session-id");
+  assert.ok(fs.existsSync(stableIdPath), "stable session id must be persisted");
+  const session1Id = fs.readFileSync(stableIdPath, "utf8").trim();
+  assert.ok(session1Id.startsWith("mcp-session-"));
+
   // Kill server process 1 by closing client transport
   await restartClient1.close();
 
@@ -211,6 +264,11 @@ async function main() {
     stderr: "pipe",
   });
   await restartClient2.connect(restartTransport2);
+
+  // Verify server 2 reuses the same stable session id
+  const session2Id = fs.readFileSync(stableIdPath, "utf8").trim();
+  assert.equal(session2Id, session1Id, "server 2 must reuse the same stable session id across restart");
+
   const restartRead = await restartClient2.callTool({
     name: "read_tmux_agent",
     arguments: { agent_id: restartId },
@@ -219,8 +277,10 @@ async function main() {
   assert.equal(restartRead.structuredContent.summary, "survived restart");
   await restartClient2.close();
 
-  // 12. Dual-install test: two adapter processes on one root do not both own or double-deliver
+  // 14. Dual-install test: two adapter processes on one root do not both own or double-deliver
   process.env.TMUX_AGENT_SESSION = "adapter-session-alpha";
+  const alphaHost = getHost(repo);
+  await ensureAdapterLive(alphaHost);
   const alphaSpawned = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
@@ -235,22 +295,57 @@ async function main() {
   assert.equal(workerRec.owner, "adapter-session-alpha");
   assert.equal(dispatchRec.owner, "adapter-session-alpha");
 
-  // Process beta with distinct session
-  process.env.TMUX_AGENT_SESSION = "adapter-session-beta";
+  // Write valid result
   fs.writeFileSync(alphaSpawned.result_path, JSON.stringify({
     schema_version: 1,
-    status: "done",
+    status: "success",
     summary: "dual ok",
     artifacts: [],
     errors: [],
+    episode: 1,
   }));
+
+  // Alpha waits and completes delivery into ledger
+  const before = deliveries();
+  const alphaWaited = await waitTmuxAgent(dualId, 1);
+  assert.equal(alphaWaited.status, "completed");
+  const alphaDeliveries = deliveries() - before;
+  assert.equal(alphaDeliveries, 1);
+
+  // Verify acks/done was written by waitTmuxAgent
+  const ackDoneDir = path.join(tmp, ".v3", dualId, "episodes", "1", "acks", "done");
+  assert.ok(fs.existsSync(ackDoneDir), "acks/done must exist in ledger after waitTmuxAgent completes");
+
+  // Process beta with distinct session and its own submission tracker
+  process.env.TMUX_AGENT_SESSION = "adapter-session-beta";
+  let betaDeliveries = 0;
+  const betaHost = nodeHost({
+    owner: "adapter-session-beta",
+    cwd: repo,
+    log: () => {},
+    submit: async () => {
+      betaDeliveries += 1;
+      return {};
+    },
+  });
+  const betaGate = newGate();
+
+  // A claim lands on the first pass and the delivery on the next (§3). Two passes
+  // are what shows a second install delivering the same episode.
+  await reconcileOnce(betaHost, betaGate);
+  await reconcileOnce(betaHost, betaGate);
+
+  assert.equal(alphaDeliveries + betaDeliveries, 1, "exactly one delivery of one finished episode across two sessions");
+  assert.equal(betaDeliveries, 0, "Beta must not deliver episode already acknowledged and closed by Alpha");
+
+  // Also verify beta reading does not alter original ownership
   const betaRead = await readTmuxAgent(dualId);
-  assert.equal(betaRead.status, "done");
-  // Ensure beta did not mutate or claim ownership
+  assert.equal(betaRead.status, "success");
   const dispatchCheck = JSON.parse(fs.readFileSync(dispatchJsonPath, "utf8"));
   assert.equal(dispatchCheck.owner, "adapter-session-alpha");
   delete process.env.TMUX_AGENT_SESSION;
 
+  stopHeartbeat();
   console.log("adapter smoke ok");
 }
 
