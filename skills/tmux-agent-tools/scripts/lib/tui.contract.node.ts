@@ -962,8 +962,15 @@ test('no-mutation tui: runTui renders, refreshes, and leaves paths, mtimes, and 
   if ('deny' in assigned) assert.fail(assigned.deny)
   const before = treeSnap(root)
   const host = quietHost('tui-viewer', repo, root)
+  const statusArgv: string[][] = []
+  const run = host.run
+  host.run = async (argv, cwd, ms) => {
+    if (argv[0] === 'agent-tmux' && argv.includes('status')) statusArgv.push([...argv])
+    return run(argv, cwd, ms)
+  }
   const { screen, writes } = await framed({ host, root, cwd: repo, session: 'tui-viewer', mirrorMs: 30, waitWrites: 2 })
   assert.ok(writes >= 2, `expected a first render and a refresh, writes=${writes}`)
+  assert.ok(statusArgv.some(argv => argv.includes('--no-write')), `status argv missing --no-write: ${JSON.stringify(statusArgv)}`)
   assert.match(screen, /workers/)
   const after = treeSnap(root)
   assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
