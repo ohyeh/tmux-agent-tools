@@ -2772,8 +2772,10 @@ result_validate_session() {
   lightweight_out="$(result_validate_lightweight "$result_path" "$schema_path")" || rc=$?
   raw_status="$(printf '%s' "$lightweight_out" | "$JQ" -r '.body.status // ""' 2>/dev/null)" || raw_status=""
   canonical_status="$(canonical_status_of "$raw_status")"
-  # --episode: the result is attributed only when its own `episode` equals it (contract v5 §8).
-  if [[ -n "$episode" ]] && ! printf '%s' "$lightweight_out" | "$JQ" -e --argjson e "$episode" '.body.episode == $e' >/dev/null 2>&1; then
+  # --episode: the result is attributed only when its own `episode` equals it (contract §8):
+  # the number, or a decimal string of it (agents drift to strings, as with schema_version).
+  if [[ -n "$episode" ]] && ! printf '%s' "$lightweight_out" | "$JQ" -e --argjson e "$episode" \
+    '.body.episode as $v | ($v == $e) or (($v | type) == "string" and ($v | test("^[1-9][0-9]*$")) and ($v | tonumber) == $e)' >/dev/null 2>&1; then
     lightweight_out="$(printf '%s' "$lightweight_out" | "$JQ" --argjson e "$episode" \
       '.valid = false | .errors += [{path: ".episode", message: "episode is not \($e)"}]')"
     rc=1

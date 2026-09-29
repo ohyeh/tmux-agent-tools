@@ -79,6 +79,12 @@ assert "matching episode is valid" "$rc:$(print -r -- "$out" | jq -r .valid)" "0
 rc=0; out="$("$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 3 2>/dev/null)" || rc=$?
 assert "other episode is not valid" "$rc:$(print -r -- "$out" | jq -r .valid)" "1:false"
 assert "the error names the field" "$(print -r -- "$out" | jq -r '.errors[-1].path')" ".episode"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"s","artifacts":[],"errors":[],"episode":"2"}' > "$P2"
+rc=0; "$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 2 >/dev/null 2>&1 || rc=$?
+assert "a decimal-string episode is attributed (r5 F5-3)" "$rc" "0"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"s","artifacts":[],"errors":[],"episode":"2x"}' > "$P2"
+rc=0; "$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 2 >/dev/null 2>&1 || rc=$?
+assert "a non-decimal string is not attributed" "$rc" "1"
 printf '%s\n' '{"schema_version":1,"status":"success","summary":"s","artifacts":[],"errors":[]}' > "$P2"
 rc=0; "$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 2 >/dev/null 2>&1 || rc=$?
 assert "a result without episode is not attributed" "$rc" "1"
