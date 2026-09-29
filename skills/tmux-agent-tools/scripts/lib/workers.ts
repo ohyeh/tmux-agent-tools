@@ -1359,7 +1359,8 @@ export function payloadOf(done: readonly Finished[]): { text: string; included: 
  * codex workers sat on a usage limit for an hour, the lead none the wiser).
  *
  * `wake` false is the view: the same probe fills `blocked` / `stalled` / `exited`,
- * and it does not toast, log, or submit.
+ * and it does not toast, log, or submit. Status is `--no-write`, so idle comes
+ * from the pane-hash the collector maintains and this view does not write one.
  */
 export async function flagStalls(
   host: Host,
@@ -1405,7 +1406,11 @@ export async function flagStalls(
     const limit = Math.min(STALL_PROBE_MS, left)
     let probe: { exitCode: number; stdout: string }
     try {
-      probe = await host.run(['agent-tmux', d.profile, 'status', '--json', d.name], d.dir, limit)
+      probe = await host.run(
+        ['agent-tmux', d.profile, 'status', ...(wake ? [] : ['--no-write']), '--json', d.name],
+        d.dir,
+        limit,
+      )
     } catch {
       // A probe cut short by what was left of the budget does not count as
       // probed: it stays at the front, where the next sweep gives it its full

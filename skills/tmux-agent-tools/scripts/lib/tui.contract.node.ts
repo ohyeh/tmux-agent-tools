@@ -1,8 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { EventEmitter } from 'node:events'
 import { execFile, spawn } from 'node:child_process'
 import { nodeHost } from './host.node.ts'
@@ -11,6 +12,7 @@ import {
   newGate,
   assignWorker,
   panelRows,
+  wrapperCall,
   v3Of,
   displayCells,
   isFullwidth,
@@ -770,8 +772,7 @@ print(output.decode('utf-8', errors='replace'))
   }
 })
 
-function writePermissionWorker(root: string, repo: string, owner: string): void {
-  const name = 'w.abcde'
+function writePermissionWorker(root: string, repo: string, owner: string, name = 'w.abcde'): void {
   const worker = join(root, '.v3', name)
   const now = Date.now() - 60_000
   for (const seq of [1, 2]) {
@@ -815,6 +816,7 @@ async function framed(opts: {
   keys?: string[]
   mirrorMs?: number
   waitWrites?: number
+  waitMs?: number
 }): Promise<{ screen: string; writes: number }> {
   class In extends EventEmitter {
     isTTY = true
@@ -845,15 +847,16 @@ async function framed(opts: {
     mirrorMs: opts.mirrorMs ?? 60_000,
   })
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+  const waitMs = opts.waitMs ?? 3_000
   const start = Date.now()
-  while (!stdout.written.includes('workers') && Date.now() - start < 3_000) await sleep(20)
+  while (!stdout.written.includes('workers') && Date.now() - start < waitMs) await sleep(20)
   for (const key of opts.keys ?? []) {
     stdin.emit('data', key)
     await sleep(20)
   }
   if (opts.waitWrites) {
     const again = Date.now()
-    while (stdout.writes < opts.waitWrites && Date.now() - again < 3_000) await sleep(20)
+    while (stdout.writes < opts.waitWrites && Date.now() - again < waitMs) await sleep(20)
   }
   stdin.emit('data', 'q')
   await done
@@ -952,4 +955,105 @@ test('no-mutation tui: runTui renders, refreshes, and leaves paths, mtimes, and 
   const after = treeSnap(root)
   assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
   for (const [path, body] of before) assert.equal(after.get(path), body, `mutated ${path}`)
+})
+
+function realTmuxBin(): string {
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue
+    const candidate = join(dir, 'tmux')
+    if (existsSync(candidate)) return candidate
+  }
+  throw new Error('tmux is not on PATH')
+}
+
+function shQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', { timeout: 60_000 }, async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'tui-nomut-live-'))
+  const root = join(parent, 'state')
+  const repo = join(parent, 'repo')
+  const socket = join(parent, 'tmux.sock')
+  const bin = join(parent, 'bin')
+  mkdirSync(root)
+  mkdirSync(repo)
+  mkdirSync(bin)
+  const real = realTmuxBin()
+  // ponytail: agent-tmux unsets TMUX and execs `tmux` with no -S. This PATH shim
+  // is the private socket. Upgrade: pass -S from the wrapper, then delete the shim.
+  writeFileSync(join(bin, 'tmux'), `#!/bin/sh\nexec ${shQuote(real)} -S ${shQuote(socket)} "$@"\n`)
+  chmodSync(join(bin, 'tmux'), 0o755)
+  const name = 'wabcde'
+  writePermissionWorker(root, repo, 'owner', name)
+  const session = `codex-cli-${name}`
+  const agentTmux = join(dirname(fileURLToPath(import.meta.url)), '..', 'agent-tmux')
+  const tmuxS = (args: string[]) =>
+    new Promise<{ code: number; out: string; err: string }>(resolve => {
+      const env = { ...process.env }
+      delete env.TMUX
+      delete env.TMUX_PANE
+      execFile(real, ['-S', socket, ...args], { encoding: 'utf8', env }, (error, stdout, stderr) => {
+        resolve({
+          code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
+          out: stdout ?? '',
+          err: stderr ?? '',
+        })
+      })
+    })
+  const started = await tmuxS(['new-session', '-d', '-s', session, '-c', repo, '-x', '80', '-y', '24'])
+  assert.equal(started.code, 0, `${started.err}\n${started.out}`)
+  let liveStatus = ''
+  try {
+    const base = nodeHost({ owner: 'owner', cwd: repo })
+    const host = {
+      ...base,
+      envTmuxAgentDir: async () => root,
+      run: async (argv: readonly string[], cwd?: string, timeoutMs?: number) => {
+        const call = await wrapperCall(host, argv)
+        const cmd = [...call.argv]
+        // zsh scripts read /etc/zshenv, which rebuilds PATH and hides the shim.
+        if (argv[0] === 'agent-tmux') cmd.splice(0, 1, '/bin/zsh', '-f', agentTmux)
+        if ((cmd[0] === 'tmux' || cmd[0] === real) && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', socket)
+        const env: NodeJS.ProcessEnv = { ...process.env, ...call.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ''}` }
+        delete env.TMUX
+        delete env.TMUX_PANE
+        const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>(resolve => {
+          // The sweep hands status a 3s cap. A full contract run can spend that
+          // on startup and kill the probe before it answers, so this check
+          // would not see the live pane. The write happens only if status
+          // finishes; give it room.
+          execFile(cmd[0]!, cmd.slice(1), { cwd, timeout: Math.max(timeoutMs ?? 0, 15_000), encoding: 'utf8', env }, (error, stdout, stderr) => {
+            const code = error ? (typeof error.code === 'number' ? error.code : -1) : 0
+            resolve({
+              exitCode: code,
+              stdout: stdout ?? '',
+              stderr: stderr || (error && typeof error.code !== 'number' ? String(error) : ''),
+            })
+          })
+        })
+        if (argv[0] === 'agent-tmux' && argv[2] === 'status') liveStatus = `${result.stdout}\n${result.stderr}`
+        return result
+      },
+    }
+    const before = treeSnap(root)
+    const { screen, writes } = await framed({
+      host,
+      root,
+      cwd: repo,
+      session: 'owner',
+      mirrorMs: 40,
+      waitWrites: 2,
+      waitMs: 20_000,
+    })
+    assert.ok(writes >= 2, `expected a first render and a refresh, writes=${writes}\n${screen}`)
+    assert.match(screen, new RegExp(name))
+    assert.match(liveStatus, /"exists":\s*true/, liveStatus)
+    const after = treeSnap(root)
+    assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
+    for (const [path, body] of before) assert.equal(after.get(path), body, `mutated ${path}`)
+  } finally {
+    await tmuxS(['kill-server'])
+    rmSync(parent, { recursive: true, force: true })
+  }
 })
