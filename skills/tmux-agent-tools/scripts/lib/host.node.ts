@@ -70,9 +70,16 @@ export function nodeHost(opts: NodeHostOptions = {}): Host {
     // The same wrapper seam as the mod (workers.ts wrapperCall): binary + TMUX_AGENT_DIR.
     run: async (argv, cwd, timeoutMs) => {
       const call = await wrapperCall(host, argv)
+      // ponytail: TMUX_AGENT_TMUX_SOCKET prefixes `tmux` with `-S` so a test can
+      // drop TMUX and still miss the default server. Ceiling: `agent-tmux` execs
+      // tmux itself and unsets TMUX, so it does not see this socket. Upgrade:
+      // pass the same `-S` from the wrapper.
+      const sock = process.env.TMUX_AGENT_TMUX_SOCKET
+      const cmd = [...call.argv]
+      if (sock && cmd[0] === 'tmux' && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', sock)
       const env = call.env ? { ...process.env, ...call.env } : undefined
       return new Promise(resolve => {
-        execFile(call.argv[0]!, call.argv.slice(1), { cwd, timeout: timeoutMs, encoding: 'utf8', ...(env ? { env } : {}) }, (error, stdout, stderr) => {
+        execFile(cmd[0]!, cmd.slice(1), { cwd, timeout: timeoutMs, encoding: 'utf8', ...(env ? { env } : {}) }, (error, stdout, stderr) => {
           const code = error ? (typeof error.code === 'number' ? error.code : -1) : 0
           resolve({ exitCode: code, stdout, stderr: stderr || (error && typeof error.code !== 'number' ? String(error) : '') })
         })

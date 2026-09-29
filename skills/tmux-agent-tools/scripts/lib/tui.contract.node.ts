@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { nodeHost } from './host.node.ts'
 import {
   type PanelRow,
@@ -29,6 +29,14 @@ import {
   type TuiState,
   ANSI_LEAVE_ALT,
 } from './tui.node.ts'
+
+/** Filesystem host whose `run` does not exec. Keeps a TUI test off the default tmux server. */
+function quietHost(owner: string | undefined, cwd: string, root: string) {
+  const host = nodeHost({ owner, cwd })
+  host.envTmuxAgentDir = async () => root
+  host.run = async () => ({ exitCode: 0, stdout: '', stderr: '' })
+  return host
+}
 
 function mockRow(id: string, opts: Partial<PanelRow> = {}): PanelRow {
   return {
@@ -433,14 +441,17 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
 
   const mockStdin = new MockStdin() as any
   const mockStdout = new MockStdout() as any
+  const root = mkdtempSync(join(tmpdir(), 'tui-root-'))
 
   let tuiPromise: Promise<void> | undefined
   try {
     tuiPromise = runTui({
       stdin: mockStdin,
       stdout: mockStdout,
+      host: quietHost('test-session', root, root),
       session: 'test-session',
-      root: mkdtempSync(join(tmpdir(), 'tui-root-')),
+      cwd: root,
+      root,
       mirrorMs: 60_000,
     })
 
@@ -509,12 +520,15 @@ test('restore: runTui restores terminal on normal quit', async () => {
 
   const mockStdin = new MockStdin() as any
   const mockStdout = new MockStdout() as any
+  const root = mkdtempSync(join(tmpdir(), 'tui-root-'))
 
   const runPromise = runTui({
     stdin: mockStdin,
     stdout: mockStdout,
+    host: quietHost('restore-test', root, root),
     session: 'restore-test',
-    root: mkdtempSync(join(tmpdir(), 'tui-root-')),
+    cwd: root,
+    root,
     mirrorMs: 60_000,
   })
 
@@ -550,7 +564,8 @@ test('restore: runTui restores terminal when an exception occurs in the loop', a
   const mockStdin = new MockStdin() as any
   const mockStdout = new MockStdout() as any
 
-  const hostWithBomb = nodeHost({ owner: 'bomb', cwd: process.cwd() })
+  const root = mkdtempSync(join(tmpdir(), 'tui-bomb-'))
+  const hostWithBomb = quietHost('bomb', root, root)
   hostWithBomb.now = () => Promise.reject(new Error('BOMB_IN_LOOP'))
 
   await assert.rejects(
@@ -559,6 +574,9 @@ test('restore: runTui restores terminal when an exception occurs in the loop', a
         stdin: mockStdin,
         stdout: mockStdout,
         host: hostWithBomb,
+        session: 'bomb',
+        cwd: root,
+        root,
         mirrorMs: 60_000,
       })
     },
@@ -573,7 +591,7 @@ test('restore: runTui restores terminal when an exception occurs in the loop', a
 // 5. No-mutation check over a root with a dead owner's orphan
 // -----------------------------------------------------------------------------
 
-test('no-mutation: TUI reads over a root with a dead owner orphan and mutates nothing', async () => {
+test('no-mutation core panelRows: reads a dead-owner orphan and mutates nothing', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-nomut-root-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-nomut-repo-'))
   process.env.TMUX_AGENT_DIR = root
@@ -651,7 +669,10 @@ import pty, os, sys, time, subprocess, termios
 
 master, slave = pty.openpty()
 env = dict(os.environ)
+env.pop('TMUX', None)
+env.pop('TMUX_PANE', None)
 env['TMUX_AGENT_DIR'] = sys.argv[1]
+env['TMUX_AGENT_TMUX_SOCKET'] = sys.argv[5]
 
 node_bin = sys.argv[2]
 tui_file = sys.argv[3]
@@ -706,25 +727,229 @@ print(output.decode('utf-8', errors='replace'))
 `
 
   const nodeBin = process.execPath
-  const res = await new Promise<{ code: number; stdout: string; stderr: string }>(resolve => {
-    const cp = spawn('python3', ['-c', pythonScript, root, nodeBin, tuiScript, repo], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const socket = join(root, 'tmux.sock')
+  const tmuxS = (args: string[]) =>
+    new Promise<{ code: number; out: string; err: string }>(resolve => {
+      const env = { ...process.env }
+      delete env.TMUX
+      delete env.TMUX_PANE
+      execFile('tmux', ['-S', socket, ...args], { encoding: 'utf8', env }, (error, stdout, stderr) => {
+        resolve({
+          code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
+          out: stdout ?? '',
+          err: stderr ?? '',
+        })
+      })
     })
-    let out = ''
-    let err = ''
-    cp.stdout.on('data', d => {
-      out += d
+  const started = await tmuxS(['new-session', '-d', '-s', 'pty', '-x', '80', '-y', '24'])
+  assert.equal(started.code, 0, started.err)
+  try {
+    const res = await new Promise<{ code: number; stdout: string; stderr: string }>(resolve => {
+      const cp = spawn('python3', ['-c', pythonScript, root, nodeBin, tuiScript, repo, socket], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let out = ''
+      let err = ''
+      cp.stdout.on('data', d => {
+        out += d
+      })
+      cp.stderr.on('data', d => {
+        err += d
+      })
+      cp.on('close', code => {
+        resolve({ code: code ?? -1, stdout: out, stderr: err })
+      })
     })
-    cp.stderr.on('data', d => {
-      err += d
-    })
-    cp.on('close', code => {
-      resolve({ code: code ?? -1, stdout: out, stderr: err })
-    })
-  })
 
-  assert.equal(res.code, 0, `python pty harness failed: ${res.stderr}`)
-  assert.ok(res.stdout.includes('=== EXIT CODE ===\n0'), 'TUI must exit with code 0 on q')
-  assert.ok(res.stdout.includes('=== TTY RESTORED ===\nTrue'), 'TTY flags must be restored after exit')
-  assert.ok(res.stdout.includes('workers'), 'Screen output must contain workers title')
+    assert.equal(res.code, 0, `python pty harness failed: ${res.stderr}`)
+    assert.ok(res.stdout.includes('=== EXIT CODE ===\n0'), 'TUI must exit with code 0 on q')
+    assert.ok(res.stdout.includes('=== TTY RESTORED ===\nTrue'), 'TTY flags must be restored after exit')
+    assert.ok(res.stdout.includes('workers'), 'Screen output must contain workers title')
+  } finally {
+    await tmuxS(['kill-server'])
+  }
+})
+
+function writePermissionWorker(root: string, repo: string, owner: string): void {
+  const name = 'w.abcde'
+  const worker = join(root, '.v3', name)
+  const now = Date.now() - 60_000
+  for (const seq of [1, 2]) {
+    const ep = join(worker, 'episodes', String(seq))
+    mkdirSync(join(ep, 'sent'), { recursive: true })
+    writeFileSync(
+      join(ep, 'dispatch.json'),
+      JSON.stringify({ seq, since: now, owner, resultPath: join(ep, 'result.json'), origin: 'tell' }),
+    )
+  }
+  mkdirSync(join(worker, 'episodes', '1', 'acks', 'done'), { recursive: true })
+  writeFileSync(
+    join(worker, 'worker.json'),
+    JSON.stringify({ profile: 'codex', name, dir: repo, ownerCwd: repo, owner, since: now, origin: 'assign' }),
+  )
+}
+
+function treeSnap(dir: string): Map<string, string> {
+  const out = new Map<string, string>()
+  const walk = (p: string) => {
+    for (const e of readdirSync(p, { withFileTypes: true })) {
+      const full = join(p, e.name)
+      const rel = full.slice(dir.length)
+      const st = statSync(full)
+      if (e.isDirectory()) {
+        out.set(`${rel}/`, String(st.mtimeMs))
+        walk(full)
+      } else out.set(rel, `${st.mtimeMs}\n${readFileSync(full)}`)
+    }
+  }
+  walk(dir)
+  return out
+}
+
+/** First paint, optional keys, quit. `waitWrites` counts stdout.write calls (render + refresh). */
+async function framed(opts: {
+  host: ReturnType<typeof quietHost>
+  root: string
+  cwd: string
+  session?: string
+  keys?: string[]
+  mirrorMs?: number
+  waitWrites?: number
+}): Promise<{ screen: string; writes: number }> {
+  class In extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    resume() {}
+    pause() {}
+  }
+  class Out extends EventEmitter {
+    columns = 180
+    rows = 40
+    written = ''
+    writes = 0
+    write(t: string) {
+      this.written += t
+      this.writes += 1
+      return true
+    }
+  }
+  const stdin = new In()
+  const stdout = new Out()
+  const done = runTui({
+    host: opts.host,
+    root: opts.root,
+    cwd: opts.cwd,
+    session: opts.session,
+    stdin: stdin as any,
+    stdout: stdout as any,
+    mirrorMs: opts.mirrorMs ?? 60_000,
+  })
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+  const start = Date.now()
+  while (!stdout.written.includes('workers') && Date.now() - start < 3_000) await sleep(20)
+  for (const key of opts.keys ?? []) {
+    stdin.emit('data', key)
+    await sleep(20)
+  }
+  if (opts.waitWrites) {
+    const again = Date.now()
+    while (stdout.writes < opts.waitWrites && Date.now() - again < 3_000) await sleep(20)
+  }
+  stdin.emit('data', 'q')
+  await done
+  return { screen: stripAnsi(stdout.written), writes: stdout.writes }
+}
+
+test('view probe: permission is needs-input, legacy and project are read, collector health is unknown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-view-root-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-view-repo-'))
+  writePermissionWorker(root, repo, 'owner')
+  mkdirSync(join(root, 'legacy-worker'))
+  writeFileSync(join(root, 'legacy-worker', 'dispatch.json'), JSON.stringify({ name: 'legacy-worker' }))
+  const host = quietHost('owner', repo, root)
+  let submits = 0
+  host.submit = async () => {
+    submits += 1
+    return { drop: 'view' }
+  }
+  host.run = async argv => {
+    if (argv[0] === 'agent-tmux') {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ exists: true, running: true, blocked_reason: 'permission', idle_seconds: 120 }),
+        stderr: '',
+      }
+    }
+    if (argv[0] === 'tmux') {
+      return { exitCode: 0, stdout: `proj-a\t${repo}\t${Math.floor(Date.now() / 1000)}\n`, stderr: '' }
+    }
+    return { exitCode: 0, stdout: '', stderr: '' }
+  }
+  const { screen } = await framed({ host, root, cwd: repo, session: 'owner' })
+  assert.match(screen, /w\.abcde/)
+  assert.match(screen, /needs input — permission/)
+  assert.match(screen, /legacy: 1/)
+  assert.match(screen, /proj-a/)
+  assert.match(screen, /collector health unknown/)
+  assert.doesNotMatch(screen, /viewer — no session/)
+  assert.equal(submits, 0)
+  assert.equal(existsSync(join(root, '.v3', 'w.abcde', 'episodes', '2', 'claims')), false)
+})
+
+test('viewer: no session shows the owner worker and says viewer', async () => {
+  const prev = process.env.TMUX_AGENT_SESSION
+  delete process.env.TMUX_AGENT_SESSION
+  try {
+    const root = mkdtempSync(join(tmpdir(), 'tui-viewer-root-'))
+    const repo = mkdtempSync(join(tmpdir(), 'tui-viewer-repo-'))
+    writePermissionWorker(root, repo, 'owner')
+    const host = quietHost(undefined, repo, root)
+    const { screen } = await framed({ host, root, cwd: repo })
+    assert.match(screen, /viewer — no session; not a collecting owner/)
+    assert.match(screen, /w\.abcde/)
+    assert.doesNotMatch(screen, /No workers outstanding/)
+  } finally {
+    if (prev === undefined) delete process.env.TMUX_AGENT_SESSION
+    else process.env.TMUX_AGENT_SESSION = prev
+  }
+})
+
+test('resume paste: a pasted session UUID fills the resume field', async () => {
+  const uuid = '12345678-1234-1234-1234-123456789abc'
+  const base: TuiState = { rows: [], all: [], showAll: false, adding: true, resumeInput: '', quit: false }
+  assert.equal(nextKeyState(base, uuid, 1).state.resumeInput, uuid)
+  assert.equal(nextKeyState(base, `\x1b[200~${uuid}\x1b[201~`, 1).state.resumeInput, uuid)
+  const root = mkdtempSync(join(tmpdir(), 'tui-paste-'))
+  const host = quietHost('s', root, root)
+  const { screen } = await framed({ host, root, cwd: root, session: 's', keys: ['n', uuid, '\x1b'] })
+  assert.match(screen, new RegExp(uuid))
+})
+
+test('no-mutation tui: runTui renders, refreshes, and leaves paths, mtimes, and contents', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-nomut-run-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-nomut-run-repo-'))
+  const base = nodeHost({ owner: 'dead-owner', cwd: repo })
+  base.envTmuxAgentDir = async () => root
+  const outside = new Set(['git', 'sh', 'tmux', 'agent-tmux'])
+  const deadHost = {
+    ...base,
+    run: async (argv: readonly string[], cwd?: string, ms?: number) => {
+      if (outside.has(argv[0]!)) return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const assigned = await assignWorker(
+    deadHost,
+    { profile: 'claude', name: 'orphan-w', dir: repo, brief: 'GOAL: orphan\nACCEPTANCE: none\nREPORT: one line\n' },
+    { owner: 'dead-owner', ownerCwd: repo },
+  )
+  if ('deny' in assigned) assert.fail(assigned.deny)
+  const before = treeSnap(root)
+  const host = quietHost('tui-viewer', repo, root)
+  const { screen, writes } = await framed({ host, root, cwd: repo, session: 'tui-viewer', mirrorMs: 30, waitWrites: 2 })
+  assert.ok(writes >= 2, `expected a first render and a refresh, writes=${writes}`)
+  assert.match(screen, /workers/)
+  const after = treeSnap(root)
+  assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
+  for (const [path, body] of before) assert.equal(after.get(path), body, `mutated ${path}`)
 })

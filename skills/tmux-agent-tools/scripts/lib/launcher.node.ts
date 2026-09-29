@@ -30,9 +30,12 @@
 //
 // Closing the TUI does not stop the collector (detached; this process watches
 // only the host pane). When the host pane vanishes, the collector exits on its
-// own and this process exits 1 with `host pane %N is gone`. tmux commands use
-// the caller's server (`$TMUX`, otherwise the default socket). A host that is
-// not in tmux has nothing to split and nothing to paste into.
+// own and this process exits 1 with `host pane %N is gone`. Without `--socket`,
+// tmux commands use the caller's server (`$TMUX`, otherwise the default socket).
+// `--socket <abs>` puts `-S` on every tmux call and does not pass `TMUX` or
+// `TMUX_PANE` to the collector. The split pane gets `TMUX_AGENT_SESSION` (the
+// same id as the collector) and, when a socket was given, `TMUX_AGENT_TMUX_SOCKET`.
+// A host that is not in tmux has nothing to split and nothing to paste into.
 import { execFile, spawn } from 'node:child_process'
 import { mkdir, open, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
@@ -43,7 +46,7 @@ import { rootOf, sessionDirOf, v3Of } from './workers.ts'
 const NODE_FLOOR = [22, 18, 0]
 const LOCK_STALE_MS = 5_000
 const COLLECTOR = new URL('./collector.node.ts', import.meta.url).pathname
-const USAGE = 'usage: node launcher.node.ts --session <id> --cwd <abs> [--pane %N] -- <tui command…>'
+const USAGE = 'usage: node launcher.node.ts --session <id> --cwd <abs> [--pane %N] [--socket <abs>] -- <tui command…>'
 
 function usage(why: string): never {
   process.stderr.write(`tmux-agent-launcher: ${why}\n${USAGE}\n`)
@@ -55,9 +58,10 @@ function die(why: string): never {
   process.exit(1)
 }
 
-function tmux(args: string[]): Promise<{ code: number; out: string; err: string }> {
+function tmux(args: string[], socket?: string): Promise<{ code: number; out: string; err: string }> {
+  const full = socket ? ['-S', socket, ...args] : args
   return new Promise(resolve => {
-    execFile('tmux', args, { timeout: 5_000, encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile('tmux', full, { timeout: 5_000, encoding: 'utf8' }, (error, stdout, stderr) => {
       resolve({
         code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
         out: stdout ?? '',
@@ -130,6 +134,7 @@ async function ensureCollector(
   cwd: string,
   pane: string,
   root: string,
+  socket?: string,
 ): Promise<{ pid: number; reused: boolean }> {
   const dir = sessionDirOf(v3Of(root), session)
   await mkdir(dir, { recursive: true })
@@ -150,10 +155,18 @@ async function ensureCollector(
       }
     }
     const log = await open(`${dir}/collector.log`, 'a')
-    const child = spawn(process.execPath, [COLLECTOR, '--session', session, '--cwd', cwd, '--pane', pane], {
+    const args = [COLLECTOR, '--session', session, '--cwd', cwd, '--pane', pane]
+    const env = { ...process.env }
+    if (socket) {
+      args.push('--socket', socket)
+      delete env.TMUX
+      delete env.TMUX_PANE
+      env.TMUX_AGENT_TMUX_SOCKET = socket
+    }
+    const child = spawn(process.execPath, args, {
       detached: true,
       stdio: ['ignore', log.fd, log.fd],
-      env: process.env,
+      env,
     })
     child.unref()
     await log.close()
@@ -165,8 +178,16 @@ async function ensureCollector(
   }
 }
 
-async function splitTui(hostPane: string, cwd: string, command: string[]): Promise<string> {
-  const r = await tmux(['split-window', '-t', hostPane, '-h', '-d', '-c', cwd, '-P', '-F', '#{pane_id}', ...command])
+async function splitTui(hostPane: string, cwd: string, command: string[], session: string, root: string, socket?: string): Promise<string> {
+  // The pane's environment is the tmux session's, not this process's. The collector
+  // was started with this root; the TUI has to see the same ledger.
+  const args = [
+    'split-window', '-t', hostPane, '-h', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
+    '-e', `TMUX_AGENT_SESSION=${session}`,
+    '-e', `TMUX_AGENT_DIR=${root}`,
+  ]
+  if (socket) args.push('-e', `TMUX_AGENT_TMUX_SOCKET=${socket}`)
+  const r = await tmux([...args, ...command], socket)
   if (r.code !== 0) die(`could not open the TUI pane: ${r.err.trim().slice(-400) || `tmux exit ${r.code}`}`)
   const id = r.out.trim()
   if (!/^%\d+$/.test(id)) die(`split did not name a pane id (got ${JSON.stringify(id)})`)
@@ -177,11 +198,16 @@ async function main(): Promise<void> {
   const have = process.versions.node.split('.').map(Number)
   const below = NODE_FLOOR.findIndex((n, i) => have[i]! !== n)
   if (below >= 0 && have[below]! < NODE_FLOOR[below]!) usage(`node ${process.versions.node} is below the floor ${NODE_FLOOR.join('.')}`)
-  let values: { session?: string; cwd?: string; pane?: string }
+  let values: { session?: string; cwd?: string; pane?: string; socket?: string }
   let positionals: string[]
   try {
     const parsed = parseArgs({
-      options: { session: { type: 'string' }, cwd: { type: 'string' }, pane: { type: 'string' } },
+      options: {
+        session: { type: 'string' },
+        cwd: { type: 'string' },
+        pane: { type: 'string' },
+        socket: { type: 'string' },
+      },
       allowPositionals: true,
     })
     values = parsed.values
@@ -189,17 +215,23 @@ async function main(): Promise<void> {
   } catch (error) {
     usage((error as Error).message)
   }
-  const { session, cwd } = values
+  const { session, cwd, socket } = values
   const pane = values.pane ?? process.env.TMUX_PANE
   if (!session) usage('--session is required')
   if (!cwd || !cwd.startsWith('/')) usage('--cwd must be an absolute path')
   if (positionals.length === 0) usage('a TUI command is required after --')
   if (!pane || !/^%\d+$/.test(pane)) usage(`--pane must be a tmux pane id like %3 (got ${pane ?? 'nothing'})`)
+  if (socket && !socket.startsWith('/')) usage('--socket must be an absolute path')
+  if (socket) {
+    process.env.TMUX_AGENT_TMUX_SOCKET = socket
+    delete process.env.TMUX
+    delete process.env.TMUX_PANE
+  }
   if (!(await paneAlive(pane))) usage(`host pane ${pane} is not alive`)
   const root = await rootOf(nodeHost())
   if (!root) usage('no state root (set TMUX_AGENT_DIR, XDG_STATE_HOME, or HOME)')
-  const ensured = await ensureCollector(session, cwd, pane, root)
-  const tui = await splitTui(pane, cwd, positionals)
+  const ensured = await ensureCollector(session, cwd, pane, root, socket)
+  const tui = await splitTui(pane, cwd, positionals, session, root, socket)
   process.stdout.write(
     `tmux-agent-launcher: tui ${tui} beside host ${pane}; collector ${ensured.pid} ${ensured.reused ? 'reused' : 'started'}\n`,
   )

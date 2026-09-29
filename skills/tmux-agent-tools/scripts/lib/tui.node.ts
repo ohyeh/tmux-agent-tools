@@ -46,6 +46,7 @@ import {
   mirrorProject,
   collectorDown,
   exactSessionTarget,
+  observeView,
 } from './workers.ts'
 import { nodeHost } from './host.node.ts'
 
@@ -123,6 +124,8 @@ export interface TuiState {
   statusMessage?: string
   statusUntil?: number
   owner?: string
+  /** No --session and no TMUX_AGENT_SESSION. Rows are shown; the band says viewer. */
+  viewer?: boolean
   quit: boolean
 }
 
@@ -133,6 +136,60 @@ export type TuiAction =
   | { type: 'stopAll' }
   | { type: 'interrupt'; row: PanelRow }
   | { type: 'resume'; value: string }
+
+const PASTE_START = '\x1b[200~'
+const PASTE_END = '\x1b[201~'
+
+/** Printable resume text from one key or one bracketed paste. Control keys are undefined. */
+export function resumeText(key: string): string | undefined {
+  let text = key
+  if (text.startsWith(PASTE_START) && text.endsWith(PASTE_END) && text.length >= PASTE_START.length + PASTE_END.length) {
+    text = text.slice(PASTE_START.length, -PASTE_END.length)
+  }
+  if (!text) return undefined
+  for (const ch of text) {
+    if (ch < ' ' || ch === '\x7f') return undefined
+  }
+  return text
+}
+
+/** One stdin chunk → keys. A bracketed paste is one text key. */
+export function inputEvents(chunk: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while (i < chunk.length) {
+    if (chunk.startsWith(PASTE_START, i)) {
+      const end = chunk.indexOf(PASTE_END, i + PASTE_START.length)
+      const from = i + PASTE_START.length
+      if (end < 0) {
+        const rest = chunk.slice(from)
+        if (rest) out.push(rest)
+        break
+      }
+      const text = chunk.slice(from, end)
+      if (text) out.push(text)
+      i = end + PASTE_END.length
+      continue
+    }
+    const csi = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(chunk.slice(i))
+    if (csi) {
+      out.push(csi[0])
+      i += csi[0].length
+      continue
+    }
+    const ch = chunk[i]!
+    if (ch >= ' ' && ch !== '\x7f') {
+      let j = i + 1
+      while (j < chunk.length && chunk[j]! >= ' ' && chunk[j] !== '\x7f' && !chunk.startsWith('\x1b', j)) j++
+      out.push(chunk.slice(i, j))
+      i = j
+      continue
+    }
+    out.push(ch)
+    i += 1
+  }
+  return out
+}
 
 export function nextKeyState(state: TuiState, key: string, now: number): { state: TuiState; action?: TuiAction } {
   if (state.adding) {
@@ -152,8 +209,9 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
     if (key === '\x7f' || key === '\b') {
       return { state: { ...state, resumeInput: state.resumeInput.slice(0, -1) } }
     }
-    if (key.length === 1 && key >= ' ') {
-      return { state: { ...state, resumeInput: state.resumeInput + key } }
+    const text = resumeText(key)
+    if (text) {
+      return { state: { ...state, resumeInput: state.resumeInput + text } }
     }
     return { state }
   }
@@ -318,6 +376,7 @@ export function renderTuiLines(
   if (width < 1 || height < 1) return []
 
   const down = gate ? collectorDown(gate) : undefined
+  const healthUnknown = !down && gate?.viewHealth === 'unknown'
   const tmuxRunning = state.rows.filter(r => !r.project && !r.terminal).length
   const me = state.owner
   const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning} · 內部 ?`
@@ -368,6 +427,8 @@ export function renderTuiLines(
     1 +
     (state.adding ? 1 : 0) +
     (down ? 1 : 0) +
+    (state.viewer ? 1 : 0) +
+    (healthUnknown ? 1 : 0) +
     (others ? 1 : 0) +
     (gate?.legacy ? 1 : 0) +
     (state.statusMessage && now < (state.statusUntil ?? 0) ? 1 : 0) +
@@ -393,6 +454,14 @@ export function renderTuiLines(
 
   if (down) {
     lines.push(truncateAnsi(`\x1b[2m⚠ ${down}\x1b[0m`, width))
+  }
+
+  if (state.viewer) {
+    lines.push(truncateAnsi('\x1b[2mviewer — no session; not a collecting owner\x1b[0m', width))
+  }
+
+  if (healthUnknown) {
+    lines.push(truncateAnsi('\x1b[2mcollector health unknown — this view does not collect\x1b[0m', width))
   }
 
   if (state.adding) {
@@ -515,9 +584,11 @@ export interface TuiOptions {
 export async function runTui(options: TuiOptions = {}): Promise<void> {
   const stdin = options.stdin ?? process.stdin
   const stdout = options.stdout ?? process.stdout
-  const session = options.session ?? process.env.TMUX_AGENT_SESSION ?? `tui-${process.pid}`
+  // No invented owner. A missing id is a viewer (every row, labeled), never `tui-<pid>`.
+  const session = options.session ?? process.env.TMUX_AGENT_SESSION
   const cwd = options.cwd ?? process.cwd()
-  const host = options.host ?? nodeHost({ owner: session, cwd })
+  const base = options.host ?? nodeHost({ owner: session, cwd })
+  const host: Host = options.root ? { ...base, envTmuxAgentDir: async () => options.root as string } : base
   const root = options.root ?? (await rootOf(host))
   const gate = newGate()
 
@@ -532,6 +603,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     resumeInput: '',
     quit: false,
     owner: host.owner(),
+    viewer: !session,
   }
 
   let refreshing = false
@@ -547,6 +619,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (refreshing) return false
     refreshing = true
     try {
+      if (root) await observeView(host, gate, root)
       const rows = await panelRows(host, gate, root)
       state.all = rows
       const panelLike = { rows: state.rows, all: state.all, showAll: state.showAll, selected: state.selected }
@@ -665,16 +738,15 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const onData = async (data: Buffer | string) => {
         try {
-          const str = String(data)
-          const result = nextKeyState(state, str, Date.now())
-          state = result.state
-          if (result.action) {
-            await handleAction(result.action)
-          }
-          if (state.quit) {
-            stdin.off('data', onData)
-            resolve()
-            return
+          for (const key of inputEvents(String(data))) {
+            const result = nextKeyState(state, key, Date.now())
+            state = result.state
+            if (result.action) await handleAction(result.action)
+            if (state.quit) {
+              stdin.off('data', onData)
+              resolve()
+              return
+            }
           }
           render()
         } catch (err) {

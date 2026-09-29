@@ -3,7 +3,7 @@
 // `reconcileOnce` and `heartbeat` as the Claude mod; only the wake differs — a
 // bracketed paste into the host's exact tmux pane id, then Enter.
 //
-// Usage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--once]
+// Usage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--socket <abs>] [--once]
 //   --session  the host session id this collector delivers for (required, §3)
 //   --cwd      the project dir; orphans are adoptable only in the same cwd (required, §3)
 //   --pane     the host pane, as `%N` (required: a name or index can point elsewhere)
@@ -19,8 +19,10 @@ const NODE_FLOOR = [22, 18, 0]
 const TMUX_MS = 5_000
 
 function tmux(args: string[], input?: string): Promise<{ code: number; out: string; err: string }> {
+  const sock = process.env.TMUX_AGENT_TMUX_SOCKET
+  const full = sock && args[0] !== '-S' && args[0] !== '-L' ? ['-S', sock, ...args] : args
   return new Promise(resolve => {
-    const child = execFile('tmux', args, { timeout: TMUX_MS, encoding: 'utf8' }, (error, stdout, stderr) => {
+    const child = execFile('tmux', full, { timeout: TMUX_MS, encoding: 'utf8' }, (error, stdout, stderr) => {
       resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout, err: stderr || (error ? String(error) : '') })
     })
     if (input !== undefined) child.stdin?.end(input)
@@ -50,7 +52,7 @@ export async function pasteInto(pane: string, text: string): Promise<{ text?: st
 }
 
 function usage(why: string): never {
-  process.stderr.write(`tmux-agent-collector: ${why}\nusage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--once]\n`)
+  process.stderr.write(`tmux-agent-collector: ${why}\nusage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--socket <abs>] [--once]\n`)
   process.exit(2)
 }
 
@@ -58,13 +60,27 @@ async function main(): Promise<void> {
   const have = process.versions.node.split('.').map(Number)
   const below = NODE_FLOOR.findIndex((n, i) => have[i]! !== n) // first differing part decides
   if (below >= 0 && have[below]! < NODE_FLOOR[below]!) usage(`node ${process.versions.node} is below the floor ${NODE_FLOOR.join('.')}`)
-  let values: { session?: string; cwd?: string; pane?: string; once?: boolean }
+  let values: { session?: string; cwd?: string; pane?: string; once?: boolean; socket?: string }
   try {
-    ;({ values } = parseArgs({ options: { session: { type: 'string' }, cwd: { type: 'string' }, pane: { type: 'string' }, once: { type: 'boolean' } } }))
+    ;({ values } = parseArgs({
+      options: {
+        session: { type: 'string' },
+        cwd: { type: 'string' },
+        pane: { type: 'string' },
+        once: { type: 'boolean' },
+        socket: { type: 'string' },
+      },
+    }))
   } catch (error) {
     usage(String((error as Error).message))
   }
-  const { session, cwd, pane, once } = values
+  const { session, cwd, pane, once, socket } = values
+  if (socket) {
+    if (!socket.startsWith('/')) usage('--socket must be an absolute path')
+    process.env.TMUX_AGENT_TMUX_SOCKET = socket
+    delete process.env.TMUX
+    delete process.env.TMUX_PANE
+  }
   if (!session) usage('--session is required: a collector without a session id would own everything (§3)')
   if (!cwd || !cwd.startsWith('/')) usage('--cwd must be an absolute path')
   if (!pane || !/^%\d+$/.test(pane)) usage('--pane must be a tmux pane id like %3')

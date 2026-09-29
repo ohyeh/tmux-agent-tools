@@ -536,6 +536,11 @@ export type Gate = {
   nextAttemptAt: number
   /** Why this activation stopped collecting, drawn as-is on the band; unset = collecting. */
   paused?: string
+  /**
+   * A view cannot see another process's `paused`. Unset on the collector.
+   * `unknown` is drawn as unknown — a missing pause is not a healthy collector.
+   */
+  viewHealth?: 'unknown'
   /** This activation's registration number under the session dir (§4); unset until the first beat. */
   activation?: number
   /** The one registration in flight: two clocks' first beats must not register twice. */
@@ -1352,6 +1357,9 @@ export function payloadOf(done: readonly Finished[]): { text: string; included: 
  * will arrive from it until someone acts, and an owner left waiting on a result
  * that cannot come is the silence this mod exists to remove (2026-09-24: two
  * codex workers sat on a usage limit for an hour, the lead none the wiser).
+ *
+ * `wake` false is the view: the same probe fills `blocked` / `stalled` / `exited`,
+ * and it does not toast, log, or submit.
  */
 export async function flagStalls(
   host: Host,
@@ -1359,6 +1367,7 @@ export async function flagStalls(
   root: string,
   outstanding: readonly TmuxDispatch[],
   live: readonly TmuxDispatch[],
+  wake = true,
 ): Promise<void> {
   const deadline = (await host.now()) + STALL_SWEEP_MS
   const woken: { id: string; text: string }[] = []
@@ -1427,7 +1436,7 @@ export async function flagStalls(
     // and `keys` answers it. One state per worker: a dialog clears any stall this
     // episode recorded, so the panel, the log and `$.tmux.stalled()` agree.
     if (reason && reason !== 'startup_pending' && !runtime) {
-      if (!gate.blocked.has(id)) host.toast(`tmux-agent: ${d.name} needs input — ${reason}`)
+      if (wake && !gate.blocked.has(id)) host.toast(`tmux-agent: ${d.name} needs input — ${reason}`)
       gate.blocked.set(id, reason)
       gate.stalled.delete(id)
       continue
@@ -1450,7 +1459,7 @@ export async function flagStalls(
       // Only the assign's launch has a receipt; a tell went to a pane that was alive.
       if (d.origin === 'launch' && !(await readOrEmpty(host, `${root}/${d.name}/launch.exit`)).trim()) continue
       gate.stalled.delete(id)
-      if (!gate.exited.has(id)) host.log(`tmux-agent: ${d.name}: pane gone with no result (status exists=${String(row.exists)} running=${String(row.running)})`)
+      if (wake && !gate.exited.has(id)) host.log(`tmux-agent: ${d.name}: pane gone with no result (status exists=${String(row.exists)} running=${String(row.running)})`)
       gate.exited.add(id)
       continue
     }
@@ -1467,7 +1476,7 @@ export async function flagStalls(
     gate.stalled.set(id, { dispatch: d, idleSeconds: row.idle_seconds, ...(evidence ? { evidence } : {}) })
     const minutes = Math.round(row.idle_seconds / 60)
     if (evidence) {
-      if (!before?.evidence) host.log(`tmux-agent: ${d.name} (${d.profile}) is stalled: ${evidence}`)
+      if (wake && !before?.evidence) host.log(`tmux-agent: ${d.name} (${d.profile}) is stalled: ${evidence}`)
       // Told is what the session accepted, not what this sweep saw: a refused
       // wake-up is asked again next tick, up to STALL_WAKE_MAX times.
       if (gate.stallNoticed.has(id)) continue
@@ -1484,6 +1493,7 @@ export async function flagStalls(
     // Quiet with no blocker: an observation for the log, never a wake-up.
     const lines = (Array.isArray(row.last_capture_lines) ? row.last_capture_lines : []).map(shown).filter(Boolean)
     const tail = lines.slice(-TAIL_LINES).join(' | ').slice(0, TAIL_MAX)
+    if (!wake) continue
     host.log(
       `tmux-agent: ${d.name} (${d.profile}) pane unchanged for ${minutes} min; not confirmed stuck. ` +
         `Last lines: ${tail || '(none captured)'}. ` +
@@ -1492,7 +1502,7 @@ export async function flagStalls(
         `Find its session with: agent-tmux ${d.profile} list`,
     )
   }
-  if (!woken.length) return
+  if (!wake || !woken.length) return
   // Once per episode per activation: the notice set lives in memory, so a reload
   // or an adopting collector may say it once more. A refusal is retried on the
   // next tick and given up on — logged, the panel still showing the row as
@@ -1975,6 +1985,24 @@ export async function legacyPending(host: Host, root: string): Promise<number> {
     if (!(typeof status === 'string' && TERMINAL.has(status))) n++
   }
   return n
+}
+
+/**
+ * What a view can show without becoming a collector.
+ *
+ * Status uses the same probe as `flagStalls` with wakes off (no claim, no
+ * submit, no toast). Legacy count and project rows are the reads `reconcile`
+ * already does. Collector pause lives in the collector process and has no
+ * file, so `viewHealth` is `unknown`.
+ */
+export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
+  gate.viewHealth = 'unknown'
+  const scanned = await scan(host, { claim: false })
+  gate.legacy = await legacyPending(host, root)
+  await refreshProjects(host, gate, scanned.visible)
+  // `visible` is the set `panelRows` draws. Probing only `dispatches` would
+  // leave another session's row as `running` when its pane is waiting.
+  await flagStalls(host, gate, v3Of(root), scanned.visible, scanned.visible, false)
 }
 
 /** A delivered teammate left alone this long is stopped (Q-1, decided 2026-09-25). */
