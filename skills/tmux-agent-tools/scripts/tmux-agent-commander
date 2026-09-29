@@ -67,8 +67,13 @@ agent_tmux() {
   fi
 }
 
+# Same rule as agent-tmux session_target: a.b is session a, pane b.
+session_target() {
+  printf '=%s:' "$1"
+}
+
 tmux_has() {
-  command tmux has-session -t "$1" 2>/dev/null
+  command tmux has-session -t "$(session_target "$1")" 2>/dev/null
 }
 
 # Session name agent-tmux will use: <prefix>-<name>, prefix from the profile
@@ -309,9 +314,9 @@ undelivered_count() {
 install_worker_panel() {
   local session="$1" fmt
   fmt="#(${(qq)SELF} panel ${(qq)session})"
-  command tmux set-option -t "$session" status 2
-  command tmux set-option -t "$session" 'status-format[1]' "$fmt"
-  command tmux set-option -t "$session" status-interval 2
+  command tmux set-option -t "$(session_target "$session")" status 2
+  command tmux set-option -t "$(session_target "$session")" 'status-format[1]' "$fmt"
+  command tmux set-option -t "$(session_target "$session")" status-interval 2
 }
 
 cmd_start() {
@@ -484,7 +489,7 @@ start_collector_from_server() {
   cmd="env -u TMUX ${(qq)SELF} collect ${(qq)cli} ${(qq)name} >> ${(qq)log} 2>&1"
   cmd="${cmd//\%/%%}"
   cmd="${cmd//\#/##}"
-  command tmux run-shell -b -t "$session" "$cmd"
+  command tmux run-shell -b -t "$(session_target "$session")" "$cmd"
   print -r -- "collector started for ${session}"
 }
 

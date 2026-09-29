@@ -45,6 +45,7 @@ import {
   mirrorOf,
   mirrorProject,
   collectorDown,
+  exactSessionTarget,
 } from './workers.ts'
 import { nodeHost } from './host.node.ts'
 
@@ -437,7 +438,7 @@ export function renderTuiLines(
           lines.push(truncateAnsi(ml || ' ', width))
         }
         const seeWhole = r.project
-          ? `See it whole: tmux attach -t ${r.d.name}`
+          ? `See it whole: tmux attach -t ${exactSessionTarget(r.d.name)}`
           : `See it whole: agent-tmux ${r.d.profile} attach ${r.d.name}`
         lines.push(truncateAnsi(`\x1b[2m${seeWhole}\x1b[0m`, width))
       } else if (mirrorAvailable === 0 && height < 12) {

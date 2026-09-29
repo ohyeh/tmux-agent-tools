@@ -2106,12 +2106,12 @@ describe('panel mirror', () => {
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:w1#1', requestId: 'above-prompt' })
     await settle()
-    expect(sent()).toEqual(['tmux send-keys -t codex-cli-w1 Escape'])
+    expect(sent()).toEqual(['tmux send-keys -t =codex-cli-w1: Escape'])
 
     pane.v = '  → Add a follow-up                ctrl+c to stop'
     await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:w1#1', requestId: 'above-prompt' })
     await settle()
-    expect(sent().at(-1), 'cursor-agent advertises ctrl+c').toEqual('tmux send-keys -t codex-cli-w1 C-c')
+    expect(sent().at(-1), 'cursor-agent advertises ctrl+c').toEqual('tmux send-keys -t =codex-cli-w1: C-c')
 
     pane.v = '› '
     await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:w1#1', requestId: 'above-prompt' })
@@ -2884,7 +2884,7 @@ describe('teammates', () => {
     await $.session.start(session())
     const ok = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__keys' as const, name: 'w1', keys: ['Down', 'Enter'] }))
     expect(ok).toContain('pressed Down Enter in codex-cli-w1')
-    expect(panel.argv.some(a => a.join(' ') === 'tmux send-keys -t codex-cli-w1 Down Enter')).toEqual(true)
+    expect(panel.argv.some(a => a.join(' ') === 'tmux send-keys -t =codex-cli-w1: Down Enter')).toEqual(true)
 
     const typed = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__keys' as const, name: 'w1', keys: ['r', 'm'] }))
     expect(typed, 'no free typing through keys').toContain('refused: r m')

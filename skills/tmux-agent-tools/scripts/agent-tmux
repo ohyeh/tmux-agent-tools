@@ -967,6 +967,13 @@ session_for_name() {
   echo "$PREFIX-$name"
 }
 
+# Exact target for an existing session. tmux reads `a.b` as session `a` and pane `b`,
+# so a reserved name (`codex-cli-review.abcde`) misses has-session and send.
+# `=name:` is that session and its current window. Never pass this to `new-session -s`.
+session_target() {
+  printf '=%s:' "$1"
+}
+
 # #P1 wrong-engine guard: when this CLI has no session for <name>, a same-name
 # session under ANOTHER known CLI's preset prefix means the caller likely used
 # the wrong engine (e.g. started with `agent-tmux claude`, queried with `agent-tmux codex` →
@@ -1153,12 +1160,12 @@ paste_and_submit() {
   _SENTINEL_SPENT=""  # a new paste gets its own look window (_sentinel_landed)
 
   printf "%s" "$prompt_text" | "$TMUX" load-buffer -b "$buffer_name" -
-  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$(session_target "$session")"
   sleep "$SUBMIT_DELAY"
-  "$TMUX" send-keys -t "$session" Enter
+  "$TMUX" send-keys -t "$(session_target "$session")" Enter
   if [[ "$prompt_text" == *$'\n'* ]]; then
     sleep "$SUBMIT_DELAY"
-    "$TMUX" send-keys -t "$session" Enter
+    "$TMUX" send-keys -t "$(session_target "$session")" Enter
     # cursor-agent 2026.09.26 keeps `→ [Pasted text #1 +9 lines]` in its
     # composer after both Enters (live 2026-09-26: send-wait timed out, one
     # later Enter submitted it). assign had its own nudge; every send path
@@ -1168,7 +1175,7 @@ paste_and_submit() {
     for _nudge in 1 2; do
       sleep 1
       _composer_holds_paste "$session" || break
-      "$TMUX" send-keys -t "$session" Enter
+      "$TMUX" send-keys -t "$(session_target "$session")" Enter
     done
   fi
 }
@@ -1182,11 +1189,11 @@ paste_file_and_submit() {
   local enter_delay="$5"
 
   "$TMUX" load-buffer -b "$buffer_name" "$payload_file"
-  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$session"
+  "$TMUX" paste-buffer -p -d -b "$buffer_name" -t "$(session_target "$session")"
   local i
   for (( i = 0; i < enter_count; i++ )); do
     sleep "$enter_delay"
-    "$TMUX" send-keys -t "$session" Enter
+    "$TMUX" send-keys -t "$(session_target "$session")" Enter
   done
 }
 
@@ -1196,11 +1203,11 @@ paste_file_and_submit() {
 # the caller, so it is wrapper-managed, not a raw-tmux bypass.
 send_keys_raw() {
   local session="$1" keys="$2" enter_count="$3" enter_delay="$4"
-  "$TMUX" send-keys -t "$session" -l -- "$keys"
+  "$TMUX" send-keys -t "$(session_target "$session")" -l -- "$keys"
   local i
   for (( i = 0; i < enter_count; i++ )); do
     sleep "$enter_delay"
-    "$TMUX" send-keys -t "$session" Enter
+    "$TMUX" send-keys -t "$(session_target "$session")" Enter
   done
 }
 
@@ -1392,7 +1399,7 @@ max_fuse_watcher_loop() {
   local now_epoch pane_text new_hash
   while :; do
     sleep 1
-    if ! "$tmux_bin" has-session -t "$tmux_session" 2>/dev/null; then
+    if ! "$tmux_bin" has-session -t "$(session_target "$tmux_session")" 2>/dev/null; then
       return 0
     fi
     now_epoch="${EPOCHSECONDS:-$(date +%s)}"
@@ -1401,7 +1408,7 @@ max_fuse_watcher_loop() {
       break
     fi
     if [[ -n "$max_idle" ]]; then
-      pane_text="$("$tmux_bin" capture-pane -p -t "$tmux_session" 2>/dev/null || true)"
+      pane_text="$("$tmux_bin" capture-pane -p -t "$(session_target "$tmux_session")" 2>/dev/null || true)"
       if command -v sha256sum >/dev/null 2>&1; then
         new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
       else
@@ -1439,7 +1446,7 @@ max_fuse_watcher_loop() {
   local _fuse_reason="unknown"
   [[ "$reason" == "max_runtime" ]] && _fuse_reason="max-runtime"
   finalize_launch_envelope "$agent_name" "$_fuse_reason" 124
-  "$tmux_bin" kill-session -t "$tmux_session" 2>/dev/null || true
+  "$tmux_bin" kill-session -t "$(session_target "$tmux_session")" 2>/dev/null || true
   rm -f "$(agent_root_dir)/$agent_name/fuse.pid" 2>/dev/null || true
   return 0
 }
@@ -1561,7 +1568,7 @@ run_dry_run_checks() {
   local session_name
   if (( exact_name )); then
     session_name="$(session_for_name "$req_name")"
-    if "$TMUX" has-session -t "$session_name" 2>/dev/null; then
+    if "$TMUX" has-session -t "$(session_target "$session_name")" 2>/dev/null; then
       add_check "session_not_in_use" "fail" "session already exists: $session_name (would be killed by start)"
       ok=0
     else
@@ -2353,7 +2360,7 @@ _sentinel_landed() {
   # each of its two markers: 22.6 s per tell (live 2026-09-25).
   [[ "${_SENTINEL_SPENT:-}" == "$session" ]] && rounds=1
   for (( i = 0; i < rounds; i++ )); do
-    if "$TMUX" capture-pane -J -p -S -200 -t "$session" 2>/dev/null \
+    if "$TMUX" capture-pane -J -p -S -200 -t "$(session_target "$session")" 2>/dev/null \
          | tr -d '[:space:]' | grep -qF -- "$needle"; then
       return 0
     fi
@@ -2372,13 +2379,13 @@ _sentinel_landed() {
 # not submitted (see _assign_paste_unsent), so it never counts.
 # The composer (the pane's LAST prompt-glyph line) still holds a paste placeholder.
 _composer_holds_paste() {
-  "$TMUX" capture-pane -J -p -S -60 -t "$1" 2>/dev/null \
+  "$TMUX" capture-pane -J -p -S -60 -t "$(session_target "$1")" 2>/dev/null \
     | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = $0 } END { print last }' \
     | grep -qE '^[[:space:]]*(→|›|❯|>)[[:space:]]+\[Pasted (text|Content)'
 }
 
 _paste_submitted_whole() {
-  "$TMUX" capture-pane -J -p -S -200 -t "$1" 2>/dev/null | awk -v need="$2" '
+  "$TMUX" capture-pane -J -p -S -200 -t "$(session_target "$1")" 2>/dev/null | awk -v need="$2" '
     { line[NR] = $0 }
     /^[[:space:]]*(→|›|❯|>)[[:space:]]/ { box = NR }
     END {
@@ -2588,7 +2595,7 @@ spawn_session_id_capture() {
     while (( $(date +%s) < deadline )); do
       sleep 2
       local pane_text labeled_line uuid
-      pane_text="$("$tmux_bin" capture-pane -t "$session" -p 2>/dev/null)" || break
+      pane_text="$("$tmux_bin" capture-pane -t "$(session_target "$session")" -p 2>/dev/null)" || break
       # Stage 1: find the first line that matches the label anchor.
       labeled_line="$(printf '%s\n' "$pane_text" | grep -m1 -E "$pattern")" || true
       [[ -n "$labeled_line" ]] || continue
@@ -2959,7 +2966,7 @@ supervise_session() {
       fi
     fi
 
-    if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+    if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
       "$JQ" -cn --arg name "$name" --arg session "$session" --arg path "$result_path" \
         '{schema_version:1,event:"lost-liveness",status:"failed",name:$name,
           session:$session,result_path:$path,worker_alive:false,
@@ -3301,8 +3308,8 @@ checkpoint_session() {
   # Capture pane scrollback if the session still exists.
   local session
   session="$(session_for_name "$name")"
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
-    "$TMUX" capture-pane -J -t "$session" -p -S -2000 > "$subdir/pane-snapshot.txt" 2>/dev/null || true
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
+    "$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -2000 > "$subdir/pane-snapshot.txt" 2>/dev/null || true
   fi
   # Pack the per-agent state dir into the tarball.
   tar -czf "$out" -C "$(agent_root_dir)" "$name" 2>/dev/null || {
@@ -5033,8 +5040,8 @@ start_session() {
   if true; then
     :
   fi
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
-    "$TMUX" kill-session -t "$session"
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
+    "$TMUX" kill-session -t "$(session_target "$session")"
   fi
 
   local color_prefix
@@ -5212,7 +5219,7 @@ start_session() {
   fi
 
   if (( should_attach )); then
-    "$TMUX" attach -t "$session"
+    "$TMUX" attach -t "$(session_target "$session")"
   fi
 }
 
@@ -5478,8 +5485,8 @@ resume_session() {
   if true; then
     :
   fi
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
-    "$TMUX" kill-session -t "$session"
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
+    "$TMUX" kill-session -t "$(session_target "$session")"
   fi
 
   # Gate UUID display: full only when AGENT_TMUX_SHOW_SESSION_ID=1 (B3).
@@ -5522,7 +5529,7 @@ resume_session() {
   echo "capture: $SELF $CLI capture $name 120"
 
   if (( should_attach )); then
-    "$TMUX" attach -t "$session"
+    "$TMUX" attach -t "$(session_target "$session")"
   fi
 }
 
@@ -5590,8 +5597,8 @@ start_ssh_session() {
   write_launch_meta "$name" 'tui' "$launch_id"
   record_started_at "$name"
   usage_init_event "$name" "$launch_id"
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
-    "$TMUX" kill-session -t "$session"
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
+    "$TMUX" kill-session -t "$(session_target "$session")"
   fi
 
   local remote_command
@@ -5626,7 +5633,7 @@ start_ssh_session() {
   fi
 
   if (( should_attach )); then
-    "$TMUX" attach -t "$session"
+    "$TMUX" attach -t "$(session_target "$session")"
   fi
 }
 
@@ -5640,12 +5647,12 @@ attach_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
 
-  "$TMUX" attach -t "$session"
+  "$TMUX" attach -t "$(session_target "$session")"
 }
 
 send_session() {
@@ -5721,7 +5728,7 @@ send_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
@@ -5737,7 +5744,7 @@ send_session() {
       down) tmux_key="Down" ;;
     esac
     send_lock_around "$name" "$SEND_LOCK_DEFAULT_TIMEOUT" \
-      "$TMUX" send-keys -t "$session" "$tmux_key" || return $?
+      "$TMUX" send-keys -t "$(session_target "$session")" "$tmux_key" || return $?
     echo "Sent key to $session: $key_name"
     return 0
   fi
@@ -5908,7 +5915,7 @@ send_wait_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
@@ -5940,7 +5947,7 @@ send_wait_session() {
 _send_wait_nonce_locked() {
   local name="$1" session="$2" prompt_text="$3" nonce="$4" timeout_seconds="$5" inject_rp="${6:-0}" inject_scope_guard="${7:-0}" transcript_text="${8:-$3}" transcript_multiline="${9:-false}"
 
-  local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+  local before="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -300)"
   local before_count
   before_count="$(count_literal_line_occurrences "$before" "$nonce")"
 
@@ -5968,7 +5975,7 @@ _send_wait_nonce_locked() {
   local current_count=0
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+    current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -300)"
     current_count="$(count_literal_line_occurrences "$current" "$nonce")"
     if (( current_count > before_count )); then
       marker_seen_add "$name" "$nonce"
@@ -6042,7 +6049,7 @@ send_wait_literal_session() {
   [[ -n "$from_file" ]] && transcript_multiline=true
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
@@ -6063,7 +6070,7 @@ send_wait_literal_session() {
 _send_wait_literal_locked() {
   local name="$1" session="$2" prompt_text="$3" needle="$4" timeout_seconds="$5" inject_rp="${6:-0}" inject_scope_guard="${7:-0}" transcript_text="${8:-$3}" transcript_multiline="${9:-false}"
 
-  local before="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+  local before="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -300)"
   local before_count
   before_count="$(count_literal_occurrences "$before" "$needle")"
 
@@ -6082,7 +6089,7 @@ _send_wait_literal_locked() {
   local current_count=0
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -J -t "$session" -p -S -300)"
+    current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -300)"
     current_count="$(count_literal_occurrences "$current" "$needle")"
     if (( current_count > before_count )); then
       marker_seen_add "$name" "$needle"
@@ -6220,13 +6227,13 @@ capture_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
 
   local raw
-  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$tail_count")"
+  raw="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S "-$tail_count")"
 
   # Redact registered secret values (#189) before any downstream sink.
   secret_redact_load_for "$name"
@@ -6612,7 +6619,7 @@ wait_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
@@ -6623,7 +6630,7 @@ wait_session() {
   local current=""
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -J -t "$session" -p -S -100)"
+    current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -100)"
     if [[ "$current" == "$last" ]]; then
       stable_count=$((stable_count + 1))
       if (( stable_count >= STABLE_SECONDS )); then
@@ -6680,7 +6687,7 @@ wait_text_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
@@ -6689,7 +6696,7 @@ wait_text_session() {
   local current=""
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -200)"
     if [[ "$current" =~ $pattern ]]; then
       transcript_emit_wait_event "$name" wait_text matched "$pattern" "$timeout_seconds"
       echo "matched: $pattern"
@@ -6720,7 +6727,7 @@ wait_literal_session() {
   fi
 
   local session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
@@ -6729,7 +6736,7 @@ wait_literal_session() {
   local current=""
 
   while (( SECONDS < deadline )); do
-    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -200)"
     if [[ "$current" == *"$needle"* ]]; then
       marker_seen_add "$name" "$needle"
       transcript_emit_wait_event "$name" wait_literal matched "$needle" "$timeout_seconds"
@@ -6973,7 +6980,7 @@ wait_and_capture_session() {
 
   local session
   session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     if (( output_json )); then
       "$JQ" -n \
         --arg marker "$marker" --arg style "$match_style" \
@@ -7005,7 +7012,7 @@ wait_and_capture_session() {
       cancelled=1
       break
     fi
-    current="$("$TMUX" capture-pane -J -t "$session" -p -S -200)"
+    current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -200)"
     if [[ "$match_style" == "literal" ]]; then
       if [[ "$current" == *"$marker"* ]]; then
         matched=1
@@ -7026,7 +7033,7 @@ wait_and_capture_session() {
   local elapsed=$((SECONDS - started))
 
   local raw
-  raw="$("$TMUX" capture-pane -J -t "$session" -p -S "-$tail_lines")"
+  raw="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S "-$tail_lines")"
 
   if (( strip_ansi )); then
     raw="$(printf '%s' "$raw" | sed $'s/\x1b\\[[0-9;?]*[A-Za-z]//g')"
@@ -7475,12 +7482,12 @@ env_doctor_session() {
   fi
 
   session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "session env: <not running: $session>"
     return 1
   fi
 
-  pane_pid="$("$TMUX" display-message -p -t "$session" '#{pane_pid}' 2>/dev/null || true)"
+  pane_pid="$("$TMUX" display-message -p -t "$(session_target "$session")" '#{pane_pid}' 2>/dev/null || true)"
   if [[ -z "$pane_pid" ]]; then
     echo "session env: <unable to resolve pane pid: $session>"
     return 1
@@ -7506,7 +7513,7 @@ env_doctor_session() {
 
 status_pane_text() {
   local session="$1"
-  "$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true
+  "$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -80 2>/dev/null || true
 }
 
 # The CLI's own UI: from the last composer line (or "Worked for" rule) down.
@@ -7766,12 +7773,12 @@ self_test_session() {
   require_tmux
   local name="self-test-$$"
   local session="$(session_for_name "$name")"
-  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  "$TMUX" kill-session -t "$(session_target "$session")" 2>/dev/null || true
   "$TMUX" new-session -d -s "$session" "zsh -lc 'printf \"%s\n\" \"TMUX_AGENT_TOOLS_SELF_TEST_OK\" \"[TMUX_AGENT_TOOLS_SELF_TEST_OK]\"; if IFS= read -r line; then printf \"%s\n\" \"echo:\$line\" \"[TMUX_AGENT_TOOLS_SEND_WAIT_OK]\"; fi; sleep 5'"
   wait_literal_session "$name" "TMUX_AGENT_TOOLS_SELF_TEST_OK" 5
   wait_text_session --literal "$name" "[TMUX_AGENT_TOOLS_SELF_TEST_OK]" 5
   send_wait_literal_session "$name" $'trigger send-wait\nsecond line' "[TMUX_AGENT_TOOLS_SEND_WAIT_OK]" 5
-  "$TMUX" kill-session -t "$session" 2>/dev/null || true
+  "$TMUX" kill-session -t "$(session_target "$session")" 2>/dev/null || true
   echo "self-test: ok"
 }
 
@@ -8093,8 +8100,8 @@ self_test_dry_run() {
   fi
 
   # Must NOT have spawned a tmux session
-  if "$TMUX" has-session -t "$inv_session" 2>/dev/null; then
-    "$TMUX" kill-session -t "$inv_session" 2>/dev/null || true
+  if "$TMUX" has-session -t "$(session_target "$inv_session")" 2>/dev/null; then
+    "$TMUX" kill-session -t "$(session_target "$inv_session")" 2>/dev/null || true
     echo "self-test dry-run: FAIL (tmux session was created despite --dry-run)" >&2
     return 1
   fi
@@ -8205,12 +8212,12 @@ FAKE_EOF
       return 1
     fi
 
-    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
+    pane="$("$TMUX" capture-pane -J -t "$(session_target "$(session_for_name "$name1")")" -p -S -200)"
     if [[ "$pane" != *"$path1"* ]]; then
       echo "self-test result-path-prompt: FAIL (initial prompt missing $path1)" >&2
       return 1
     fi
-    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name2")" -p -S -200)"
+    pane="$("$TMUX" capture-pane -J -t "$(session_target "$(session_for_name "$name2")")" -p -S -200)"
     if [[ "$pane" != *"$path2"* ]]; then
       echo "self-test result-path-prompt: FAIL (initial prompt missing $path2)" >&2
       return 1
@@ -8218,18 +8225,18 @@ FAKE_EOF
 
     # Once-per-session (#283): start already injected path1 and marked the
     # sentinel, so a follow-up send-wait must NOT re-inject it.
-    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
+    pane="$("$TMUX" capture-pane -J -t "$(session_target "$(session_for_name "$name1")")" -p -S -200)"
     before_count="$(count_literal_occurrences "$pane" "$path1")"
     send_wait_session "$name1" "follow-up prompt" 5
-    pane="$("$TMUX" capture-pane -J -t "$(session_for_name "$name1")" -p -S -200)"
+    pane="$("$TMUX" capture-pane -J -t "$(session_target "$(session_for_name "$name1")")" -p -S -200)"
     after_count="$(count_literal_occurrences "$pane" "$path1")"
     if (( after_count != before_count )); then
       echo "self-test result-path-prompt: FAIL (follow-up send-wait re-injected $path1; expected once-per-session)" >&2
       return 1
     fi
   } always {
-    [[ -n "$name1" ]] && "$TMUX" kill-session -t "$(session_for_name "$name1")" 2>/dev/null || true
-    [[ -n "$name2" ]] && "$TMUX" kill-session -t "$(session_for_name "$name2")" 2>/dev/null || true
+    [[ -n "$name1" ]] && "$TMUX" kill-session -t "$(session_target "$(session_for_name "$name1")")" 2>/dev/null || true
+    [[ -n "$name2" ]] && "$TMUX" kill-session -t "$(session_target "$(session_for_name "$name2")")" 2>/dev/null || true
     CLI_BIN="$saved_cli_bin"
     LAUNCH_FLAGS="$saved_launch_flags"
     RESULT_PATH_VIA_PROMPT="$saved_result_prompt"
@@ -8296,9 +8303,9 @@ self_test_watch_count() {
   session3="$(session_for_name "$name3")"
 
   {
-    "$TMUX" kill-session -t "$session1" 2>/dev/null || true
-    "$TMUX" kill-session -t "$session2" 2>/dev/null || true
-    "$TMUX" kill-session -t "$session3" 2>/dev/null || true
+    "$TMUX" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
+    "$TMUX" kill-session -t "$(session_target "$session2")" 2>/dev/null || true
+    "$TMUX" kill-session -t "$(session_target "$session3")" 2>/dev/null || true
     "$TMUX" new-session -d -s "$session1" "zsh -lc 'sleep 30'"
     "$TMUX" new-session -d -s "$session2" "zsh -lc 'sleep 30'"
     "$TMUX" new-session -d -s "$session3" "zsh -lc 'sleep 30'"
@@ -8335,9 +8342,9 @@ self_test_watch_count() {
     fi
   } always {
     [[ -n "$writer_pid" ]] && kill "$writer_pid" 2>/dev/null || true
-    "$TMUX" kill-session -t "$session1" 2>/dev/null || true
-    "$TMUX" kill-session -t "$session2" 2>/dev/null || true
-    "$TMUX" kill-session -t "$session3" 2>/dev/null || true
+    "$TMUX" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
+    "$TMUX" kill-session -t "$(session_target "$session2")" 2>/dev/null || true
+    "$TMUX" kill-session -t "$(session_target "$session3")" 2>/dev/null || true
     if [[ -n "$saved_dir" ]]; then
       export TMUX_AGENT_DIR="$saved_dir"
     else
@@ -8461,7 +8468,7 @@ status_session() {
   # Liveness fields (issue #98). Additive only — existing field shape is preserved.
   local last_change_at=""
   local bytes_in_pane=""
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     exists=true
     running=true
     local lowered
@@ -8636,13 +8643,13 @@ ping_session() {
   local rtt_ms=0
   local exit_code=2
 
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     local before_bytes after_bytes
-    before_bytes="$("$TMUX" capture-pane -J -t "$session" -p -S -200 2>/dev/null | wc -c | tr -d ' ')"
+    before_bytes="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -200 2>/dev/null | wc -c | tr -d ' ')"
     # Send Enter then C-u: Enter pokes line-buffered consumers (CLIs that
     # block on `read`); C-u immediately clears the input line so no stray
     # text persists in an interactive REPL's prompt buffer.
-    "$TMUX" send-keys -t "$session" Enter C-u 2>/dev/null || true
+    "$TMUX" send-keys -t "$(session_target "$session")" Enter C-u 2>/dev/null || true
     local start_ms deadline_ms now_ms timeout_ms
     timeout_ms=$(( timeout * 1000 ))
     start_ms=$(ping_now_ms)
@@ -8650,7 +8657,7 @@ ping_session() {
     result="timeout"
     exit_code=1
     while :; do
-      after_bytes="$("$TMUX" capture-pane -J -t "$session" -p -S -200 2>/dev/null | wc -c | tr -d ' ')"
+      after_bytes="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -200 2>/dev/null | wc -c | tr -d ' ')"
       if [[ -n "$after_bytes" && -n "$before_bytes" && "$after_bytes" != "$before_bytes" ]]; then
         result="ok"
         exit_code=0
@@ -8761,13 +8768,13 @@ probe_session() {
 
   local session
   session="$(session_for_name "$name")"
-  if ! "$TMUX" has-session -t "$session" 2>/dev/null; then
+  if ! "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
     echo "Session does not exist: $session" >&2
     exit 1
   fi
 
   local pane parsed_from value confidence
-  pane="$("$TMUX" capture-pane -J -t "$session" -p -S -120 2>/dev/null | strip_ansi_text)"
+  pane="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -120 2>/dev/null | strip_ansi_text)"
   parsed_from=""
   value="null"
   confidence="low"
@@ -8914,7 +8921,7 @@ watch_session() {
       m="$(_watch_result_sig "$rp")"
       if [[ "$m" != "${base_sig[$name]}" ]]; then
         done_reason[$name]="result_updated"
-      elif ! "$TMUX" has-session -t "$(session_for_name "$name")" 2>/dev/null; then
+      elif ! "$TMUX" has-session -t "$(session_target "$(session_for_name "$name")")" 2>/dev/null; then
         done_reason[$name]="exited"
       else
         all_done=0
@@ -9004,8 +9011,8 @@ stop_session() {
   local session
   session="$(session_for_name "$name")"
   local stopped=0
-  if "$TMUX" has-session -t "$session" 2>/dev/null; then
-    "$TMUX" kill-session -t "$session"
+  if "$TMUX" has-session -t "$(session_target "$session")" 2>/dev/null; then
+    "$TMUX" kill-session -t "$(session_target "$session")"
     stopped=1
     echo "Stopped $session"
   else

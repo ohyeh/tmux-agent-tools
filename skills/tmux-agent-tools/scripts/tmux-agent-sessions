@@ -15,6 +15,11 @@ resolve_tmux_bin() {
 TMUX_BIN="$(resolve_tmux_bin)"
 unset TMUX
 TMUX="$TMUX_BIN"
+
+# Same rule as agent-tmux `session_target`: `a.b` is session `a`, pane `b`.
+session_target() {
+  printf '=%s:' "$1"
+}
 JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 CLAUDE_PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
 CODEX_PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
@@ -158,7 +163,7 @@ fallback_status_json() {
   local session="$3"
   local prefix="$4"
   local current lowered
-  current="$("$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true)"
+  current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -80 2>/dev/null || true)"
   lowered="${current:l}"
 
   local running=true
@@ -333,7 +338,7 @@ cwd_for_session() {
       return
     fi
   fi
-  "$TMUX" display-message -p -t "$session" "#{pane_current_path}" 2>/dev/null || true
+  "$TMUX" display-message -p -t "$(session_target "$session")" "#{pane_current_path}" 2>/dev/null || true
 }
 
 wrapper_name_for_tool() {
@@ -848,11 +853,11 @@ cleanup_sessions() {
 
     case "$tool" in
       claude|codex)
-        "$TMUX" kill-session -t "$session"
+        "$TMUX" kill-session -t "$(session_target "$session")"
         print -r -- "Stopped $session"
         ;;
       dialogue)
-        "$TMUX" kill-session -t "$session"
+        "$TMUX" kill-session -t "$(session_target "$session")"
         print -r -- "Stopped $session"
         ;;
     esac

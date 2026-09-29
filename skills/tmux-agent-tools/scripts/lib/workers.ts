@@ -1724,12 +1724,19 @@ export function paneTail(stdout: string, n: number): string[] {
   return lines.slice(-n)
 }
 
+/** Exact tmux target for an existing session.
+ *  A bare name containing `.` is session.pane (`review.abcde` → pane `abcde`).
+ *  `=name:` is that session and its current window. Not valid as `new-session -s`. */
+export function exactSessionTarget(session: string): string {
+  return `=${session}:`
+}
+
 /** The selected project row's pane. Same cap as the worker mirror; one row at a time. */
 export async function mirrorProject(host: Host, name: string, rows: number): Promise<string[]> {
   const cwd = host.cwd()
   if (!cwd) return []
   const probe = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${name}:`], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
     .catch(() => undefined)
   if (!probe || probe.exitCode !== 0) return []
   return paneTail(probe.stdout, rows)
@@ -2319,7 +2326,7 @@ export async function peekProject(host: Host, name: string, lines: number): Prom
   const cwd = host.cwd()
   if (!cwd) return { ok: false, text: `no cwd; cannot capture "${name}"` }
   const pane = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${name}:`], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (pane.exitCode !== 0) {
     return { ok: false, text: `capture for "${name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
@@ -2342,7 +2349,7 @@ export async function pressKeys(host: Host, d: TmuxDispatch, keys: readonly stri
   const session = [...alive].find(sname => sname.endsWith(`-${d.name}`))
   if (!session) return { ok: false, text: `no tmux session for "${d.name}" — it is not running` }
   const run = await host
-    .run(['tmux', 'send-keys', '-t', session, ...keys], d.dir, LIVE_PROBE_MS)
+    .run(['tmux', 'send-keys', '-t', exactSessionTarget(session), ...keys], d.dir, LIVE_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (run.exitCode !== 0) return { ok: false, text: `send-keys exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
   return { ok: true, text: `pressed ${keys.join(' ')} in ${session}; peek to see what it did` }
@@ -2363,14 +2370,14 @@ export async function interruptWorker(host: Host, d: TmuxDispatch): Promise<Outc
   const session = [...alive].find(sname => sname.endsWith(`-${d.name}`))
   if (!session) return { ok: false, text: `no tmux session for "${d.name}" — it is not running` }
   const pane = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', `=${session}:`], d.dir, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(session)], d.dir, MIRROR_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (pane.exitCode !== 0) return { ok: false, text: `capture for "${d.name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
   const hint = paneTail(pane.stdout, 15).join('\n').match(INTERRUPT_HINT_RE)
   if (!hint) return { ok: false, text: `"${d.name}" shows no "esc/ctrl+c to interrupt" hint — it is not mid-turn; nothing sent` }
   const key = /^esc/i.test(hint[1]!) ? 'Escape' : 'C-c'
   const run = await host
-    .run(['tmux', 'send-keys', '-t', session, key], d.dir, LIVE_PROBE_MS)
+    .run(['tmux', 'send-keys', '-t', exactSessionTarget(session), key], d.dir, LIVE_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (run.exitCode !== 0) return { ok: false, text: `send-keys exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
   return { ok: true, text: `interrupted ${d.name} with ${key} (its screen said "${hint[0]}"); the next message steers it` }
