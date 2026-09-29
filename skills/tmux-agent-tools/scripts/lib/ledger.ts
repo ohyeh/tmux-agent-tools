@@ -30,8 +30,8 @@ export async function mkdirExclusive(host: Host, path: string): Promise<Contest>
 
 /** Numeric children of `dir` (`1`, `2`, …), ascending. `undefined` = unknown (never "none"). */
 export async function numericChildren(host: Host, dir: string): Promise<number[] | undefined> {
-  if (!(await host.exists(dir).catch(() => false))) return []
   try {
+    if (!(await host.exists(dir))) return []
     const entries = await host.list(dir)
     return entries
       .filter(e => e.kind === 'dir' && /^[1-9][0-9]*$/.test(e.name))

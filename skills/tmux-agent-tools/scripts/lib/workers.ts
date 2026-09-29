@@ -61,6 +61,12 @@ export type TmuxDispatch = {
   ownerCwd?: string
   /** Set when a collector claimed this worker from a session that stopped heartbeating: that session's id. */
   adoptedFrom?: string
+  /**
+   * The episode's max claim gen has no complete owner yet (a claimant crashed, or is
+   * slow, between its mkdir and its owner publish): nobody owns it and nobody
+   * delivers it (§3.3). `owner` is absent, and this is NOT "anyone's".
+   */
+  ownerIncomplete?: true
   /** `git rev-parse HEAD` of `dir` when the episode began; a claimed commit must descend from it. Absent when `dir` was not a repo. */
   base?: string
   /**
@@ -752,6 +758,8 @@ export async function adoptable(
   cache: Map<string, string>,
 ): Promise<'mine' | 'orphan' | 'no'> {
   const mine = host.owner()
+  // An unfinished claim: nobody's until claim() lets a gen+1 contest it (after ORPHAN_MS).
+  if (d.ownerIncomplete) return mine && sameProject(host, d) ? 'orphan' : 'no'
   if (!d.owner || !mine || d.owner === mine) return 'mine'
   if (!sameProject(host, d)) return 'no'
   if (!cache.has(d.owner)) cache.set(d.owner, await sessionLiveness(host, sessionDirOf(v3, d.owner), now))
@@ -763,11 +771,12 @@ export async function adoptable(
  * (or a /resume that changed this one's id) can leave dozens of records: one
  * line each flooded the transcript with 40 (live 2026-09-26).
  */
+const INTERRUPTED = ''
 export function logClaims(host: Host, claimed: Map<string, string[]>): void {
   for (const [from, names] of claimed) {
     const shown = names.slice(0, 5).map(n => `"${n}"`).join(', ') + (names.length > 5 ? ` and ${names.length - 5} more` : '')
     host.log(
-      `tmux-agent: claimed ${names.length} episode(s) from session ${from} (non-live for ${ORPHAN_MS / 1000}s): ${shown}; delivering from the next tick`,
+      `tmux-agent: claimed ${names.length} episode(s) from ${from === INTERRUPTED ? `an interrupted claim (no owner for ${ORPHAN_MS / 1000}s)` : `session ${from} (non-live for ${ORPHAN_MS / 1000}s)`}: ${shown}; delivering from the next tick`,
     )
   }
 }
@@ -839,7 +848,15 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
         continue
       }
       // Incomplete, or not yet sent: skipped until recovery settles it (§8).
-      if (!desc || !(await hasMark(host, dir, 'sent').catch(() => false))) {
+      const sent = await hasMark(host, dir, 'sent').catch((error: unknown) => {
+        host.log(`tmux-agent: could not read ${dir}/sent: ${String(error)}`)
+        return undefined
+      })
+      if (sent === undefined) {
+        out.complete = false
+        continue
+      }
+      if (!desc || !sent) {
         if (!out.unsent.includes(w)) out.unsent.push(w)
         continue
       }
@@ -862,6 +879,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
         since: desc.since,
         ...(goal ? { goal } : {}),
         ...(cur.session ? { owner: cur.session } : {}),
+        ...(cur.complete ? {} : { ownerIncomplete: true as const }),
         ...(rec.ownerCwd ? { ownerCwd: rec.ownerCwd } : {}),
         ...(cur.gen > 0 && desc.owner ? { adoptedFrom: desc.owner } : {}),
         ...(desc.base && SHA_RE.test(desc.base) ? { base: desc.base } : {}),
@@ -905,8 +923,9 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
           out.dispatches.push(d)
           ours = true
         } else if (opts.claim && d.seq && me) {
-          const r = await claimEpisode(host, v3, `${w}/episodes/${d.seq}`, d.owner, me, now)
-          if (r === 'claimed') claimed.set(d.owner!, [...(claimed.get(d.owner!) ?? []), `${d.name}#${d.seq}`])
+          const r = await claimEpisode(host, v3, `${w}/episodes/${d.seq}`, d.adoptedFrom ?? d.owner, me, now)
+          const from = d.owner ?? INTERRUPTED
+          if (r === 'claimed') claimed.set(from, [...(claimed.get(from) ?? []), `${d.name}#${d.seq}`])
         }
       }
     }
@@ -1790,12 +1809,15 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
 
   await releaseEndedWaiters(host, gate, v3, pending.filter(d => d.waiter && !finished.has(idOf(d))))
   // Held waiters (still running) are in neither list: not acked, not submitted.
-  const { deliver, silent } = await partitionWaiters(host, gate, done)
-  if (!deliver.length && !silent.length) {
+  const parted = await partitionWaiters(host, gate, done)
+  if (!parted.deliver.length && !parted.silent.length) {
     // Quiet ticks only: a stop is a subprocess inside the hook's budget.
     if (probeStalls) await autoStop(host, gate, v3, s.quiet, now)
     return
   }
+  const deliver = await stillOurs(host, gate, v3, parted.deliver)
+  const silent = await stillOurs(host, gate, v3, parted.silent)
+  if (!deliver || !silent) return
 
   const { text, included } = deliver.length ? payloadOf(deliver) : { text: '', included: [] as Finished[] }
   if (!included.length && !silent.length) return
@@ -2264,6 +2286,35 @@ export async function takeLock(host: Host, workerDir: string, token = randomBase
 }
 const busyText = (name: string, busy: unknown) =>
   `"${name}" is busy: another action holds its lock (${typeof busy === 'object' && busy && 'session' in busy ? `session ${String((busy as Holder).session).slice(0, 8)}` : String(busy)}); try again in a moment`
+
+/**
+ * A pass can outlive its authority: a slow pass, a stopped process, a reload (§4).
+ * Right before a submit or ack, this activation must still be its session's max,
+ * and each episode's max claim gen must still name this session. An episode that
+ * lost its owner is dropped here and left to the new one; `undefined` = this
+ * activation was superseded and delivers nothing.
+ */
+export async function stillOurs(host: Host, gate: Gate, v3: string, fs: readonly Finished[]): Promise<Finished[] | undefined> {
+  if (!fs.length) return []
+  const me = host.owner()
+  if (me && gate.activation !== undefined && (await superseded(host, sessionDirOf(v3, me), gate.activation)) === true) {
+    gate.paused = 'this activation was superseded by a newer one of the same session (a reload), which collects now'
+    host.log(`tmux-agent: activation ${gate.activation} was superseded during a pass; it delivers nothing`)
+    return undefined
+  }
+  const out: Finished[] = []
+  for (const f of fs) {
+    // A record with no owner is anyone's (a pre-owner record): nothing to lose.
+    if (!f.d.owner || !me) {
+      out.push(f)
+      continue
+    }
+    const cur = await currentOwner(host, episodeDirOf(v3, f.d), f.d.adoptedFrom ?? f.d.owner)
+    if (cur?.complete && cur.session === me) out.push(f)
+    else host.log(`tmux-agent: ${idOf(f.d)} changed owner during this pass (${cur ? `gen ${cur.gen}: ${cur.session ?? 'incomplete'}` : 'owner unreadable'}); not delivered here`)
+  }
+  return out
+}
 
 /** Every entry — startup, tick, and the public noun — goes through one gate. */
 export function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promise<void> {

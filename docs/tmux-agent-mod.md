@@ -231,7 +231,8 @@ reload 會重跑 module，面板原本會跟著關掉；0.7.10 起開著的面�
 2. 組一則 prompt（上限 20 個 worker / 16,000 字元），送出。第一筆自己就放不下時
    （摘要 fence 後變長、dir 很長），這一筆改成不帶摘要送出（摘要留在 result.json），
    不會卡住之後所有的交付
-3. **session 接受之後**才在鎖裡 `mkdir` 這批的 ack 目錄
+3. 送出前重讀一次：這個 activation 還是 session 的最新一個、每一輪最高一代 claim 還是本 session；不是就不送，留給新 owner
+4. **session 接受之後**才 `mkdir` 這批的 ack 目錄（建一次，搶輸的也算已記）
 
 `prompt.submit` 可能 throw，也可能正常回傳 `{ drop }` —— 兩者都不算送達。
 因此送出後、記帳前當掉最多多報一次，永遠不會靜默漏報。
