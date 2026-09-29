@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SERVER = /\b(kill-server|new-session|start-server)\b/
-const SOCKET = /['"`]-S['"`]|['"`]-L['"`]|(?:^|\s)-S(?:\s|$)|(?:^|\s)-L(?:\s|$)/
+// -S/-L counts only as an argv element passed toward tmux: an array element, or a
+// bare flag on a command line. A quoted unused string does not.
+const SOCKET_ARG = /(?:^|[[,])\s*['"`]-S['"`]|(?:^|[[,])\s*['"`]-L['"`]|(?:^|[\s;|&])-S(?:\s|$)|(?:^|[\s;|&])-L(?:\s|$)/
 const BINARY = /(?:^|[;&|(`])\s*(?:command\s+)?(?:env\s+(?:-\S+(?:\s+\S*)?\s+)*)?(?<![A-Za-z0-9_])tmux\s/g
 
 function walk(dir, acc) {
@@ -80,8 +82,8 @@ function strip(text, shell) {
   })
 }
 
-function addsSocket(text) {
-  return SOCKET.test(text)
+function passesSocket(text) {
+  return SOCKET_ARG.test(text)
 }
 
 function findDef(lines, before, name) {
@@ -117,11 +119,11 @@ function tsProblems(lines, i) {
     if (!SERVER.test(m[2])) continue
     const name = m[1]
     if (name === 'execFile' || name === 'execFileSync' || name === 'exec' || name === 'spawn') {
-      if (!addsSocket(m[2])) problems.push(`${name} tmux argv has no -S/-L`)
+      if (!passesSocket(m[2])) problems.push(`${name} tmux argv has no -S/-L`)
       continue
     }
     const def = findDef(lines, i, name)
-    if (def < 0 || !addsSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
+    if (def < 0 || !passesSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
   }
   return problems
 }
@@ -137,8 +139,8 @@ function shProblems(lines, i) {
     binary = true
     const forced = /command\s|env\s/.test(m[0])
     if (forced || findDef(lines, i, 'tmux') < 0) {
-      if (!addsSocket(code)) problems.push('tmux has no -S/-L')
-    } else if (!addsSocket(bodyOf(lines, findDef(lines, i, 'tmux')))) {
+      if (!passesSocket(code)) problems.push('tmux has no -S/-L')
+    } else if (!passesSocket(bodyOf(lines, findDef(lines, i, 'tmux')))) {
       problems.push('wrapper tmux() has no -S/-L')
     }
   }
@@ -148,7 +150,7 @@ function shProblems(lines, i) {
   const name = call[1]
   const def = findDef(lines, i, name)
   if (def < 0) return []
-  if (!addsSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
+  if (!passesSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
   return problems
 }
 
