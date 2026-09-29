@@ -59,7 +59,7 @@ jobs:
           node-version: 22.18.0
 
       - name: Core contract tests (node 22.18.0)
-        run: scripts/test-core-contract-smoke
+        run: scripts/test-core-contract-smoke --test-timeout=120000
 
       - name: Typecheck the mod and the shared core
         run: scripts/test-mod-typecheck-smoke

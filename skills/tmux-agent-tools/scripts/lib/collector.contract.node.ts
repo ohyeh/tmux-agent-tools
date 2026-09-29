@@ -230,7 +230,7 @@ function privateServer(): { dir: string; sock: string; env: NodeJS.ProcessEnv; t
   const tmux = (args: string[]) =>
     new Promise<{ code: number; out: string }>(resolve => {
       const has = args.some((a, i) => a === '-S' || a === '-L' || args[i - 1] === '-S' || args[i - 1] === '-L')
-      execFile('tmux', has ? args : ['-S', sock, ...args], { env, encoding: 'utf8' }, (error, stdout) =>
+      execFile('tmux', has ? args : ['-S', sock, ...args], { env, encoding: 'utf8', timeout: 20_000 }, (error, stdout) =>
         resolve({ code: error ? 1 : 0, out: stdout }),
       )
     })

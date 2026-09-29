@@ -17,7 +17,14 @@ if [[ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | head -1)" != "$floor" ]]
   exit 1
 fi
 
-if out="$(node --test --test-reporter=tap ./*.contract.node.ts 2>&1)"; then
+# A hung test used to sit until the job timeout. Each test dies at this bound.
+timeout_ms=120000
+for arg in "$@"; do
+  if [[ "$arg" == --test-timeout=* ]]; then
+    timeout_ms="${arg#*=}"
+  fi
+done
+if out="$(node --test --test-timeout="$timeout_ms" --test-reporter=tap ./*.contract.node.ts 2>&1)"; then
   echo "  ok   core contract (node $have):$(print -r -- "$out" | rg -o '^# (pass|fail) \d+' | tr '\n' ' ' | sed 's/# / /g')"
   echo "1 passed, 0 failed"
 else

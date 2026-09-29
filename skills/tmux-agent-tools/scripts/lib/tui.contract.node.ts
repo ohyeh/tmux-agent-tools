@@ -667,7 +667,7 @@ test('pty run: starts TUI in a real PTY, presses keys, quits, verifies screen ou
 
   // Python PTY harness to run node tui.node.ts in an actual pseudo-terminal
   const pythonScript = `
-import pty, os, sys, time, subprocess, termios
+import pty, os, select, sys, time, subprocess, termios
 
 master, slave = pty.openpty()
 env = dict(os.environ)
@@ -686,17 +686,30 @@ p = subprocess.Popen(
 )
 os.close(slave)
 
+def read_some(master, seconds, until=None):
+    # os.read on a PTY master blocks until bytes arrive. The old loops checked
+    # the clock only after a read returned, so a partial frame (no "workers"
+    # yet, child still open) waited forever. select makes the bound real.
+    deadline = time.time() + seconds
+    buf = bytearray()
+    while time.time() < deadline and (until is None or until not in buf):
+        left = deadline - time.time()
+        ready, _, _ = select.select([master], [], [], left)
+        if not ready:
+            break
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return buf
+
 output = bytearray()
 start = time.time()
-while time.time() - start < 3:
-    try:
-        chunk = os.read(master, 4096)
-        if chunk:
-            output.extend(chunk)
-            if b'workers' in output:
-                break
-    except OSError:
-        break
+while time.time() - start < 3 and b'workers' not in output:
+    output.extend(read_some(master, max(0.0, 3 - (time.time() - start)), b'workers'))
 
 # Send key 'r' (refresh), then key 'q' (quit)
 time.sleep(0.1)
@@ -704,17 +717,15 @@ os.write(master, b'r')
 time.sleep(0.1)
 os.write(master, b'q')
 
-while time.time() - start < 5:
-    try:
-        chunk = os.read(master, 4096)
-        if chunk:
-            output.extend(chunk)
-    except OSError:
-        break
-    if p.poll() is not None:
-        break
+while time.time() - start < 5 and p.poll() is None:
+    output.extend(read_some(master, 0.2))
+output.extend(read_some(master, 0.2))
 
-p.wait(timeout=3)
+try:
+    p.wait(timeout=3)
+except subprocess.TimeoutExpired:
+    p.kill()
+    p.wait(timeout=3)
 post_attr = termios.tcgetattr(master)
 os.close(master)
 
@@ -735,7 +746,7 @@ print(output.decode('utf-8', errors='replace'))
       const env = { ...process.env }
       delete env.TMUX
       delete env.TMUX_PANE
-      execFile('tmux', ['-S', socket, ...args], { encoding: 'utf8', env }, (error, stdout, stderr) => {
+      execFile('tmux', ['-S', socket, ...args], { encoding: 'utf8', env, timeout: 20_000 }, (error, stdout, stderr) => {
         resolve({
           code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
           out: stdout ?? '',
@@ -752,6 +763,7 @@ print(output.decode('utf-8', errors='replace'))
       })
       let out = ''
       let err = ''
+      const timer = setTimeout(() => cp.kill('SIGKILL'), 20_000)
       cp.stdout.on('data', d => {
         out += d
       })
@@ -759,6 +771,7 @@ print(output.decode('utf-8', errors='replace'))
         err += d
       })
       cp.on('close', code => {
+        clearTimeout(timer)
         resolve({ code: code ?? -1, stdout: out, stderr: err })
       })
     })
@@ -993,7 +1006,7 @@ test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', {
       const env = { ...process.env }
       delete env.TMUX
       delete env.TMUX_PANE
-      execFile(real, ['-S', socket, ...args], { encoding: 'utf8', env }, (error, stdout, stderr) => {
+      execFile(real, ['-S', socket, ...args], { encoding: 'utf8', env, timeout: 20_000 }, (error, stdout, stderr) => {
         resolve({
           code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
           out: stdout ?? '',

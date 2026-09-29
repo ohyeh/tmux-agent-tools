@@ -25,7 +25,7 @@ function exclusive<T>(fn: () => Promise<T>): Promise<T> {
 
 function tmux(args: string[]): Promise<{ code: number; out: string; err: string }> {
   return new Promise(resolve => {
-    execFile('tmux', ['-L', SOCK, ...args], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile('tmux', ['-L', SOCK, ...args], { encoding: 'utf8', timeout: 20_000 }, (error, stdout, stderr) => {
       resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout ?? '', err: stderr ?? '' })
     })
   })
@@ -66,7 +66,7 @@ async function live(tag: string): Promise<Live> {
   const env: NodeJS.ProcessEnv = { ...process.env, TMUX: `${socketPath},${serverPid},0`, TMUX_AGENT_DIR: root }
   delete env.TMUX_PANE
   const routed = await new Promise<string>((resolve, reject) => {
-    execFile('tmux', ['display-message', '-p', '#{socket_path}'], { encoding: 'utf8', env }, (error, stdout) => {
+    execFile('tmux', ['display-message', '-p', '#{socket_path}'], { encoding: 'utf8', env, timeout: 15_000 }, (error, stdout) => {
       if (error) reject(error)
       else resolve(stdout.trim())
     })
@@ -381,7 +381,7 @@ exit 0
         const childEnv = { ...env }
         delete childEnv.TMUX
         delete childEnv.TMUX_PANE
-        execFile('tmux', ['-S', socket, ...args], { encoding: 'utf8', env: childEnv }, (error, stdout, stderr) => {
+        execFile('tmux', ['-S', socket, ...args], { encoding: 'utf8', env: childEnv, timeout: 20_000 }, (error, stdout, stderr) => {
           resolve({
             code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
             out: stdout ?? '',

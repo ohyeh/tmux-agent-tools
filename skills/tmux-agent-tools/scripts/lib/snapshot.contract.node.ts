@@ -763,7 +763,7 @@ test('finding R3/R12: no-mutation with live fleet pane compares root before and 
     const env = { ...process.env, TMUX_TMPDIR: socketDir }
     delete env.TMUX
     delete env.TMUX_PANE
-    return execFileSync('tmux', ['-S', socketPath, ...args], { env, encoding: 'utf8' })
+    return execFileSync('tmux', ['-S', socketPath, ...args], { env, encoding: 'utf8', timeout: 20_000 })
   }
 
   process.env.TMUX_AGENT_DIR = root
