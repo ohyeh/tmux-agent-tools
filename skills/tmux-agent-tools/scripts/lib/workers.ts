@@ -2057,6 +2057,72 @@ export function fitCells(text: string, max: number): string {
   return `${out}…`
 }
 
+/** `text` cut to `max` display cells without breaking wide (CJK) characters. */
+export function truncateCells(text: string, max: number): string {
+  if (displayCells(text) <= max) return text
+  let out = ''
+  let cur = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    const w = ch === '·' || isFullwidth(cp) ? 2 : 1
+    if (cur + w > max) break
+    out += ch
+    cur += w
+  }
+  return out
+}
+
+/** Repo folder name from dir, e.g. /a/b/my-repo -> my-repo */
+export function rowRepo(dir: string): string {
+  return dir.split('/').filter(Boolean).slice(-1)[0] ?? dir
+}
+
+/** Human-readable status mark for a row */
+export function rowMark(r: PanelRow): string {
+  if (r.project) return r.shell ? `shell · ${r.shell}` : '專案'
+  return r.state === 'finished'
+    ? 'finished — awaiting delivery'
+    : r.state === 'delivered'
+      ? 'done — tell it more, or stop it'
+      : r.state === 'needs-input'
+        ? `needs input — ${r.blockedReason ?? 'dialog'}`
+        : r.state === 'stalled'
+          ? `stalled ${Math.round((r.idleSeconds ?? 0) / 60)}m`
+          : r.state === 'exited'
+            ? 'exited — no result'
+            : r.state === 'launch-failed'
+              ? 'launch failed — see mod-assign.log'
+              : r.idleSeconds !== undefined
+                ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
+                : 'running'
+}
+
+/** Dot or status glyph for a row */
+export function rowGlyph(r: PanelRow): string {
+  if (r.project) return '● '
+  return r.state === 'needs-input' ? '? ' : r.state === 'delivered' ? '✓ ' : '● '
+}
+
+/** Formatted text for a row (excluding glyph), shared by mod band and TUI */
+export function rowLabel(r: PanelRow, selected: boolean): string {
+  if (r.project) {
+    const mark = r.shell ? `shell · ${r.shell}` : '專案'
+    return `${selected ? '›' : ' '} ${r.d.name}  ${mark}  ${elapsed(r.ageMs)}`
+  }
+  const mark = rowMark(r)
+  const tag = r.holder ? `  @${r.holder}` : ''
+  const repo = rowRepo(r.d.dir)
+  return `${selected ? '›' : ' '} ${r.d.name}${tag}  ${mark}  ${elapsed(r.ageMs)}  ${repo}`
+}
+
+export function clearButtonLabel(armed: boolean): string {
+  return armed ? 'clear all? press again' : 'clear'
+}
+
+export function stopButtonLabel(name: string, armed: boolean): string {
+  return armed ? `stop ${name}? press again` : 'stop'
+}
+
 export async function rememberPanel(host: Host, open: boolean): Promise<void> {
   const id = host.owner()
   if (!id) return

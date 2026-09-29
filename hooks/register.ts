@@ -60,6 +60,10 @@ import {
   setRows,
   othersLine,
   fitCells,
+  rowGlyph,
+  rowLabel,
+  clearButtonLabel,
+  stopButtonLabel,
   rememberPanel,
   tellWorker,
   stopAll,
@@ -567,7 +571,7 @@ export const register: Register = on => {
     // `[ clear ]` stops every worker this mod started; drawn only when there is one.
     const clearable = panel.rows.some(r => !r.project)
     const clearArmed = panel.armedStop?.id === CLEAR_ID && now < panel.armedStop.until
-    const clearLabel = clearArmed ? 'clear all? press again' : 'clear'
+    const clearLabel = clearButtonLabel(clearArmed)
     const buttonCells =
       displayCells('[ + ]') +
       displayCells('[ refresh ]') +
@@ -691,12 +695,12 @@ export const register: Register = on => {
     for (const [i, r] of panel.rows.entries()) {
       if (i < first || i >= first + shownRows) continue
       if (r.project) {
-        const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}  ${r.shell ? `shell · ${r.shell}` : '專案'}  ${elapsed(r.ageMs)}`
+        const label = rowLabel(r, r.id === panel.selected)
         children.push(
           Box({
             flexDirection: 'row',
             children: [
-              Text({ color: 'blue', bold: true, children: '● ' }),
+              Text({ color: 'blue', bold: true, children: rowGlyph(r) }),
               Button({
                 key: r.id,
                 label: label.slice(0, Math.max(10, width - 5)),
@@ -713,29 +717,7 @@ export const register: Register = on => {
         )
         continue
       }
-      const repo = r.d.dir.split('/').filter(Boolean).slice(-1)[0] ?? r.d.dir
-      const mark =
-        r.state === 'finished'
-          ? 'finished — awaiting delivery'
-          : r.state === 'delivered'
-            ? 'done — tell it more, or stop it'
-            : r.state === 'needs-input'
-              ? `needs input — ${r.blockedReason ?? 'dialog'}`
-            : r.state === 'stalled'
-            ? `stalled ${Math.round((r.idleSeconds ?? 0) / 60)}m`
-            : r.state === 'exited'
-              ? 'exited — no result'
-              : r.state === 'launch-failed'
-                ? 'launch failed — see mod-assign.log'
-                : r.idleSeconds !== undefined
-                  ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
-                  : 'running'
-      // Whose it is: the title names this session, a row names only another
-      // holder — a live session's id, or `unknown` for an orphan.
-      const tag = r.holder ? `  @${r.holder}` : ''
-      // The state before the repo: a narrow band cuts from the right, and the
-      // state is what the person reads the panel for.
-      const label = `${r.id === panel.selected ? '›' : ' '} ${r.d.name}${tag}  ${mark}  ${elapsed(r.ageMs)}  ${repo}`
+      const label = rowLabel(r, r.id === panel.selected)
       // A Button takes no colour, so the state is coloured beside it: a dot before
       // the row and, on the selected row, its state word restated in that colour.
       const color = STATE_COLOR[r.state]
@@ -744,7 +726,7 @@ export const register: Register = on => {
           flexDirection: 'row',
           children: [
             // finished and delivered share cyan; the glyph tells "reported" apart.
-            Text({ color, bold: true, children: r.state === 'needs-input' ? '? ' : r.state === 'delivered' ? '✓ ' : '● ' }),
+            Text({ color, bold: true, children: rowGlyph(r) }),
             Button({
               key: r.id,
               label: label.slice(0, Math.max(10, width - 5)),
@@ -810,7 +792,7 @@ export const register: Register = on => {
             Text({ children: '  ' }),
             Button({
               key: `stop:${r.id}`,
-              label: armed ? `stop ${r.d.name}? press again` : 'stop',
+              label: stopButtonLabel(r.d.name, armed),
               hotkey: 'x',
               onPress: () => pressTwice(r.id, () => void act(`stop ${r.d.name}`, host => stopWorker(host, gate, r.d))),
             }),
