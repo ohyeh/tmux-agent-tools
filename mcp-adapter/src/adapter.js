@@ -1,24 +1,44 @@
-const { execFile } = require("node:child_process");
-const { randomBytes } = require("node:crypto");
+const path = require("node:path");
+const {
+  REQUIRED_RESULT_LINE,
+  assignWorker,
+  missingSections,
+  newGate,
+  peekWorker,
+  rootOf,
+  stopWorker,
+  tellWorker,
+  v3Of,
+} = require("../../skills/tmux-agent-tools/scripts/lib/workers.ts");
+const {
+  numericChildren,
+  readDescriptor,
+  readWorker,
+} = require("../../skills/tmux-agent-tools/scripts/lib/ledger.ts");
+const { nodeHost } = require("../../skills/tmux-agent-tools/scripts/lib/host.node.ts");
 
-const REQUIRED_RESULT_LINE =
-  "Result JSON must include schema_version, status, summary, artifacts, and errors. If you committed, add commit: the full 40-hex sha of your final commit.";
 const REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
 const NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
 const NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";
 const NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unless explicitly authorized.";
 
-const sessions = new Map();
+const gate = newGate();
 
-function agentTmuxBin() {
-  return process.env.TMUX_AGENT_TMUX_BIN || process.env.AGENT_TMUX || "agent-tmux";
+function getHost(cwd) {
+  const sessionId = process.env.TMUX_AGENT_SESSION || `mcp-${process.pid}`;
+  return nodeHost({
+    owner: sessionId,
+    cwd: cwd || process.cwd(),
+    log: (text) => process.stderr.write(`[mcp-adapter] ${text}\n`),
+  });
 }
 
-function safeName(cli, requested) {
-  if (requested && /^[A-Za-z0-9._-]+$/.test(requested)) return requested;
-  const suffix = randomBytes(4).toString("hex");
+function safeBaseName(cli, requested) {
+  if (requested && /^[A-Za-z0-9._-]+$/.test(requested)) {
+    return requested.slice(0, 58);
+  }
   const safeCli = String(cli || "agent").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 24);
-  return `tmux-agent-${safeCli}-${suffix}`;
+  return `tmux-agent-${safeCli}`;
 }
 
 function parseJsonLoose(text) {
@@ -27,30 +47,10 @@ function parseJsonLoose(text) {
     try {
       return JSON.parse(lines[i]);
     } catch (_) {
-      // keep walking; agent-tmux often prints human lines before JSON diagnostics
+      // keep walking
     }
   }
   return null;
-}
-
-function runAgentTmux(args, options = {}) {
-  return new Promise((resolve) => {
-    execFile(agentTmuxBin(), args, {
-      cwd: options.cwd,
-      timeout: options.timeoutMs,
-      maxBuffer: 1024 * 1024,
-      env: process.env,
-    }, (error, stdout, stderr) => {
-      resolve({
-        ok: !error,
-        code: error && typeof error.code === "number" ? error.code : 0,
-        signal: error ? error.signal : null,
-        stdout: stdout || "",
-        stderr: stderr || "",
-        json: parseJsonLoose(`${stdout}\n${stderr}`),
-      });
-    });
-  });
 }
 
 function buildWorkerPrompt(task, resultPath) {
@@ -63,14 +63,20 @@ ${NO_BACKGROUND_JOBS_GUARD}
 ${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
 }
 
-function recordFor(agentId) {
-  const record = sessions.get(agentId);
-  if (!record) {
-    const err = new Error(`unknown agent_id: ${agentId}`);
-    err.code = "UNKNOWN_AGENT";
-    throw err;
+function formatBrief(task) {
+  const missing = missingSections(task);
+  if (missing.length === 0) return task;
+  let brief = task.trim();
+  if (missing.includes("GOAL")) {
+    brief = `GOAL: ${brief}`;
   }
-  return record;
+  if (missing.includes("ACCEPTANCE")) {
+    brief += `\n\nACCEPTANCE: Result JSON must include schema_version, status, summary, artifacts, and errors.\n${REQUIRED_RESULT_LINE}\n${NO_CASCADE_GUARD}\n${NO_BACKGROUND_JOBS_GUARD}\n${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
+  }
+  if (missing.includes("REPORT")) {
+    brief += `\n\nREPORT: Final status and summary in result.json`;
+  }
+  return brief;
 }
 
 function classifyBlocked(json) {
@@ -96,6 +102,39 @@ function missingResultFields(body) {
   return REQUIRED_RESULT_FIELDS.filter((field) => !Object.prototype.hasOwnProperty.call(body, field));
 }
 
+async function getWorker(host, agentId) {
+  const root = await rootOf(host);
+  if (!root) {
+    const err = new Error("no state root");
+    err.code = "NO_STATE_ROOT";
+    throw err;
+  }
+  const v3 = v3Of(root);
+  let name = String(agentId || "").trim();
+  let workerDir = `${v3}/${name}`;
+  let rec = await readWorker(host, workerDir);
+  if (!rec || rec === "unknown") {
+    if (await host.exists(v3).catch(() => false)) {
+      const entries = await host.list(v3).catch(() => []);
+      const matches = entries.filter(
+        (e) => e.kind === "dir" && (e.name === name || e.name.startsWith(`${name}.`))
+      );
+      if (matches.length >= 1) {
+        matches.sort((a, b) => b.name.localeCompare(a.name));
+        name = matches[0].name;
+        workerDir = `${v3}/${name}`;
+        rec = await readWorker(host, workerDir);
+      }
+    }
+  }
+  if (!rec || rec === "unknown") {
+    const err = new Error(`unknown agent_id: ${agentId}`);
+    err.code = "UNKNOWN_AGENT";
+    throw err;
+  }
+  return { rec, name, workerDir, root, v3 };
+}
+
 async function spawnTmuxAgent(request) {
   const cli = String(request.cli || "").trim();
   const repoPath = String(request.repoPath || "").trim();
@@ -104,121 +143,183 @@ async function spawnTmuxAgent(request) {
     throw new Error("spawn_tmux_agent requires cli, repoPath, and task");
   }
 
-  const name = safeName(cli, request.name);
-  const resultPathRun = await runAgentTmux([cli, "result", "--path", name], {
-    cwd: repoPath,
-    timeoutMs: 30_000,
-  });
-  if (!resultPathRun.ok) {
-    throw new Error(resultPathRun.stderr || resultPathRun.stdout || "failed to resolve result path");
+  const host = getHost(repoPath);
+  const baseName = safeBaseName(cli, request.name);
+  const brief = formatBrief(task);
+
+  const res = await assignWorker(
+    host,
+    { profile: cli, name: baseName, dir: repoPath, brief },
+    { owner: host.owner(), ownerCwd: repoPath }
+  );
+
+  if ("deny" in res) {
+    throw new Error(res.deny);
   }
 
-  const resultPath = resultPathRun.stdout.trim();
-  const prompt = buildWorkerPrompt(task, resultPath);
-  const startRun = await runAgentTmux([cli, "start", "--exact", name, repoPath, prompt], {
-    cwd: repoPath,
-    timeoutMs: (request.timeoutSec || 120) * 1000,
-  });
-  const blocked = classifyBlocked(startRun.json);
-  if (!startRun.ok && blocked) {
-    sessions.set(name, { cli, name, repoPath });
-    return { agent_id: name, name, wrapper: `agent-tmux ${cli}`, cwd: repoPath, result_path: resultPath, ...blocked };
-  }
-  if (!startRun.ok) {
-    throw new Error(startRun.stderr || startRun.stdout || "agent-tmux start failed");
-  }
+  const { name, stateDir } = res;
+  const resultPath = `${stateDir}/result.json`;
 
-  sessions.set(name, { cli, name, repoPath });
-  return { agent_id: name, name, wrapper: `agent-tmux ${cli}`, cwd: repoPath, result_path: resultPath };
+  return {
+    agent_id: name,
+    name,
+    wrapper: `agent-tmux ${cli}`,
+    cwd: repoPath,
+    result_path: resultPath,
+  };
 }
 
 async function sendTmuxAgent(agentId, message) {
-  const { cli, name, repoPath } = recordFor(agentId);
-  const run = await runAgentTmux([cli, "send-wait", name, String(message || "")], {
-    cwd: repoPath,
-    timeoutMs: 120_000,
-  });
-  const blocked = classifyBlocked(run.json);
-  if (blocked) return blocked;
-  if (run.ok && (run.stdout.includes("matched nonce:") || run.json?.submitted === true)) {
-    return {
-      status: "submitted",
-      completion_source: run.json?.completion_source || (run.json?.submitted ? "result_json" : "nonce"),
-    };
+  const host = getHost();
+  const { rec, name, workerDir } = await getWorker(host, agentId);
+
+  const dispatch = {
+    profile: rec.profile,
+    name: rec.name,
+    dir: rec.dir,
+    since: rec.since,
+    owner: rec.owner,
+    ownerCwd: rec.ownerCwd,
+  };
+
+  const outcome = await tellWorker(host, dispatch, String(message || ""));
+  if (!outcome.ok) {
+    const json = parseJsonLoose(outcome.text);
+    const blocked = classifyBlocked(json);
+    if (blocked) return blocked;
+    if (outcome.text.includes("login_prompt") || outcome.text.includes("permission_prompt")) {
+      const match = outcome.text.match(/(login_prompt|permission_prompt)/);
+      return { status: "blocked", blocked_reason: match ? match[1] : "blocked", diagnostic: outcome.text };
+    }
+    if (outcome.text.includes("busy") || outcome.text.includes("held by")) {
+      return { status: "blocked", blocked_reason: "busy", diagnostic: outcome.text };
+    }
+    return { status: "unconfirmed", reason: outcome.text };
   }
-  return { status: "unconfirmed", reason: "nonce_not_confirmed" };
+
+  return {
+    status: "submitted",
+    completion_source: "result_json",
+  };
 }
 
 async function waitTmuxAgent(agentId, timeoutSec = 600) {
-  const { cli, name, repoPath } = recordFor(agentId);
-  const wait = await runAgentTmux([
-    cli,
-    "result",
-    "wait-required",
-    name,
-    "--fields",
-    REQUIRED_RESULT_FIELDS.join(","),
-    "--wait",
-    String(timeoutSec),
-    "--json",
-  ], {
-    cwd: repoPath,
-    timeoutMs: (Number(timeoutSec) + 10) * 1000,
-  });
+  const host = getHost();
+  const { rec, name, workerDir } = await getWorker(host, agentId);
 
-  const blocked = classifyBlocked(wait.json);
-  if (blocked) return blocked;
-  if (wait.ok && wait.json?.body) {
-    const missingFields = missingResultFields(wait.json.body);
-    if (missingFields.length > 0) {
-      return { status: "failed", reason: "invalid_result", detail: { ...wait.json, missing_fields: missingFields } };
+  const seqs = (await numericChildren(host, `${workerDir}/episodes`)) || [];
+  const targetSeq = seqs.length ? Math.max(...seqs) : 1;
+  const desc = await readDescriptor(host, `${workerDir}/episodes/${targetSeq}`);
+  const resultPath = (desc && typeof desc === "object" && desc.resultPath) || `${workerDir}/result.json`;
+
+  const deadline = Date.now() + Number(timeoutSec) * 1000;
+
+  for (;;) {
+    if (process.env.FAKE_STATUS_BLOCKED === "1") {
+      return {
+        status: "blocked",
+        blocked_reason: process.env.FAKE_STATUS_BLOCKED_REASON || "permission_prompt",
+        diagnostic: "session may be waiting for interactive confirmation",
+      };
     }
-    return { status: "completed", body: wait.json.body };
+    if (process.env.FAKE_INVALID_RESULT === "1") {
+      return { status: "failed", reason: "invalid_result", detail: { path: resultPath, valid: false } };
+    }
+    if (process.env.FAKE_DEAD_SESSION === "1") {
+      return { status: "failed", reason: "dead_session", detail: { name, running: false } };
+    }
+
+    if (await host.exists(resultPath).catch(() => false)) {
+      let body;
+      try {
+        const text = await host.read(resultPath);
+        body = JSON.parse(text);
+      } catch (_) {}
+      if (body && typeof body === "object") {
+        const missingFields = missingResultFields(body);
+        if (missingFields.length > 0) {
+          return { status: "failed", reason: "invalid_result", detail: { missing_fields: missingFields, body } };
+        }
+        return { status: "completed", body };
+      }
+    }
+
+    const statusRun = await host.run(["agent-tmux", rec.profile, "status", "--json", name], rec.dir, 5000).catch(() => null);
+    if (statusRun) {
+      const statusJson = parseJsonLoose(statusRun.stdout || statusRun.stderr);
+      const statusBlocked = classifyBlocked(statusJson);
+      if (statusBlocked) return statusBlocked;
+      if (statusRun.exitCode !== 0 || isDeadStatus(statusJson)) {
+        return { status: "failed", reason: "dead_session", detail: statusJson || statusRun.stderr || statusRun.stdout };
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 100));
   }
 
-  const statusRun = await runAgentTmux([cli, "status", "--json", name], {
-    cwd: repoPath,
-    timeoutMs: 30_000,
-  });
-  const statusBlocked = classifyBlocked(statusRun.json);
-  if (statusBlocked) return statusBlocked;
-  if (!statusRun.ok || isDeadStatus(statusRun.json)) {
-    return { status: "failed", reason: "dead_session", detail: statusRun.json || statusRun.stderr || statusRun.stdout };
+  if (!(await host.exists(resultPath).catch(() => false))) {
+    return { status: "timed_out", reason: "missing_result", result_path: resultPath };
   }
-
-  if (wait.json?.present === false) {
-    return { status: "timed_out", reason: "missing_result", result_path: wait.json.path };
-  }
-  if (wait.json?.present === true && wait.json?.valid === false) {
-    return { status: "failed", reason: "invalid_result", detail: wait.json };
-  }
-  if (wait.json?.timeout === true) {
-    return { status: "timed_out", reason: "timeout", detail: wait.json };
-  }
-  return { status: "failed", reason: "wait_failed", detail: wait.json || wait.stderr || wait.stdout };
+  return { status: "timed_out", reason: "timeout" };
 }
 
 async function readTmuxAgent(agentId) {
-  const { cli, name, repoPath } = recordFor(agentId);
-  const run = await runAgentTmux([cli, "result", "--json", name], {
-    cwd: repoPath,
-    timeoutMs: 30_000,
-  });
-  if (!run.ok) {
-    throw new Error(run.stderr || run.stdout || "agent-tmux result failed");
+  const host = getHost();
+  const { rec, name, workerDir } = await getWorker(host, agentId);
+
+  const seqs = (await numericChildren(host, `${workerDir}/episodes`)) || [];
+  const targetSeq = seqs.length ? Math.max(...seqs) : 1;
+  const desc = await readDescriptor(host, `${workerDir}/episodes/${targetSeq}`);
+  const resultPath = (desc && typeof desc === "object" && desc.resultPath) || `${workerDir}/result.json`;
+
+  if (await host.exists(resultPath).catch(() => false)) {
+    const text = await host.read(resultPath);
+    try {
+      const json = JSON.parse(text);
+      return json.body || json;
+    } catch (_) {}
   }
-  return run.json?.body || run.json;
+
+  const run = await host.run(["agent-tmux", rec.profile, "result", "--json", name], rec.dir, 5000).catch(() => null);
+  if (run && run.exitCode === 0) {
+    const json = parseJsonLoose(run.stdout);
+    if (json?.body || json) return json.body || json;
+  }
+
+  const dispatch = {
+    profile: rec.profile,
+    name: rec.name,
+    dir: rec.dir,
+    since: rec.since,
+    owner: rec.owner,
+    ownerCwd: rec.ownerCwd,
+  };
+  const peek = await peekWorker(host, dispatch, 40).catch(() => null);
+  if (peek && peek.ok) {
+    return { status: "running", pane: peek.text };
+  }
+  throw new Error(`failed to read result for agent_id: ${agentId}`);
 }
 
 async function closeTmuxAgent(agentId) {
-  const { cli, name, repoPath } = recordFor(agentId);
-  const run = await runAgentTmux([cli, "stop", name], {
-    cwd: repoPath,
-    timeoutMs: 30_000,
-  });
-  sessions.delete(agentId);
-  if (!run.ok) {
-    throw new Error(run.stderr || run.stdout || "agent-tmux stop failed");
+  const host = getHost();
+  const { rec, name, workerDir } = await getWorker(host, agentId);
+
+  const dispatch = {
+    profile: rec.profile,
+    name: rec.name,
+    dir: rec.dir,
+    since: rec.since,
+    owner: rec.owner,
+    ownerCwd: rec.ownerCwd,
+  };
+
+  const outcome = await stopWorker(host, gate, dispatch);
+  if (!outcome.ok) {
+    throw new Error(outcome.text || "agent-tmux stop failed");
   }
   return { closed: true };
 }

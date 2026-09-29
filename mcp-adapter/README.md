@@ -34,27 +34,16 @@ This is a managed external-worker adapter with a sub-agent-like lifecycle. It is
 
 ## Backend Contract
 
-The adapter does not invent a second orchestration model. Each operation shells out to existing commands:
+The adapter runs on the shared `workers-core` through `nodeHost`:
 
-- `agent-tmux <cli> doctor --json`
-- `agent-tmux <cli> start --exact ...`
-- `agent-tmux <cli> send-wait ...`
-- `agent-tmux <cli> status --json ...`
-- `agent-tmux <cli> result --json ...`
-- `agent-tmux <cli> result wait-required ...`
-- `agent-tmux <cli> watch --any|--all|--count ...`
-- `agent-tmux <cli> stop ...`
-- `tmux-agent-sessions resolve/list/diff/cleanup ...`
+- `spawn_tmux_agent` → `assignWorker` (reserves v5 `<base>.<5 base36>` worker identity, publishes `worker.json`, opens episode 1 on the producer route `--result-path ... --episode 1`)
+- `send_tmux_agent` → `tellWorker` (takes per-worker `.action` lock, allocates episode seq, sends via `--result-path ... --episode <seq>`)
+- `wait_tmux_agent` → result read of the opened episode descriptor's `resultPath`
+- `read_tmux_agent` → reads `result.json` if available, or pane status/capture via `peekWorker`
+- `close_tmux_agent` → `stopWorker` (takes action lock, writes `acks/cancel` for all open episodes, kills pane)
 
-Every spawned worker prompt appends the literal wrapper result path and:
+The registry is the durable `.v3` ledger (`<root>/.v3/<name>/worker.json`), not an in-memory Map: a restarted server or independent MCP process discovers the same workers and their episode descriptors.
 
-```text
-Do not spawn additional tmux sessions or delegate further.
-Do not start background jobs unless explicitly requested.
-Do not create external side effects unless explicitly authorized.
-```
-
-Completion is based on `result.json` via `result wait-required`, not pane scraping.
 
 ## Multi-Worker Pattern
 
