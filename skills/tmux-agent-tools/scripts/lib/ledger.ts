@@ -158,9 +158,26 @@ export async function currentOwner(host: Host, episode: string, gen0Owner: strin
   return { gen: g, session: complete ? text!.trim() : undefined, complete, createdMs }
 }
 
+const CLAIM_CLOSED = ['done', 'expired', 'cancel'] as const
+
+/** `true` when a closing ack exists. `unknown` = the ack dirs could not be read (not "open"). */
+async function closedForClaim(host: Host, episode: string): Promise<boolean | 'unknown'> {
+  for (const kind of CLAIM_CLOSED) {
+    const path = `${episode}/acks/${kind}`
+    try {
+      if (await host.exists(path)) return true
+    } catch (error) {
+      host.log(`tmux-agent: could not check ${path}: ${String(error)}`)
+      return 'unknown'
+    }
+  }
+  return false
+}
+
 /**
  * Contest the next claim gen for `me`. Allowed only when the current owner session is
- * non-live, or the max gen is incomplete and ORPHAN_MS old. The owner file is
+ * non-live, or the max gen is incomplete and ORPHAN_MS old. A closed episode
+ * (`acks/done|expired|cancel`) is never re-claimed. The owner file is
  * published by tmp + rename, newline-terminated, so a torn read is incomplete.
  */
 export async function claim(
@@ -171,6 +188,9 @@ export async function claim(
   me: string,
   now: number,
 ): Promise<'claimed' | 'held' | 'lost' | 'unknown'> {
+  const closed = await closedForClaim(host, episode)
+  if (closed === 'unknown') return 'unknown'
+  if (closed) return 'held'
   const cur = await currentOwner(host, episode, gen0Owner)
   if (!cur) return 'unknown'
   if (cur.complete) {

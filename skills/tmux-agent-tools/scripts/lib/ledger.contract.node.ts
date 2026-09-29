@@ -109,6 +109,22 @@ test('claim: a live owner keeps it; a dead owner is claimed by exactly one of 8 
   assert.match(owner?.session ?? '', /^c\d$/)
 })
 
+test('claim: aged owner beats on a closed episode do not open a new gen', async () => {
+  const root = fresh()
+  const ep = join(root, 'w', 'episodes', '1')
+  mkdirSync(join(ep, 'acks', 'done'), { recursive: true })
+  const dead = 'dead-session'
+  const act = join(root, '.sessions', sessionKey(dead), 'act')
+  mkdirSync(join(act, '1'), { recursive: true })
+  writeFileSync(join(act, '1.beat'), '')
+  const now = Date.now()
+  const old = (now - ORPHAN_MS - 5_000) / 1000
+  utimesSync(join(act, '1.beat'), old, old)
+  const out = await claim(host('other'), root, ep, dead, 'other', now)
+  assert.ok(out === 'held' || out === 'closed', `claim returned ${out}`)
+  assert.equal(existsSync(join(ep, 'claims')), false, 'closed episode must not gain a claim gen')
+})
+
 test('claim: an incomplete max gen is waited out for ORPHAN_MS, never promoted early', async () => {
   const root = fresh()
   const ep = join(root, 'w', 'episodes', '1')
