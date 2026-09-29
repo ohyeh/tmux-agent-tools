@@ -105,6 +105,10 @@ agent-tmux codex watch --any --timeout 600 --json w1 w2 w3
 
 Full walkthrough: `references/core-workflow.md`.
 
+## v5 ledger (non-Claude hosts)
+
+Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). Layout, ownership, and delivery are in the repository document `docs/tmux-agent-mod.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only.
+
 ## result.json completion contract
 
 Agents write `$TMUX_AGENT_DIR/<name>/result.json` with `schema_version: 1`, canonical `status` (`success|failed|blocked|needs-input`), `summary`, `artifacts`, and `errors` (optional `verdict`/`decision`, and `commit` — the full 40-hex sha when a success delivers a commit; the tmux-agent mod checks it is a commit that descends from the dispatch base (HEAD when the episode began) and delivers `commit <sha12> verified (…)` or `success claimed, commit <sha> NOT verified: <reason>`; omit it when no commit was made). The first prompt send of a session injects the literal result path (every family by default); the worker cannot rely on `$TMUX_AGENT_RESULT` inside tool sandboxes. Branch in this order — never scrape the pane when a valid result exists: `.present -> .valid -> .body`.

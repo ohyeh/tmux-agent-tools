@@ -112,7 +112,15 @@ Its credential-free `fake` participants are covered by CI; real `codex`/`claude`
 - The skill is optional: add it only if you want the model to drive `agent-tmux` from
   the shell too. Install it one way — `npx skills` or the `tmux-agent-tools` plugin, not
   both — or the same skill loads twice.
-- Codex, Cursor and other CLIs: the skill plus `install-bin`.
+- Codex, Cursor and other CLIs: the skill plus `install-bin`. They do not load
+  the Claude function-hook mod. They share its v5 ledger: one `.v3/` tree under
+  the state root, written by the same core the mod imports
+  (`skills/tmux-agent-tools/scripts/lib/workers.ts`). One collector per host
+  session is `node skills/tmux-agent-tools/scripts/lib/collector.node.ts`;
+  `cancel` and `unlock` are `node skills/tmux-agent-tools/scripts/lib/workers.cli.node.ts`.
+  Layout, ownership, and delivery are in
+  [`docs/tmux-agent-mod.md`](docs/tmux-agent-mod.md) (收集端). Bash guard
+  (`tool.call`) stays on the Claude mod only.
 
 ## Install Skill With skills.sh
 

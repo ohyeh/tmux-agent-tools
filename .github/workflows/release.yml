@@ -28,7 +28,7 @@ concurrency:
 jobs:
   validate:
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Check out main
@@ -42,6 +42,26 @@ jobs:
           brew list tmux >/dev/null 2>&1 || brew install tmux
           brew list jq >/dev/null 2>&1 || brew install jq
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
+
+      - name: Set up the core's Node floor
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.18.0
+
+      - name: Core contract tests (node 22.18.0)
+        run: scripts/test-core-contract-smoke
+
+      - name: Typecheck the mod and the shared core
+        run: scripts/test-mod-typecheck-smoke
+
+      - name: Install Claude Code for plugin test
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          echo "CLAUDE_BIN=$(npm prefix -g)/bin/claude" >> "$GITHUB_ENV"
+          "$(npm prefix -g)/bin/claude" --version
+
+      - name: Permission surface and plugin test
+        run: scripts/test-mod-permissions-smoke
 
       - name: Validate release candidate
         env:
