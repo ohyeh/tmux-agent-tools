@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFile
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  ack, acquireLock, allocateNext, claim, currentOwner, hasMark, mark, openEpisode, ORPHAN_MS, readDescriptor, recoverEpisodes,
+  ack, acquireLock, allocateNext, claim, currentOwner, hasMark, mark, openEpisode, ORPHAN_MS, publishWorker, readDescriptor, readWorker, recoverEpisodes,
   registerActivation, releaseLock, sessionKey, sessionLiveness, superseded, type Descriptor,
 } from './ledger.ts'
 import { nodeHost } from './host.node.ts'
@@ -137,7 +137,17 @@ test('activation: 8 processes register 8 distinct numbers, each with its record;
 })
 
 const desc = (seq: number, resultPath = `/r/${seq}.json`): Descriptor =>
-  ({ profile: 'codex', name: 'w', dir: '/d', since: 1, seq, owner: 'me', ownerCwd: '/d', resultPath, origin: seq === 1 ? 'launch' : 'tell' })
+  ({ seq, since: 1, resultPath, origin: seq === 1 ? 'launch' : 'tell' })
+
+test('worker record: published whole, read back; absent → undefined; torn → undefined', async () => {
+  const w = fresh()
+  assert.equal(await readWorker(host(), w), undefined)
+  const rec = { profile: 'codex', name: 'w.abcde', dir: '/d', since: 1, owner: 'me', ownerCwd: '/d', origin: 'resume' as const }
+  assert.equal(await publishWorker(host(), w, rec, 't'), true)
+  assert.deepEqual(await readWorker(host(), w), rec)
+  writeFileSync(join(w, 'worker.json'), '{"profile":')
+  assert.equal(await readWorker(host(), w), undefined)
+})
 
 test('episode: seq = max+1, the descriptor is published whole and names its own seq', async () => {
   const w = fresh()

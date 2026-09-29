@@ -226,14 +226,21 @@ export async function superseded(host: Host, sessionDir: string, n: number): Pro
 
 // ── episodes (§2, §8): allocation, immutable descriptor, markers, recovery ──────
 
-export type Descriptor = {
+/** `worker.json`: the worker's identity, published once at name reservation (assign and resume). */
+export type WorkerRecord = {
   profile: string
   name: string
   dir: string
   since: number
-  seq: number
   owner: string
   ownerCwd: string
+  origin: 'assign' | 'resume'
+}
+
+/** `episodes/<seq>/dispatch.json`: one episode; worker fields live in `worker.json`. */
+export type Descriptor = {
+  seq: number
+  since: number
   goal?: string
   resultPath: string
   origin: 'launch' | 'tell'
@@ -263,6 +270,26 @@ export async function readDescriptor(host: Host, episodeDir: string): Promise<De
   try {
     const d = JSON.parse(text) as Descriptor
     return typeof d?.seq === 'number' && typeof d.resultPath === 'string' ? d : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Publish `worker.json` right after the reservation mkdir, before any wrapper call. */
+export const publishWorker = (host: Host, workerDir: string, w: WorkerRecord, token: string) =>
+  publish(host, `${workerDir}/worker.json`, JSON.stringify(w), token)
+
+/** `undefined` = no complete record (the reservation is `incomplete`); `'unknown'` = unreadable. */
+export async function readWorker(host: Host, workerDir: string): Promise<WorkerRecord | undefined | 'unknown'> {
+  let text: string
+  try {
+    text = await host.read(`${workerDir}/worker.json`)
+  } catch {
+    return (await host.exists(`${workerDir}/worker.json`).catch(() => true)) ? 'unknown' : undefined
+  }
+  try {
+    const w = JSON.parse(text) as WorkerRecord
+    return typeof w?.profile === 'string' && typeof w.name === 'string' && typeof w.owner === 'string' ? w : undefined
   } catch {
     return undefined
   }
