@@ -11,9 +11,9 @@ export AGENT_TMUX_SUPPRESS_DEPRECATION=1
 # to real workers: a name that matched was killed, and leftovers showed up in
 # the /tmux panel (live 2026-09-25). $TMUX, set inside a tmux pane, would
 # outrank TMUX_TMPDIR, so it goes too.
-unset TMUX
+unset TMUX TMUX_PANE
 export TMUX_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/tas-tmux.XXXXXX")"
-trap 'tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+trap '[[ -n "${TMUX_TMPDIR:-}" ]] && tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
 timeout_seconds=240
 kill_after_seconds=15
 

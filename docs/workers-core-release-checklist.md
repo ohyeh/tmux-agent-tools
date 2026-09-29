@@ -37,9 +37,9 @@ D1 C is already the tree at this base. These paths must stay pointed at the root
 | `.claude-plugin/marketplace.json:14` | `"source": "./"` | plugin root is the repo root, not `./mods/tmux-agent` |
 | `.claude-plugin/plugin.json:2` | `"name": "tmux-agent"` | Claude manifest name |
 | `.claude-plugin/plugin.json:21` | `"skills": "./skills/"` | skill payload |
-| `.codex-plugin/plugin.json:2` | `"name": "tmux-agent-tools"` | does not match the marketplace plugin name; see Codex install below |
+| `.codex-plugin/plugin.json:2` | `"name": "tmux-agent"` | matches the marketplace plugin name `tmux-agent` (install id `tmux-agent@tmux-agent-tools`) |
 | `.codex-plugin/plugin.json:21` | `"skills": "./skills/"` | same skill tree |
-| `.cursor-plugin/plugin.json:2` | `"name": "tmux-agent-tools"` | Cursor manifest name |
+| `.cursor-plugin/plugin.json:2` | `"name": "tmux-agent"` | Cursor manifest name, matches marketplace entry |
 | `.cursor-plugin/plugin.json:21` | `"skills": "./skills/"` | same skill tree |
 | `hooks/hooks.json:9` | `"${CLAUDE_PLUGIN_ROOT}"/hooks/tmux-dispatch-gate.sh` | classic Bash gate |
 | `hooks/hooks.json:17` | `"modules": ["./register.ts"]` | function-hook module at the plugin root |
@@ -61,8 +61,8 @@ Node entry points (not Claude plugin paths):
 | Node floor `22.18.0` | `ci.yml:31–34` `actions/setup-node@v5` | yes, for the steps below |
 | Core contract | `ci.yml:36–37` `scripts/test-core-contract-smoke` | yes. The smoke is `scripts/test-core-contract-smoke:13–20`: floor `22.18.0`, then `node --test ./*.contract.node.ts` |
 | Collector tests | same glob | yes: `collector.contract.node.ts` matches `*.contract.node.ts`. `ledger.race.node.ts` and `workers.race.node.ts` are contender processes, not `node:test` files |
-| Launcher tests | — | no file. P7 is not in this tree |
-| TUI tests | — | no file. P6 is not in this tree |
+| Launcher tests | same glob | yes: `launcher.contract.node.ts` matches `*.contract.node.ts` (P7) |
+| TUI tests | same glob | yes: `tui.contract.node.ts` matches `*.contract.node.ts` (P6, renamed from `tui.test.node.ts` in 4463641) |
 | `claude plugin test .` | `ci.yml:522–544` installs Claude, then `scripts/run-all-smokes` | yes, indirectly. `scripts/run-all-smokes:46` globs `test-*-smoke`, which includes `scripts/test-mod-permissions-smoke:70` (`claude plugin test .`). Per-smoke timeout is `scripts/run-all-smokes:17` (240s) |
 | Typecheck | same glob | yes: `scripts/test-mod-typecheck-smoke:22` (`npx -p typescript tsc --noEmit -p tsconfig.json`). `tsconfig.json:17–18` includes `scripts/lib` and excludes `*.node.ts` |
 
@@ -70,25 +70,28 @@ Node entry points (not Claude plugin paths):
 
 ### Release workflow (landed here)
 
-Before this prep, `.github/workflows/release.yml` `validate` did not set up Node 22.18.0 and did not run the contract smoke, typecheck, or plugin test. It still does not run launcher or TUI tests, because those files are not in the tree.
+Before this prep, `.github/workflows/release.yml` `validate` did not set up Node 22.18.0 and did not run the contract smoke, typecheck, or plugin test. P6 TUI tests (`tui.contract.node.ts`) and P7 launcher tests (`launcher.contract.node.ts`) are now in the tree and executed by `test-core-contract-smoke` (`*.contract.node.ts`). Release workflow now also runs the full smoke suite (`scripts/run-all-smokes`) with private tmux isolation, and ties publish to the tested candidate SHA.
 
 | gate | file:line |
 |---|---|
-| job timeout | `release.yml:31` `timeout-minutes: 20` |
-| Node `22.18.0` | `release.yml:46–49` |
-| Core contract (includes collector contract) | `release.yml:51–52` |
-| Typecheck | `release.yml:54–55` |
-| Claude install | `release.yml:57–61` |
-| Permission surface + `claude plugin test .` | `release.yml:63–64` `scripts/test-mod-permissions-smoke` |
-| Existing candidate checks (version regex, tag absent, wrapper self-test, version-sync, session-meta, oneshot, dialogue) | `release.yml:66–94` |
-| CHANGELOG section for the tag | `release.yml:96–110` |
-| Publish (tag + GitHub release) only when `dry_run` is false | `release.yml:119–163` |
+| job timeout | `release.yml:31` `timeout-minutes: 30` |
+| Candidate SHA recording | `release.yml:42–46` `record_sha` output |
+| Node `22.18.0` | `release.yml:56–59` |
+| Core contract (includes collector, launcher, and TUI contracts) | `release.yml:61–62` |
+| Typecheck | `release.yml:64–65` |
+| Claude install | `release.yml:67–71` |
+| Permission surface + `claude plugin test .` | `release.yml:73–74` `scripts/test-mod-permissions-smoke` |
+| Smoke CLI stubs + full smoke suite (private tmux isolation) | `release.yml:76–90` `scripts/run-all-smokes` |
+| Existing candidate checks (version regex, tag absent, wrapper self-test, version-sync, session-meta, oneshot, dialogue with isolated tmux) | `release.yml:92–124` |
+| CHANGELOG section for the tag | `release.yml:126–140` |
+| Checkout tested candidate SHA & refuse if main moved | `release.yml:151–167` |
+| Publish (tag + GitHub release on tested SHA) only when `dry_run` is false | `release.yml:180–201` |
 
-`publish` does not re-run tests. `needs: validate` is the gate. Formula syntax is not a gate: the Homebrew formula was removed (`CHANGELOG.md:112`). `docs/wiki/Contributing.md:85` still mentions it. `docs/release-process.md` is not in the tree; `docs/wiki/Contributing.md:81` still points at it.
+`publish` does not re-run tests. `needs: validate` is the gate, and publish checks out the tested SHA and tags it explicitly. Formula syntax is not a gate: the Homebrew formula was removed (`CHANGELOG.md:112`). `docs/wiki/Contributing.md:85` still mentions it. `docs/release-process.md` is not in the tree; `docs/wiki/Contributing.md:81` still points at it.
 
 ## Capability matrix
 
-Contract §9 groups Codex, Cursor, and agy as one node collector. This tree has no TUI and no P7 launcher, so those cells are the contract, not a binary in this commit.
+Contract §9 groups Codex, Cursor, and agy as one node collector. P6 TUI (`tui.node.ts`) and P7 launcher (`launcher.node.ts`) are implemented in this tree.
 
 | capability | Claude mod | Codex | Cursor | agy |
 |---|---|---|---|---|
@@ -99,7 +102,7 @@ Contract §9 groups Codex, Cursor, and agy as one node collector. This tree has 
 | cancel | `/workers cancel` and `workers.cli.node.ts cancel` | `workers.cli.node.ts cancel` | same | same |
 | unlock | `/workers unlock` and `workers.cli.node.ts unlock` | `workers.cli.node.ts unlock` | same | same |
 | panel | `/workers` band | read-only snapshot (panel line / dashboard). Not a collector | same | same |
-| TUI | contract: shared keys; closing it does not stop a collector. Not in this tree | same | same | same |
+| TUI | `skills/tmux-agent-tools/scripts/lib/tui.node.ts`: shared key handling, panel rows, viewer mode | same | same | same |
 | Bash guard (`tool.call`) | yes | unsupported | unsupported | unsupported |
 
 Wake on Claude is `Host.submit`. Wake on Codex, Cursor, and agy is a tmux paste into pane id `%N`. A waiter subagent is Claude-only; other hosts get the collector delivery.
@@ -195,7 +198,7 @@ Error: plugin `tmux-agent-tools` was not found in marketplace `tmux-agent-tools`
 Error: plugin.json name `tmux-agent-tools` does not match marketplace plugin name `tmux-agent`
 ```
 
-That mismatch is `.codex-plugin/plugin.json:2` versus `.claude-plugin/marketplace.json:13`. Not changed here: renaming either id is a consumer migration.
+That historical mismatch was `.codex-plugin/plugin.json:2` (`tmux-agent-tools`) versus `.claude-plugin/marketplace.json:13` (`tmux-agent`). Resolved in R11: unified public plugin id is `tmux-agent` across `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, and `.cursor-plugin/plugin.json`.
 
 Cursor: `cursor` prints `No Cursor IDE installation found`. `agent plugin marketplace add <local path>` exit 1:
 
@@ -235,11 +238,11 @@ running the mod's test suite
 ## Left for the final P8 (after P3–P7 merge)
 
 - Bump the eight version rows above in one commit, with a new `CHANGELOG.md` `## vX.Y.Z` section. `hooks/register.ts` is in that set and is owned by the parallel mod lane until merge.
-- Decide the Codex plugin id (`tmux-agent` vs `tmux-agent-tools`) and re-run `codex plugin add`.
-- Add launcher and TUI tests to `ci.yml` and `release.yml` when P6 and P7 land their files.
+- Decided: unified public plugin id is `tmux-agent` across all manifests and marketplace entries (R11).
+- Completed: launcher and TUI contract tests landed in the tree (`launcher.contract.node.ts`, `tui.contract.node.ts`) and run in `test-core-contract-smoke` on CI and release.
 - Fold commander, dashboard, and mcp-adapter only in their lanes. Then re-run the skills payload check (`scripts/lib` must remain; `mods/` must not reappear).
 - Point `docs/wiki/Contributing.md:81` at a real release doc, and drop the Formula sentence at `:85`.
-- `docs/tmux-agent-mod.md:8` still calls the mod a second plugin. `:20` and the marketplace say there is one plugin, `tmux-agent`.
+- Updated `docs/tmux-agent-mod.md` to clarify the unified single plugin `tmux-agent` layout.
 - Operator: release workflow `dry_run: true`, then `dry_run: false` for the tag. Not from this worktree.
 - Re-run `claude --plugin-dir` on a logged-in config, and Cursor `agent plugin` after `agent login`.
 - Record the consumer `skills@<version>` pin. `1.7.0` is the probe pin, not a lockfile.

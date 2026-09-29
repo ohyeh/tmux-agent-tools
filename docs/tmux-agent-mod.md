@@ -4,7 +4,7 @@
 對帳一次 `result.json`，worker 收工時直接把結果送進你的 session —— 即使那個
 session 正閒著沒人看。
 
-這是 `tmux-agent-tools` 的第二個 plugin，跟原本的 shell plugin 並存、互不取代。
+這是整合在 `tmux-agent` 單一 plugin 中的 function-hook mod（包含 skills、Bash gate 與 mod）。
 shell 路徑（`agent-tmux ... assign` + `result wait-required`）繼續服務 codex／
 cursor 等沒有這個 mod 的 runtime。
 

@@ -110,7 +110,7 @@ Its credential-free `fake` participants are covered by CI; real `codex`/`claude`
   own marketplace checkout when `agent-tmux` is not on `PATH` (0.7.14), so no skill
   and no `install-bin` are needed.
 - The skill is optional: add it only if you want the model to drive `agent-tmux` from
-  the shell too. Install it one way — `npx skills` or the `tmux-agent-tools` plugin, not
+  the shell too. Install it one way — `npx skills` or the `tmux-agent` plugin, not
   both — or the same skill loads twice.
 - Codex, Cursor and other CLIs: the skill plus `install-bin`. They do not load
   the Claude function-hook mod. They share its v5 ledger: one `.v3/` tree under

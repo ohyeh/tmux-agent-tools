@@ -27,9 +27,18 @@ if [[ -z "$changelog_version" ]]; then
 fi
 echo "latest CHANGELOG version: $changelog_version"
 
+MARKET=.claude-plugin/marketplace.json
+market_plugin_name="$(jq -r '.plugins[0].name' "$MARKET")"
+if [[ -z "$market_plugin_name" || "$market_plugin_name" == "null" ]]; then
+  echo "  FAIL could not parse plugin name from $MARKET" >&2
+  exit 1
+fi
+
 for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json .cursor-plugin/plugin.json; do
   v="$(jq -r '.version' "$manifest")"
   assert "$manifest matches CHANGELOG" "$v" "$changelog_version"
+  m_name="$(jq -r '.name' "$manifest")"
+  assert "$manifest name matches marketplace entry" "$m_name" "$market_plugin_name"
 done
 
 # AGENT_TMUX_VERSION is what `--version` and `doctor` print — the offline signal
@@ -42,7 +51,6 @@ assert "agent-tmux AGENT_TMUX_VERSION matches CHANGELOG" "$script_version" "$cha
 # marketplace.json was the hole this smoke used to have: it passed 4/4 while
 # metadata.version sat a whole release behind (0.38.0 vs 0.39.0). It is what the
 # marketplace listing shows, so a lag there is drift users can see.
-MARKET=.claude-plugin/marketplace.json
 assert "$MARKET metadata.version matches CHANGELOG" \
   "$(jq -r '.metadata.version' "$MARKET")" "$changelog_version"
 assert "$MARKET tmux-agent entry matches CHANGELOG" \

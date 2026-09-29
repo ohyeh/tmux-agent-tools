@@ -28,7 +28,9 @@ concurrency:
 jobs:
   validate:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    outputs:
+      tested_sha: ${{ steps.record_sha.outputs.sha }}
 
     steps:
       - name: Check out main
@@ -37,11 +39,19 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Record candidate commit SHA
+        id: record_sha
+        run: |
+          tested_sha="$(git rev-parse HEAD)"
+          echo "sha=${tested_sha}" >> "$GITHUB_OUTPUT"
+          echo "Validated candidate SHA: ${tested_sha}"
+
       - name: Install runtime tools
         run: |
           brew list tmux >/dev/null 2>&1 || brew install tmux
           brew list jq >/dev/null 2>&1 || brew install jq
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
 
       - name: Set up the core's Node floor
         uses: actions/setup-node@v5
@@ -63,6 +73,22 @@ jobs:
       - name: Permission surface and plugin test
         run: scripts/test-mod-permissions-smoke
 
+      - name: Install smoke CLI stubs
+        run: |
+          stub_cli_dir="$RUNNER_TEMP/tmux-agent-tools-cli-stubs"
+          mkdir -p "$stub_cli_dir"
+          printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/claude"
+          printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/codex"
+          chmod +x "$stub_cli_dir/claude" "$stub_cli_dir/codex"
+          echo "$stub_cli_dir" >> "$GITHUB_PATH"
+
+      - name: Run full smoke suite (private tmux isolation)
+        run: |
+          unset TMUX TMUX_PANE
+          export TMUX_TMPDIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tas-rel-tmux.XXXXXX")"
+          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+          scripts/run-all-smokes
+
       - name: Validate release candidate
         env:
           VERSION: ${{ inputs.version }}
@@ -76,6 +102,9 @@ jobs:
             echo "tag already exists: ${VERSION}" >&2
             exit 1
           fi
+          unset TMUX TMUX_PANE
+          export TMUX_TMPDIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tas-rel-diag.XXXXXX")"
+          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
           zsh -n skills/tmux-agent-tools/scripts/agent-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
@@ -113,8 +142,9 @@ jobs:
         if: ${{ inputs.dry_run }}
         env:
           VERSION: ${{ inputs.version }}
+          TESTED_SHA: ${{ steps.record_sha.outputs.sha }}
         run: |
-          echo "dry run: would create annotated tag and GitHub release for ${VERSION}"
+          echo "dry run: would create annotated tag and GitHub release for ${VERSION} at commit ${TESTED_SHA}"
 
   publish:
     runs-on: macos-latest
@@ -125,13 +155,24 @@ jobs:
       contents: write
 
     steps:
-      - name: Check out main
+      - name: Check out tested candidate commit
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ needs.validate.outputs.tested_sha }}
           fetch-depth: 0
 
-      - name: Build release notes
+      - name: Refuse if main moved since validate
+        env:
+          TESTED_SHA: ${{ needs.validate.outputs.tested_sha }}
+        run: |
+          git fetch origin main
+          current_main="$(git rev-parse origin/main)"
+          if [[ "$TESTED_SHA" != "$current_main" ]]; then
+            echo "Refusing to publish: main moved since validate (tested: ${TESTED_SHA}, main tip: ${current_main})" >&2
+            exit 1
+          fi
+
+      - name: Build release notes from tested checkout
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -151,10 +192,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
+          TESTED_SHA: ${{ needs.validate.outputs.tested_sha }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$VERSION" -m "$VERSION"
+          git tag -a "$VERSION" "$TESTED_SHA" -m "$VERSION"
           git push origin "$VERSION"
           prerelease_flag=()
           if [[ "$PRERELEASE" == "true" ]]; then
