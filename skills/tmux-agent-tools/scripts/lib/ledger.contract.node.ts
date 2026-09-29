@@ -137,7 +137,7 @@ test('activation: 8 processes register 8 distinct numbers, each with its record;
 })
 
 const desc = (seq: number, resultPath = `/r/${seq}.json`): Descriptor =>
-  ({ seq, since: 1, resultPath, origin: seq === 1 ? 'launch' : 'tell' })
+  ({ seq, since: 1, owner: 'me', resultPath, origin: seq === 1 ? 'launch' : 'tell' })
 
 test('worker record: published whole, read back; absent → undefined; torn → undefined', async () => {
   const w = fresh()

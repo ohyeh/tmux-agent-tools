@@ -40,12 +40,11 @@ import {
   padCells,
   agentTmuxShown,
   runnableCwd,
-  withAgentTmux,
+  wrapperCall,
   type Panel,
   type PanelRow,
   type Gate,
   parseJson,
-  asDispatch,
   rootOf,
   readOrEmpty,
   type Finished,
@@ -195,8 +194,10 @@ export const register: Register = on => {
       submit: text => beneath.prompt.submit({ text }),
       toast: text => beneath.ui.toast(text),
       log: text => beneath.ui.log(text),
-      run: async (argv, cwd, timeoutMs) =>
-        beneath.process.run(await withAgentTmux(host, argv), { cwd: await runnableCwd(host, cwd), timeoutMs }),
+      run: async (argv, cwd, timeoutMs) => {
+        const call = await wrapperCall(host, argv)
+        return beneath.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) })
+      },
       agentList: () => listAgents(),
     }
     world = host
@@ -259,8 +260,10 @@ export const register: Register = on => {
       submit: text => $.prompt.submit({ text }),
       toast: text => $.ui.toast(text),
       log: text => $.ui.log(text),
-      run: async (argv, cwd, timeoutMs) =>
-        $.process.run(await withAgentTmux(host, argv), { cwd: await runnableCwd(host, cwd), timeoutMs }),
+      run: async (argv, cwd, timeoutMs) => {
+        const call = await wrapperCall(host, argv)
+        return $.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) })
+      },
       agentList: () => listAgents(),
     }
 
@@ -397,7 +400,7 @@ export const register: Register = on => {
     // — workers this live session dispatched (observed 2026-09-26). A paused
     // collector still goes quiet on purpose, so its workers can be adopted.
     $.clock.every(POLL_MS, async () => {
-      if (!gate.paused) await heartbeat(host)
+      if (!gate.paused) await heartbeat(host, gate)
     })
 
     // Catch up on whatever finished while no collector was alive, through the same
@@ -502,7 +505,7 @@ export const register: Register = on => {
     const layout = (sel: PanelRow | undefined) => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
+      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (gate.legacy ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
       const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
@@ -775,11 +778,7 @@ export const register: Register = on => {
                     onSubmit: (value: string) => {
                       const text = value.trim()
                       if (!text) return
-                      void act(`tell ${r.d.name}`, async host => {
-                        const root = await rootOf(host)
-                        if (!root) return { ok: false, text: 'no state root' }
-                        return tellWorker(host, root, r.d, text)
-                      })
+                      void act(`tell ${r.d.name}`, host => tellWorker(host, r.d, text))
                     },
                   }),
                 ]
@@ -842,6 +841,12 @@ export const register: Register = on => {
             }),
           ],
         }),
+      )
+    }
+    // Workers of the previous state layout: counted read-only, never collected here (§7).
+    if (gate.legacy) {
+      children.push(
+        Text({ dimColor: true, wrap: 'truncate-end', children: `legacy: ${gate.legacy} worker(s) still pending in the old state root (not collected by this version)` }),
       )
     }
 
@@ -1081,8 +1086,7 @@ export const register: Register = on => {
         } else {
           const text = message.trim() ? message : ''
           if (!text) return { text: '/workers tell <name> <text> — the message is missing.' }
-          const root = await rootOf(bound)
-          out = root ? await tellWorker(bound, root, row.d, text) : { ok: false, text: 'no state root' }
+          out = await tellWorker(bound, row.d, text)
         }
         if (panel.open) void panel.refresh?.()
         return { text: `${verb} "${row.d.name}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 300)}` }
@@ -1132,20 +1136,19 @@ export const register: Register = on => {
     if (!text) return { deny: 'tmux-agent: text is empty' }
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
-    const root = await rootOf(host)
-    const d = root && (await dispatchNamed(host, input.name))
+    const d = await dispatchNamed(host, input.name)
     if (!d && projectNamed(input.name)) return READONLY_PROJECT
-    if (!root || !d) {
+    if (!d) {
       return { deny: `tmux-agent: no worker "${input.name}" was dispatched by this mod (use the exact name the assign receipt returned, suffix included)` }
     }
-    const told = await tellWorker(host, root, d, text)
+    const told = await tellWorker(host, d, text)
     if (!told.ok) return { deny: `tmux-agent: ${told.text}` }
     const down = collectorDown(gate)
     return {
       result:
         `${told.text}. ` +
         (down
-          ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read ${root}/${d.name}/result.json with the Read tool`
+          ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read the result file named above with the Read tool`
           : 'collector: active — end the turn; a prompt arrives when it answers') +
         '.',
     }
@@ -1176,8 +1179,7 @@ export const register: Register = on => {
     }
     // The wrapper says `running` for any live pane; a terminal result.json is
     // the honest word for a worker parked at its prompt after finishing.
-    const root = await rootOf(host)
-    const raw = root ? (parseJson(await readOrEmpty(host, `${root}/${d.name}/result.json`)) as { status?: unknown } | undefined) : undefined
+    const raw = d.resultPath ? (parseJson(await readOrEmpty(host, d.resultPath)) as { status?: unknown } | undefined) : undefined
     const status = typeof raw?.status === 'string' && TERMINAL.has(raw.status) ? raw.status : undefined
     const out = await peekWorker(host, d, typeof input.lines === 'number' ? input.lines : PEEK_DEFAULT, status)
     return out.ok ? { result: out.text } : { deny: `tmux-agent: ${out.text}` }
@@ -1289,10 +1291,8 @@ export const register: Register = on => {
     if (r.deny) {
       return { deny: `${r.deny} — tmux worker "${assigned.name}" was dispatched anyway; the collector will deliver its result. Do not dispatch it again.` }
     }
-    if (r.agentId) {
-      const d = asDispatch(parseJson(await host.read(`${assigned.stateDir}/dispatch.json`)))
-      if (d) await host.write(`${assigned.stateDir}/dispatch.json`, JSON.stringify({ ...d, waiter: r.agentId }))
-    }
+    // The waiter binds the launch episode only (§2): E1 of the fresh worker.
+    if (r.agentId) await host.write(`${assigned.stateDir}/episodes/1/waiter`, JSON.stringify({ agentId: r.agentId }))
     return r
   })
 }

@@ -37,17 +37,23 @@ marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-t
 把結果丟回給人自己收，正是這個 mod 要補的洞；各 session 只投遞自己的，所以
 多個 session 同時收也不會重複。
 
-多個 session 共用的東西只有一個：已回報集合的 store（每個 plugin 一份檔案，不是
-每個 session）。它沒有原子的 read-modify-write，所以規則是**每個 session 只寫
-自己的 key**（`tmux-agent.reported.<sessionId>`），讀的時候聯集所有 key——沒有
-人能蓋掉別人的 ack，一個 worker 不會被送第二次。自己的 key 在同一個 session 裡也有
-兩個寫入者（交付與 `stop`），所以每次寫入都排進同一條序列、寫入當下重讀再改：
-`prompt.submit` 要到 turn 邊界才返回，0.7.6 的交付拿著約 80 秒前讀的清單寫回，
-蓋掉了這段時間裡兩次 `stop` 的 ack（2026-09-25 e2e；0.7.7 修）。已死 session 留下的 key、以及
-0.5.1 之前的共用 key，等它們列的目錄都不在磁碟上時才刪。
-（0.5.1 之前的剪除用「我能管的 worker」當依據，別的專案的 session 每 10 秒把你
-的 ack 剪掉、你這邊每 10 秒重送——2026-09-18 實測 131 次；0.5.1 改看磁碟，0.5.2
-再把寫入拆成每 session 一個 key。）
+多個 session 共用的是一本帳：state root 下的 `.v3/`（workers-core 合約 v6）。它不放在
+`$.store`（store 沒有原子的 read-modify-write），每一筆都是檔案系統的原子動作：
+
+- `.v3/<name>/worker.json`：worker 的身分，assign／resume 時寫一次，之後不改。
+- `.v3/<name>/episodes/<seq>/dispatch.json`：每一輪（assign 是第 1 輪，每次 `tell` 開下一輪）
+  的描述，寫一次不改：`seq`、`since`、開它的 session（第 0 代 owner）、`goal`、`base`、
+  這一輪的 `resultPath`、`origin`。
+- `episodes/<seq>/sent/`、`acks/<kind>/`：`mkdir` 建一次、不刪不剪。`acks/done|expired|cancel`
+  關掉這一輪；`acks/launch|exited|unattributed-*` 只記通知送過了。
+- `episodes/<seq>/claims/<gen>/owner`：接手孤兒時 `mkdir` 下一代，搶輸的拿到 `EEXIST`。
+- `.v3/.sessions/<sha256(sid)>/act/<n>` 加 `.beat`：每次 reload 註冊一個 activation，每次對帳
+  更新心跳；同一個 session 只有最新的 activation 收，舊的停下來並說明原因。
+- `.v3/<name>/.action`：每個 worker 一把 `ln -sn` 鎖，tell／stop／交付記帳在鎖裡做。
+
+ack 是目錄，不是 store key，所以沒有「誰蓋掉誰的 ack」，也沒有剪除與容量預算。
+0.11 以前的紀錄（state root 直下的 `<name>/dispatch.json`）不會被匯入：還有沒結清的，
+面板會多一行 `legacy: N worker(s) still pending…`，用 shell 路徑收完或手動清掉。
 
 settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽略它
 （`claude --debug` 印 unknown option），拿掉即可。
@@ -57,9 +63,9 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | 面 | 用途 |
 |---|---|
 | `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上） |
-| `fs.read/write/list/stat` | 寫只在 state root 底下：`brief.md`、`dispatch.json`、`launch.exit`、`mod-assign.log`、`result.json`、`tell-<ts>.md`、`.collector-*` 心跳。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
+| `fs.read/write/list/stat` | 寫只在 state root 的 `.v3/` 底下：`worker.json`、每輪的 `dispatch.json`／`tell.md`／`waiter`、`brief.md`、`launch.exit`、`mod-assign.log`、`result.json`、activation 心跳。建目錄、`ln -sn` 鎖、`mv` 發佈、`rm` 走 `process.run`（引擎的 `fs` 沒有 mkdir／rename）。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
 | `fs.exists` | state root 之外兩種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；以及 `resume` 找 session id 在哪個 CLI 的 store（下面 `[ + ]` 那節列的路徑）。只問「在不在」 |
-| `store.get/set/keys/delete` | 已回報集合：每個 session 自己的 key `tmux-agent.reported.<sessionId>`，讀時聯集全部（`stop` 也寫它，讓被停掉的 worker 離開面板；`delete` 只清已死 session 留下、且目錄全不在的 key） |
+| `store.get/set/keys/delete` | 只放 UI 偏好：面板開著沒（`tmux-agent.panel`）。交付帳不在 store（見上面 `.v3/`） |
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
 | `agent.spawn` | brief 有一行 `runtime: tmux/<profile>` 時派工，並把這次 Agent 呼叫改成 `tmux-waiter`（haiku、背景；清單裡看得到——`isOffered: false` 連派工也擋）。設了 `name` 則拒絕。waiter 沒註冊成功時，維持舊的拒絕。沒有那一行則原樣放行 |
 | `$.agent.register` | `session.start` 註冊 `tmux-waiter`（只有 Bash、haiku、不帶 CLAUDE.md）。失敗 log 一次，之後 runtime spawn 改回拒絕 |
@@ -97,16 +103,15 @@ Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會�
 | 工具 | 做什麼 |
 |---|---|
 | `mcp__tmux-agent__assign` | 派一個 brief 給 `<profile>`，立刻回傳；收據最後一句說 collector 會不會叫你 |
-| `mcp__tmux-agent__tell` | 對同一個 worker 再說一句（下一個任務、修正）。它會 `result init` 重設結果、把訊息連同 result 路徑送進去、把 `dispatch.json` 的 `since` 往前推——新的 id，collector 重新監看，worker 回到面板。對別的 session 派的 worker 也能用：之後它歸你，結果送你 |
+| `mcp__tmux-agent__tell` | 對同一個 worker 再說一句（下一個任務、修正）。它開下一輪 `episodes/<seq+1>/`（自己的 `result.json` 路徑與 `episode` 編號），把訊息連同這兩者送進去——collector 監看這一輪，worker 回到面板。對別的 session 派的 worker 也能用：新的一輪由你開，結果送你 |
 | `mcp__tmux-agent__stop` | 停掉 worker 並把它記為已回報，離開面板；之後不會再有任何投遞 |
 | `mcp__tmux-agent__peek` | 卡住時先看：pane 最後幾行，加上 running／idle／gone／needs input |
 | `mcp__tmux-agent__keys` | 回答 worker 停著的信任／權限對話框（只收白名單鍵）；答完用 `tell` 重送 brief |
 | `mcp__tmux-agent__panel` | 開或關 `/workers` 面板，和人打 `/workers` 同一條路 |
 | `mcp__tmux-agent__reload` | `claude plugin update` 之後，本輪結束時跑 `/reload-plugins` |
 
-**自動 stop（0.7.7）**：終態 result 已交付給**這個** session（ack 在自己的 key）、之後 30 分鐘
-沒有 `tell` 的 worker，會在一個沒有交付的 tick 被停掉——走 `stop` 同一條路，所以離開面板、ack
-照寫——並留一行 log／toast：`auto-stopped "<名字>" — its result was delivered and it had no
+**自動 stop（0.7.7）**：每一輪都已關閉（最新一輪的終態 result 已交付）、之後 30 分鐘
+沒有 `tell` 的 worker，會在一個沒有交付的 tick 被停掉——走 `stop` 同一條路，所以離開面板——並留一行 log／toast：`auto-stopped "<名字>" — its result was delivered and it had no
 tell for 30 min`。30 分鐘從派工／最後一次 tell、result 的 `finished_at`、本次載入的交付時間三者
 最晚的那個算。不會停：別的 session 的 worker、沒有終態 result.json 的（`tell` 會把它重設，也就是
 進行中的一輪）、pane 已經不在的。每個 tick 最多停一個；session 啟動那一輪不停。
@@ -149,7 +154,7 @@ result_required_fields=status,summary
 
 `tool.call` 攔 `Bash`：`agent-tmux <cli> assign|send|send-wait|stop|status|capture|probe|result`
 會被拒絕，訊息指向該用的工具（或說「collector 會叫你、`/workers` 看得到」）。
-理由是兩個：只有工具會寫 `dispatch.json`，手打的 assign collector 永遠聽不到；
+理由是兩個：只有工具會寫 `.v3/` 的帳，手打的 assign collector 永遠聽不到；
 而 status／capture／result 是第二個監督者。`--help` 放行。這個 gate 跟
 `~/.agents/hooks/tmux-assign-host-gate.sh` 守的是同一件事——那個 shell hook 是給
 沒有 mod 的 session 用的，mod 在時以 mod 為準。
@@ -177,8 +182,8 @@ result_required_fields=status,summary
 | 範圍 | 規則 |
 |---|---|
 | `/workers` 列表、`tell`、`stop`、`peek` | **同一個 repo**（`ownerCwd` 等於本 session 的 cwd，字串相等）的所有 worker，不管誰派的、派它的 session 活著沒。別人派的列上標 `@<sid 前 8 碼>`。別的 repo 的看不到。 |
-| 結果投遞 | 只送給 `owner`。owner 的心跳（`<root>/.collector-<sid>`）停超過 90 秒才算它死了，同 repo 的 collector 這時**認領**：把 `dispatch.json` 改成 `owner = 我`、`adoptedFrom = 舊 sid`，這一 tick 不送，下一 tick 只有紀錄上寫的那個 session 送。兩個 collector 同時看到同一個孤兒會各寫一次，下一 tick 讀到同一個值，只有被點名的送——不用鎖，結果只落一次（#323）。 |
-| `tell` | **誰最後對它下指令，它就歸誰**：別的 session 對你的 worker `tell`，`owner` 改成它，答案送它、不送你。 |
+| 結果投遞 | 只送給這一輪的 owner（最高一代 `claims/<gen>/owner`，沒有就是開這一輪的 session）。owner 的所有 activation 心跳停超過 90 秒（或沒有心跳、過了寬限期、確認 `ENOENT`）才算它死了；`EACCES` 等錯誤一律當 unknown，不接手。同 repo 的 collector 這時 `mkdir claims/<gen+1>` **認領**，搶輸的拿到 `EEXIST` 不送；這一 tick 不送，下一 tick 只有新 owner 送。 |
+| `tell` | **誰開的這一輪，這一輪就歸誰**：別的 session 對你的 worker `tell`，新的一輪的 owner 是它，答案送它；你已經開的輪次照樣送你。 |
 | resume | `claude --resume` 回來的 session id 不變（實測：transcript 每份只有一個 sessionId，resume 寫回同一份），所以 owner 不變、零等待。只有「關掉、另開新 session」才走 90 秒認領。 |
 
 同 repo 的判準是 cwd 字串相等：在子目錄或 worktree 開的 session 算另一個 repo。
@@ -226,10 +231,10 @@ reload 會重跑 module，面板原本會跟著關掉；0.7.10 起開著的面�
 2. 組一則 prompt（上限 20 個 worker / 16,000 字元），送出。第一筆自己就放不下時
    （摘要 fence 後變長、dir 很長），這一筆改成不帶摘要送出（摘要留在 result.json），
    不會卡住之後所有的交付
-3. **session 接受之後**才把這批寫進自己的 `tmux-agent.reported.<sessionId>`
+3. **session 接受之後**才在鎖裡 `mkdir` 這批的 ack 目錄
 
 `prompt.submit` 可能 throw，也可能正常回傳 `{ drop }` —— 兩者都不算送達。
-因此 store 掉了最多多報一次，永遠不會靜默漏報。
+因此送出後、記帳前當掉最多多報一次，永遠不會靜默漏報。
 
 連續 3 次被拒（backoff 10 秒、60 秒）後**暫停自動交付**，寫一次 log 告訴你還有
 幾筆留在磁碟上；修好原因後重啟收集端 session 即恢復。暫停期間：面板第一行寫原因；
@@ -268,15 +273,6 @@ commit」——不是這個 worker 寫的（另一條 branch 上早就在 base �
 24 小時是**結果**的窗口，不是任務壽命：以 `result.finished_at`（缺則檔案
 mtime）判定。跑了 25 小時才收工的 worker 照樣會通知你。
 
-## 已回報集合的容量
-
-每個 session 的 `tmux-agent.reported.<sessionId>` 只留「目錄還在磁碟上」的 id；目錄
-消失的 id 會在一次**完整**掃描後剪除（只剪自己的 key；別人的 key 只在它列的目錄
-全部消失時整個刪掉）。掃描途中有 I/O 錯誤就不剪 —— 讀不到不等於不存在。
-
-預算 3 MiB（engine 的 store 上限是 4 MiB）。真的塞不下時**寧可不送**也不送了
-記不住，並提示你清掉舊的 worker 目錄。
-
 ## 已驗證（真實 session，非 mock）
 
 2026-09-18，0.6.0 同 repo 多 session（`agent-tmux claude start --plugin-dir`，full）：
@@ -308,7 +304,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 - plugin 載入、`$.tmux` 掛上 engine、`assign` 工具註冊成 MCP server。
 - `mode: full` 生效，startup 對帳掃到 `TMUX_AGENT_DIR` 底下的 worker，
   `$.prompt.submit` 確實送出批次通知。
-- **同一個 worker 在第二個 session 不會再送一次** —— 已回報集合跨 session 生效。
+- **同一個 worker 在第二個 session 不會再送一次** —— 已回報集合跨 session 生效（當時是 store；現在是 `.v3/` 的 ack 目錄）。
 
 2026-09-17，互動式 session（`--plugin-dir`，全程未重開）跑完 P8 驗收，worker
 `modtest3-opqu`（codex，經 `assign` 工具派出，`dispatch.json` 在）：
@@ -402,8 +398,8 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
   看 `samples_with_capture > 0` 以及 `max_concurrent` 是否始終為 1。關閉後的
   negative 同理要用同樣長度的窗口，否則 0 沒有意義。
 - `prompt.submit` 成功只代表引擎接受並排入，不代表模型已讀懂或採取行動。
-- 跨 process 的 exactly-once 做不到：引擎沒有把 `prompt.submit` 與 `store.set`
-  綁成一筆 transaction 的 API。本 mod 的取捨是「可能重報，絕不漏報」。
+- 跨 process 的 exactly-once 做不到：`prompt.submit` 與 ack 的 `mkdir` 不是
+  同一筆 transaction。本 mod 的取捨是「可能重報，絕不漏報」。
 
 ## `/workers` 面板
 
@@ -443,7 +439,7 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 - **name**：沒給用 `<profile>-<id 前 8 碼>`，撞名就加尾碼；給了就原樣當 tmux 名
   （`--exact`），撞名拒絕——跟 `assign` 一樣，每個 worker 一個新目錄。
 
-接回後寫 `dispatch.json`（跟 `assign` 同形）和 `launch.exit`（`0`），所以它是一般的 worker
+接回後寫 `worker.json`（跟 `assign` 同形），不開任何一輪，所以它是一般的 worker
 列，`tell`／`peek`／`stop` 都找得到，不是唯讀的 `shell` 列；pane 死了會照常以 `exited`
 回報。它沒有 brief，`result.json` 不會自己寫，所以**在你 `tell` 它第一件事之前，什麼都
 不會叫醒你**，回覆裡會寫這句。
@@ -512,8 +508,8 @@ band 連「一列加它的控制」都放不下時只畫標題列和一行指令
   （你按了 stop，或它自己退出），不是「已投遞」。2026-09-17 實測：舊行為下
   assign→tell→投遞完，使用者開 `/workers` 只看到 `No workers outstanding.`，隊友明明還開著。
 - **只認自己 session 的隊友；別人的只在它死了之後接手。** assign 把 `$.session.id()`
-  寫進 dispatch.json 的 `owner`、session cwd 寫進 `ownerCwd`。每次對帳 collector 都
-  touch `<root>/.collector-<sessionId>` 當心跳；另一個 session 的 worker，只有在它的
+  寫進第 1 輪 dispatch.json 的 `owner`、session cwd 寫進 worker.json 的 `ownerCwd`。每次對帳 collector 都
+  更新自己 activation 的 `.beat` 當心跳；另一個 session 的 worker，只有在它的
   心跳超過 90 秒沒動、而且 `ownerCwd` 等於本 session cwd 時才接手（結果總得有人收）。
   同一個 repo 開多個 session 各做各的事，彼此的隊友互不干擾；session 關了，同 repo 的
   下一個 session 會把它留下的結果收回來。沒有 `owner` 的舊紀錄任何人都可接手。
@@ -579,19 +575,19 @@ stalled 紀錄，面板、log、`$.tmux.stalled()` 三者一致。閒置時鐘�
 `agent-tmux assign` 自己以非零碼結束。這是**暫定**判斷：assign 看的是 pane，而 CLI
 可能收下了 brief 卻沒顯示在 pane 上（2026-09-24：claude-fable-gate 開進 session
 picker，brief 變成背景 session，結果照樣寫出來）。所以 launch-failed 通知另記一個
-ack（`<name>@<since>#launch`），episode 不關；同一 episode 之後寫出的 terminal result
+ack（`episodes/<seq>/acks/launch/`），episode 不關；同一 episode 之後寫出的 terminal result
 一律優先於收據，照常交付一次。以前這種結果會被永遠丟掉。通知之後這個 worker 照一般
 worker 看：pane 已經不在就以 `exited` 通知一次、離開面板與 `outstanding()`（不存在的
 profile 名稱不會永遠掛在面板上），pane 還活著就照樣探測，停在 quota 或對話框時一樣會被發現。
 
 面板最上面一行說 collector 現在會不會投遞：連續三次投遞被拒而
-暫停、或已回報集合超出預算而暫停，都會印出原因與解法；沒有這一行就表示
+暫停、或這個 activation 被同 session 較新的一個（reload）取代，都會印出原因；沒有這一行就表示
 collector 活著。同一個判斷也寫進 `assign` 工具的回傳最後一句
 （`collector: active …` 或 `collector: NONE — …` 加上 `peek` 後讀 `result.json` 的路徑），
 `skills/using-tmux-agent-tools/SKILL.md` 的 COLLECTOR 一節就是拿這一句當分支條件。
 
 同一輪探測還負責第四種狀態 `exited`：status 回 `exists:false`（session 沒了），但磁碟上沒有終態
-result；下一個 tick 會以 `exited` 通知一次，記在自己的 ack（`<name>@<since>#exited`，跟
+result；下一個 tick 會以 `exited` 通知一次，記在自己的 ack（`acks/exited/`，跟
 `#launch` 一樣只關通知、不關 episode）：列離開面板，但之後如果還有遲到的 result（背景
 寫入者、延遲 flush）照樣交付一次。光看磁碟，這種 worker 跟「還在想」長得一模一樣，所以面板以前一路畫成
 `running` —— 那是在叫人去等一個永遠不會來的結果。狀態探測是這個 mod 裡唯一會

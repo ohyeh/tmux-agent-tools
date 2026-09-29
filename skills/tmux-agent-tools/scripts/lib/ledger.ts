@@ -10,10 +10,10 @@ export const ORPHAN_MS = 90_000
 
 export type Contest = 'won' | 'lost' | 'unknown'
 
-async function op(host: Host, argv: readonly string[], cwd: string) {
-  return host.run(argv, cwd, OP_MS).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+// Every op names absolute paths; `/` is a cwd that always exists (a missing parent must not fail the spawn).
+async function op(host: Host, argv: readonly string[]) {
+  return host.run(argv, '/', OP_MS).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
 }
-const parent = (path: string) => path.slice(0, path.lastIndexOf('/')) || '/'
 const exists = (stderr: string) => /File exists/i.test(stderr)
 
 function contest(host: Host, what: string, r: { exitCode: number; stderr: string }): Contest {
@@ -25,7 +25,7 @@ function contest(host: Host, what: string, r: { exitCode: number; stderr: string
 
 /** Exclusive create of one directory. The parent must exist. */
 export async function mkdirExclusive(host: Host, path: string): Promise<Contest> {
-  return contest(host, `mkdir ${path}`, await op(host, ['mkdir', path], parent(path)))
+  return contest(host, `mkdir ${path}`, await op(host, ['mkdir', path]))
 }
 
 /** Numeric children of `dir` (`1`, `2`, …), ascending. `undefined` = unknown (never "none"). */
@@ -66,7 +66,7 @@ export type Holder = { token: string; session: string; activation: string; host:
 export type Lock = { ok: true; token: string } | { ok: false; busy: Holder | 'unreadable' | 'unknown' }
 
 export async function readHolder(host: Host, lock: string): Promise<Holder | 'unreadable' | undefined> {
-  const r = await op(host, ['readlink', lock], parent(lock))
+  const r = await op(host, ['readlink', lock])
   if (r.exitCode !== 0) return undefined
   try {
     const h = JSON.parse(r.stdout.trim()) as Holder
@@ -78,7 +78,7 @@ export async function readHolder(host: Host, lock: string): Promise<Holder | 'un
 
 /** Acquire and holder publication are one `ln -sn`: a lock without a holder cannot exist. */
 export async function acquireLock(host: Host, lock: string, holder: Holder): Promise<Lock> {
-  const r = await op(host, ['ln', '-sn', JSON.stringify(holder), lock], parent(lock))
+  const r = await op(host, ['ln', '-sn', JSON.stringify(holder), lock])
   const c = contest(host, `lock ${lock}`, r)
   if (c === 'won') return { ok: true, token: holder.token }
   if (c === 'unknown') return { ok: false, busy: 'unknown' }
@@ -92,7 +92,7 @@ export async function releaseLock(host: Host, lock: string, token: string): Prom
     host.log(`tmux-agent: release of ${lock} refused: not held by ${token}`)
     return false
   }
-  const r = await op(host, ['rm', lock], parent(lock))
+  const r = await op(host, ['rm', lock])
   return r.exitCode === 0
 }
 
@@ -188,7 +188,7 @@ export async function claim(
   if (r !== 'won') return r === 'lost' ? 'lost' : 'unknown'
   const tmp = `${next}/owner.${me}.tmp`
   await host.write(tmp, `${me}\n`)
-  const mv = await op(host, ['mv', tmp, `${next}/owner`], next)
+  const mv = await op(host, ['mv', tmp, `${next}/owner`])
   return mv.exitCode === 0 ? 'claimed' : 'unknown'
 }
 
@@ -202,7 +202,7 @@ export type ActivationRecord = { pid: number; pidStart: string; host: string; to
  * mtime is its creation time (the R2-4 grace). `undefined` = could not register.
  */
 export async function registerActivation(host: Host, sessionDir: string, record: ActivationRecord): Promise<number | undefined> {
-  const mk = await op(host, ['mkdir', '-p', `${sessionDir}/act`], parent(sessionDir))
+  const mk = await op(host, ['mkdir', '-p', `${sessionDir}/act`])
   if (mk.exitCode !== 0) {
     host.log(`tmux-agent: mkdir ${sessionDir}/act: ${mk.stderr.trim() || `exit ${mk.exitCode}`}`)
     return undefined
@@ -241,7 +241,11 @@ export type WorkerRecord = {
 export type Descriptor = {
   seq: number
   since: number
+  /** The session that opened this episode: claim gen 0. A tell from another session moves the answer there. */
+  owner: string
   goal?: string
+  /** `git rev-parse HEAD` of the worker dir when the episode began, when it is a repo. */
+  base?: string
   resultPath: string
   origin: 'launch' | 'tell'
 }
@@ -254,7 +258,7 @@ let published = 0
 async function publish(host: Host, path: string, text: string, token: string): Promise<boolean> {
   const tmp = `${path}.${token}.${++published}`
   await host.write(tmp, text)
-  const mv = await op(host, ['mv', tmp, path], parent(path))
+  const mv = await op(host, ['mv', tmp, path])
   if (mv.exitCode !== 0) host.log(`tmux-agent: publish ${path}: ${mv.stderr.trim() || `exit ${mv.exitCode}`}`)
   return mv.exitCode === 0
 }

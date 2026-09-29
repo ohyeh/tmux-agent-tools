@@ -2,7 +2,7 @@
 // answer observably: no submit, no in-process agents (p0-contract.md §9).
 import { execFile } from 'node:child_process'
 import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
-import type { Host } from './workers.ts'
+import { wrapperCall, type Host } from './workers.ts'
 
 export type NodeHostOptions = {
   owner?: string
@@ -30,7 +30,7 @@ export function nodeHost(opts: NodeHostOptions = {}): Host {
     await writeFile(tmp, JSON.stringify(data))
     await rename(tmp, opts.storePath)
   }
-  return {
+  const host: Host = {
     now: async () => Date.now(),
     owner: () => opts.owner,
     cwd: () => opts.cwd,
@@ -43,7 +43,10 @@ export function nodeHost(opts: NodeHostOptions = {}): Host {
       await mkdir(path.slice(0, path.lastIndexOf('/')), { recursive: true })
       await writeFile(path, text)
     },
-    stat: async path => ({ mtimeMs: (await stat(path)).mtimeMs }),
+    stat: async path => {
+      const st = await stat(path)
+      return { mtimeMs: st.mtimeMs, size: st.size }
+    },
     exists: async path =>
       stat(path).then(
         () => true,
@@ -64,13 +67,18 @@ export function nodeHost(opts: NodeHostOptions = {}): Host {
     submit: opts.submit ?? (async () => ({ drop: 'this host cannot submit a prompt' })),
     toast: text => log(text),
     log,
-    run: (argv, cwd, timeoutMs) =>
-      new Promise(resolve => {
-        execFile(argv[0]!, argv.slice(1), { cwd, timeout: timeoutMs, encoding: 'utf8' }, (error, stdout, stderr) => {
+    // The same wrapper seam as the mod (workers.ts wrapperCall): binary + TMUX_AGENT_DIR.
+    run: async (argv, cwd, timeoutMs) => {
+      const call = await wrapperCall(host, argv)
+      const env = call.env ? { ...process.env, ...call.env } : undefined
+      return new Promise(resolve => {
+        execFile(call.argv[0]!, call.argv.slice(1), { cwd, timeout: timeoutMs, encoding: 'utf8', ...(env ? { env } : {}) }, (error, stdout, stderr) => {
           const code = error ? (typeof error.code === 'number' ? error.code : -1) : 0
           resolve({ exitCode: code, stdout, stderr: stderr || (error && typeof error.code !== 'number' ? String(error) : '') })
         })
-      }),
+      })
+    },
     agentList: async () => [],
   }
+  return host
 }
