@@ -28,6 +28,14 @@ jobs:
           brew list sqlite >/dev/null 2>&1 || brew install sqlite
           echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
+      - name: Set up the core's Node floor
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.18.0
+
+      - name: Core contract tests (node, fake Host)
+        run: scripts/test-core-contract-smoke
+
       - name: Validate shell scripts
         run: |
           scripts/lint-no-path-tied-locals

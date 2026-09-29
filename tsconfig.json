@@ -8,10 +8,12 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "jsx": "react",
     "jsxFactory": "h",
     "jsxFragmentFactory": "Fragment"
   },
-  "include": ["types", "hooks", "tests", "skills/tmux-agent-tools/scripts/lib"]
+  "include": ["types", "hooks", "tests", "skills/tmux-agent-tools/scripts/lib"],
+  "exclude": ["skills/tmux-agent-tools/scripts/lib/*.contract.ts"]
 }
