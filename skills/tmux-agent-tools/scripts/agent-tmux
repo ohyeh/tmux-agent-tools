@@ -7556,10 +7556,12 @@ runtime_blocker_phrase() {
 # usage window, a rate limit it gave up on, credentials). Three rules, each
 # from a counterexample:
 #   - the CLI's own error block only: a line that STARTS at column 0 as one
-#     (`■` banner, `⚠ Individual quota reached`, `Error:`, `API Error:`/`(`), or
-#     claude's `⎿  API Error:…`. A worker's prose ("• Implemented rate limit
-#     handling", "Error handling…" / "API Error handling…" — no colon) and a tool's output
-#     (under `⎿`/`└`, or indented beneath them) are not the CLI refusing work;
+#     (`■` banner, `⚠ Individual quota reached`, `Error:`, `API Error:`/`(`,
+#     `ActionRequiredError:`), claude's `⎿  API Error:…`, or cursor's structured
+#     `unifiedSkuWeeklyLimit: true` and `chatMessage: …` lines. A worker's prose
+#     ("• Implemented rate limit handling", "Error handling…" / "API Error handling…" — no colon)
+#     and a tool's output (under `⎿`/`└`, or indented beneath them) are not the
+#     CLI refusing work;
 #   - the LAST block only: any newer output line (`•`, `⏺`, `⎿`, `└`, `✔`, a "Worked
 #     for" rule) after the error means the worker resumed, so the banner is
 #     history however recent. Unmarked lines are the block's continuation (the
@@ -7573,11 +7575,12 @@ runtime_blocker_phrase() {
 # own — but a worker can still print a quoted `Error:` there. That is why the
 # mod words the wake-up as "looks stopped", with the line and a pointer to peek.
 # Prints "<reason><TAB><the line>", or nothing.
-# ponytail: layout verified on a live codex banner (2026-09-24). The claude/agy/grok
-# strings come from transcripts and the CLI binaries (2026-09-25); their on-screen
-# layout is UNCONFIRMED — add a row when a live pane is captured.
+# ponytail: layout verified on a live codex banner (2026-09-24) and live cursor
+# weekly-limit blocks (2026-09-29). The claude/agy/grok strings come from transcripts
+# and the CLI binaries (2026-09-25); their on-screen layout is UNCONFIRMED — add a
+# row when a live pane is captured.
 runtime_blocker_for_text() {
-  local current="$1" line body rest hit=""
+  local current="$1" line body rest hit="" structured_hit="" limit_false=false
   local -a recent
   recent=("${(@f)$(awk '
     /[^[:space:]]/ { lines[++n] = $0 }
@@ -7592,18 +7595,32 @@ runtime_blocker_for_text() {
         'API Error:'*|'API Error ('*|'Claude usage limit'*|'Claude AI usage limit'*|"You've hit your "*|'You’ve hit your '*|'Credit balance is too low'*) hit="$(runtime_blocker_phrase "$line")" ;;
         *) hit="" ;;
       esac
-    elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error:'|'API Error ('|"You've hit your "|'You’ve hit your ')* ]]; then
+    elif [[ "$body" == 'unifiedSkuWeeklyLimit:'* ]]; then
+      rest="${body#'unifiedSkuWeeklyLimit:'}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ "${rest%%[[:space:]]*}" == ('true'|'True'|'TRUE')* ]]; then
+        structured_hit="quota_exhausted"$'\t'"$line"
+      else
+        structured_hit=""
+        hit=""
+        limit_false=true
+      fi
+    elif [[ "$body" == 'chatMessage:'* ]]; then
+      if [[ "$limit_false" != true ]]; then
+        hit="$(runtime_blocker_phrase "$line")"
+      fi
+    elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error:'|'API Error ('|'ActionRequiredError:'|"You've hit your "|'You’ve hit your ')* ]]; then
       hit="$(runtime_blocker_phrase "$line")"
       # A ⚠ line is a CLI warning (an MCP server that failed to authenticate), not
       # a refusal of work: only a quota banner there stops the worker.
       [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]] && hit=""
     else
       case "$body" in
-        '•'*|'⏺'*|'✔'*|'✓'*|'↳'*|'└'*|*'Worked for '*) hit="" ;;
+        '•'*|'⏺'*|'✔'*|'✓'*|'↳'*|'└'*|*'Worked for '*) hit=""; structured_hit="" ;;
       esac
     fi
   done
-  [[ -n "$hit" ]] && print -r -- "$hit"
+  local chosen="${structured_hit:-$hit}"
+  [[ -n "$chosen" ]] && print -r -- "$chosen"
   return 0
 }
 
