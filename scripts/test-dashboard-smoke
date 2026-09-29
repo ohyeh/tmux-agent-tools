@@ -37,21 +37,7 @@ assert "totals.total numeric" "$(printf '%s' "$out" | jq -r '.totals.total | typ
 assert "sessions array" "$(printf '%s' "$out" | jq -r '.sessions | type')" "array"
 
 echo "case: snapshot includes started session"
-mkdir -p "$WORK/state/.v3/dash-test/episodes/1"
-now_ms="$(perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000')"
-jq -n \
-  --arg profile codex --arg name dash-test --arg dir "$WORK" \
-  --argjson since "$now_ms" --arg owner me --arg ownerCwd "$WORK" \
-  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd,origin:"assign"}' \
-  > "$WORK/state/.v3/dash-test/worker.json"
-jq -n \
-  --arg profile codex --arg name dash-test --arg dir "$WORK" \
-  --argjson since "$now_ms" --arg owner me --arg goal "dash test" \
-  --arg resultPath "$WORK/state/.v3/dash-test/result.json" \
-  '{seq:1,since:$since,owner:$owner,goal:$goal,resultPath:$resultPath,origin:"launch"}' \
-  > "$WORK/state/.v3/dash-test/episodes/1/dispatch.json"
-touch "$WORK/state/.v3/dash-test/episodes/1/sent"
-TMUX_AGENT_DIR="$WORK/state/.v3" CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact dash-test "$WORK" >/dev/null
+CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact dash-test "$WORK" >/dev/null
 /bin/sleep 1
 out="$("$DASH" 2>&1)"
 total="$(printf '%s' "$out" | jq -r '.totals.total')"
@@ -60,7 +46,29 @@ if (( total >= 1 )); then
 else
   echo "  FAIL total expected >=1, got $total" >&2; FAIL=$((FAIL + 1))
 fi
-TMUX_AGENT_DIR="$WORK/state/.v3" "$CODEX_TMUX" stop dash-test >/dev/null 2>&1 || true
+"$CODEX_TMUX" stop dash-test >/dev/null 2>&1 || true
+
+echo "case: snapshot includes ledger-enriched session"
+mkdir -p "$WORK/state/.v3/dash-worker/episodes/1"
+now_ms="$(perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000')"
+jq -n \
+  --arg profile codex --arg name dash-worker --arg dir "$WORK" \
+  --argjson since "$now_ms" --arg owner me --arg ownerCwd "$WORK" \
+  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd,origin:"assign"}' \
+  > "$WORK/state/.v3/dash-worker/worker.json"
+jq -n \
+  --arg profile codex --arg name dash-worker --arg dir "$WORK" \
+  --argjson since "$now_ms" --arg owner me --arg goal "dash test" \
+  --arg resultPath "$WORK/state/.v3/dash-worker/result.json" \
+  '{seq:1,since:$since,owner:$owner,goal:$goal,resultPath:$resultPath,origin:"launch"}' \
+  > "$WORK/state/.v3/dash-worker/episodes/1/dispatch.json"
+touch "$WORK/state/.v3/dash-worker/episodes/1/sent"
+CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact dash-worker "$WORK" >/dev/null
+/bin/sleep 1
+out="$("$DASH" 2>&1)"
+worker_name="$(printf '%s' "$out" | jq -r '.sessions[] | select(.name=="dash-worker") | .worker.name // empty')"
+assert "ledger-enriched entry has worker.name" "$worker_name" "dash-worker"
+"$CODEX_TMUX" stop dash-worker >/dev/null 2>&1 || true
 
 echo "case: --watch --count 1 exits"
 out="$("$DASH" --watch --count 1 --interval 1 2>&1)"

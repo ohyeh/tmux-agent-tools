@@ -22,6 +22,7 @@ import {
   TERMINAL,
   v3Of,
   type Host,
+  type TmuxDispatch,
 } from './workers.ts'
 
 export type PanelOptions = {
@@ -31,16 +32,11 @@ export type PanelOptions = {
   now?: number
 }
 
-export type DashboardOptions = {
-  host?: Host
-  now?: number
-}
-
-export type DashboardTotals = {
-  running: number
-  exited: number
-  stopped: number
-  total: number
+export type DashboardWorkerInfo = {
+  name: string
+  seq?: number
+  owner?: string
+  resultStatus?: string
 }
 
 export type DashboardSession = {
@@ -74,6 +70,21 @@ export type DashboardSession = {
   created_epoch: number | null
   age_seconds: number | null
   age: string | null
+  worker?: DashboardWorkerInfo
+}
+
+export type DashboardOptions = {
+  host?: Host
+  now?: number
+  sessions?: DashboardSession[]
+  sessionsFetcher?: (host: Host) => Promise<DashboardSession[]>
+}
+
+export type DashboardTotals = {
+  running: number
+  exited: number
+  stopped: number
+  total: number
 }
 
 export type DashboardSnapshot = {
@@ -178,137 +189,185 @@ export async function panel(opts: PanelOptions = {}): Promise<string> {
   return fitPanelLine(entries, width)
 }
 
+/** Find the absolute path to tmux-agent-sessions or fallback to PATH. */
+export async function findSessionsBin(host: Host): Promise<string> {
+  const envBin = process.env.TMUX_AGENT_SESSIONS_BIN
+  if (envBin && (await host.exists(envBin).catch(() => false))) return envBin
+  const scriptDir = resolve(fileURLToPath(import.meta.url), '../..')
+  const besideLib = resolve(scriptDir, 'tmux-agent-sessions')
+  if (await host.exists(besideLib).catch(() => false)) return besideLib
+  return 'tmux-agent-sessions'
+}
+
+/** Fetch fleet sessions via tmux-agent-sessions list --json. */
+export async function fetchFleetSessions(host: Host): Promise<DashboardSession[]> {
+  try {
+    const sessionsBin = await findSessionsBin(host)
+    const run = await host.run([sessionsBin, 'list', '--json'], (await host.cwd()) ?? process.cwd(), 10000)
+    if (run.exitCode !== 0) return []
+    const lines = run.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+    const sessions: DashboardSession[] = []
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as DashboardSession
+        if (obj && typeof obj === 'object' && obj.schema_version === 1 && typeof obj.name === 'string') {
+          sessions.push(obj)
+        }
+      } catch {}
+    }
+    return sessions
+  } catch {
+    return []
+  }
+}
+
 /**
- * Fleet JSON snapshot for all sessions. Keeps the dashboard's public contract,
- * built from read-only scan(..., { claim: false }).
+ * Fleet JSON snapshot for all sessions. Keeps the dashboard's public contract:
+ * every live agent session from the sessions list, enriched with ledger worker
+ * data from read-only scan(..., { claim: false }), plus stopped ledger workers.
  */
 export async function dashboard(opts: DashboardOptions = {}): Promise<DashboardSnapshot> {
   const host = opts.host ?? nodeHost()
   const now = opts.now ?? (await host.now())
+
+  // 1. Fleet sessions: truth of all live sessions on this machine
+  const fleetSessions: DashboardSession[] = opts.sessions
+    ? [...opts.sessions]
+    : opts.sessionsFetcher
+      ? await opts.sessionsFetcher(host)
+      : await fetchFleetSessions(host)
+
+  // 2. Scan ledger (read-only, claim: false)
   const root = await rootOf(host)
-  if (!root) {
-    return {
-      schema_version: 1,
-      at: new Date(now).toISOString(),
-      totals: { running: 0, exited: 0, stopped: 0, total: 0 },
-      sessions: [],
-    }
-  }
-  const v3 = v3Of(root)
-  if (!(await host.exists(v3).catch(() => false))) {
-    return {
-      schema_version: 1,
-      at: new Date(now).toISOString(),
-      totals: { running: 0, exited: 0, stopped: 0, total: 0 },
-      sessions: [],
+  const dispatchMap = new Map<string, { d: TmuxDispatch; resultStatus?: string }>()
+
+  if (root) {
+    const v3 = v3Of(root)
+    if (await host.exists(v3).catch(() => false)) {
+      const s = await scan(host, { claim: false })
+      for (const d of s.visible) {
+        let resultStatus: string | undefined
+        if (d.resultPath && (await host.exists(d.resultPath).catch(() => false))) {
+          const text = await readOrEmpty(host, d.resultPath)
+          const raw = parseJson(text) as { status?: unknown; body?: { status?: unknown }; episode?: unknown } | undefined
+          const st = typeof raw?.status === 'string' ? raw.status : typeof raw?.body?.status === 'string' ? raw.body.status : undefined
+          if (st && TERMINAL.has(st) && episodeMatches(raw?.episode ?? (raw as any)?.body?.episode, d.seq)) {
+            resultStatus = st
+          }
+        }
+        dispatchMap.set(d.name, { d, resultStatus })
+      }
     }
   }
 
-  const s = await scan(host, { claim: false })
-  const alive = await liveSessions(host, root)
-  const sessions: DashboardSession[] = []
+  // 3. Enrich fleet sessions with matching ledger data
+  const matchedLedgerNames = new Set<string>()
+  const finalSessions: DashboardSession[] = []
 
-  for (const d of s.visible) {
-    const exists = hasSession(alive, d)
-    let resultStatus: string | undefined
-    let done = false
-    if (d.resultPath && (await host.exists(d.resultPath).catch(() => false))) {
-      const text = await readOrEmpty(host, d.resultPath)
-      const raw = parseJson(text) as { status?: unknown; body?: { status?: unknown }; episode?: unknown } | undefined
-      const st = typeof raw?.status === 'string' ? raw.status : typeof raw?.body?.status === 'string' ? raw.body.status : undefined
-      if (st && TERMINAL.has(st) && episodeMatches(raw?.episode ?? (raw as any)?.body?.episode, d.seq)) {
-        resultStatus = st
-        done = true
+  for (const sess of fleetSessions) {
+    let match: { d: TmuxDispatch; resultStatus?: string } | undefined
+    if (dispatchMap.has(sess.name)) {
+      match = dispatchMap.get(sess.name)
+    } else {
+      for (const [name, info] of dispatchMap) {
+        if (sess.session === `${info.d.profile}-cli-${name}` || sess.session.endsWith(`-${name}`)) {
+          match = info
+          break
+        }
       }
     }
 
-    let running = false
-    let exit_detected = false
-    let exit_code: number | null = null
-    let state: 'running' | 'exited' | 'stopped' = 'stopped'
+    if (match) {
+      matchedLedgerNames.add(match.d.name)
+      const workerInfo: DashboardWorkerInfo = {
+        name: match.d.name,
+        ...(match.d.seq !== undefined ? { seq: match.d.seq } : {}),
+        ...(match.d.owner ? { owner: match.d.owner } : {}),
+        ...(match.resultStatus ? { resultStatus: match.resultStatus } : {}),
+      }
+      finalSessions.push({
+        ...sess,
+        worker: workerInfo,
+      })
+    } else {
+      finalSessions.push({ ...sess })
+    }
+  }
 
-    if (exists) {
-      if (done) {
-        if (resultStatus === 'success') {
-          running = false
-          exit_detected = false
+  // 4. Ledger workers with no live session may be listed as stopped
+  for (const [name, info] of dispatchMap) {
+    if (!matchedLedgerNames.has(name)) {
+      const d = info.d
+      const ageSec = d.since ? Math.max(0, Math.floor((now - d.since) / 1000)) : null
+      const sessionName = `${d.profile}-cli-${d.name}`
+      let exit_detected = false
+      let exit_code: number | null = null
+      let state: 'running' | 'exited' | 'stopped' = 'stopped'
+
+      if (info.resultStatus) {
+        if (info.resultStatus === 'success') {
           exit_code = 0
           state = 'stopped'
         } else {
-          running = false
           exit_detected = true
           exit_code = 1
           state = 'exited'
         }
-      } else {
-        running = true
-        exit_detected = false
-        exit_code = null
-        state = 'running'
       }
-    } else {
-      running = false
-      if (done && resultStatus !== 'success') {
-        exit_detected = true
-        exit_code = 1
-        state = 'exited'
-      } else {
-        exit_detected = false
-        exit_code = done && resultStatus === 'success' ? 0 : null
-        state = 'stopped'
-      }
-    }
 
-    const ageSec = d.since ? Math.max(0, Math.floor((now - d.since) / 1000)) : null
-    const sessionName = `${d.profile}-cli-${d.name}`
-    sessions.push({
-      schema_version: 1,
-      tool: d.profile,
-      name: d.name,
-      session: sessionName,
-      prefix: `${d.profile}-cli`,
-      exists,
-      running,
-      exit_detected,
-      exit_code,
-      local_or_remote: 'local',
-      diagnostic: null,
-      last_capture_lines: [],
-      confirmation_detected: false,
-      blocked_reason: null,
-      blocked_evidence: null,
-      started_at: d.since ? new Date(d.since).toISOString() : null,
-      last_change_at: null,
-      idle_seconds: null,
-      bytes_in_pane: null,
-      marker_seen: [],
-      state,
-      wrapper: `agent-tmux ${d.profile}`,
-      agent_name: d.name,
-      tmux_session: sessionName,
-      cwd: d.dir ?? null,
-      result_path: d.resultPath ?? '',
-      created_at: d.since ? new Date(d.since).toISOString() : null,
-      created_epoch: d.since ? Math.floor(d.since / 1000) : null,
-      age_seconds: ageSec,
-      age: ageSec !== null ? `${ageSec}s` : null,
-    })
+      finalSessions.push({
+        schema_version: 1,
+        tool: d.profile,
+        name: d.name,
+        session: sessionName,
+        prefix: `${d.profile}-cli`,
+        exists: false,
+        running: false,
+        exit_detected,
+        exit_code,
+        local_or_remote: 'local',
+        diagnostic: null,
+        last_capture_lines: [],
+        confirmation_detected: false,
+        blocked_reason: null,
+        blocked_evidence: null,
+        started_at: d.since ? new Date(d.since).toISOString() : null,
+        last_change_at: null,
+        idle_seconds: null,
+        bytes_in_pane: null,
+        marker_seen: [],
+        state,
+        wrapper: `agent-tmux ${d.profile}`,
+        agent_name: d.name,
+        tmux_session: sessionName,
+        cwd: d.dir ?? null,
+        result_path: d.resultPath ?? '',
+        created_at: d.since ? new Date(d.since).toISOString() : null,
+        created_epoch: d.since ? Math.floor(d.since / 1000) : null,
+        age_seconds: ageSec,
+        age: ageSec !== null ? `${ageSec}s` : null,
+        worker: {
+          name: d.name,
+          ...(d.seq !== undefined ? { seq: d.seq } : {}),
+          ...(d.owner ? { owner: d.owner } : {}),
+          ...(info.resultStatus ? { resultStatus: info.resultStatus } : {}),
+        },
+      })
+    }
   }
 
-  sessions.sort((a, b) => (b.created_epoch ?? 0) - (a.created_epoch ?? 0))
-
   const totals: DashboardTotals = {
-    running: sessions.filter(s => s.state === 'running').length,
-    exited: sessions.filter(s => s.state === 'exited').length,
-    stopped: sessions.filter(s => s.state === 'stopped').length,
-    total: sessions.length,
+    running: finalSessions.filter(s => s.state === 'running').length,
+    exited: finalSessions.filter(s => s.state === 'exited').length,
+    stopped: finalSessions.filter(s => s.state === 'stopped').length,
+    total: finalSessions.length,
   }
 
   return {
     schema_version: 1,
     at: new Date(now).toISOString(),
     totals,
-    sessions,
+    sessions: finalSessions,
   }
 }
 

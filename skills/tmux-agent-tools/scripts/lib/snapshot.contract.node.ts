@@ -23,12 +23,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { nodeHost } from './host.node.ts'
 import {
   dashboard,
   fitPanelLine,
   formatElapsed,
   panel,
+  type DashboardSession,
   type DashboardSnapshot,
 } from './snapshot.node.ts'
 import { scan, v3Of } from './workers.ts'
@@ -231,7 +233,7 @@ test('dashboard fixture and schema: keys, totals, and values match contract', as
   const hostEmpty = nodeHost({ cwd: '/tmp/repo' })
   process.env.TMUX_AGENT_DIR = root
   try {
-    const emptySnap = await dashboard({ host: hostEmpty, now })
+    const emptySnap = await dashboard({ host: hostEmpty, now, sessions: [] })
     assert.equal(emptySnap.schema_version, 1)
     assert.equal(typeof emptySnap.at, 'string')
     assert.deepEqual(emptySnap.totals, { running: 0, exited: 0, stopped: 0, total: 0 })
@@ -285,7 +287,7 @@ test('dashboard fixture and schema: keys, totals, and values match contract', as
     setup('w-bad', 'agy', now - 20000, 'failed')
     setup('w-ok', 'claude', now - 30000, 'success')
 
-    const snap = await dashboard({ host: hostEmpty, now })
+    const snap = await dashboard({ host: hostEmpty, now, sessions: [] })
     assert.equal(snap.schema_version, 1)
     assert.equal(snap.totals.total, 3)
     assert.equal(snap.sessions.length, 3)
@@ -339,6 +341,251 @@ test('dashboard fixture and schema: keys, totals, and values match contract', as
       snap.totals.running + snap.totals.exited + snap.totals.stopped,
       snap.totals.total,
     )
+
+    // Verify fixture file against required keys and totals
+    const fixturePath = join(fileURLToPath(new URL('.', import.meta.url)), 'fixtures/dashboard.fixture.json')
+    const fixture = JSON.parse(readFileSync(fixturePath, 'utf8')) as DashboardSnapshot
+    assert.equal(fixture.schema_version, 1)
+    assert.equal(fixture.totals.total, fixture.sessions.length)
+    assert.equal(
+      fixture.totals.running + fixture.totals.exited + fixture.totals.stopped,
+      fixture.totals.total,
+    )
+    for (const sess of fixture.sessions) {
+      assert.equal(sess.schema_version, 1)
+      for (const k of requiredKeys) {
+        assert.ok(k in sess, `missing key ${k} in fixture session ${sess.name}`)
+      }
+    }
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('fleet sessions: live session with no ledger record and session from another cwd are both in sessions', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fleet-fixture-'))
+  const v3 = v3Of(root)
+  mkdirSync(v3, { recursive: true })
+  const now = 1700000000000
+
+  // 1. Ledger worker recorded in this repo's .v3
+  const wdir = `${v3}/repo-worker`
+  mkdirSync(`${wdir}/episodes/1`, { recursive: true })
+  writeFileSync(
+    `${wdir}/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name: 'repo-worker',
+      dir: '/tmp/repo-a',
+      since: now - 5000,
+      owner: 'owner-1',
+      ownerCwd: '/tmp/repo-a',
+      origin: 'assign',
+    }),
+  )
+  writeFileSync(
+    `${wdir}/episodes/1/dispatch.json`,
+    JSON.stringify({
+      seq: 1,
+      since: now - 5000,
+      owner: 'owner-1',
+      goal: 'goal',
+      resultPath: `${wdir}/episodes/1/result.json`,
+      origin: 'launch',
+    }),
+  )
+  writeFileSync(`${wdir}/episodes/1/sent`, '')
+
+  // 2. Three fleet sessions:
+  // a) live session with NO ledger record (plain start in same cwd)
+  const plainSession: DashboardSession = {
+    schema_version: 1,
+    tool: 'claude',
+    name: 'plain-live',
+    session: 'claude-cli-plain-live',
+    prefix: 'claude-cli',
+    exists: true,
+    running: true,
+    exit_detected: false,
+    exit_code: null,
+    local_or_remote: 'local',
+    diagnostic: null,
+    last_capture_lines: [],
+    confirmation_detected: false,
+    blocked_reason: null,
+    blocked_evidence: null,
+    started_at: '2026-09-29T12:00:00Z',
+    last_change_at: null,
+    idle_seconds: 10,
+    bytes_in_pane: 100,
+    marker_seen: [],
+    state: 'running',
+    wrapper: 'agent-tmux claude',
+    agent_name: 'plain-live',
+    tmux_session: 'claude-cli-plain-live',
+    cwd: '/tmp/repo-a',
+    result_path: '/tmp/repo-a/result.json',
+    created_at: '2026-09-29T12:00:00Z',
+    created_epoch: 1790683200,
+    age_seconds: 10,
+    age: '10s',
+  }
+
+  // b) live session from ANOTHER cwd (e.g. another project)
+  const otherCwdSession: DashboardSession = {
+    schema_version: 1,
+    tool: 'agy',
+    name: 'other-cwd-live',
+    session: 'agy-cli-other-cwd-live',
+    prefix: 'agy-cli',
+    exists: true,
+    running: true,
+    exit_detected: false,
+    exit_code: null,
+    local_or_remote: 'local',
+    diagnostic: null,
+    last_capture_lines: [],
+    confirmation_detected: false,
+    blocked_reason: null,
+    blocked_evidence: null,
+    started_at: '2026-09-29T11:00:00Z',
+    last_change_at: null,
+    idle_seconds: 20,
+    bytes_in_pane: 200,
+    marker_seen: [],
+    state: 'running',
+    wrapper: 'agent-tmux agy',
+    agent_name: 'other-cwd-live',
+    tmux_session: 'agy-cli-other-cwd-live',
+    cwd: '/tmp/repo-other',
+    result_path: '/tmp/repo-other/result.json',
+    created_at: '2026-09-29T11:00:00Z',
+    created_epoch: 1790679600,
+    age_seconds: 3600,
+    age: '3600s',
+  }
+
+  // c) live session matching the ledger record in this repo
+  const matchingSession: DashboardSession = {
+    schema_version: 1,
+    tool: 'codex',
+    name: 'repo-worker',
+    session: 'codex-cli-repo-worker',
+    prefix: 'codex-cli',
+    exists: true,
+    running: true,
+    exit_detected: false,
+    exit_code: null,
+    local_or_remote: 'local',
+    diagnostic: null,
+    last_capture_lines: [],
+    confirmation_detected: false,
+    blocked_reason: null,
+    blocked_evidence: null,
+    started_at: '2026-09-29T12:00:00Z',
+    last_change_at: null,
+    idle_seconds: 5,
+    bytes_in_pane: 50,
+    marker_seen: [],
+    state: 'running',
+    wrapper: 'agent-tmux codex',
+    agent_name: 'repo-worker',
+    tmux_session: 'codex-cli-repo-worker',
+    cwd: '/tmp/repo-a',
+    result_path: `${wdir}/episodes/1/result.json`,
+    created_at: '2026-09-29T12:00:00Z',
+    created_epoch: 1790683200,
+    age_seconds: 5,
+    age: '5s',
+  }
+
+  const host = nodeHost({ cwd: '/tmp/repo-a' })
+  process.env.TMUX_AGENT_DIR = root
+
+  try {
+    const snap = await dashboard({
+      host,
+      now,
+      sessions: [plainSession, otherCwdSession, matchingSession],
+    })
+
+    // Both plain session and other-cwd session MUST be in sessions!
+    assert.equal(snap.sessions.length, 3)
+    const plain = snap.sessions.find(s => s.name === 'plain-live')
+    assert.ok(plain, 'live session with no ledger record must be in sessions')
+    assert.equal(plain.worker, undefined)
+
+    const other = snap.sessions.find(s => s.name === 'other-cwd-live')
+    assert.ok(other, 'session from another cwd must be in sessions')
+    assert.equal(other.cwd, '/tmp/repo-other')
+    assert.equal(other.worker, undefined)
+
+    const matching = snap.sessions.find(s => s.name === 'repo-worker')
+    assert.ok(matching, 'matching ledger session must be in sessions')
+    assert.equal(matching.worker?.name, 'repo-worker')
+    assert.equal(matching.worker?.seq, 1)
+
+    // Verification check: filtering sessions to ledger workers only drops plain and other-cwd
+    const ledgerOnly = snap.sessions.filter(s => s.worker)
+    assert.equal(ledgerOnly.length, 1)
+    assert.equal(ledgerOnly[0]?.name, 'repo-worker')
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('dashboard calls host.run with tmux-agent-sessions list --json when sessions not passed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fleet-run-test-'))
+  const dummy: DashboardSession = {
+    schema_version: 1,
+    tool: 'claude',
+    name: 'shell-worker',
+    session: 'claude-cli-shell-worker',
+    prefix: 'claude-cli',
+    exists: true,
+    running: true,
+    exit_detected: false,
+    exit_code: null,
+    local_or_remote: 'local',
+    diagnostic: null,
+    last_capture_lines: [],
+    confirmation_detected: false,
+    blocked_reason: null,
+    blocked_evidence: null,
+    started_at: '2026-09-29T12:00:00Z',
+    last_change_at: null,
+    idle_seconds: 10,
+    bytes_in_pane: 100,
+    marker_seen: [],
+    state: 'running',
+    wrapper: 'agent-tmux claude',
+    agent_name: 'shell-worker',
+    tmux_session: 'claude-cli-shell-worker',
+    cwd: '/tmp/repo',
+    result_path: '/tmp/repo/result.json',
+    created_at: '2026-09-29T12:00:00Z',
+    created_epoch: 1790683200,
+    age_seconds: 10,
+    age: '10s',
+  }
+  const baseHost = nodeHost({ cwd: '/tmp/repo' })
+  const host: typeof baseHost = {
+    ...baseHost,
+    run: async (argv, cwd, ms) => {
+      if (argv.some(a => a.includes('tmux-agent-sessions')) && argv.includes('list') && argv.includes('--json')) {
+        return { exitCode: 0, stdout: `${JSON.stringify(dummy)}\n`, stderr: '' }
+      }
+      return baseHost.run(argv, cwd, ms)
+    },
+  }
+  process.env.TMUX_AGENT_DIR = root
+  try {
+    const snap = await dashboard({ host })
+    assert.equal(snap.sessions.length, 1)
+    assert.equal(snap.sessions[0]?.name, 'shell-worker')
+    assert.equal(snap.totals.running, 1)
   } finally {
     delete process.env.TMUX_AGENT_DIR
     rmSync(root, { recursive: true, force: true })

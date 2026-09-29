@@ -2,10 +2,10 @@
   "schema_version": 1,
   "at": "2026-09-29T12:00:00.000Z",
   "totals": {
-    "running": 1,
+    "running": 3,
     "exited": 1,
     "stopped": 1,
-    "total": 3
+    "total": 5
   },
   "sessions": [
     {
@@ -38,7 +38,12 @@
       "created_at": "2026-09-29T11:48:00.000Z",
       "created_epoch": 1790682480,
       "age_seconds": 720,
-      "age": "720s"
+      "age": "720s",
+      "worker": {
+        "name": "worker-run",
+        "seq": 1,
+        "owner": "owner-1"
+      }
     },
     {
       "schema_version": 1,
@@ -70,7 +75,77 @@
       "created_at": "2026-09-29T07:00:00.000Z",
       "created_epoch": 1790665200,
       "age_seconds": 18000,
-      "age": "18000s"
+      "age": "18000s",
+      "worker": {
+        "name": "worker-bad",
+        "seq": 1,
+        "owner": "owner-1",
+        "resultStatus": "failed"
+      }
+    },
+    {
+      "schema_version": 1,
+      "tool": "claude",
+      "name": "plain-live",
+      "session": "claude-cli-plain-live",
+      "prefix": "claude-cli",
+      "exists": true,
+      "running": true,
+      "exit_detected": false,
+      "exit_code": null,
+      "local_or_remote": "local",
+      "diagnostic": null,
+      "last_capture_lines": [],
+      "confirmation_detected": false,
+      "blocked_reason": null,
+      "blocked_evidence": null,
+      "started_at": "2026-09-29T11:55:00.000Z",
+      "last_change_at": null,
+      "idle_seconds": 120,
+      "bytes_in_pane": 500,
+      "marker_seen": [],
+      "state": "running",
+      "wrapper": "agent-tmux claude",
+      "agent_name": "plain-live",
+      "tmux_session": "claude-cli-plain-live",
+      "cwd": "/tmp/test-repo",
+      "result_path": "/tmp/test-repo/result.json",
+      "created_at": "2026-09-29T11:55:00.000Z",
+      "created_epoch": 1790682900,
+      "age_seconds": 300,
+      "age": "300s"
+    },
+    {
+      "schema_version": 1,
+      "tool": "codex",
+      "name": "other-cwd-worker",
+      "session": "codex-cli-other-cwd-worker",
+      "prefix": "codex-cli",
+      "exists": true,
+      "running": true,
+      "exit_detected": false,
+      "exit_code": null,
+      "local_or_remote": "local",
+      "diagnostic": null,
+      "last_capture_lines": [],
+      "confirmation_detected": false,
+      "blocked_reason": null,
+      "blocked_evidence": null,
+      "started_at": "2026-09-29T10:00:00.000Z",
+      "last_change_at": null,
+      "idle_seconds": 60,
+      "bytes_in_pane": 1200,
+      "marker_seen": [],
+      "state": "running",
+      "wrapper": "agent-tmux codex",
+      "agent_name": "other-cwd-worker",
+      "tmux_session": "codex-cli-other-cwd-worker",
+      "cwd": "/tmp/other-repo",
+      "result_path": "/tmp/other-repo/result.json",
+      "created_at": "2026-09-29T10:00:00.000Z",
+      "created_epoch": 1790676000,
+      "age_seconds": 7200,
+      "age": "7200s"
     },
     {
       "schema_version": 1,
@@ -102,7 +177,13 @@
       "created_at": "2026-09-29T04:00:00.000Z",
       "created_epoch": 1790654400,
       "age_seconds": 28800,
-      "age": "28800s"
+      "age": "28800s",
+      "worker": {
+        "name": "worker-done",
+        "seq": 1,
+        "owner": "owner-1",
+        "resultStatus": "success"
+      }
     }
   ]
 }

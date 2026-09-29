@@ -86,7 +86,18 @@
           "created_at": { "type": ["string", "null"] },
           "created_epoch": { "type": ["integer", "null"] },
           "age_seconds": { "type": ["integer", "null"] },
-          "age": { "type": ["string", "null"] }
+          "age": { "type": ["string", "null"] },
+          "worker": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "seq": { "type": "integer" },
+              "owner": { "type": "string" },
+              "resultStatus": { "type": "string" }
+            }
+          }
         }
       }
     }
