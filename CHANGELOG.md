@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.42.0 - 2026-09-30
+
+- One workers core (`skills/tmux-agent-tools/scripts/lib/workers.ts`) is shared by the mod, the CLI collector, the commander, the mcp-adapter, and the TUI/launcher.
+- Those callers share the `.v3` ledger (contract v6).
+- The single public plugin id is `tmux-agent`.
+- Breaking: legacy import is removed. A pre-v5 root is not imported; pending legacy workers stay a band line.
+
 - F2: `claim()` returns held and does not mkdir a new gen when `acks/done`, `acks/expired`, or `acks/cancel` exists.
 - F3: a binding waiter holds delivery only while the `.action` holder is provably alive; a dead pid does not, and panel does not mark a skipped episode's synthesized row delivered.
 - F4: `flagStalls` drops a stall notice whose episode gained `acks/cancel`, `acks/done`, or `acks/expired` before `submit`.

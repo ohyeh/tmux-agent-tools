@@ -6,18 +6,18 @@ Contract: workers-core P0 contract v6 §9 (capability matrix) and §10 (P8 = imm
 
 ## Version strings that move together
 
-`scripts/test-version-sync-smoke` fails the release if these disagree with the first `^## vX.Y.Z` heading in `CHANGELOG.md`. Today that heading is `CHANGELOG.md:114` (`## v0.41.0 - 2026-09-18`). A release adds a newer `## vX.Y.Z` heading above it. Do not edit historical headings.
+`scripts/test-version-sync-smoke` fails the release if these disagree with the first `^## vX.Y.Z` heading in `CHANGELOG.md`. That heading is `CHANGELOG.md:5` (`## v0.42.0 - 2026-09-30`). `CHANGELOG.md:3` is an empty `## Unreleased`. Do not edit historical headings.
 
 | file:line | string | this prep |
 |---|---|---|
-| `CHANGELOG.md:114` | `## v0.41.0 - 2026-09-18` (first released heading; `CHANGELOG.md:3` is `## Unreleased`) | not bumped |
-| `.claude-plugin/plugin.json:3` | `"version": "0.41.0"` | not bumped |
-| `.codex-plugin/plugin.json:3` | `"version": "0.41.0"` | not bumped |
-| `.cursor-plugin/plugin.json:3` | `"version": "0.41.0"` | not bumped |
-| `.claude-plugin/marketplace.json:9` | `metadata.version` `0.41.0` | not bumped |
-| `.claude-plugin/marketplace.json:16` | plugin `tmux-agent` `version` `0.41.0` | not bumped |
-| `skills/tmux-agent-tools/scripts/agent-tmux:13` | `AGENT_TMUX_VERSION='0.41.0'` | not bumped |
-| `hooks/register.ts:90` | `const MOD_VERSION = '0.41.0'` | not bumped; parallel work owns this file |
+| `CHANGELOG.md:5` | `## v0.42.0 - 2026-09-30` (first `## v` heading; `CHANGELOG.md:3` is empty `## Unreleased`) | bumped |
+| `.claude-plugin/plugin.json:3` | `"version": "0.42.0"` | bumped |
+| `.codex-plugin/plugin.json:3` | `"version": "0.42.0"` | bumped |
+| `.cursor-plugin/plugin.json:3` | `"version": "0.42.0"` | bumped |
+| `.claude-plugin/marketplace.json:9` | `metadata.version` `0.42.0` | bumped |
+| `.claude-plugin/marketplace.json:16` | plugin `tmux-agent` `version` `0.42.0` | bumped |
+| `skills/tmux-agent-tools/scripts/agent-tmux:13` | `AGENT_TMUX_VERSION='0.42.0'` | bumped |
+| `hooks/register.ts:94` | `const MOD_VERSION = '0.42.0'` | bumped; version-sync compares it to the plugin manifest |
 
 The guard that reads them: `scripts/test-version-sync-smoke:23` (CHANGELOG), `:30` (three plugin manifests), `:38` (`AGENT_TMUX_VERSION`), `:46` and `:48` (marketplace metadata and the `tmux-agent` entry), `:56` (`MOD_VERSION`).
 
@@ -244,7 +244,7 @@ running the mod's test suite
 
 ## Left for the final P8 (after P3–P7 merge)
 
-- Bump the eight version rows above in one commit, with a new `CHANGELOG.md` `## vX.Y.Z` section. `hooks/register.ts` is in that set and is owned by the parallel mod lane until merge.
+- Done in this prep: the eight version rows above are `0.42.0`, under `## v0.42.0 - 2026-09-30`. `hooks/register.ts` `MOD_VERSION` moved with them because version-sync compares it to the plugin manifest. Tag and publish stay with the operator.
 - Decided: unified public plugin id is `tmux-agent` across all manifests and marketplace entries (R11).
 - Completed: launcher and TUI contract tests landed in the tree (`launcher.contract.node.ts`, `tui.contract.node.ts`) and run in `test-core-contract-smoke` on CI and release.
 - Fold commander, dashboard, and mcp-adapter only in their lanes. Then re-run the skills payload check (`scripts/lib` must remain; `mods/` must not reappear).

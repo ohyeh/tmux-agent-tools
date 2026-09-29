@@ -76,7 +76,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的 `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
 | `agent.spawn` | brief 有一行 `runtime: tmux/<profile>` 時派工，並把這次 Agent 呼叫改成 `tmux-waiter`（haiku、背景；清單裡看得到——`isOffered: false` 連派工也擋）。設了 `name` 則拒絕。waiter 沒註冊成功時，維持舊的拒絕。沒有那一行則原樣放行 |
 | `$.agent.register` | `session.start` 註冊 `tmux-waiter`（只有 Bash、haiku、不帶 CLAUDE.md）。失敗 log 一次，之後 runtime spawn 改回拒絕 |
-| `$.agent.list` | 面板開著時，跟 2 秒時鐘一起讀本 session 的 agent（含 teammate），數 `status === 'running'`，寫進標題的 `內部 M`。collector 也用同一份清單對 `dispatch.json` 的 `waiter` id。失敗顯示 `內部 ?`（面板）並 log 一次；對帳時失敗則改走 `prompt.submit` |
+| `$.agent.list` | 面板開著時，跟 2 秒時鐘一起讀本 session 的 agent（含 teammate），數 `status === 'running'`，寫進標題的 `內部 M`。collector 用同一份清單對這一輪 `episodes/<seq>/waiter` 的 `agentId`。面板上失敗顯示 `內部 ?` 並 log 一次。對帳時 `agent.list` 丟出：有 waiter 的通知留著（unknown 不是沒有 waiter），沒有 waiter 的照送。 |
 | `prompt.submit` | worker 收工時喚醒 session —— 這個 mod 唯一不可取代的能力 |
 | `clock.every` | 兩條時鐘：10 秒對帳（永遠跑），2 秒面板鏡像（只在面板開著時存在） |
 | `ui.render/resolve/invalidate` | `/workers` 面板（畫在 `AbovePrompt` band；沒有 pane，所以沒有 `ui.open/close`） |
@@ -93,12 +93,12 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會照 `assign` 派出 tmux worker，同時讓這次 Agent 呼叫繼續跑一個 haiku sub-agent（`tmux-agent:tmux-waiter`）。它只用 Bash，一次一個迴圈、每次不超過 540 秒（Bash timeout `600000`），每 5 秒看一次絕對路徑的 `result.json`（要到終態 status；agent-tmux 開工時先寫一份 `pending`）與 `launch.exit`，總共最多 60 分鐘，然後只回答 worker 名字、狀態、摘要和 result 路徑。
 
-原生 sub-agent 列，以及只看主 transcript 裡名為 `Agent`／`Task` 的 tool_use 的 claude-hud，因此跟 worker 同時存在。`dispatch.json` 上記下 waiter 的 id 之後，collector 的規則是：
+原生 sub-agent 列，以及只看主 transcript 裡名為 `Agent`／`Task` 的 tool_use 的 claude-hud，因此跟 worker 同時存在。runtime spawn 在 action lock 裡先把 `{binding:true, token}` 寫進 `episodes/1/waiter`，`next()` 回來後改成 `agentId`。collector 的規則是：
 
 - waiter 還是 `running`：不 `prompt.submit`，也不 ack
 - waiter `completed` 且 result 已是終態：靜默 ack（它的 `turn.complete` 就是交付），之後的 tick 不再喚醒
 - waiter `failed`、`killed`、或清單裡已經沒有（例如 reload 之後）：照舊喚醒一次
-- `$.agent.list` 失敗：照舊喚醒，並 log 一次
+- `$.agent.list` 失敗：有 waiter 的通知不送，沒有 waiter 的照送，並 log 一次
 
 這行 spawn 不可以帶 `name`（有名字會變成閒置的 teammate，永遠不會 `completed`）。拿掉 runtime 那一行之後，brief 仍要有 GOAL、ACCEPTANCE、REPORT。`assign` 工具本身的行為不變。
 
@@ -355,6 +355,13 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 ## 已知邊界
 
 - A cancel that lands during an in-flight pass does not stop that pass's submit. `cancelEpisode` writes `acks/cancel` under the lock. `stillOurs` re-reads the owner and the activation, not the acks. `reconcile` submits before `ackFinished`. Collect can already have built the notice; cancel runs; submit still runs once. Same window as §4 “a submit already past its last check may still land”. The next tick sees `cancel` and does not deliver again. (P2 gate r2, R2-8.)
+- The lock holder pid is `$PPID` of a `/bin/sh` probe (`processId`, `skills/tmux-agent-tools/scripts/lib/workers.ts:2566`). In the collector that pid is the node process; in the engine it is UNCONFIRMED that it is the engine and not a short-lived intermediate. `unlock` also requires the holder's session to be non-live (`unlockWorker`, `workers.ts:2652`), and the waiter `binding` hold (`waiterOf` / `holderProvablyAlive`, `workers.ts:861` and `:838`) is released when that pid is provably gone — if the recorded pid is an intermediate, a binding can be released during the spawn window and E1 may be delivered by both the waiter and the collector (one extra re-report).
+- `holderProvablyAlive` treats a `ps` exit other than 0 with empty output as the pid gone (`workers.ts:849`).
+- The launcher steals a stale collector lock after 5 seconds (`LOCK_STALE_MS`, `skills/tmux-agent-tools/scripts/lib/launcher.node.ts:47`, used at `:122`).
+- Contract §2 `current` is not written. `allocateNext` takes one past the max listed seq (`skills/tmux-agent-tools/scripts/lib/ledger.ts:50`).
+- The wrapper half of “a late launch-lifecycle fold after tell E2 lands at the launch path only” is traced in `agent-tmux` (`reconcile_launch_envelope`, `skills/tmux-agent-tools/scripts/agent-tmux:3672`, which folds `$(agent_root_dir)/$name/result.json`). It is not a tested p2-matrix row. The core observation is `workers.contract.node.ts:687`.
+- Commander `collect` is started with `TMUX` unset (`skills/tmux-agent-tools/scripts/tmux-agent-commander:256` and `:376`) and then calls `tmux` with no `-S`, so the socket is the `TMUX_TMPDIR` default. `scripts/test-commander-smoke` isolates that with a private `TMUX_TMPDIR` (`:32`) plus a `-S` shim (`:37`, `:125`).
+- `.github/workflows/release.yml` has not run on GitHub yet. The Codex install with id `tmux-agent` was verified once before the last manifest change and has not been re-run.
 - `mock.clock` **確實**驅動 plugin 的 `$.clock.every`（本 mod 只用 `every`，
   沒有用到 `after`）：tick、面板的 2 秒
   mirror clock 都是用 `clock.advance()` 在單元測試裡

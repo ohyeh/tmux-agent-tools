@@ -91,7 +91,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.41.0'
+const MOD_VERSION = '0.42.0'
 
 // Tool names as literals here: the engine resolves a `tool.call` matcher only
 // from a constant in this file (imported ones validate as `tool=?`). The core

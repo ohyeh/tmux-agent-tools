@@ -206,7 +206,8 @@ emit_wrapper_session_json() {
     codex) prefix="$CODEX_PREFIX" ;;
     agy) prefix="$AGY_PREFIX" ;;
   esac
-  local -a status_cmd=("${wrapper[@]}" status)
+  local -a status_cmd
+  status_cmd=("${wrapper[@]}" status)
   if (( NO_WRITE )) || [[ -n "${TMUX_AGENT_NO_WRITE:-}" ]]; then
     status_cmd+=(--no-write)
   fi

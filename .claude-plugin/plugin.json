@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent",
-  "version": "0.41.0",
+  "version": "0.42.0",
   "description": "tmux wrappers, a skill and a Claude Code function-hook mod for running Claude Code, Codex, Cursor, agy or grok CLI workers as supervised tmux teammates: dispatch from an MCP tool, the /workers panel, and a collector that wakes the session when a worker finishes or fails to launch. The skills also install via npx skills for other CLIs.",
   "author": {
     "name": "PaulYeh",
