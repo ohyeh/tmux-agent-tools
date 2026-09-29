@@ -768,6 +768,10 @@ export type Scan = {
   /** Worker dirs holding an episode without `sent`, or an incomplete one: recovery under the lock (§8). */
   unsent: string[]
   complete: boolean
+  /** Errno or Error name when the v3 root could not be checked or listed. */
+  error?: string
+  /** Names whose visible row was synthesized because an episode was skipped as UNKNOWN. */
+  withheld: Set<string>
 }
 
 /** Same repo = same cwd string, the field `assign` stamped; a record without one is anyone's. */
@@ -827,11 +831,32 @@ async function ackNames(host: Host, dir: string): Promise<string[] | undefined> 
 }
 
 /**
+ * Same probe as `unlock`: `TZ=UTC LC_ALL=C` lstart. `true` = this holder instance
+ * is still running. `false` = same host and the pid is absent or its lstart differs.
+ * `undefined` = not provable (unknown is not gone).
+ */
+async function holderProvablyAlive(host: Host, holder: Holder): Promise<boolean | undefined> {
+  if (!holder.host || !(holder.pid > 0) || !holder.pidStart) return undefined
+  const me = await processId(host)
+  if (!me.host || holder.host !== me.host) return undefined
+  const ps = await host
+    .run(['/bin/sh', '-c', 'TZ=UTC LC_ALL=C ps -o lstart= -p "$1"', 'ps', String(holder.pid)], '/', 5_000)
+    .catch(() => undefined)
+  if (!ps) return undefined
+  const start = ps.stdout.trim()
+  if (ps.exitCode === 0 && start === holder.pidStart) return true
+  if (ps.exitCode === 0 && start && start !== holder.pidStart) return false
+  if (ps.exitCode !== 0 && !start) return false
+  return undefined
+}
+
+/**
  * Waiter id, `undefined` when there is none, or UNKNOWN when this pass must not
- * deliver. A binding record holds delivery only while the lock that wrote it is
- * still the current `.action` holder (same token, or a tokenless record under a
- * held lock). Lock released, gone, or a different token → no waiter. An
- * unreadable lock is UNKNOWN (unknown is not absent).
+ * deliver. A binding record holds delivery only while its `.action` holder is
+ * provably alive (same token, or a tokenless record under a held lock, and the
+ * holder's pid still has the recorded lstart). Lock released, gone, a different
+ * token, or a pid that is provably dead → no waiter. An unreadable lock or an
+ * unprovable holder is UNKNOWN (unknown is not absent).
  */
 async function waiterOf(host: Host, dir: string, workerDir: string): Promise<string | undefined | typeof UNKNOWN> {
   const text = await readOrAbsent(host, `${dir}/waiter`)
@@ -843,7 +868,15 @@ async function waiterOf(host: Host, dir: string, workerDir: string): Promise<str
   if (holder === 'unreadable') return UNKNOWN
   if (!holder) return undefined
   if (typeof w.token === 'string' && w.token && holder.token !== w.token) return undefined
+  if ((await holderProvablyAlive(host, holder)) === false) return undefined
   return UNKNOWN
+}
+
+function errorClass(error: unknown): string {
+  if (typeof error === 'object' && error && 'code' in error && typeof (error as { code: unknown }).code === 'string') {
+    return (error as { code: string }).code
+  }
+  return error instanceof Error ? error.name : 'Error'
 }
 
 /**
@@ -852,18 +885,25 @@ async function waiterOf(host: Host, dir: string, workerDir: string): Promise<str
  * view passes false and writes nothing (workers-core C3).
  */
 export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> {
-  const empty = (): Scan => ({ dispatches: [], visible: [], episodes: new Map(), reported: new Set(), acked: new Map(), quiet: [], unsent: [], complete: false })
+  const empty = (): Scan => ({ dispatches: [], visible: [], episodes: new Map(), reported: new Set(), acked: new Map(), quiet: [], unsent: [], complete: false, withheld: new Set() })
   const now = await host.now()
   const root = await rootOf(host)
   if (!root) return empty()
   const v3 = v3Of(root)
-  if (!(await host.exists(v3).catch(() => false))) return { ...empty(), complete: true }
+  let present: boolean
+  try {
+    present = await host.exists(v3)
+  } catch (error) {
+    host.log(`tmux-agent: could not check ${v3}: ${String(error)}`)
+    return { ...empty(), complete: false, error: errorClass(error) }
+  }
+  if (!present) return { ...empty(), complete: true }
   let entries: readonly { name: string; kind: string }[]
   try {
     entries = await host.list(v3)
   } catch (error) {
     host.log(`tmux-agent: could not list ${v3}: ${String(error)}`)
-    return empty()
+    return { ...empty(), complete: false, error: errorClass(error) }
   }
   const out = { ...empty(), complete: true }
   const claimed = new Map<string, string[]>()
@@ -891,6 +931,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
     const eps: TmuxDispatch[] = []
     const acked = new Set<string>()
     let open = 0
+    let skippedUnknown = false
     for (const seq of seqs) {
       const dir = `${w}/episodes/${seq}`
       if (await hasMark(host, dir, 'aborted').catch(() => false)) continue
@@ -927,6 +968,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
       // A waiter we cannot read may still be running: deliver nothing for it this pass.
       if (waiter === UNKNOWN) {
         out.complete = false
+        skippedUnknown = true
         continue
       }
       const d: TmuxDispatch = {
@@ -964,7 +1006,8 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
       ...(rec.ownerCwd ? { ownerCwd: rec.ownerCwd } : {}),
       seq: 0,
     }
-    if (!eps.length) out.reported.add(idOf(latest))
+    if (!eps.length && !skippedUnknown) out.reported.add(idOf(latest))
+    if (!eps.length && skippedUnknown) out.withheld.add(rec.name)
     out.visible.push(latest)
     let ours = false
     for (const d of eps.length ? eps : [latest]) {
@@ -1372,7 +1415,7 @@ export async function flagStalls(
   wake = true,
 ): Promise<void> {
   const deadline = (await host.now()) + STALL_SWEEP_MS
-  const woken: { id: string; text: string }[] = []
+  const woken: { id: string; d: TmuxDispatch; text: string }[] = []
   // State is kept for every worker still outstanding — one this pass did not
   // reach keeps what it had — and only `live` (read, no terminal result) is probed.
   const seen = new Set(outstanding.map(idOf))
@@ -1488,6 +1531,7 @@ export async function flagStalls(
       if (gate.stallNoticed.has(id)) continue
       woken.push({
         id,
+        d,
         text:
           `- "${d.name}" on ${d.profile}: stalled for ${minutes} min — ${evidence}\n` +
           `  ${shown(row.diagnostic) || 'if the pane confirms it, nothing arrives until someone acts'}\n` +
@@ -1509,23 +1553,31 @@ export async function flagStalls(
     )
   }
   if (!wake || !woken.length) return
-  // Once per episode per activation: the notice set lives in memory, so a reload
-  // or an adopting collector may say it once more. A refusal is retried on the
-  // next tick and given up on — logged, the panel still showing the row as
-  // stalled — after STALL_WAKE_MAX of them.
+  // stop can land after the status probe and before this submit. A closed
+  // episode has nothing to report.
+  const still: typeof woken = []
+  for (const item of woken) {
+    const seq = item.d.seq
+    if (seq) {
+      const names = await ackNames(host, `${root}/${item.d.name}/episodes/${seq}`)
+      if (names?.some(n => CLOSED_ACKS.includes(n))) continue
+    }
+    still.push(item)
+  }
+  if (!still.length) return
   const text = [
     // "Looks": the evidence is one line of pane text, which a worker quoting an
     // error at column 0 can also produce — the notice says what was seen and
     // where to look, not that the result cannot come.
-    `tmux-agent: ${woken.length} worker(s) look stopped by their CLI — peek at the pane before waiting on a result.`,
-    ...woken.map(w => w.text),
+    `tmux-agent: ${still.length} worker(s) look stopped by their CLI — peek at the pane before waiting on a result.`,
+    ...still.map(w => w.text),
   ].join('\n')
   const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error) }))
   if (!answer?.drop) {
-    for (const w of woken) gate.stallNoticed.add(w.id)
+    for (const w of still) gate.stallNoticed.add(w.id)
     return
   }
-  for (const w of woken) {
+  for (const w of still) {
     const drops = (gate.stallDrops.get(w.id) ?? 0) + 1
     gate.stallDrops.set(w.id, drops)
     if (drops < STALL_WAKE_MAX) continue
@@ -1655,12 +1707,14 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
   const beats = new Map<string, boolean>()
   const v3 = root && v3Of(root)
   // Every teammate of this repo, whoever dispatched it: see `Scan.visible`.
-  const { visible: dispatches, reported } = await scan(host, { claim: false })
+  const scanned = await scan(host, { claim: false })
+  const { visible: dispatches, reported, withheld } = scanned
   // A teammate whose result was already delivered is still a teammate: while
   // its pane is alive you can tell it more or stop it, so it stays listed as
   // `delivered`. Once the pane is gone (stopped, or exited on its own) the row
   // goes with it — that, not delivery, is what ends a worker's presence here.
-  const delivered = dispatches.filter(d => settled(reported, d))
+  // A row synthesized because an episode was skipped as UNKNOWN is not delivered.
+  const delivered = dispatches.filter(d => settled(reported, d) && !withheld.has(d.name))
   const alive = delivered.length ? await liveSessions(host, delivered[0]!.dir, gate) : new Set<string>()
   const live = dispatches.filter(d => !settled(reported, d) || hasSession(alive, d))
   const rows: PanelRow[] = []
@@ -1699,7 +1753,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       d,
       state: failed
         ? 'launch-failed'
-        : reported.has(id)
+        : reported.has(id) && !withheld.has(d.name)
           ? 'delivered'
           : done
             ? 'finished'

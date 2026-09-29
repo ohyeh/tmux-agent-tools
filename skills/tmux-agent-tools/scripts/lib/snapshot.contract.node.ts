@@ -10,7 +10,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
@@ -998,10 +998,10 @@ test('finding R6: ledger read error is surfaced and not suppressed', async () =>
   }
 
   try {
-    // In panel: must not swallow error and return 'tmux-agent: no workers'
-    await assert.rejects(async () => {
-      await panel({ host: errorHost, session: 'owner' })
-    }, /EACCES/)
+    const line = await panel({ host: errorHost, session: 'owner' })
+    assert.match(line, /ledger incomplete/)
+    assert.match(line, /EACCES/)
+    assert.doesNotMatch(line, /no workers/)
 
     // In dashboard: must mark incomplete and surface diagnostic
     const snap = await dashboard({ host: errorHost, sessions: [] })
@@ -1010,6 +1010,38 @@ test('finding R6: ledger read error is surfaced and not suppressed', async () =>
     assert.equal(snap.at, undefined)
   } finally {
     delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('finding F5: panel CLI prints ledger incomplete and exits 1, never no workers', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'panel-f5-'))
+  const v3 = join(root, '.v3', 'w.abcde')
+  mkdirSync(v3, { recursive: true })
+  writeFileSync(join(v3, 'worker.json'), '{"profile":"codex","name":"w.abcde"}\n')
+  chmodSync(join(root, '.v3'), 0o000)
+  const script = fileURLToPath(new URL('./snapshot.node.ts', import.meta.url))
+  const run = await new Promise<{ code: number; out: string; err: string }>(resolve => {
+    execFile(
+      process.execPath,
+      ['--experimental-strip-types', script, 'panel'],
+      { env: { ...process.env, TMUX_AGENT_DIR: root }, encoding: 'utf8' },
+      (error, stdout, stderr) => {
+        resolve({
+          code: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
+          out: stdout ?? '',
+          err: stderr ?? '',
+        })
+      },
+    )
+  })
+  try {
+    assert.doesNotMatch(run.out, /no workers/, run.out)
+    assert.match(run.out, /ledger incomplete/)
+    assert.match(run.out, /EACCES/)
+    assert.equal(run.code, 1)
+  } finally {
+    chmodSync(join(root, '.v3'), 0o755)
     rmSync(root, { recursive: true, force: true })
   }
 })

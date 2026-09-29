@@ -140,10 +140,11 @@ export async function panel(opts: PanelOptions = {}): Promise<string> {
   const now = opts.now ?? (await host.now())
   const root = await rootOf(host)
   if (!root) return 'tmux-agent: no workers'
-  const v3 = v3Of(root)
-  if (!(await host.exists(v3))) return 'tmux-agent: no workers'
 
   const s = await scan(host, { claim: false })
+  if (!s.complete && (s.error || s.visible.length === 0)) {
+    return `tmux-agent: ledger incomplete: ${s.error ?? 'unknown'}`
+  }
   const activeEntries: { since: number; entry: string }[] = []
   const deliveredEntries: { since: number; entry: string }[] = []
 
@@ -152,7 +153,7 @@ export async function panel(opts: PanelOptions = {}): Promise<string> {
     if (opts.session && !d.owner) continue
 
     const id = idOf(d)
-    const isDelivered = s.reported.has(id)
+    const isDelivered = s.reported.has(id) && !s.withheld.has(d.name)
 
     let mark: string
     if (isDelivered) {
@@ -282,8 +283,8 @@ export async function dashboard(opts: DashboardOptions = {}): Promise<DashboardS
       try {
         const s = await scan(host, { claim: false })
         if (!s.complete) {
-          ledgerError = { message: `ledger scan incomplete for ${v3}` }
-          host.log?.(`tmux-agent: ledger scan incomplete for ${v3}`)
+          ledgerError = { message: s.error ? `ledger scan incomplete: ${s.error}` : `ledger scan incomplete for ${v3}` }
+          host.log?.(`tmux-agent: ledger scan incomplete for ${v3}${s.error ? `: ${s.error}` : ''}`)
         }
         for (const d of s.visible) {
           let resultStatus: string | undefined
@@ -447,6 +448,7 @@ async function main(): Promise<void> {
     }
     const line = await panel({ session, width })
     process.stdout.write(`${line}\n`)
+    if (line.startsWith('tmux-agent: ledger incomplete')) process.exit(1)
   } else if (cmd === 'dashboard') {
     let watch = false
     let interval = 2

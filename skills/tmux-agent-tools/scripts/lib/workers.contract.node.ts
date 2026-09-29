@@ -5,11 +5,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, heartbeat, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, flagStalls, heartbeat, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
+import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
@@ -960,4 +961,88 @@ test('a send blocked past ORPHAN_MS does not lose ownership while its beat still
     release()
     await telling
   }
+})
+
+test('finding F3: dead holder pid with a live session delivers finished E1 once', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  assert.equal(await heartbeat(w.host, gate), true)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const me = await processId(w.host)
+  assert.ok(me.host && me.pid > 0, JSON.stringify(me))
+  const holder = { token: 'dead-token', session: 'me', activation: '1', host: me.host, pid: 2147483646, pidStart: 'Thu Jan  1 00:00:00 1970' }
+  symlinkSync(JSON.stringify(holder), `${r.stateDir}/.action`)
+  await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: 'dead-token' }))
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1, 'finished E1 is delivered')
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1, 'delivered exactly once')
+})
+
+test('finding F3: unprovable holder delivers nothing and the row is not shown as delivered', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  assert.equal(await heartbeat(w.host, gate), true)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const holder = { token: 'dead-token', session: 'me', activation: '1', host: 'not-this-host', pid: 2147483646, pidStart: 'Thu Jan  1 00:00:00 1970' }
+  symlinkSync(JSON.stringify(holder), `${r.stateDir}/.action`)
+  await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: 'dead-token' }))
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 0)
+  const line = await panel({ host: w.host, session: 'me', width: 200 })
+  assert.doesNotMatch(line, /delivered/, line)
+  const s = await scan(w.host, { claim: false })
+  assert.equal(s.reported.has(`${r.name}#0`), false, `reported ${[...s.reported].join(',')}`)
+  const rows = await panelRows(w.host, newGate(), w.root)
+  assert.ok(rows.every(row => row.state !== 'delivered'), rows.map(row => row.state).join(','))
+})
+
+test('finding F4: stop inside the status probe submits no stall notice', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const gate = newGate()
+  let cancelBeforeSubmit = false
+  const host: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'agent-tmux' && argv.includes('status')) {
+        await stopWorker(w.host, gate, d)
+        cancelBeforeSubmit = existsSync(`${r.stateDir}/episodes/1/acks/cancel`)
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            exists: true,
+            running: true,
+            idle_seconds: 1200,
+            blocked_reason: 'model_error',
+            blocked_evidence: 'API error column 0',
+          }),
+          stderr: '',
+        }
+      }
+      return w.host.run(argv, cwd, ms)
+    },
+  }
+  await flagStalls(host, gate, w.v3, [d], [d], true)
+  assert.equal(cancelBeforeSubmit, true)
+  assert.equal(w.woken.length, 0, w.woken.join('\n'))
+})
+
+test('finding F5: exists error is an incomplete scan, not an empty ledger', async () => {
+  const w = world()
+  await assigned(w)
+  const denied = Object.assign(new Error('EACCES ledger exists denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    exists: async path => {
+      if (path === w.v3) throw denied
+      return w.host.exists(path)
+    },
+  }
+  const s = await scan(host, { claim: false })
+  assert.equal(s.complete, false, 'exists error must not look like an empty ledger')
+  assert.equal(s.error, 'EACCES')
 })
