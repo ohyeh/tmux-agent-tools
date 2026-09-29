@@ -24,8 +24,11 @@ function exclusive<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 function tmux(args: string[]): Promise<{ code: number; out: string; err: string }> {
+  const env = { ...process.env }
+  delete env.TMUX
+  delete env.TMUX_PANE
   return new Promise(resolve => {
-    execFile('tmux', ['-L', SOCK, ...args], { encoding: 'utf8', timeout: 20_000 }, (error, stdout, stderr) => {
+    execFile('tmux', ['-L', SOCK, ...args], { encoding: 'utf8', env, timeout: 20_000 }, (error, stdout, stderr) => {
       resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout ?? '', err: stderr ?? '' })
     })
   })

@@ -70,7 +70,7 @@ printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$2" in
   start)
     # agent-tmux <cli> start --exact <name> <dir>
-    command tmux new-session -d -s "${COMMANDER_PREFIX}-$4" "sleep 180"
+    command env -u TMUX -u TMUX_PANE tmux -S "$COMMANDER_SOCK" new-session -d -s "${COMMANDER_PREFIX}-$4" "sleep 180"
     ;;
   assign)
     prev=""
@@ -206,6 +206,7 @@ export FAKE_LOG=${(q)FAKE_LOG}
 export FAKE_SNAP=${(q)FAKE_SNAP}
 export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
 export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
+export COMMANDER_SOCK=${(q)COMMANDER_SOCK}
 export ZDOTDIR=${(q)WORK}/zdot
 unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 cd ${(q)ASSIGN_CWD}
@@ -213,7 +214,7 @@ ${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)ASSIGN_OU
 print -r -- \$? > ${(q)ASSIGN_CODE}
 EOF
 chmod +x "$WORK/run-assign.zsh"
-command tmux new-session -d -s "$ASSIGN_SESSION" "$WORK/run-assign.zsh"
+private_tmux new-session -d -s "$ASSIGN_SESSION" "$WORK/run-assign.zsh"
 assign_done() { [[ -f "$ASSIGN_CODE" ]]; }
 poll 50 assign_done || { echo "assign did not finish" >&2; echo "--- err ---"; cat "$ASSIGN_ERR" 2>/dev/null || true; echo "--- log ---"; cat "$FAKE_LOG"; exit 1; }
 have_snap() { [[ -s "$FAKE_SNAP" ]] && grep -q 'dispatch-before-launch:' "$FAKE_LOG"; }
@@ -254,7 +255,7 @@ assert_contains "R9: panel lists the worker assigned by commander assign" "$R9_L
 # be read as the second run's answer.
 rm -f "$ASSIGN_CODE" "$FAKE_SNAP"
 sleep 0.01
-command tmux new-session -d -s "${ASSIGN_SESSION}b" "$WORK/run-assign.zsh"
+private_tmux new-session -d -s "${ASSIGN_SESSION}b" "$WORK/run-assign.zsh"
 poll 50 assign_done || { echo "second assign did not finish" >&2; exit 1; }
 poll 50 have_snap || { echo "second launch did not see the descriptor" >&2; cat "$FAKE_LOG"; exit 1; }
 SECOND="$(jq -r '.name' "$FAKE_SNAP")"
@@ -350,7 +351,7 @@ assert "case 3: other owner has no done ack" "$([[ -e "$V3/$OTHER/episodes/1/ack
 
 echo
 echo "case 5: collect exits when the commander session is gone"
-command tmux kill-session -t "$SESSION"
+private_tmux kill-session -t "$SESSION"
 ec=0
 (
   sleep 20
@@ -381,13 +382,13 @@ poll 50 have_start_hb || { echo "start collector wrote no beat" >&2; cat "$WORK/
 assert "start beat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$SBEAT")" == <-> ]] && echo yes || echo no)" "yes"
 ST_STATUS="$(command tmux show-options -t "$SSESSION" -v status)"
 assert "start sets per-session status 2" "$ST_STATUS" "2"
-ST_INT="$(command tmux show-options -t "$SSESSION" -v status-interval)"
+ST_INT="$(private_tmux show-options -t "$SSESSION" -v status-interval)"
 assert "start sets per-session status-interval 2" "$ST_INT" "2"
-ST_FMT="$(command tmux show-options -t "$SSESSION" -v 'status-format[1]')"
+ST_FMT="$(private_tmux show-options -t "$SSESSION" -v 'status-format[1]')"
 assert_contains "start status line runs panel" "$ST_FMT" " panel "
 assert_contains "start status line quotes the session" "$ST_FMT" "'$SSESSION'"
 assert_contains "start status line names this script" "$ST_FMT" "tmux-agent-commander"
-G_FMT="$(command tmux show-options -g -v 'status-format[1]' 2>/dev/null || true)"
+G_FMT="$(private_tmux show-options -g -v 'status-format[1]' 2>/dev/null || true)"
 assert_excludes "panel command is not a global option" "$G_FMT" "tmux-agent-commander"
 code=0
 "$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start2.out" 2>"$WORK/start2.err" || code=$?
@@ -411,7 +412,7 @@ if (( np_code != 0 )); then
 fi
 assert "--no-panel start exits 0" "$np_code" "0"
 if (( np_code == 0 )); then
-  NPOPTS="$(command tmux show-options -t "$NPSESSION" 2>/dev/null || true)"
+  NPOPTS="$(private_tmux show-options -t "$NPSESSION" 2>/dev/null || true)"
   assert_excludes "--no-panel does not set the panel command" "$NPOPTS" "tmux-agent-commander"
   command tmux kill-session -t "$NPSESSION"
 fi
@@ -607,6 +608,7 @@ export FAKE_LOG=${(q)FAKE_LOG}
 export FAKE_SNAP=${(q)FAKE_SNAP}
 export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
 export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
+export COMMANDER_SOCK=${(q)COMMANDER_SOCK}
 export ZDOTDIR=${(q)WORK}/zdot
 unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 cd ${(q)ASSIGN_CWD}
@@ -614,7 +616,7 @@ ${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)out} 2>${
 print -r -- \$? > ${(q)code}
 EOF
   chmod +x "$script"
-  command tmux split-window -d -t "$session" "$script"
+  private_tmux split-window -d -t "$session" "$script"
 }
 
 echo
@@ -625,7 +627,7 @@ AC_OUT="$WORK/ac.out"
 AC_ERR="$WORK/ac.err"
 AC_CODE="$WORK/ac.code"
 AC_SCRIPT="$WORK/run-ac.zsh"
-command tmux new-session -d -s "$ASESSION" "sleep 180"
+private_tmux new-session -d -s "$ASESSION" "sleep 180"
 run_assign_in "$ASESSION" "$AC_OUT" "$AC_ERR" "$AC_CODE" "$AC_SCRIPT"
 ac_done() { [[ -f "$AC_CODE" ]]; }
 poll 50 ac_done || {
@@ -696,7 +698,7 @@ echo
 echo "case: collect exits 0 without writing when a live collector owns the pid"
 DNAME="ownedcol$$"
 DSESSION="${PREFIX}-${DNAME}"
-command tmux new-session -d -s "$DSESSION" "sleep 180"
+private_tmux new-session -d -s "$DSESSION" "sleep 180"
 "$COMMANDER" collect codex "$DNAME" >"$WORK/down.out" 2>"$WORK/derr.err" &
 DCOLLECT_PID=$!
 DPIDFILE="$TMUX_AGENT_DIR/.commander-${DSESSION}.pid"
@@ -714,7 +716,7 @@ assert "second collect writes nothing to stdout" "$(<"$WORK/d2.out")" ""
 assert "second collect writes nothing to stderr" "$(<"$WORK/d2.err")" ""
 assert "second collect leaves the owner's pid" "$(tr -d '[:space:]' < "$DPIDFILE")" "$DCOLLECT_PID"
 assert "owner collect still alive" "$(kill -0 "$DCOLLECT_PID" 2>/dev/null && echo yes || echo no)" "yes"
-command tmux kill-session -t "$DSESSION"
+private_tmux kill-session -t "$DSESSION"
 dec=0
 wait "$DCOLLECT_PID" || dec=$?
 DCOLLECT_PID=""

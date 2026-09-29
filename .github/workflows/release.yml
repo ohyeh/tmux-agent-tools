@@ -58,6 +58,9 @@ jobs:
         with:
           node-version: 22.18.0
 
+      - name: Guard tmux socket isolation
+        run: scripts/check-tmux-socket-isolation
+
       - name: Core contract tests (node 22.18.0)
         run: scripts/test-core-contract-smoke --test-timeout=120000
 
@@ -85,8 +88,8 @@ jobs:
       - name: Run full smoke suite (private tmux isolation)
         run: |
           unset TMUX TMUX_PANE
-          export TMUX_TMPDIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tas-rel-tmux.XXXXXX")"
-          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+          export TMUX_TMPDIR="$(mktemp -d /tmp/tas-rel.XXXXXX)"
+          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
           scripts/run-all-smokes
 
       - name: Validate release candidate
@@ -103,8 +106,8 @@ jobs:
             exit 1
           fi
           unset TMUX TMUX_PANE
-          export TMUX_TMPDIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tas-rel-diag.XXXXXX")"
-          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+          export TMUX_TMPDIR="$(mktemp -d /tmp/tas-diag.XXXXXX)"
+          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
           zsh -n skills/tmux-agent-tools/scripts/agent-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions

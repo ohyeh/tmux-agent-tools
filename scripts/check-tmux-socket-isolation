@@ -1,0 +1,181 @@
+#!/usr/bin/env node
+// Fail when a smoke or contract calls tmux kill-server / new-session / start-server
+// without a private -S or -L socket. $TMUX outranks TMUX_TMPDIR, so a private
+// temp dir alone is not a private server. A wrapper is safe only when its body
+// adds -S or -L; the call then counts as that wrapper.
+
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, relative, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const SERVER = /\b(kill-server|new-session|start-server)\b/
+const SOCKET = /['"`]-S['"`]|['"`]-L['"`]|(?:^|\s)-S(?:\s|$)|(?:^|\s)-L(?:\s|$)/
+const BINARY = /(?:^|[;&|(`])\s*(?:command\s+)?(?:env\s+(?:-\S+(?:\s+\S*)?\s+)*)?(?<![A-Za-z0-9_])tmux\s/g
+
+function walk(dir, acc) {
+  let names
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (name === 'node_modules' || name === '.git' || name === '.codex') continue
+    const p = join(dir, name)
+    let st
+    try {
+      st = statSync(p)
+    } catch {
+      continue
+    }
+    if (st.isDirectory()) walk(p, acc)
+    else acc.push(p)
+  }
+}
+
+function wanted(rel) {
+  return rel.startsWith('scripts/test-') || rel === 'scripts/run-all-smokes' || rel.endsWith('.contract.node.ts')
+}
+
+function strip(text, shell) {
+  const lines = text.split('\n')
+  let block = false
+  return lines.map(line => {
+    if (block) {
+      const end = line.indexOf('*/')
+      if (end === -1) return ''
+      block = false
+      line = line.slice(end + 2)
+    }
+    let out = ''
+    let q = ''
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]
+      const n = line[i + 1]
+      if (q) {
+        if (c === '\\') {
+          out += c
+          if (i + 1 < line.length) out += line[++i]
+          continue
+        }
+        if (c === q) q = ''
+        out += c
+        continue
+      }
+      if (c === '"' || c === "'" || c === '`') {
+        q = c
+        out += c
+        continue
+      }
+      if (c === '/' && n === '/') break
+      if (c === '/' && n === '*') {
+        block = true
+        break
+      }
+      if (shell && c === '#') break
+      out += c
+    }
+    return out
+  })
+}
+
+function addsSocket(text) {
+  return SOCKET.test(text)
+}
+
+function findDef(lines, before, name) {
+  const re = new RegExp(
+    `^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\b|^\\s*(?:export\\s+)?(?:const|let|var)\\s+${name}\\s*=|^\\s*${name}\\s*\\(\\)\\s*\\{`,
+  )
+  let def = -1
+  for (let i = 0; i < before; i++) if (re.test(lines[i])) def = i
+  return def
+}
+
+function bodyOf(lines, def) {
+  const indent = lines[def].match(/^ */)?.[0].length ?? 0
+  const chunk = [lines[def]]
+  for (let i = def + 1; i < Math.min(lines.length, def + 30); i++) {
+    const line = lines[i]
+    if (line.trim() === '') {
+      chunk.push(line)
+      continue
+    }
+    const ind = line.match(/^ */)?.[0].length ?? 0
+    if (ind <= indent && /^(?:export\s+)?(?:async\s+)?(?:function\b|const\b|let\b|var\b|test\()/.test(line.trim())) break
+    chunk.push(line)
+  }
+  return chunk.join('\n')
+}
+
+function tsProblems(lines, i) {
+  const problems = []
+  const re = /\b([A-Za-z_][\w]*)\s*\(\s*(?:['"]tmux['"]\s*,\s*)?\[([^\]]*)\]/g
+  let m
+  while ((m = re.exec(lines[i]))) {
+    if (!SERVER.test(m[2])) continue
+    const name = m[1]
+    if (name === 'execFile' || name === 'execFileSync' || name === 'exec' || name === 'spawn') {
+      if (!addsSocket(m[2])) problems.push(`${name} tmux argv has no -S/-L`)
+      continue
+    }
+    const def = findDef(lines, i, name)
+    if (def < 0 || !addsSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
+  }
+  return problems
+}
+
+function shProblems(lines, i) {
+  const code = lines[i]
+  if (!SERVER.test(code)) return []
+  const problems = []
+  BINARY.lastIndex = 0
+  let binary = false
+  let m
+  while ((m = BINARY.exec(code))) {
+    binary = true
+    const forced = /command\s|env\s/.test(m[0])
+    if (forced || findDef(lines, i, 'tmux') < 0) {
+      if (!addsSocket(code)) problems.push('tmux has no -S/-L')
+    } else if (!addsSocket(bodyOf(lines, findDef(lines, i, 'tmux')))) {
+      problems.push('wrapper tmux() has no -S/-L')
+    }
+  }
+  if (binary) return problems
+  const call = code.match(/^\s*([A-Za-z_][\w]*)\b/)
+  if (!call) return []
+  const name = call[1]
+  const def = findDef(lines, i, name)
+  if (def < 0) return []
+  if (!addsSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
+  return problems
+}
+
+function scan(file) {
+  const rel = relative(root, file)
+  const shell = !rel.endsWith('.ts') && !rel.endsWith('.js') && !rel.endsWith('.mjs')
+  const lines = strip(readFileSync(file, 'utf8'), shell)
+  const hits = []
+  for (let i = 0; i < lines.length; i++) {
+    const problems = shell ? shProblems(lines, i) : tsProblems(lines, i)
+    for (const problem of problems) hits.push(`${rel}:${i + 1}: ${problem}`)
+  }
+  return hits
+}
+
+const files = process.argv.slice(2)
+const targets = files.length ? files.map(f => (f.startsWith('/') ? f : join(process.cwd(), f))) : []
+if (!files.length) {
+  const acc = []
+  walk(root, acc)
+  for (const file of acc) if (wanted(relative(root, file))) targets.push(file)
+}
+
+const hits = targets.flatMap(scan)
+if (hits.length) {
+  for (const hit of hits) console.error(hit)
+  console.error(`tmux socket isolation: ${hits.length} call(s) without a private -S/-L socket`)
+  process.exit(1)
+}
+console.log('tmux socket isolation: ok')
