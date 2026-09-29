@@ -22,6 +22,7 @@ import {
   openEpisode,
   publishWorker,
   readDescriptor,
+  readHolder,
   readWorker,
   recoverEpisodes,
   registerActivation,
@@ -658,9 +659,10 @@ export function ackKindOf(f: Finished): string {
  */
 export async function ackFinished(host: Host, v3: string, f: Finished): Promise<boolean> {
   const ep = episodeDirOf(v3, f.d)
-  const r = await ackDir(host, ep, ackKindOf(f))
-  if (r !== 'unknown' && f.status !== UNATTRIBUTED && f.observation) await ackDir(host, ep, f.observation)
-  return r !== 'unknown'
+  // The closing snapshot's identity first: a `done` without it would make that same
+  // snapshot a false unattributed notice once a later tell opens a new episode (§8).
+  if (f.status !== UNATTRIBUTED && f.observation && (await ackDir(host, ep, f.observation)) === 'unknown') return false
+  return (await ackDir(host, ep, ackKindOf(f))) !== 'unknown'
 }
 
 /** The worker's own free text is data, never instruction. Bounded and fenced. */
@@ -688,6 +690,19 @@ export async function rootOf(host: Host): Promise<string | undefined> {
 
 export async function readOrEmpty(host: Host, path: string): Promise<string> {
   return host.read(path).catch(() => '')
+}
+
+export const UNKNOWN = 'unknown' as const
+/** A file's text; `undefined` = confirmed absent (ENOENT); `UNKNOWN` = any other failure, logged (§1). */
+export async function readOrAbsent(host: Host, path: string): Promise<string | undefined | typeof UNKNOWN> {
+  try {
+    return await host.read(path)
+  } catch (error) {
+    const there = await host.exists(path).catch(() => true)
+    if (!there) return undefined
+    host.log(`tmux-agent: could not read ${path}: ${String(error)}`)
+    return UNKNOWN
+  }
 }
 
 /** A claimed commit, checked against the worker's own repo before delivery. */
@@ -758,9 +773,11 @@ export async function adoptable(
   cache: Map<string, string>,
 ): Promise<'mine' | 'orphan' | 'no'> {
   const mine = host.owner()
+  // No identity, no ownership: an anonymous collector owns nothing (§3).
+  if (!mine) return 'no'
   // An unfinished claim: nobody's until claim() lets a gen+1 contest it (after ORPHAN_MS).
-  if (d.ownerIncomplete) return mine && sameProject(host, d) ? 'orphan' : 'no'
-  if (!d.owner || !mine || d.owner === mine) return 'mine'
+  if (d.ownerIncomplete) return sameProject(host, d) ? 'orphan' : 'no'
+  if (!d.owner || d.owner === mine) return 'mine'
   if (!sameProject(host, d)) return 'no'
   if (!cache.has(d.owner)) cache.set(d.owner, await sessionLiveness(host, sessionDirOf(v3, d.owner), now))
   return cache.get(d.owner) === 'non-live' ? 'orphan' : 'no'
@@ -781,16 +798,21 @@ export function logClaims(host: Host, claimed: Map<string, string[]>): void {
   }
 }
 
+/** The ack names of an episode; `undefined` = unknown (an IO error), never "no acks" (§1). */
 async function ackNames(host: Host, dir: string): Promise<string[] | undefined> {
-  if (!(await host.exists(`${dir}/acks`).catch(() => false))) return []
-  return host.list(`${dir}/acks`).then(
-    es => es.filter(e => e.kind === 'dir').map(e => e.name),
-    () => undefined,
-  )
+  try {
+    if (!(await host.exists(`${dir}/acks`))) return []
+    return (await host.list(`${dir}/acks`)).filter(e => e.kind === 'dir').map(e => e.name)
+  } catch (error) {
+    host.log(`tmux-agent: could not list ${dir}/acks: ${String(error)}`)
+    return undefined
+  }
 }
 
-async function waiterOf(host: Host, dir: string): Promise<string | undefined> {
-  const w = parseJson(await readOrEmpty(host, `${dir}/waiter`)) as { agentId?: unknown } | undefined
+async function waiterOf(host: Host, dir: string): Promise<string | undefined | typeof UNKNOWN> {
+  const text = await readOrAbsent(host, `${dir}/waiter`)
+  if (text === UNKNOWN) return UNKNOWN
+  const w = parseJson(text ?? '') as { agentId?: unknown } | undefined
   return typeof w?.agentId === 'string' && w.agentId && !CTRL_RE.test(w.agentId) ? w.agentId : undefined
 }
 
@@ -872,6 +894,11 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
       }
       const goal = desc.goal?.replace(CTRL_ALL_RE, ' ').trim().slice(0, GOAL_MAX)
       const waiter = await waiterOf(host, dir)
+      // A waiter we cannot read may still be running: deliver nothing for it this pass.
+      if (waiter === UNKNOWN) {
+        out.complete = false
+        continue
+      }
       const d: TmuxDispatch = {
         profile: rec.profile,
         name: rec.name,
@@ -916,10 +943,11 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
         out.dispatches.push(d)
         ours = true
       } else if (who === 'orphan') {
-        // A settled episode has nothing left to deliver: claiming it would only move
+        // A CLOSED episode has nothing left to deliver: claiming it would only move
         // the owner. It is still ours to stop, unclaimed (autoStop asks for the same
-        // idle window the owner would). An unsettled one is contested (§3).
-        if (settled(out.reported, d)) {
+        // idle window the owner would). An open one — an `exited` notice included,
+        // since a late result still closes it — is contested (§3).
+        if (out.reported.has(idOf(d))) {
           out.dispatches.push(d)
           ours = true
         } else if (opts.claim && d.seq && me) {
@@ -1039,7 +1067,10 @@ export async function collect(
     const dir = `${root}/${d.name}`
     const path = d.resultPath ?? `${dir}/result.json`
     try {
-      const text = await readOrEmpty(host, path)
+      const got = await readOrAbsent(host, path)
+      // An unreadable result is unknown: this pass says nothing about it (§1), not "no result".
+      if (got === UNKNOWN) continue
+      const text = got ?? ''
       read.add(idOf(d))
       const raw = parseJson(text) as
         | { status?: unknown; summary?: unknown; commit?: unknown; episode?: unknown; body?: { status?: unknown; summary?: unknown; commit?: unknown; episode?: unknown } }
@@ -1148,22 +1179,29 @@ export async function observe(host: Host, s: Scan, budget: number, read: Readonl
   const out: Finished[] = []
   for (const [name, eps] of s.episodes) {
     if (out.length >= budget) break
-    const open = eps.filter(d => !s.reported.has(idOf(d)) && s.dispatches.includes(d))
-    if (!open.length) continue
+    // Open and own are the WORKER's, whoever owns each episode (§8); only the owner
+    // of the worker's max open episode observes, and acks there, so two owners never
+    // both notice one snapshot.
+    const open = eps.filter(d => !s.reported.has(idOf(d)))
+    const target = open.at(-1)
+    if (!target || !s.dispatches.includes(target)) continue
     const acked = s.acked.get(name) ?? new Set<string>()
-    const target = open.at(-1)!
     for (const path of new Set(eps.map(d => d.resultPath).filter((p): p is string => !!p))) {
       const own = open.find(d => d.resultPath === path)
-      if (own && (!read.has(idOf(own)) || terminal.has(idOf(own)))) continue
+      // Our own open episode: only what this pass's collect read and found non-terminal.
+      // Another owner's: its collect is not ours to wait on — read it here, and the
+      // attribution check below leaves an attributed result to that owner (§8).
+      if (own && s.dispatches.includes(own) && (!read.has(idOf(own)) || terminal.has(idOf(own)))) continue
       const a = await host.stat(path).catch(() => undefined)
       if (!a) continue
-      const text = await readOrEmpty(host, path)
+      const text = await readOrAbsent(host, path)
+      if (typeof text !== 'string') continue
       const b = await host.stat(path).catch(() => undefined)
       if (!b || a.mtimeMs !== b.mtimeMs || a.size !== b.size) continue
       const raw = parseJson(text) as { status?: unknown; summary?: unknown; episode?: unknown; body?: { status?: unknown; summary?: unknown; episode?: unknown } } | undefined
       const status = raw?.status ?? raw?.body?.status
       if (typeof status !== 'string' || !TERMINAL.has(status)) continue
-      // The path's own OPEN episode, attributed since collect read it: collect closes it next pass.
+      // Attributed to the path's own OPEN episode: that episode's collector delivers it.
       if (own && episodeMatches(raw?.episode ?? raw?.body?.episode, own.seq)) continue
       const observation = await identity(text, b.mtimeMs)
       if (acked.has(observation)) continue
@@ -1755,10 +1793,20 @@ export async function releaseEndedWaiters(host: Host, gate: Gate, v3: string, wa
   const running = new Set(listed.filter(a => a.status === 'running').map(a => a.id))
   for (const d of waiting) {
     if (running.has(d.waiter!)) continue
-    // The waiter binds THIS episode only (§2); an empty record means none.
-    await host.write(`${episodeDirOf(v3, d)}/waiter`, '{}').catch((error: unknown) => {
-      host.log(`tmux-agent: could not release the waiter of ${d.name}: ${String(error)}`)
-    })
+    // Waiter bind/release is serialized by the action lock (§8). Busy: the next tick retries.
+    const lock = await takeLock(host, `${v3}/${d.name}`)
+    if (!lock.ok) continue
+    try {
+      const dir = episodeDirOf(v3, d)
+      // Re-read under the lock: only the waiter this pass saw end is released.
+      if ((await waiterOf(host, dir)) !== d.waiter) continue
+      // The waiter binds THIS episode only (§2); an empty record means none.
+      await host.write(`${dir}/waiter`, '{}').catch((error: unknown) => {
+        host.log(`tmux-agent: could not release the waiter of ${d.name}: ${String(error)}`)
+      })
+    } finally {
+      await releaseLock(host, `${v3}/${d.name}/.action`, lock.token)
+    }
   }
 }
 
@@ -1888,7 +1936,9 @@ export async function legacyPending(host: Host, root: string): Promise<number> {
   for (const e of entries) {
     if (e.kind !== 'dir' || e.name.startsWith('.')) continue
     if (!(await host.exists(`${root}/${e.name}/dispatch.json`).catch(() => false))) continue
-    const raw = parseJson(await readOrEmpty(host, `${root}/${e.name}/result.json`)) as { status?: unknown; body?: { status?: unknown } } | undefined
+    const text = await readOrAbsent(host, `${root}/${e.name}/result.json`)
+    if (text === UNKNOWN) continue
+    const raw = parseJson(text ?? '') as { status?: unknown; body?: { status?: unknown } } | undefined
     const status = raw?.status ?? raw?.body?.status
     if (!(typeof status === 'string' && TERMINAL.has(status))) n++
   }
@@ -1951,6 +2001,12 @@ export async function autoStop(host: Host, gate: Gate, v3: string, quiet: readon
     // Short idle, or a live CLI whose pane has not sat still for the whole
     // window: someone is in the turn. A prompt idle for AUTO_STOP_MS is stopped.
     if (idle < AUTO_STOP_MS / 1000) continue
+    // §4: re-read max n before a stop. A superseded (or unreadable) activation stops nothing.
+    const me = host.owner()
+    if (!me || gate.activation === undefined || (await superseded(host, sessionDirOf(v3, me), gate.activation)) !== false) {
+      host.log(`tmux-agent: not auto-stopping "${d.name}" — this activation is superseded or its registrations could not be read`)
+      return
+    }
     // Re-validated inside the lock: a tell that landed since the scan keeps the pane.
     const out = await stopWorker(host, gate, d, d.seq)
     const line = `tmux-agent: auto-stopped "${d.name}" — its result was delivered and it had no tell for ${AUTO_STOP_MS / 60_000} min${out.ok ? '' : ` (${out.text})`}`
@@ -2018,7 +2074,8 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
   try {
     // A crashed earlier action is settled first (§8), never re-sent.
     await recoverEpisodes(host, w)
-    const me = host.owner() ?? d.owner ?? ''
+    const me = host.owner()
+    if (!me) return { ok: false, text: 'this host has no session id; tell refuses to open an episode without an owner (§3)' }
     const since = Math.max(await host.now(), d.since + 1)
     // The new episode's work starts from wherever the repo is now.
     const head = await host.run(['git', '-C', d.dir, 'rev-parse', 'HEAD'], d.dir, COMMIT_PROBE_MS).catch(gitFailed)
@@ -2048,13 +2105,18 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
         cut = String(error)
         return undefined
       })
+    // A failed exit is NOT proof nothing was sent: the wrapper can fail after its
+    // paste (transcript, audit). The descriptor is complete, so this is `uncertain` +
+    // `sent` — watched, never re-sent; `aborted` is only for no descriptor (§8).
     if (sent && sent.exitCode !== 0) {
-      await mark(host, epDir, 'aborted')
+      await mark(host, epDir, 'uncertain')
+      await mark(host, epDir, 'sent')
       return {
         ok: false,
         text:
           `send to ${d.name} failed (exit ${sent.exitCode}): ${(sent.stderr || sent.stdout).trim().slice(-400)}. ` +
-          'Is the pane alive? A stopped worker needs a fresh assign.',
+          `It may still have reached the pane: episode ${ep.seq} stays watched, and a result it writes is delivered. ` +
+          `Peek at "${d.name}" before telling it again; a stopped worker needs a fresh assign.`,
       }
     }
     // Cut off: it may have arrived. `uncertain` + `sent` — watched, never re-sent (§8).
@@ -2109,14 +2171,18 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
   const lock = await takeLock(host, w)
   if (!lock.ok) return { ok: false, text: busyText(d.name, lock.busy) }
   try {
-    const seqs = (await numericChildren(host, `${w}/episodes`)) ?? []
+    const listed = await numericChildren(host, `${w}/episodes`)
+    if (!listed) return { ok: false, text: `not stopping "${d.name}": its episodes could not be read (see the log)` }
+    const seqs = listed
     if (expectSeq !== undefined && (seqs.at(-1) ?? 0) !== expectSeq) {
       return { ok: false, text: `not stopping "${d.name}": a tell opened episode ${seqs.at(-1)} since` }
     }
     const open: number[] = []
     for (const seq of seqs) {
-      const names = (await host.list(`${w}/episodes/${seq}/acks`).catch(() => [])).map(e => e.name)
-      if (!names.some(n => CLOSED_ACKS.includes(n)) && !(await hasMark(host, `${w}/episodes/${seq}`, 'aborted').catch(() => false))) open.push(seq)
+      const names = await ackNames(host, `${w}/episodes/${seq}`)
+      const aborted = await hasMark(host, `${w}/episodes/${seq}`, 'aborted').catch(() => undefined)
+      if (!names || aborted === undefined) return { ok: false, text: `not stopping "${d.name}": episode ${seq} could not be read (see the log)` }
+      if (!names.some(n => CLOSED_ACKS.includes(n)) && !aborted) open.push(seq)
     }
     const run = await host.run(['agent-tmux', d.profile, 'stop', d.name], d.dir, 8_000).catch(
       (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }),
@@ -2259,7 +2325,11 @@ export function randomBase36(n: number): string {
 export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
   const id = host.owner()
   const root = await rootOf(host)
-  if (!id || !root) return true
+  // A collector without a session id or a root does not collect (§3).
+  if (!id || !root) {
+    host.log(`tmux-agent: not collecting — ${id ? 'no state root' : 'this host has no session id'}`)
+    return false
+  }
   const dir = sessionDirOf(v3Of(root), id)
   if (gate.activation === undefined) {
     gate.registering ??= registerActivation(host, dir, { pid: 0, pidStart: '', host: '', token: gate.token })
@@ -2268,10 +2338,18 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
       gate.registering = undefined
       return false
     }
-  } else if ((await superseded(host, dir, gate.activation)) === true) {
-    gate.paused = 'this activation was superseded by a newer one of the same session (a reload), which collects now'
-    host.log(`tmux-agent: activation ${gate.activation} of this session was superseded by a newer one; this one stops collecting`)
-    return false
+  } else {
+    const sup = await superseded(host, dir, gate.activation)
+    if (sup === true) {
+      gate.paused = 'this activation was superseded by a newer one of the same session (a reload), which collects now'
+      host.log(`tmux-agent: activation ${gate.activation} of this session was superseded by a newer one; this one stops collecting`)
+      return false
+    }
+    // Unknown is not "still the newest" (§1): no tick until the registrations read again.
+    if (sup === undefined) {
+      host.log(`tmux-agent: activation ${gate.activation}: this session's registrations could not be read; not collecting this tick`)
+      return false
+    }
   }
   await beat(host, dir, gate.activation, await host.now()).catch((error: unknown) => {
     host.log(`tmux-agent: could not beat: ${String(error)}`)
@@ -2280,9 +2358,98 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
 }
 
 /** The worker's action lock (§5), held by this activation's token. */
-export async function takeLock(host: Host, workerDir: string, token = randomBase36(12)) {
-  const holder: Holder = { token, session: host.owner() ?? '', activation: '', host: '', pid: 0, pidStart: '' }
+/** This process as `unlock` can check it later: the parent of a run child, its host and start time. */
+export type ProcessId = { host: string; pid: number; pidStart: string }
+let selfId: Promise<ProcessId> | undefined
+/**
+ * One probe per process: `$PPID` of the probe shell is the process that ran it (the
+ * collector, or the engine). Unprovable (the probe failed) = pid 0, which `unlock`
+ * never treats as dead. `/bin/sh` by path: the bare `sh` is the launch route.
+ */
+export function processId(host: Host): Promise<ProcessId> {
+  selfId ??= host
+    .run(['/bin/sh', '-c', 'echo "$PPID"; hostname; ps -o lstart= -p "$PPID"'], '/', 5_000)
+    .then(r => {
+      const [pid, name, start] = r.stdout.split('\n').map(l => l.trim())
+      const n = Number(pid)
+      return r.exitCode === 0 && Number.isInteger(n) && n > 0 && name && start ? { host: name, pid: n, pidStart: start } : { host: '', pid: 0, pidStart: '' }
+    })
+    .catch(() => ({ host: '', pid: 0, pidStart: '' }))
+  return selfId
+}
+
+export async function takeLock(host: Host, workerDir: string, token = randomBase36(12), activation = '') {
+  const me = await processId(host)
+  const holder: Holder = { token, session: host.owner() ?? '', activation, ...me }
   return acquireLock(host, `${workerDir}/.action`, holder)
+}
+
+/**
+ * Episode cancel (§5): `acks/cancel` on that one episode, inside the lock. It
+ * closes the episode's later notices and never touches the pane.
+ */
+export async function cancelEpisode(host: Host, name: string, seq: number): Promise<Outcome> {
+  if (!NAME_RE.test(name) || !Number.isInteger(seq) || seq < 1) return { ok: false, text: 'cancel takes <name> <seq>' }
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const w = `${v3Of(root)}/${name}`
+  const ep = `${w}/episodes/${seq}`
+  const lock = await takeLock(host, w)
+  if (!lock.ok) return { ok: false, text: busyText(name, lock.busy) }
+  try {
+    const desc = await readDescriptor(host, ep)
+    if (desc === 'unknown') return { ok: false, text: `episode ${seq} of "${name}" could not be read (see the log)` }
+    if (!desc) return { ok: false, text: `"${name}" has no episode ${seq}` }
+    const names = await ackNames(host, ep)
+    if (!names) return { ok: false, text: `episode ${seq} of "${name}" could not be read (see the log)` }
+    const closed = names.find(n => CLOSED_ACKS.includes(n))
+    if (closed) return { ok: true, text: `episode ${seq} of "${name}" is already closed (${closed})` }
+    const r = await ackDir(host, ep, 'cancel')
+    if (r === 'unknown') return { ok: false, text: `could not cancel episode ${seq} of "${name}" (see the log)` }
+    return { ok: true, text: `cancelled episode ${seq} of "${name}"; its pane is untouched, and nothing more is delivered for that episode` }
+  } finally {
+    await releaseLock(host, `${w}/.action`, lock.token)
+  }
+}
+
+export const UNLOCK_WORD = 'confirm'
+/**
+ * The maintenance unlock (§5): never online stealing. It removes `.action` only when the
+ * operator confirmed quiescence AND the holder is provably gone: same host, its session not
+ * live, and its pid dead or started at another time. Anything unprovable stays busy.
+ */
+export async function unlockWorker(host: Host, name: string, word?: string): Promise<Outcome> {
+  if (!NAME_RE.test(name)) return { ok: false, text: 'unlock takes <name> [confirm]' }
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const v3 = v3Of(root)
+  const lock = `${v3}/${name}/.action`
+  const h = await readHolder(host, lock)
+  if (!h) return { ok: true, text: `"${name}" is not locked` }
+  if (h === 'unreadable') return { ok: false, text: `"${name}": the lock holder cannot be read; not removing it` }
+  const who = `session ${h.session || '?'} pid ${h.pid || '?'} on ${h.host || '?'}`
+  if (word !== UNLOCK_WORD) {
+    return {
+      ok: false,
+      text:
+        `"${name}" is held by ${who}. Unlock is maintenance only: confirm that every caller acting on this worker ` +
+        `has exited and its subprocesses finished, then run: unlock ${name} ${UNLOCK_WORD}`,
+    }
+  }
+  const me = await processId(host)
+  if (!h.host || !me.host || h.host !== me.host) return { ok: false, text: `not unlocking "${name}": held by ${who}, not provably this host (${me.host || '?'})` }
+  const live = h.session ? await sessionLiveness(host, sessionDirOf(v3, h.session), await host.now()) : 'unknown'
+  if (live !== 'non-live') return { ok: false, text: `not unlocking "${name}": holder ${who} — its session is ${live}` }
+  if (!h.pid || !h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} records no process to check` }
+  const ps = await host.run(['ps', '-o', 'lstart=', '-p', String(h.pid)], '/', 5_000).catch(() => undefined)
+  if (!ps) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
+  const start = ps.stdout.trim()
+  if (ps.exitCode === 0 && start === h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
+  if (ps.exitCode !== 0 && start) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
+  // Only that exact holder instance is removed (release checks the token again).
+  if (!(await releaseLock(host, lock, h.token))) return { ok: false, text: `"${name}": the lock changed while checking; nothing removed` }
+  host.log(`tmux-agent: unlocked "${name}" (holder ${who}: ${ps.exitCode === 0 ? 'pid reused' : 'pid gone'})`)
+  return { ok: true, text: `unlocked "${name}" (the holder ${who} is gone)` }
 }
 const busyText = (name: string, busy: unknown) =>
   `"${name}" is busy: another action holds its lock (${typeof busy === 'object' && busy && 'session' in busy ? `session ${String((busy as Holder).session).slice(0, 8)}` : String(busy)}); try again in a moment`
@@ -2297,15 +2464,20 @@ const busyText = (name: string, busy: unknown) =>
 export async function stillOurs(host: Host, gate: Gate, v3: string, fs: readonly Finished[]): Promise<Finished[] | undefined> {
   if (!fs.length) return []
   const me = host.owner()
-  if (me && gate.activation !== undefined && (await superseded(host, sessionDirOf(v3, me), gate.activation)) === true) {
-    gate.paused = 'this activation was superseded by a newer one of the same session (a reload), which collects now'
-    host.log(`tmux-agent: activation ${gate.activation} was superseded during a pass; it delivers nothing`)
+  if (!me || gate.activation === undefined) {
+    host.log('tmux-agent: no session id or activation; this pass delivers nothing (§3)')
+    return undefined
+  }
+  const sup = await superseded(host, sessionDirOf(v3, me), gate.activation)
+  if (sup !== false) {
+    if (sup) gate.paused = 'this activation was superseded by a newer one of the same session (a reload), which collects now'
+    host.log(`tmux-agent: activation ${gate.activation} ${sup ? 'was superseded during a pass' : 'could not re-read its registrations'}; it delivers nothing`)
     return undefined
   }
   const out: Finished[] = []
   for (const f of fs) {
     // A record with no owner is anyone's (a pre-owner record): nothing to lose.
-    if (!f.d.owner || !me) {
+    if (!f.d.owner) {
       out.push(f)
       continue
     }
@@ -2358,6 +2530,8 @@ export async function assignWorker(
   // The CLI's own precedence (rootOf); no HOME at all falls back to /tmp, as before.
   const v3 = v3Of((await rootOf(host)) ?? `/tmp${STATE_SUFFIX}`)
   const owner = extra?.owner ?? ''
+  // An anonymous episode would be anyone's: every collector would deliver it (§3).
+  if (!owner) return { deny: 'tmux-agent: this host has no session id; assign refuses to write an episode without an owner' }
   const res = await reserve(host, v3, input.name, { profile: input.profile, dir: input.dir, since, owner, ownerCwd: extra?.ownerCwd ?? '', origin: 'assign' }, input.dir)
   if ('deny' in res) return res
   const { name, w: stateDir } = res
@@ -2422,17 +2596,18 @@ export async function assignWorker(
  * The `has-session` look is advisory only: it covers names v5 did not draw (a pre-P2
  * session, a commander `start`, a shell), whose collision is a Known limit (§11).
  */
-async function reserve(
+export async function reserve(
   host: Host,
   v3: string,
   base: string,
   rec: Omit<WorkerRecord, 'name'>,
   cwd: string,
+  draw: () => string = () => randomBase36(5),
 ): Promise<{ name: string; w: string } | { deny: string }> {
   const mk = await host.run(['mkdir', '-p', v3], '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (mk.exitCode !== 0) return { deny: `tmux-agent: could not create ${v3}: ${mk.stderr.trim()}` }
   for (let i = 0; i < 2; i++) {
-    const name = `${base.slice(0, 58)}.${randomBase36(5)}`
+    const name = `${base.slice(0, 58)}.${draw()}`
     if (hasSession(await liveSessions(host, cwd), { name } as TmuxDispatch)) continue
     const w = `${v3}/${name}`
     const r = await mkdirExclusive(host, w)

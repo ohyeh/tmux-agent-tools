@@ -188,6 +188,22 @@ test('an ack that cannot be written is logged and re-reported, never read as del
   assert.ok(acked(w))
 })
 
+test('an exited-but-open orphan (F1): a dead owner, acks/exited, a late result — one claim gen, one delivery, closed done', async () => {
+  const w = world('X')
+  beatAt(w, 'X', OLD)
+  mkdirSync(`${w.ep}/acks/exited`, { recursive: true })
+  const late = readFileSync(`${w.ep}/../../result.json`, 'utf8')
+  writeFileSync(`${w.ep}/../../result.json`, '{"schema_version":1,"status":"running"}')
+  await Promise.all(Array.from({ length: 4 }, (_, i) => pass(w, `B${i}`)))
+  assert.deepEqual(gens(w), ['1'], 'open (exited is not closed): contested, claimed once')
+  const owner = readFileSync(`${w.ep}/claims/1/owner`, 'utf8').trim()
+  writeFileSync(`${w.ep}/../../result.json`, late)
+  await Promise.all(Array.from({ length: 4 }, (_, i) => pass(w, `B${i}`)))
+  await Promise.all(Array.from({ length: 4 }, (_, i) => pass(w, `B${i}`)))
+  assert.deepEqual(by(w), [owner], 'the late result is delivered once, by the claimant')
+  assert.ok(acked(w))
+})
+
 test('uncrashed contention: a live owner and 7 peers in one pass each — exactly one delivery, no claim', async () => {
   const w = world('A')
   beatAt(w, 'A', 0)

@@ -47,9 +47,16 @@ marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-t
 - `episodes/<seq>/sent/`、`acks/<kind>/`：`mkdir` 建一次、不刪不剪。`acks/done|expired|cancel`
   關掉這一輪；`acks/launch|exited|unattributed-*` 只記通知送過了。
 - `episodes/<seq>/claims/<gen>/owner`：接手孤兒時 `mkdir` 下一代，搶輸的拿到 `EEXIST`。
-- `.v3/.sessions/<sha256(sid)>/act/<n>` 加 `.beat`：每次 reload 註冊一個 activation，每次對帳
+- `.v3/.sessions/<hex(sid)>/act/<n>` 加 `.beat`（key 是 session id 的 UTF-8 位元組 hex）：每次 reload 註冊一個 activation，每次對帳
   更新心跳；同一個 session 只有最新的 activation 收，舊的停下來並說明原因。
-- `.v3/<name>/.action`：每個 worker 一把 `ln -sn` 鎖，tell／stop／交付記帳在鎖裡做。
+- `.v3/<name>/.action`：每個 worker 一把 `ln -sn` 鎖，內容是持有者（session、host、pid、pid 起始時間）。
+  tell、開新一輪、復原、stop／cancel、autoStop、waiter 綁定與釋放在鎖裡做；ack 是 create-once
+  目錄，不進鎖（重複送只會 `EEXIST`）。鎖卡住（持有者當掉）時用 `/workers unlock <name>`：
+  先回報持有者、要你確認所有對這個 worker 的動作都結束了，再打 `/workers unlock <name> confirm`；
+  它只在持有者同一台機器、session 已不 live、pid 已不在（或被重用）時才拔鎖，否則照樣說 busy。
+- `/workers cancel <name> <seq>`：只關掉那一輪（`acks/cancel`），不動 pane；`stop` 才殺 pane
+  並把所有開著的輪次一起關掉。shell 上同一套是 `node skills/tmux-agent-tools/scripts/lib/workers.cli.node.ts
+  cancel <name> <seq> | unlock <name> [confirm]`。
 
 ack 是目錄，不是 store key，所以沒有「誰蓋掉誰的 ack」，也沒有剪除與容量預算。
 0.11 以前的紀錄（state root 直下的 `<name>/dispatch.json`）不會被匯入：還有沒結清的，
@@ -182,7 +189,7 @@ result_required_fields=status,summary
 | 範圍 | 規則 |
 |---|---|
 | `/workers` 列表、`tell`、`stop`、`peek` | **同一個 repo**（`ownerCwd` 等於本 session 的 cwd，字串相等）的所有 worker，不管誰派的、派它的 session 活著沒。別人派的列上標 `@<sid 前 8 碼>`。別的 repo 的看不到。 |
-| 結果投遞 | 只送給這一輪的 owner（最高一代 `claims/<gen>/owner`，沒有就是開這一輪的 session）。owner 的所有 activation 心跳停超過 90 秒（或沒有心跳、過了寬限期、確認 `ENOENT`）才算它死了；`EACCES` 等錯誤一律當 unknown，不接手。同 repo 的 collector 這時 `mkdir claims/<gen+1>` **認領**，搶輸的拿到 `EEXIST` 不送；這一 tick 不送，下一 tick 只有新 owner 送。 |
+| 結果投遞 | 只送給這一輪的 owner（最高一代 `claims/<gen>/owner`，沒有就是開這一輪的 session）。owner 的最新 activation（編號最大的那個，只看它）心跳停超過 90 秒（或沒有心跳、過了寬限期、確認 `ENOENT`）才算它死了；`EACCES` 等錯誤一律當 unknown，不接手。同 repo 的 collector 這時 `mkdir claims/<gen+1>` **認領**，搶輸的拿到 `EEXIST` 不送；這一 tick 不送，下一 tick 只有新 owner 送。 |
 | `tell` | **誰開的這一輪，這一輪就歸誰**：別的 session 對你的 worker `tell`，新的一輪的 owner 是它，答案送它；你已經開的輪次照樣送你。 |
 | resume | `claude --resume` 回來的 session id 不變（實測：transcript 每份只有一個 sessionId，resume 寫回同一份），所以 owner 不變、零等待。只有「關掉、另開新 session」才走 90 秒認領。 |
 

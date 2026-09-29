@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFile
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { heartbeat, newGate, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
+import { autoStop, AUTO_STOP_MS, cancelEpisode, heartbeat, newGate, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
 import { ORPHAN_MS, registerActivation, beat } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
@@ -134,15 +134,20 @@ test('tell: resumed worker → seq 1 on episodes/1; assigned worker → seq 2; s
   assert.equal(read(`${r.stateDir}/episodes/2/dispatch.json`).resultPath, `${r.stateDir}/episodes/2/result.json`)
 })
 
-test('tell: a failed send marks the episode aborted; scan skips it', async () => {
+test('tell: a failed send is uncertain, not aborted (F4) — the episode stays watched and never re-sent', async () => {
   const w = world()
   const r = await assigned(w)
   const w2 = { ...w, host: { ...w.host, run: async (argv: readonly string[], cwd: string, ms: number) => (argv[1] === 'astra' && argv[2] === 'send' ? { exitCode: 1, stdout: '', stderr: 'pane gone' } : w.host.run(argv, cwd, ms)) } }
   const d = (await scan(w.host, { claim: false })).visible[0]!
   const out = await tellWorker(w2.host, d, 'x')
   assert.ok(!out.ok)
-  assert.ok(existsSync(`${r.stateDir}/episodes/2/aborted`))
-  assert.equal((await scan(w.host, { claim: false })).visible[0]!.seq, 1)
+  assert.match(out.text, /may still have reached the pane/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2/aborted`), 'a failed exit is not proof nothing was sent')
+  assert.ok(existsSync(`${r.stateDir}/episodes/2/uncertain`))
+  assert.ok(existsSync(`${r.stateDir}/episodes/2/sent`), 'sent: recovery never re-sends it')
+  const after = await scan(w.host, { claim: false })
+  assert.equal(after.visible[0]!.seq, 2, 'E2 is the watched episode')
+  assert.deepEqual(after.unsent, [])
 })
 
 test('panelRows is read-only; only a collector scan claims an orphan episode; a live owner keeps it', async () => {
@@ -369,4 +374,323 @@ test('tell during a collect pass: the pass acks only the episode it read; the ne
   assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks`))
   const s = await scan(w.host, { claim: false })
   assert.deepEqual(s.dispatches.filter(d => !s.reported.has(`${d.name}#${d.seq}`)).map(d => d.seq), [2])
+})
+
+
+/** A second live session on the same root and repo: its own owner and wake list. */
+function peer(w: ReturnType<typeof world>, owner: string) {
+  const woken: string[] = []
+  const host: Host = { ...w.host, owner: () => owner, submit: async text => (woken.push(text), undefined) }
+  return { host, woken }
+}
+
+test('two owners (F2): an attributed result of another live owner’s open episode is theirs alone — no false unattributed notice', async () => {
+  const w = world({ owner: 'A' })
+  const r = await assigned(w)
+  const b = peer(w, 'B')
+  const ga = newGate()
+  const gb = newGate()
+  assert.ok(await heartbeat(w.host, ga))
+  assert.ok(await heartbeat(b.host, gb))
+  await tellWorker(b.host, (await scan(b.host, { claim: false })).visible[0]!, 'two')
+  writeFileSync(`${r.stateDir}/episodes/2/result.json`, result({ episode: 2 }))
+  await reconcile(w.host, ga, false)
+  assert.deepEqual(w.woken, [], 'A owns E1 only; E2’s attributed result is not A’s news')
+  await reconcile(b.host, gb, false)
+  assert.equal(b.woken.length, 1)
+  assert.match(b.woken[0]!, /on astra: success/)
+  assert.ok(existsSync(`${r.stateDir}/episodes/2/acks/done`))
+})
+
+test('two owners (F2): an unattributed write on another owner’s open path is noticed once, by the owner of the max open episode', async () => {
+  const w = world({ owner: 'A' })
+  const r = await assigned(w)
+  const b = peer(w, 'B')
+  const ga = newGate()
+  const gb = newGate()
+  assert.ok(await heartbeat(w.host, ga))
+  assert.ok(await heartbeat(b.host, gb))
+  await tellWorker(b.host, (await scan(b.host, { claim: false })).visible[0]!, 'two')
+  writeFileSync(`${r.stateDir}/result.json`, result({}))
+  await reconcile(w.host, ga, false)
+  await reconcile(b.host, gb, false)
+  await reconcile(w.host, ga, false)
+  assert.deepEqual(w.woken, [])
+  assert.equal(b.woken.length, 1)
+  assert.match(b.woken[0]!, /unattributed/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`), 'E1 stays open')
+})
+
+test('superseded unknown (F3): an unreadable act dir stops the tick and the submit, without pausing', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  let broken = false
+  const host: Host = {
+    ...w.host,
+    list: async path => {
+      if (broken && path.endsWith('/act')) throw new Error('EIO: act')
+      return w.host.list(path)
+    },
+    read: async path => {
+      if (path === `${r.stateDir}/result.json`) broken = true
+      return w.host.read(path)
+    },
+  }
+  const gate = newGate()
+  await reconcile(host, gate, false) // breaks between the beat and the submit
+  assert.deepEqual(w.woken, [], 'stillOurs: unknown is not "still the newest"')
+  assert.equal(gate.paused, undefined)
+  assert.equal(await heartbeat(host, gate), false, 'the next beat sees unknown too')
+  assert.equal(gate.paused, undefined)
+  broken = false
+  const healthy: Host = { ...w.host }
+  await reconcile(healthy, gate, false)
+  assert.equal(w.woken.length, 1, 'readable again: delivered')
+})
+
+test('no identity (F5): no beat, no claim, no episode written', async () => {
+  const w = world({ owner: 'dead' })
+  const r = await assigned(w)
+  const anon: Host = { ...w.host, owner: () => undefined }
+  assert.equal(await heartbeat(anon, newGate()), false)
+  const old = (Date.now() - ORPHAN_MS - 5_000) / 1000
+  mkdirSync(`${sessionDirOf(w.v3, 'dead')}/act/1`, { recursive: true })
+  utimesSync(`${sessionDirOf(w.v3, 'dead')}/act/1`, old, old)
+  await scan(anon, { claim: true })
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/claims`), 'an anonymous collector owns nothing')
+  const denied = await assignWorker(w.host, { profile: 'astra', name: 'x', dir: w.repo, brief: BRIEF }, { owner: '', ownerCwd: w.repo })
+  assert.ok('deny' in denied)
+  const told = await tellWorker(anon, (await scan(w.host, { claim: false })).visible[0]!, 'two')
+  assert.ok(!told.ok)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2`))
+})
+
+test('stop on unknown (F7): an episode list that cannot be read refuses the stop', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const host: Host = { ...w.host, list: async path => (path.endsWith('/episodes') ? Promise.reject(new Error('EIO')) : w.host.list(path)) }
+  const out = await stopWorker(host, newGate(), d)
+  assert.ok(!out.ok)
+  assert.match(out.text, /could not be read/)
+  assert.ok(!w.calls.some(c => c.argv[0] === 'agent-tmux' && c.argv[2] === 'stop'), 'nothing killed on unknown')
+  const acks = `${r.stateDir}/episodes/1/acks`
+  const host2: Host = { ...w.host, list: async path => (path === acks ? Promise.reject(new Error('EIO')) : w.host.list(path)) }
+  mkdirSync(acks, { recursive: true })
+  const out2 = await stopWorker(host2, newGate(), d)
+  assert.ok(!out2.ok)
+  assert.match(out2.text, /episode 1 could not be read/)
+})
+
+test('unreadable result (F8): an EIO read is unknown — logged, not delivered, not "no result"; readable again → delivered once', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  let eio = true
+  const host: Host = { ...w.host, read: async path => (eio && path === `${r.stateDir}/result.json` ? Promise.reject(new Error('EIO')) : w.host.read(path)) }
+  const gate = newGate()
+  await reconcile(host, gate, false)
+  assert.deepEqual(w.woken, [])
+  assert.ok(w.logs.some(l => l.includes('could not read') && l.includes('result.json')), w.logs.join('\n'))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks`))
+  eio = false
+  await reconcile(host, gate, false)
+  assert.equal(w.woken.length, 1)
+})
+
+test('unreadable waiter (F8): a waiter record that cannot be read holds its episode', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ agentId: 'ag1' }))
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const host: Host = {
+    ...w.host,
+    agentList: async () => [],
+    read: async path => (path.endsWith('/waiter') ? Promise.reject(new Error('EIO')) : w.host.read(path)),
+  }
+  await reconcile(host, newGate(), false)
+  assert.deepEqual(w.woken, [])
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks`))
+})
+
+test('identity ack failure (F9): no done without the closing snapshot’s identity; re-reported, then closed once', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  let fail = true
+  const host: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) =>
+      fail && argv[0] === 'mkdir' && /\/acks\/unattributed-/.test(argv.at(-1) ?? '') ? { exitCode: 1, stdout: '', stderr: 'Input/output error' } : w.host.run(argv, cwd, ms),
+  }
+  const gate = newGate()
+  await reconcile(host, gate, false)
+  assert.equal(w.woken.length, 1)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`), 'done waits for the identity')
+  fail = false
+  await reconcile(host, gate, false)
+  assert.equal(w.woken.length, 2, 'unacked: reported again')
+  assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/done`))
+  await reconcile(host, gate, false)
+  assert.equal(w.woken.length, 2)
+})
+
+test('waiter release under the lock (F10): a held lock defers the release; free, the ended waiter is released', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ agentId: 'ag1' }))
+  const host: Host = { ...w.host, agentList: async () => [] }
+  const lock = `${r.stateDir}/.action`
+  ;(await import('node:fs')).symlinkSync(JSON.stringify({ token: 'other', session: 'x' }), lock)
+  await reconcile(host, newGate(), false)
+  assert.equal(read(`${r.stateDir}/episodes/1/waiter`).agentId, 'ag1', 'the lock holder’s action is not overwritten')
+  ;(await import('node:fs')).unlinkSync(lock)
+  await reconcile(host, newGate(), false)
+  assert.deepEqual(read(`${r.stateDir}/episodes/1/waiter`), {})
+  assert.ok(!existsSync(lock), 'released')
+})
+
+test('autoStop re-reads max n (F10): a superseded activation stops nothing', async () => {
+  const done = Date.now() - AUTO_STOP_MS - 60_000
+  let name = ''
+  const w = world({
+    answer: a =>
+      a[0] === 'tmux' ? { exitCode: 0, stdout: `astra-cli-${name}\n`, stderr: '' }
+      : a[0] === 'agent-tmux' && a[2] === 'status' ? { exitCode: 0, stdout: JSON.stringify({ running: false, idle_seconds: AUTO_STOP_MS / 1000 + 60 }), stderr: '' }
+      : undefined,
+  })
+  const r = await assigned(w)
+  name = r.name
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const old = newGate()
+  await heartbeat(w.host, old)
+  const d = { ...(await scan(w.host, { claim: false })).visible[0]!, since: done }
+  await heartbeat(w.host, newGate()) // a reload registers a newer activation
+  const t = done / 1000
+  utimesSync(`${r.stateDir}/result.json`, t, t)
+  await autoStop(w.host, old, w.v3, [d], Date.now())
+  assert.ok(!w.calls.some(c => c.argv[0] === 'agent-tmux' && c.argv[2] === 'stop'), 'nothing stopped')
+  assert.ok(w.logs.some(l => l.includes('not auto-stopping') && l.includes('superseded')), w.logs.join('\n'))
+  // The newest activation, same inputs: stopped (the test reaches the stop).
+  const fresh = newGate()
+  await heartbeat(w.host, fresh)
+  await autoStop(w.host, fresh, w.v3, [d], Date.now())
+  assert.ok(w.calls.some(c => c.argv[0] === 'agent-tmux' && c.argv[2] === 'stop'))
+})
+
+test('episode cancel (F6, §5): closes one episode, never the pane; idempotent; a missing episode or a held lock is refused', async () => {
+  const w = world()
+  const r = await assigned(w)
+  await tellWorker(w.host, (await scan(w.host, { claim: false })).visible[0]!, 'two')
+  const out = await cancelEpisode(w.host, r.name, 1)
+  assert.ok(out.ok, out.text)
+  assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks`), 'E2 stays open')
+  assert.ok(!w.calls.some(c => c.argv[0] === 'agent-tmux' && c.argv[2] === 'stop'), 'the pane is untouched')
+  assert.match((await cancelEpisode(w.host, r.name, 1)).text, /already closed \(cancel\)/)
+  assert.ok(!(await cancelEpisode(w.host, r.name, 9)).ok)
+  const held = await takeLock(w.host, r.stateDir)
+  assert.ok(held.ok)
+  const busy = await cancelEpisode(w.host, r.name, 2)
+  assert.ok(!busy.ok)
+  assert.match(busy.text, /busy/)
+  const s = await scan(w.host, { claim: false })
+  assert.deepEqual(s.dispatches.filter(d => !s.reported.has(`${d.name}#${d.seq}`)).map(d => d.seq), [2])
+})
+
+test('lock holder (F6): takeLock records this process — host, pid, start time — for a later unlock', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const me = await processId(w.host)
+  assert.equal(me.pid, process.pid)
+  assert.ok(me.host && me.pidStart)
+  const lock = await takeLock(w.host, r.stateDir)
+  assert.ok(lock.ok)
+  const h = JSON.parse((await import('node:fs')).readlinkSync(`${r.stateDir}/.action`))
+  assert.deepEqual([h.session, h.host, h.pid, h.pidStart], ['me', me.host, process.pid, me.pidStart])
+})
+
+test('unlock (F6, §5): maintenance only — needs confirm; refuses a live process, a live session, another host, no pid; removes a gone holder', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const fs = await import('node:fs')
+  const lock = `${r.stateDir}/.action`
+  const me = await processId(w.host)
+  const hold = (h: Record<string, unknown>) => {
+    if (fs.existsSync(lock) || (() => { try { fs.readlinkSync(lock); return true } catch { return false } })()) fs.unlinkSync(lock)
+    fs.symlinkSync(JSON.stringify({ token: 't', activation: '', session: 'gone', host: me.host, pid: 999_999, pidStart: 'Thu Jan  1 00:00:00 1970', ...h }), lock)
+  }
+  assert.match((await unlockWorker(w.host, r.name)).text, /not locked/)
+  hold({})
+  const ask = await unlockWorker(w.host, r.name)
+  assert.ok(!ask.ok)
+  assert.match(ask.text, /unlock .* confirm/)
+  assert.ok(fs.readlinkSync(lock))
+  hold({ pid: process.pid, pidStart: me.pidStart })
+  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /still running/)
+  hold({ host: 'elsewhere' })
+  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /not provably this host/)
+  hold({ pid: 0, pidStart: '' })
+  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /records no process/)
+  const sd = sessionDirOf(w.v3, 'gone')
+  const n = (await registerActivation(w.host, sd, { pid: 1, pidStart: '', host: '', token: 'x' }))!
+  await beat(w.host, sd, n, Date.now())
+  hold({})
+  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /session is live/)
+  const old = (Date.now() - ORPHAN_MS - 5_000) / 1000
+  utimesSync(`${sd}/act/${n}.beat`, old, old)
+  const done = await unlockWorker(w.host, r.name, 'confirm')
+  assert.ok(done.ok, done.text)
+  assert.throws(() => fs.readlinkSync(lock), 'removed')
+})
+
+test('workers CLI (F6): cancel and unlock on the shared ledger; bad arguments exit 2', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const cli = new URL('./workers.cli.node.ts', import.meta.url).pathname
+  const { execFile } = await import('node:child_process')
+  const run = (args: string[]) =>
+    new Promise<{ code: number; out: string }>(resolve =>
+      execFile(process.execPath, [cli, ...args], { env: { ...process.env, TMUX_AGENT_DIR: w.root } }, (error, stdout) =>
+        resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout }),
+      ),
+    )
+  const c = await run(['cancel', r.name, '1'])
+  assert.equal(c.code, 0, c.out)
+  assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
+  assert.equal((await run(['unlock', r.name])).code, 0)
+  assert.equal((await run(['cancel', r.name])).code, 2)
+  assert.equal((await run(['nope'])).code, 2)
+  assert.equal((await run(['cancel', r.name, '7'])).code, 1)
+})
+
+test('reserve (F6): a drawn name whose tmux session exists is redrawn, never reserved; two hits deny', async () => {
+  let live = ''
+  const w = world({ answer: a => (a[0] === 'tmux' ? { exitCode: 0, stdout: live, stderr: '' } : undefined) })
+  const rec = { profile: 'astra', dir: w.repo, since: Date.now(), owner: 'me', ownerCwd: w.repo, origin: 'assign' as const }
+  live = 'astra-cli-w.aaaaa\n'
+  const draws = ['aaaaa', 'bbbbb']
+  const got = await reserve(w.host, w.v3, 'w', rec, w.repo, () => draws.shift()!)
+  assert.deepEqual(got, { name: 'w.bbbbb', w: `${w.v3}/w.bbbbb` })
+  assert.ok(!existsSync(`${w.v3}/w.aaaaa`), 'the live name is never reserved')
+  live = 'astra-cli-w.ccccc\nastra-cli-w.ddddd\n'
+  const both = ['ccccc', 'ddddd']
+  const denied = await reserve(w.host, w.v3, 'w', rec, w.repo, () => both.shift()!)
+  assert.ok('deny' in denied)
+  assert.ok(!w.calls.some(c => c.argv[0] === 'agent-tmux'), 'the wrapper never ran on a live name')
+})
+
+test('a seq ≥ 2 result on the launch path (§10): one unattributed notice; E1 and E2 stay open', async () => {
+  const w = world()
+  const r = await assigned(w)
+  await tellWorker(w.host, (await scan(w.host, { claim: false })).visible[0]!, 'two')
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 2 }))
+  const gate = newGate()
+  await reconcile(w.host, gate, false)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1)
+  assert.match(w.woken[0]!, /unattributed/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks/done`), 'E2 closes only from its own path')
 })

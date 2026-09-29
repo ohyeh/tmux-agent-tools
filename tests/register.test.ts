@@ -85,6 +85,8 @@ function mockFs(
       })),
     }
   })
+  // No id, no collecting (§3): every fs-backed test is a session; `setSessionId` names it.
+  on('session.id', () => ({ value: sessionIds.get(on) ?? 'sess-test' }))
   runOf(on).ledger = argv => ledgerOp(files, links, mtimes, argv)
   fsNow = files
   for (const id of seededAcks.splice(0)) {
@@ -95,6 +97,12 @@ function mockFs(
   return seen
 }
 
+
+const sessionIds = new WeakMap<On, string>()
+/** The session id this test's `mockFs` answers (default `sess-test`). */
+function setSessionId(on: On, id: string): void {
+  sessionIds.set(on, id)
+}
 
 type RunResult = { value: { exitCode: number; stdout: string; stderr: string } }
 
@@ -379,7 +387,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     const clock = mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {
       ...worker('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
       [`${V3}/mine/result.json`]: finished('mine'),
@@ -436,7 +444,7 @@ describe('ownership', () => {
     // All three are delivered, so nobody claims them and each keeps its owner.
     mockStore(on, ['mine@0', 'live@0', 'dead@0'])
     const clock = mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     mockFs(on, {
       ...live('sess-B'),
       ...worker('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
@@ -471,7 +479,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on, ['mine@0'])
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     mockFs(on, {
       ...worker('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
       [`${V3}/mine/result.json`]: finished(),
@@ -489,7 +497,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     // A worktree removed after its branch merged: the record names a dir that is no more.
     mockFs(on, { ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work', dir: '/gone/wt' }) })
     mockSessionStart(on)
@@ -516,7 +524,7 @@ describe('ownership', () => {
     // sess-C delivered "done" and acked it under its own key, then went quiet.
     mockStore(on, ['done@0'], 'tmux-agent.reported.sess-C')
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {
       ...worker('done', 0, { owner: 'sess-C', ownerCwd: '/work' }),
       [`${V3}/done/result.json`]: finished('done'),
@@ -539,7 +547,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {
       ...worker('live', 0, { owner: 'sess-A', ownerCwd: '/work' }),
     }
@@ -567,7 +575,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {
       ...worker('orphan', 0, { owner: 'sess-C', ownerCwd: '/work' }),
       [`${V3}/orphan/result.json`]: finished('orphan'),
@@ -592,7 +600,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {}
     for (let i = 0; i < 7; i += 1) Object.assign(files, worker(`o${i}`, 0, { owner: 'sess-C', ownerCwd: '/work' }))
     Object.assign(files, worker('p0', 0, { owner: 'sess-D', ownerCwd: '/work' }))
@@ -616,7 +624,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-B' }))
+    setSessionId(on, 'sess-B')
     const files: Files = {
       ...worker('orphan', 0, { owner: 'sess-A', ownerCwd: '/work', adoptedFrom: 'sess-C' }),
       [`${V3}/orphan/result.json`]: finished('orphan'),
@@ -637,7 +645,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-B' }))
+    setSessionId(on, 'sess-B')
     const files: Files = {
       ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work', goal: 'port the poller' }),
       ...live('sess-A'),
@@ -672,7 +680,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     const store = mockStore(on, ['mine@0'])
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-B' }))
+    setSessionId(on, 'sess-B')
     mockFs(on, {
       ...worker('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
       [`${V3}/mine/result.json`]: finished('mine'),
@@ -697,7 +705,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     const store = mockStore(on, ['mine@0'], 'tmux-agent.reported.sess-A')
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-B' }))
+    setSessionId(on, 'sess-B')
     mockFs(on, {
       ...worker('mine', 0, { owner: 'sess-A', ownerCwd: '/work' }),
       [`${V3}/mine/result.json`]: finished('mine'),
@@ -725,7 +733,7 @@ describe('ownership', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {}
     mockFs(on, files)
     mockPanel(on, { running: true })
@@ -1352,8 +1360,9 @@ describe('assign', () => {
     expect(record.name).not.toEqual('w1')
     expect(JSON.parse(files[`${V3}/${record.name}/episodes/1/dispatch.json`]!), 'E1 carries the base').toMatchObject({ seq: 1, base: head, origin: 'launch' })
     // HEAD is read BEFORE the launch, so a worker that commits fast cannot move the base.
-    // (`tmux ls` before both is the reservation's advisory has-session look, §8.)
-    const calls = argvs.filter(a => a[0] !== 'tmux')
+    // (`tmux ls` before both is the reservation's advisory has-session look, §8; `/bin/sh`
+    // is the one-per-process identity probe the action lock's holder records, §5.)
+    const calls = argvs.filter(a => a[0] !== 'tmux' && a[0] !== '/bin/sh')
     expect(calls.length).toEqual(2)
     expect(calls[0]).toEqual(['git', '-C', '/work', 'rev-parse', 'HEAD'])
     // The launched argv carries the fresh name, and the brief went with it.
@@ -2816,7 +2825,7 @@ describe('teammates', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     mockFs(on, {
       ...live('286cedc4-f039'),
       ...live('169a198a-2927'),
@@ -3148,7 +3157,7 @@ describe('astra re-review of e8704d6', () => {
   test('a peer must preserve another live worker launch acknowledgement', WITH_DRIVER, async ($, on) => {
     mock.env(on,{HOME}); mockClock(on);
     const store=mockStore(on,['w1@0#launch'],'tmux-agent.reported.sess-A');
-    on('session.id',()=>({value:'sess-B'}));
+    setSessionId(on, 'sess-B');
     mockFs(on,{...worker('w1',0,{owner:'sess-A',ownerCwd:'/work'}),[`${V3}/w1/launch.exit`]:'1',...live('sess-A')});
     mockWake(on); mockSessionStart(on); on('ui.status',()=>({value:undefined}));
     await $.session.start({...session(),cwd:'/other'});
@@ -3708,6 +3717,22 @@ describe('panel UX, 2026-09-25 live probe', () => {
     expect((await $.command.run(run('workers', 'hide'))).text).toContain('hidden')
     expect(textOf(await $.ui.render(bandRender()))).not.toContain('w2')
   })
+
+  test('/workers cancel closes one episode and leaves the pane; unlock asks for confirm first (§5)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    expect((await $.command.run(run('workers', 'cancel w1'))).text).toContain('FAILED: cancel takes <name> <seq>')
+    expect((await $.command.run(run('workers', 'cancel w1 1'))).text).toContain('cancel "w1" — ok: cancelled episode 1')
+    expect(store.acked()).toContain('w1#1')
+    expect(panel.argv.some(a => a.includes('stop'))).toEqual(false)
+    expect((await $.command.run(run('workers', 'unlock w1'))).text).toContain('is not locked')
+    expect((await $.command.run(run('workers', 'nope'))).text).toContain('cancel <name> <seq> | unlock <name> [confirm]')
+  })
 })
 
 describe('astra review of 34e2a1e', () => {
@@ -3997,7 +4022,7 @@ describe('live e2e of 0.7.6', () => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = {
       ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }),
       ...worker('w2', 0, { owner: 'sess-A', ownerCwd: '/work' }),
@@ -4086,7 +4111,7 @@ describe('live e2e of 0.7.6', () => {
     // As a reload finds it: this session's panel was open, the module state is gone.
     const store = mockStore(on, [], 'tmux-agent.reported', { 'tmux-agent.panel': ['sess-B', 'sess-A'] })
     const clock = mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     mockFs(on, { ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }) })
     mockPanel(on, { running: true, idle_seconds: 10 })
 
@@ -4105,7 +4130,7 @@ describe('live e2e of 0.7.6', () => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     const clock = mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     mockFs(on, {})
     const panel = mockPanel(on, { running: true, idle_seconds: 10 })
 
@@ -4122,7 +4147,7 @@ describe('live e2e of 0.7.6', () => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     mockFs(on, { ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }) })
     mockPanel(on, { running: true, idle_seconds: 10 })
 
@@ -4181,7 +4206,7 @@ describe('live e2e of 0.7.6', () => {
     const ago = -40 * 60_000
     const store = mockStore(on, ['done', 'adopted', 'mid', 'young', 'gone'].map(n => `${n}@${ago}`), 'tmux-agent.reported.sess-A')
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const at = (ms: number) => JSON.stringify({ episode: 1, status: 'success', summary: 'ok', finished_at: new Date(ms).toISOString() })
     const mine = { owner: 'sess-A', ownerCwd: '/work' }
     const files: Files = {
@@ -4242,7 +4267,7 @@ describe('live e2e of 0.7.6', () => {
     const ago = -40 * 60_000
     mockStore(on, ['busy', 'idle', 'down'].map(n => `${n}@${ago}`), 'tmux-agent.reported.sess-A')
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const at = (ms: number) => JSON.stringify({ episode: 1, status: 'success', summary: 'ok', finished_at: new Date(ms).toISOString() })
     const mine = { owner: 'sess-A', ownerCwd: '/work' }
     mockFs(on, {
@@ -4757,7 +4782,7 @@ describe('resume', () => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
-    on('session.id', () => ({ value: 'sess-A' }))
+    setSessionId(on, 'sess-A')
     const files: Files = { [`${HOME}/.cursor/chats/b974ad48/${ID}/meta.json`]: JSON.stringify({ cwd: '/work' }) }
     mockFs(on, files)
     const probe = { running: true, idle_seconds: 5, sessions: [] as string[] }

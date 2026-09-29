@@ -64,6 +64,8 @@ import {
   tellWorker,
   stopAll,
   stopWorker,
+  cancelEpisode,
+  unlockWorker,
   peekWorker,
   peekProject,
   pressKeys,
@@ -167,6 +169,11 @@ export const register: Register = on => {
   let listAgents: Host['agentList'] = () => Promise.reject(new Error('tmux-agent: agent.list before the session binds'))
   let sessionCwd: string | undefined
   let sessionId: string | undefined
+  /** The session id, asked again when the first read found none: no id, no owner (§3). */
+  const idNow = async (ask: () => Promise<string>): Promise<string | undefined> => {
+    sessionId ||= (await ask().catch(() => undefined)) || undefined
+    return sessionId
+  }
   /** False after a failed `$.agent.register`: the spawn hook then denies, as 0.9 did. */
   let waiterReady = false
   let waiterRegisterLogged = false
@@ -207,7 +214,12 @@ export const register: Register = on => {
     void beneath.session.cwd().then(cwd => { sessionCwd ||= cwd }).catch(() => undefined)
     const tmux: EngineInterface['tmux'] = {
       outstanding: () => outstanding(host),
-      reconcile: () => reconcileOnce(host, gate),
+      // The early id read above can land before the engine answers it (a hot reload,
+      // a harness that binds hooks late): ask again, since no id means no collecting (§3).
+      reconcile: async () => {
+        await idNow(() => beneath.session.id())
+        return reconcileOnce(host, gate)
+      },
       stalled: async () => [...gate.stalled.values()],
     }
     return { ...beneath, tmux }
@@ -269,7 +281,7 @@ export const register: Register = on => {
 
     await $.command.register({
       name: 'workers',
-      description: 'Show or hide the workers panel; /workers N selects row N, /workers stop <name>, /workers tell <name> <text>, /workers hide',
+      description: 'Show or hide the workers panel; /workers N selects row N, /workers stop <name>, /workers tell <name> <text>, /workers cancel <name> <seq>, /workers unlock <name> [confirm], /workers hide',
     })
 
     await $.tool.register({
@@ -1046,6 +1058,16 @@ export const register: Register = on => {
         if (out.ok && panel.open) void panel.refresh?.()
         return { text: `resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}` }
       }
+      if (verb === 'cancel' || verb === 'unlock') {
+        // By name, like stop/tell: an episode cancel never touches the pane (§5); unlock is
+        // maintenance only and refuses a holder it cannot prove gone.
+        if (!target) return { text: verb === 'cancel' ? '/workers cancel <name> <seq>' : '/workers unlock <name> [confirm]' }
+        await idNow(() => $.session.id())
+        const word = message.trim()
+        const out = verb === 'cancel' ? await cancelEpisode(bound, target, /^[0-9]+$/.test(word) ? Number(word) : NaN) : await unlockWorker(bound, target, word || undefined)
+        if (panel.open) void panel.refresh?.()
+        return { text: `${verb} "${target}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 400)}` }
+      }
       const fresh = panel.open ? undefined : await panelRows(bound, gate, await rootOf(bound))
       // Numbers index what is drawn; names reach every row, folded ones too.
       const rows = fresh ?? panel.rows
@@ -1091,7 +1113,7 @@ export const register: Register = on => {
         if (panel.open) void panel.refresh?.()
         return { text: `${verb} "${row.d.name}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 300)}` }
       } else {
-        return { text: '/workers [N | stop <name> | tell <name> <text> | resume [profile] <session-id> [name] | hide]' }
+        return { text: '/workers [N | stop <name> | tell <name> <text> | cancel <name> <seq> | unlock <name> [confirm] | resume [profile] <session-id> [name] | hide]' }
       }
     }
     if (panel.open) {
@@ -1111,7 +1133,7 @@ export const register: Register = on => {
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
     const out = await assignWorker(host, e as unknown as AssignInput, {
-      owner: sessionId,
+      owner: await idNow(() => $.session.id()),
       ownerCwd: sessionCwd,
       down: () => collectorDown(gate),
     })
@@ -1136,6 +1158,7 @@ export const register: Register = on => {
     if (!text) return { deny: 'tmux-agent: text is empty' }
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
+    await idNow(() => $.session.id())
     const d = await dispatchNamed(host, input.name)
     if (!d && projectNamed(input.name)) return READONLY_PROJECT
     if (!d) {
@@ -1274,7 +1297,7 @@ export const register: Register = on => {
     const assigned = await assignWorker(
       host,
       { profile, name: workerBase(e.description), dir: e.cwd ?? sessionCwd ?? '', brief },
-      { owner: sessionId, ownerCwd: sessionCwd, down: () => collectorDown(gate) },
+      { owner: await idNow(() => $.session.id()), ownerCwd: sessionCwd, down: () => collectorDown(gate) },
     )
     if ('deny' in assigned) return { deny: assigned.deny }
     const r = await next({
