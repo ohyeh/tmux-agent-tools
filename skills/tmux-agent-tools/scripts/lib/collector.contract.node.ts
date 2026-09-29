@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { sessionKey } from './ledger.ts'
@@ -220,24 +220,83 @@ test('collector entry: missing identity or a pane that is not %N is refused with
   assert.equal(await run(['--session', 's', '--cwd', '/x', '--pane', 'main']), 2)
 })
 
-test('collector wake: a bracketed paste into the exact pane, then Enter; a gone pane is a drop', async t => {
+/** A private tmux server. `$TMUX` is not copied onto the child, and every call carries `-S`. */
+function privateServer(): { dir: string; sock: string; env: NodeJS.ProcessEnv; tmux: (args: string[]) => Promise<{ code: number; out: string }> } {
+  const dir = mkdtempSync('/tmp/p3t-')
+  const sock = join(dir, 's')
+  const env: NodeJS.ProcessEnv = { ...process.env, TMUX_AGENT_TMUX_SOCKET: sock, TMUX_TMPDIR: dir }
+  delete env.TMUX
+  delete env.TMUX_PANE
   const tmux = (args: string[]) =>
-    new Promise<{ code: number; out: string }>(resolve =>
-      execFile('tmux', args, { encoding: 'utf8' }, (error, stdout) => resolve({ code: error ? 1 : 0, out: stdout })),
-    )
+    new Promise<{ code: number; out: string }>(resolve => {
+      const has = args.some((a, i) => a === '-S' || a === '-L' || args[i - 1] === '-S' || args[i - 1] === '-L')
+      execFile('tmux', has ? args : ['-S', sock, ...args], { env, encoding: 'utf8' }, (error, stdout) =>
+        resolve({ code: error ? 1 : 0, out: stdout }),
+      )
+    })
+  return { dir, sock, env, tmux }
+}
+
+test('collector wake: a bracketed paste into the exact pane, then Enter; a gone pane is a drop', async t => {
+  const srv = privateServer()
   const name = `tac-collector-${process.pid}`
-  if ((await tmux(['new-session', '-d', '-s', name, '-x', '120', '-y', '20', 'cat'])).code !== 0) return t.skip('no tmux server can start here')
+  if ((await srv.tmux(['new-session', '-d', '-s', name, '-x', '120', '-y', '20', 'cat'])).code !== 0) {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+    return t.skip('no private tmux server can start here')
+  }
   try {
-    const pane = (await tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
-    assert.ok(await paneAlive(pane))
-    assert.deepEqual(await pasteInto(pane, 'line one\nline two'), { text: 'line one\nline two' })
+    const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
+    assert.ok(await paneAlive(pane, srv.env))
+    assert.deepEqual(await pasteInto(pane, 'line one\nline two', srv.env), { text: 'line one\nline two' })
     await new Promise(r => setTimeout(r, 300))
-    const screen = (await tmux(['capture-pane', '-p', '-t', pane])).out
+    const screen = (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
     assert.match(screen, /line one/)
     assert.match(screen, /line two/)
+    assert.equal(await paneAlive('%999999', srv.env), false)
+    assert.match((await pasteInto('%999999', 'x', srv.env)).drop ?? '', /gone/)
   } finally {
-    await tmux(['kill-session', '-t', name])
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
   }
-  assert.equal(await paneAlive('%999999'), false)
-  assert.match((await pasteInto('%999999', 'x')).drop ?? '', /gone/)
+})
+
+test('CLI collector and another session on one root: a dead owner\'s finished episode is claimed and delivered once', async t => {
+  const w = world('dead')
+  beatAt(w, 'dead', OLD)
+  const srv = privateServer()
+  const env = { ...srv.env, TMUX_AGENT_DIR: w.root }
+  const name = `p3-xh-${process.pid}`
+  if ((await srv.tmux(['new-session', '-d', '-s', name, '-x', '200', '-y', '30', 'cat'])).code !== 0) {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+    return t.skip('no private tmux server can start here')
+  }
+  try {
+    const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
+    assert.match(pane, /^%\d+$/)
+    const once = (session: string) =>
+      new Promise<number>(resolve =>
+        execFile(
+          process.execPath,
+          [COLLECTOR, '--session', session, '--cwd', w.cwd, '--pane', pane, '--once'],
+          { env, timeout: 20_000 },
+          error => resolve(error ? (typeof error.code === 'number' ? error.code : -1) : 0),
+        ),
+      )
+    const round = () => Promise.all([once('cli-host'), pass(w, 'other-host')])
+    const first = await round()
+    assert.deepEqual(first.map(c => (typeof c === 'number' ? c : c.code)), [0, 0])
+    assert.deepEqual(delivered(w), [], 'the claim tick delivers nothing')
+    assert.equal(gens(w).length, 1, 'one claim gen')
+    await round()
+    await new Promise(r => setTimeout(r, 300))
+    const screen = (await srv.tmux(['capture-pane', '-p', '-J', '-t', pane])).out
+    const pasted = screen.includes('did it') ? 1 : 0
+    assert.equal(delivered(w).length + pasted, 1, 'the claimant delivers once, the other session does not')
+    assert.ok(acked(w))
+  } finally {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+  }
 })

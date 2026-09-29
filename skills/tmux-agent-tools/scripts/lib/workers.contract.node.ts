@@ -5,7 +5,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
@@ -657,13 +657,14 @@ test('workers CLI (F6): cancel and unlock on the shared ledger; bad arguments ex
         resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout }),
       ),
     )
-  const c = await run(['cancel', r.name, '1'])
+  const id = ['--session', 'me', '--cwd', w.repo]
+  const c = await run([...id, 'cancel', r.name, '1'])
   assert.equal(c.code, 0, c.out)
   assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
-  assert.equal((await run(['unlock', r.name])).code, 0)
-  assert.equal((await run(['cancel', r.name])).code, 2)
-  assert.equal((await run(['nope'])).code, 2)
-  assert.equal((await run(['cancel', r.name, '7'])).code, 1)
+  assert.equal((await run([...id, 'unlock', r.name])).code, 0)
+  assert.equal((await run([...id, 'cancel', r.name])).code, 2)
+  assert.equal((await run([...id, 'nope'])).code, 2)
+  assert.equal((await run([...id, 'cancel', r.name, '7'])).code, 1)
 })
 
 test('reserve (F6): a drawn name whose tmux session exists is redrawn, never reserved; two hits deny', async () => {
@@ -861,4 +862,102 @@ test('stop cancel unknown (R2-7): an unrecorded cancel is not reported as cancel
   assert.equal(out.ok, false)
   assert.doesNotMatch(out.text, /cancelled episode/)
   assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
+})
+
+test('workers CLI (§3, §9): missing --session or --cwd is refused; assign, tell, stop and rows call the core', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wcli-'))
+  const repo = mkdtempSync(join(tmpdir(), 'wrepo-'))
+  const bin = mkdtempSync(join(tmpdir(), 'wbin-'))
+  const log = join(root, 'fake.log')
+  writeFileSync(log, '')
+  writeFileSync(`${bin}/agent-tmux`, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_LOG"\nexit 0\n')
+  chmodSync(`${bin}/agent-tmux`, 0o755)
+  const { execFileSync } = await import('node:child_process')
+  execFileSync('git', ['init', '-q'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '--allow-empty', '-q', '-m', 'init'], { cwd: repo })
+  const brief = join(root, 'brief.md')
+  const text = join(root, 'tell.md')
+  writeFileSync(brief, BRIEF)
+  writeFileSync(text, 'next step\n')
+  const cli = new URL('./workers.cli.node.ts', import.meta.url).pathname
+  const { execFile } = await import('node:child_process')
+  const run = (args: string[]) =>
+    new Promise<{ code: number; out: string; err: string }>(resolve =>
+      execFile(
+        process.execPath,
+        [cli, ...args],
+        { env: { ...process.env, TMUX_AGENT_DIR: root, PATH: `${bin}:${process.env.PATH ?? ''}`, FAKE_LOG: log } },
+        (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout, err: stderr }),
+      ),
+    )
+  const noSession = await run(['rows', '--cwd', repo])
+  assert.equal(noSession.code, 2, noSession.err)
+  assert.match(noSession.err, /--session is required/)
+  const noCwd = await run(['rows', '--session', 's1'])
+  assert.equal(noCwd.code, 2, noCwd.err)
+  assert.match(noCwd.err, /--cwd/)
+  const id = ['--session', 's1', '--cwd', repo]
+  const assignedCli = await run(['assign', 'codex', 'w', repo, brief, ...id])
+  assert.equal(assignedCli.code, 0, assignedCli.out + assignedCli.err)
+  assert.match(assignedCli.out, /end the turn/)
+  const rows = await run(['rows', ...id])
+  assert.equal(rows.code, 0, rows.err)
+  const parsed = JSON.parse(rows.out) as { d: { name: string } }[]
+  assert.equal(parsed.length, 1)
+  assert.match(parsed[0]!.d.name, /^w\.[0-9a-z]{5}$/)
+  const name = parsed[0]!.d.name
+  assert.ok(existsSync(`${root}/.v3/${name}/episodes/1/dispatch.json`))
+  const told = await run(['tell', name, text, ...id])
+  assert.equal(told.code, 0, told.out + told.err)
+  assert.match(readFileSync(log, 'utf8'), /send/)
+  assert.match(readFileSync(log, 'utf8'), /--episode/)
+  const stopped = await run(['stop', name, ...id])
+  assert.equal(stopped.code, 0, stopped.out + stopped.err)
+  assert.match(readFileSync(log, 'utf8'), /stop/)
+})
+
+test('a send blocked past ORPHAN_MS does not lose ownership while its beat still runs (§4)', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  assert.equal(await heartbeat(w.host, gate), true)
+  let release: () => void = () => {}
+  const hung = new Promise<void>(res => {
+    release = res
+  })
+  let saw = false
+  const orig = w.host.run
+  w.host.run = (argv, cwd, ms) => {
+    if (argv[0] === 'agent-tmux' && argv[2] === 'send') {
+      saw = true
+      return hung.then(() => ({ exitCode: 0, stdout: '', stderr: '' }))
+    }
+    return orig(argv, cwd, ms)
+  }
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const telling = tellWorker(w.host, d, 'hold the send')
+  for (let i = 0; i < 200 && !saw; i++) await new Promise(res => setTimeout(res, 10))
+  assert.ok(saw, 'the send started')
+  const beat = `${sessionDirOf(w.v3, 'me')}/act/${gate.activation}.beat`
+  const old = (Date.now() - ORPHAN_MS - 5_000) / 1000
+  utimesSync(beat, old, old)
+  try {
+    assert.equal(await heartbeat(w.host, gate), true, 'the beat is not blocked by the in-flight send')
+    const peerWoken: string[] = []
+    const peerBase = nodeHost({ owner: 'peer', cwd: w.repo, submit: async text => (peerWoken.push(text), undefined) })
+    const peer: Host = {
+      ...peerBase,
+      run: async (argv, cwd, ms) => {
+        if (argv[0] === 'tmux' || argv[0] === 'agent-tmux' || argv[0] === 'sh') return { exitCode: 0, stdout: '', stderr: '' }
+        if (argv[0] === 'git') return { exitCode: 0, stdout: `${SHA}\n`, stderr: '' }
+        return peerBase.run(argv, cwd, ms)
+      },
+    }
+    await reconcile(peer, newGate(), false)
+    assert.deepEqual(peerWoken, [], 'a peer does not deliver the episode')
+    assert.ok(!existsSync(`${r.stateDir}/episodes/1/claims`), 'no claim gen: the beat kept the owner')
+  } finally {
+    release()
+    await telling
+  }
 })

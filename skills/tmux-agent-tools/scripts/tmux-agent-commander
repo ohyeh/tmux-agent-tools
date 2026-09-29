@@ -1,16 +1,11 @@
 #!/usr/bin/env zsh
 # tmux-agent-commander — wake codex, agy, and cursor when a worker finishes.
-# The Claude mod already does this. This collector writes the same dispatch
-# record and the same heartbeat file, then sends the result into the
-# commander's own pane. It does not adopt orphans; a stale heartbeat (90s)
-# is the mod's job.
+# assign / tell / stop call the shared workers CLI. collect is the node
+# collector: it pastes into this pane (%N). The zsh delivery loop is gone.
 set -euo pipefail
 
 SELF="${0:A}"
 SCRIPT_DIR="${0:A:h}"
-JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
-TICK_SECONDS=10
-SUMMARY_MAX=600
 
 usage() {
   cat <<'EOF'
@@ -19,19 +14,20 @@ tmux-agent-commander — collect worker results into a non-Claude pane
 Usage:
   tmux-agent-commander start <cli> <name> <dir> [--no-attach] [--no-panel]
   tmux-agent-commander assign <profile> <worker> <dir> <brief-file>
-  tmux-agent-commander collect <cli> <name>
-  tmux-agent-commander stop <cli> <name>
+  tmux-agent-commander tell <worker> <text-file>
+  tmux-agent-commander collect [<cli> <name>]
+  tmux-agent-commander stop <worker>
   tmux-agent-commander status
   tmux-agent-commander panel <session> [--width N]
 
 start launches `agent-tmux <cli> start --exact`, then a detached collector,
 then attach (unless --no-attach). Unless --no-panel, it also sets a second
-status line on that session that runs `panel <session>`. assign runs inside
-that pane: it records dispatch.json, then `agent-tmux <profile> assign
---detach`. If that session has no live collector, assign starts one from the
-tmux server. collect is that loop and owns the pid file — do not background
-it yourself. panel prints one line of workers whose dispatch owner is the
-tmux session name.
+status line on that session that runs `panel <session>`. assign, tell and
+stop run inside that pane and call the shared workers CLI. The session name
+is the session id. collect runs the node collector against this pane's %N
+(`$TMUX_PANE` when this shell is in that session, otherwise the session's
+pane id). panel prints one line of workers whose owner is the tmux session
+name.
 EOF
   exit 2
 }
@@ -39,10 +35,6 @@ EOF
 die() {
   print -r -- "tmux-agent-commander: $*" >&2
   exit 1
-}
-
-require_jq() {
-  [[ -n "$JQ" && -x "$JQ" ]] || die "jq not found"
 }
 
 state_root() {
@@ -53,10 +45,6 @@ state_root() {
 sanitize_owner() {
   # register.ts heartbeatOf: chars outside [A-Za-z0-9._-] become _.
   print -r -- "${1//[^A-Za-z0-9._-]/_}"
-}
-
-now_ms() {
-  perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'
 }
 
 agent_tmux() {
@@ -147,10 +135,6 @@ session_cli_name() {
   return 1
 }
 
-heartbeat_path() {
-  print -r -- "$1/.collector-$(sanitize_owner "$2")"
-}
-
 pid_path() {
   print -r -- "$1/.commander-$(sanitize_owner "$2").pid"
 }
@@ -178,135 +162,42 @@ is_terminal_status() {
   esac
 }
 
-goal_of_brief() {
-  local file="$1"
-  awk '
-    function clean(s) {
-      gsub(/[\001-\037\177]/, " ", s)
-      sub(/^[[:space:]]+/, "", s)
-      sub(/[[:space:]]+$/, "", s)
-      return s
-    }
-    /^[[:space:]]*GOAL([:[:space:]]|$)/ {
-      line = $0
-      sub(/^[[:space:]]*GOAL[[:space:]:]*/, "", line)
-      line = clean(line)
-      if (line != "") { print substr(line, 1, 160); exit }
-      want = 1
-      next
-    }
-    want && /[^[:space:]]/ {
-      print substr(clean($0), 1, 160)
-      exit
-    }
-  ' "$file"
-}
-
-git_base() {
-  local dir="$1" head
-  head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-  head="${head//[[:space:]]/}"
-  if [[ "$head" =~ '^[0-9a-f]{40}$' ]]; then
-    print -r -- "$head"
+node_bin() {
+  local n="${TMUX_AGENT_NODE:-}"
+  if [[ -z "$n" ]]; then
+    n="$(command -v node 2>/dev/null || true)"
   fi
-}
-
-write_heartbeat() {
-  local root="$1" owner="$2" dest
-  dest="$(heartbeat_path "$root" "$owner")"
-  print -r -- "$(now_ms)" > "$dest"
-}
-
-# One pass: heartbeat, then one prompt for every owned terminal result that
-# this since has not been delivered. A failed send leaves markers unwritten.
-deliver_once() {
-  local cli="$1" commander_name="$2" session="$3" root="$4"
-  local dispatch worker_dir owner since result_path result_status summary
-  local worker_profile worker_label prompt_file block item marked
-  local -a mark_list
-  mark_list=()
-  local prompt=""
-  write_heartbeat "$root" "$session"
-  local -a dispatches
-  dispatches=("$root"/*/dispatch.json(N))
-  for dispatch in "${dispatches[@]}"; do
-    [[ -f "$dispatch" ]] || continue
-    worker_dir="${dispatch:h}"
-    owner="$("$JQ" -r '.owner // empty' "$dispatch" 2>/dev/null || true)"
-    [[ "$owner" == "$session" ]] || continue
-    since="$("$JQ" -r '.since // empty' "$dispatch" 2>/dev/null || true)"
-    [[ "$since" == <-> ]] || continue
-    if [[ -f "$worker_dir/delivered" ]]; then
-      marked="$(<"$worker_dir/delivered")"
-      marked="${marked//[[:space:]]/}"
-      [[ "$marked" == "$since" ]] && continue
-    fi
-    result_path="$worker_dir/result.json"
-    [[ -f "$result_path" ]] || continue
-    "$JQ" -e . "$result_path" >/dev/null 2>&1 || continue
-    result_status="$("$JQ" -r 'if (.status|type)=="string" then .status elif (.body.status|type)=="string" then .body.status else empty end' "$result_path" 2>/dev/null || true)"
-    is_terminal_status "$result_status" || continue
-    summary="$("$JQ" -r 'if (.summary|type)=="string" then .summary elif (.body.summary|type)=="string" then .body.summary else "" end' "$result_path" 2>/dev/null || true)"
-    if (( ${#summary} > SUMMARY_MAX )); then
-      # [1,n] not :0:NAME — zsh reads :S as a history modifier.
-      summary="${summary[1,SUMMARY_MAX]}"
-    fi
-    worker_profile="$("$JQ" -r '.profile // empty' "$dispatch" 2>/dev/null || true)"
-    worker_label="$("$JQ" -r '.name // empty' "$dispatch" 2>/dev/null || true)"
-    [[ -n "$worker_label" ]] || worker_label="${worker_dir:t}"
-    block="name: ${worker_label}
-profile: ${worker_profile}
-status: ${result_status}
-summary: ${summary}
-result.json: ${result_path}"
-    if [[ -n "$prompt" ]]; then
-      prompt+=$'\n\n'
-    fi
-    prompt+="$block"
-    mark_list+=("${worker_dir}"$'\t'"${since}")
-  done
-  (( ${#mark_list} == 0 )) && return 0
-  prompt_file="$(mktemp "${TMPDIR:-/tmp}/commander-prompt.XXXXXX")"
-  print -r -- "$prompt" > "$prompt_file"
-  if ! agent_tmux "$cli" send "$commander_name" --prompt-file "$prompt_file"; then
-    print -r -- "tmux-agent-commander: send into ${session} failed; retrying next tick" >&2
-    rm -f "$prompt_file"
-    return 0
-  fi
-  rm -f "$prompt_file"
-  # Delivered: retire the record. The Claude mod reads only dispatch.json, so
-  # when this commander ends and its heartbeat goes stale, a Claude session in
-  # the same repo adopts what is still undelivered — never what was sent here.
-  for item in "${mark_list[@]}"; do
-    print -r -- "${item#*$'\t'}" > "${item%%$'\t'*}/delivered"
-    mv -f "${item%%$'\t'*}/dispatch.json" "${item%%$'\t'*}/dispatch.delivered.json"
-  done
-}
-
-undelivered_count() {
-  local root="$1" session="$2"
-  local dispatch worker_dir owner since result_path result_status marked n=0
-  local -a dispatches
-  dispatches=("$root"/*/dispatch.json(N))
-  for dispatch in "${dispatches[@]}"; do
-    [[ -f "$dispatch" ]] || continue
-    worker_dir="${dispatch:h}"
-    owner="$("$JQ" -r '.owner // empty' "$dispatch" 2>/dev/null || true)"
-    [[ "$(sanitize_owner "$owner")" == "$(sanitize_owner "$session")" ]] || continue
-    since="$("$JQ" -r '.since // empty' "$dispatch" 2>/dev/null || true)"
-    [[ "$since" == <-> ]] || continue
-    if [[ -f "$worker_dir/delivered" ]]; then
-      marked="$(<"$worker_dir/delivered")"
-      marked="${marked//[[:space:]]/}"
-      [[ "$marked" == "$since" ]] && continue
-    fi
-    result_path="$worker_dir/result.json"
-    [[ -f "$result_path" ]] || continue
-    result_status="$("$JQ" -r 'if (.status|type)=="string" then .status elif (.body.status|type)=="string" then .body.status else empty end' "$result_path" 2>/dev/null || true)"
-    is_terminal_status "$result_status" || continue
-    n=$((n + 1))
-  done
+  [[ -n "$n" && -x "$n" ]] || die "node not found"
   print -r -- "$n"
+}
+
+# Shared workers CLI. stdout is the CLI's; stderr passes through. Status is the CLI's.
+core_cli() {
+  local node
+  node="$(node_bin)"
+  NODE_NO_WARNINGS=1 "$node" --experimental-strip-types "$SCRIPT_DIR/lib/workers.cli.node.ts" "$@"
+}
+
+# Exact pane id. Inside the host session, $TMUX_PANE. A server-started collector
+# has no $TMUX (start clears it), so the session's current pane id is the same %N.
+host_pane() {
+  local session="$1" here
+  if [[ -n "${TMUX_PANE:-}" && "${TMUX_PANE}" == %<-> && -n "${TMUX:-}" ]]; then
+    here="$(command tmux display-message -p '#S' 2>/dev/null || true)"
+    if [[ -n "$here" && "$here" == "$session" ]]; then
+      print -r -- "$TMUX_PANE"
+      return 0
+    fi
+  fi
+  command tmux display-message -p -t "$session" '#{pane_id}'
+}
+
+require_tmux_session() {
+  local session
+  [[ -n "${TMUX:-}" ]] || die "not inside tmux; run $1 from the commander's pane"
+  session="$(command tmux display-message -p '#S' 2>/dev/null)" || die "not inside tmux; tmux display-message failed"
+  [[ -n "$session" ]] || die "not inside tmux; tmux display-message returned no session"
+  print -r -- "$session"
 }
 
 # Not a split pane: agent-tmux sends to the session's active pane, so a pane
@@ -393,57 +284,50 @@ cmd_start() {
 cmd_assign() {
   (( $# == 4 )) || usage
   local profile="$1" worker="$2" dir="$3" brief="$4"
-  [[ -n "${TMUX:-}" ]] || die "not inside tmux; run assign from the commander's pane"
-  local session
-  session="$(command tmux display-message -p '#S' 2>/dev/null)" || die "not inside tmux; tmux display-message failed"
-  [[ -n "$session" ]] || die "not inside tmux; tmux display-message returned no session"
-  [[ "$profile" =~ '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$' ]] || die "profile must match [A-Za-z0-9_.-], max 64 chars"
-  [[ "$worker" =~ '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$' ]] || die "worker name must match [A-Za-z0-9_.-], max 64 chars"
+  local session abs_dir root down="" code=0 text
+  session="$(require_tmux_session assign)"
   [[ -f "$brief" ]] || die "brief file not found: $brief"
-  local abs_dir owner_cwd root worker_dir since goal base
   abs_dir="${dir:A}"
   [[ "$abs_dir" == /* ]] || die "dir must be an absolute path"
-  owner_cwd="${PWD:A}"
   root="$(state_root)"
-  since="$(now_ms)"
-  # A fresh directory per dispatch, as the mod does: a reused name would find
-  # the last run's terminal result.json before `assign` resets it, and the
-  # collector would deliver that as this run's answer.
-  local suffix="$(( [##36] since ))"
-  suffix="${${suffix:l}[-4,-1]}"
-  worker="${worker[1,59]}-${suffix}"
-  worker_dir="$root/$worker"
-  mkdir -p "$worker_dir"
-  goal="$(goal_of_brief "$brief" || true)"
-  base="$(git_base "$abs_dir" || true)"
-  local tmp
-  tmp="$(mktemp "$worker_dir/dispatch.json.XXXXXX")"
-  "$JQ" -n \
-    --arg profile "$profile" \
-    --arg name "$worker" \
-    --arg dir "$abs_dir" \
-    --argjson since "$since" \
-    --arg goal "$goal" \
-    --arg owner "$session" \
-    --arg ownerCwd "$owner_cwd" \
-    --arg base "$base" \
-    '{profile:$profile, name:$name, dir:$dir, since:$since, owner:$owner, ownerCwd:$ownerCwd}
-     + (if $goal != "" then {goal:$goal} else {} end)
-     + (if $base != "" then {base:$base} else {} end)' > "$tmp"
-  mv -f "$tmp" "$worker_dir/dispatch.json"
   start_collector_from_server "$session" "$root"
-  agent_tmux "$profile" assign --detach "$worker" "$abs_dir" "$brief"
-  print -r -- "$worker"
-  print -r -- "the collector will send the result into this pane; end your turn"
+  # The pid file lands after run-shell; a known cli session is collected.
+  if ! session_cli_name "$session" >/dev/null; then
+    down="no collector for ${session}: run \`tmux-agent-commander collect <cli> <name>\` from a shell outside this CLI"
+  fi
+  if [[ -n "$down" ]]; then
+    text="$(core_cli assign "$profile" "$worker" "$abs_dir" "$brief" --session "$session" --cwd "${PWD:A}" --collector-down "$down")" || code=$?
+  else
+    text="$(core_cli assign "$profile" "$worker" "$abs_dir" "$brief" --session "$session" --cwd "${PWD:A}")" || code=$?
+  fi
+  [[ "$code" -eq 0 ]] || exit "$code"
+  print -r -- "$text"
+}
+
+cmd_tell() {
+  (( $# == 2 )) || usage
+  local session code=0 text
+  session="$(require_tmux_session tell)"
+  [[ -f "$2" ]] || die "text file not found: $2"
+  text="$(core_cli tell "$1" "$2" --session "$session" --cwd "${PWD:A}")" || code=$?
+  [[ "$code" -eq 0 ]] || exit "$code"
+  print -r -- "$text"
 }
 
 # One collector per session. A live pid that is not us exits quietly.
 # We remove the file on exit only when it still names us.
 cmd_collect() {
-  (( $# == 2 )) || usage
-  local cli="$1" name="$2"
-  local session root pidfile existing
-  session="$(session_name "$cli" "$name")"
+  local cli="" name="" session
+  if (( $# == 2 )); then
+    cli="$1"
+    name="$2"
+    session="$(session_name "$cli" "$name")"
+  elif (( $# == 0 )); then
+    session="$(require_tmux_session collect)"
+  else
+    usage
+  fi
+  local root pidfile existing pane cwd node
   root="$(state_root)"
   mkdir -p "$root"
   pidfile="$(pid_path "$root" "$session")"
@@ -453,6 +337,10 @@ cmd_collect() {
       exit 0
     fi
   fi
+  pane="$(host_pane "$session" 2>/dev/null || true)"
+  [[ "$pane" == %<-> ]] || die "host pane must be a %N id, got ${pane:-nothing}"
+  cwd="$(command tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
+  [[ "$cwd" == /* ]] || die "host pane cwd is not an absolute path"
   print -r -- "$$" > "$pidfile"
   COLLECTOR_PIDFILE="$pidfile"
   trap '
@@ -461,10 +349,9 @@ cmd_collect() {
       rm -f "$COLLECTOR_PIDFILE"
     fi
   ' EXIT
-  while tmux_has "$session"; do
-    deliver_once "$cli" "$name" "$session" "$root"
-    sleep "$TICK_SECONDS"
-  done
+  node="$(node_bin)"
+  NODE_NO_WARNINGS=1 "$node" --experimental-strip-types "$SCRIPT_DIR/lib/collector.node.ts" \
+    --session "$session" --cwd "$cwd" --pane "$pane"
 }
 
 # The tmux server owns this process, so a CLI shell tool cannot reap it.
@@ -494,25 +381,17 @@ start_collector_from_server() {
 }
 
 cmd_stop() {
-  (( $# == 2 )) || usage
-  local cli="$1" name="$2"
-  local session root pidfile pid
-  session="$(session_name "$cli" "$name")"
-  root="$(state_root)"
-  pidfile="$(pid_path "$root" "$session")"
-  [[ -f "$pidfile" ]] || die "no collector pid file for ${session}"
-  pid="$(read_pid "$pidfile" || true)"
-  if pid_alive "$pid"; then
-    kill "$pid" 2>/dev/null || true
-  fi
-  rm -f "$pidfile"
-  print -r -- "stopped collector for ${session}"
+  (( $# == 1 )) || usage
+  local session code=0 text
+  session="$(require_tmux_session stop)"
+  text="$(core_cli stop "$1" --session "$session" --cwd "${PWD:A}")" || code=$?
+  [[ "$code" -eq 0 ]] || exit "$code"
+  print -r -- "$text"
 }
 
 cmd_status() {
   (( $# == 0 )) || usage
-  require_jq
-  local root pidfile owner pid alive hb age n
+  local root pidfile owner pid alive
   root="$(state_root)"
   [[ -d "$root" ]] || return 0
   local -a pidfiles
@@ -523,20 +402,7 @@ cmd_status() {
     owner="${owner%.pid}"
     pid="$(read_pid "$pidfile" || true)"
     if pid_alive "$pid"; then alive=yes; else alive=no; fi
-    hb="$(heartbeat_path "$root" "$owner")"
-    if [[ -f "$hb" ]]; then
-      age="$(<"$hb")"
-      age="${age//[[:space:]]/}"
-      if [[ "$age" == <-> ]]; then
-        age=$(( ( $(now_ms) - age ) / 1000 ))
-      else
-        age=missing
-      fi
-    else
-      age=missing
-    fi
-    n="$(undelivered_count "$root" "$owner")"
-    print -r -- "${owner} alive=${alive} pid=${pid:-none} heartbeat_age=${age} undelivered=${n}"
+    print -r -- "${owner} alive=${alive} pid=${pid:-none}"
   done
 }
 
@@ -585,9 +451,10 @@ main() {
   shift
   case "$cmd" in
     -h|--help|help) usage ;;
-    start) require_jq; cmd_start "$@" ;;
-    assign) require_jq; cmd_assign "$@" ;;
-    collect) require_jq; cmd_collect "$@" ;;
+    start) cmd_start "$@" ;;
+    assign) cmd_assign "$@" ;;
+    tell) cmd_tell "$@" ;;
+    collect) cmd_collect "$@" ;;
     stop) cmd_stop "$@" ;;
     panel) cmd_panel "$@" ;;
     status) cmd_status "$@" ;;

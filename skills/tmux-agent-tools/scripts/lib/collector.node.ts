@@ -18,8 +18,8 @@ import { heartbeat, newGate, POLL_MS, reconcileOnce } from './workers.ts'
 const NODE_FLOOR = [22, 18, 0]
 const TMUX_MS = 5_000
 
-function tmux(args: string[], input?: string): Promise<{ code: number; out: string; err: string }> {
-  const sock = process.env.TMUX_AGENT_TMUX_SOCKET
+function tmux(args: string[], input?: string, env: NodeJS.ProcessEnv = process.env): Promise<{ code: number; out: string; err: string }> {
+  const sock = env.TMUX_AGENT_TMUX_SOCKET
   const full = sock && args[0] !== '-S' && args[0] !== '-L' ? ['-S', sock, ...args] : args
   return new Promise(resolve => {
     const child = execFile('tmux', full, { timeout: TMUX_MS, encoding: 'utf8' }, (error, stdout, stderr) => {
@@ -30,14 +30,14 @@ function tmux(args: string[], input?: string): Promise<{ code: number; out: stri
 }
 
 /** The pane still exists and is the one named (a `%N` id is never reused while the server lives). */
-export async function paneAlive(pane: string): Promise<boolean> {
-  const r = await tmux(['display-message', '-p', '-t', pane, '#{pane_id}'])
+export async function paneAlive(pane: string, env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  const r = await tmux(['display-message', '-p', '-t', pane, '#{pane_id}'], undefined, env)
   return r.code === 0 && r.out.trim() === pane
 }
 
 /** Wake the host: bracketed paste (a multi-line prompt stays one prompt), then Enter. */
-export async function pasteInto(pane: string, text: string): Promise<{ text?: string; drop?: string }> {
-  if (!(await paneAlive(pane))) return { drop: `host pane ${pane} is gone` }
+export async function pasteInto(pane: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<{ text?: string; drop?: string }> {
+  if (!(await paneAlive(pane, env))) return { drop: `host pane ${pane} is gone` }
   const buffer = `tmux-agent-collector-${process.pid}`
   const steps: [string[], string?][] = [
     [['load-buffer', '-b', buffer, '-'], text],
@@ -45,7 +45,7 @@ export async function pasteInto(pane: string, text: string): Promise<{ text?: st
     [['send-keys', '-t', pane, 'Enter']],
   ]
   for (const [args, input] of steps) {
-    const r = await tmux(args, input)
+    const r = await tmux(args, input, env)
     if (r.code !== 0) return { drop: `tmux ${args[0]} into ${pane} failed (exit ${r.code}): ${r.err.trim().slice(-200)}` }
   }
   return { text }
