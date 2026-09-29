@@ -32,6 +32,9 @@ unset CURSOR_TMUX_PREFIX GROK_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 export TMUX_TMPDIR="/tmp/tcmd-$$"
 REAL_TMUX="$(command -v tmux)"
 export TMUX_AGENT_TMUX_SOCKET="$TMUX_TMPDIR/tmux-$(id -u)/default"
+# Direct smoke calls. Commander and the fake agent-tmux still exec plain tmux;
+# the PATH shim below adds -S for those, because $TMUX outranks TMUX_TMPDIR.
+private_tmux() { command env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$TMUX_AGENT_TMUX_SOCKET" "$@"; }
 mkdir -p "$TMUX_AGENT_DIR" "$XDG_CONFIG_HOME" "$AGENT_TMUX_PROFILE_DIR" "${TMUX_AGENT_TMUX_SOCKET:h}" "$WORK/bin"
 # ~/.zshenv prepends ~/.local/bin on every new zsh. The commander is one, so
 # that stale agent-tmux would win over the fake. An empty ZDOTDIR skips it.
@@ -59,7 +62,7 @@ cleanup() {
   if [[ -n "${TIMER_PID:-}" ]]; then
     kill "$TIMER_PID" 2>/dev/null || true
   fi
-  command tmux -S "$TMUX_AGENT_TMUX_SOCKET" kill-server 2>/dev/null || true
+  private_tmux kill-server 2>/dev/null || true
   rm -rf "$WORK" "$TMUX_TMPDIR"
 }
 trap cleanup EXIT
@@ -70,7 +73,7 @@ printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$2" in
   start)
     # agent-tmux <cli> start --exact <name> <dir>
-    command env -u TMUX -u TMUX_PANE tmux -S "$COMMANDER_SOCK" new-session -d -s "${COMMANDER_PREFIX}-$4" "sleep 180"
+    command env -u TMUX -u TMUX_PANE tmux -S "$TMUX_AGENT_TMUX_SOCKET" new-session -d -s "${COMMANDER_PREFIX}-$4" "sleep 180"
     ;;
   assign)
     prev=""
@@ -157,6 +160,15 @@ assert_excludes() {
     FAIL=$((FAIL + 1))
   fi
 }
+index_of() {
+  local needle="$1" hay="$2" prefix
+  prefix="${hay%%"$needle"*}"
+  if [[ "$prefix" == "$hay" ]]; then
+    print -r -- -1
+  else
+    print -r -- "${#prefix}"
+  fi
+}
 poll() {
   local tries="$1"
   shift
@@ -206,7 +218,7 @@ export FAKE_LOG=${(q)FAKE_LOG}
 export FAKE_SNAP=${(q)FAKE_SNAP}
 export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
 export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
-export COMMANDER_SOCK=${(q)COMMANDER_SOCK}
+export TMUX_AGENT_TMUX_SOCKET=${(q)TMUX_AGENT_TMUX_SOCKET}
 export ZDOTDIR=${(q)WORK}/zdot
 unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 cd ${(q)ASSIGN_CWD}
@@ -274,9 +286,9 @@ OTHER="other$$"
 SINCE=1700000000001
 LONG="$(perl -e 'print "OWNEDOK" . ("x" x 693)')"
 # Echo would print the paste and cat would print it again. -echo keeps one copy.
-command tmux new-session -d -s "$SESSION" -x 4000 -y 50 "stty -echo; cat"
-PANE="$(command tmux display-message -p -t "$SESSION" '#{pane_id}')"
-PANE_CWD="$(command tmux display-message -p -t "$PANE" '#{pane_current_path}')"
+private_tmux new-session -d -s "$SESSION" -x 4000 -y 50 "stty -echo; cat"
+PANE="$(private_tmux display-message -p -t "$SESSION" '#{pane_id}')"
+PANE_CWD="$(private_tmux display-message -p -t "$PANE" '#{pane_current_path}')"
 V3="$TMUX_AGENT_DIR/.v3"
 mkdir -p "$V3/$OWNED/episodes/1/sent" "$V3/$OTHER/episodes/1/sent" "$REPO"
 jq -n \
@@ -309,14 +321,14 @@ mkdir -p "$V3/.sessions/$OKEY/act/1"
 "$COMMANDER" collect codex "$CNAME" >"$WORK/collect.out" 2>"$WORK/collect.err" &
 COLLECT_PID=$!
 
-have_prompt() { command tmux capture-pane -p -J -t "$PANE" | grep -q OWNEDOK; }
+have_prompt() { private_tmux capture-pane -p -J -t "$PANE" | grep -q OWNEDOK; }
 poll 75 have_prompt || {
   echo "no paste within 15s" >&2
   echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
-  echo "--- pane ---"; command tmux capture-pane -p -J -t "$PANE" >&2 || true
+  echo "--- pane ---"; private_tmux capture-pane -p -J -t "$PANE" >&2 || true
   exit 1
 }
-BODY="$(command tmux capture-pane -p -J -t "$PANE")"
+BODY="$(private_tmux capture-pane -p -J -t "$PANE")"
 assert "case 2: pasted once on the first tick" "$(print -r -- "$BODY" | grep -c OWNEDOK)" "1"
 assert_contains "case 2: paste names the worker" "$BODY" "$OWNED"
 assert_contains "case 2: paste names the status" "$BODY" "success"
@@ -337,7 +349,7 @@ poll 125 hb_changed || {
   exit 1
 }
 sleep 1
-BODY="$(command tmux capture-pane -p -J -t "$PANE")"
+BODY="$(private_tmux capture-pane -p -J -t "$PANE")"
 HB2="$(tr -d '[:space:]' < "$HB")"
 assert "case 4: beat refreshed on the next tick" "$([[ "$HB1" != "$HB2" ]] && echo yes || echo no)" "yes"
 assert "case 2: second tick pastes nothing" "$(print -r -- "$BODY" | grep -c OWNEDOK)" "1"
@@ -380,7 +392,7 @@ SBEAT="$TMUX_AGENT_DIR/.v3/.sessions/$(session_key "$SSESSION")/act/1.beat"
 have_start_hb() { [[ -f "$SBEAT" ]]; }
 poll 50 have_start_hb || { echo "start collector wrote no beat" >&2; cat "$WORK/start.err"; echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${SSESSION}.log" 2>/dev/null || true; exit 1; }
 assert "start beat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$SBEAT")" == <-> ]] && echo yes || echo no)" "yes"
-ST_STATUS="$(command tmux show-options -t "$SSESSION" -v status)"
+ST_STATUS="$(private_tmux show-options -t "$SSESSION" -v status)"
 assert "start sets per-session status 2" "$ST_STATUS" "2"
 ST_INT="$(private_tmux show-options -t "$SSESSION" -v status-interval)"
 assert "start sets per-session status-interval 2" "$ST_INT" "2"
@@ -394,7 +406,7 @@ code=0
 "$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start2.out" 2>"$WORK/start2.err" || code=$?
 assert "second start exits 1" "$code" "1"
 assert_contains "second start names the live collector" "$(<"$WORK/start2.err")" "already running"
-command tmux kill-session -t "$SSESSION"
+private_tmux kill-session -t "$SSESSION"
 start_gone() { ! kill -0 "$SPID" 2>/dev/null; }
 poll 50 start_gone || { echo "collector still alive after the session died" >&2; exit 1; }
 assert "collector exits when its session is gone" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "no"
@@ -414,7 +426,7 @@ assert "--no-panel start exits 0" "$np_code" "0"
 if (( np_code == 0 )); then
   NPOPTS="$(private_tmux show-options -t "$NPSESSION" 2>/dev/null || true)"
   assert_excludes "--no-panel does not set the panel command" "$NPOPTS" "tmux-agent-commander"
-  command tmux kill-session -t "$NPSESSION"
+  private_tmux kill-session -t "$NPSESSION"
 fi
 
 echo
@@ -608,7 +620,7 @@ export FAKE_LOG=${(q)FAKE_LOG}
 export FAKE_SNAP=${(q)FAKE_SNAP}
 export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
 export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
-export COMMANDER_SOCK=${(q)COMMANDER_SOCK}
+export TMUX_AGENT_TMUX_SOCKET=${(q)TMUX_AGENT_TMUX_SOCKET}
 export ZDOTDIR=${(q)WORK}/zdot
 unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 cd ${(q)ASSIGN_CWD}
