@@ -1284,12 +1284,13 @@ export const register: Register = on => {
         owner: await idNow(() => $.session.id()),
         ownerCwd: sessionCwd,
         down: () => collectorDown(gate),
-        // Inside the action lock (§5, §8): the binding record is on disk before
-        // `next()` yields, so a collector tick cannot submit E1 with no waiter.
-        bindWaiter: async stateDir => {
+        // Inside the action lock (§5, §8): the binding record names this lock's
+        // token and is on disk before `next()` yields, so a collector tick cannot
+        // submit E1 with no waiter. After the lock drops, that record is no waiter.
+        bindWaiter: async (stateDir, token) => {
           const waiterPath = `${stateDir}/episodes/1/waiter`
           const name = stateDir.slice(stateDir.lastIndexOf('/') + 1)
-          await host.write(waiterPath, '{"binding":true}')
+          await host.write(waiterPath, JSON.stringify({ binding: true, token }))
           try {
             spawned = await next({
               ...e,

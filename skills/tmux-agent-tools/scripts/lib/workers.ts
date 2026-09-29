@@ -292,9 +292,9 @@ export type AssignExtra = {
   /**
    * Runs after the launch and before the action lock drops (§5, §8). The spawn
    * hook binds the waiter here, so a collector tick cannot see a launched worker
-   * with no waiter file.
+   * with no waiter file. `token` is the `.action` holder this bind is inside.
    */
-  bindWaiter?: (stateDir: string) => Promise<void>
+  bindWaiter?: (stateDir: string, token: string) => Promise<void>
 }
 export type TellInput = { name: string; text: string }
 export type StopInput = { name?: string; all?: boolean }
@@ -820,14 +820,24 @@ async function ackNames(host: Host, dir: string): Promise<string[] | undefined> 
   }
 }
 
-async function waiterOf(host: Host, dir: string): Promise<string | undefined | typeof UNKNOWN> {
+/**
+ * Waiter id, `undefined` when there is none, or UNKNOWN when this pass must not
+ * deliver. A binding record holds delivery only while the lock that wrote it is
+ * still the current `.action` holder (same token, or a tokenless record under a
+ * held lock). Lock released, gone, or a different token → no waiter. An
+ * unreadable lock is UNKNOWN (unknown is not absent).
+ */
+async function waiterOf(host: Host, dir: string, workerDir: string): Promise<string | undefined | typeof UNKNOWN> {
   const text = await readOrAbsent(host, `${dir}/waiter`)
   if (text === UNKNOWN) return UNKNOWN
-  const w = parseJson(text ?? '') as { agentId?: unknown; binding?: unknown } | undefined
-  // Bind is in progress (the lock is still held, `next()` has not returned an id).
-  // Same as an unreadable waiter: this pass delivers nothing.
-  if (w?.binding === true && !(typeof w.agentId === 'string' && w.agentId)) return UNKNOWN
-  return typeof w?.agentId === 'string' && w.agentId && !CTRL_RE.test(w.agentId) ? w.agentId : undefined
+  const w = parseJson(text ?? '') as { agentId?: unknown; binding?: unknown; token?: unknown } | undefined
+  if (typeof w?.agentId === 'string' && w.agentId && !CTRL_RE.test(w.agentId)) return w.agentId
+  if (w?.binding !== true) return undefined
+  const holder = await readHolder(host, `${workerDir}/.action`)
+  if (holder === 'unreadable') return UNKNOWN
+  if (!holder) return undefined
+  if (typeof w.token === 'string' && w.token && holder.token !== w.token) return undefined
+  return UNKNOWN
 }
 
 /**
@@ -907,7 +917,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
         continue
       }
       const goal = desc.goal?.replace(CTRL_ALL_RE, ' ').trim().slice(0, GOAL_MAX)
-      const waiter = await waiterOf(host, dir)
+      const waiter = await waiterOf(host, dir, w)
       // A waiter we cannot read may still be running: deliver nothing for it this pass.
       if (waiter === UNKNOWN) {
         out.complete = false
@@ -1821,7 +1831,7 @@ export async function releaseEndedWaiters(host: Host, gate: Gate, v3: string, wa
     try {
       const dir = episodeDirOf(v3, d)
       // Re-read under the lock: only the waiter this pass saw end is released.
-      if ((await waiterOf(host, dir)) !== d.waiter) continue
+      if ((await waiterOf(host, dir, `${v3}/${d.name}`)) !== d.waiter) continue
       // The waiter binds THIS episode only (§2); an empty record means none.
       await host.write(`${dir}/waiter`, '{}').catch((error: unknown) => {
         host.log(`tmux-agent: could not release the waiter of ${d.name}: ${String(error)}`)
@@ -2684,7 +2694,7 @@ export async function assignWorker(
       return { deny: `tmux-agent: could not launch assign: ${(run.stderr || run.stdout).trim().slice(-400)}` }
     }
     await mark(host, `${stateDir}/episodes/1`, 'sent')
-    if (extra?.bindWaiter) await extra.bindWaiter(stateDir)
+    if (extra?.bindWaiter) await extra.bindWaiter(stateDir, lock.token)
   } finally {
     await releaseLock(host, `${stateDir}/.action`, lock.token)
   }

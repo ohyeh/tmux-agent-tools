@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
 import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, heartbeat, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
-import { ORPHAN_MS, registerActivation, beat } from './ledger.ts'
+import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
@@ -792,6 +792,45 @@ test('waiter bind (R2-4): the waiter file is written while the action lock is he
   assert.equal(held, true)
   assert.equal(JSON.parse(readFileSync(`${r.stateDir}/episodes/1/waiter`, 'utf8')).agentId, 'ag-live')
   assert.throws(() => readlinkSync(`${r.stateDir}/.action`))
+})
+
+test('waiter bind: a stale binding record delivers E1 once after the action lock is released', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const lock = await takeLock(w.host, r.stateDir)
+  if (!lock.ok) assert.fail('lock')
+  await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: lock.token }))
+  assert.equal(await releaseLock(w.host, `${r.stateDir}/.action`, lock.token), true)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const gate = newGate()
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1, 'delivered exactly once')
+})
+
+test('waiter bind: a binding record is not delivered while its token holds the action lock', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const lock = await takeLock(w.host, r.stateDir)
+  if (!lock.ok) assert.fail('lock')
+  await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: lock.token }))
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  await reconcile(w.host, newGate(), false)
+  assert.equal(w.woken.length, 0)
+  await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)
+})
+
+test('waiter bind: a binding record whose token differs from the lock holder is delivered', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const lock = await takeLock(w.host, r.stateDir)
+  if (!lock.ok) assert.fail('lock')
+  await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: 'not-the-holder' }))
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  await reconcile(w.host, newGate(), false)
+  assert.equal(w.woken.length, 1)
+  await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)
 })
 
 test('closing snapshot without identity (R2-5): a stat failure does not write done', async () => {
