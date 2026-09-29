@@ -1,0 +1,123 @@
+// Contract tests for the v4 ledger primitives (p0-contract.md §3–§5, §8 allocation),
+// against a real filesystem and real OS-process contention.
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { mkdtempSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ack, acquireLock, allocateNext, claim, currentOwner, ORPHAN_MS, releaseLock, sessionKey, sessionLiveness } from './ledger.ts'
+import { nodeHost } from './host.node.ts'
+
+const RACE = new URL('./ledger.race.node.ts', import.meta.url).pathname
+const host = (owner = 'me') => nodeHost({ owner, log: () => {} })
+const fresh = () => mkdtempSync(join(tmpdir(), 'ledger-'))
+const holder = (token: string) => ({ token, session: token, activation: '1', host: 'h', pid: process.pid, pidStart: 'x' })
+
+/** Run `n` contender processes at once; resolve their parsed outputs. */
+function race(n: number, args: (i: number) => string[]): Promise<unknown[]> {
+  return Promise.all(
+    Array.from({ length: n }, (_, i) =>
+      new Promise<unknown>((resolve, reject) =>
+        execFile(process.execPath, [RACE, ...args(i)], (error, stdout, stderr) =>
+          error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve(JSON.parse(stdout)),
+        ),
+      ),
+    ),
+  )
+}
+
+test('lock: 8 processes, exactly one holder, 20 rounds', async () => {
+  for (let round = 0; round < 20; round++) {
+    const lock = join(fresh(), '.action')
+    const outs = (await race(8, i => ['lock', lock, `p${i}`])) as { ok: boolean }[]
+    assert.equal(outs.filter(o => o.ok).length, 1, `round ${round}: ${JSON.stringify(outs)}`)
+  }
+})
+
+test('lock: the loser sees the holder; a non-holder cannot release; the holder can', async () => {
+  const h = host()
+  const lock = join(fresh(), '.action')
+  assert.deepEqual(await acquireLock(h, lock, holder('A')), { ok: true, token: 'A' })
+  const second = await acquireLock(h, lock, holder('B'))
+  assert.equal(second.ok, false)
+  assert.equal(!second.ok && second.busy !== 'unknown' && second.busy !== 'unreadable' && second.busy.token, 'A')
+  assert.equal(await releaseLock(h, lock, 'B'), false)
+  assert.equal(await releaseLock(h, lock, 'A'), true)
+  assert.equal((await acquireLock(h, lock, holder('B'))).ok, true)
+})
+
+test('allocate: 8 processes get 8 distinct consecutive numbers', async () => {
+  const dir = join(fresh(), 'episodes')
+  mkdirSync(dir)
+  const outs = (await race(8, i => ['allocate', dir, `p${i}`])) as number[]
+  assert.deepEqual([...outs].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8])
+})
+
+test('allocate: a crash after mkdir (no descriptor) never makes the next allocation reuse it', async () => {
+  const dir = join(fresh(), 'episodes')
+  mkdirSync(join(dir, '1'), { recursive: true })
+  assert.equal(await allocateNext(host(), dir), 2)
+})
+
+test('ack: create-once — first records, second reports already recorded', async () => {
+  const ep = fresh()
+  assert.equal(await ack(host(), ep, 'done'), 'won')
+  assert.equal(await ack(host(), ep, 'done'), 'lost')
+})
+
+test('liveness: fresh beat live; stale beat non-live; no beat inside grace initializing, after grace non-live', async () => {
+  const s = fresh()
+  const now = Date.now()
+  mkdirSync(join(s, 'act', '1'), { recursive: true })
+  assert.equal(await sessionLiveness(host(), s, now), 'initializing')
+  const old = (now - ORPHAN_MS - 5_000) / 1000
+  utimesSync(join(s, 'act', '1'), old, old)
+  assert.equal(await sessionLiveness(host(), s, now), 'non-live')
+  writeFileSync(join(s, 'act', '1.beat'), '')
+  assert.equal(await sessionLiveness(host(), s, now), 'live')
+  utimesSync(join(s, 'act', '1.beat'), old, old)
+  assert.equal(await sessionLiveness(host(), s, now), 'non-live')
+  mkdirSync(join(s, 'act', '2'))
+  assert.equal(await sessionLiveness(host(), s, now), 'initializing', 'a newer registration without a beat fences the older one')
+})
+
+test('liveness: no registration at all is non-live', async () => {
+  assert.equal(await sessionLiveness(host(), fresh(), Date.now()), 'non-live')
+})
+
+test('claim: a live owner keeps it; a dead owner is claimed by exactly one of 8 processes', async () => {
+  const root = fresh()
+  const ep = join(root, 'w', 'episodes', '1')
+  mkdirSync(ep, { recursive: true })
+  const dead = 'dead-session'
+  const act = join(root, '.sessions', sessionKey(dead), 'act')
+  mkdirSync(join(act, '1'), { recursive: true })
+  writeFileSync(join(act, '1.beat'), '')
+  const now = Date.now()
+  assert.equal(await claim(host('x'), root, ep, dead, 'x', now), 'held', 'a live owner keeps it')
+  const old = (now - ORPHAN_MS - 5_000) / 1000
+  utimesSync(join(act, '1.beat'), old, old)
+  const outs = (await race(8, i => ['claim', ep, `c${i}`, root, dead, String(now)])) as string[]
+  assert.equal(outs.filter(o => o === 'claimed').length, 1, JSON.stringify(outs))
+  const owner = await currentOwner(host(), ep, dead)
+  assert.equal(owner?.gen, 1)
+  assert.equal(owner?.complete, true)
+  assert.match(owner?.session ?? '', /^c\d$/)
+})
+
+test('claim: an incomplete max gen is waited out for ORPHAN_MS, never promoted early', async () => {
+  const root = fresh()
+  const ep = join(root, 'w', 'episodes', '1')
+  mkdirSync(join(ep, 'claims', '1'), { recursive: true })
+  const now = Date.now()
+  assert.equal(await claim(host('x'), root, ep, 'gone', 'x', now), 'held')
+  const old = (now - ORPHAN_MS - 5_000) / 1000
+  utimesSync(join(ep, 'claims', '1'), old, old)
+  assert.equal(await claim(host('x'), root, ep, 'gone', 'x', now), 'claimed')
+  assert.equal((await currentOwner(host(), ep, 'gone'))?.gen, 2)
+})
+
+test('sessionKey is injective where the legacy slug was not', () => {
+  assert.notEqual(sessionKey('a/b'), sessionKey('a_b'))
+})

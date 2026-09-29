@@ -1,9 +1,9 @@
 #!/usr/bin/env zsh
 # The shared core (skills/tmux-agent-tools/scripts/lib/workers.ts) is run by plain
 # node for every non-Claude host, so its contract is tested by plain node against
-# an in-memory Host. The file is `*.contract.ts`, not `*.test.ts`: `claude plugin
-# test` claims every `*.test.ts` in the plugin and refuses `node:` imports. It is
-# kept out of tsconfig (no node typings there); running it is the check.
+# an in-memory Host. The files are `*.contract.node.ts`, not `*.test.ts`: `claude plugin
+# test` claims every `*.test.ts` in the plugin and refuses `node:` imports. Every
+# `*.node.ts` is kept out of tsconfig (no node typings there); running them is the check.
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ if [[ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | head -1)" != "$floor" ]]
   exit 1
 fi
 
-if out="$(node --test --test-reporter=tap workers.contract.ts 2>&1)"; then
+if out="$(node --test --test-reporter=tap ./*.contract.node.ts 2>&1)"; then
   echo "  ok   core contract (node $have):$(print -r -- "$out" | rg -o '^# (pass|fail) \d+' | tr '\n' ' ' | sed 's/# / /g')"
   echo "1 passed, 0 failed"
 else

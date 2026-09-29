@@ -15,5 +15,5 @@
     "jsxFragmentFactory": "Fragment"
   },
   "include": ["types", "hooks", "tests", "skills/tmux-agent-tools/scripts/lib"],
-  "exclude": ["skills/tmux-agent-tools/scripts/lib/*.contract.ts"]
+  "exclude": ["skills/tmux-agent-tools/scripts/lib/*.node.ts"]
 }
