@@ -1864,11 +1864,16 @@ send_lock_around() {
     if [[ -z "$holder_pid" ]]; then
       sleep 0.2
       if [[ ! -f "$lock_dir/pid" ]]; then
-        if [[ ! -d "$lock_dir" || ! -w "$subdir" ]]; then
+        # The dir can vanish during this wait: the holder finished and
+        # removed it. That is a release, so retry mkdir until $end.
+        # Only an unwritable $subdir can never succeed.
+        if [[ ! -w "$subdir" ]]; then
           echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
           return 75
         fi
-        rm -rf "$lock_dir" 2>/dev/null || true
+        if [[ -d "$lock_dir" ]]; then
+          rm -rf "$lock_dir" 2>/dev/null || true
+        fi
       fi
     fi
     now_epoch="${EPOCHSECONDS:-$(date +%s)}"

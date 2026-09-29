@@ -4,12 +4,15 @@
 # Validates that `send_lock_around` in agent-tmux claude and codex:
 #   - serializes concurrent acquirers on the same agent name
 #   - recovers from a stale PID written into the lock dir
+#   - retries mkdir when the lock dir vanishes during the no-pid wait
 #   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
 #   - exits with the inner command's return code
 #
-# The helper is sourced from the actual wrapper file via
-# TMUX_AGENT_TOOLS_SOURCE_ONLY so we exercise the real implementation,
-# not a copy.
+# The helper is sourced from agent-tmux via TMUX_AGENT_TOOLS_SOURCE_ONLY
+# so we exercise the real implementation, not a copy. The cli launcher is
+# `exec agent-tmux <cli>`; sourcing that replaces the shell and the
+# source-only guard exits before the case body. The harness sources the
+# engine with that <cli> name instead.
 #
 # Exits non-zero on the first failure.
 
@@ -34,18 +37,22 @@ fail() {
 # by the harness so $send_lock_around / $ensure_agent_dir are in scope.
 run_case() {
   local wrapper="$1" label="$2" body_file="$3"
-  echo "[$label] $(basename "$wrapper")"
+  local cli
+  cli="$(basename "$wrapper")"
+  echo "[$label] $cli"
   local state_dir="$WORK/$label"
   mkdir -p "$state_dir"
   TMUX_AGENT_DIR="$state_dir" \
     TMUX_AGENT_TOOLS_SOURCE_ONLY=1 \
-    WRAPPER="$wrapper" \
+    ENGINE="$AGENT_TMUX" \
+    CLI_NAME="$cli" \
     BODY="$body_file" \
     zsh -c '
       set -euo pipefail
-      source "$WRAPPER"
+      set -- "$CLI_NAME"
+      source "$ENGINE"
       source "$BODY"
-    ' || fail "$label on $(basename "$wrapper")"
+    ' || fail "$label on $cli"
 }
 
 # Case bodies -------------------------------------------------------------
@@ -104,6 +111,47 @@ if (( elapsed >= 3 )); then
 fi
 BODY
 
+cat > "$WORK/case-vanished-dir.zsh" <<'BODY'
+# Holder created the lock dir and has not stamped a pid. During the wait
+# the holder finishes and removes the dir. That is a release: retry mkdir.
+# Removing the dir inside sleep is the wait itself, so the case does not
+# depend on a timer.
+name=vanish
+mkdir -p "$TMUX_AGENT_DIR/$name"
+lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
+mkdir "$lock_dir"
+wait_hits=0
+command() {
+  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+sleep() {
+  if [[ -d "$lock_dir" && ! -f "$lock_dir/pid" ]]; then
+    wait_hits=$(( wait_hits + 1 ))
+    rm -rf "$lock_dir" 2>/dev/null || true
+  fi
+  return 0
+}
+sentinel="$TMUX_AGENT_DIR/vanish-out"
+set +e
+send_lock_around "$name" 5 sh -c "echo ok > '$sentinel'"
+rc=$?
+set -e
+if [[ "$rc" -eq 75 ]]; then
+  echo "vanished lock dir returned 75 (treated as cannot create)" >&2
+  exit 1
+fi
+[[ "$rc" -eq 0 ]] || { echo "expected rc=0 got $rc" >&2; exit 1; }
+[[ "$wait_hits" -ge 1 ]] || { echo "no-pid wait did not run" >&2; exit 1; }
+[[ "$(cat "$sentinel")" == ok ]] || { echo "sentinel mismatch" >&2; exit 1; }
+if [[ -d "$lock_dir" ]]; then
+  echo "lock dir not cleaned up after vanished-dir retry" >&2
+  exit 1
+fi
+BODY
+
 cat > "$WORK/case-missing-dir.zsh" <<'BODY'
 name=brand-new
 [[ ! -e "$TMUX_AGENT_DIR/$name" ]] || { echo "precondition: dir should not exist" >&2; exit 1; }
@@ -124,6 +172,7 @@ for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   run_case "$wrapper" "$tool-basic"        "$WORK/case-basic.zsh"
   run_case "$wrapper" "$tool-concurrent"   "$WORK/case-concurrent.zsh"
   run_case "$wrapper" "$tool-stale-pid"    "$WORK/case-stale-pid.zsh"
+  run_case "$wrapper" "$tool-vanished-dir" "$WORK/case-vanished-dir.zsh"
   run_case "$wrapper" "$tool-missing-dir"  "$WORK/case-missing-dir.zsh"
   run_case "$wrapper" "$tool-rc"           "$WORK/case-rc.zsh"
 done

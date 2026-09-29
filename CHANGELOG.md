@@ -4,6 +4,8 @@
 
 ## v0.42.0 - 2026-09-30
 
+- mkdir send-lock fallback: a lock dir that disappears during the no-pid wait is the holder releasing the lock. The waiter retries `mkdir` until the existing timeout. Exit 75 stays only when the agent directory is not writable, and a dead holder pid is still reclaimed. `scripts/test-send-lock-smoke` covers that vanish.
+
 - One workers core (`skills/tmux-agent-tools/scripts/lib/workers.ts`) is shared by the mod, the CLI collector, the commander, the mcp-adapter, and the TUI/launcher.
 - Those callers share the `.v3` ledger (contract v6).
 - The single public plugin id is `tmux-agent`.
