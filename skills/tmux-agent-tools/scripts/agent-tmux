@@ -7580,43 +7580,79 @@ runtime_blocker_phrase() {
 # and the CLI binaries (2026-09-25); their on-screen layout is UNCONFIRMED — add a
 # row when a live pane is captured.
 runtime_blocker_for_text() {
-  local current="$1" line body rest hit="" structured_hit="" limit_false=false
+  local current="$1" line body rest hit="" structured_hit="" limit_false=false in_tool=false lead lead_len
   local -a recent
   recent=("${(@f)$(awk '
     /[^[:space:]]/ { lines[++n] = $0 }
     END { for (i = (n > 10 ? n - 9 : 1); i <= n; i++) print lines[i] }' <<< "$current")}")
   for line in "${recent[@]}"; do
-    body="${line#"${line%%[![:space:]]*}"}"
+    lead="${line%%[![:space:]]*}"
+    lead_len="${#lead}"
+    body="${line#"$lead"}"
     if [[ "$body" == '⎿'* ]]; then
       # claude nests its own errors under ⎿, the text right after the glyph; anything
       # else there is a tool's output.
       rest="${body#'⎿'}"; rest="${rest#"${rest%%[![:space:]]*}"}"
       case "$rest" in
-        'API Error:'*|'API Error ('*|'Claude usage limit'*|'Claude AI usage limit'*|"You've hit your "*|'You’ve hit your '*|'Credit balance is too low'*) hit="$(runtime_blocker_phrase "$line")" ;;
-        *) hit="" ;;
+        'API Error:'*|'API Error ('*|'Claude usage limit'*|'Claude AI usage limit'*|"You've hit your "*|'You’ve hit your '*|'Credit balance is too low'*)
+          hit="$(runtime_blocker_phrase "$line")"
+          in_tool=false
+          ;;
+        *)
+          hit=""
+          in_tool=true
+          ;;
       esac
-    elif [[ "$body" == 'unifiedSkuWeeklyLimit:'* ]]; then
-      rest="${body#'unifiedSkuWeeklyLimit:'}"; rest="${rest#"${rest%%[![:space:]]*}"}"
-      if [[ "${rest%%[[:space:]]*}" == ('true'|'True'|'TRUE')* ]]; then
-        structured_hit="quota_exhausted"$'\t'"$line"
-      else
-        structured_hit=""
-        hit=""
-        limit_false=true
-      fi
-    elif [[ "$body" == 'chatMessage:'* ]]; then
-      if [[ "$limit_false" != true ]]; then
-        hit="$(runtime_blocker_phrase "$line")"
-      fi
-    elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error:'|'API Error ('|'ActionRequiredError:'|"You've hit your "|'You’ve hit your ')* ]]; then
-      hit="$(runtime_blocker_phrase "$line")"
-      # A ⚠ line is a CLI warning (an MCP server that failed to authenticate), not
-      # a refusal of work: only a quota banner there stops the worker.
-      [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]] && hit=""
+    elif [[ "$body" == '└'* ]]; then
+      hit=""
+      structured_hit=""
+      limit_false=false
+      in_tool=true
     else
+      # Check if a new marker or CLI indent ends tool output
       case "$body" in
-        '•'*|'⏺'*|'✔'*|'✓'*|'↳'*|'└'*|*'Worked for '*) hit=""; structured_hit="" ;;
+        '•'*|'⏺'*|'✔'*|'✓'*|'↳'*|'■'*|'✗'*|'✘'*|'⚠'*|'Error:'*|'error:'*|'ERROR:'*|'API Error:'*|'ActionRequiredError:'*|*'Worked for '*|'›'*|'→'*|'❯'*|'>'*)
+          in_tool=false
+          ;;
+        *)
+          if (( lead_len <= 2 )); then
+            in_tool=false
+          fi
+          ;;
       esac
+
+      if [[ "$in_tool" == true ]]; then
+        # Indented lines beneath a tool line stay tool output
+        :
+      elif [[ "$body" == 'unifiedSkuWeeklyLimit:'* ]]; then
+        rest="${body#'unifiedSkuWeeklyLimit:'}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+        if [[ "${rest%%[[:space:]]*}" == ('true'|'True'|'TRUE')* ]]; then
+          structured_hit="quota_exhausted"$'\t'"$line"
+          limit_false=false
+        else
+          structured_hit=""
+          hit=""
+          limit_false=true
+        fi
+      elif [[ "$body" == 'chatMessage:'* ]]; then
+        if [[ "$limit_false" != true ]]; then
+          hit="$(runtime_blocker_phrase "$line")"
+        fi
+      elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error:'|'API Error ('|'ActionRequiredError:'|"You've hit your "|'You’ve hit your ')* ]]; then
+        hit="$(runtime_blocker_phrase "$line")"
+        # A ⚠ line is a CLI warning (an MCP server that failed to authenticate), not
+        # a refusal of work: only a quota banner there stops the worker.
+        [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]] && hit=""
+        limit_false=false
+      else
+        case "$body" in
+          '•'*|'⏺'*|'✔'*|'✓'*|'↳'*|*'Worked for '*)
+            hit=""
+            structured_hit=""
+            limit_false=false
+            ;;
+        esac
+      fi
     fi
   done
   local chosen="${structured_hit:-$hit}"

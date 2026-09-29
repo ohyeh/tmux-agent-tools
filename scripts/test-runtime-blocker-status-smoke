@@ -231,6 +231,24 @@ Added a test for "usage limit reached" handling.
 →
 EOF
 
+fake cursor-tool-output <<'EOF'
+• Reading the usage fixture
+└ cat usage.json
+    unifiedSkuWeeklyLimit: true
+    chatMessage: *Weekly usage limit reached.*
+→
+EOF
+
+fake cursor-false-then-true <<'EOF'
+  chatMessage: *Working on task*
+  unifiedSkuWeeklyLimit: false
+• Resuming task
+  chatMessage: *Weekly usage limit reached. It resets in 6 days.*
+  unifiedSkuWeeklyLimit: true
+  unifiedSkuWeeklyLimitResetDays: 6
+→
+EOF
+
 PASS=0
 FAIL=0
 assert() {
@@ -395,6 +413,16 @@ assert "cursor limit false not blocked" "$(jq -r '.blocked_reason // "null"' <<<
 echo "case: cursor prose quoting phrase is not a blocker"
 st="$(status_of cursor-quoted cursor)"
 assert "cursor quoted not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: cursor tool output under └ is not a blocker"
+st="$(status_of cursor-tool-output cursor)"
+assert "cursor tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "cursor tool output has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
+
+echo "case: cursor false block followed by newer true block is quota_exhausted"
+st="$(status_of cursor-false-then-true cursor)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the structured key line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "  unifiedSkuWeeklyLimit: true"
 
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
