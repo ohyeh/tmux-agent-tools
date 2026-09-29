@@ -289,6 +289,12 @@ export type AssignExtra = {
   ownerCwd?: string
   /** Read after the launch, so the receipt names the gate as it is then. */
   down?: () => string | undefined
+  /**
+   * Runs after the launch and before the action lock drops (§5, §8). The spawn
+   * hook binds the waiter here, so a collector tick cannot see a launched worker
+   * with no waiter file.
+   */
+  bindWaiter?: (stateDir: string) => Promise<void>
 }
 export type TellInput = { name: string; text: string }
 export type StopInput = { name?: string; all?: boolean }
@@ -661,8 +667,13 @@ export async function ackFinished(host: Host, v3: string, f: Finished): Promise<
   const ep = episodeDirOf(v3, f.d)
   // The closing snapshot's identity first: a `done` without it would make that same
   // snapshot a false unattributed notice once a later tell opens a new episode (§8).
+  const kind = ackKindOf(f)
+  // A closing snapshot with no identity is re-reported, not closed: `done` without
+  // it makes that same file a false unattributed notice once a later tell opens
+  // a new episode (§8). Stat failure omits `observation`; that is this case.
+  if ((kind === 'done' || kind === 'expired') && !f.observation) return false
   if (f.status !== UNATTRIBUTED && f.observation && (await ackDir(host, ep, f.observation)) === 'unknown') return false
-  return (await ackDir(host, ep, ackKindOf(f))) !== 'unknown'
+  return (await ackDir(host, ep, kind)) !== 'unknown'
 }
 
 /** The worker's own free text is data, never instruction. Bounded and fenced. */
@@ -812,7 +823,10 @@ async function ackNames(host: Host, dir: string): Promise<string[] | undefined> 
 async function waiterOf(host: Host, dir: string): Promise<string | undefined | typeof UNKNOWN> {
   const text = await readOrAbsent(host, `${dir}/waiter`)
   if (text === UNKNOWN) return UNKNOWN
-  const w = parseJson(text ?? '') as { agentId?: unknown } | undefined
+  const w = parseJson(text ?? '') as { agentId?: unknown; binding?: unknown } | undefined
+  // Bind is in progress (the lock is still held, `next()` has not returned an id).
+  // Same as an unreadable waiter: this pass delivers nothing.
+  if (w?.binding === true && !(typeof w.agentId === 'string' && w.agentId)) return UNKNOWN
   return typeof w?.agentId === 'string' && w.agentId && !CTRL_RE.test(w.agentId) ? w.agentId : undefined
 }
 
@@ -1745,7 +1759,8 @@ export async function mirrorProject(host: Host, name: string, rows: number): Pro
 /**
  * A mirrored worker's waiter is the delivery while that row lives.
  * running → say nothing, do not ack. completed + terminal result → ack, no prompt.
- * failed / killed / absent → deliver as before. list() rejecting → deliver as before, log once.
+ * failed / killed / absent → deliver as before. list() rejecting → a notice with a
+ * waiter is held (unknown is not "absent"); a notice without one still delivers.
  */
 export async function partitionWaiters(
   host: Host,
@@ -1762,7 +1777,7 @@ export async function partitionWaiters(
       const kind = error instanceof Error ? error.name : typeof error
       host.log(`tmux-agent: agent.list failed: ${kind}: ${String(error)}`)
     }
-    return { deliver: [...done], silent: [] }
+    return { deliver: done.filter(f => !f.d.waiter), silent: [] }
   }
   const byId = new Map(listed.map(a => [a.id, a.status]))
   const deliver: Finished[] = []
@@ -2260,9 +2275,18 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
     const run = await host.run(['agent-tmux', d.profile, 'stop', d.name], d.dir, 8_000).catch(
       (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }),
     )
-    for (const seq of open) await ackDir(host, `${w}/episodes/${seq}`, 'cancel')
+    const missed: number[] = []
+    for (const seq of open) {
+      if ((await ackDir(host, `${w}/episodes/${seq}`, 'cancel')) === 'unknown') missed.push(seq)
+    }
     for (const key of [...gate.stalled.keys()]) if (key.startsWith(`${d.name}#`)) gate.stalled.delete(key)
     for (const key of [...gate.exited]) if (key.startsWith(`${d.name}#`)) gate.exited.delete(key)
+    if (missed.length) {
+      return {
+        ok: false,
+        text: `stop for "${d.name}" did not record cancel for episode(s) ${missed.join(', ')} (see the log); those episodes stay open`,
+      }
+    }
     const cancelled = open.length ? `; cancelled episode(s) ${open.join(', ')}` : ''
     return run.exitCode === 0
       ? { ok: true, text: `stopped "${d.name}" on ${d.profile}${cancelled}; it no longer appears in /workers and nothing will be delivered for it` }
@@ -2435,20 +2459,35 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
 export type ProcessId = { host: string; pid: number; pidStart: string }
 let selfId: Promise<ProcessId> | undefined
 /**
- * One probe per process: `$PPID` of the probe shell is the process that ran it (the
- * collector, or the engine). Unprovable (the probe failed) = pid 0, which `unlock`
- * never treats as dead. `/bin/sh` by path: the bare `sh` is the launch route.
+ * `$PPID` of the probe shell is the process that ran it (the collector, or the
+ * engine). Only a proven id is cached (`pid > 0` and a start string); a failed
+ * probe is tried again on the next `takeLock`. `lstart` is `TZ=UTC LC_ALL=C` on
+ * both this probe and `unlock`, so the two strings are one form. `/bin/sh` by
+ * path: the bare `sh` is the launch route.
  */
 export function processId(host: Host): Promise<ProcessId> {
-  selfId ??= host
-    .run(['/bin/sh', '-c', 'echo "$PPID"; hostname; ps -o lstart= -p "$PPID"'], '/', 5_000)
+  if (selfId) return selfId
+  const probe = host
+    .run(['/bin/sh', '-c', 'echo "$PPID"; hostname; TZ=UTC LC_ALL=C ps -o lstart= -p "$PPID"'], '/', 5_000)
     .then(r => {
-      const [pid, name, start] = r.stdout.split('\n').map(l => l.trim())
-      const n = Number(pid)
-      return r.exitCode === 0 && Number.isInteger(n) && n > 0 && name && start ? { host: name, pid: n, pidStart: start } : { host: '', pid: 0, pidStart: '' }
+      const id = processIdFrom(r)
+      if (!(id.pid > 0 && id.pidStart) && selfId === probe) selfId = undefined
+      return id
     })
-    .catch(() => ({ host: '', pid: 0, pidStart: '' }))
-  return selfId
+    .catch(() => {
+      if (selfId === probe) selfId = undefined
+      return { host: '', pid: 0, pidStart: '' }
+    })
+  selfId = probe
+  return probe
+}
+
+function processIdFrom(r: { exitCode: number; stdout: string }): ProcessId {
+  const [pid, name, start] = r.stdout.split('\n').map(l => l.trim())
+  const n = Number(pid)
+  return r.exitCode === 0 && Number.isInteger(n) && n > 0 && name && start
+    ? { host: name, pid: n, pidStart: start }
+    : { host: '', pid: 0, pidStart: '' }
 }
 
 export async function takeLock(host: Host, workerDir: string, token = randomBase36(12), activation = '') {
@@ -2514,7 +2553,9 @@ export async function unlockWorker(host: Host, name: string, word?: string): Pro
   const live = h.session ? await sessionLiveness(host, sessionDirOf(v3, h.session), await host.now()) : 'unknown'
   if (live !== 'non-live') return { ok: false, text: `not unlocking "${name}": holder ${who} — its session is ${live}` }
   if (!h.pid || !h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} records no process to check` }
-  const ps = await host.run(['ps', '-o', 'lstart=', '-p', String(h.pid)], '/', 5_000).catch(() => undefined)
+  const ps = await host
+    .run(['/bin/sh', '-c', 'TZ=UTC LC_ALL=C ps -o lstart= -p "$1"', 'ps', String(h.pid)], '/', 5_000)
+    .catch(() => undefined)
   if (!ps) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
   const start = ps.stdout.trim()
   if (ps.exitCode === 0 && start === h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
@@ -2643,6 +2684,7 @@ export async function assignWorker(
       return { deny: `tmux-agent: could not launch assign: ${(run.stderr || run.stdout).trim().slice(-400)}` }
     }
     await mark(host, `${stateDir}/episodes/1`, 'sent')
+    if (extra?.bindWaiter) await extra.bindWaiter(stateDir)
   } finally {
     await releaseLock(host, `${stateDir}/.action`, lock.token)
   }

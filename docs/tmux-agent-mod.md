@@ -354,6 +354,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## 已知邊界
 
+- A cancel that lands during an in-flight pass does not stop that pass's submit. `cancelEpisode` writes `acks/cancel` under the lock. `stillOurs` re-reads the owner and the activation, not the acks. `reconcile` submits before `ackFinished`. Collect can already have built the notice; cancel runs; submit still runs once. Same window as §4 “a submit already past its last check may still land”. The next tick sees `cancel` and does not deliver again. (P2 gate r2, R2-8.)
 - `mock.clock` **確實**驅動 plugin 的 `$.clock.every`（本 mod 只用 `every`，
   沒有用到 `after`）：tick、面板的 2 秒
   mirror clock 都是用 `clock.advance()` 在單元測試裡

@@ -4,11 +4,12 @@
 // agent-tmux — is answered by the test.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { autoStop, AUTO_STOP_MS, cancelEpisode, heartbeat, newGate, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, heartbeat, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
 import { ORPHAN_MS, registerActivation, beat } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
@@ -693,4 +694,132 @@ test('a seq ≥ 2 result on the launch path (§10): one unattributed notice; E1 
   assert.match(w.woken[0]!, /unattributed/)
   assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`))
   assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks/done`), 'E2 closes only from its own path')
+})
+
+function lstartOf(tz: string): string {
+  const env = { ...process.env }
+  delete env.TMUX
+  delete env.TMUX_PANE
+  const r = spawnSync('/bin/sh', ['-c', 'TZ="$1" LC_ALL=C ps -o lstart= -p "$2"', 'ps', tz, String(process.pid)], {
+    encoding: 'utf8',
+    env,
+  })
+  assert.equal(r.status, 0, r.stderr)
+  return r.stdout.trim()
+}
+
+test('unlock lstart (R2-1): a live holder is kept when the recorded start is UTC and the process TZ is not', async () => {
+  const utc = lstartOf('UTC')
+  const taipei = lstartOf('Asia/Taipei')
+  assert.notEqual(utc, taipei)
+  const w = world()
+  const r = await assigned(w)
+  const fs = await import('node:fs')
+  const lock = `${r.stateDir}/.action`
+  const me = await processId(w.host)
+  const prev = process.env.TZ
+  process.env.TZ = 'Asia/Taipei'
+  try {
+    if (fs.existsSync(lock) || (() => { try { fs.readlinkSync(lock); return true } catch { return false } })()) fs.unlinkSync(lock)
+    fs.symlinkSync(JSON.stringify({ token: 't', activation: '', session: 'gone', host: me.host, pid: process.pid, pidStart: utc }), lock)
+    const out = await unlockWorker(w.host, r.name, 'confirm')
+    assert.match(out.text, /still running/)
+    assert.equal(fs.readlinkSync(lock).includes(String(process.pid)), true)
+  } finally {
+    if (prev === undefined) delete process.env.TZ
+    else process.env.TZ = prev
+  }
+})
+
+test('processId (R2-2): a failed probe is not cached', () => {
+  const url = new URL('./workers.ts', import.meta.url).href
+  const code = `
+    const { processId } = await import(${JSON.stringify(url)})
+    let calls = 0
+    const host = { run: async () => {
+      calls += 1
+      if (calls === 1) return { exitCode: 1, stdout: '', stderr: 'fail' }
+      return { exitCode: 0, stdout: '4242\\nprobe-host\\nTue Jan  1 00:00:00 2020\\n', stderr: '' }
+    }}
+    const a = await processId(host)
+    const b = await processId(host)
+    console.log(JSON.stringify({ calls, aPid: a.pid, bPid: b.pid }))
+  `
+  const env = { ...process.env }
+  delete env.TMUX
+  delete env.TMUX_PANE
+  const r = spawnSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { encoding: 'utf8', env })
+  assert.equal(r.status, 0, r.stderr)
+  const got = JSON.parse(r.stdout) as { calls: number; aPid: number; bPid: number }
+  assert.equal(got.calls, 2)
+  assert.equal(got.aPid, 0)
+  assert.equal(got.bPid, 4242)
+})
+
+test('agent.list failure (R2-3): a notice with a waiter is not delivered; one without still is', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const host: Host = { ...w.host, agentList: async () => { throw new Error('EIO') } }
+  const notice = (waiter?: string) => ({ d: waiter ? { ...d, waiter } : d, path: `${r.stateDir}/result.json`, status: 'success', summary: 'did it' })
+  const parted = await partitionWaiters(host, newGate(), [notice('ag-live'), notice()])
+  assert.equal(parted.deliver.length, 1)
+  assert.equal(parted.deliver[0]!.d.waiter, undefined)
+  assert.equal(parted.silent.length, 0)
+  assert.ok(w.logs.some(l => l.includes('agent.list failed')))
+})
+
+test('waiter bind (R2-4): the waiter file is written while the action lock is held, and a binding record is not submitted', async () => {
+  const w = world()
+  let held = false
+  const r = await assignWorker(
+    w.host,
+    { profile: 'astra', name: 'w', dir: w.repo, brief: BRIEF },
+    {
+      owner: 'me',
+      ownerCwd: w.repo,
+      bindWaiter: async stateDir => {
+        try { readlinkSync(`${stateDir}/.action`); held = true } catch { held = false }
+        await w.host.write(`${stateDir}/episodes/1/waiter`, '{"binding":true}')
+        writeFileSync(`${stateDir}/result.json`, result({ episode: 1 }))
+        await reconcile(w.host, newGate(), false)
+        assert.deepEqual(w.woken, [])
+        await w.host.write(`${stateDir}/episodes/1/waiter`, JSON.stringify({ agentId: 'ag-live' }))
+      },
+    },
+  )
+  if ('deny' in r) assert.fail(r.deny)
+  assert.equal(held, true)
+  assert.equal(JSON.parse(readFileSync(`${r.stateDir}/episodes/1/waiter`, 'utf8')).agentId, 'ag-live')
+  assert.throws(() => readlinkSync(`${r.stateDir}/.action`))
+})
+
+test('closing snapshot without identity (R2-5): a stat failure does not write done', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const host: Host = {
+    ...w.host,
+    stat: async path => (path === `${r.stateDir}/result.json` ? Promise.reject(new Error('EIO')) : w.host.stat(path)),
+  }
+  await reconcile(host, newGate(), false)
+  assert.equal(w.woken.length, 1)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`))
+})
+
+test('stop cancel unknown (R2-7): an unrecorded cancel is not reported as cancelled', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const host: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) =>
+      argv[0] === 'mkdir' && String(argv.at(-1)).endsWith('/acks/cancel')
+        ? { exitCode: 1, stdout: '', stderr: 'Input/output error' }
+        : w.host.run(argv, cwd, ms),
+  }
+  const out = await stopWorker(host, newGate(), d)
+  assert.equal(out.ok, false)
+  assert.doesNotMatch(out.text, /cancelled episode/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
 })

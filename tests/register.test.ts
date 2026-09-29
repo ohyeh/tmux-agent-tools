@@ -86,7 +86,10 @@ function mockFs(
     }
   })
   // No id, no collecting (§3): every fs-backed test is a session; `setSessionId` names it.
-  on('session.id', () => ({ value: sessionIds.get(on) ?? 'sess-test' }))
+  on('session.id', () => {
+    if (withheldSessionIds.has(on)) return { value: '' }
+    return { value: sessionIds.get(on) ?? 'sess-test' }
+  })
   runOf(on).ledger = argv => ledgerOp(files, links, mtimes, argv)
   fsNow = files
   for (const id of seededAcks.splice(0)) {
@@ -102,6 +105,15 @@ const sessionIds = new WeakMap<On, string>()
 /** The session id this test's `mockFs` answers (default `sess-test`). */
 function setSessionId(on: On, id: string): void {
   sessionIds.set(on, id)
+}
+
+/** `session.id` answers '' until `releaseSessionId` (R2-6). */
+const withheldSessionIds = new WeakSet<On>()
+function withholdSessionId(on: On): void {
+  withheldSessionIds.add(on)
+}
+function releaseSessionId(on: On): void {
+  withheldSessionIds.delete(on)
 }
 
 type RunResult = { value: { exitCode: number; stdout: string; stderr: string } }
@@ -373,6 +385,25 @@ function mockSessionStart(on: On): void {
   on('agent.register', ($, e) => ({ value: { agent: `tmux-agent:${e.name}` } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
 }
+
+describe('session id (R2-6)', () => {
+  test('session.start does not mint local-* when session.id is missing', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockClock(on)
+    const files: Files = {}
+    withholdSessionId(on)
+    mockFs(on, files)
+    mockSessionStart(on)
+    mockWake(on)
+    setSessionId(on, 'real-sess')
+    await $.session.start(session())
+    expect(Object.keys(files).some(k => k.includes('/.sessions/'))).toBe(false)
+    releaseSessionId(on)
+    await $.turn.complete(turn())
+    const realKey = [...new TextEncoder().encode('real-sess')].map(b => b.toString(16).padStart(2, '0')).join('')
+    expect(Object.keys(files).some(k => k.includes(`/.sessions/${realKey}/`))).toBe(true)
+  })
+})
 
 const namesIn = (text: string | undefined) => (text ?? '').split(',').filter(Boolean)
 
@@ -4734,7 +4765,7 @@ describe('native mirror', () => {
     expect(store.acked().sort()).toEqual(['w1#1', 'w2#1'])
   })
 
-  test('agent.list rejecting delivers the mirrored result and logs once', WITH_DRIVER, async ($, on) => {
+  test('agent.list rejecting holds the mirrored result and logs once (R2-3)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mockClock(on)
@@ -4762,8 +4793,8 @@ describe('native mirror', () => {
     await $.session.start(session())
     await $.turn.complete(turn())
 
-    expect(woken).toHaveLength(1)
-    expect(store.acked()).toEqual(['w1#1'])
+    expect(woken).toHaveLength(0)
+    expect(store.acked()).toEqual([])
     expect(logs.filter(l => l.includes('agent.list failed'))).toHaveLength(1)
   })
 })

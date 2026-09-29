@@ -231,9 +231,9 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     sessionCwd = e.cwd
-    // The transcript's name; a harness without one gets a per-activation id.
-    sessionId = await $.session.id().catch(() => undefined)
-    sessionId ||= `local-${Math.random().toString(36).slice(2, 10)}`
+    // The transcript's name. A missing id stays missing: assign and tell refuse,
+    // and `idNow` stores the real id when the engine answers (§3). Never mint `local-*`.
+    sessionId = (await $.session.id().catch(() => undefined)) || undefined
     listAgents = () => $.agent.list()
     try {
       await $.agent.register({
@@ -1276,28 +1276,49 @@ export const register: Register = on => {
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
     const brief = stripRuntimeLine(e.prompt)
+    let spawned: Awaited<ReturnType<typeof next>> | undefined
     const assigned = await assignWorker(
       host,
       { profile, name: workerBase(e.description), dir: e.cwd ?? sessionCwd ?? '', brief },
-      { owner: await idNow(() => $.session.id()), ownerCwd: sessionCwd, down: () => collectorDown(gate) },
+      {
+        owner: await idNow(() => $.session.id()),
+        ownerCwd: sessionCwd,
+        down: () => collectorDown(gate),
+        // Inside the action lock (§5, §8): the binding record is on disk before
+        // `next()` yields, so a collector tick cannot submit E1 with no waiter.
+        bindWaiter: async stateDir => {
+          const waiterPath = `${stateDir}/episodes/1/waiter`
+          const name = stateDir.slice(stateDir.lastIndexOf('/') + 1)
+          await host.write(waiterPath, '{"binding":true}')
+          try {
+            spawned = await next({
+              ...e,
+              subagentType: WAITER_TYPE,
+              model: 'haiku',
+              background: true,
+              description: name,
+              prompt: waiterPrompt(stateDir, name),
+            })
+          } catch (error) {
+            await host.write(waiterPath, '{}')
+            throw error
+          }
+          if (!spawned || spawned.deny || !spawned.agentId) {
+            await host.write(waiterPath, '{}')
+            return
+          }
+          await host.write(waiterPath, JSON.stringify({ agentId: spawned.agentId }))
+        },
+      },
     )
     if ('deny' in assigned) return { deny: assigned.deny }
-    const r = await next({
-      ...e,
-      subagentType: WAITER_TYPE,
-      model: 'haiku',
-      background: true,
-      description: assigned.name,
-      prompt: waiterPrompt(assigned.stateDir, assigned.name),
-    })
+    if (!spawned) return { deny: `tmux-agent: waiter did not bind for "${assigned.name}"` }
     // Refused downstream (another plugin's spawn hook): the worker is already
     // running, so say so — a bare deny reads as "nothing started" and invites a
     // second dispatch. Without a waiter the collector delivers it as usual.
-    if (r.deny) {
-      return { deny: `${r.deny} — tmux worker "${assigned.name}" was dispatched anyway; the collector will deliver its result. Do not dispatch it again.` }
+    if (spawned.deny) {
+      return { deny: `${spawned.deny} — tmux worker "${assigned.name}" was dispatched anyway; the collector will deliver its result. Do not dispatch it again.` }
     }
-    // The waiter binds the launch episode only (§2): E1 of the fresh worker.
-    if (r.agentId) await host.write(`${assigned.stateDir}/episodes/1/waiter`, JSON.stringify({ agentId: r.agentId }))
-    return r
+    return spawned
   })
 }
