@@ -89,9 +89,12 @@ export type DashboardTotals = {
 
 export type DashboardSnapshot = {
   schema_version: 1
-  at: string
-  totals: DashboardTotals
+  at?: string
+  totals?: DashboardTotals
   sessions: DashboardSession[]
+  incomplete?: boolean
+  error?: string
+  diagnostic?: string | null
 }
 
 /** 45s / 12m / 3h. Floor of whole seconds; a since in the future is 0s. */
@@ -138,7 +141,7 @@ export async function panel(opts: PanelOptions = {}): Promise<string> {
   const root = await rootOf(host)
   if (!root) return 'tmux-agent: no workers'
   const v3 = v3Of(root)
-  if (!(await host.exists(v3).catch(() => false))) return 'tmux-agent: no workers'
+  if (!(await host.exists(v3))) return 'tmux-agent: no workers'
 
   const s = await scan(host, { claim: false })
   const activeEntries: { since: number; entry: string }[] = []
@@ -149,15 +152,15 @@ export async function panel(opts: PanelOptions = {}): Promise<string> {
     if (opts.session && !d.owner) continue
 
     const id = idOf(d)
-    const isDelivered = s.reported.has(id) || (d.seq !== undefined && s.acked.get(d.name)?.has('done'))
+    const isDelivered = s.reported.has(id)
 
     let mark: string
     if (isDelivered) {
       mark = '✓ delivered'
     } else {
       let resultStatus: string | undefined
-      if (d.resultPath && (await host.exists(d.resultPath).catch(() => false))) {
-        const text = await readOrEmpty(host, d.resultPath)
+      if (d.resultPath && (await host.exists(d.resultPath))) {
+        const text = await host.read(d.resultPath)
         const raw = parseJson(text) as { status?: unknown; body?: { status?: unknown }; episode?: unknown } | undefined
         const st = typeof raw?.status === 'string' ? raw.status : typeof raw?.body?.status === 'string' ? raw.body.status : undefined
         if (st && TERMINAL.has(st) && episodeMatches(raw?.episode ?? (raw as any)?.body?.episode, d.seq)) {
@@ -199,26 +202,42 @@ export async function findSessionsBin(host: Host): Promise<string> {
   return 'tmux-agent-sessions'
 }
 
-/** Fetch fleet sessions via tmux-agent-sessions list --json. */
-export async function fetchFleetSessions(host: Host): Promise<DashboardSession[]> {
-  try {
-    const sessionsBin = await findSessionsBin(host)
-    const run = await host.run([sessionsBin, 'list', '--json'], (await host.cwd()) ?? process.cwd(), 10000)
-    if (run.exitCode !== 0) return []
-    const lines = run.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-    const sessions: DashboardSession[] = []
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line) as DashboardSession
-        if (obj && typeof obj === 'object' && obj.schema_version === 1 && typeof obj.name === 'string') {
-          sessions.push(obj)
-        }
-      } catch {}
-    }
-    return sessions
-  } catch {
-    return []
+export class FleetProbeError extends Error {
+  readonly stderr?: string
+  readonly exitCode?: number
+
+  constructor(message: string, stderr?: string, exitCode?: number) {
+    super(message)
+    this.name = 'FleetProbeError'
+    this.stderr = stderr
+    this.exitCode = exitCode
   }
+}
+
+/** Fetch fleet sessions via tmux-agent-sessions list --json --no-write. */
+export async function fetchFleetSessions(host: Host): Promise<DashboardSession[]> {
+  const sessionsBin = await findSessionsBin(host)
+  const run = await host.run([sessionsBin, 'list', '--json', '--no-write'], (await host.cwd()) ?? process.cwd(), 10000)
+  if (run.exitCode !== 0) {
+    const errText = run.stderr?.trim() || `exit code ${run.exitCode}`
+    throw new FleetProbeError(`fleet probe failed with exit ${run.exitCode}: ${errText}`, run.stderr?.trim(), run.exitCode)
+  }
+  const lines = run.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+  const sessions: DashboardSession[] = []
+  for (const line of lines) {
+    let obj: unknown
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      throw new FleetProbeError(`fleet probe emitted malformed JSON: ${line}`)
+    }
+    if (obj && typeof obj === 'object' && (obj as any).schema_version === 1 && typeof (obj as any).name === 'string') {
+      sessions.push(obj as DashboardSession)
+    } else {
+      throw new FleetProbeError(`fleet probe emitted invalid session schema: ${line}`)
+    }
+  }
+  return sessions
 }
 
 /**
@@ -231,31 +250,63 @@ export async function dashboard(opts: DashboardOptions = {}): Promise<DashboardS
   const now = opts.now ?? (await host.now())
 
   // 1. Fleet sessions: truth of all live sessions on this machine
-  const fleetSessions: DashboardSession[] = opts.sessions
-    ? [...opts.sessions]
-    : opts.sessionsFetcher
-      ? await opts.sessionsFetcher(host)
-      : await fetchFleetSessions(host)
+  let fleetSessions: DashboardSession[] = []
+  let fleetError: { message: string; stderr?: string } | undefined
+  try {
+    fleetSessions = opts.sessions
+      ? [...opts.sessions]
+      : opts.sessionsFetcher
+        ? await opts.sessionsFetcher(host)
+        : await fetchFleetSessions(host)
+  } catch (error) {
+    const stderr = (error as any)?.stderr ?? (error instanceof Error ? error.message : String(error))
+    fleetError = { message: String(error), stderr }
+    host.log?.(`tmux-agent: fleet probe failed: ${stderr}`)
+  }
 
   // 2. Scan ledger (read-only, claim: false)
+  let ledgerError: { message: string } | undefined
   const root = await rootOf(host)
   const dispatchMap = new Map<string, { d: TmuxDispatch; resultStatus?: string }>()
 
   if (root) {
     const v3 = v3Of(root)
-    if (await host.exists(v3).catch(() => false)) {
-      const s = await scan(host, { claim: false })
-      for (const d of s.visible) {
-        let resultStatus: string | undefined
-        if (d.resultPath && (await host.exists(d.resultPath).catch(() => false))) {
-          const text = await readOrEmpty(host, d.resultPath)
-          const raw = parseJson(text) as { status?: unknown; body?: { status?: unknown }; episode?: unknown } | undefined
-          const st = typeof raw?.status === 'string' ? raw.status : typeof raw?.body?.status === 'string' ? raw.body.status : undefined
-          if (st && TERMINAL.has(st) && episodeMatches(raw?.episode ?? (raw as any)?.body?.episode, d.seq)) {
-            resultStatus = st
-          }
+    let v3Exists = false
+    try {
+      v3Exists = await host.exists(v3)
+    } catch (error) {
+      ledgerError = { message: String(error) }
+      host.log?.(`tmux-agent: error checking ledger ${v3}: ${String(error)}`)
+    }
+    if (v3Exists) {
+      try {
+        const s = await scan(host, { claim: false })
+        if (!s.complete) {
+          ledgerError = { message: `ledger scan incomplete for ${v3}` }
+          host.log?.(`tmux-agent: ledger scan incomplete for ${v3}`)
         }
-        dispatchMap.set(d.name, { d, resultStatus })
+        for (const d of s.visible) {
+          let resultStatus: string | undefined
+          if (d.resultPath) {
+            try {
+              if (await host.exists(d.resultPath)) {
+                const text = await host.read(d.resultPath)
+                const raw = parseJson(text) as { status?: unknown; body?: { status?: unknown }; episode?: unknown } | undefined
+                const st = typeof raw?.status === 'string' ? raw.status : typeof raw?.body?.status === 'string' ? raw.body.status : undefined
+                if (st && TERMINAL.has(st) && episodeMatches(raw?.episode ?? (raw as any)?.body?.episode, d.seq)) {
+                  resultStatus = st
+                }
+              }
+            } catch (error) {
+              host.log?.(`tmux-agent: error reading result ${d.resultPath}: ${String(error)}`)
+              ledgerError = { message: `error reading result ${d.resultPath}: ${String(error)}` }
+            }
+          }
+          dispatchMap.set(d.name, { d, resultStatus })
+        }
+      } catch (error) {
+        ledgerError = { message: String(error) }
+        host.log?.(`tmux-agent: error scanning ledger ${v3}: ${String(error)}`)
       }
     }
   }
@@ -287,6 +338,7 @@ export async function dashboard(opts: DashboardOptions = {}): Promise<DashboardS
       }
       finalSessions.push({
         ...sess,
+        ...(match.d.resultPath ? { result_path: match.d.resultPath } : {}),
         worker: workerInfo,
       })
     } else {
@@ -295,64 +347,67 @@ export async function dashboard(opts: DashboardOptions = {}): Promise<DashboardS
   }
 
   // 4. Ledger workers with no live session may be listed as stopped
-  for (const [name, info] of dispatchMap) {
-    if (!matchedLedgerNames.has(name)) {
-      const d = info.d
-      const ageSec = d.since ? Math.max(0, Math.floor((now - d.since) / 1000)) : null
-      const sessionName = `${d.profile}-cli-${d.name}`
-      let exit_detected = false
-      let exit_code: number | null = null
-      let state: 'running' | 'exited' | 'stopped' = 'stopped'
+  // Never synthesize exists:false/stopped when fleet probe failed!
+  if (!fleetError) {
+    for (const [name, info] of dispatchMap) {
+      if (!matchedLedgerNames.has(name)) {
+        const d = info.d
+        const ageSec = d.since ? Math.max(0, Math.floor((now - d.since) / 1000)) : null
+        const sessionName = `${d.profile}-cli-${d.name}`
+        let exit_detected = false
+        let exit_code: number | null = null
+        let state: 'running' | 'exited' | 'stopped' = 'stopped'
 
-      if (info.resultStatus) {
-        if (info.resultStatus === 'success') {
-          exit_code = 0
-          state = 'stopped'
-        } else {
-          exit_detected = true
-          exit_code = 1
-          state = 'exited'
+        if (info.resultStatus) {
+          if (info.resultStatus === 'success') {
+            exit_code = 0
+            state = 'stopped'
+          } else {
+            exit_detected = true
+            exit_code = 1
+            state = 'exited'
+          }
         }
-      }
 
-      finalSessions.push({
-        schema_version: 1,
-        tool: d.profile,
-        name: d.name,
-        session: sessionName,
-        prefix: `${d.profile}-cli`,
-        exists: false,
-        running: false,
-        exit_detected,
-        exit_code,
-        local_or_remote: 'local',
-        diagnostic: null,
-        last_capture_lines: [],
-        confirmation_detected: false,
-        blocked_reason: null,
-        blocked_evidence: null,
-        started_at: d.since ? new Date(d.since).toISOString() : null,
-        last_change_at: null,
-        idle_seconds: null,
-        bytes_in_pane: null,
-        marker_seen: [],
-        state,
-        wrapper: `agent-tmux ${d.profile}`,
-        agent_name: d.name,
-        tmux_session: sessionName,
-        cwd: d.dir ?? null,
-        result_path: d.resultPath ?? '',
-        created_at: d.since ? new Date(d.since).toISOString() : null,
-        created_epoch: d.since ? Math.floor(d.since / 1000) : null,
-        age_seconds: ageSec,
-        age: ageSec !== null ? `${ageSec}s` : null,
-        worker: {
+        finalSessions.push({
+          schema_version: 1,
+          tool: d.profile,
           name: d.name,
-          ...(d.seq !== undefined ? { seq: d.seq } : {}),
-          ...(d.owner ? { owner: d.owner } : {}),
-          ...(info.resultStatus ? { resultStatus: info.resultStatus } : {}),
-        },
-      })
+          session: sessionName,
+          prefix: `${d.profile}-cli`,
+          exists: false,
+          running: false,
+          exit_detected,
+          exit_code,
+          local_or_remote: 'local',
+          diagnostic: null,
+          last_capture_lines: [],
+          confirmation_detected: false,
+          blocked_reason: null,
+          blocked_evidence: null,
+          started_at: d.since ? new Date(d.since).toISOString() : null,
+          last_change_at: null,
+          idle_seconds: null,
+          bytes_in_pane: null,
+          marker_seen: [],
+          state,
+          wrapper: `agent-tmux ${d.profile}`,
+          agent_name: d.name,
+          tmux_session: sessionName,
+          cwd: d.dir ?? null,
+          result_path: d.resultPath ?? '',
+          created_at: d.since ? new Date(d.since).toISOString() : null,
+          created_epoch: d.since ? Math.floor(d.since / 1000) : null,
+          age_seconds: ageSec,
+          age: ageSec !== null ? `${ageSec}s` : null,
+          worker: {
+            name: d.name,
+            ...(d.seq !== undefined ? { seq: d.seq } : {}),
+            ...(d.owner ? { owner: d.owner } : {}),
+            ...(info.resultStatus ? { resultStatus: info.resultStatus } : {}),
+          },
+        })
+      }
     }
   }
 
@@ -363,9 +418,13 @@ export async function dashboard(opts: DashboardOptions = {}): Promise<DashboardS
     total: finalSessions.length,
   }
 
+  const isIncomplete = !!fleetError || !!ledgerError
+  const diagnostic = fleetError ? (fleetError.stderr || fleetError.message) : ledgerError ? ledgerError.message : null
+
   return {
     schema_version: 1,
-    at: new Date(now).toISOString(),
+    ...(isIncomplete ? { incomplete: true, diagnostic } : { at: new Date(now).toISOString() }),
+    ...(isIncomplete && (fleetError || ledgerError) ? { error: (fleetError ?? ledgerError)?.message } : {}),
     totals,
     sessions: finalSessions,
   }
@@ -404,11 +463,19 @@ async function main(): Promise<void> {
     }
     if (!watch) {
       const snap = await dashboard()
+      if (snap.incomplete) {
+        process.stderr.write(`tmux-agent: dashboard incomplete: ${snap.diagnostic ?? snap.error}\n`)
+        process.exit(1)
+      }
       process.stdout.write(`${JSON.stringify(snap)}\n`)
     } else {
       let i = 0
       while (count === 0 || i < count) {
         const snap = await dashboard()
+        if (snap.incomplete) {
+          process.stderr.write(`tmux-agent: dashboard incomplete: ${snap.diagnostic ?? snap.error}\n`)
+          process.exit(1)
+        }
         process.stdout.write(`${JSON.stringify(snap)}\n`)
         i++
         if (count > 0 && i >= count) break

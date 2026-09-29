@@ -8411,26 +8411,39 @@ self_test_team_quorum() {
 status_session() {
   require_tmux
   local output_json=0
+  local no_write=0
+  [[ -n "${TMUX_AGENT_NO_WRITE:-}" ]] && no_write=1
 
-  if [[ "${1:-}" == "--json" ]]; then
-    output_json=1
-    shift
-  fi
-  if [[ "${1:-}" == "--usage" ]]; then
-    shift
-    local name_for_usage="${1:-}"
-    if [[ -z "$name_for_usage" ]]; then
-      echo "Usage: status --usage <name>" >&2
-      exit 2
-    fi
-    usage_aggregate_json "$name_for_usage"
-    return $?
-  fi
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --json)
+        output_json=1
+        shift
+        ;;
+      --no-write)
+        no_write=1
+        shift
+        ;;
+      --usage)
+        shift
+        local name_for_usage="${1:-}"
+        if [[ -z "$name_for_usage" ]]; then
+          echo "Usage: status --usage <name>" >&2
+          exit 2
+        fi
+        usage_aggregate_json "$name_for_usage"
+        return $?
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
 
   local name="${1:-}"
 
   if [[ -z "$name" ]]; then
-    echo "Usage: agent-tmux status [--json] <name>" >&2
+    echo "Usage: agent-tmux status [--no-write] [--json] <name>" >&2
     exit 2
   fi
 
@@ -8482,7 +8495,14 @@ status_session() {
         confirmation_detected=true
         ;;
     esac
-    last_change_at="$(update_pane_hash "$name" "$(pane_activity_text "$current")")"
+    if (( no_write )); then
+      local hash_file="$(agent_root_dir)/$name/pane-hash"
+      if [[ -f "$hash_file" ]]; then
+        last_change_at="$(awk '{print $2}' "$hash_file")"
+      fi
+    else
+      last_change_at="$(update_pane_hash "$name" "$(pane_activity_text "$current")")"
+    fi
     bytes_in_pane=$(printf '%s' "$current" | wc -c | tr -d ' ')
   fi
   local started_at

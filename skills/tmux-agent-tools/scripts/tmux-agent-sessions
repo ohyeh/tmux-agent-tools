@@ -28,6 +28,7 @@ FILTER_CREATED_AFTER_EPOCH=""
 SORT_FIELD=""
 typeset -a FILTER_TAGS
 FILTER_TAGS=()
+NO_WRITE=0
 TMUX_AGENT_DIR="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}"
 
 tags_for_session() {
@@ -61,8 +62,8 @@ usage() {
 tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
 
 Usage:
-  tmux-agent-sessions list [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
-  tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions list [--no-write] [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions list --watch [--no-write] --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
   tmux-agent-sessions resolve --name <partial-or-full-name> --json
   tmux-agent-sessions diff --since <timestamp> --json
   tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]
@@ -200,7 +201,12 @@ emit_wrapper_session_json() {
     codex) prefix="$CODEX_PREFIX" ;;
     agy) prefix="$AGY_PREFIX" ;;
   esac
-  if output="$("${wrapper[@]}" status --json "$name" 2>/dev/null)"; then
+  local -a status_cmd=("${wrapper[@]}" status)
+  if (( NO_WRITE )) || [[ -n "${TMUX_AGENT_NO_WRITE:-}" ]]; then
+    status_cmd+=(--no-write)
+  fi
+  status_cmd+=(--json "$name")
+  if output="$("${status_cmd[@]}" 2>/dev/null)"; then
     print -r -- "$output" | add_state_field
     return
   fi
@@ -453,6 +459,9 @@ list_sessions() {
       --json)
         output_json=1
         ;;
+      --no-write)
+        NO_WRITE=1
+        ;;
       --watch)
         watch=1
         ;;
@@ -496,7 +505,7 @@ list_sessions() {
         SORT_FIELD="$(parse_sort_arg "${1:-}")"
         ;;
       *)
-        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>] | list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]"
+        die "Usage: tmux-agent-sessions list [--no-write] [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>] | list --watch [--no-write] --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]"
         ;;
     esac
     shift

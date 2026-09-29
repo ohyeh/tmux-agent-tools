@@ -10,8 +10,10 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -716,3 +718,299 @@ test('mutation proof: scan with claim:true mutates and creates claims/ for a dea
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('finding R3/R12: no-mutation with live fleet pane compares root before and after', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'snapshot-nomut-live-'))
+  const v3 = v3Of(root)
+  const name = 'reviewdash'
+  mkdirSync(`${v3}/${name}/episodes/2/sent`, { recursive: true })
+  const now = Date.now()
+  writeFileSync(
+    `${v3}/${name}/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name,
+      dir: root,
+      ownerCwd: root,
+      owner: 'owner',
+      since: now,
+      origin: 'assign',
+    }),
+  )
+  writeFileSync(
+    `${v3}/${name}/episodes/2/dispatch.json`,
+    JSON.stringify({
+      seq: 2,
+      owner: 'owner',
+      since: now,
+      resultPath: `${v3}/${name}/episodes/2/result.json`,
+      origin: 'tell',
+    }),
+  )
+  writeFileSync(
+    `${v3}/${name}/episodes/2/result.json`,
+    JSON.stringify({ schema_version: 1, episode: 2, status: 'success', summary: 'done', artifacts: [], errors: [] }),
+  )
+
+  const socketDir = mkdtempSync(join(tmpdir(), 'dash-sock-'))
+  chmodSync(socketDir, 0o700)
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 501
+  const userDir = join(socketDir, `tmux-${uid}`)
+  mkdirSync(userDir, { mode: 0o700, recursive: true })
+  chmodSync(userDir, 0o700)
+  const socketPath = join(userDir, 'default')
+  const execTmux = (args: string[]) => {
+    const env = { ...process.env, TMUX_TMPDIR: socketDir }
+    delete env.TMUX
+    delete env.TMUX_PANE
+    return execFileSync('tmux', ['-S', socketPath, ...args], { env, encoding: 'utf8' })
+  }
+
+  process.env.TMUX_AGENT_DIR = root
+  process.env.TMUX_TMPDIR = socketDir
+  const savedTmux = process.env.TMUX
+  const savedTmuxPane = process.env.TMUX_PANE
+  delete process.env.TMUX
+  delete process.env.TMUX_PANE
+
+  try {
+    execTmux(['-f', '/dev/null', 'new-session', '-d', '-s', `codex-cli-${name}`, 'cat'])
+    const host = nodeHost({ cwd: root })
+
+    const before = captureDir(root)
+    assert.ok(before.size > 0)
+
+    const snap = await dashboard({ host })
+    assert.ok(snap.sessions.some(s => s.name === name))
+
+    const after = captureDir(root)
+    assert.equal(after.size, before.size, 'root must not have added or removed files')
+    for (const [path, entry] of before) {
+      const afterEntry = after.get(path)
+      assert.ok(afterEntry, `path missing after snapshot: ${path}`)
+      assert.equal(afterEntry.type, entry.type, `type changed for ${path}`)
+      assert.equal(afterEntry.mtimeMs, entry.mtimeMs, `mtime changed for ${path}`)
+      assert.equal(afterEntry.hash, entry.hash, `content hash changed for ${path}`)
+    }
+  } finally {
+    try {
+      execTmux(['kill-server'])
+    } catch {}
+    if (savedTmux !== undefined) process.env.TMUX = savedTmux
+    if (savedTmuxPane !== undefined) process.env.TMUX_PANE = savedTmuxPane
+    delete process.env.TMUX_AGENT_DIR
+    delete process.env.TMUX_TMPDIR
+    rmSync(root, { recursive: true, force: true })
+    rmSync(socketDir, { recursive: true, force: true })
+  }
+})
+
+test('finding R4: live ledger worker result_path comes from descriptor, overriding fleet default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'snapshot-r4-'))
+  const v3 = v3Of(root)
+  const name = 'reviewdash'
+  const ep2Dir = `${v3}/${name}/episodes/2`
+  mkdirSync(`${ep2Dir}/sent`, { recursive: true })
+  const now = Date.now()
+  writeFileSync(
+    `${v3}/${name}/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name,
+      dir: root,
+      ownerCwd: root,
+      owner: 'owner',
+      since: now,
+      origin: 'assign',
+    }),
+  )
+  const descriptorResultPath = `${ep2Dir}/result.json`
+  writeFileSync(
+    `${ep2Dir}/dispatch.json`,
+    JSON.stringify({
+      seq: 2,
+      owner: 'owner',
+      since: now,
+      resultPath: descriptorResultPath,
+      origin: 'tell',
+    }),
+  )
+  writeFileSync(
+    descriptorResultPath,
+    JSON.stringify({ schema_version: 1, episode: 2, status: 'success', summary: 'done', artifacts: [], errors: [] }),
+  )
+
+  process.env.TMUX_AGENT_DIR = root
+  const host = nodeHost({ cwd: root })
+
+  const fakeFleetSession: DashboardSession = {
+    schema_version: 1,
+    tool: 'codex',
+    name,
+    session: `codex-cli-${name}`,
+    prefix: 'codex-cli',
+    exists: true,
+    running: true,
+    exit_detected: false,
+    exit_code: null,
+    local_or_remote: 'local',
+    diagnostic: null,
+    last_capture_lines: [],
+    confirmation_detected: false,
+    blocked_reason: null,
+    blocked_evidence: null,
+    started_at: new Date(now).toISOString(),
+    last_change_at: null,
+    idle_seconds: 10,
+    bytes_in_pane: 100,
+    marker_seen: [],
+    state: 'running',
+    wrapper: 'agent-tmux codex',
+    agent_name: name,
+    tmux_session: `codex-cli-${name}`,
+    cwd: root,
+    result_path: `${root}/${name}/result.json`,
+    created_at: new Date(now).toISOString(),
+    created_epoch: Math.floor(now / 1000),
+    age_seconds: 10,
+    age: '10s',
+  }
+
+  try {
+    const snap = await dashboard({ host, sessions: [fakeFleetSession] })
+    const row = snap.sessions.find(s => s.name === name)
+    assert.ok(row, 'session row must exist')
+    assert.equal(row.result_path, descriptorResultPath, 'live worker result_path must come from descriptor')
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('finding R5: E1 done does not mark E2 pending as delivered in panel', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'snapshot-r5-'))
+  const v3 = v3Of(root)
+  const name = 'w.abcde'
+  const workerDir = `${v3}/${name}`
+  const now = Date.now()
+
+  mkdirSync(`${workerDir}/episodes/1/sent`, { recursive: true })
+  mkdirSync(`${workerDir}/episodes/1/acks/done`, { recursive: true })
+  mkdirSync(`${workerDir}/episodes/2/sent`, { recursive: true })
+
+  writeFileSync(
+    `${workerDir}/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name,
+      dir: root,
+      ownerCwd: root,
+      owner: 'owner',
+      since: now - 60000,
+      origin: 'assign',
+    }),
+  )
+  writeFileSync(
+    `${workerDir}/episodes/1/dispatch.json`,
+    JSON.stringify({ seq: 1, since: now - 60000, owner: 'owner', resultPath: `${workerDir}/episodes/1/result.json`, origin: 'launch' }),
+  )
+  writeFileSync(
+    `${workerDir}/episodes/2/dispatch.json`,
+    JSON.stringify({ seq: 2, since: now - 30000, owner: 'owner', resultPath: `${workerDir}/episodes/2/result.json`, origin: 'tell' }),
+  )
+
+  process.env.TMUX_AGENT_DIR = root
+  const host = nodeHost({ owner: 'owner', cwd: root })
+
+  try {
+    const line = await panel({ host, session: 'owner' })
+    assert.doesNotMatch(line, /delivered/, 'pending E2 must not be reported as delivered when E1 was done')
+    assert.match(line, /▶/, 'pending E2 must be marked active')
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('finding R6: failed fleet probe surfaces error and incomplete, never synthesizes stopped or fresh at', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'snapshot-r6-'))
+  const v3 = v3Of(root)
+  const name = 'w.abcde'
+  const workerDir = `${v3}/${name}`
+  const now = Date.now()
+
+  mkdirSync(`${workerDir}/episodes/1/sent`, { recursive: true })
+  writeFileSync(
+    `${workerDir}/worker.json`,
+    JSON.stringify({
+      profile: 'codex',
+      name,
+      dir: root,
+      ownerCwd: root,
+      owner: 'owner',
+      since: now - 60000,
+      origin: 'assign',
+    }),
+  )
+  writeFileSync(
+    `${workerDir}/episodes/1/dispatch.json`,
+    JSON.stringify({ seq: 1, since: now - 60000, owner: 'owner', resultPath: `${workerDir}/episodes/1/result.json`, origin: 'launch' }),
+  )
+
+  process.env.TMUX_AGENT_DIR = root
+  const logs: string[] = []
+  const host = nodeHost({ owner: 'owner', cwd: root, log: t => logs.push(t) })
+  const failureHost: typeof host = {
+    ...host,
+    run: async () => ({ exitCode: -1, stdout: '', stderr: 'EACCES fleet probe denied' }),
+  }
+
+  try {
+    const failed = await dashboard({ host: failureHost })
+    assert.equal(failed.incomplete, true, 'snapshot must be marked incomplete on probe failure')
+    assert.match(failed.diagnostic ?? '', /EACCES fleet probe denied/, 'diagnostic must contain probe stderr')
+    assert.equal(failed.at, undefined, 'never stamp fresh at on incomplete data')
+    assert.equal(failed.totals?.stopped ?? 0, 0, 'never synthesize stopped for unmatched ledger workers on failure')
+    assert.equal(failed.sessions.length, 0, 'sessions must not contain synthesized stopped sessions')
+    assert.ok(logs.length > 0, 'error must be logged to host')
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('finding R6: ledger read error is surfaced and not suppressed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'snapshot-r6-ledger-'))
+  const v3 = v3Of(root)
+  process.env.TMUX_AGENT_DIR = root
+  const logs: string[] = []
+  const host = nodeHost({ owner: 'owner', cwd: root, log: t => logs.push(t) })
+  const errorHost: typeof host = {
+    ...host,
+    exists: async path => {
+      if (path.includes(v3)) {
+        const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException
+        err.code = 'EACCES'
+        throw err
+      }
+      return host.exists(path)
+    },
+  }
+
+  try {
+    // In panel: must not swallow error and return 'tmux-agent: no workers'
+    await assert.rejects(async () => {
+      await panel({ host: errorHost, session: 'owner' })
+    }, /EACCES/)
+
+    // In dashboard: must mark incomplete and surface diagnostic
+    const snap = await dashboard({ host: errorHost, sessions: [] })
+    assert.equal(snap.incomplete, true)
+    assert.match(snap.diagnostic ?? snap.error ?? '', /EACCES/)
+    assert.equal(snap.at, undefined)
+  } finally {
+    delete process.env.TMUX_AGENT_DIR
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
