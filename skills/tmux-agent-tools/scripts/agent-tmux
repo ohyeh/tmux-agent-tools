@@ -362,7 +362,7 @@ Usage:
   agent-tmux <cli> result [--path] [--field <jq>] [--wait <seconds>] [--json] <name>
   agent-tmux <cli> result path <name>
   agent-tmux <cli> result init <name>
-  agent-tmux <cli> result validate <name> --json
+  agent-tmux <cli> result validate <name> --json [--path <abs>] [--episode <n>]
   agent-tmux <cli> outcome <name> met|not-met|unknown [--note <text>]
   agent-tmux <cli> result wait-required <name> --fields <csv> --wait <seconds> --json
   agent-tmux <cli> supervise [--timeout <seconds>] [--interval <seconds>] [--result-required] [--silent-while-unchanged] --json <name>
@@ -573,6 +573,12 @@ prompt. Cannot be combined with --from-file.
 --key sends an explicit mapped TUI key (enter/up/down) with no text injection.
 Use it for prompts where `--raw "Enter"` would type literal text.
 
+--result-path <abs> [--episode <n>] (also on start and send-wait) names THIS
+prompt's result file: the instruction is prepended every time, not once per
+session, and the once-per-session sentinel is left alone. --episode asks the
+worker to write `"episode": <n>`; `result validate --episode <n> --path <abs>`
+checks it. The workers-core ledger closes an episode only on that match.
+
 By default, prompt-bearing sends prepend a task-scope guard that tells the worker
 to treat the target repo's own AGENTS.md/CLAUDE.md/skills/hooks as read-only
 context while the user-level kernel (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
@@ -684,7 +690,7 @@ agent-tmux result [flags] <name>
 agent-tmux result --path <name>
 agent-tmux result path <name>
 agent-tmux result init <name>
-agent-tmux result validate <name> --json
+agent-tmux result validate <name> --json [--path <abs>] [--episode <n>]
 agent-tmux result wait-required <name> --fields <csv> --wait <seconds> --json
 
 Read the agent's result.json (#97) at $TMUX_AGENT_DIR/<name>/result.json.
@@ -2314,6 +2320,8 @@ RESULT_PATH_MARKER="Write final JSON to this exact path:"
 # `result validate` accepts all three today, so this is drift, not breakage —
 # pinned in the wording rather than normalized in code, because no reader
 # compares the value yet and a normalizer would be built for no consumer.
+RESULT_PATH_OVERRIDE=""
+RESULT_EPISODE=""
 RESULT_SCHEMA_LINE="Result JSON must include schema_version, status, summary, artifacts, and errors; schema_version must be the number 1 (not a string), and status must be exactly one of success, failed, blocked, needs-input. If you committed, add commit: the full 40-hex sha of your final commit."
 
 # Did an injected prefix actually LAND in the pane? Intent (the paste command
@@ -2643,13 +2651,19 @@ result_path_sentinel() {
 # inside $(...) would not survive command substitution).
 result_path_should_inject() {
   local name="$1" prompt_text="$2"
+  # An explicit --result-path is per prompt: always told, whatever the sentinel
+  # or result_path_via_prompt say (contract v5 §8).
+  if [[ -n "$RESULT_PATH_OVERRIDE" ]]; then [[ -n "$prompt_text" ]]; return; fi
   [[ "$RESULT_PATH_VIA_PROMPT" == true && -n "$prompt_text" && ! -e "$(result_path_sentinel "$name")" ]]
 }
 
-# Prepend the result-path instruction to a prompt.
+# Prepend the result-path instruction to a prompt. With --episode the schema line
+# also asks for the episode number, the only field that attributes a result.
 result_path_prepend() {
-  printf '%s %s\n%s\n\n%s' "$RESULT_PATH_MARKER" "$(agent_root_dir)/$1/result.json" \
-    "$RESULT_SCHEMA_LINE" "$2"
+  local schema="$RESULT_SCHEMA_LINE"
+  [[ -n "$RESULT_EPISODE" ]] && schema+=" Also include episode: the number $RESULT_EPISODE (not a string)."
+  printf '%s %s\n%s\n\n%s' "$RESULT_PATH_MARKER" "${RESULT_PATH_OVERRIDE:-$(agent_root_dir)/$1/result.json}" \
+    "$schema" "$2"
 }
 
 # Record that the result-path instruction has been delivered. Call ONLY after
@@ -2657,6 +2671,8 @@ result_path_prepend() {
 # silently never learned its result path (#283).
 result_path_mark_injected() {
   local name="$1" session="${2:-}"
+  # The sentinel records that the DEFAULT path was taught; an override taught another one.
+  [[ -n "$RESULT_PATH_OVERRIDE" ]] && return 0
   # Cheapest disqualifier first: for an untrustworthy family the pane poll's
   # outcome is discarded anyway, so do not pay its up-to-10s wait.
   _sentinel_trustworthy || { _sentinel_unconfirmed "result-path" "$name"; return 1; }
@@ -2695,12 +2711,17 @@ _sentinel_unconfirmed() {
 
 result_validate_session() {
   local output_json=0
-  local name=""
+  local name="" episode="" path_override=""
   while (( $# > 0 )); do
     case "$1" in
       --json)
         output_json=1
         shift
+        ;;
+      --episode|--path)
+        (( $# >= 2 )) || { echo "$1 requires a value" >&2; exit 2; }
+        if [[ "$1" == --episode ]]; then episode="$2"; else path_override="$2"; fi
+        shift 2
         ;;
       --)
         shift
@@ -2717,16 +2738,22 @@ result_validate_session() {
     esac
   done
   if [[ -z "$name" || $# -gt 0 ]]; then
-    echo "Usage: agent-tmux result validate <name> --json" >&2
+    echo "Usage: agent-tmux result validate <name> --json [--path <abs>] [--episode <n>]" >&2
     exit 2
   fi
   if (( ! output_json )); then
     echo "result validate requires --json" >&2
     exit 2
   fi
+  if [[ -n "$episode" && ! "$episode" =~ '^[1-9][0-9]*$' ]]; then
+    echo "--episode must be a positive integer: $episode" >&2; exit 2
+  fi
+  if [[ -n "$path_override" && "$path_override" != /* ]]; then
+    echo "--path must be absolute: $path_override" >&2; exit 2
+  fi
   require_jq
   local result_path schema_path
-  result_path="$(agent_root_dir)/$name/result.json"
+  result_path="${path_override:-$(agent_root_dir)/$name/result.json}"
   schema_path="$(result_schema_path_for "$name")"
   [[ -n "$schema_path" ]] || schema_path="$(result_default_schema_path)"
   if [[ ! -f "$result_path" ]]; then
@@ -2745,6 +2772,12 @@ result_validate_session() {
   lightweight_out="$(result_validate_lightweight "$result_path" "$schema_path")" || rc=$?
   raw_status="$(printf '%s' "$lightweight_out" | "$JQ" -r '.body.status // ""' 2>/dev/null)" || raw_status=""
   canonical_status="$(canonical_status_of "$raw_status")"
+  # --episode: the result is attributed only when its own `episode` equals it (contract v5 §8).
+  if [[ -n "$episode" ]] && ! printf '%s' "$lightweight_out" | "$JQ" -e --argjson e "$episode" '.body.episode == $e' >/dev/null 2>&1; then
+    lightweight_out="$(printf '%s' "$lightweight_out" | "$JQ" --argjson e "$episode" \
+      '.valid = false | .errors += [{path: ".episode", message: "episode is not \($e)"}]')"
+    rc=1
+  fi
   printf '%s' "$lightweight_out" | "$JQ" --arg s "$canonical_status" \
     '. + {canonical_status: $s, status_bucket: $s}'
   if [[ "$canonical_status" == "unknown" ]]; then
@@ -4096,12 +4129,32 @@ _extract_prompt_file_prepass() {
         _PPFF_VALUE="${@[i]#*=}"
         (( i += 1 ))
         ;;
+      --result-path|--episode)
+        if (( i >= $# )); then
+          echo "${@[i]} requires a value" >&2; return 2
+        fi
+        if [[ "${@[i]}" == --result-path ]]; then RESULT_PATH_OVERRIDE="${@[i+1]}"; else RESULT_EPISODE="${@[i+1]}"; fi
+        (( i += 2 ))
+        ;;
       *)
         _PPFF_REMAINING+=("${@[i]}")
         (( i += 1 ))
         ;;
     esac
   done
+  # Producer route (workers-core P0 contract v5 §8): the caller names THIS prompt's
+  # result file and episode. Both or neither; the path is absolute and has no
+  # control characters, because it is pasted into the pane on its own line.
+  if [[ -n "$RESULT_EPISODE" && -z "$RESULT_PATH_OVERRIDE" ]]; then
+    echo "--episode requires --result-path" >&2; return 2
+  fi
+  if [[ -n "$RESULT_EPISODE" && ! "$RESULT_EPISODE" =~ '^[1-9][0-9]*$' ]]; then
+    echo "--episode must be a positive integer: $RESULT_EPISODE" >&2; return 2
+  fi
+  if [[ -n "$RESULT_PATH_OVERRIDE" && ( "$RESULT_PATH_OVERRIDE" != /* || "$RESULT_PATH_OVERRIDE" == *[[:cntrl:]]* ) ]]; then
+    echo "--result-path must be an absolute path without control characters: $RESULT_PATH_OVERRIDE" >&2; return 2
+  fi
+  return 0
 }
 
 # ---- brief: render a GOAL/ACCEPTANCE/REPORT prompt from flags -------------

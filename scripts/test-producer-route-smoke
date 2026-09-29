@@ -1,0 +1,88 @@
+#!/usr/bin/env zsh
+# Smoke test for the producer route (workers-core P0 contract v5 §8):
+# `start`/`send --result-path <abs> --episode <n>` tells the worker THIS prompt's
+# result file and episode on every prompt, never touches the once-per-session
+# sentinel, and `result validate --episode <n> --path <abs>` checks the field.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+
+WORK="$(mktemp -d -t tmux-agent-producer.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'tmux kill-session -t codex-cli-pr-route 2>/dev/null || true; rm -rf "$WORK"' EXIT
+
+cat > "$WORK/fake-live.sh" <<'EOF'
+#!/bin/sh
+echo "ready"
+while IFS= read -r line; do
+  echo "got:$line"
+done
+EOF
+chmod +x "$WORK/fake-live.sh"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+count() {
+  local haystack="$1" needle="$2" n=0
+  while [[ "$haystack" == *"$needle"* ]]; do haystack="${haystack#*"$needle"}"; n=$((n + 1)); done
+  echo "$n"
+}
+pane() { tmux capture-pane -J -t "codex-cli-$N" -p -S -300; }
+
+RP="Write final JSON to this exact path:"
+N="pr-route"
+P1="$WORK/eps/1/result.json"
+P2="$WORK/eps/2/result.json"
+
+echo "case: start carries the launch episode"
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact --result-path "$P1" --episode 1 "$N" "$WORK" "first-task" >/dev/null
+sleep 1
+p="$(pane)"
+assert "start names the given path" "$([[ "$p" == *"$RP $P1"* ]] && echo yes || echo no)" "yes"
+assert "start asks for episode 1" "$([[ "$p" == *"episode: the number 1"* ]] && echo yes || echo no)" "yes"
+sentinel="$(dirname "$("$CODEX_TMUX" result --path "$N")")/.result-path-injected"
+assert "override leaves the session sentinel alone" "$([[ -e "$sentinel" ]] && echo yes || echo no)" "no"
+
+echo "case: every send with --result-path is told again"
+"$CODEX_TMUX" send --result-path "$P2" --episode 2 "$N" "second-task" >/dev/null
+sleep 1
+c1="$(count "$(pane)" "$RP $P2")"
+"$CODEX_TMUX" send --result-path "$P2" --episode 2 "$N" "second-again" >/dev/null
+sleep 1
+c2="$(count "$(pane)" "$RP $P2")"
+assert "first episode-2 send names its path" "$([[ "$c1" -ge 1 ]] && echo yes || echo no)" "yes"
+assert "a repeat send is told again (not once per session)" "$([[ "$c2" -gt "$c1" ]] && echo yes || echo no)" "yes"
+assert "episode 2 asked for" "$([[ "$(pane)" == *"episode: the number 2"* ]] && echo yes || echo no)" "yes"
+assert "still no session sentinel" "$([[ -e "$sentinel" ]] && echo yes || echo no)" "no"
+
+echo "case: bad flags are refused before anything is sent"
+rc=0; "$CODEX_TMUX" send --episode 3 "$N" "x" >/dev/null 2>&1 || rc=$?
+assert "--episode without --result-path" "$rc" "2"
+rc=0; "$CODEX_TMUX" send --result-path rel/result.json "$N" "x" >/dev/null 2>&1 || rc=$?
+assert "relative --result-path" "$rc" "2"
+rc=0; "$CODEX_TMUX" send --result-path "$P2" --episode 0 "$N" "x" >/dev/null 2>&1 || rc=$?
+assert "--episode 0" "$rc" "2"
+
+echo "case: result validate --episode"
+mkdir -p "$(dirname "$P2")"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"s","artifacts":[],"errors":[],"episode":2}' > "$P2"
+rc=0; out="$("$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 2 2>/dev/null)" || rc=$?
+assert "matching episode is valid" "$rc:$(print -r -- "$out" | jq -r .valid)" "0:true"
+rc=0; out="$("$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 3 2>/dev/null)" || rc=$?
+assert "other episode is not valid" "$rc:$(print -r -- "$out" | jq -r .valid)" "1:false"
+assert "the error names the field" "$(print -r -- "$out" | jq -r '.errors[-1].path')" ".episode"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"s","artifacts":[],"errors":[]}' > "$P2"
+rc=0; "$CODEX_TMUX" result validate "$N" --json --path "$P2" --episode 2 >/dev/null 2>&1 || rc=$?
+assert "a result without episode is not attributed" "$rc" "1"
+
+"$CODEX_TMUX" stop "$N" >/dev/null 2>&1 || true
+echo "producer-route smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

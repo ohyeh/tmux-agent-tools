@@ -67,6 +67,7 @@ jobs:
           scripts/test-color-env-smoke
           scripts/test-outcome-smoke
           scripts/test-resume-keyword-smoke
+          scripts/test-producer-route-smoke
           skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 0'
           watch_zero_output="$(skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 0)"
           test -z "$watch_zero_output"
