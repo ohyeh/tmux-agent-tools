@@ -7559,6 +7559,16 @@ runtime_blocker_phrase() {
   esac
 }
 
+# A column-0 ⚠ that is a model/API failure, not a quota banner and not an MCP
+# warning. agy draws `⚠ … 404 NOT_FOUND` and then sits there. Empty if the line
+# is only a warning.
+runtime_model_error_phrase() {
+  case "${1:l}" in
+    *'404'*|*'not_found'*|*'not found'*|*'model error'*|*'model_not_found'*|*'no such model'*|*'api error'*)
+      print -r -- "model_error"$'\t'"$1" ;;
+  esac
+}
+
 # Runtime blockers: the CLI is alive but refuses work until a person acts (a
 # usage window, a rate limit it gave up on, credentials). Three rules, each
 # from a counterexample:
@@ -7647,9 +7657,12 @@ runtime_blocker_for_text() {
         fi
       elif [[ "$line" == "$body" ]] && [[ "$body" == ('■'|'✗'|'✘'|'⚠'|'Error:'|'error:'|'ERROR:'|'API Error:'|'API Error ('|'ActionRequiredError:'|"You've hit your "|'You’ve hit your ')* ]]; then
         hit="$(runtime_blocker_phrase "$line")"
-        # A ⚠ line is a CLI warning (an MCP server that failed to authenticate), not
-        # a refusal of work: only a quota banner there stops the worker.
-        [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]] && hit=""
+        # A ⚠ line is usually a CLI warning (an MCP server that failed to
+        # authenticate): only a quota banner, or a model/API failure, stops the
+        # worker. Tool output under └ never reaches here (that line is indented).
+        if [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]]; then
+          hit="$(runtime_model_error_phrase "$line")"
+        fi
         limit_false=false
       else
         case "$body" in
@@ -7752,6 +7765,9 @@ diagnostic_for_blocked_reason() {
       ;;
     login_required)
       echo "the CLI lost its credentials mid-run (see blocked_evidence); log in on this host, then tell the worker to resume"
+      ;;
+    model_error)
+      echo "the CLI stopped on a model/API error (see blocked_evidence); nothing is processing until that error is fixed — peek at the pane, then change the model or reassign"
       ;;
   esac
 }

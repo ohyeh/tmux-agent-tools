@@ -249,6 +249,21 @@ fake cursor-false-then-true <<'EOF'
 →
 EOF
 
+# agy draws a column-0 ⚠ for a model/API failure that is not a quota banner
+# (live: "⚠ … 404 NOT_FOUND"). The same text under └ is the tool's output.
+fake agy-model-404 <<'EOF'
+⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND
+? for shortcuts
+>
+EOF
+
+fake model-error-in-tool <<'EOF'
+• Reading the model fixture
+└ cat model-error.txt
+    ⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND
+>
+EOF
+
 PASS=0
 FAIL=0
 assert() {
@@ -423,6 +438,16 @@ echo "case: cursor false block followed by newer true block is quota_exhausted"
 st="$(status_of cursor-false-then-true cursor)"
 assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
 assert "evidence is the structured key line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "  unifiedSkuWeeklyLimit: true"
+
+echo "case: agy ⚠ model 404 is a model error, not a quota stop and not running"
+st="$(status_of agy-model-404)"
+assert "blocked_reason model_error" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "model_error"
+assert "evidence is the model error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND"
+
+echo "case: the same ⚠ model error under └ is tool output"
+st="$(status_of model-error-in-tool)"
+assert "tool model error not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "tool model error has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
 
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

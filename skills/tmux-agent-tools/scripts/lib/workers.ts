@@ -39,7 +39,7 @@ export type TmuxStalled = {
   dispatch: TmuxDispatch
   /** Seconds since the worker's pane last changed, as `agent-tmux status` measures it. */
   idleSeconds: number
-  /** `<blocked_reason>: <line>` when agent-tmux status says the CLI stopped (quota_exhausted, login_required). Absent = quiet, not confirmed stuck. */
+  /** `<blocked_reason>: <line>` when agent-tmux status says the CLI stopped (quota_exhausted, login_required, model_error). Absent = quiet, not confirmed stuck. */
   evidence?: string
 }
 
@@ -155,9 +155,10 @@ export const STALL_SECONDS = 15 * 60
  * its own (a half-copy here matched a worker's prose — astra 0.7.4 review F5).
  * Observed cases: `⚠ Individual quota reached` for 7 days with `dead=0`; a
  * codex `■ You’ve hit your usage limit` for hours on 2026-09-24 while the lead
- * waited on a result that could not come.
+ * waited on a result that could not come; an agy `⚠ … 404 NOT_FOUND` that is
+ * not a quota banner (`model_error`).
  */
-export const RUNTIME_BLOCKERS = new Set(['quota_exhausted', 'login_required'])
+export const RUNTIME_BLOCKERS = new Set(['quota_exhausted', 'login_required', 'model_error'])
 /**
  * How long the pane must be unchanged before a runtime blocker counts. Short,
  * because the CLI has already said it stopped; not zero, so a banner still on
