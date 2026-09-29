@@ -1,6 +1,6 @@
 # workers-core P8 release checklist
 
-Inventory for the release that ships one core (`skills/tmux-agent-tools/scripts/lib/workers.ts`) inside the root plugin. This worktree is `wc-p8` at base `eec07ff`. Tag and publish stay with the operator. Do not bump versions in a lane that has not merged P3–P7.
+Inventory for the release that ships one core (`skills/tmux-agent-tools/scripts/lib/workers.ts`) inside the root plugin. The base is `merge-base main HEAD` of the branch being released, not worktree `wc-p8` or `eec07ff`. Tag and publish stay with the operator. Do not bump versions in a lane that has not merged P3–P7.
 
 Contract: workers-core P0 contract v6 §9 (capability matrix) and §10 (P8 = immutable candidate / approved tag, install + upgrade matrix). Plan D1 is C: the mod binding lives in the root plugin and imports the core. Release policy for pinned consumers: agent-scripts `AGENTS.md` lines 35–37 (`npx --yes skills@<version>` against a gated release ref).
 
@@ -221,7 +221,7 @@ adapter smoke ok
 
 ```text
 zsh -f scripts/test-core-contract-smoke
-  ok   core contract (node 22.18.0): pass 65  fail 0
+  ok   core contract (node 22.18.0): pass 65  fail 0  # dated sample 2026-09-29; use that run's count
 1 passed, 0 failed
 ```
 
