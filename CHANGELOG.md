@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `agent-tmux cursor|agy resume <name> <dir> <session-id>` opens the session it names. The bundled profiles (and the legacy presets) put the id after a `resume` subcommand. `cursor-agent resume` is "Resume the latest chat session" and takes no id; its id flag is `--resume [chatId]`. agy has no resume subcommand at all; its id flag is `--conversation`. Found live 2026-09-29 by a Cursor session resuming `5ea32e6e…`. `cursor.conf` now sets `resume_keyword=--resume`, `agy.conf` sets `resume_keyword=--conversation`. Checked against `cursor-agent --help` and `agy --help`. grok is not checked (not installed here). Smoke: `scripts/test-resume-keyword-smoke` 2/2 (a fake binary records the argv of a real tmux launch); both assertions fail with the old keywords.
 - `agent-tmux <cli> outcome <name> met|not-met|unknown [--note <text>]` — the commander records whether a worker's delivered work met the brief. The worker's `status`/`summary` is a judge output (agent-scripts `judgment-rubrics` §9); this is the outcome label it can be checked against later. Written to a sidecar `<agent dir>/outcome.json` (never into `result.json`, which the worker writes and which is `additionalProperties: false`), bound to `sha256(result.json)` so a result reset by a later send does not inherit the old label; `unknown` is stored, not implied by a missing file. Observability only: nothing reads it to gate or route. Not in the mod's Bash deny list. Smoke: `scripts/test-outcome-smoke` 5/5.
 
 ## 0.10.5
