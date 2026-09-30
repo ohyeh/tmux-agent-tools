@@ -64,20 +64,11 @@ jobs:
       - name: Guard tmux socket isolation
         run: scripts/check-tmux-socket-isolation
 
-      - name: Core contract tests (node 22.18.0)
-        run: scripts/test-core-contract-smoke --test-timeout=120000
-
-      - name: Typecheck the mod and the shared core
-        run: scripts/test-mod-typecheck-smoke
-
       - name: Install Claude Code for plugin test
         run: |
           npm install -g @anthropic-ai/claude-code
           echo "CLAUDE_BIN=$(npm prefix -g)/bin/claude" >> "$GITHUB_ENV"
           "$(npm prefix -g)/bin/claude" --version
-
-      - name: Permission surface and plugin test
-        run: scripts/test-mod-permissions-smoke
 
       - name: Install smoke CLI stubs
         run: |

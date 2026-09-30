@@ -76,7 +76,7 @@ run_job() {
     unset TMUX TMUX_PANE
     export TMUX_TMPDIR="$job_dir"
     local socket="$job_dir/tmux-$(id -u)/default"
-    mkdir -p "${socket:h}"
+    mkdir -p -m 0700 "${socket:h}"
     trap 'env -u TMUX -u TMUX_PANE tmux -S "$socket" kill-server 2>/dev/null; rm -rf "$job_dir"' EXIT
     "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file" < /dev/null
   ) > "$out_file" 2>&1

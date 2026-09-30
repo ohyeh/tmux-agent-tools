@@ -46,7 +46,7 @@ tmux-agent-tools/
 5. **Run locally**:
    ```bash
    scripts/test-<name>-smoke
-   scripts/test-l5-batch-smoke         # if you touched L5
+   scripts/test-fanout-run-smoke       # if you touched L5 fanout/dag
    scripts/test-l6-batch-smoke         # if you touched L6
    scripts/ci-shellcheck
    scripts/lint-no-path-tied-locals
