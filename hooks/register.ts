@@ -521,7 +521,7 @@ export const register: Register = on => {
     const layout = (sel: PanelRow | undefined) => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (gate.legacy ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
+      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
       const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
@@ -835,12 +835,6 @@ export const register: Register = on => {
             }),
           ],
         }),
-      )
-    }
-    // Workers of the previous state layout: counted read-only, never collected here (§7).
-    if (gate.legacy) {
-      children.push(
-        Text({ dimColor: true, wrap: 'truncate-end', children: `legacy: ${gate.legacy} worker(s) still pending in the old state root (not collected by this version)` }),
       )
     }
 

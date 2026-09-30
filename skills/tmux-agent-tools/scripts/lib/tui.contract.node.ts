@@ -876,12 +876,10 @@ async function framed(opts: {
   return { screen: stripAnsi(stdout.written), writes: stdout.writes }
 }
 
-test('view probe: permission is needs-input, legacy and project are read, collector health is unknown', async () => {
+test('view probe: permission is needs-input, project is read, collector health is unknown', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-view-root-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-view-repo-'))
   writePermissionWorker(root, repo, 'owner')
-  mkdirSync(join(root, 'legacy-worker'))
-  writeFileSync(join(root, 'legacy-worker', 'dispatch.json'), JSON.stringify({ name: 'legacy-worker' }))
   const host = quietHost('owner', repo, root)
   let submits = 0
   host.submit = async () => {
@@ -904,7 +902,6 @@ test('view probe: permission is needs-input, legacy and project are read, collec
   const { screen } = await framed({ host, root, cwd: repo, session: 'owner' })
   assert.match(screen, /w\.abcde/)
   assert.match(screen, /needs input — permission/)
-  assert.match(screen, /legacy: 1/)
   assert.match(screen, /proj-a/)
   assert.match(screen, /collector health unknown/)
   assert.doesNotMatch(screen, /viewer — no session/)

@@ -1469,32 +1469,6 @@ describe('launch receipt', () => {
   })
 })
 
-describe('legacy root', () => {
-  // v5 cut import (P0): a pre-v5 record under the old root is counted, never collected.
-  test('a pending pre-v5 worker is counted on the band and never collected; a finished one is not counted', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME })
-    const store = mockStore(on)
-    mockClock(on)
-    const files: Files = {
-      [`${ROOT}/old/dispatch.json`]: dispatch('old', 0),
-      [`${ROOT}/done/dispatch.json`]: dispatch('done', 0),
-      [`${ROOT}/done/result.json`]: JSON.stringify({ status: 'success', summary: 'x' }),
-      ...worker('w1', 0),
-    }
-    mockFs(on, files)
-    mockPanel(on, { running: true, sessions: ['codex-cli-w1'] })
-
-    await $.session.start(session())
-    await $.command.run(run('workers'))
-    const drawn = textOf(await $.ui.render(bandRender()))
-    expect(drawn).toContain('legacy: 1 worker(s) still pending in the old state root (not collected by this version)')
-    expect(drawn, 'the v5 worker is listed').toContain('w1')
-    expect(drawn, 'a legacy worker is no row').not.toContain('  old  ')
-    expect(store.acked(), 'nothing under the old root is acked').toEqual([])
-    expect(Object.keys(files).filter(k => k.startsWith(`${ROOT}/old/`)), 'the old root is only read').toEqual([`${ROOT}/old/dispatch.json`])
-  })
-})
-
 /** Floors for a stall test: no delivery happens, so only the log matters. */
 function mockQuiet(on: On, submits: string[] = []): string[] {
   const logs: string[] = []

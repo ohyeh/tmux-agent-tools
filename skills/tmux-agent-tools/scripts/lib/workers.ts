@@ -551,8 +551,6 @@ export type Gate = {
   registering?: Promise<number | undefined>
   /** The action-lock holder token of this activation (§5). */
   token: string
-  /** Legacy workers still pending in the legacy root: the panel's read-only count (§7). */
-  legacy: number
   /**
    * Idle workers by id → the worker, its last measured idle, and the blocker line
    * when the pane tail shows one. Only an entry WITH evidence is stalled. An
@@ -1937,7 +1935,6 @@ export const newGate = (): Gate => ({
   failures: 0,
   nextAttemptAt: 0,
   token: randomBase36(12),
-  legacy: 0,
   stalled: new Map(),
   stallNoticed: new Set(),
   stallDrops: new Map(),
@@ -1960,7 +1957,6 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
 
   const s = await scan(host, { claim: true })
   await recoverUnsent(host, s.unsent)
-  gate.legacy = await legacyPending(host, root)
   // Project sessions ride this pass, not the 2s mirror clock: one list for the fleet.
   await refreshProjects(host, gate, s.visible)
   const reported = s.reported
@@ -2052,22 +2048,6 @@ export async function recoverUnsent(host: Host, dirs: readonly string[]): Promis
   }
 }
 
-/** The legacy layout's pending workers: a read-only count, never a claim (§7). */
-export async function legacyPending(host: Host, root: string): Promise<number> {
-  const entries = await host.list(root).catch(() => [] as { name: string; kind: string }[])
-  let n = 0
-  for (const e of entries) {
-    if (e.kind !== 'dir' || e.name.startsWith('.')) continue
-    if (!(await host.exists(`${root}/${e.name}/dispatch.json`).catch(() => false))) continue
-    const text = await readOrAbsent(host, `${root}/${e.name}/result.json`)
-    if (text === UNKNOWN) continue
-    const raw = parseJson(text ?? '') as { status?: unknown; body?: { status?: unknown } } | undefined
-    const status = raw?.status ?? raw?.body?.status
-    if (!(typeof status === 'string' && TERMINAL.has(status))) n++
-  }
-  return n
-}
-
 /**
  * What a view can show without becoming a collector.
  *
@@ -2079,7 +2059,6 @@ export async function legacyPending(host: Host, root: string): Promise<number> {
 export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
   gate.viewHealth = 'unknown'
   const scanned = await scan(host, { claim: false })
-  gate.legacy = await legacyPending(host, root)
   await refreshProjects(host, gate, scanned.visible)
   // `visible` is the set `panelRows` draws. Probing only `dispatches` would
   // leave another session's row as `running` when its pane is waiting.

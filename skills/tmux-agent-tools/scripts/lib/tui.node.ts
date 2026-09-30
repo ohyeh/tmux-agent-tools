@@ -430,7 +430,6 @@ export function renderTuiLines(
     (state.viewer ? 1 : 0) +
     (healthUnknown ? 1 : 0) +
     (others ? 1 : 0) +
-    (gate?.legacy ? 1 : 0) +
     (state.statusMessage && now < (state.statusUntil ?? 0) ? 1 : 0) +
     (selected ? 1 + (selected.summary ? 1 : 0) : 0) +
     (state.rows.length ? 0 : 1)
@@ -523,10 +522,6 @@ export function renderTuiLines(
   if (others) {
     const glyphColor = others.running ? '\x1b[32m' : '\x1b[2m'
     lines.push(truncateAnsi(`${glyphColor}◌\x1b[0m [ ${state.showAll ? '只看自己' : '展開'} · ${others.text} ]`, width))
-  }
-
-  if (gate?.legacy) {
-    lines.push(truncateAnsi(`\x1b[2mlegacy: ${gate.legacy} worker(s) still pending in the old state root (not collected by this version)\x1b[0m`, width))
   }
 
   if (state.statusMessage && now < (state.statusUntil ?? 0)) {

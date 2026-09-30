@@ -59,8 +59,7 @@ marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-t
   cancel <name> <seq> | unlock <name> [confirm]`。
 
 ack 是目錄，不是 store key，所以沒有「誰蓋掉誰的 ack」，也沒有剪除與容量預算。
-0.11 以前的紀錄（state root 直下的 `<name>/dispatch.json`）不會被匯入：還有沒結清的，
-面板會多一行 `legacy: N worker(s) still pending…`，用 shell 路徑收完或手動清掉。
+0.11 以前的紀錄（state root 直下的 `<name>/dispatch.json`）不支援：不匯入、不計數、不顯示。
 
 settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽略它
 （`claude --debug` 印 unknown option），拿掉即可。
