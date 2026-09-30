@@ -3,6 +3,9 @@
 #   1. Clean repo passes socket isolation check
 #   2. Unused decoy `const decoy = ['-S']` in wrapper body is rejected (N1)
 #   3. Wrapper bodies exceeding 30 lines with real -S pass (T1)
+#   4. Same-line decoy is rejected (R3)
+#   5. A brace inside a string does not end the wrapper body (F4)
+#   6. An argv declaration without a semicolon counts; an unused one does not (F5)
 
 set -euo pipefail
 
@@ -83,6 +86,51 @@ code=0
 out="$("$GUARD" "$tmp_r3" 2>&1)" || code=$?
 rm -f "$tmp_r3"
 assert "line-level short-circuit decoy is rejected (R3)" "$code" 1
+
+# 5. Finding F4: a "}" inside a string must not end the wrapper body early
+tmp_f4="$(mktemp "${TMPDIR:-/tmp}/f4_brace.XXXXXX.contract.node.ts")"
+cat <<EOF > "$tmp_f4"
+function safe(args) {
+  const label = "}"
+  return execFile("tmux", ["-S", "/private", ...args])
+}
+safe(["$(b_srv)"])
+EOF
+
+code=0
+out="$("$GUARD" "$tmp_f4" 2>&1)" || code=$?
+rm -f "$tmp_f4"
+assert "brace inside a string does not end the wrapper body (F4)" "$code" 0
+
+# 6. Finding F5: argv declared without a semicolon passes; an unused one is rejected
+tmp_f5="$(mktemp "${TMPDIR:-/tmp}/f5_asi.XXXXXX.contract.node.ts")"
+cat <<EOF > "$tmp_f5"
+function safe(args) {
+  const argv = ["-S", "/private", ...args]
+  return execFile("tmux", argv)
+}
+safe(["$(b_srv)"])
+EOF
+
+code=0
+out="$("$GUARD" "$tmp_f5" 2>&1)" || code=$?
+rm -f "$tmp_f5"
+assert "argv declared without a semicolon passes (F5)" "$code" 0
+
+tmp_f5d="$(mktemp "${TMPDIR:-/tmp}/f5_asi_decoy.XXXXXX.contract.node.ts")"
+cat <<EOF > "$tmp_f5d"
+function unsafe(args) {
+  const decoy = ["-S", "/private"]
+  const argv = [...args]
+  return execFile("tmux", argv)
+}
+unsafe(["$(b_srv)"])
+EOF
+
+code=0
+out="$("$GUARD" "$tmp_f5d" 2>&1)" || code=$?
+rm -f "$tmp_f5d"
+assert "unused decoy without a semicolon is rejected (F5)" "$code" 1
 
 echo "socket-isolation smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

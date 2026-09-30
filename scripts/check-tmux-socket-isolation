@@ -95,14 +95,33 @@ function findDef(lines, before, name) {
   return def
 }
 
+// Code text of one line with quoted strings skipped. A template literal stays open
+// across lines; a quote left open at the end of a line is a stray apostrophe.
+function codeOnly(line, open) {
+  let q = open
+  let out = ''
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (q) {
+      if (c === '\\') i++
+      else if (c === q) q = ''
+    } else if (c === '"' || c === "'" || c === '`') q = c
+    else out += c
+  }
+  return { out, open: q === '`' ? q : '' }
+}
+
 function bodyOf(lines, def) {
   const indent = lines[def].match(/^ */)?.[0].length ?? 0
   const chunk = [lines[def]]
   let braceDepth = 0
   let sawBrace = false
+  let open = ''
   for (let i = def; i < lines.length; i++) {
     const line = lines[i]
-    for (const ch of line) {
+    const scanned = codeOnly(line, open)
+    open = scanned.open
+    for (const ch of scanned.out) {
       if (ch === '{') {
         braceDepth++
         sawBrace = true
@@ -123,6 +142,24 @@ function bodyOf(lines, def) {
   return chunk.join('\n')
 }
 
+// End of the expression that starts at `start`: the first `;` or newline outside any
+// bracket or string, so a declaration counts with or without a semicolon.
+function exprEnd(text, start) {
+  let depth = 0
+  let q = ''
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]
+    if (q) {
+      if (c === '\\') i++
+      else if (c === q) q = ''
+    } else if (c === '"' || c === "'" || c === '`') q = c
+    else if ('([{'.includes(c)) depth++
+    else if (')]}'.includes(c)) depth--
+    else if (depth <= 0 && (c === ';' || c === '\n')) return i
+  }
+  return text.length
+}
+
 function tsWrapperPasses(lines, def) {
   const body = bodyOf(lines, def)
   const execRe = /\b(?:execFile|execFileSync|spawn|exec)\s*\(\s*[^,]+,\s*([^,)\n]+)/g
@@ -133,9 +170,11 @@ function tsWrapperPasses(lines, def) {
     const idMatch = argvArg.match(/^[A-Za-z_]\w*$/)
     if (idMatch) {
       const varName = idMatch[0]
-      const varDefRe = new RegExp(`\\b(?:const|let|var)\\s+${varName}\\s*=([^;\\n]+(?:\\n[^;\\n]+)*);`, 'g')
-      const varDef = varDefRe.exec(body)
-      if (varDef && passesSocket(varDef[1])) return true
+      const varDef = new RegExp(`\\b(?:const|let|var)\\s+${varName}\\s*=`).exec(body)
+      if (varDef) {
+        const start = varDef.index + varDef[0].length
+        if (passesSocket(body.slice(start, exprEnd(body, start)))) return true
+      }
     }
   }
   const runRe = /\b[A-Za-z_]\w*\s*\(\s*\[\s*(?:['"]tmux['"]|[A-Za-z_]\w*)\s*,\s*([^\]]+)\]/g
