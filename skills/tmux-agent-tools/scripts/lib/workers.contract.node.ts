@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
 
@@ -1221,3 +1221,32 @@ test('finding R2: launchFailure uses readOrAbsent, UNKNOWN does not count as no 
   const result = await collect(host, w.v3, [d], exited)
   assert.equal(result.finished.length, 0, 'must not deliver finished (neither EXITED nor LAUNCH_FAILED) when launch.exit is UNKNOWN')
 })
+
+test('gap B5: a launch-failed notice is provisional: a real result of the same episode is delivered once', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+
+  // 1. Simulate failed launch receipt
+  writeFileSync(`${r.stateDir}/launch.exit`, '1\n')
+  writeFileSync(`${r.stateDir}/mod-assign.log`, 'fake launch failure: dialog was not answered\n')
+
+  // First reconcile pass: delivers launch-failed notice
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1, 'first pass delivers launch failure')
+  assert.match(w.woken[0]!, /launch-failed/)
+
+  // 2. Real terminal result.json is written for the same episode
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1, summary: 'real result arrived' }))
+
+  // Second reconcile pass: real result outranks provisional launch notice and is delivered
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 2, 'second pass delivers real result')
+  assert.match(w.woken[1]!, /on astra: success/)
+  assert.match(w.woken[1]!, /real result arrived/)
+
+  // Third reconcile pass: already closed, never delivered twice
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 2, 'never delivered twice')
+})
+
