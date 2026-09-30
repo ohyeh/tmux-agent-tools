@@ -142,7 +142,7 @@ export async function panel(opts: PanelOptions = {}): Promise<string> {
   if (!root) return 'tmux-agent: no workers'
 
   const s = await scan(host, { claim: false })
-  if (!s.complete && (s.error || s.visible.length === 0)) {
+  if (!s.complete) {
     return `tmux-agent: ledger incomplete: ${s.error ?? 'unknown'}`
   }
   const activeEntries: { since: number; entry: string }[] = []

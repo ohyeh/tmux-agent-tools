@@ -1046,3 +1046,37 @@ test('finding F5: panel CLI prints ledger incomplete and exits 1, never no worke
   }
 })
 
+test('finding M1: panel CLI prints ledger incomplete and exits 1 when worker episode read errors without top-level error', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'panel-m1-'))
+  const v3 = join(root, '.v3', 'w.abcde')
+  const ep = join(v3, 'episodes', '1')
+  mkdirSync(ep, { recursive: true })
+  writeFileSync(join(v3, 'worker.json'), JSON.stringify({ profile: 'codex', name: 'w.abcde', owner: 'me', dir: root, since: Date.now() }) + '\n')
+  writeFileSync(join(ep, 'dispatch.json'), '{"seq":1,"resultPath":"/tmp/r.json"}\n')
+  chmodSync(join(ep, 'dispatch.json'), 0o000)
+  const script = fileURLToPath(new URL('./snapshot.node.ts', import.meta.url))
+  const run = await new Promise<{ code: number; out: string; err: string }>(resolve => {
+    execFile(
+      process.execPath,
+      ['--experimental-strip-types', script, 'panel'],
+      { env: { ...process.env, TMUX_AGENT_DIR: root }, encoding: 'utf8' },
+      (error, stdout, stderr) => {
+        resolve({
+          code: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
+          out: stdout ?? '',
+          err: stderr ?? '',
+        })
+      },
+    )
+  })
+  try {
+    assert.doesNotMatch(run.out, /no workers/, run.out)
+    assert.doesNotMatch(run.out, /delivered/, run.out)
+    assert.match(run.out, /ledger incomplete/)
+    assert.equal(run.code, 1)
+  } finally {
+    chmodSync(join(ep, 'dispatch.json'), 0o644)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+

@@ -30,6 +30,8 @@ import {
   sessionKey,
   sessionLiveness,
   superseded,
+  readOrAbsent,
+  UNKNOWN,
   type Contest,
   type Holder,
   type WorkerRecord,
@@ -710,18 +712,7 @@ export async function readOrEmpty(host: Host, path: string): Promise<string> {
   return host.read(path).catch(() => '')
 }
 
-export const UNKNOWN = 'unknown' as const
-/** A file's text; `undefined` = confirmed absent (ENOENT); `UNKNOWN` = any other failure, logged (§1). */
-export async function readOrAbsent(host: Host, path: string): Promise<string | undefined | typeof UNKNOWN> {
-  try {
-    return await host.read(path)
-  } catch (error) {
-    const there = await host.exists(path).catch(() => true)
-    if (!there) return undefined
-    host.log(`tmux-agent: could not read ${path}: ${String(error)}`)
-    return UNKNOWN
-  }
-}
+export { readOrAbsent, UNKNOWN }
 
 /** A claimed commit, checked against the worker's own repo before delivery. */
 export type CommitCheck = { sha: string; verified: true; scope: string } | { sha: string; verified: false; reason: string }
@@ -935,10 +926,20 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
     let skippedUnknown = false
     for (const seq of seqs) {
       const dir = `${w}/episodes/${seq}`
-      if (await hasMark(host, dir, 'aborted').catch(() => false)) continue
+      const aborted = await hasMark(host, dir, 'aborted').catch((error: unknown) => {
+        host.log(`tmux-agent: could not read ${dir}/aborted: ${String(error)}`)
+        return undefined
+      })
+      if (aborted === undefined) {
+        out.complete = false
+        skippedUnknown = true
+        continue
+      }
+      if (aborted) continue
       const desc = await readDescriptor(host, dir)
       if (desc === 'unknown') {
         out.complete = false
+        skippedUnknown = true
         continue
       }
       // Incomplete, or not yet sent: skipped until recovery settles it (§8).
@@ -948,6 +949,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
       })
       if (sent === undefined) {
         out.complete = false
+        skippedUnknown = true
         continue
       }
       if (!desc || !sent) {
@@ -957,11 +959,13 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
       const names = await ackNames(host, dir)
       if (!names) {
         out.complete = false
+        skippedUnknown = true
         continue
       }
       const cur = await currentOwner(host, dir, desc.owner)
       if (!cur) {
         out.complete = false
+        skippedUnknown = true
         continue
       }
       const goal = desc.goal?.replace(CTRL_ALL_RE, ' ').trim().slice(0, GOAL_MAX)
@@ -1507,7 +1511,14 @@ export async function flagStalls(
       // worker delivered as `exited` ~1s after dispatch and acknowledged, so its
       // real launch-failed report was never delivered.
       // Only the assign's launch has a receipt; a tell went to a pane that was alive.
-      if (d.origin === 'launch' && !(await readOrEmpty(host, `${root}/${d.name}/launch.exit`)).trim()) continue
+      if (d.origin === 'launch') {
+        const exitText = await readOrAbsent(host, `${root}/${d.name}/launch.exit`)
+        if (exitText === UNKNOWN) {
+          host.log(`tmux-agent: could not read launch.exit for ${d.name}`)
+          continue
+        }
+        if (!exitText || !exitText.trim()) continue
+      }
       gate.stalled.delete(id)
       if (wake && !gate.exited.has(id)) host.log(`tmux-agent: ${d.name}: pane gone with no result (status exists=${String(row.exists)} running=${String(row.running)})`)
       gate.exited.add(id)
@@ -1559,10 +1570,10 @@ export async function flagStalls(
   const still: typeof woken = []
   for (const item of woken) {
     const seq = item.d.seq
-    if (seq) {
-      const names = await ackNames(host, `${root}/${item.d.name}/episodes/${seq}`)
-      if (names?.some(n => CLOSED_ACKS.includes(n))) continue
-    }
+    if (!seq) continue
+    const names = await ackNames(host, `${root}/${item.d.name}/episodes/${seq}`)
+    if (names === undefined) continue
+    if (names.some(n => CLOSED_ACKS.includes(n))) continue
     still.push(item)
   }
   if (!still.length) return

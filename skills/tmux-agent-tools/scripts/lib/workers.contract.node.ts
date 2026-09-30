@@ -1046,3 +1046,113 @@ test('finding F5: exists error is an incomplete scan, not an empty ledger', asyn
   assert.equal(s.complete, false, 'exists error must not look like an empty ledger')
   assert.equal(s.error, 'EACCES')
 })
+
+test('finding M1: readDescriptor returning unknown makes panel print incomplete and omits name#0 from reported', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const denied = Object.assign(new Error('EACCES dispatch.json denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    read: async (path: string) => {
+      if (path.endsWith('/dispatch.json')) throw denied
+      return w.host.read(path)
+    },
+  }
+  const s = await scan(host, { claim: false })
+  assert.equal(s.complete, false, 'scan must be marked incomplete')
+  assert.equal(s.reported.has(`${r.name}#0`), false, 'name#0 must not be in reported')
+  assert.ok(s.withheld.has(r.name), 'worker name must be withheld')
+  const line = await panel({ host, session: 'me', width: 200 })
+  assert.doesNotMatch(line, /delivered/, line)
+  assert.match(line, /^tmux-agent: ledger incomplete/, line)
+})
+
+test('finding M2: ackNames list error prevents submitting stall notice', async () => {
+  const w = world()
+  const r = await assigned(w)
+  mkdirSync(`${r.stateDir}/episodes/1/acks`, { recursive: true })
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const gate = newGate()
+  const denied = Object.assign(new Error('EACCES ack dir list denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    list: async (path: string) => {
+      if (path.includes('/acks')) throw denied
+      return w.host.list(path)
+    },
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'agent-tmux' && argv.includes('status')) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            exists: true,
+            running: true,
+            idle_seconds: 1200,
+            blocked_reason: 'model_error',
+            blocked_evidence: 'API error column 0',
+          }),
+          stderr: '',
+        }
+      }
+      return w.host.run(argv, cwd, ms)
+    },
+  }
+  await flagStalls(host, gate, w.v3, [d], [d], true)
+  assert.equal(w.woken.length, 0, 'must not submit stall notice when ack read fails')
+})
+
+test('finding M6: exists error on aborted mark marks scan incomplete and omits episode from dispatches', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const denied = Object.assign(new Error('EACCES aborted check denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    exists: async (path: string) => {
+      if (path.endsWith('/aborted')) throw denied
+      return w.host.exists(path)
+    },
+  }
+  const s = await scan(host, { claim: false })
+  assert.equal(s.complete, false, 'scan must be incomplete on aborted check failure')
+  assert.equal(s.dispatches.some(d => d.seq === 1), false, 'episode 1 must not be in dispatches')
+  assert.equal((s.episodes.get(r.name) ?? []).length, 0, 'no episodes parsed')
+})
+
+test('finding N5: read error on launch.exit logs error and does not mark worker exited or clear existing exited state', async () => {
+  const w = world()
+  await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const gate = newGate()
+  const id = `${d.name}#${d.seq}`
+  gate.exited.add(id) // Pre-existing exited state
+
+  const denied = Object.assign(new Error('EACCES launch.exit denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    exists: async (path: string) => {
+      if (path.endsWith('/launch.exit')) return true
+      return w.host.exists(path)
+    },
+    read: async (path: string) => {
+      if (path.endsWith('/launch.exit')) throw denied
+      return w.host.read(path)
+    },
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'agent-tmux' && argv.includes('status')) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            exists: false,
+            running: false,
+          }),
+          stderr: '',
+        }
+      }
+      return w.host.run(argv, cwd, ms)
+    },
+  }
+
+  await flagStalls(host, gate, w.v3, [d], [d], true)
+  assert.ok(gate.exited.has(id), 'pre-existing exited state must not be cleared on read failure')
+  assert.ok(w.logs.some(l => l.includes('could not read launch.exit')), 'must log read failure')
+})

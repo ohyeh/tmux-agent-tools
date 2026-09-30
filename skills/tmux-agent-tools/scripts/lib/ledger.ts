@@ -140,6 +140,20 @@ async function statOrAbsent(host: Host, path: string): Promise<{ mtimeMs: number
   }
 }
 
+export const UNKNOWN = 'unknown' as const
+
+/** A file's text; `undefined` = confirmed absent (ENOENT); `UNKNOWN` = any other failure, logged (§1). */
+export async function readOrAbsent(host: Host, path: string): Promise<string | undefined | typeof UNKNOWN> {
+  try {
+    return await host.read(path)
+  } catch (error) {
+    const there = await host.exists(path).catch(() => true)
+    if (!there) return undefined
+    host.log(`tmux-agent: could not read ${path}: ${String(error)}`)
+    return UNKNOWN
+  }
+}
+
 // ── claims (§3) ────────────────────────────────────────────────────────────────
 
 export type Owner = { gen: number; session: string | undefined; complete: boolean; createdMs?: number }
@@ -151,11 +165,12 @@ export async function currentOwner(host: Host, episode: string, gen0Owner: strin
   const g = gens.at(-1)
   if (g === undefined) return { gen: 0, session: gen0Owner, complete: true }
   const dir = `${episode}/claims/${g}`
-  const text = await host.read(`${dir}/owner`).catch(() => undefined)
+  const text = await readOrAbsent(host, `${dir}/owner`)
+  if (text === UNKNOWN) return undefined
   const born = await statOrAbsent(host, dir)
   const createdMs = born && born !== 'unknown' ? born.mtimeMs : undefined
   const complete = !!text && text.endsWith('\n') && text.trim().length > 0
-  return { gen: g, session: complete ? text!.trim() : undefined, complete, createdMs }
+  return { gen: g, session: complete ? text.trim() : undefined, complete, createdMs }
 }
 
 const CLAIM_CLOSED = ['done', 'expired', 'cancel'] as const
@@ -353,14 +368,24 @@ export async function recoverEpisodes(host: Host, workerDir: string): Promise<st
   const changed: string[] = []
   for (const seq of seqs) {
     const dir = `${workerDir}/episodes/${seq}`
-    if (await hasMark(host, dir, 'aborted').catch(() => false)) continue
+    const aborted = await hasMark(host, dir, 'aborted').catch((error: unknown) => {
+      host.log(`tmux-agent: could not check ${dir}/aborted: ${String(error)}`)
+      return undefined
+    })
+    if (aborted === undefined) return undefined
+    if (aborted) continue
     const d = await readDescriptor(host, dir)
     if (d === 'unknown') return undefined
     if (!d) {
       if ((await mark(host, dir, 'aborted')) === 'won') changed.push(`${seq}: aborted`)
       continue
     }
-    if (!(await hasMark(host, dir, 'sent').catch(() => true))) {
+    const sent = await hasMark(host, dir, 'sent').catch((error: unknown) => {
+      host.log(`tmux-agent: could not check ${dir}/sent: ${String(error)}`)
+      return undefined
+    })
+    if (sent === undefined) return undefined
+    if (!sent) {
       await mark(host, dir, 'uncertain')
       if ((await mark(host, dir, 'sent')) === 'won') changed.push(`${seq}: uncertain`)
     }

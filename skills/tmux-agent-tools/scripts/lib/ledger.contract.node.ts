@@ -10,6 +10,7 @@ import {
   ack, acquireLock, allocateNext, claim, currentOwner, hasMark, mark, openEpisode, ORPHAN_MS, publishWorker, readDescriptor, readWorker, recoverEpisodes,
   registerActivation, releaseLock, sessionKey, sessionLiveness, superseded, type Descriptor,
 } from './ledger.ts'
+import type { Host } from './workers.ts'
 import { nodeHost } from './host.node.ts'
 
 const RACE = new URL('./ledger.race.node.ts', import.meta.url).pathname
@@ -206,4 +207,68 @@ test('liveness: a registration dir that cannot be listed (EACCES) is unknown, ne
   } finally {
     chmodSync(join(s, 'act'), 0o755)
   }
+})
+
+test('finding M5: claim returns unknown and does not open gen 2 when owner read errors (EACCES)', async () => {
+  const root = fresh()
+  const ep = join(root, 'w', 'episodes', '1')
+  mkdirSync(join(ep, 'claims', '1'), { recursive: true })
+  writeFileSync(join(ep, 'claims', '1', 'owner'), 'previous\n')
+  const now = Date.now()
+  const old = (now - ORPHAN_MS - 5_000) / 1000
+  utimesSync(join(ep, 'claims', '1'), old, old)
+
+  const unreadableHost: Host = {
+    ...host('x'),
+    read: async (path: string) => {
+      if (path.endsWith('/claims/1/owner')) {
+        const err = new Error('EACCES: permission denied')
+        ;(err as any).code = 'EACCES'
+        throw err
+      }
+      return host('x').read(path)
+    },
+  }
+
+  const out = await claim(unreadableHost, root, ep, 'gone', 'x', now)
+  assert.equal(out, 'unknown')
+  assert.equal(existsSync(join(ep, 'claims', '2')), false, 'must not open gen 2 on read error')
+})
+
+test('finding N4: recoverEpisodes returns undefined when checking sent mark throws (EACCES)', async () => {
+  const w = fresh()
+  const h = host()
+  await openEpisode(h, w, 't', desc) // 1: descriptor, never sent
+  const errorHost: Host = {
+    ...h,
+    exists: async (path: string) => {
+      if (path.endsWith('/sent')) {
+        const err = new Error('EACCES: permission denied')
+        ;(err as any).code = 'EACCES'
+        throw err
+      }
+      return h.exists(path)
+    },
+  }
+  const res = await recoverEpisodes(errorHost, w)
+  assert.equal(res, undefined, 'recovery must return undefined when mark check throws')
+})
+
+test('finding N4 / M6: recoverEpisodes returns undefined when checking aborted mark throws (EACCES)', async () => {
+  const w = fresh()
+  const h = host()
+  await openEpisode(h, w, 't', desc)
+  const errorHost: Host = {
+    ...h,
+    exists: async (path: string) => {
+      if (path.endsWith('/aborted')) {
+        const err = new Error('EACCES: permission denied')
+        ;(err as any).code = 'EACCES'
+        throw err
+      }
+      return h.exists(path)
+    },
+  }
+  const res = await recoverEpisodes(errorHost, w)
+  assert.equal(res, undefined, 'recovery must return undefined when aborted check throws')
 })
