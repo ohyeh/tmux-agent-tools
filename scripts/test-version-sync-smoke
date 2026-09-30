@@ -65,5 +65,17 @@ assert "hooks/register.ts MOD_VERSION matches the plugin manifest" \
   "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" hooks/register.ts)" \
   "$(jq -r '.version' .claude-plugin/plugin.json)"
 
+# Finding M4: release notes extraction pattern from release.yml must not swallow 0.10.x headings
+release_notes_test="$(CHANGELOG_VERSION="$changelog_version" ruby -e '
+  version = "v" + ENV.fetch("CHANGELOG_VERSION")
+  changelog = File.read("CHANGELOG.md")
+  pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## |\z)/m
+  match = changelog.match(pattern)
+  abort("missing section") unless match
+  body = match[:body].strip
+  puts body.include?("## 0.10.5") ? "contains_old" : "clean"
+')"
+assert "release.yml release notes pattern does not leak old 0.10.x sections" "$release_notes_test" "clean"
+
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

@@ -135,7 +135,7 @@ jobs:
           ruby -e '
             version = ENV.fetch("VERSION")
             changelog = File.read("CHANGELOG.md")
-            pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## v|\z)/m
+            pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## |\z)/m
             match = changelog.match(pattern)
             abort("CHANGELOG.md is missing a #{version} section") unless match
             body = match[:body].strip
@@ -185,7 +185,7 @@ jobs:
           ruby -e '
             version = ENV.fetch("VERSION")
             changelog = File.read("CHANGELOG.md")
-            pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## v|\z)/m
+            pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## |\z)/m
             match = changelog.match(pattern)
             abort("CHANGELOG.md is missing a #{version} section") unless match
             body = match[:body].strip
