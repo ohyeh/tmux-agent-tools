@@ -27,8 +27,10 @@ const {
   CLOSED_ACKS,
   POLL_MS,
   REQUIRED_RESULT_LINE,
+  TERMINAL,
   ackFinished,
   assignWorker,
+  episodeMatches,
   heartbeat,
   missingSections,
   newGate,
@@ -61,6 +63,7 @@ const gates = new Map();
 const beatTimers = new Map();
 let cachedSessionId = null;
 let deliveryCount = 0;
+const inFlightDeliveries = new Map();
 
 function gateFor(sessionId) {
   let gate = gates.get(sessionId);
@@ -382,9 +385,32 @@ async function closedAcks(host, episodeDir) {
 }
 
 async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body) {
+  if (inFlightDeliveries.has(episodeDir)) {
+    await inFlightDeliveries.get(episodeDir);
+    if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
+      return { status: "already_acked" };
+    }
+  }
+  let notifyDone;
+  const inFlight = new Promise((resolve) => {
+    notifyDone = resolve;
+  });
+  inFlightDeliveries.set(episodeDir, inFlight);
+  try {
+    return await doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body);
+  } finally {
+    inFlightDeliveries.delete(episodeDir);
+    notifyDone();
+  }
+}
+
+async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body) {
   // Closed ack first: never claim, and never hand the body out as a new completion.
   if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
     return { status: "already_acked" };
+  }
+  if (!TERMINAL.has(body.status) || !episodeMatches(body.episode, targetSeq)) {
+    return { status: "failed", reason: "invalid_result", detail: { body, targetSeq } };
   }
   const me = host.owner();
   const gate = me ? gateFor(me) : undefined;
@@ -422,7 +448,7 @@ async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, result
       resultPath,
     },
     path: resultPath,
-    status: body.status || "done",
+    status: body.status,
     summary: body.summary || "",
     observation,
   };
@@ -444,13 +470,16 @@ async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, result
     host.log(`submit refused: ${answer.drop}`);
     return { status: "failed", reason: "delivery_refused", detail: answer.drop };
   }
-  const ackOk = await ackFinished(host, v3, ours[0]);
-  if (!ackOk) {
-    host.log(`ackFinished failed for ${rec.name}#${targetSeq}`);
-    return { status: "failed", reason: "ack_failed", detail: `${rec.name}#${targetSeq}` };
+  const ackResult = await ackFinished(host, v3, ours[0]);
+  if (ackResult === "won") {
+    deliveryCount += 1;
+    return { status: "completed", body };
   }
-  deliveryCount += 1;
-  return { status: "completed", body };
+  if (ackResult === "lost") {
+    return { status: "already_acked" };
+  }
+  host.log(`ackFinished failed for ${rec.name}#${targetSeq}`);
+  return { status: "failed", reason: "ack_failed", detail: `${rec.name}#${targetSeq}` };
 }
 
 async function waitTmuxAgent(agentId, timeoutSec = 600) {
@@ -510,7 +539,20 @@ async function waitTmuxAgent(agentId, timeoutSec = 600) {
               detail: { missing_fields: missingFields, body, path: resultPath }
             };
           }
-          return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body);
+          if (typeof body.status !== "string" || !body.status) {
+            return {
+              status: "failed",
+              reason: "invalid_result",
+              detail: { error: "status must be a non-empty string", body, path: resultPath }
+            };
+          }
+          if (!TERMINAL.has(body.status)) {
+            // Non-terminal status (e.g. "running"); wait until done or deadline
+          } else if (!episodeMatches(body.episode, targetSeq)) {
+            // Episode does not match; wait until done or deadline
+          } else {
+            return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body);
+          }
         }
       }
     }

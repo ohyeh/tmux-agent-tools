@@ -30,6 +30,7 @@ import {
   sessionKey,
   sessionLiveness,
   superseded,
+  type Contest,
   type Holder,
   type WorkerRecord,
 } from './ledger.ts'
@@ -669,7 +670,7 @@ export function ackKindOf(f: Finished): string {
  * snapshot that closed the episode, so observing that file later is not news (§8).
  * `false` = the ack could not be written: the next tick re-reports (never a miss).
  */
-export async function ackFinished(host: Host, v3: string, f: Finished): Promise<boolean> {
+export async function ackFinished(host: Host, v3: string, f: Finished): Promise<Contest> {
   const ep = episodeDirOf(v3, f.d)
   // The closing snapshot's identity first: a `done` without it would make that same
   // snapshot a false unattributed notice once a later tell opens a new episode (§8).
@@ -677,9 +678,9 @@ export async function ackFinished(host: Host, v3: string, f: Finished): Promise<
   // A closing snapshot with no identity is re-reported, not closed: `done` without
   // it makes that same file a false unattributed notice once a later tell opens
   // a new episode (§8). Stat failure omits `observation`; that is this case.
-  if ((kind === 'done' || kind === 'expired') && !f.observation) return false
-  if (f.status !== UNATTRIBUTED && f.observation && (await ackDir(host, ep, f.observation)) === 'unknown') return false
-  return (await ackDir(host, ep, kind)) !== 'unknown'
+  if ((kind === 'done' || kind === 'expired') && !f.observation) return 'unknown'
+  if (f.status !== UNATTRIBUTED && f.observation && (await ackDir(host, ep, f.observation)) === 'unknown') return 'unknown'
+  return ackDir(host, ep, kind)
 }
 
 /** The worker's own free text is data, never instruction. Bounded and fenced. */
@@ -2009,7 +2010,8 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
   // notice names (§5), never re-read after the await. A failed ack re-reports.
   for (const f of [...silent, ...included]) {
     gate.deliveredAt.set(idOf(f.d), await host.now())
-    if (!(await ackFinished(host, v3, f))) host.log(`tmux-agent: could not ack ${idOf(f.d)} (${ackKindOf(f)}); it will be reported again`)
+    const res = await ackFinished(host, v3, f)
+    if (res === 'unknown') host.log(`tmux-agent: could not ack ${idOf(f.d)} (${ackKindOf(f)}); it will be reported again`)
   }
 }
 

@@ -133,6 +133,7 @@ async function runChild(kind, args) {
       summary: "once",
       artifacts: [],
       errors: [],
+      episode: 1,
     }));
     const waited = await waitTmuxAgent(spawned.agent_id, 1);
     process.stdout.write(JSON.stringify({ agent_id: spawned.agent_id, waited }));
@@ -200,6 +201,106 @@ async function testPersistFailureIsToolError() {
   assert.equal(out.code, "EEXIST");
   assert.equal(out.owner, null);
   assert.doesNotMatch(JSON.stringify(out), /ephemeral/);
+}
+
+async function testOverlappingWaitInSameProcessDeliversOnce() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-overlap-"));
+  process.env.TMUX_AGENT_DIR = dir;
+  process.env.FAKE_AGENT_TMUX_ROOT = dir;
+  const repo = path.resolve(__dirname, "..");
+
+  const spawned = await spawnTmuxAgent({
+    cli: "fake",
+    repoPath: repo,
+    task: "overlap test",
+    name: "adapter-overlap",
+  });
+
+  fs.writeFileSync(spawned.result_path, JSON.stringify({
+    schema_version: 1,
+    status: "success",
+    summary: "overlap-body",
+    artifacts: [],
+    errors: [],
+    episode: 1,
+  }));
+
+  const [w1, w2] = await Promise.all([
+    waitTmuxAgent(spawned.agent_id, 2),
+    waitTmuxAgent(spawned.agent_id, 2),
+  ]);
+
+  const completed = [w1, w2].filter((w) => w.status === "completed");
+  const alreadyAcked = [w1, w2].filter((w) => w.status === "already_acked");
+  assert.equal(completed.length, 1, "exactly one wait must return completed");
+  assert.equal(alreadyAcked.length, 1, "the other wait must return already_acked");
+  assert.equal(completed[0].body.summary, "overlap-body");
+  assert.equal(alreadyAcked[0].body, undefined, "already_acked must not deliver body");
+}
+
+async function testWaitTerminalAndEpisodeChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-terminal-"));
+  process.env.TMUX_AGENT_DIR = dir;
+  process.env.FAKE_AGENT_TMUX_ROOT = dir;
+  const repo = path.resolve(__dirname, "..");
+
+  // Case 1: non-terminal status ("running") does not deliver and does not ack
+  const sp1 = await spawnTmuxAgent({
+    cli: "fake",
+    repoPath: repo,
+    task: "running test",
+    name: "running-ag",
+  });
+  fs.writeFileSync(sp1.result_path, JSON.stringify({
+    schema_version: 1,
+    status: "running",
+    summary: "in-flight",
+    artifacts: [],
+    errors: [],
+    episode: 1,
+  }));
+  const w1 = await waitTmuxAgent(sp1.agent_id, 1);
+  assert.ok(w1.status === "timed_out" || w1.status === "failed", "non-terminal status must not complete");
+  assert.equal(fs.existsSync(path.join(dir, ".v3", sp1.agent_id, "episodes", "1", "acks", "done")), false);
+
+  // Case 2: episode mismatch (episode 2 for targetSeq 1) does not deliver and does not ack
+  const sp2 = await spawnTmuxAgent({
+    cli: "fake",
+    repoPath: repo,
+    task: "mismatch test",
+    name: "mismatch-ag",
+  });
+  fs.writeFileSync(sp2.result_path, JSON.stringify({
+    schema_version: 1,
+    status: "success",
+    summary: "wrong-seq",
+    artifacts: [],
+    errors: [],
+    episode: 2,
+  }));
+  const w2 = await waitTmuxAgent(sp2.agent_id, 1);
+  assert.ok(w2.status === "timed_out" || w2.status === "failed", "mismatched episode must not complete");
+  assert.equal(fs.existsSync(path.join(dir, ".v3", sp2.agent_id, "episodes", "1", "acks", "done")), false);
+
+  // Case 3: empty status ("") fails invalid_result and does not turn into "done"
+  const sp3 = await spawnTmuxAgent({
+    cli: "fake",
+    repoPath: repo,
+    task: "empty status test",
+    name: "empty-status-ag",
+  });
+  fs.writeFileSync(sp3.result_path, JSON.stringify({
+    schema_version: 1,
+    status: "",
+    summary: "empty-status",
+    artifacts: [],
+    errors: [],
+    episode: 1,
+  }));
+  const w3 = await waitTmuxAgent(sp3.agent_id, 1);
+  assert.equal(w3.status, "failed");
+  assert.equal(w3.reason, "invalid_result");
+  assert.equal(fs.existsSync(path.join(dir, ".v3", sp3.agent_id, "episodes", "1", "acks", "done")), false);
 }
 
 async function testConcurrentSessionId() {
@@ -328,7 +429,7 @@ async function main() {
 
   // 6. read_tmux_agent
   const read = await readTmuxAgent(spawned.agent_id);
-  assert.equal(read.status, "done");
+  assert.equal(read.status, "success");
 
   // 7. incomplete result handling
   const incomplete = await spawnTmuxAgent({
@@ -484,6 +585,8 @@ async function main() {
 
   delete process.env.TMUX_AGENT_SESSION;
   await testSharedSessionDeliversOnce();
+  await testOverlappingWaitInSameProcessDeliversOnce();
+  await testWaitTerminalAndEpisodeChecks();
   await testClosedEpisodeNotClaimedByOtherOwner();
   await testPersistFailureIsToolError();
   await testConcurrentSessionId();
