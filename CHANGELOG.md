@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `assign`: a CLI not up by `AGENT_TMUX_START_READY_TIMEOUT` (default 45s) is no longer judged failed. The brief stays unsent, the worker is left running, and the diagnostic names the `send --from-file` command that sends it by hand, so the agent decides from the pane (a self-update or slow sign-in can outlast any fixed window; cursor-agent did on 2026-09-30). A CLI that exits during boot fails at once as an exit. `scripts/test-assign-dialog-smoke` covers both.
+
 ## v0.42.0 - 2026-09-30
 
 - mkdir send-lock fallback: a lock dir that disappears during the no-pid wait is the holder releasing the lock. The waiter retries `mkdir` until the existing timeout. Exit 75 stays only when the agent directory is not writable, and a dead holder pid is still reclaimed. `scripts/test-send-lock-smoke` covers that vanish.

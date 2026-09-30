@@ -4349,10 +4349,26 @@ assign_session() {
     [[ "${pane:l}" == *"trust this folder"* || "${pane:l}" == *"trust the contents of this project"* || "${pane:l}" == *"trust the files in this folder"* ]] || return 1
     printf '%s\n' "$pane" | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = tolower($0) } END { exit !(last ~ /^[[:space:]]*(→|›|❯|>)[[:space:]]+([0-9]+[.)][[:space:]]+)?(yes|trust)/) }'
   }
+  # A CLI that is not up yet is not a failed one: it may be updating, signing
+  # in, or just slow (cursor-agent took over 45s after a self-update, live
+  # 2026-09-30), and no fixed window tells those apart. So the window only
+  # hands the call to the agent: the brief stays unsent, the worker stays up,
+  # and the notice says how to look and how to send it by hand. A CLI that
+  # EXITED is the one case decided here, at once, and named as an exit.
+  # The named send carries this dispatch's --result-path/--episode: without
+  # them the worker is told the default path and no episode, and the
+  # collector can never attribute what it writes.
+  _assign_not_up() {
+    local route="${RESULT_PATH_OVERRIDE:+ --result-path $RESULT_PATH_OVERRIDE}${RESULT_EPISODE:+ --episode $RESULT_EPISODE}"
+    _assign_fail send "CLI not up after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s ($1) — the brief was NOT sent and the worker is left running. It may be updating, signing in or just slow: peek it, then when its UI is up send the brief yourself (agent-tmux $CLI send$route --from-file $prompt $name), or stop it" "$name"
+  }
   local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10 _trusted=0
   local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle _saw_startup=0
   while :; do
     rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
+    if [[ "$(printf '%s' "$rj" | "$JQ" -r 'if .exit_detected == true or .exists == false then "gone" else empty end' 2>/dev/null || true)" == gone ]]; then
+      _assign_fail send "CLI exited before it was up (exit $(printf '%s' "$rj" | "$JQ" -r '.exit_code // "unknown"' 2>/dev/null)) — the brief was NOT sent" "$name"
+    fi
     rreason="$(printf '%s' "$rj" | "$JQ" -r '.blocked_reason // empty' 2>/dev/null || true)"
     case "$rreason" in
       update_prompt)
@@ -4372,13 +4388,11 @@ assign_session() {
         _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
         _saw_startup=1
-        (( SECONDS >= ready_deadline )) && _assign_fail send \
-          "CLI still starting after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s (startup_pending) — refusing to paste into a swallowing UI" "$name"
+        (( SECONDS >= ready_deadline )) && _assign_not_up "startup_pending: still on its startup screen"
         sleep 2 ;;
       *)
         if ! _assign_cli_drew "$name"; then
-          (( SECONDS >= ready_deadline )) && _assign_fail send \
-            "CLI drew nothing after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s — refusing to paste into a UI that is not up" "$name"
+          (( SECONDS >= ready_deadline )) && _assign_not_up "nothing drawn below the launcher header"
           _saw_startup=1
           sleep 1; continue
         fi
