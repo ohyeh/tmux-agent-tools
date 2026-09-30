@@ -141,9 +141,9 @@ env HOME="$scratch/home" agent --plugin-dir "$REPO" -p 'Reply with the single wo
 
 A published tag install (`npx --yes skills@1.7.0 add ohyeh/tmux-agent-tools --skill tmux-agent-tools` at a tag, or `codex plugin marketplace add ohyeh/tmux-agent-tools --ref <tag>`) waits until the operator publishes. UNVERIFIED until that tag exists.
 
-### Ran from this worktree (candidate = this checkout, not a tag)
+### Sample run from 0.41.0 worktree p8 (historical 2026-09-29 sample, not this checkout)
 
-`REPO=/Users/paul.yeh/git/tmux-agent-tools.wt/p8`, scratch HOME `/tmp/wc-p8-install.QpkldD/home`, cwd `/tmp/wc-p8-install.QpkldD/elsewhere`.
+`REPO=/Users/paul.yeh/git/tmux-agent-tools.wt/p8` (historical sample), scratch HOME `/tmp/wc-p8-install.QpkldD/home`, cwd `/tmp/wc-p8-install.QpkldD/elsewhere`.
 
 `npx --yes skills@1.7.0 add` exit 0. The registry warned, then installed:
 
