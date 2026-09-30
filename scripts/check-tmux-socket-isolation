@@ -98,17 +98,74 @@ function findDef(lines, before, name) {
 function bodyOf(lines, def) {
   const indent = lines[def].match(/^ */)?.[0].length ?? 0
   const chunk = [lines[def]]
-  for (let i = def + 1; i < Math.min(lines.length, def + 30); i++) {
+  let braceDepth = 0
+  let sawBrace = false
+  for (let i = def; i < lines.length; i++) {
     const line = lines[i]
-    if (line.trim() === '') {
-      chunk.push(line)
-      continue
+    for (const ch of line) {
+      if (ch === '{') {
+        braceDepth++
+        sawBrace = true
+      } else if (ch === '}') {
+        braceDepth--
+      }
     }
-    const ind = line.match(/^ */)?.[0].length ?? 0
-    if (ind <= indent && /^(?:export\s+)?(?:async\s+)?(?:function\b|const\b|let\b|var\b|test\()/.test(line.trim())) break
-    chunk.push(line)
+    if (i > def) chunk.push(line)
+    if (sawBrace && braceDepth <= 0) break
+    if (i > def) {
+      const ind = line.match(/^ */)?.[0].length ?? 0
+      if (line.trim() !== '' && ind <= indent && /^(?:export\s+)?(?:async\s+)?(?:function\b|const\b|let\b|var\b|test\(|[A-Za-z_]\w*\(\)\s*\{)/.test(line.trim())) {
+        chunk.pop()
+        break
+      }
+    }
   }
   return chunk.join('\n')
+}
+
+function tsWrapperPasses(lines, def) {
+  const body = bodyOf(lines, def)
+  const execRe = /\b(?:execFile|execFileSync|spawn|exec)\s*\(\s*[^,]+,\s*([^,)\n]+)/g
+  let m
+  while ((m = execRe.exec(body))) {
+    const argvArg = m[1].trim()
+    if (passesSocket(argvArg)) return true
+    const idMatch = argvArg.match(/^[A-Za-z_]\w*$/)
+    if (idMatch) {
+      const varName = idMatch[0]
+      const varDefRe = new RegExp(`\\b(?:const|let|var)\\s+${varName}\\s*=([^;\\n]+(?:\\n[^;\\n]+)*);`, 'g')
+      const varDef = varDefRe.exec(body)
+      if (varDef && passesSocket(varDef[1])) return true
+    }
+  }
+  const runRe = /\b[A-Za-z_]\w*\s*\(\s*\[\s*(?:['"]tmux['"]|[A-Za-z_]\w*)\s*,\s*([^\]]+)\]/g
+  while ((m = runRe.exec(body))) {
+    if (passesSocket(m[1])) return true
+  }
+  const bodyLines = body.split('\n')
+  for (const line of bodyLines) {
+    if (/(?:tmux|TMUX)/i.test(line) && passesSocket(line)) return true
+  }
+  return false
+}
+
+function shWrapperPasses(lines, def) {
+  const body = bodyOf(lines, def)
+  const bodyLines = body.split('\n')
+  for (const line of bodyLines) {
+    if (/(?:tmux|TMUX)/i.test(line) && passesSocket(line)) return true
+  }
+  for (const line of bodyLines) {
+    if (/(?:tmux|TMUX)/i.test(line)) {
+      const vars = [...line.matchAll(/\$([A-Za-z_]\w*)|\$\{([A-Za-z_]\w*)/g)].map(m => m[1] || m[2])
+      for (const v of vars) {
+        const varDefRe = new RegExp(`^\\s*${v}=([^\\n]+)`, 'm')
+        const mVar = body.match(varDefRe)
+        if (mVar && passesSocket(mVar[1])) return true
+      }
+    }
+  }
+  return false
 }
 
 function tsProblems(lines, i) {
@@ -123,7 +180,7 @@ function tsProblems(lines, i) {
       continue
     }
     const def = findDef(lines, i, name)
-    if (def < 0 || !passesSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
+    if (def < 0 || !tsWrapperPasses(lines, def)) problems.push(`wrapper ${name}() has no -S/-L`)
   }
   return problems
 }
@@ -140,7 +197,7 @@ function shProblems(lines, i) {
     const forced = /command\s|env\s/.test(m[0])
     if (forced || findDef(lines, i, 'tmux') < 0) {
       if (!passesSocket(code)) problems.push('tmux has no -S/-L')
-    } else if (!passesSocket(bodyOf(lines, findDef(lines, i, 'tmux')))) {
+    } else if (!shWrapperPasses(lines, findDef(lines, i, 'tmux'))) {
       problems.push('wrapper tmux() has no -S/-L')
     }
   }
@@ -150,7 +207,7 @@ function shProblems(lines, i) {
   const name = call[1]
   const def = findDef(lines, i, name)
   if (def < 0) return []
-  if (!passesSocket(bodyOf(lines, def))) problems.push(`wrapper ${name}() has no -S/-L`)
+  if (!shWrapperPasses(lines, def)) problems.push(`wrapper ${name}() has no -S/-L`)
   return problems
 }
 
