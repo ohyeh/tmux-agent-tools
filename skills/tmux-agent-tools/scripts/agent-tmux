@@ -1848,11 +1848,46 @@ send_lock_around() {
 
   # mkdir fallback with PID-stamped stale-holder recovery.
   zmodload zsh/datetime 2>/dev/null || true
+  zmodload zsh/system 2>/dev/null || true
   local lock_dir="$lock_file.d"
   local now_epoch end
   now_epoch="${EPOCHSECONDS:-$(date +%s)}"
   end=$(( now_epoch + timeout_seconds ))
-  while ! mkdir "$lock_dir" 2>/dev/null; do
+  local my_pid="${sysparams[pid]:-$$}"
+  local token="$my_pid.$RANDOM.${EPOCHSECONDS:-0}"
+  local tmp_lock="$lock_dir.tmp.$token"
+  local acquired=0
+  while (( ! acquired )); do
+    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
+    if (( now_epoch >= end )); then
+      local holder_pid=""
+      [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+      echo "lock contended on $agent_name after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
+      rm -rf "$tmp_lock" 2>/dev/null || true
+      return 75
+    fi
+    if [[ ! -w "$subdir" ]]; then
+      echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
+      return 75
+    fi
+
+    # Atomic create: prepare lock dir with PID and token inside before making it visible as lock_dir.
+    rm -rf "$tmp_lock" 2>/dev/null || true
+    if mkdir "$tmp_lock" 2>/dev/null; then
+      printf '%s\n' "$my_pid" > "$tmp_lock/pid"
+      printf '%s\n' "$token" > "$tmp_lock/token"
+      if mv "$tmp_lock" "$lock_dir" 2>/dev/null; then
+        if [[ -f "$lock_dir/token" ]] && [[ "$(cat "$lock_dir/token" 2>/dev/null || true)" == "$token" ]]; then
+          acquired=1
+          break
+        else
+          # lock_dir already existed, so tmp_lock moved inside it.
+          rm -rf "$lock_dir/${tmp_lock:t}" 2>/dev/null || true
+        fi
+      fi
+    fi
+    rm -rf "$tmp_lock" 2>/dev/null || true
+
     local holder_pid=""
     [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
     if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
@@ -1861,29 +1896,11 @@ send_lock_around() {
       rm -rf "$lock_dir" 2>/dev/null || true
       continue
     fi
-    if [[ -z "$holder_pid" ]]; then
-      sleep 0.2
-      if [[ ! -f "$lock_dir/pid" ]]; then
-        # The dir can vanish during this wait: the holder finished and
-        # removed it. That is a release, so retry mkdir until $end.
-        # Only an unwritable $subdir can never succeed.
-        if [[ ! -w "$subdir" ]]; then
-          echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
-          return 75
-        fi
-        if [[ -d "$lock_dir" ]]; then
-          rm -rf "$lock_dir" 2>/dev/null || true
-        fi
-      fi
-    fi
-    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
-    if (( now_epoch >= end )); then
-      echo "lock contended on $agent_name after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
-      return 75
-    fi
+    # If lock_dir exists (whether with pid of a live holder, or momentarily without pid),
+    # wait until released or timeout. Never rm -rf a dir whose pid is just not written yet!
     sleep 0.1
   done
-  printf '%s\n' "$$" > "$lock_dir/pid"
+  rm -rf "$tmp_lock" 2>/dev/null || true
   # Subshell-scoped trap: do NOT use a process-wide trap here, it would
   # overwrite the caller's trap. rm -rf because the pid file lives inside
   # the lock dir; rmdir alone would fail and leak the lock.

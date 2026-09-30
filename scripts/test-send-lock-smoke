@@ -167,12 +167,47 @@ set -e
 [[ "$rc" -eq 7 ]] || { echo "expected rc=7 got $rc" >&2; exit 1; }
 BODY
 
+cat > "$WORK/case-delayed-pid.zsh" <<'BODY'
+# Holder creates lock dir and delays writing pid (>0.2s). Waiter must wait
+# and NOT steal the lock or rm -rf the lock dir during the delay.
+name=delayed-pid
+mkdir -p "$TMUX_AGENT_DIR/$name"
+lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
+mkdir "$lock_dir"
+out="$TMUX_AGENT_DIR/delayed-out"
+holder_err="$TMUX_AGENT_DIR/holder.err"
+command() {
+  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+(
+  sleep 0.35
+  if ! echo "$$" > "$lock_dir/pid" 2>"$holder_err"; then
+    exit 1
+  fi
+  sleep 0.35
+  rm -rf "$lock_dir"
+) &
+holder_pid=$!
+
+sleep 0.05
+send_lock_around "$name" 2 sh -c "echo acquired > '$out'"
+wait "$holder_pid" || { echo "holder failed: lock dir was stolen or deleted" >&2; exit 1; }
+[[ "$(cat "$out")" == acquired ]] || { echo "sentinel mismatch" >&2; exit 1; }
+if [[ -d "$lock_dir" ]]; then
+  echo "lock dir not cleaned up" >&2; exit 1
+fi
+BODY
+
 for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   tool="$(basename "$wrapper")"
   run_case "$wrapper" "$tool-basic"        "$WORK/case-basic.zsh"
   run_case "$wrapper" "$tool-concurrent"   "$WORK/case-concurrent.zsh"
   run_case "$wrapper" "$tool-stale-pid"    "$WORK/case-stale-pid.zsh"
   run_case "$wrapper" "$tool-vanished-dir" "$WORK/case-vanished-dir.zsh"
+  run_case "$wrapper" "$tool-delayed-pid"  "$WORK/case-delayed-pid.zsh"
   run_case "$wrapper" "$tool-missing-dir"  "$WORK/case-missing-dir.zsh"
   run_case "$wrapper" "$tool-rc"           "$WORK/case-rc.zsh"
 done
