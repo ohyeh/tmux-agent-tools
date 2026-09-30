@@ -1075,8 +1075,14 @@ export const LAUNCH_TAIL_LINES = 5
  * its own exit code here, and a non-zero one is news the session must hear: that
  * worker will never write a result, and waiting for it is waiting forever.
  */
-export async function launchFailure(host: Host, dir: string, since: number): Promise<Finished['summary'] | undefined> {
-  const text = (await readOrEmpty(host, `${dir}/launch.exit`)).trim()
+export async function launchFailure(host: Host, dir: string, since: number): Promise<Finished['summary'] | typeof UNKNOWN | undefined> {
+  const got = await readOrAbsent(host, `${dir}/launch.exit`)
+  if (got === UNKNOWN) {
+    host.log(`tmux-agent: could not read launch.exit for ${dir}`)
+    return UNKNOWN
+  }
+  if (!got) return undefined
+  const text = got.trim()
   if (!text) return undefined
   // The receipt belongs to the launch, not to the worker: a `tell` opens a new
   // episode (since strictly later) on a pane that is provably alive, so a receipt
@@ -1169,6 +1175,7 @@ export async function collect(
       if (!terminal) {
         // Only the assign's first prompt has a launch receipt; a tell went to a live pane.
         const failure = d.origin === 'launch' ? await launchFailure(host, dir, d.since) : undefined
+        if (failure === UNKNOWN) continue
         if (failure) {
           if (!reported.has(launchIdOf(d))) out.push({ d, path: `${dir}/mod-assign.log`, status: LAUNCH_FAILED, summary: failure })
           // After the notice the worker is watched like any other: a pane that is
@@ -1757,7 +1764,8 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       }
       // Same order as `collect`: a real result outranks the launch receipt, and
       // without one a launch that never took must not read as `running`.
-      failed = !done && d.origin === 'launch' && (await launchFailure(host, dir, d.since).catch(() => undefined)) !== undefined
+      const lf = !done && d.origin === 'launch' ? await launchFailure(host, dir, d.since).catch(() => undefined) : undefined
+      failed = !!lf && lf !== UNKNOWN
     }
     const holder = await holderOf(host, v3, d, now, beats)
     rows.push({

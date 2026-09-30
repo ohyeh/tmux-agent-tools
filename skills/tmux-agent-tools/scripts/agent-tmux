@@ -1891,9 +1891,25 @@ send_lock_around() {
     local holder_pid=""
     [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
     if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
-      # Holder died without releasing — reclaim. rm -rf because the pid
-      # file lives inside the lock dir; rmdir alone would fail.
-      rm -rf "$lock_dir" 2>/dev/null || true
+      # If the pid changed while we checked, someone else already reclaimed it.
+      if [[ "$(cat "$lock_dir/pid" 2>/dev/null || true)" != "$holder_pid" ]]; then
+        continue
+      fi
+      # Holder died without releasing — reclaim. Atomically move send.lock.d
+      # to a unique reclaim name so competing waiters do not both rm -rf
+      # a live lock path.
+      local reclaim_dir="$lock_dir.reclaim.$token.$RANDOM"
+      if mv "$lock_dir" "$reclaim_dir" 2>/dev/null; then
+        local moved_pid=""
+        [[ -f "$reclaim_dir/pid" ]] && moved_pid="$(cat "$reclaim_dir/pid" 2>/dev/null || true)"
+        if [[ -n "$moved_pid" && "$moved_pid" == "$holder_pid" ]]; then
+          rm -rf "$reclaim_dir" 2>/dev/null || true
+        elif [[ ! -e "$lock_dir" ]]; then
+          mv "$reclaim_dir" "$lock_dir" 2>/dev/null || true
+        fi
+        continue
+      fi
+      # mv failure = someone else won the reclaim or lock changed; do not delete.
       continue
     fi
     # If lock_dir exists (whether with pid of a live holder, or momentarily without pid),

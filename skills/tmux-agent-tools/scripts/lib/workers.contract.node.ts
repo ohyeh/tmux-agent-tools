@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, flagStalls, heartbeat, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
 
@@ -1155,4 +1155,35 @@ test('finding N5: read error on launch.exit logs error and does not mark worker 
   await flagStalls(host, gate, w.v3, [d], [d], true)
   assert.ok(gate.exited.has(id), 'pre-existing exited state must not be cleared on read failure')
   assert.ok(w.logs.some(l => l.includes('could not read launch.exit')), 'must log read failure')
+})
+
+test('finding R2: launchFailure uses readOrAbsent, UNKNOWN does not count as no receipt nor exit 0', async () => {
+  const w = world()
+  await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const dir = `${w.v3}/${d.name}`
+  const denied = Object.assign(new Error('EACCES launch.exit denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    exists: async (path: string) => {
+      if (path.endsWith('/launch.exit')) return true
+      return w.host.exists(path)
+    },
+    read: async (path: string) => {
+      if (path.endsWith('/launch.exit')) throw denied
+      return w.host.read(path)
+    },
+  }
+
+  // 1. launchFailure directly returns UNKNOWN and logs
+  const res = await launchFailure(host, dir, d.since)
+  assert.equal(res, UNKNOWN, 'launchFailure must return UNKNOWN on read failure')
+  assert.ok(w.logs.some(l => l.includes('could not read launch.exit')), 'must log read failure')
+
+  // 2. collect with UNKNOWN launchFailure: session marked exited, but launch receipt is UNKNOWN.
+  // Must NOT treat as "no receipt" / exit 0 and deliver EXITED or LAUNCH_FAILED.
+  const id = `${d.name}#${d.seq}`
+  const exited = new Set([id])
+  const result = await collect(host, w.v3, [d], exited)
+  assert.equal(result.finished.length, 0, 'must not deliver finished (neither EXITED nor LAUNCH_FAILED) when launch.exit is UNKNOWN')
 })

@@ -67,5 +67,22 @@ out="$("$GUARD" "$tmp_t1" 2>&1)" || code=$?
 rm -f "$tmp_t1"
 assert "wrapper body > 30 lines with real -S passes (T1)" "$code" 0
 
+# 4. Finding R3: Line-level short-circuit with tmux and ['-S'] on same line must fail
+tmp_r3="$(mktemp "${TMPDIR:-/tmp}/r3_line_decoy.XXXXXX.contract.node.ts")"
+cat <<EOF > "$tmp_r3"
+function badWrapperR3(args) {
+  const note = "tmux ['-S']"
+  return execFile("tmux", args)
+}
+async function main() {
+  badWrapperR3(["$(b_srv)"])
+}
+EOF
+
+code=0
+out="$("$GUARD" "$tmp_r3" 2>&1)" || code=$?
+rm -f "$tmp_r3"
+assert "line-level short-circuit decoy is rejected (R3)" "$code" 1
+
 echo "socket-isolation smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

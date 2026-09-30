@@ -142,10 +142,6 @@ function tsWrapperPasses(lines, def) {
   while ((m = runRe.exec(body))) {
     if (passesSocket(m[1])) return true
   }
-  const bodyLines = body.split('\n')
-  for (const line of bodyLines) {
-    if (/(?:tmux|TMUX)/i.test(line) && passesSocket(line)) return true
-  }
   return false
 }
 

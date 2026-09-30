@@ -201,15 +201,101 @@ if [[ -d "$lock_dir" ]]; then
 fi
 BODY
 
+cat > "$WORK/case-reclaim-toctou.zsh" <<'BODY'
+# Finding R1: stale send-lock reclaim TOCTOU.
+# Two waiters discover the same dead holder PID. Waiter A pauses after
+# confirming dead PID. Waiter B reclaims, acquires the lock, and enters
+# critical section. Waiter A must NOT rm -rf Waiter B's live lock dir or
+# enter the critical section concurrently.
+name=reclaim-toctou
+mkdir -p "$TMUX_AGENT_DIR/$name"
+lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
+mkdir "$lock_dir"
+dead_pid=2147483646
+echo "$dead_pid" > "$lock_dir/pid"
+
+concurrency_log="$TMUX_AGENT_DIR/concurrency.log"
+violation_log="$TMUX_AGENT_DIR/violation.log"
+: > "$concurrency_log"
+: > "$violation_log"
+
+command() {
+  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+
+kill() {
+  if [[ "$1" == "-0" && "$2" == "$dead_pid" && "${IS_WAITER_A:-0}" == "1" ]]; then
+    touch "$TMUX_AGENT_DIR/a_checked_dead"
+    local count=0
+    while [[ ! -f "$TMUX_AGENT_DIR/b_in_critical" ]]; do
+      command sleep 0.01
+      count=$(( count + 1 ))
+      if (( count > 300 )); then
+        echo "timeout waiting for b_in_critical" >&2
+        return 1
+      fi
+    done
+    unset IS_WAITER_A
+    return 1
+  fi
+  builtin kill "$@"
+}
+
+(
+  while [[ ! -f "$TMUX_AGENT_DIR/a_checked_dead" ]]; do
+    command sleep 0.01
+  done
+  send_lock_around "$name" 5 zsh -c '
+    touch "$TMUX_AGENT_DIR/b_in_critical"
+    echo "B-start" >> "'"$concurrency_log"'"
+    for i in {1..20}; do
+      command sleep 0.02
+      if [[ ! -d "'"$lock_dir"'" ]]; then
+        echo "VIOLATION: lock_dir was deleted while B held it" >> "'"$violation_log"'"
+        break
+      fi
+      if grep -q "A-start" "'"$concurrency_log"'" 2>/dev/null; then
+        echo "VIOLATION: A entered critical section while B held lock" >> "'"$violation_log"'"
+        break
+      fi
+    done
+    echo "B-end" >> "'"$concurrency_log"'"
+  '
+) &
+b_job=$!
+
+IS_WAITER_A=1
+send_lock_around "$name" 5 zsh -c '
+  echo "A-start" >> "'"$concurrency_log"'"
+  command sleep 0.05
+  echo "A-end" >> "'"$concurrency_log"'"
+'
+
+wait "$b_job"
+
+if [[ -s "$violation_log" ]]; then
+  cat "$violation_log" >&2
+  exit 1
+fi
+if [[ -d "$lock_dir" ]]; then
+  echo "lock dir not cleaned up after both waiters finished" >&2
+  exit 1
+fi
+BODY
+
 for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   tool="$(basename "$wrapper")"
-  run_case "$wrapper" "$tool-basic"        "$WORK/case-basic.zsh"
-  run_case "$wrapper" "$tool-concurrent"   "$WORK/case-concurrent.zsh"
-  run_case "$wrapper" "$tool-stale-pid"    "$WORK/case-stale-pid.zsh"
-  run_case "$wrapper" "$tool-vanished-dir" "$WORK/case-vanished-dir.zsh"
-  run_case "$wrapper" "$tool-delayed-pid"  "$WORK/case-delayed-pid.zsh"
-  run_case "$wrapper" "$tool-missing-dir"  "$WORK/case-missing-dir.zsh"
-  run_case "$wrapper" "$tool-rc"           "$WORK/case-rc.zsh"
+  run_case "$wrapper" "$tool-basic"          "$WORK/case-basic.zsh"
+  run_case "$wrapper" "$tool-concurrent"     "$WORK/case-concurrent.zsh"
+  run_case "$wrapper" "$tool-stale-pid"      "$WORK/case-stale-pid.zsh"
+  run_case "$wrapper" "$tool-vanished-dir"   "$WORK/case-vanished-dir.zsh"
+  run_case "$wrapper" "$tool-delayed-pid"    "$WORK/case-delayed-pid.zsh"
+  run_case "$wrapper" "$tool-missing-dir"    "$WORK/case-missing-dir.zsh"
+  run_case "$wrapper" "$tool-rc"             "$WORK/case-rc.zsh"
+  run_case "$wrapper" "$tool-reclaim-toctou" "$WORK/case-reclaim-toctou.zsh"
 done
 
 echo "OK: send-lock smoke passed for agent-tmux claude and codex."
