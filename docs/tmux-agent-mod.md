@@ -516,7 +516,7 @@ band 連「一列加它的控制」都放不下時只畫標題列和一行指令
 
 - **面板畫的是「還有 pane 的隊友」，不只是「未回報」的。** `panelRows()` 吃
   `scan()` 全集：未回報的照舊（running／stalled／finished／exited／launch-failed／
-  needs-input），已投遞記帳的則標 `done — tell it more, or stop it`，只要它的 tmux
+  needs-input；`launch.exit` 讀不到時標 `unknown`，不猜 running 或 exited），已投遞記帳的則標 `done — tell it more, or stop it`，只要它的 tmux
   session 還活著就留在面板上（每個 tick 跑一次 `tmux ls -F '#S'`，用 `-<name>` 尾綴
   比對；session 名稱前綴是 profile 自己的，mod 不猜）。收工的隊友選中後印
   `success: <summary>`，同一列仍有輸入列與 `[stop]`。**列消失的條件是 pane 沒了**

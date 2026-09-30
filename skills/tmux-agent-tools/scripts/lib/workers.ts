@@ -105,6 +105,7 @@ export const STATE_COLOR: Record<PanelRow['state'], string> = {
   'needs-input': 'magenta',
   exited: 'red',
   'launch-failed': 'red',
+  unknown: 'yellow',
 }
 export const PEEK_MAX = 200
 /**
@@ -516,7 +517,7 @@ export type PanelRow = {
    * leaves finished results sitting there. Drawing those as `running` would tell the person to keep waiting for
    * work that is already done.
    */
-  state: 'running' | 'stalled' | 'finished' | 'delivered' | 'exited' | 'launch-failed' | 'needs-input'
+  state: 'running' | 'stalled' | 'finished' | 'delivered' | 'exited' | 'launch-failed' | 'needs-input' | 'unknown'
   /** The dialog the pane is stuck on, for a `needs-input` row. */
   blockedReason?: string
   idleSeconds?: number
@@ -1743,6 +1744,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
     // nothing and submits nothing. The panel reports state; it never delivers.
     let done = false
     let failed = false
+    let unreadable = false
     let summary: string | undefined
     // A finished worker's clock stops at its result: `done — 26:23` still
     // ticking read as work in progress (observed 2026-09-25).
@@ -1763,7 +1765,8 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       // Same order as `collect`: a real result outranks the launch receipt, and
       // without one a launch that never took must not read as `running`.
       const lf = !done && d.origin === 'launch' ? await launchFailure(host, dir, d.since).catch(() => undefined) : undefined
-      failed = !!lf && lf !== UNKNOWN
+      unreadable = lf === UNKNOWN
+      failed = !!lf && !unreadable
     }
     const holder = await holderOf(host, v3, d, now, beats)
     rows.push({
@@ -1779,9 +1782,11 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
             ? 'needs-input'
           : stall?.evidence
             ? 'stalled'
-            : gate.exited.has(id)
-              ? 'exited'
-              : 'running',
+            : unreadable
+              ? 'unknown'
+              : gate.exited.has(id)
+                ? 'exited'
+                : 'running',
       idleSeconds: stall?.idleSeconds,
       ageMs: Math.min(endedAt ?? now, now) - d.since,
       ...(holder ? { holder } : {}),
@@ -2212,9 +2217,11 @@ export function rowMark(r: PanelRow): string {
             ? 'exited — no result'
             : r.state === 'launch-failed'
               ? 'launch failed — see mod-assign.log'
-              : r.idleSeconds !== undefined
-                ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
-                : 'running'
+              : r.state === 'unknown'
+                ? 'unknown — launch receipt unreadable, see the log'
+                : r.idleSeconds !== undefined
+                  ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
+                  : 'running'
 }
 
 /** Dot or status glyph for a row */
@@ -2259,7 +2266,10 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
   if (!lock.ok) return { ok: false, text: busyText(d.name, lock.busy) }
   try {
     // A crashed earlier action is settled first (§8), never re-sent.
-    await recoverEpisodes(host, w)
+    // An unreadable earlier episode is unsettled: opening a new one would send on top of it.
+    if ((await recoverEpisodes(host, w)) === undefined) {
+      return { ok: false, text: `could not read the earlier episodes of "${d.name}" (see the log); nothing was sent` }
+    }
     const me = host.owner()
     if (!me) return { ok: false, text: 'this host has no session id; tell refuses to open an episode without an owner (§3)' }
     const since = Math.max(await host.now(), d.since + 1)

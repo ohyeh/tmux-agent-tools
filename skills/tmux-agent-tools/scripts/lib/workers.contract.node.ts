@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
 
@@ -1118,43 +1118,77 @@ test('finding M6: exists error on aborted mark marks scan incomplete and omits e
   assert.equal((s.episodes.get(r.name) ?? []).length, 0, 'no episodes parsed')
 })
 
-test('finding N5: read error on launch.exit logs error and does not mark worker exited or clear existing exited state', async () => {
+test('finding N5: read error on launch.exit neither marks a worker exited nor clears exited', async () => {
   const w = world()
   await assigned(w)
   const d = (await scan(w.host, { claim: false })).visible[0]!
-  const gate = newGate()
   const id = `${d.name}#${d.seq}`
-  gate.exited.add(id) // Pre-existing exited state
-
   const denied = Object.assign(new Error('EACCES launch.exit denied'), { code: 'EACCES' })
   const host: Host = {
     ...w.host,
-    exists: async (path: string) => {
-      if (path.endsWith('/launch.exit')) return true
-      return w.host.exists(path)
-    },
+    exists: async (path: string) => (path.endsWith('/launch.exit') ? true : w.host.exists(path)),
     read: async (path: string) => {
       if (path.endsWith('/launch.exit')) throw denied
       return w.host.read(path)
     },
-    run: async (argv, cwd, ms) => {
-      if (argv[0] === 'agent-tmux' && argv.includes('status')) {
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({
-            exists: false,
-            running: false,
-          }),
-          stderr: '',
-        }
-      }
-      return w.host.run(argv, cwd, ms)
+    run: async (argv, cwd, ms) =>
+      argv[0] === 'agent-tmux' && argv.includes('status')
+        ? { exitCode: 0, stdout: JSON.stringify({ exists: false, running: false }), stderr: '' }
+        : w.host.run(argv, cwd, ms),
+  }
+  for (const before of [false, true]) {
+    const gate = newGate()
+    if (before) gate.exited.add(id)
+    await flagStalls(host, gate, w.v3, [d], [d], true)
+    assert.equal(gate.exited.has(id), before, `exited must stay ${before} when launch.exit is unreadable`)
+  }
+  assert.equal(w.woken.length, 0, 'an unreadable receipt submits nothing')
+  assert.ok(w.logs.some(l => l.includes('could not read launch.exit')), 'must log read failure')
+})
+
+test('sol-review F3: panelRows shows an unreadable launch receipt as unknown, never running or exited', async () => {
+  const w = world()
+  await assigned(w)
+  const denied = Object.assign(new Error('EACCES launch.exit denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    exists: async (path: string) => (path.endsWith('/launch.exit') ? true : w.host.exists(path)),
+    read: async (path: string) => {
+      if (path.endsWith('/launch.exit')) throw denied
+      return w.host.read(path)
     },
   }
-
-  await flagStalls(host, gate, w.v3, [d], [d], true)
-  assert.ok(gate.exited.has(id), 'pre-existing exited state must not be cleared on read failure')
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  for (const exited of [false, true]) {
+    const gate = newGate()
+    if (exited) gate.exited.add(`${d.name}#${d.seq}`)
+    const rows = await panelRows(host, gate, w.root)
+    assert.deepEqual(rows.map(r => r.state), ['unknown'], `exited=${exited}`)
+    assert.match(rowMark(rows[0]!), /unknown/)
+  }
   assert.ok(w.logs.some(l => l.includes('could not read launch.exit')), 'must log read failure')
+})
+
+test('sol-review F2: tell stops when an earlier episode cannot be read — no episode, no send, lock released', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  const denied = Object.assign(new Error('EACCES sent denied'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    exists: async (path: string) => {
+      if (path.endsWith('/episodes/1/sent')) throw denied
+      return w.host.exists(path)
+    },
+  }
+  const sends = () => w.calls.filter(c => c.argv[0] === 'agent-tmux' && c.argv.includes('send'))
+  const out = await tellWorker(host, d, 'more')
+  assert.equal(out.ok, false, out.text)
+  assert.match(out.text, /nothing was sent/)
+  assert.equal(sends().length, 0, 'nothing is sent on top of an unsettled episode')
+  assert.ok(!existsSync(`${r.stateDir}/episodes/2`), 'no new episode')
+  assert.ok(!existsSync(`${r.stateDir}/.action`), 'the lock is released')
+  assert.ok(w.logs.some(l => l.includes('could not check') && l.includes('/episodes/1/sent')), 'recovery logs the read error')
 })
 
 test('finding R2: launchFailure uses readOrAbsent, UNKNOWN does not count as no receipt nor exit 0', async () => {
