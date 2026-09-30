@@ -1813,14 +1813,13 @@ setup_fresh_worktree() {
 # tmux pane.
 #
 # Lock file: $TMUX_AGENT_DIR/<name>/send.lock
-# Prefers flock(1) (Linux/coreutils). On macOS without flock, falls back to
-# mkdir-based locking with PID stamping for stale-holder recovery — design
-# in docs/design-issue-102-advisory-lock.md.
-#
-# The fallback recovers from `kill -9`, OOM, or reboot by probing the
-# holder PID with `kill -0`. The trap inside the subshell is intentionally
-# scoped to the subshell so it does NOT clobber the caller's process-wide
-# trap (partner review on the original sketch).
+# The lock is an OS advisory lock (fcntl via `zsystem flock`) on a file
+# descriptor that lives in a subshell for the whole critical section. The OS
+# releases it when that subshell exits for any reason, including `kill -9`,
+# OOM, or reboot, so there is no holder PID, no stale-lock recovery, and no
+# path that can remove a live holder's lock. The descriptor is close-on-exec,
+# so a process the critical section starts (for example a tmux server) does
+# not inherit the lock. The subshell also keeps the caller's traps untouched.
 
 SEND_LOCK_DEFAULT_TIMEOUT=30
 
@@ -1834,99 +1833,27 @@ send_lock_around() {
   subdir="$(ensure_agent_dir "$agent_name")"
   local lock_file="$subdir/send.lock"
 
-  if command -v flock >/dev/null 2>&1; then
-    : > "$lock_file" 2>/dev/null || true
-    (
-      flock -w "$timeout_seconds" -x 9 || {
-        echo "lock contended on $agent_name after ${timeout_seconds}s" >&2
-        exit 75
-      }
-      "$@"
-    ) 9>"$lock_file"
-    return $?
-  fi
-
-  # mkdir fallback with PID-stamped stale-holder recovery.
-  zmodload zsh/datetime 2>/dev/null || true
-  zmodload zsh/system 2>/dev/null || true
-  local lock_dir="$lock_file.d"
-  local now_epoch end
-  now_epoch="${EPOCHSECONDS:-$(date +%s)}"
-  end=$(( now_epoch + timeout_seconds ))
-  local my_pid="${sysparams[pid]:-$$}"
-  local token="$my_pid.$RANDOM.${EPOCHSECONDS:-0}"
-  local tmp_lock="$lock_dir.tmp.$token"
-  local acquired=0
-  while (( ! acquired )); do
-    now_epoch="${EPOCHSECONDS:-$(date +%s)}"
-    if (( now_epoch >= end )); then
-      local holder_pid=""
-      [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-      echo "lock contended on $agent_name after ${timeout_seconds}s (holder pid=$holder_pid)" >&2
-      rm -rf "$tmp_lock" 2>/dev/null || true
-      return 75
-    fi
-    if [[ ! -w "$subdir" ]]; then
-      echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
-      return 75
-    fi
-
-    # Atomic create: prepare lock dir with PID and token inside before making it visible as lock_dir.
-    rm -rf "$tmp_lock" 2>/dev/null || true
-    if mkdir "$tmp_lock" 2>/dev/null; then
-      printf '%s\n' "$my_pid" > "$tmp_lock/pid"
-      printf '%s\n' "$token" > "$tmp_lock/token"
-      if mv "$tmp_lock" "$lock_dir" 2>/dev/null; then
-        if [[ -f "$lock_dir/token" ]] && [[ "$(cat "$lock_dir/token" 2>/dev/null || true)" == "$token" ]]; then
-          acquired=1
-          break
-        else
-          # lock_dir already existed, so tmp_lock moved inside it.
-          rm -rf "$lock_dir/${tmp_lock:t}" 2>/dev/null || true
-        fi
-      fi
-    fi
-    rm -rf "$tmp_lock" 2>/dev/null || true
-
-    local holder_pid=""
-    [[ -f "$lock_dir/pid" ]] && holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-    if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
-      # If the pid changed while we checked, someone else already reclaimed it.
-      if [[ "$(cat "$lock_dir/pid" 2>/dev/null || true)" != "$holder_pid" ]]; then
-        continue
-      fi
-      # Holder died without releasing — reclaim. Atomically move send.lock.d
-      # to a unique reclaim name so competing waiters do not both rm -rf
-      # a live lock path.
-      local reclaim_dir="$lock_dir.reclaim.$token.$RANDOM"
-      if mv "$lock_dir" "$reclaim_dir" 2>/dev/null; then
-        local moved_pid=""
-        [[ -f "$reclaim_dir/pid" ]] && moved_pid="$(cat "$reclaim_dir/pid" 2>/dev/null || true)"
-        if [[ -n "$moved_pid" && "$moved_pid" == "$holder_pid" ]]; then
-          rm -rf "$reclaim_dir" 2>/dev/null || true
-        elif [[ ! -e "$lock_dir" ]]; then
-          mv "$reclaim_dir" "$lock_dir" 2>/dev/null || true
-        fi
-        continue
-      fi
-      # mv failure = someone else won the reclaim or lock changed; do not delete.
-      continue
-    fi
-    # If lock_dir exists (whether with pid of a live holder, or momentarily without pid),
-    # wait until released or timeout. Never rm -rf a dir whose pid is just not written yet!
-    sleep 0.1
-  done
-  rm -rf "$tmp_lock" 2>/dev/null || true
-  # Subshell-scoped trap: do NOT use a process-wide trap here, it would
-  # overwrite the caller's trap. rm -rf because the pid file lives inside
-  # the lock dir; rmdir alone would fail and leak the lock.
+  zmodload zsh/system 2>/dev/null || {
+    echo "lock unavailable on $agent_name: zsh/system module is missing" >&2
+    return 75
+  }
+  # zsystem flock needs an existing file; append, never truncate.
+  ( : >> "$lock_file" ) 2>/dev/null || {
+    echo "lock unavailable on $agent_name: cannot create send lock under $subdir" >&2
+    return 75
+  }
   (
-    trap "rm -rf '$lock_dir' 2>/dev/null || true" EXIT INT TERM
+    local lock_rc=0
+    zsystem flock -t "$timeout_seconds" -i 0.1 "$lock_file" || lock_rc=$?
+    if (( lock_rc == 2 )); then
+      echo "lock contended on $agent_name after ${timeout_seconds}s" >&2
+      exit 75
+    elif (( lock_rc != 0 )); then
+      echo "lock unavailable on $agent_name: cannot lock $lock_file" >&2
+      exit 75
+    fi
     "$@"
   )
-  local rc=$?
-  rm -rf "$lock_dir" 2>/dev/null || true
-  return $rc
 }
 
 send_blocked_guard() {

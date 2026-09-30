@@ -3,8 +3,8 @@
 #
 # Validates that `send_lock_around` in agent-tmux claude and codex:
 #   - serializes concurrent acquirers on the same agent name
-#   - recovers from a stale PID written into the lock dir
-#   - retries mkdir when the lock dir vanishes during the no-pid wait
+#   - refuses a second acquirer while a holder is alive (rc 75, no entry)
+#   - hands the lock to waiters one at a time after the holder is killed -9
 #   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
 #   - exits with the inner command's return code
 #
@@ -13,6 +13,10 @@
 # `exec agent-tmux <cli>`; sourcing that replaces the shell and the
 # source-only guard exits before the case body. The harness sources the
 # engine with that <cli> name instead.
+#
+# Cases wait on files, never on a sleep that has to win a race: a holder
+# blocks until the test creates its release file, and every wait loop has a
+# deadline that only bounds a failing run.
 #
 # Exits non-zero on the first failure.
 
@@ -44,6 +48,7 @@ run_case() {
   mkdir -p "$state_dir"
   TMUX_AGENT_DIR="$state_dir" \
     TMUX_AGENT_TOOLS_SOURCE_ONLY=1 \
+    WORK="$WORK" \
     ENGINE="$AGENT_TMUX" \
     CLI_NAME="$cli" \
     BODY="$body_file" \
@@ -61,9 +66,6 @@ cat > "$WORK/case-basic.zsh" <<'BODY'
 sentinel="$TMUX_AGENT_DIR/basic-out"
 send_lock_around basic 5 sh -c "echo ok > '$sentinel'"
 [[ "$(cat "$sentinel")" == ok ]] || { echo "sentinel mismatch" >&2; exit 1; }
-if [[ -d "$TMUX_AGENT_DIR/basic/send.lock.d" ]]; then
-  echo "lock dir not cleaned up after success" >&2; exit 1
-fi
 BODY
 
 cat > "$WORK/case-concurrent.zsh" <<'BODY'
@@ -86,72 +88,6 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 BODY
 
-cat > "$WORK/case-stale-pid.zsh" <<'BODY'
-zmodload zsh/datetime 2>/dev/null || true
-name=stale
-mkdir -p "$TMUX_AGENT_DIR/$name"
-lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
-mkdir "$lock_dir"
-# Pick a PID essentially guaranteed dead (above MAX_PID on Linux/macOS).
-dead_pid=2147483646
-echo "$dead_pid" > "$lock_dir/pid"
-# Force the mkdir fallback path by intercepting `command -v flock`.
-command() {
-  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
-    return 1
-  fi
-  builtin command "$@"
-}
-start="${EPOCHSECONDS:-$(date +%s)}"
-send_lock_around "$name" 5 true
-now="${EPOCHSECONDS:-$(date +%s)}"
-elapsed=$(( now - start ))
-if (( elapsed >= 3 )); then
-  echo "stale lock recovery too slow: ${elapsed}s" >&2; exit 1
-fi
-BODY
-
-cat > "$WORK/case-vanished-dir.zsh" <<'BODY'
-# Holder created the lock dir and has not stamped a pid. During the wait
-# the holder finishes and removes the dir. That is a release: retry mkdir.
-# Removing the dir inside sleep is the wait itself, so the case does not
-# depend on a timer.
-name=vanish
-mkdir -p "$TMUX_AGENT_DIR/$name"
-lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
-mkdir "$lock_dir"
-wait_hits=0
-command() {
-  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
-    return 1
-  fi
-  builtin command "$@"
-}
-sleep() {
-  if [[ -d "$lock_dir" && ! -f "$lock_dir/pid" ]]; then
-    wait_hits=$(( wait_hits + 1 ))
-    rm -rf "$lock_dir" 2>/dev/null || true
-  fi
-  return 0
-}
-sentinel="$TMUX_AGENT_DIR/vanish-out"
-set +e
-send_lock_around "$name" 5 sh -c "echo ok > '$sentinel'"
-rc=$?
-set -e
-if [[ "$rc" -eq 75 ]]; then
-  echo "vanished lock dir returned 75 (treated as cannot create)" >&2
-  exit 1
-fi
-[[ "$rc" -eq 0 ]] || { echo "expected rc=0 got $rc" >&2; exit 1; }
-[[ "$wait_hits" -ge 1 ]] || { echo "no-pid wait did not run" >&2; exit 1; }
-[[ "$(cat "$sentinel")" == ok ]] || { echo "sentinel mismatch" >&2; exit 1; }
-if [[ -d "$lock_dir" ]]; then
-  echo "lock dir not cleaned up after vanished-dir retry" >&2
-  exit 1
-fi
-BODY
-
 cat > "$WORK/case-missing-dir.zsh" <<'BODY'
 name=brand-new
 [[ ! -e "$TMUX_AGENT_DIR/$name" ]] || { echo "precondition: dir should not exist" >&2; exit 1; }
@@ -167,121 +103,107 @@ set -e
 [[ "$rc" -eq 7 ]] || { echo "expected rc=7 got $rc" >&2; exit 1; }
 BODY
 
-cat > "$WORK/case-delayed-pid.zsh" <<'BODY'
-# Holder creates lock dir and delays writing pid (>0.2s). Waiter must wait
-# and NOT steal the lock or rm -rf the lock dir during the delay.
-name=delayed-pid
-mkdir -p "$TMUX_AGENT_DIR/$name"
-lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
-mkdir "$lock_dir"
-out="$TMUX_AGENT_DIR/delayed-out"
-holder_err="$TMUX_AGENT_DIR/holder.err"
-command() {
-  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
-    return 1
-  fi
-  builtin command "$@"
-}
-(
-  sleep 0.35
-  if ! echo "$$" > "$lock_dir/pid" 2>"$holder_err"; then
-    exit 1
-  fi
-  sleep 0.35
-  rm -rf "$lock_dir"
-) &
-holder_pid=$!
-
-sleep 0.05
-send_lock_around "$name" 2 sh -c "echo acquired > '$out'"
-wait "$holder_pid" || { echo "holder failed: lock dir was stolen or deleted" >&2; exit 1; }
-[[ "$(cat "$out")" == acquired ]] || { echo "sentinel mismatch" >&2; exit 1; }
-if [[ -d "$lock_dir" ]]; then
-  echo "lock dir not cleaned up" >&2; exit 1
-fi
-BODY
-
-cat > "$WORK/case-reclaim-toctou.zsh" <<'BODY'
-# Finding R1: stale send-lock reclaim TOCTOU.
-# Two waiters discover the same dead holder PID. Waiter A pauses after
-# confirming dead PID. Waiter B reclaims, acquires the lock, and enters
-# critical section. Waiter A must NOT rm -rf Waiter B's live lock dir or
-# enter the critical section concurrently.
-name=reclaim-toctou
-mkdir -p "$TMUX_AGENT_DIR/$name"
-lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
-mkdir "$lock_dir"
-dead_pid=2147483646
-echo "$dead_pid" > "$lock_dir/pid"
-
-concurrency_log="$TMUX_AGENT_DIR/concurrency.log"
-violation_log="$TMUX_AGENT_DIR/violation.log"
-: > "$concurrency_log"
-: > "$violation_log"
-
-command() {
-  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
-    return 1
-  fi
-  builtin command "$@"
-}
-
-kill() {
-  if [[ "$1" == "-0" && "$2" == "$dead_pid" && "${IS_WAITER_A:-0}" == "1" ]]; then
-    touch "$TMUX_AGENT_DIR/a_checked_dead"
-    local count=0
-    while [[ ! -f "$TMUX_AGENT_DIR/b_in_critical" ]]; do
-      command sleep 0.01
-      count=$(( count + 1 ))
-      if (( count > 300 )); then
-        echo "timeout waiting for b_in_critical" >&2
-        return 1
-      fi
-    done
-    unset IS_WAITER_A
-    return 1
-  fi
-  builtin kill "$@"
-}
-
-(
-  while [[ ! -f "$TMUX_AGENT_DIR/a_checked_dead" ]]; do
+# Shared helper sourced by the cases below. wait_for_file only bounds a run
+# that is already failing; a passing run leaves the loop as soon as the file
+# exists.
+cat > "$WORK/helpers.zsh" <<'BODY'
+wait_for_file() {
+  local file="$1" i
+  for (( i = 0; i < 1000; i++ )); do
+    [[ -e "$file" ]] && return 0
     command sleep 0.01
   done
-  send_lock_around "$name" 5 zsh -c '
-    touch "$TMUX_AGENT_DIR/b_in_critical"
-    echo "B-start" >> "'"$concurrency_log"'"
-    for i in {1..20}; do
-      command sleep 0.02
-      if [[ ! -d "'"$lock_dir"'" ]]; then
-        echo "VIOLATION: lock_dir was deleted while B held it" >> "'"$violation_log"'"
+  echo "timeout waiting for $file" >&2
+  return 1
+}
+# Start a holder that owns the lock until $1/release exists. Records the pid
+# of the lock-holding subshell (the critical section's parent) in $1/holder.pid.
+# Callers install their own EXIT trap to touch release (a trap set inside a zsh
+# function ends with the function), so a failing case cannot leave it spinning.
+start_holder() {
+  local dir="$1" name="$2"
+  ( send_lock_around "$name" 10 zsh -c '
+      echo $PPID > "$1/holder.pid"
+      touch "$1/held"
+      while [[ ! -e "$1/release" ]]; do command sleep 0.01; done
+    ' _ "$dir" ) &
+  holder_job=$!
+  wait_for_file "$dir/held"
+}
+BODY
+
+cat > "$WORK/case-contended.zsh" <<'BODY'
+# A live holder keeps the lock until the test releases it. A second acquirer
+# must give up with rc 75 and never run its command; once the holder is
+# released a new acquirer gets the lock.
+source "$WORK/helpers.zsh"
+name=contended
+dir="$TMUX_AGENT_DIR/$name-case"
+mkdir -p "$dir"
+start_holder "$dir" "$name"
+trap 'touch "$dir/release"' EXIT
+
+entered="$dir/contender-entered"
+set +e
+send_lock_around "$name" 1 touch "$entered" 2>"$dir/contender.err"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] || { echo "expected rc=75 while held, got $rc" >&2; exit 1; }
+[[ ! -e "$entered" ]] || { echo "contender entered the critical section while the holder held the lock" >&2; exit 1; }
+grep -q "lock contended on $name" "$dir/contender.err" || { echo "missing contention message" >&2; cat "$dir/contender.err" >&2; exit 1; }
+
+touch "$dir/release"
+wait "$holder_job"
+send_lock_around "$name" 5 touch "$entered"
+[[ -e "$entered" ]] || { echo "lock not released after holder finished" >&2; exit 1; }
+BODY
+
+cat > "$WORK/case-killed-holder.zsh" <<'BODY'
+# The holder is killed with SIGKILL while two waiters are queued. The OS must
+# release the lock, and the waiters must then enter one at a time: each waiter
+# claims a mutex directory, marks itself, and waits for the peer's mark. Under
+# a correct lock the peer never enters, so the wait ends at its deadline with
+# no mark and the mutex claim holds.
+source "$WORK/helpers.zsh"
+name=killed
+dir="$TMUX_AGENT_DIR/$name-case"
+mkdir -p "$dir"
+start_holder "$dir" "$name"
+trap 'touch "$dir/release"' EXIT
+
+waiter() {
+  local me="$1" peer="$2"
+  send_lock_around "$name" 10 zsh -c '
+    dir="$1"; me="$2"; peer="$3"
+    mkdir "$dir/in-critical" 2>/dev/null || { echo "VIOLATION: $me entered while another waiter was inside" >> "$dir/violations"; exit 0; }
+    touch "$dir/$me-in"
+    for (( i = 0; i < 100; i++ )); do
+      if [[ -e "$dir/$peer-in" ]]; then
+        echo "VIOLATION: $me and $peer overlapped" >> "$dir/violations"
         break
       fi
-      if grep -q "A-start" "'"$concurrency_log"'" 2>/dev/null; then
-        echo "VIOLATION: A entered critical section while B held lock" >> "'"$violation_log"'"
-        break
-      fi
+      command sleep 0.01
     done
-    echo "B-end" >> "'"$concurrency_log"'"
-  '
-) &
-b_job=$!
+    touch "$dir/$me-done"
+    rm "$dir/$me-in"
+    rmdir "$dir/in-critical"
+  ' _ "$dir" "$me" "$peer"
+}
+( waiter b c ) &
+job_b=$!
+( waiter c b ) &
+job_c=$!
 
-IS_WAITER_A=1
-send_lock_around "$name" 5 zsh -c '
-  echo "A-start" >> "'"$concurrency_log"'"
-  command sleep 0.05
-  echo "A-end" >> "'"$concurrency_log"'"
-'
+# The killed holder's critical-section child is orphaned and keeps running
+# until release: the lock must be free without waiting for it to exit.
+kill -9 "$(cat "$dir/holder.pid")"
+wait "$holder_job" 2>/dev/null || true
+wait "$job_b"
+wait "$job_c"
 
-wait "$b_job"
-
-if [[ -s "$violation_log" ]]; then
-  cat "$violation_log" >&2
-  exit 1
-fi
-if [[ -d "$lock_dir" ]]; then
-  echo "lock dir not cleaned up after both waiters finished" >&2
+[[ -e "$dir/b-done" && -e "$dir/c-done" ]] || { echo "a waiter never ran after the holder was killed" >&2; exit 1; }
+if [[ -s "$dir/violations" ]]; then
+  cat "$dir/violations" >&2
   exit 1
 fi
 BODY
@@ -290,12 +212,10 @@ for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   tool="$(basename "$wrapper")"
   run_case "$wrapper" "$tool-basic"          "$WORK/case-basic.zsh"
   run_case "$wrapper" "$tool-concurrent"     "$WORK/case-concurrent.zsh"
-  run_case "$wrapper" "$tool-stale-pid"      "$WORK/case-stale-pid.zsh"
-  run_case "$wrapper" "$tool-vanished-dir"   "$WORK/case-vanished-dir.zsh"
-  run_case "$wrapper" "$tool-delayed-pid"    "$WORK/case-delayed-pid.zsh"
+  run_case "$wrapper" "$tool-contended"      "$WORK/case-contended.zsh"
+  run_case "$wrapper" "$tool-killed-holder"  "$WORK/case-killed-holder.zsh"
   run_case "$wrapper" "$tool-missing-dir"    "$WORK/case-missing-dir.zsh"
   run_case "$wrapper" "$tool-rc"             "$WORK/case-rc.zsh"
-  run_case "$wrapper" "$tool-reclaim-toctou" "$WORK/case-reclaim-toctou.zsh"
 done
 
 echo "OK: send-lock smoke passed for agent-tmux claude and codex."
