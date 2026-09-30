@@ -1250,3 +1250,36 @@ test('gap B5: a launch-failed notice is provisional: a real result of the same e
   assert.equal(w.woken.length, 2, 'never delivered twice')
 })
 
+test('gap B6: a result.json written for an episode after stop cancelled it is not delivered, and no ack is written; live episode is delivered', async () => {
+  const w = world()
+  const r1 = await assigned(w, 'stopped')
+  const r2 = await assigned(w, 'live')
+  writeFileSync(`${r2.stateDir}/result.json`, result({ episode: 1, summary: 'live ok' }))
+
+  let stopped = false
+  const host: Host = {
+    ...w.host,
+    read: async path => {
+      if (!stopped && path.includes('stopped') && path.endsWith('result.json')) {
+        stopped = true
+        const d1 = (await scan(w.host, { claim: false })).visible.find(d => d.name === r1.name)!
+        await stopWorker(w.host, newGate(), d1)
+        writeFileSync(path, result({ episode: 1, summary: 'result after stop' }))
+      }
+      return w.host.read(path)
+    },
+  }
+
+  await reconcile(host, newGate(), false)
+  assert.ok(stopped, 'stopWorker was invoked during reconcile pass')
+  assert.equal(w.woken.length, 1, 'only live episode is delivered')
+  assert.match(w.woken[0]!, new RegExp(r2.name), 'live episode delivered')
+  assert.doesNotMatch(w.woken[0]!, new RegExp(r1.name), 'stopped episode not delivered')
+  assert.ok(!existsSync(`${r1.stateDir}/episodes/1/acks/done`), 'no done ack written for cancelled episode')
+  assert.ok(existsSync(`${r1.stateDir}/episodes/1/acks/cancel`), 'cancel ack preserved')
+  assert.ok(existsSync(`${r2.stateDir}/episodes/1/acks/done`), 'live episode acked done')
+
+  await reconcile(w.host, newGate(), false)
+  assert.equal(w.woken.length, 1, 'subsequent pass delivers nothing more')
+})
+

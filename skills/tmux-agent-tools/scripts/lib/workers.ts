@@ -2679,8 +2679,9 @@ const busyText = (name: string, busy: unknown) =>
 /**
  * A pass can outlive its authority: a slow pass, a stopped process, a reload (§4).
  * Right before a submit or ack, this activation must still be its session's max,
- * and each episode's max claim gen must still name this session. An episode that
- * lost its owner is dropped here and left to the new one; `undefined` = this
+ * each episode's max claim gen must still name this session, and the episode must
+ * not have been closed (cancel, done, expired). An episode that lost its owner or
+ * was closed is dropped here and left to the new one or stopped; `undefined` = this
  * activation was superseded and delivers nothing.
  */
 export async function stillOurs(host: Host, gate: Gate, v3: string, fs: readonly Finished[]): Promise<Finished[] | undefined> {
@@ -2698,14 +2699,25 @@ export async function stillOurs(host: Host, gate: Gate, v3: string, fs: readonly
   }
   const out: Finished[] = []
   for (const f of fs) {
-    // A record with no owner is anyone's (a pre-owner record): nothing to lose.
-    if (!f.d.owner) {
-      out.push(f)
+    const epDir = episodeDirOf(v3, f.d)
+    if (f.d.owner) {
+      const cur = await currentOwner(host, epDir, f.d.adoptedFrom ?? f.d.owner)
+      if (!cur?.complete || cur.session !== me) {
+        host.log(`tmux-agent: ${idOf(f.d)} changed owner during this pass (${cur ? `gen ${cur.gen}: ${cur.session ?? 'incomplete'}` : 'owner unreadable'}); not delivered here`)
+        continue
+      }
+    }
+    const names = await ackNames(host, epDir)
+    if (!names) {
+      host.log(`tmux-agent: could not read acks for ${idOf(f.d)}; not delivered here`)
       continue
     }
-    const cur = await currentOwner(host, episodeDirOf(v3, f.d), f.d.adoptedFrom ?? f.d.owner)
-    if (cur?.complete && cur.session === me) out.push(f)
-    else host.log(`tmux-agent: ${idOf(f.d)} changed owner during this pass (${cur ? `gen ${cur.gen}: ${cur.session ?? 'incomplete'}` : 'owner unreadable'}); not delivered here`)
+    const closed = names.find(n => CLOSED_ACKS.includes(n))
+    if (closed) {
+      host.log(`tmux-agent: ${idOf(f.d)} closed during this pass (${closed}); not delivered here`)
+      continue
+    }
+    out.push(f)
   }
   return out
 }
