@@ -67,7 +67,7 @@ run_attempt() {
   local started_at ended_at
 
   started_at="$(date +%s)"
-  "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file"
+  "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file" < /dev/null
   attempt_exit_code=$?
   ended_at="$(date +%s)"
   attempt_duration=$(( ended_at - started_at ))

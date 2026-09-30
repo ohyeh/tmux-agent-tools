@@ -36,7 +36,7 @@ if ! command -v "$CLAUDE" >/dev/null 2>&1; then
   echo "$pass passed, $fail failed" >&2
   exit 1
 fi
-if ! "$CLAUDE" plugin validate --help >/dev/null 2>&1; then
+if ! "$CLAUDE" plugin validate --help </dev/null >/dev/null 2>&1; then
   bad "$CLAUDE is not a Claude Code that knows 'plugin validate' (a stub on PATH?) — set CLAUDE_BIN"
   echo "$pass passed, $fail failed" >&2
   exit 1
@@ -45,10 +45,10 @@ fi
 actual="$(mktemp)"
 trap 'rm -f "$actual"' EXIT
 # Only the derived surface lines; the header carries an absolute path.
-"$CLAUDE" plugin validate "$MOD/.claude-plugin/plugin.json" 2>&1 | grep '❯' | sed 's/^[[:space:]]*❯ //' > "$actual"
+"$CLAUDE" plugin validate "$MOD/.claude-plugin/plugin.json" </dev/null 2>&1 | grep '❯' | sed 's/^[[:space:]]*❯ //' > "$actual"
 if [[ ! -s "$actual" ]]; then
   bad "plugin validate printed no surface lines"
-  "$CLAUDE" plugin validate "$MOD/.claude-plugin/plugin.json" >&2 || true
+  "$CLAUDE" plugin validate "$MOD/.claude-plugin/plugin.json" </dev/null >&2 || true
   echo "$pass passed, $fail failed" >&2
   exit 1
 fi
@@ -67,7 +67,7 @@ else
 fi
 
 echo "running the mod's test suite"
-if out="$("$CLAUDE" plugin test "$MOD" 2>&1)"; then
+if out="$("$CLAUDE" plugin test "$MOD" </dev/null 2>&1)"; then
   summary="$(printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail)$' | tr -s ' ' | paste -sd, -)"
   if printf '%s\n' "$out" | grep -qE '^ *0 fail$'; then
     ok "plugin test:${summary}"
