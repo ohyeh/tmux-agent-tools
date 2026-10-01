@@ -1398,3 +1398,20 @@ test('Sol#4 heartbeat: a beat that cannot be written is not a successful beat', 
   assert.equal(await heartbeat(failing, gate), false, 'a later failed beat is not success either')
   assert.equal(await heartbeat(w.host, gate), true, 'a beat that lands is')
 })
+
+test('band width (S7): displayCells/truncateCells/fitCells use the TUI rules — graphemes, EAW W=2, A=2', async () => {
+  const { displayCells, truncateCells, fitCells } = await import('./workers.ts')
+  const { cellWidth } = await import('./tui.node.ts')
+  const family = '\u{1F468}‍\u{1F469}‍\u{1F467}'
+  const cases: Array<[string, number]> = [
+    ['中文', 4], ['·', 2], ['●', 2], ['─', 2], [family, 2], ['é', 1], ['\u{1F1F9}\u{1F1FC}', 2], ['ab', 2], ['가', 2],
+  ]
+  for (const [t, n] of cases) {
+    assert.equal(displayCells(t), n, JSON.stringify(t))
+    assert.equal(displayCells(t), cellWidth(t), `band and TUI agree on ${JSON.stringify(t)}`)
+  }
+  assert.equal(truncateCells(`a${family}b`, 2), 'a', 'a grapheme of 2 that does not fit is left out whole')
+  assert.equal(truncateCells(`a${family}b`, 3), `a${family}`)
+  assert.equal(truncateCells('éx', 1), 'é', 'a combining mark stays with its base')
+  assert.equal(fitCells('中文字', 5), '中文…')
+})

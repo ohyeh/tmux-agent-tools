@@ -9,6 +9,7 @@
  * - node strip-only TypeScript (floor 22.18.0): no enum, namespace or parameter
  *   properties; type-only imports say `import type`; relative imports end in `.ts`.
  */
+import { graphemes, graphemeWidth, textCells } from './width.ts'
 import {
   ack as ackDir,
   acquireLock,
@@ -349,30 +350,11 @@ export type Host = {
 }
 
 /**
- * Terminal display cells. CJK and other fullwidth ranges count 2.
- * `·` is ambiguous width; count it 2 so a hint cannot spill past `[ hide ]`.
+ * Terminal display cells, by the TUI's rules (width.ts, plan §1c S7): graphemes,
+ * East Asian Width W = 2, A (`·`, `●`, `─`) = 2 so a hint cannot spill past `[ hide ]`.
  */
 export function displayCells(text: string): number {
-  let n = 0
-  for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0
-    n += ch === '·' || isFullwidth(cp) ? 2 : 1
-  }
-  return n
-}
-
-export function isFullwidth(cp: number): boolean {
-  return (
-    (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0xa4cf) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe10 && cp <= 0xfe19) ||
-    (cp >= 0xfe30 && cp <= 0xfe6f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x20000 && cp <= 0x3fffd)
-  )
+  return textCells(text, 2)
 }
 
 export function padCells(text: string, width: number): string {
@@ -2336,24 +2318,18 @@ export function othersLine(all: readonly PanelRow[]): { text: string; running: n
 /** `text` cut to `max` display cells, `…` marking the cut. */
 export function fitCells(text: string, max: number): string {
   if (displayCells(text) <= max) return text
-  let out = ''
-  for (const ch of text) {
-    if (displayCells(out + ch) > max - 1) break
-    out += ch
-  }
-  return `${out}…`
+  return `${truncateCells(text, max - 1)}…`
 }
 
-/** `text` cut to `max` display cells without breaking wide (CJK) characters. */
+/** `text` cut to `max` display cells without breaking a grapheme or a wide (CJK) character. */
 export function truncateCells(text: string, max: number): string {
   if (displayCells(text) <= max) return text
   let out = ''
   let cur = 0
-  for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0
-    const w = ch === '·' || isFullwidth(cp) ? 2 : 1
+  for (const g of graphemes(text)) {
+    const w = graphemeWidth(g, 2)
     if (cur + w > max) break
-    out += ch
+    out += g
     cur += w
   }
   return out
