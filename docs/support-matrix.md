@@ -19,22 +19,22 @@ path, or a blocker and the action that closes it. Nothing here is inferred.
 - **PASS** = a check ran and the cited artifact records it. **UNCONFIRMED** = no real run backs the cell.
 
 Every live run below used macOS and a private tmux server. Live MCP runs used a
-fake worker CLI (`$R/r8-live/common/r8cli`) under a real host.
+fake worker CLI (`$R/r8-live-ff31398/common/r8cli`) under a real host. The Codex and
+Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff31398.md`).
 
 ## Codex CLI
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| MCP | write + read (spawn, wait, send, wait, close) | PASS | `$R/r8-live/codex/life2.jsonl`, `$R/r8-live/codex/life2-calls.txt` |
-| MCP | restart during wait | FAIL, then PASS | `$R/r8-live/codex/restart/`. First wait after host kill returns `not_owner` (finding F3 in `$R/agent-r8-live.md`). Second wait returns `completed` with the same `delivery_id`. To close: re-run on the release SHA after the F3 fix. |
-| MCP | two waits at once | PASS in one process only | `$R/r8-live/common/concurrent-inprocess/`. Codex serialises its own calls (`$R/r8-live/codex/concurrent2/`). |
-| MCP | all rows above | not re-run on the current SHA | Live MCP runs used `3c96040` plus `a39bfba`. To close: re-run `life2` on the release SHA. |
+| MCP | write + read (spawn, wait, send, wait, close) | PASS on `ff31398` | `$R/r8-live-ff31398/codex/life.jsonl`, `life-calls.txt` (seq 1 and 2 `completed`, `close` returns `closed: true`) |
+| MCP | restart during wait | PASS on `ff31398` | `$R/r8-live-ff31398/codex/restart/`. After the host is killed its MCP server exits (`host gone (stdin ended); shutting down`). The new host's first wait returns `pending` / `wait_again` within the 40 s cap; the next wait returns `completed` with the original owner's `delivery_id`; one ack set. |
+| MCP | two waits at once | PASS on `ff31398` | `$R/r8-live-ff31398/codex/concurrent/`. While the first claim is held both waits return `not_owner`; after it expires one returns `completed`, the other `already_acked`, same `delivery_id`, one ack set. Codex serialises its own calls (`$R/r8-live/codex/concurrent2/`). |
 | Paste | read (composer-state) | PASS | `skills/tmux-agent-tools/scripts/lib/collector.contract.node.ts`, test `composer-state: every captured pane gets its class` (real codex captures in `skills/tmux-agent-tools/scripts/lib/fixtures/composer/codex-*.txt`) |
-| Paste | write, empty composer | PASS | `$R/r74-e8acb89/codex/1-empty/driver.log` |
-| Paste | write, multiline | PASS | `$R/r74-e8acb89/codex/5-multiline/driver.log` |
-| Paste | write, permission dialog | PASS (no Enter sent into the dialog) | `$R/r74-e8acb89/codex/4-permission/act-state-during.txt`, `04-scrollback.txt` |
-| Paste | write, unsent draft | PASS | `$R/r74-paste-fix/codex/2-draft/driver.log` (code `041fa0f`, not re-run on `e8acb89`) |
-| Paste | write, busy host | PASS | `$R/r74-paste-fix/codex/3-busy/act-state-during.txt`, `driver.log` (code `041fa0f`, not re-run on `e8acb89`) |
+| Paste | write, empty composer | PASS on `ff31398` | `$R/r74-ff31398/codex/1-empty/driver.log` |
+| Paste | write, multiline | PASS on `ff31398` | `$R/r74-ff31398/codex/5-multiline/driver.log` (one prompt) |
+| Paste | write, permission dialog | PASS on `ff31398` (no Enter sent into the dialog) | `$R/r74-ff31398/codex/4-permission/` (`host composer is permission; nothing pasted`, release Escape, ack after the release, `You approved` 0) |
+| Paste | write, unsent draft | PASS on `ff31398` | `$R/r74-ff31398/codex/2-draft/` (`host composer is draft; nothing pasted`, ack after Ctrl-U) |
+| Paste | write, busy host | PASS on `ff31398` | `$R/r74-ff31398/codex/3-busy/` (`host composer is busy; nothing pasted`, ack after the busy command ends) |
 | Paste | write, collector in host pane (R8.2) | PASS | `$R/r8-live/codex/r82/` (`host-pane-after-delivery.txt`, `focus-*.txt`, `ps-after-tui-close.txt`, `host-gone-result.txt`, `rereport-count.txt`) |
 | Both | one channel only (S3) | PASS | `$R/r8-live/codex/r82/s3-forward.jsonl`, `s3-reverse/launcher.out`; unit: `skills/tmux-agent-tools/scripts/lib/channel.contract.node.ts` |
 
@@ -42,13 +42,12 @@ fake worker CLI (`$R/r8-live/common/r8cli`) under a real host.
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| MCP | write + read (full lifecycle) | PASS | `$R/r8-live/cursor-agent/life2.jsonl`, `$R/r8-live/cursor-agent/life2-calls.txt` |
-| MCP | restart during wait | FAIL, then PASS | `$R/r8-live/cursor-agent/restart/`. One cursor tool call times out after about 62 s (finding F7). The old claim needs 90 s or more to expire. To close: the host retries the wait; re-run on the release SHA. |
-| MCP | two waits (two host processes) | PASS | `$R/r8-live/cursor-agent/concurrent/` |
-| MCP | all rows above | not re-run on the current SHA | Same SHA caveat as Codex. |
+| MCP | write + read (full lifecycle) | PASS on `ff31398` | `$R/r8-live-ff31398/cursor-agent/life.jsonl`, `life-calls.txt`. The harness must create the project `.cursor/mcp.json` first (`attempt0-no-mcp-json.jsonl` shows a run without it: no MCP tools). |
+| MCP | restart during wait | PASS on `ff31398` | `$R/r8-live-ff31398/cursor-agent/restart/`. Two `wait_again` answers, then `completed` with the original owner's `delivery_id`; no `not_owner`, no tool timeout. |
+| MCP | two waits (two host processes) | PASS on `ff31398` | `$R/r8-live-ff31398/cursor-agent/concurrent/`. After the claim expires one wait returns `completed`, the other `not_owner` (the other waiter's claim was still held); one ack set, exactly once. On `3c96040` the loser returned `already_acked`; both are contract answers, and which one depends on the timing. |
 | Paste | read (composer-state) | PASS | `collector.contract.node.ts`, same test as Codex (real captures `fixtures/composer/cursor-agent-*.txt`) |
-| Paste | write, empty and multiline | PASS on old code only | `$R/r74-paste/cursor-agent/1-empty/VERDICT.txt`, `5-multiline/VERDICT.txt` (code `3c96040` plus `a39bfba`, before the composer probe). To close: re-run both cells on the release SHA. |
-| Paste | write, draft and busy | blocker: not re-run since the old FAIL | `$R/r74-paste/cursor-agent/2-draft/VERDICT.txt`, `3-busy/VERDICT.txt` record FAIL on old code. Unit coverage: `collector.contract.node.ts`, test `D-paste: host draft -> nothing pasted ...` and the `busy` twin. To close: live run of both cells on the release SHA. |
+| Paste | write, empty and multiline | PASS on `ff31398` | `$R/r74-ff31398/cursor-agent/1-empty/`, `5-multiline/` |
+| Paste | write, draft and busy | PASS on `ff31398` | `$R/r74-ff31398/cursor-agent/2-draft/` (ack after Ctrl-U), `3-busy/` (`host composer is busy`) |
 | Paste | write, permission dialog | blocker: the dialog cannot be produced | `$R/r74-paste/cursor-agent/4-permission/VERDICT.txt`. `~/.cursor/cli-config.json` sets `approvalMode=unrestricted`, and no CLI flag asks again. To close: use a machine or profile with a changed Cursor config (user decision). |
 
 ## agy CLI
@@ -84,7 +83,7 @@ fake worker CLI (`$R/r8-live/common/r8cli`) under a real host.
 | macOS: detached worker launch (perl `setpgrp`) | PASS | `skills/tmux-agent-tools/scripts/lib/workers.contract.node.ts` (launch detach test); `sh`, `bash`, `dash` children survive a group kill (commit `7ab54a2` record in `$R/state.md`) |
 | Linux: detached launch with `setsid` | UNCONFIRMED | `$R/state.md` row `7ab54a2` says Linux `setsid` did not run. CI runs on `macos-latest` only (`.github/workflows/ci.yml`). To close: run the core contract and `scripts/run-all-smokes` on a Linux host or add a Linux CI job. |
 | Linux: all other cells | UNCONFIRMED | No Linux run of any live or smoke test is recorded. Same action. |
-| Unit and smoke suites (macOS) | PASS | `scripts/test-mcp-bundle-smoke`, `mcp-adapter/test/adapter-smoke.js`, `skills/tmux-agent-tools/scripts/lib/*.contract.node.ts`; green run for `a78880a` in `$R/state.md` ("gate-b16") |
+| Unit and smoke suites (macOS) | PASS | `scripts/test-mcp-bundle-smoke`, `mcp-adapter/test/adapter-smoke.js`, `skills/tmux-agent-tools/scripts/lib/*.contract.node.ts`; green run for `ff31398` in `$R/state.md` ("gate-b17") |
 
 ## Other open items
 
