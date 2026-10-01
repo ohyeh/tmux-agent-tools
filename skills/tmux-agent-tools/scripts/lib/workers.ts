@@ -3230,12 +3230,17 @@ export function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promi
 }
 
 /**
- * Runs the launch line (`$1`) in the background and returns at once. `set -m`
- * puts the background job in a process group of its own, so a host killed with
- * its group (R8 F4) does not take the launch with it; nohup covers SIGHUP. POSIX
- * sh only: the mod path needs no node on PATH.
+ * Runs the launch line (`$1`) in the background and returns at once, in a process group
+ * of its own so a host killed with its group (R8 F4) does not take the launch with it;
+ * nohup covers SIGHUP. `set -m` is not portable (dash turns job control off without a
+ * tty), so: `setsid` (Linux), else perl `setpgrp` (macOS); neither on PATH fails the
+ * launch with the reason instead of running it unprotected.
  */
-const DETACH_LAUNCH = 'set -m; nohup sh -c "$1" >/dev/null 2>&1 &'
+const DETACH_LAUNCH = [
+  'if command -v setsid >/dev/null 2>&1; then setsid nohup sh -c "$1" >/dev/null 2>&1 &',
+  `elif command -v perl >/dev/null 2>&1; then perl -e 'setpgrp(0, 0); exec @ARGV' nohup sh -c "$1" >/dev/null 2>&1 &`,
+  'else echo "tmux-agent: cannot detach the launch: neither setsid nor perl is on PATH" >&2; exit 127; fi',
+].join(' ')
 
 /**
  * The assign tool's body, shared with the runtime-tmux spawn hook and every

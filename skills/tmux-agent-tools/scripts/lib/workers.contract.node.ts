@@ -75,7 +75,7 @@ test('assign: v5 name, worker.json, E1 descriptor + sent, launch on the producer
   assert.ok(!existsSync(`${r.stateDir}/.action`), 'the lock is released')
   const detach = w.calls.find(c => c.argv[0] === 'sh')!.argv
   assert.equal(detach[1], '-c')
-  assert.match(detach[2]!, /^set -m; nohup /, 'the launch runs in a process group of its own')
+  assert.match(detach[2]!, /setsid nohup .*setpgrp\(0, 0\)/, 'the launch runs in a process group of its own')
   const launch = detach[4]!
   // The child is one `sh -c` line: check the words, not the quoting.
   assert.ok(launch.includes('TMUX_AGENT_DIR=') && launch.includes(w.v3), launch)
