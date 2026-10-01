@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
 import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
-import { ORPHAN_MS, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
+import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
@@ -1854,6 +1854,15 @@ test('R4-9: a marker with an impossible activation, a missing record or missing 
   assert.equal(await reservationOf(w.host, w.v3, ep), 'unknown', 'identity complete but no such activation record')
   put({ ...full, at: 'x' })
   assert.equal(await reservationOf(w.host, w.v3, ep), 'unknown', 'at is not a time')
+  // Sol R5-2: the referenced registration must be a whole record, not just an existing file.
+  const recPath = `${sessionDirOf(w.v3, 'me')}/act/${gate.activation}.json`
+  const rec = readFileSync(recPath, 'utf8')
+  put(full)
+  writeFileSync(recPath, '{}')
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'unknown', 'act record {} has no identity')
+  assert.ok(w.logs.some(l => /not a whole activation record/.test(l)), w.logs.join('\n'))
+  writeFileSync(recPath, rec)
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'in-flight', 'control: the record restored')
   const second = await registerActivation(w.host, sessionDirOf(w.v3, 'me'), { pid: 1, pidStart: '', host: '', token: 'again' })
   assert.ok(second && second > gate.activation!)
   put(full)
@@ -1899,6 +1908,43 @@ test('R4-10 fence: a worker.json published while clearing is put back, never rem
   const r = await clearIncomplete(host, 'late.abcde')
   assert.ok(!r.ok && /changed while clearing \(worker\.json\); put back/.test(r.text), r.text)
   assert.ok(existsSync(`${dir}/worker.json`), 'the published record is back in place')
+})
+
+test('Sol R5-1: put back never nests into a new same-name reservation; it keeps the moved dir and says where', async () => {
+  const w = world()
+  const dir = `${w.v3}/aba.abcde`
+  mkdirSync(dir, { recursive: true })
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(dir, old, old)
+  // The original writer publishes just before the move; a new reserve then takes the same name.
+  const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
+    const r = await w.host.run(argv, cwd, ms)
+    if (argv[0] === 'mv' && argv[1] === dir && r.exitCode === 0) {
+      writeFileSync(`${argv[2]}/worker.json`, JSON.stringify({ owner: 'OLD' }))
+      mkdirSync(dir)
+      writeFileSync(`${dir}/worker.json`, JSON.stringify({ owner: 'NEW' }))
+    }
+    return r
+  } }
+  const r = await clearIncomplete(host, 'aba.abcde')
+  assert.ok(!r.ok && /a new reservation took "aba\.abcde" meanwhile; it is kept at .*\.clearing\.aba\.abcde\./.test(r.text), r.text)
+  assert.deepEqual(readdirSync(dir), ['worker.json'], 'nothing nested inside the new reservation')
+  assert.equal(JSON.parse(readFileSync(`${dir}/worker.json`, 'utf8')).owner, 'NEW')
+  const aside = r.text.match(/kept at (\S+)$/)![1]!
+  assert.equal(JSON.parse(readFileSync(`${aside}/worker.json`, 'utf8')).owner, 'OLD', 'the old record is kept, not lost')
+})
+
+test('Sol R5-1: a writer that publishes after the clear leaves a complete worker, never a half-cleared dir', async () => {
+  const w = world()
+  const dir = `${w.v3}/gone.abcde`
+  mkdirSync(dir, { recursive: true })
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(dir, old, old)
+  assert.ok((await clearIncomplete(w.host, 'gone.abcde')).ok)
+  const rec = { ...JSON.parse(readFileSync(`${(await assigned(w)).stateDir}/worker.json`, 'utf8')), name: 'gone.abcde' }
+  assert.ok(await publishWorker(w.host, dir, rec, 'late'), 'the late publish re-creates the dir')
+  assert.deepEqual(readdirSync(dir), ['worker.json'], 'one whole record, no tmp left')
+  assert.equal((await panelRows(w.host, newGate(), w.root)).some(r => r.incomplete), false, 'not an unfinished reservation')
 })
 
 test('R4-11: a detacher that fails (setsid exits 23) leaves launch.exit and its stderr in the launch log', async () => {

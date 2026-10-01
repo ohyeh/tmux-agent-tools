@@ -37,6 +37,7 @@ import {
   superseded,
   readOrAbsent,
   UNKNOWN,
+  type ActivationRecord,
   type Contest,
   type Holder,
   type Maintained,
@@ -718,8 +719,16 @@ export async function reservationOf(host: Host, v3: string, epDir: string): Prom
   if (typeof m?.token !== 'string' || !m.token || typeof m.session !== 'string' || !m.session) return 'unknown'
   if (!Number.isInteger(m.activation) || (m.activation as number) < 1 || typeof m.at !== 'number') return 'unknown'
   const dir = sessionDirOf(v3, m.session)
-  const known = await host.exists(`${dir}/act/${m.activation}.json`).catch(() => undefined)
-  if (known !== true) return 'unknown'
+  // The referenced registration must itself be a whole ActivationRecord (S8): an existing
+  // file is not proof. Absent, unreadable (logged by readOrAbsent) or malformed -> unknown.
+  const recPath = `${dir}/act/${m.activation}.json`
+  const recText = await readOrAbsent(host, recPath)
+  if (recText === undefined || recText === UNKNOWN) return 'unknown'
+  const rec = parseJson(recText) as Partial<Record<keyof ActivationRecord, unknown>> | undefined
+  if (!Number.isInteger(rec?.pid) || (rec!.pid as number) < 0 || typeof rec!.pidStart !== 'string' || typeof rec!.host !== 'string' || typeof rec!.token !== 'string' || !rec!.token) {
+    host.log(`tmux-agent: ${recPath} is not a whole activation record; the delivery marker of ${epDir} reads unknown`)
+    return 'unknown'
+  }
   const sup = await superseded(host, dir, m.activation as number)
   if (sup === undefined) return 'unknown'
   if (sup) return 'stale'
@@ -3201,21 +3210,40 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
   if (!entries) return { ok: false, text: `"${name}" could not be listed (see the log); nothing is cleared` }
   const other = entries.find(e => !e.name.startsWith('worker.json.'))
   if (other) return { ok: false, text: `"${name}" holds ${other.name}: not a bare unfinished reservation; nothing is cleared` }
-  const born = await host.stat(w).catch(() => undefined)
+  const born = await host.stat(w).catch((error: unknown) => {
+    host.log(`tmux-agent: could not stat ${w}: ${String(error)}`)
+    return undefined
+  })
   const age = born ? (await host.now()) - born.mtimeMs : undefined
   if (age === undefined) return { ok: false, text: `"${name}" could not be stat'ed (see the log); nothing is cleared` }
   if (age <= ORPHAN_MS) return { ok: false, text: `"${name}" is ${Math.round(age / 1000)}s old: a writer may still publish its worker.json; try again after ${ORPHAN_MS / 1000}s` }
-  // Fence (rename(2)): move the dir aside first, so a late writer's publish into `w` fails
-  // instead of landing in a dir about to be removed; then re-check what was moved.
+  // Fence (rename(2)): move the dir aside first, then re-check what was moved, so a record
+  // published before the move is never removed. A writer that publishes after the clear
+  // re-creates the dir (host.write makes parents) with a whole worker.json: that is a
+  // complete worker again, never a half-cleared one (Sol R5-1, accepted).
   const run = (argv: string[]) => host.run(argv, '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   const aside = `${v3Of(root)}/.clearing.${name}.${randomBase36(6)}`
   const mv = await run(['mv', w, aside])
   if (mv.exitCode !== 0) return { ok: false, text: `could not move ${w} aside: ${mv.stderr.trim() || `exit ${mv.exitCode}`}; nothing is cleared` }
-  const moved = await host.list(aside).catch(() => undefined)
+  const moved = await host.list(aside).catch((error: unknown) => {
+    host.log(`tmux-agent: could not list ${aside}: ${String(error)}`)
+    return undefined
+  })
   const late = moved ? moved.find(e => !e.name.startsWith('worker.json.')) : { name: '(unlistable)' }
   if (late) {
-    const back = await run(['mv', aside, w])
-    return { ok: false, text: `"${name}" changed while clearing (${late.name}); ${back.exitCode === 0 ? 'put back, nothing is cleared' : `left at ${aside}: ${back.stderr.trim()}`}` }
+    // Put back without ever landing inside another dir (`mv aside w` nests when w exists, Sol R5-1):
+    // win the name with an exclusive mkdir first, then move each entry into that empty dir.
+    const keep = (why: string) => ({ ok: false, text: `"${name}" changed while clearing (${late.name}); ${why}; it is kept at ${aside}` })
+    if (!moved) return keep('the moved dir could not be listed')
+    const won = await mkdirExclusive(host, w)
+    if (won !== 'won') return keep(won === 'lost' ? `a new reservation took "${name}" meanwhile` : `${w} could not be re-created (see the log)`)
+    for (const e of moved) {
+      const m = await run(['mv', `${aside}/${e.name}`, `${w}/${e.name}`])
+      if (m.exitCode !== 0) return keep(`moving ${e.name} back failed: ${m.stderr.trim() || `exit ${m.exitCode}`}`)
+    }
+    const rd = await run(['rmdir', aside])
+    if (rd.exitCode !== 0) host.log(`tmux-agent: could not remove the empty ${aside}: ${rd.stderr.trim() || `exit ${rd.exitCode}`}`)
+    return { ok: false, text: `"${name}" changed while clearing (${late.name}); put back, nothing is cleared` }
   }
   const rm = await run(['rm', '-rf', aside])
   if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${aside}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }
