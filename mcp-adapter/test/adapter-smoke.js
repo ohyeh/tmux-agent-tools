@@ -556,10 +556,14 @@ async function testAckBoundariesInProcess() {
   assert.ok(writes.length >= 4);
 
   const promptly = async (sp, w, why) => {
-    const again = await Promise.race([
-      waitTmuxAgent(sp.agent_id, 0, { seq: 1 }),
-      new Promise((r) => setTimeout(() => r({ status: "hung" }), 3000)),
-    ]);
+    // timeoutSec=0 no longer queues behind the release (R4-4): it may answer wait_again
+    // until the release lands, then it must complete.
+    let again;
+    for (const end = Date.now() + 3000; Date.now() < end; ) {
+      again = await waitTmuxAgent(sp.agent_id, 0, { seq: 1 });
+      if (again.status !== "pending") break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
     assert.equal(again.status, "completed", `${why}: next wait(timeoutSec=0) is not stuck`);
     assert.equal(again.delivery_id, w.delivery_id, `${why}: same delivery_id`);
   };
@@ -631,6 +635,8 @@ async function testCancelParkedResponse() {
   // The gate registered its activation under an earlier test's state root; give this root the
   // same registration (its dir) so the marker's activation is the live, authoritative one.
   fs.mkdirSync(path.join(dir, ".v3", ".sessions", sessionHex(marker.session), "act", String(marker.activation)), { recursive: true })
+  // The core now also requires the activation record `act/<n>.json` to trust a marker.
+  fs.writeFileSync(path.join(dir, ".v3", ".sessions", sessionHex(marker.session), "act", `${marker.activation}.json`), "{}")
   const cancelled = await cancelEpisode(await getHost(), sp.agent_id, 1);
   assert.equal(cancelled.ok, false, cancelled.text);
   assert.match(cancelled.text, /in-flight/);
@@ -840,6 +846,77 @@ async function testWaitCallIsCapped() {
   assert.equal(done.delivery_id, `${workerOwner(dir, sp.agent_id)}/${sp.agent_id}/1`);
 }
 
+// R4-4: a wait behind a parked delivery obeys its own deadline and abort; the earlier
+// delivery's reservation and ack state do not change.
+async function testWaitBoundBehindInFlight() {
+  const { AckingStdioTransport } = require("../src/server.js");
+  const { PassThrough } = require("node:stream");
+  const dir = freshState("r44");
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r44", name: "r4-4" });
+  writeResult(sp.result_path, { summary: "r44" });
+  const first = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId: 7001, signal: new AbortController().signal } });
+  assert.equal(first.status, "completed");
+  const marker = path.join(path.dirname(sp.result_path), "episodes/1/delivering");
+  assert.ok(fs.existsSync(marker), "the first delivery holds its marker");
+  const prompt = (p) => Promise.race([p, new Promise((r) => setTimeout(() => r({ status: "HUNG" }), 1500))]);
+  const t0 = Date.now();
+  const zero = await prompt(waitTmuxAgent(sp.agent_id, 0, { seq: 1 }));
+  assert.deepEqual([zero.status, zero.reason], ["pending", "wait_again"], JSON.stringify(zero));
+  assert.ok(Date.now() - t0 < 1000, "timeoutSec=0 returns at once");
+  const ac = new AbortController();
+  const aborting = waitTmuxAgent(sp.agent_id, 30, { seq: 1, extra: { requestId: 7002, signal: ac.signal } });
+  setTimeout(() => ac.abort(), 200);
+  const aborted = await prompt(aborting);
+  assert.deepEqual([aborted.status, aborted.reason], ["pending", "wait_again"], JSON.stringify(aborted));
+  const capped = await prompt(waitTmuxAgent(sp.agent_id, 30, { seq: 1, capSec: 1 }));
+  assert.deepEqual([capped.status, capped.reason], ["pending", "wait_again"], JSON.stringify(capped));
+  assert.ok(fs.existsSync(marker), "bounded waits leave the reservation");
+  assert.equal(doneAck(dir, sp.agent_id), false, "bounded waits leave the ack state");
+  // The earlier delivery still completes normally afterwards.
+  const t = new AckingStdioTransport(new PassThrough(), { write(chunk, cb) { setImmediate(cb); return true; } });
+  await t.send({ jsonrpc: "2.0", id: 7001, result: { structuredContent: first, content: [] } });
+  assert.ok(doneAck(dir, sp.agent_id), "the earlier delivery acks after its flush");
+  const after = await waitTmuxAgent(sp.agent_id, 1, { seq: 1 });
+  assert.equal(after.status, "already_acked");
+}
+
+// The closing ack is the truth: once acks/done exists, a wait answers already_acked even
+// while the earlier delivery is still releasing (gap between ack and in-flight release).
+async function testAckedWhileStillInFlight() {
+  const dir = freshState("ackgap");
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "ackgap", name: "ack-gap" });
+  writeResult(sp.result_path, { summary: "ackgap" });
+  const first = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId: 7101, signal: new AbortController().signal } });
+  assert.equal(first.status, "completed");
+  fs.mkdirSync(path.join(dir, ".v3", sp.agent_id, "episodes/1/acks/done"), { recursive: true });
+  const w = await waitTmuxAgent(sp.agent_id, 0, { seq: 1 });
+  assert.deepEqual([w.status, w.delivery_id], ["already_acked", first.delivery_id], JSON.stringify(w));
+}
+
+// R4-2: a busy action lock defers the notice: pending (not already_acked), no ack, no
+// marker; after the release the next wait delivers once with the same delivery_id.
+async function testDeferredReserveIsPendingNotAcked() {
+  const dir = freshState("r42");
+  const core = require("../../skills/tmux-agent-tools/scripts/lib/workers.ts");
+  const { nodeHost } = require("../../skills/tmux-agent-tools/scripts/lib/host.node.ts");
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r42", name: "r4-2" });
+  writeResult(sp.result_path, { summary: "r42" });
+  const other = nodeHost({ owner: "someone-else", cwd: dir, log: () => {} });
+  const workerDir = path.join(dir, ".v3", sp.agent_id);
+  const lock = await core.takeLock(other, workerDir);
+  assert.ok(lock.ok, "the test holder takes the action lock");
+  const marker = path.join(workerDir, "episodes/1/delivering");
+  const w = await waitTmuxAgent(sp.agent_id, 0, { seq: 1 });
+  assert.deepEqual([w.status, w.reason], ["pending", "wait_again"], JSON.stringify(w));
+  assert.equal(doneAck(dir, sp.agent_id), false, "deferred: no ack");
+  assert.equal(fs.existsSync(marker), false, "deferred: no marker");
+  await require("../../skills/tmux-agent-tools/scripts/lib/ledger.ts").releaseLock(other, `${workerDir}/.action`, lock.token);
+  const again = await waitTmuxAgent(sp.agent_id, 1, { seq: 1 });
+  assert.equal(again.status, "completed", JSON.stringify(again));
+  assert.equal(again.delivery_id, `${workerOwner(dir, sp.agent_id)}/${sp.agent_id}/1`);
+  assert.ok(doneAck(dir, sp.agent_id));
+}
+
 // F3 host: a stand-in for codex. Spawns the server, spawns a worker, leaves a wait in flight.
 async function hostMode(dir, errFile, codeFile) {
   const env = childEnv(dir, { PATH: `${FIXTURE_BIN}${path.delimiter}${process.env.PATH}` });
@@ -953,7 +1030,7 @@ async function main() {
   if (process.argv[2] === "--r8") {
     // One R8 fixture alone: `node test/adapter-smoke.js --r8 testBriefHasNoUndefined`.
     process.env.PATH = `${FIXTURE_BIN}${path.delimiter}${process.env.PATH}`;
-    await { testBriefHasNoUndefined, testSpawnThenWaitIsStartingNotDead, testWaitCallIsCapped, testTransportReportsGoneHost, testHostKilledServerShutsDownClean, testLaunchSurvivesHostGroupKill }[process.argv[3]]();
+    await { testBriefHasNoUndefined, testSpawnThenWaitIsStartingNotDead, testWaitCallIsCapped, testTransportReportsGoneHost, testHostKilledServerShutsDownClean, testLaunchSurvivesHostGroupKill, testWaitBoundBehindInFlight, testAckedWhileStillInFlight, testDeferredReserveIsPendingNotAcked }[process.argv[3]]();
     stopHeartbeat();
     console.log(`${process.argv[3]} ok`);
     return;
@@ -1177,6 +1254,12 @@ async function main() {
   await testTransportReportsGoneHost();
   await testHostKilledServerShutsDownClean();
   await testLaunchSurvivesHostGroupKill();
+
+  // Round 4: wait bound behind an in-flight delivery; retire vs an in-flight beat (own process).
+  await testWaitBoundBehindInFlight();
+  await testAckedWhileStillInFlight();
+  await testDeferredReserveIsPendingNotAcked();
+  execFileSync(process.execPath, [path.join(__dirname, "retire-inflight.js")], { stdio: "inherit" });
 
   stopHeartbeat();
   console.log("adapter smoke ok");

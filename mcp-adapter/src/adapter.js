@@ -51,12 +51,17 @@ const REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifact
 // out at about 62 s (R8 F7). A longer `timeoutSec` returns `pending` at this bound; the
 // caller calls wait again. A conservative margin: each loop also runs a 5 s status probe.
 const WAIT_CAP_SEC = 40;
+/** How long an `already_acked` answer waits for the earlier delivery to release its marker (ms-scale in practice). */
+const RELEASE_GRACE_MS = 2000;
 const NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
 const NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";
 const NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unless explicitly authorized.";
 
 const gates = new Map();
 const beatTimers = new Map();
+// Set once at shutdown: no new beat starts; beats already writing are awaited before the retire.
+let stopping = false;
+const beatsInFlight = new Set();
 // Episode dir → the delivery in flight in this process; held until its ack is settled.
 const inFlightDeliveries = new Map();
 // JSON-RPC request id → settle(sent) of a `completed` wait response (plan §1c S4).
@@ -105,16 +110,28 @@ async function getHost(cwd) {
   return nodeHost({ owner: await sessionId(), cwd: cwd || process.cwd(), log });
 }
 
+/** One heartbeat, tracked so shutdown can wait for it; none starts once shutdown began. */
+async function beat(host, gate) {
+  if (stopping) return false;
+  const p = heartbeat(host, gate);
+  beatsInFlight.add(p);
+  try {
+    return await p;
+  } finally {
+    beatsInFlight.delete(p);
+  }
+}
+
 async function ensureAdapterLive(host) {
   const id = host.owner();
   if (!id) return false;
   const gate = gateFor(id);
   if (gate.paused) return false;
-  const live = await heartbeat(host, gate);
-  if (!beatTimers.has(id)) {
+  const live = await beat(host, gate);
+  if (!beatTimers.has(id) && !stopping) {
     const timer = setInterval(() => {
       if (!gate.paused) {
-        void heartbeat(host, gate).catch((err) => {
+        void beat(host, gate).catch((err) => {
           host.log(`heartbeat failed: ${err}`);
         });
       }
@@ -346,6 +363,27 @@ async function closedAcks(host, episodeDir) {
   return entries.filter((e) => e.kind === "dir").map((e) => e.name);
 }
 
+/** True when `p` settled; false when `deadline` (ms epoch) or `signal` came first. */
+async function settledBy(p, deadline, signal) {
+  const ms = deadline - Date.now();
+  if (ms <= 0 || (signal && signal.aborted)) return false;
+  let timer;
+  let onAbort;
+  const bound = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    if (signal) {
+      onAbort = () => resolve(false);
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+  try {
+    return await Promise.race([p.then(() => true), bound]);
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 /**
  * Deliver one finished episode as this wait's response (plan D-mcp-ack, §1c S4).
  * Delivered = the response bytes were flushed to stdout (the transport's write
@@ -357,9 +395,22 @@ async function closedAcks(host, episodeDir) {
  * overlapping wait waits for it and then sees the closing ack. At-least-once: a crash
  * between flush and ack re-reports the same `delivery_id` on a later wait.
  */
-async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, extra) {
+async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, extra, deadline) {
   const deliveryId = deliveryIdOf({ name: rec.name, seq: targetSeq, owner: (desc && desc.owner) || rec.owner });
-  while (inFlightDeliveries.has(episodeDir)) await inFlightDeliveries.get(episodeDir);
+  // Wait behind an earlier delivery only until this call's deadline or abort (R4-4); its
+  // reservation and ack state stay as they are, a later wait sees them.
+  while (inFlightDeliveries.has(episodeDir)) {
+    // The closing ack is the truth: once written, the episode is acked even while the
+    // earlier delivery is still releasing its reservation. Give that release (a lock and an
+    // unlink) a short grace first, so a close right after this answer does not meet its lock.
+    if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
+      await settledBy(inFlightDeliveries.get(episodeDir) || Promise.resolve(), Date.now() + RELEASE_GRACE_MS, extra && extra.signal);
+      return { status: "already_acked", delivery_id: deliveryId };
+    }
+    if (!(await settledBy(inFlightDeliveries.get(episodeDir), deadline, extra && extra.signal))) {
+      return { status: "pending", reason: "wait_again", seq: targetSeq, detail: "an earlier delivery of this episode is still being acked; call wait_tmux_agent again with the same agent_id and seq" };
+    }
+  }
   let notifyDone;
   const inFlight = new Promise((resolve) => {
     notifyDone = resolve;
@@ -510,9 +561,16 @@ async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resu
   }
   // Reserve before the transport may send (plan §1c S8, Sol R3-4): the same `delivering`
   // marker the collector writes, so cancel reads it and answers in-flight, not "unsent".
-  // A busy lock or unwritable marker comes back with token '' (delivered unreserved).
-  const [held] = await reserveDeliveries(host, gate, v3, [ours[0]]);
-  if (!held) return { status: "already_acked" };
+  // An empty result is closed OR deferred (busy action lock, unreadable ack, failed marker):
+  // a deferred notice is not acked and holds no marker; the next wait retries the reserve.
+  const deferred = [];
+  const [held] = await reserveDeliveries(host, gate, v3, [ours[0]], deferred);
+  if (!held) {
+    if (deferred.length) {
+      return { status: "pending", reason: "wait_again", seq: targetSeq, detail: "delivery deferred: the worker's action lock is busy or its marker could not be written; call wait_tmux_agent again with the same agent_id and seq" };
+    }
+    return { status: "already_acked" };
+  }
   return { finished: held.f, token: held.token };
 }
 
@@ -631,7 +689,7 @@ async function waitTmuxAgent(agentId, timeoutSec = 600, opts = {}) {
           } else if (!episodeMatches(body.episode, targetSeq)) {
             // Episode does not match; wait until done or deadline
           } else {
-            return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, opts.extra);
+            return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, opts.extra, deadline);
           }
         }
       }
@@ -795,7 +853,9 @@ async function closeTmuxAgent(agentId) {
  * behind a dead process (R8 F3). Call after unsent responses are settled.
  */
 async function retireSession() {
+  stopping = true;
   stopHeartbeat();
+  await Promise.allSettled([...beatsInFlight]);
   for (const [id, gate] of gates) {
     if (gate.activation === undefined) continue;
     try {

@@ -36151,11 +36151,14 @@ var require_adapter = __commonJS({
     var { nodeHost } = resolveCoreModule("host.node.ts");
     var REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
     var WAIT_CAP_SEC = 40;
+    var RELEASE_GRACE_MS = 2e3;
     var NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
     var NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";
     var NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unless explicitly authorized.";
     var gates = /* @__PURE__ */ new Map();
     var beatTimers = /* @__PURE__ */ new Map();
+    var stopping = false;
+    var beatsInFlight = /* @__PURE__ */ new Set();
     var inFlightDeliveries = /* @__PURE__ */ new Map();
     var pendingAcks = /* @__PURE__ */ new Map();
     function gateFor(sessionId2) {
@@ -36191,16 +36194,26 @@ var require_adapter = __commonJS({
     async function getHost(cwd) {
       return nodeHost({ owner: await sessionId(), cwd: cwd || process.cwd(), log });
     }
+    async function beat(host, gate) {
+      if (stopping) return false;
+      const p = heartbeat(host, gate);
+      beatsInFlight.add(p);
+      try {
+        return await p;
+      } finally {
+        beatsInFlight.delete(p);
+      }
+    }
     async function ensureAdapterLive(host) {
       const id = host.owner();
       if (!id) return false;
       const gate = gateFor(id);
       if (gate.paused) return false;
-      const live = await heartbeat(host, gate);
-      if (!beatTimers.has(id)) {
+      const live = await beat(host, gate);
+      if (!beatTimers.has(id) && !stopping) {
         const timer = setInterval(() => {
           if (!gate.paused) {
-            void heartbeat(host, gate).catch((err) => {
+            void beat(host, gate).catch((err) => {
               host.log(`heartbeat failed: ${err}`);
             });
           }
@@ -36418,9 +36431,36 @@ REPORT: Final status and summary in result.json`;
       const entries = await listOrThrow(host, ackDir);
       return entries.filter((e) => e.kind === "dir").map((e) => e.name);
     }
-    async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, extra) {
+    async function settledBy(p, deadline, signal) {
+      const ms = deadline - Date.now();
+      if (ms <= 0 || signal && signal.aborted) return false;
+      let timer;
+      let onAbort;
+      const bound = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), ms);
+        if (signal) {
+          onAbort = () => resolve(false);
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+      try {
+        return await Promise.race([p.then(() => true), bound]);
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      }
+    }
+    async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, extra, deadline) {
       const deliveryId = deliveryIdOf({ name: rec.name, seq: targetSeq, owner: desc && desc.owner || rec.owner });
-      while (inFlightDeliveries.has(episodeDir)) await inFlightDeliveries.get(episodeDir);
+      while (inFlightDeliveries.has(episodeDir)) {
+        if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
+          await settledBy(inFlightDeliveries.get(episodeDir) || Promise.resolve(), Date.now() + RELEASE_GRACE_MS, extra && extra.signal);
+          return { status: "already_acked", delivery_id: deliveryId };
+        }
+        if (!await settledBy(inFlightDeliveries.get(episodeDir), deadline, extra && extra.signal)) {
+          return { status: "pending", reason: "wait_again", seq: targetSeq, detail: "an earlier delivery of this episode is still being acked; call wait_tmux_agent again with the same agent_id and seq" };
+        }
+      }
       let notifyDone;
       const inFlight = new Promise((resolve) => {
         notifyDone = resolve;
@@ -36549,8 +36589,14 @@ REPORT: Final status and summary in result.json`;
       if (ours.length !== 1) {
         return { status: "failed", reason: "not_owner", detail: "episode owner changed before delivery (\xA73.3)" };
       }
-      const [held] = await reserveDeliveries(host, gate, v3, [ours[0]]);
-      if (!held) return { status: "already_acked" };
+      const deferred = [];
+      const [held] = await reserveDeliveries(host, gate, v3, [ours[0]], deferred);
+      if (!held) {
+        if (deferred.length) {
+          return { status: "pending", reason: "wait_again", seq: targetSeq, detail: "delivery deferred: the worker's action lock is busy or its marker could not be written; call wait_tmux_agent again with the same agent_id and seq" };
+        }
+        return { status: "already_acked" };
+      }
       return { finished: held.f, token: held.token };
     }
     async function episodeOf(host, workerDir, agentId, seq) {
@@ -36645,7 +36691,7 @@ REPORT: Final status and summary in result.json`;
               if (!TERMINAL.has(body.status)) {
               } else if (!episodeMatches(body.episode, targetSeq)) {
               } else {
-                return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, opts.extra);
+                return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, opts.extra, deadline);
               }
             }
           }
@@ -36791,7 +36837,9 @@ REPORT: Final status and summary in result.json`;
       return { closed: true };
     }
     async function retireSession() {
+      stopping = true;
       stopHeartbeat();
+      await Promise.allSettled([...beatsInFlight]);
       for (const [id, gate] of gates) {
         if (gate.activation === void 0) continue;
         try {
