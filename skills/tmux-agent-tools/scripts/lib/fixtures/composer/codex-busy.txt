@@ -1,0 +1,50 @@
+ 
+  >_ OpenAI Codex (v0.159.3)
+     ~      
+  permissions: YOLO mode
+                                   
+  A fresh prompt. An open question.
+
+⚠ Heads up, you have less than 25% of your 5h limit left. Run /status for a breakdown.
+
+
+› Run the shell command: sleep 40. Then reply only OK.
+
+
+↳ Hook · PONYTAIL:FULL
+
+• Hook failed
+  └ hook returned invalid session start JSON output                              
+                                                                                          
+                                                                                            
+                                                                                             
+                                                                                              
+                                                                                              
+                                                                                               
+                                                                                                
+                                                                                                
+                                                                                                 
+                                                                                                
+                                                                                                
+                                                                                               
+                                                                                             
+                                                                                          
+                                                                                         
+                                                                                       
+
+
+
+
+
+
+
+
+
+• Working (2s • esc to interrupt)                                                              
+
+                                                                                                               ⚠ 5h limit: 20% left · resets at 01:46 · /status
+
+› Ask Codex to do anything                            
+
+  GPT-6.1-Sol medium · 01a0f869-521c-7871-aa69-02c5ee0ca01e · Context 0% used · 01a0f869-521c-7871-aa69-02c5ee0ca01e
+  ← for agents · ? for shortcuts                                                                                                      ⚠ 2 warnings · f2 to view

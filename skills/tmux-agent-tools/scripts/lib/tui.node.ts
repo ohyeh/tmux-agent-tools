@@ -277,7 +277,7 @@ export type TuiAction =
   | { type: 'resume'; value: string }
   | { type: 'tell'; row: PanelRow; text: string }
   | { type: 'assign'; value: string }
-  | { type: 'cancel'; row: PanelRow }
+  | { type: 'cancel'; row: PanelRow; force?: boolean }
   | { type: 'unlock'; row: PanelRow }
   | { type: 'detail' }
 
@@ -323,7 +323,7 @@ export const INPUT_DROPPED = '\x00dropped'
  * buffered until it ends or a bound drops it, so its tail never becomes keys. A CSI or SS3 cut by a byte that cannot
  * belong to it is dropped whole; that byte (Ctrl-C, say) is read as a key.
  * Bounds (a sequence that never ends must not hold the TUI): `expire()` after
- * SEQ_IDLE_MS with no new input drops a started CSI/SS3 or an open paste. A CSI parameter stream past SEQ_MAX is dropped and the rest of it
+ * SEQ_IDLE_MS with no new input drops a started CSI/SS3 or an open paste and skips its tail up to the final byte / ESC[201~. A CSI parameter stream past SEQ_MAX is dropped and the rest of it
  * skipped up to its final byte; a paste past PASTE_MAX is dropped and the rest of
  * it skipped up to ESC[201~. Each drop emits INPUT_DROPPED (a status line), never
  * the dropped bytes as keys. Ctrl-C (0x03) inside an open paste drops the paste and
@@ -351,21 +351,30 @@ export class KeyParser {
     return this.drain(true)
   }
 
-  /** When the caller runs `expire()`: ESC_WAIT_MS for a lone ESC, SEQ_IDLE_MS for a started sequence or paste. */
+  /** When the caller runs `expire()`: ESC_WAIT_MS for a lone ESC, SEQ_IDLE_MS for a started sequence or paste. A skip in progress waits for its terminator, not for the clock. */
   waitMs(): number | undefined {
     if (this.paste === undefined && this.buf === '\x1b') return ESC_WAIT_MS
-    return this.paste !== undefined || this.skipCsi || this.buf ? SEQ_IDLE_MS : undefined
+    const open = this.paste !== undefined ? !this.pasteOver : !this.skipCsi && this.buf !== ''
+    return open ? SEQ_IDLE_MS : undefined
   }
 
-  /** Idle bound reached: a lone ESC is a key; a started sequence or paste is dropped. */
+  /**
+   * Idle bound reached: a lone ESC is a key; a started sequence or paste is dropped and
+   * its tail skipped up to the terminator (ESC[201~ / the CSI final byte), so the rest of
+   * a dead paste or sequence never becomes action keys. Ctrl-C still cuts through.
+   */
   expire(): string[] {
     if (this.paste === undefined && this.buf === '\x1b') return this.flushEsc()
-    const dropped = this.paste !== undefined || this.buf !== ''
+    if (this.paste !== undefined) {
+      const first = !this.pasteOver
+      this.paste = '' // buf keeps only a prefix of ESC[201~
+      this.pasteOver = true
+      return first ? [INPUT_DROPPED] : []
+    }
+    if (this.skipCsi || this.buf === '') return []
     this.buf = ''
-    this.paste = undefined
-    this.pasteOver = false
-    this.skipCsi = false
-    return dropped ? [INPUT_DROPPED] : []
+    this.skipCsi = true
+    return [INPUT_DROPPED]
   }
 
   private drain(force: boolean): string[] {
@@ -569,7 +578,7 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
     if (!row || row.project) return { state }
     // A resumed worker has no episode until its first tell (seq 0).
     if (!row.d.seq) return say(state, `cancel — "${row.d.name}" has no episode yet`, now)
-    return pressTwice(state, `cancel:${row.id}`, now, { type: 'cancel', row })
+    return pressTwice(state, `cancel:${row.id}`, now, { type: 'cancel', row, ...(row.reservation === 'stale' ? { force: true } : {}) })
   }
 
   if (key === 'U') {
@@ -680,7 +689,10 @@ export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
   const keys: [string, string][] = [['t', 'tell']]
   if (r.state === 'running' || r.state === 'stalled') keys.push(['i', 'interrupt'])
   keys.push(['x', stopButtonLabel(r.d.name, armed(r.id))])
-  if (r.d.seq) keys.push(['-', armed(`cancel:${r.id}`) ? `cancel episode ${r.d.seq}? press again` : 'cancel'])
+  if (r.d.seq) {
+    const force = r.reservation === 'stale'
+    keys.push(['-', armed(`cancel:${r.id}`) ? `${force ? 'force-close' : 'cancel'} episode ${r.d.seq}? press again` : force ? 'force-close' : 'cancel'])
+  }
   keys.push(['U', armed(`unlock:${r.id}`) ? 'unlock (maintenance)? press again' : 'unlock'])
   const tail = armed(r.id) ? `  \x1b[31mends its tmux session · ${Math.ceil((state.armedStop!.until - now) / 1000)}s\x1b[0m` : ''
   return [
@@ -1235,7 +1247,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     }
     // Same core calls as `workers.cli.node.ts cancel|unlock`; the second press is the confirm.
     if (action.type === 'cancel') {
-      const out = await cancelEpisode(host, action.row.d.name, action.row.d.seq ?? 0)
+      const out = await cancelEpisode(host, action.row.d.name, action.row.d.seq ?? 0, { force: action.force === true })
       say(`cancel ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       await refreshRows()
       render()

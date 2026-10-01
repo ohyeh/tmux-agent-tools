@@ -7,7 +7,8 @@
 # width, `capture-pane -J`); r refresh; resize to 80x24 and 40x10; t tell reaches
 # the worker and its result shows; a real paste (`paste-buffer -p`) of x, q, qx
 # is text, not keys; x (twice) stops a worker; a viewer (no
-# --session) pressing x - U t c + n changes nothing on disk; q exits and the
+# --session) pressing x - U t c + n changes nothing on disk; R8.5: a resumed worker with a dead
+# pane reads exited, an unacknowledged delivery reads unknown: 可能已送達 and force-closes by - or CLI --force; q exits and the
 # pane's stty is unchanged; an unterminated paste (`send-keys -H` of ESC[200~abc)
 # then Ctrl-C exits and `stty -a` is unchanged (Sol-r2#N2). Bounded polls only;
 # the whole smoke has a deadline.
@@ -294,6 +295,60 @@ T send-keys -t "$CC" -H 03
 check "Ctrl-C in an open paste exits the TUI" wait_for "$CC" 'TUI_EXIT=0' 50
 for _ in {1..25}; do [[ -s "$WORK/stty.ctrlc.after" ]] && break; /bin/sleep 0.2; done
 check "Ctrl-C: stty -a after == stty -a before" cmp -s "$WORK/stty-a.ctrlc.before" "$WORK/stty-a.ctrlc.after"
+
+echo "case: R8.5 a dead resumed pane and an incomplete reservation (TUI wording, force-close by TUI and CLI)"
+# Hand-made ledger rows: `rz` is a resumed worker with no pane (never a tmux session);
+# `rc` and `rd` have an open episode whose `delivering` marker belongs to activation 1 of
+# session `ghost`, which restarted as activation 2 (superseded): the delivery was never acknowledged.
+"$NODE_BIN" -e "
+  const fs = require('node:fs'), path = require('node:path')
+  const v3 = path.join(process.argv[1], '.v3'), repo = process.argv[2]
+  const worker = (name, origin, episode) => {
+    const w = path.join(v3, name); fs.mkdirSync(w, { recursive: true })
+    fs.writeFileSync(path.join(w, 'worker.json'), JSON.stringify({ profile: 'e2ecli', name, dir: repo, since: Date.now() - 60000, owner: '$SESSION', ownerCwd: repo, origin }))
+    if (!episode) return
+    const ep = path.join(w, 'episodes', '1'); fs.mkdirSync(path.join(ep, 'sent'), { recursive: true })
+    fs.writeFileSync(path.join(ep, 'dispatch.json'), JSON.stringify({ seq: 1, since: Date.now() - 60000, owner: '$SESSION', resultPath: path.join(w, 'result.json'), origin: 'tell' }))
+    fs.writeFileSync(path.join(ep, 'delivering'), JSON.stringify({ token: 'old', activation: 1, session: 'ghost', at: 1 }))
+  }
+  worker('rz.abcde', 'resume', false); worker('rc.abcde', 'assign', true); worker('rd.abcde', 'assign', true)
+  const hex = [...Buffer.from('ghost')].map(b => b.toString(16).padStart(2, '0')).join('')
+  fs.mkdirSync(path.join(v3, '.sessions', hex, 'act', '1'), { recursive: true })
+  fs.mkdirSync(path.join(v3, '.sessions', hex, 'act', '2'), { recursive: true })
+" "$TMUX_AGENT_DIR" "$WORK/repo"
+RC="$TMUX_AGENT_DIR/.v3/rc.abcde/episodes/1"
+RD="$TMUX_AGENT_DIR/.v3/rd.abcde/episodes/1"
+T new-session -d -s res -x 140 -y 40 "$RUN owner"
+R="=res:"
+check "the TUI draws the resumed worker whose pane is gone as exited" wait_for "$R" 'rz\.abcde.*exited — no result' 50
+# Walk the selection to rc: the row's own line says unknown: 可能已送達.
+for _ in {1..8}; do screen "$R" | grep -q '› rc\.abcde' && break; keys "$R" j; /bin/sleep 0.3; done
+check "rc is selected" wait_for "$R" '› rc\.abcde' 25
+check "the incomplete reservation reads unknown: 可能已送達" wait_for "$R" 'rc\.abcde.*unknown: 可能已送達' 25
+check "the key hint offers force-close" wait_for "$R" '\[ - force-close \]' 25
+for _ in {1..8}; do screen "$R" | grep -q '› rz\.abcde' && break; keys "$R" j; /bin/sleep 0.3; done
+check "rz selected: its summary says the pane is gone" wait_for "$R" 'resumed worker: its pane is gone' 25
+for _ in {1..8}; do screen "$R" | grep -q '› rc\.abcde' && break; keys "$R" j; /bin/sleep 0.3; done
+check "rc is selected again" wait_for "$R" '› rc\.abcde' 25
+keys "$R" -
+check "- arms the force-close" wait_for "$R" 'force-close episode 1\? press again' 25
+/bin/sleep 0.5
+keys "$R" -
+check "force-close ran" wait_for "$R" 'cancel rc\.abcde — ok: force-closed episode 1' 50
+check "force-close text keeps 可能已送達" wait_for "$R" 'force-closed episode 1 of .*: unknown: 可能已送達' 10
+check "only acks/cancel was added to rc" test "$(ls $RC/acks)" = cancel
+# The same core call by CLI: refuses without --force, closes with it.
+cli cancel rd.abcde 1 > "$WORK/cancel-plain.out" || true
+check "CLI without --force: unknown: 可能已送達, nothing closed" sh -c "grep -q 'unknown: 可能已送達' '$WORK/cancel-plain.out' && test ! -e '$RD/acks/cancel'"
+"$NODE_BIN" "$LIB/workers.cli.node.ts" cancel rd.abcde 1 --force --cwd "$WORK/repo" > "$WORK/cancel-noses.out" 2>&1 || true
+check "CLI without --session cannot force-close" sh -c "test ! -e '$RD/acks/cancel'"
+cli cancel rd.abcde 1 --force > "$WORK/cancel-force.out"
+check "CLI --force closes it and says 可能已送達" sh -c "grep -q 'force-closed episode 1' '$WORK/cancel-force.out' && grep -q '可能已送達' '$WORK/cancel-force.out' && test \"\$(ls $RD/acks)\" = cancel"
+sleep 1
+"$NODE_BIN" "$LIB/workers.cli.node.ts" rows --session "$SESSION" --cwd "$WORK/repo" > "$WORK/rows.json"
+check "a later reconcile does not deliver it: no done ack, no marker rewrite" sh -c "test ! -e '$RC/acks/done' && test ! -e '$RD/acks/done'"
+keys "$R" q
+check "the R8.5 TUI exited 0" wait_for "$R" 'TUI_EXIT=0' 50
 
 (( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; echo "--- tree diff"; diff "$WORK/tree.before" "$WORK/tree.after" 2>/dev/null | head -20 || true; }
 echo

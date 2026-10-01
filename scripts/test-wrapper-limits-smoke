@@ -8,6 +8,10 @@
 #   c. late fold: E1 blocked → tell E2 → stop folds the lifecycle into E1's
 #      path only; E1 keeps its status and episode; E2's result is unchanged
 #   d. a result left by an earlier launch of the name is preserved, not deleted
+#   g. two starters of one name: A paused right after its has-session while B
+#      starts. Exactly one wins; the loser writes none of the winner's state
+#      (result, launch state, pane-id); an empty or unreadable pane-id makes
+#      stop refuse
 #   f. the protocol docs name no `current` seq pointer (it has no writer/reader)
 # Two private servers: B is tmux's default socket under a private TMUX_TMPDIR,
 # A is an explicit -S socket. Never the user's server.
@@ -165,6 +169,69 @@ assert "b: the host session is on server A" "$(tmux_a has-session -t '=wlim-cmdr
 assert "b: the host session is not on the default server" "$(tmux_b has-session -t '=wlim-cmdr' 2>/dev/null && echo yes || echo no)" no
 assert "b: the panel line is set on A" "$(tmux_a show-options -v -t '=wlim-cmdr:' 'status-format[1]' 2>/dev/null | grep -c ' panel ' || true)" 1
 assert_contains "b: the collector is up" "$out" "collector pid"
+
+print -r -- "case g: a start paused after its live-name check cannot disturb a concurrent start"
+# Shim tmux: the first has-session of the process with GCUT set reports at-cut,
+# then waits for release (the cut point between precheck and state init).
+cat > "$WORK/bin/tmux-cut" <<SHIM
+#!/bin/bash
+"$REAL_TMUX" "\$@"; rc=\$?
+if [ -n "\${GCUT:-}" ] && [ "\$1" = has-session ] && [ ! -e "$WORK/cut-done" ]; then
+  : > "$WORK/cut-done"; : > "$WORK/at-cut"
+  for _ in \$(seq 1 300); do [ -e "$WORK/release" ] && break; sleep 0.1; done
+fi
+exit \$rc
+SHIM
+chmod +x "$WORK/bin/tmux-cut"
+G="$TMUX_AGENT_DIR/gname"
+GCUT=1 TMUX="$WORK/bin/tmux-cut" "$AGENT_TMUX" fakecli start --exact gname "$WORK/repo" >"$WORK/ga.out" 2>&1 &
+pid_a=$!
+for (( i = 0; i < 100; i++ )); do [[ -e "$WORK/at-cut" ]] && break; sleep 0.1; done
+assert "g: A reached the cut point" "$([[ -e "$WORK/at-cut" ]] && echo yes || echo no)" yes
+"$AGENT_TMUX" fakecli start --exact gname "$WORK/repo" >"$WORK/gb.out" 2>&1 &
+pid_b=$!
+# Before the fix B finishes at once (A is only paused); after it B waits on A's lock.
+winner=""
+for (( i = 0; i < 25; i++ )); do kill -0 $pid_b 2>/dev/null || { winner=B; break; }; sleep 0.1; done
+code_a=0; code_b=0
+if [[ $winner == B ]]; then
+  wait $pid_b || code_b=$?
+else
+  : > "$WORK/release"; wait $pid_a || code_a=$?; winner=A
+fi
+gpane="$(tr -d '[:space:]' < "$G/pane-id" 2>/dev/null || true)"
+glaunch="$(jq -r .launch_id "$G/launch-meta.json" 2>/dev/null || true)"
+printf '{"status":"success","summary":"winner","episode":1}\n' > "$G/result.json"
+rsum="$(shasum "$G/result.json" | cut -d' ' -f1)"
+: > "$WORK/release"
+if [[ $winner == B ]]; then wait $pid_a || code_a=$?; else wait $pid_b || code_b=$?; fi
+if [[ $winner == A ]]; then won=$code_a lost=$code_b; else won=$code_b lost=$code_a; fi
+print -r -- "  g: winner=$winner A_exit=$code_a B_exit=$code_b"
+assert "g: the winner exits 0" "$won" 0
+assert "g: the loser exits non-zero" "$(( lost != 0 ))" 1
+live="$(tmux_b display-message -p -t '=wlim-gname:' '#{pane_id}' 2>/dev/null || true)"
+assert "g: pane-id is the live winner pane, not truncated" "$(tr -d '[:space:]' < "$G/pane-id")" "$live"
+assert "g: the loser kept the winner's launch state" "$(jq -r .launch_id "$G/launch-meta.json")" "$glaunch"
+assert "g: the winner's result.json is preserved in place" "$(shasum "$G/result.json" 2>/dev/null | cut -d' ' -f1)" "$rsum"
+legacy=("$G"/legacy-*(N))
+assert "g: nothing moved to legacy-*" "${#legacy}" 0
+assert "g: the winner session is alive" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" yes
+
+print -r -- "case g: stop refuses an empty or unreadable pane-id binding"
+: > "$G/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli stop gname 2>&1)" || code=$?
+assert "g: stop with an empty pane-id exits non-zero" "$(( code != 0 ))" 1
+assert_contains "g: the refusal names pane-id" "$out" "pane-id is missing, empty, or unreadable"
+assert "g: the session survives the empty binding" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" yes
+printf '%s\n' "$live" > "$G/pane-id"; chmod 000 "$G/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli stop gname 2>&1)" || code=$?
+chmod 600 "$G/pane-id"
+assert "g: stop with an unreadable pane-id exits non-zero" "$(( code != 0 ))" 1
+assert "g: the session survives the unreadable binding" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" yes
+"$AGENT_TMUX" fakecli stop gname >/dev/null 2>&1 || true
+assert "g: stop with a valid binding still stops it" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" no
 
 print -r -- "case f: the protocol docs name no \`current\` seq pointer"
 hits="$(cd "$REPO_ROOT" && grep -n '`current`' docs/tmux-agent-mod.md README.md skills/tmux-agent-tools/SKILL.md skills/tmux-agent-tools/references/*.md || true)"

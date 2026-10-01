@@ -53,6 +53,7 @@ import {
   wrapCells,
   MUTATING_KEYS,
   READ_ONLY,
+  rowHints,
   PAGE_DOWN,
   PAGE_UP,
   ANSI_CLEAR_HOME,
@@ -2364,10 +2365,25 @@ test('Sol-r2#N2 parser bounds: Ctrl-C in an open paste, the idle bound, and an o
   assert.deepEqual(p.feed('\x1b[200~abc'), [])
   assert.equal(p.waitMs(), SEQ_IDLE_MS, 'an open paste has the idle bound')
   assert.deepEqual(p.expire(), [INPUT_DROPPED], 'the idle bound drops the paste')
-  assert.deepEqual(p.feed('q'), ['q'], 'normal keys again')
+  // Sol-r3 R3-5: the tail of the dropped paste is skipped up to ESC[201~, never read as keys.
+  assert.equal(p.waitMs(), undefined, 'a skip in progress waits for its terminator, not the clock')
+  assert.deepEqual(p.expire(), [], 'a second idle expiry does not repeat the notice')
+  assert.deepEqual(p.feed('q\x1b[201~'), [], 'q inside the dead paste is not quit')
+  assert.deepEqual(p.feed('q'), ['q'], 'normal keys again after the end marker')
   assert.deepEqual(p.feed('\x1b[12'), [])
   assert.equal(p.waitMs(), SEQ_IDLE_MS)
   assert.deepEqual(p.expire(), [INPUT_DROPPED], 'the idle bound drops a started CSI')
+  assert.deepEqual(p.feed('3'), [], 'a CSI parameter byte after the drop is skipped')
+  assert.deepEqual(p.feed('x'), [], 'the CSI final byte ends the skip and is not a key')
+  assert.deepEqual(p.feed('x'), ['x'], 'normal keys again after the final byte')
+  const split = new KeyParser()
+  split.feed('\x1b[200~abc\x1b[20')
+  assert.deepEqual(split.expire(), [INPUT_DROPPED])
+  assert.deepEqual(split.feed('1~q'), ['q'], 'an end marker split across the idle drop still ends the skip')
+  const ctrlc = new KeyParser()
+  ctrlc.feed('\x1b[200~abc')
+  ctrlc.expire()
+  assert.deepEqual(ctrlc.feed('q\x03'), ['\x03'], 'Ctrl-C cuts through a skip')
   assert.deepEqual(p.feed('\x1b'), [])
   assert.equal(p.waitMs(), ESC_WAIT_MS, 'a lone ESC keeps its short wait')
   assert.deepEqual(p.expire(), ['\x1b'])
@@ -2388,7 +2404,20 @@ test('Sol-r2#N2 parser bounds: Ctrl-C in an open paste, the idle bound, and an o
   assert.deepEqual(got, [INPUT_DROPPED, 'q'], 'only the drop notice and the key after the end marker')
 })
 
-test('Sol-r2#N2 runTui: an unterminated paste then Ctrl-C ends the run and restores the terminal; idle time alone frees the keys', async () => {
+test('Sol-r3 R3-5: after the idle drop, the tail of a dead paste or CSI is skipped to its terminator, never read as action keys', () => {
+  const p = new KeyParser()
+  assert.deepEqual(p.feed('\x1b[200~unfinished'), [])
+  assert.deepEqual(p.expire(), [INPUT_DROPPED])
+  assert.deepEqual(p.feed('q\x1b[201~'), [], 'q in the dead paste is not an action key')
+  assert.deepEqual(p.feed('q'), ['q'], 'the end marker frees the keys')
+  const c = new KeyParser()
+  c.feed('\x1b[1;')
+  assert.deepEqual(c.expire(), [INPUT_DROPPED])
+  assert.deepEqual(c.feed('x'), [], 'the CSI final byte is skipped, not a key (x would stop a worker)')
+  assert.deepEqual(c.feed('x'), ['x'])
+})
+
+test('Sol-r2#N2 runTui: an unterminated paste then Ctrl-C ends the run and restores the terminal; the end marker (not idle time) frees the keys', async () => {
   for (const how of ['ctrl-c', 'idle'] as const) {
     const { stdin, stdout } = mockTty()
     const root = mkdtempSync(join(tmpdir(), 'tui-n2-'))
@@ -2406,7 +2435,10 @@ test('Sol-r2#N2 runTui: an unterminated paste then Ctrl-C ends the run and resto
         await until(() => stdout.written.includes('dropped an unfinished paste'), SEQ_IDLE_MS + 3_000, `${how}: the drop status`)
         assert.equal(ended, false)
         stdin.emit('data', 'q')
-        await until(() => ended, 3_000, `${how}: q after the idle bound to end the run`)
+        await tick(ESC_WAIT_MS * 4)
+        assert.equal(ended, false, 'q inside the dropped paste is skipped, not quit')
+        stdin.emit('data', '\x1b[201~q')
+        await until(() => ended, 3_000, `${how}: q after the end marker to end the run`)
       }
     } finally {
       if (!ended) {
@@ -2578,4 +2610,69 @@ test('Sol#13 SGR inside a grapheme: truncation cuts only at whole visible graphe
       }
     }
   })
+})
+
+
+test('R8.5: a stale delivery reservation shows "unknown: 可能已送達" and - force-closes it (same core call as the CLI); a dead resumed pane shows exited', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-r85-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-r85-repo-'))
+  const base = nodeHost({ owner: 'S', cwd: repo })
+  base.envTmuxAgentDir = async () => root
+  const outside = new Set(['git', 'sh', 'tmux', 'agent-tmux'])
+  const host = {
+    ...base,
+    run: async (argv: readonly string[], cwd: string, ms: number) =>
+      outside.has(argv[0]!) ? { exitCode: 0, stdout: '', stderr: '' } : base.run(argv, cwd, ms),
+  }
+  const r = await assignWorker(host, { profile: 'claude', name: 'res', dir: repo, brief: 'GOAL: g\nACCEPTANCE: a\nREPORT: r\n' }, { owner: 'S', ownerCwd: repo })
+  if ('deny' in r) assert.fail(r.deny)
+  const rs = await resumeWorker(host, 'codex 12345678-1234-1234-1234-123456789abc')
+  assert.ok(rs.ok, rs.text)
+  // `ghost` delivered and lost its activation: activation 1 is superseded by 2.
+  const gd = join(sessionDirOf(v3Of(root), 'ghost'), 'act')
+  mkdirSync(join(gd, '1'), { recursive: true })
+  mkdirSync(join(gd, '2'), { recursive: true })
+  writeFileSync(join(r.stateDir, 'episodes', '1', 'delivering'), JSON.stringify({ token: 'old', activation: 1, session: 'ghost', at: 1 }))
+  const pause = (ms: number) => new Promise(res => setTimeout(res, ms))
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 200
+  stdout.rows = 40
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000 })
+  const shown = () => stripAnsi(stdout.written)
+  try {
+    await until(() => shown().includes(r.name), 5_000, 'the rows')
+    assert.match(shown(), /codex-12345678\.[0-9a-z]{5}\s+exited — no result/, 'the resumed worker with a dead pane')
+    const rows = shown().split('\n').map(l => l.trim())
+    // Select the assigned worker's row (the list order is not the point of this test).
+    for (let i = 0; i < 4 && !shown().includes(`› ${r.name}`); i++) {
+      stdin.emit('data', 'j')
+      await pause(150)
+    }
+    await until(() => shown().includes('unknown: 可能已送達'), 5_000, 'the honest wording')
+    await until(() => /- force-close/.test(shown()), 5_000, 'the force-close hint')
+
+    stdin.emit('data', '-')
+    await until(() => shown().includes('force-close episode 1? press again'), 5_000, 'the arm')
+    await pause(STOP_REPEAT_MS + 50)
+    stdin.emit('data', '-')
+    await until(() => shown().includes(`cancel ${r.name} — ok: force-closed episode 1 of "${r.name}"`), 5_000, 'force-close text')
+    assert.match(shown(), /force-closed episode 1 of "[^"]+": unknown: 可能已送達/)
+    assert.deepEqual(readdirSync(join(r.stateDir, 'episodes', '1', 'acks')), ['cancel'])
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
+test('R8.5 key-state: - on a stale reservation arms force-close; the viewer stays read-only', () => {
+  const s = ownerState()
+  const row = { ...s.rows[0]!, state: 'unknown' as const, reservation: 'stale' as const }
+  const t = { ...s, rows: [row], all: [row] }
+  assert.match(rowHints(t, row, 1).join('\n'), /- force-close/)
+  const one = nextKeyState(t, '-', 1_000)
+  assert.equal(one.action, undefined)
+  assert.deepEqual(nextKeyState(one.state, '-', 1_000 + STOP_REPEAT_MS).action, { type: 'cancel', row, force: true })
+  const v = nextKeyState({ ...t, viewer: true }, '-', 1_000)
+  assert.equal(v.action, undefined)
+  assert.equal(v.state.statusMessage, READ_ONLY)
 })

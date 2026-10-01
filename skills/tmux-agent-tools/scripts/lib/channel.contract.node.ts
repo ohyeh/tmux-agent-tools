@@ -287,6 +287,55 @@ test('S3 cut point: A read channel=mcp outside the lock, B hands over to node, A
   }
 })
 
+test('Sol-r3 R3-3: a failed channel publish leaves the old channel in place — no instant without an authority, no third registrant', async () => {
+  for (const step of ['ln', 'mv'] as const) {
+    const w = world()
+    try {
+      await mcpRegisteredNoState(w)
+      const bad: Host = {
+        ...w.host,
+        run: async (argv, cwd, ms) =>
+          argv[0] === step && String(argv.at(-1)).startsWith(`${w.sd}/channel`) && !String(argv.at(-1)).startsWith(`${w.sd}/channel.lock`)
+            ? { exitCode: 1, stdout: '', stderr: `EIO injected channel ${step}` }
+            : w.host.run(argv, cwd, ms),
+      }
+      const out = await handoverChannel(bad, w.root, SESSION, 'node', true, noProcs)
+      assert.equal(out.ok, false, step)
+      assert.ok(linked(`${w.sd}/channel`), `${step}: a channel record still exists`)
+      assert.equal(channelOf(w), 'mcp', `${step}: the old channel keeps its authority`)
+      assert.ok(!linked(`${w.sd}/channel.lock`), `${step}: nothing is left held`)
+      assert.deepEqual(readdirSync(w.sd).filter(f => f.startsWith('channel.') && f !== 'channel.lock'), [], `${step}: no temp record is left`)
+      const mod = gateOf('mod')
+      assert.equal(await heartbeat(w.host, mod), false, `${step}: an unrelated channel is refused, not first-writer`)
+      assert.match(mod.paused ?? '', /collected by its mcp channel/)
+      assert.equal(channelOf(w), 'mcp')
+      assert.match(out.text, /the mcp channel is unchanged/, `${step}: the message matches the state kept`)
+    } finally {
+      rmSync(w.root, { recursive: true, force: true })
+    }
+  }
+})
+
+test('Sol-r3 R3-6: a handover whose lock release leaves a guard says so and exits not-ok, though the switch happened', async () => {
+  const w = world()
+  try {
+    await mcpRegisteredNoState(w)
+    const bad: Host = {
+      ...w.host,
+      run: async (argv, cwd, ms) =>
+        argv[0] === 'rm' && argv[1] === `${w.sd}/channel.lock.unlock` ? { exitCode: 1, stdout: '', stderr: 'EACCES injected guard' } : w.host.run(argv, cwd, ms),
+    }
+    const out = await handoverChannel(bad, w.root, SESSION, 'node', true, noProcs)
+    assert.equal(out.ok, false)
+    assert.match(out.text, /mcp → node/, 'the switch is reported')
+    assert.match(out.text, /release of .*channel\.lock is incomplete: its guard .*channel\.lock\.unlock remains/)
+    assert.equal(channelOf(w), 'node')
+    assert.ok(linked(`${w.sd}/channel.lock.unlock`))
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
 test('handover CLI: the maintenance command runs from the entry, dry run exits 1, --yes exits 0 and switches', async () => {
   const w = world()
   try {

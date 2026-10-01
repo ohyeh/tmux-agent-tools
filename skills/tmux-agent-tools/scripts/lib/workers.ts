@@ -23,6 +23,7 @@ import {
   numericChildren,
   openEpisode,
   probeHolder,
+  publish,
   publishWorker,
   readDescriptor,
   readHolder,
@@ -52,6 +53,8 @@ export type TmuxStalled = {
 }
 
 export type TmuxDispatch = {
+  /** A resumed worker with no episode yet (seq 0): a row with nothing to deliver. */
+  resumed?: true
   profile: string
   name: string
   /** Absolute working directory the worker was given. */
@@ -338,7 +341,8 @@ export type Host = {
   storeSet: (key: string, value: unknown) => Promise<void>
   storeKeys: () => Promise<string[]>
   storeDelete: (key: string) => Promise<void>
-  submit: (text: string) => Promise<{ text?: string; drop?: string } | undefined>
+  /** `drop`: refused (counts toward the pause). `deferred`: nothing was sent and the reason says why (a draft, a busy host, a dialog); not a refusal, retried next pass. */
+  submit: (text: string) => Promise<{ text?: string; drop?: string; deferred?: string } | undefined>
   /** Best-effort: a surface that cannot toast must never abort a delivery. */
   toast: (text: string) => void
   log: (text: string) => void
@@ -512,6 +516,8 @@ export type PanelRow = {
   holder?: string
   /** A finished row's own words, so the panel can show what it did without a mirror. */
   summary?: string
+  /** The delivery of this episode was reserved (`delivering`) and never acknowledged: `stale` = its activation is gone, `unknown` = the marker could not be read. */
+  reservation?: 'stale' | 'unknown'
   /** result.json status is in `TERMINAL`. Still listed, but not "running now". */
   terminal: boolean
   /** A detached tmux session of this cwd, not a worker this mod dispatched. */
@@ -529,6 +535,8 @@ export type Gate = {
   paused?: string
   /** Why the last registration tick registered nothing (channel.lock busy, channel state unknown); retried next tick. */
   waiting?: string
+  /** Why the last delivery was deferred (host composer not empty, paste blocked); kept while it holds, cleared by a delivery. Published in `act/<n>.state` as `reason`. */
+  deferred?: string
   /** A view's reading of its session's collector (`act/<n>.state` + beat, C-health). Unset on the collector. */
   viewHealth?: Health
   /** A view's last scan error (errno or Error name): the ledger could not be read. */
@@ -562,6 +570,8 @@ export type Gate = {
   blocked: Map<string, string>
   /** The last `tmux ls` that answered, so one slow tick cannot empty the panel. */
   alive?: Set<string>
+  /** `tmux ls` answered at its last call. `false` = it did not (the set above is then an older answer, or empty). */
+  aliveKnown?: boolean
   /**
    * Detached tmux sessions of this cwd from the last reconcile that answered
    * `list-sessions`. The 2s mirror clock reads this; it does not list again.
@@ -678,6 +688,106 @@ export async function ackFinished(host: Host, v3: string, f: Finished): Promise<
   if ((kind === 'done' || kind === 'expired') && !f.observation) return 'unknown'
   if (f.status !== UNATTRIBUTED && f.observation && (await ackDir(host, ep, f.observation)) === 'unknown') return 'unknown'
   return ackDir(host, ep, kind)
+}
+
+/** `<worker>/stopped`: this mod stopped the pane on purpose (create-once dir). */
+export const STOPPED = 'stopped'
+/** `episodes/<seq>/delivering`: written under the action lock before a submit, removed after its ack (plan §1c S8). */
+export const DELIVERING = 'delivering'
+/** The wording of a delivery that may have happened (§1c S8): it is never reported as "not delivered". */
+export const MAYBE_DELIVERED = 'unknown: 可能已送達'
+export type Reservation = 'none' | 'in-flight' | 'stale' | 'unknown'
+
+/**
+ * The state of an episode's `delivering` marker. `in-flight` = its activation is the
+ * session's authoritative one and live; `stale` = that activation is superseded or the
+ * session is non-live. A marker or registration that cannot be read is `unknown`,
+ * never `stale` (unknown is not dead).
+ */
+export async function reservationOf(host: Host, v3: string, epDir: string): Promise<Reservation> {
+  const text = await readOrAbsent(host, `${epDir}/${DELIVERING}`)
+  if (text === undefined) return 'none'
+  if (text === UNKNOWN) return 'unknown'
+  const m = parseJson(text) as { session?: unknown; activation?: unknown } | undefined
+  if (typeof m?.session !== 'string' || !m.session || typeof m.activation !== 'number') return 'unknown'
+  const dir = sessionDirOf(v3, m.session)
+  const sup = await superseded(host, dir, m.activation)
+  if (sup === undefined) return 'unknown'
+  if (sup) return 'stale'
+  const live = await sessionLiveness(host, dir, await host.now())
+  return live === 'live' || live === 'initializing' ? 'in-flight' : live === 'non-live' ? 'stale' : 'unknown'
+}
+
+/**
+ * Reserve each notice's episode before its submit (§1c S8): under the worker's action
+ * lock, re-check that the episode is open, then publish the marker (tmp + rename).
+ * A busy lock or an unwritable marker does not hold the notice back: it goes out unreserved (token '').
+ */
+export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: readonly Finished[]): Promise<{ f: Finished; token: string }[]> {
+  const out: { f: Finished; token: string }[] = []
+  const names = [...new Set(fs.map(f => f.d.name))]
+  for (const name of names) {
+    const mine = fs.filter(f => f.d.name === name)
+    const w = `${v3}/${name}`
+    const lock = await takeLock(host, w, undefined, String(gate.activation ?? ''))
+    if (!lock.ok) {
+      // Best effort: a stuck or foreign lock must not stop delivery (F3). No marker is
+      // written then, so a cancel in that window is not fenced (docs: known limits).
+      host.log(`tmux-agent: ${name} is locked by another action; delivering without a delivery marker`)
+      for (const f of mine) out.push({ f, token: '' })
+      continue
+    }
+    try {
+      for (const f of mine) {
+        const ep = episodeDirOf(v3, f.d)
+        if (!f.d.seq) {
+          out.push({ f, token: '' })
+          continue
+        }
+        const acks = await ackNames(host, ep)
+        if (!acks || acks.some(n => CLOSED_ACKS.includes(n))) continue
+        const token = randomBase36(12)
+        const marker = { token, activation: gate.activation, session: host.owner() ?? '', at: await host.now() }
+        const wrote = await publish(host, `${ep}/${DELIVERING}`, JSON.stringify(marker), token).catch((error: unknown) => {
+          host.log(`tmux-agent: could not publish ${ep}/${DELIVERING}: ${String(error)}`)
+          return false
+        })
+        if (wrote) out.push({ f, token })
+        else {
+          host.log(`tmux-agent: could not write the delivery marker of ${idOf(f.d)}; delivering without it`)
+          out.push({ f, token: '' })
+        }
+      }
+    } finally {
+      await releaseLock(host, `${w}/.action`, lock.token)
+    }
+  }
+  return out
+}
+
+/** After the ack (or a refused submit): under the lock, remove each marker that still carries this call's token. */
+export async function releaseDeliveries(host: Host, v3: string, held: readonly { f: Finished; token: string }[]): Promise<void> {
+  const names = [...new Set(held.filter(h => h.token).map(h => h.f.d.name))]
+  for (const name of names) {
+    const w = `${v3}/${name}`
+    const lock = await takeLock(host, w)
+    if (!lock.ok) {
+      host.log(`tmux-agent: ${name} is locked; its delivery marker stays until the next delivery replaces it`)
+      continue
+    }
+    try {
+      for (const h of held.filter(x => x.f.d.name === name && x.token)) {
+        const path = `${episodeDirOf(v3, h.f.d)}/${DELIVERING}`
+        const m = parseJson((await readOrAbsent(host, path)) ?? '') as { token?: unknown } | undefined
+        // A different token is a newer reservation (another activation): it stays.
+        if (m?.token !== h.token) continue
+        const rm = await host.run(['rm', '-f', path], '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+        if (rm.exitCode !== 0) host.log(`tmux-agent: could not remove ${path}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`)
+      }
+    } finally {
+      await releaseLock(host, `${w}/.action`, lock.token)
+    }
+  }
 }
 
 /** The worker's own free text is data, never instruction. Bounded and fenced. */
@@ -1007,6 +1117,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
       name: rec.name,
       dir: rec.dir,
       since: rec.since,
+      ...(rec.origin === 'resume' ? { resumed: true as const } : {}),
       ...(rec.owner ? { owner: rec.owner } : {}),
       ...(rec.ownerCwd ? { ownerCwd: rec.ownerCwd } : {}),
       seq: 0,
@@ -1592,7 +1703,8 @@ export async function flagStalls(
     `tmux-agent: ${still.length} worker(s) look stopped by their CLI — peek at the pane before waiting on a result.`,
     ...still.map(w => w.text),
   ].join('\n')
-  const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error) }))
+  const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error), deferred: undefined }))
+  if (answer?.deferred) return // nothing was sent: not noticed, not a drop; the next pass asks again
   if (!answer?.drop) {
     for (const w of still) gate.stallNoticed.add(w.id)
     return
@@ -1701,6 +1813,7 @@ export function elapsed(ms: number): string {
  */
 export async function liveSessions(host: Host, cwd: string, gate?: Gate): Promise<Set<string>> {
   const run = await host.run(['tmux', 'ls', '-F', '#S'], cwd, LIVE_PROBE_MS).catch(() => undefined)
+  if (gate) gate.aliveKnown = !!run
   if (!run) return gate?.alive ?? new Set()
   const alive = run.exitCode === 0 ? new Set(run.stdout.split('\n').map(l => l.trim()).filter(Boolean)) : new Set<string>()
   if (gate) gate.alive = alive
@@ -1736,7 +1849,17 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
   // A row synthesized because an episode was skipped as UNKNOWN is not delivered.
   const delivered = dispatches.filter(d => settled(reported, d) && !withheld.has(d.name))
   const alive = delivered.length ? await liveSessions(host, delivered[0]!.dir, gate) : new Set<string>()
-  const live = dispatches.filter(d => !settled(reported, d) || hasSession(alive, d))
+  // A resumed worker with no episode has no `exited` notice to carry its pane's end, so
+  // the row stays while the pane is gone (until a stop is recorded). `tmux ls` that did
+  // not answer is `unknown`, never `exited`.
+  const resumedGone = new Map<string, 'exited' | 'unknown'>()
+  for (const d of delivered) {
+    if (!d.resumed || hasSession(alive, d)) continue
+    const stopped = v3 ? await host.exists(`${v3}/${d.name}/${STOPPED}`).catch(() => undefined) : undefined
+    if (stopped === true) continue
+    resumedGone.set(d.name, stopped === undefined || gate.aliveKnown === false ? 'unknown' : 'exited')
+  }
+  const live = dispatches.filter(d => !settled(reported, d) || hasSession(alive, d) || resumedGone.has(d.name))
   const rows: PanelRow[] = []
   for (const d of live) {
     const id = idOf(d)
@@ -1771,10 +1894,26 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       failed = !!lf && !unreadable
     }
     const holder = await holderOf(host, v3, d, now, beats)
+    // An open episode whose delivery was reserved and never acknowledged (§1c S8).
+    const held = v3 && d.seq && !reported.has(id) ? await reservationOf(host, v3, episodeDirOf(v3, d)) : 'none'
+    const reservation = held === 'stale' || held === 'unknown' ? held : undefined
+    const gone = resumedGone.get(d.name)
+    if (reservation) {
+      summary =
+        reservation === 'stale'
+          ? `${MAYBE_DELIVERED} — never acknowledged; "cancel ${d.name} ${d.seq} --force" (TUI: -) stops new attempts only`
+          : `${MAYBE_DELIVERED} — its delivery marker could not be read`
+    } else if (gone) {
+      summary = gone === 'exited' ? 'resumed worker: its pane is gone (before any tell); x records the stop and clears the row' : 'resumed worker: whether its pane is alive is unknown (tmux ls did not answer)'
+    }
     rows.push({
       id,
       d,
-      state: failed
+      state: reservation || gone === 'unknown'
+        ? 'unknown'
+        : gone
+          ? 'exited'
+          : failed
         ? 'launch-failed'
         : reported.has(id) && !withheld.has(d.name)
           ? 'delivered'
@@ -1793,6 +1932,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       ageMs: Math.min(endedAt ?? now, now) - d.since,
       ...(holder ? { holder } : {}),
       ...(summary ? { summary } : {}),
+      ...(reservation ? { reservation } : {}),
       ...(blockedReason ? { blockedReason } : {}),
       terminal: done,
     })
@@ -1992,7 +2132,11 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
   const silent = await stillOurs(host, gate, v3, parted.silent)
   if (!deliver || !silent) return
 
-  const { text, included } = deliver.length ? payloadOf(deliver) : { text: '', included: [] as Finished[] }
+  const reserved = await reserveDeliveries(host, gate, v3, deliver)
+  const { text, included } = reserved.length ? payloadOf(reserved.map(r => r.f)) : { text: '', included: [] as Finished[] }
+  const held = reserved.filter(r => included.includes(r.f))
+  // Reserved but not in the payload (it was cut): not sent, so not held.
+  await releaseDeliveries(host, v3, reserved.filter(r => !included.includes(r.f)))
   if (!included.length && !silent.length) return
 
   // A completed waiter already spoke (its turn.complete). Ack it with no prompt.
@@ -2005,13 +2149,24 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
     }
 
     let refusal: string | undefined
+    let deferred: string | undefined
     try {
       const answer = await host.submit(text)
       if (answer?.drop) refusal = `refused: ${answer.drop}`
+      else deferred = answer?.deferred
     } catch (error) {
       refusal = String(error)
     }
+    if (deferred) {
+      // Nothing was sent, so nothing is acked and nothing counts as a refusal; the reason stays visible while it holds.
+      await releaseDeliveries(host, v3, held)
+      gate.deferred = deferred
+      await writeActState(host, gate)
+      return
+    }
     if (refusal) {
+      // Refused (or thrown): the submit did not take, so the next tick reserves again.
+      await releaseDeliveries(host, v3, held)
       gate.failures += 1
       gate.nextAttemptAt = now + (BACKOFF_MS[gate.failures - 1] ?? 0)
       if (gate.failures >= FAIL_MAX) {
@@ -2029,6 +2184,10 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
 
   gate.failures = 0
   gate.nextAttemptAt = 0
+  if (gate.deferred) {
+    gate.deferred = undefined
+    await writeActState(host, gate)
+  }
   // Only what the session actually accepted is acknowledged: the exact episode each
   // notice names (§5), never re-read after the await. A failed ack re-reports.
   for (const f of [...silent, ...included]) {
@@ -2036,6 +2195,7 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
     const res = await ackFinished(host, v3, f)
     if (res === 'unknown') host.log(`tmux-agent: could not ack ${idOf(f.d)} (${ackKindOf(f)}); it will be reported again`)
   }
+  await releaseDeliveries(host, v3, held)
 }
 
 /**
@@ -2108,7 +2268,8 @@ export async function writeActState(host: Host, gate: Gate): Promise<void> {
   const n = gate.activation
   if (!id || !root || n === undefined) return
   const status = gate.paused ? 'paused' : 'collecting'
-  const key = `${n}|${status}|${gate.paused ?? ''}`
+  const reason = gate.paused ?? gate.deferred
+  const key = `${n}|${status}|${reason ?? ''}`
   if (gate.stateWritten === key) return
   const channel = gate.channel ?? 'mod'
   const body: ActState = {
@@ -2116,7 +2277,7 @@ export async function writeActState(host: Host, gate: Gate): Promise<void> {
     channel,
     mode: channel === 'mcp' ? 'on-request' : 'auto',
     status,
-    ...(gate.paused ? { reason: gate.paused } : {}),
+    ...(reason ? { reason } : {}),
     updatedAt: await host.now(),
   }
   const path = `${sessionDirOf(v3Of(root), id)}/act/${n}.state`
@@ -2366,7 +2527,11 @@ export function rowMark(r: PanelRow): string {
             : r.state === 'launch-failed'
               ? 'launch failed — see mod-assign.log'
               : r.state === 'unknown'
-                ? 'unknown — launch receipt unreadable, see the log'
+                ? r.reservation
+                  ? MAYBE_DELIVERED
+                  : r.d.resumed
+                    ? 'unknown — tmux did not say whether its pane is alive'
+                    : 'unknown — launch receipt unreadable, see the log'
                 : r.idleSeconds !== undefined
                   ? `running · idle ${Math.round(r.idleSeconds / 60)}m`
                   : 'running'
@@ -2604,6 +2769,8 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
       }
     }
     const cancelled = open.length ? `; cancelled episode(s) ${open.join(', ')}` : ''
+    // Stopped on purpose: a resumed worker with no episode leaves the panel with this mark.
+    if (run.exitCode === 0 && (await mkdirExclusive(host, `${w}/${STOPPED}`)) === 'unknown') host.log(`tmux-agent: could not record ${w}/${STOPPED}`)
     return run.exitCode === 0
       ? { ok: true, text: `stopped "${d.name}" on ${d.profile}${cancelled}; its row leaves the workers panel and nothing will be delivered for it` }
       : {
@@ -2863,8 +3030,9 @@ export async function takeLock(host: Host, workerDir: string, token = randomBase
  * Episode cancel (§5): `acks/cancel` on that one episode, inside the lock. It
  * closes the episode's later notices and never touches the pane.
  */
-export async function cancelEpisode(host: Host, name: string, seq: number): Promise<Outcome> {
-  if (!NAME_RE.test(name) || !Number.isInteger(seq) || seq < 1) return { ok: false, text: 'cancel takes <name> <seq>' }
+export async function cancelEpisode(host: Host, name: string, seq: number, opts: { force?: boolean } = {}): Promise<Outcome> {
+  if (!NAME_RE.test(name) || !Number.isInteger(seq) || seq < 1) return { ok: false, text: 'cancel takes <name> <seq> [--force]' }
+  if (opts.force && !host.owner()) return { ok: false, text: 'force-close needs a session id: a view without one is read-only' }
   const root = await rootOf(host)
   if (!root) return { ok: false, text: 'no state root' }
   const w = `${v3Of(root)}/${name}`
@@ -2879,8 +3047,27 @@ export async function cancelEpisode(host: Host, name: string, seq: number): Prom
     if (!names) return { ok: false, text: `episode ${seq} of "${name}" could not be read (see the log)` }
     const closed = names.find(n => CLOSED_ACKS.includes(n))
     if (closed) return { ok: true, text: `episode ${seq} of "${name}" is already closed (${closed})` }
+    // A reservation (§1c S8) says a submit may be under way or may have happened.
+    const held = await reservationOf(host, v3Of(root), ep)
+    if (held === 'in-flight') return { ok: false, text: `in-flight: episode ${seq} of "${name}" is being delivered by a live activation; try again once it is acknowledged` }
+    if (held === 'unknown') return { ok: false, text: `${MAYBE_DELIVERED}: the delivery marker of episode ${seq} of "${name}" could not be read (see the log); nothing is closed` }
+    if (held === 'stale' && !opts.force) {
+      return {
+        ok: false,
+        text:
+          `${MAYBE_DELIVERED}: a delivery of episode ${seq} of "${name}" was reserved by an activation that is gone and was never acknowledged. ` +
+          `Nothing says it was not delivered. To stop new attempts and retries anyway, force-close it (cancel ${name} ${seq} --force; in the TUI press - on the row)`,
+      }
+    }
     const r = await ackDir(host, ep, 'cancel')
     if (r === 'unknown') return { ok: false, text: `could not cancel episode ${seq} of "${name}" (see the log)` }
+    if (held === 'stale') {
+      return {
+        ok: true,
+        text:
+          `force-closed episode ${seq} of "${name}": ${MAYBE_DELIVERED} — no new delivery attempt or retry starts; the earlier attempt was not withdrawn, and this does not say it was not delivered`,
+      }
+    }
     return { ok: true, text: `cancelled episode ${seq} of "${name}"; its pane is untouched, and nothing more is delivered for that episode` }
   } finally {
     await releaseLock(host, `${w}/.action`, lock.token)

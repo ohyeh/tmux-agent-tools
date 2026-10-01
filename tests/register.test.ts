@@ -529,6 +529,58 @@ describe('ownership', () => {
     expect(textOf(await $.ui.render(bandRender()))).not.toContain('live  @sess-B')
   })
 
+  test('R8.5: a resumed worker whose pane died stays on the band as exited; no tmux answer is unknown, never exited', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    setSessionId(on, 'sess-A')
+    mockFs(on, {
+      [`${V3}/rz/worker.json`]: JSON.stringify({ profile: 'codex', name: 'rz', dir: '/work', since: 0, owner: 'sess-A', ownerCwd: '/work', origin: 'resume' }),
+    })
+    const probe: Record<string, unknown> = { running: true, sessions: [] }
+    mockPanel(on, probe)
+    await clock.advance(1_000)
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const band = textOf(await $.ui.render(bandRender()))
+    expect(band, 'the row stays with its pane gone').toContain('exited — no result')
+    await $.ui.press({ plugin: 'tmux-agent', key: 'rz#0', requestId: 'above-prompt' })
+    expect(textOf(await $.ui.render(bandRender()))).toContain('its pane is gone')
+    probe.reject = true
+    await clock.advance(11_000)
+    expect(textOf(await $.ui.render(bandRender())), 'tmux ls did not answer').toContain('unknown — tmux did not say whether its pane is alive')
+  })
+
+  test('R8.5: an episode whose delivery was reserved and never acknowledged shows unknown: 可能已送達 on the band; /workers cancel needs --force', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    setSessionId(on, 'sess-A')
+    const files: Files = {
+      ...live('sess-A'),
+      ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }),
+      // `ghost` delivered under activation 1 and then restarted as activation 2.
+      [`${V3}/.sessions/${hex('ghost')}/act/1/`]: '',
+      [`${V3}/.sessions/${hex('ghost')}/act/2/`]: '',
+      [`${V3}/w1/episodes/1/delivering`]: JSON.stringify({ token: 'old', activation: 1, session: 'ghost', at: 0 }),
+    }
+    mockFs(on, files)
+    mockPanel(on, { running: true, idle_seconds: 5, sessions: ['codex-w1'] })
+    await clock.advance(1_000)
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    expect(textOf(await $.ui.render(bandRender()))).toContain('unknown: 可能已送達')
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+    expect(textOf(await $.ui.render(bandRender()))).toContain('cancel w1 1 --force')
+    const plain = await $.command.run(run('workers', 'cancel w1 1'))
+    expect(plain.text).toContain('FAILED')
+    expect(plain.text).toContain('unknown: 可能已送達')
+    expect(Object.keys(files).some(k => k.includes('/acks/cancel')), 'a plain cancel closes nothing').toEqual(false)
+    const forced = await $.command.run(run('workers', 'cancel w1 1 --force'))
+    expect(forced.text).toContain('force-closed episode 1')
+    expect(Object.keys(files).filter(k => /\/acks\/[^/]+\/$/.test(k)), 'only the cancel ack is added').toEqual([`${V3}/w1/episodes/1/acks/cancel/`])
+  })
+
   test('with no other session here there is no others line', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on, ['mine@0'])

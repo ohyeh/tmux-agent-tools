@@ -155,7 +155,7 @@ You ran a non-locked write directly into the JSONL file. The audit chain uses an
 
 ## `start --exact` says the session already exists
 
-A live session of that name is another worker's, and `start`/`resume`/`start-ssh` never replace it (exit 1, before any state of the name is touched). Stop it first (`agent-tmux <cli> stop <name>`), or use a different name. `tmux-agent-fanout` and the core `assign` choose names for you. `stop` also refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`).
+A live session of that name is another worker's, and `start`/`resume`/`start-ssh` never replace it (exit 1, before any state of the name is touched). Stop it first (`agent-tmux <cli> stop <name>`), or use a different name. `tmux-agent-fanout` and the core `assign` choose names for you. `stop` also refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`). `start`, `resume`, and `start-ssh` hold one per-name lock (`<name>/launch.lock`, an OS advisory lock the OS drops when its holder exits) from the live-name check until `pane-id` is published, so a concurrent starter of the same name waits, then refuses without touching the winner's state. `stop` also refuses when `pane-id` is missing, empty, or unreadable.
 
 ## Fanout hangs for ~10 minutes when one wrapper binary is missing
 

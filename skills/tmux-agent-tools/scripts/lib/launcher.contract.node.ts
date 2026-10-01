@@ -66,7 +66,9 @@ async function live(tag: string): Promise<Live> {
   const cwd = join(root, 'repo')
   mkdirSync(cwd)
   const session = `p7-${process.pid}-${tag}`
-  const started = await tmux(['new-session', '-d', '-s', session, '-x', '200', '-y', '40', 'cat'])
+  // The host is a fake composer; its state dir is named cursor-agent-* so the collector's `hostCli` finds the CLI.
+  const fake = new URL('./fixtures/composer/fake-cursor.mjs', import.meta.url).pathname
+  const started = await tmux(['new-session', '-d', '-s', session, '-x', '200', '-y', '40', `${process.execPath} ${fake} ${mkdtempSync(join(tmpdir(), 'cursor-agent-fake-'))}`])
   assert.equal(started.code, 0, started.err)
   const socketPath = (await tmux(['display-message', '-p', '-t', session, '#{socket_path}'])).out.trim()
   const serverPid = (await tmux(['display-message', '-p', '-t', session, '#{pid}'])).out.trim()
@@ -494,7 +496,7 @@ try {
   const token = await takeLauncherLock(host, process.env.DIR, process.env.S)
   say({ won: token })
   await new Promise(r => setTimeout(r, Number(process.env.HOLD || 0)))
-  if (process.env.RELEASE === '1') say({ released: await releaseLock(host, process.env.DIR + '/collector.owner', token) })
+  if (process.env.RELEASE === '1') say({ released: (await releaseLock(host, process.env.DIR + '/collector.owner', token)).ok })
 } catch (error) {
   say({ busy: error.message })
 }
@@ -681,7 +683,7 @@ test('C-lock: an old holder\'s late finally never deletes the new lock', async (
     assert.equal((await unlockLauncher(host, w.root, 'lock-s', true)).ok, true)
     const fresh = await acquireLock(host, w.lock, { token: 'new', session: 'lock-s', activation: 'launcher', ...me })
     assert.equal(fresh.ok, true)
-    assert.equal(await releaseLock(host, w.lock, 'old'), false, 'the old holder\'s finally')
+    assert.equal((await releaseLock(host, w.lock, 'old')).ok, false, 'the old holder\'s finally')
     assert.equal(holderOf(w.lock).token, 'new')
   } finally {
     rmSync(w.root, { recursive: true, force: true })

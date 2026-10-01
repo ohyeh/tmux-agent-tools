@@ -73,7 +73,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { paneAlive, readCollectorRecord, serverSocket, type CollectorRecord } from './collector.node.ts'
 import { nodeHost } from './host.node.ts'
-import { acquireLock, maintainLock, probeHolder, releaseLock, switchChannel, unlinkHeld, type Holder } from './ledger.ts'
+import { acquireLock, maintainLock, probeHolder, switchChannel, underLock, unlinkHeld, type Holder } from './ledger.ts'
 import { holderProvablyAlive, maintainedOutcome, processId, randomBase36, rootOf, sessionDirOf, v3Of, type Host } from './workers.ts'
 
 const NODE_FLOOR = [22, 18, 0]
@@ -264,7 +264,7 @@ export async function ensureCollector(
   const dir = sessionDirOf(v3Of(opts.root), opts.session)
   await mkdir(dir, { recursive: true })
   const token = await takeLauncherLock(host, dir, opts.session)
-  try {
+  return await underLock(host, `${dir}/collector.owner`, token, async () => {
     const legacy = await legacyFiles(dir)
     if (legacy.length) {
       throw new Error(
@@ -308,10 +308,13 @@ export async function ensureCollector(
       if (alive) replaced = { pid: cur.pid, exited: await stopCollector(host, cur) }
     }
     return { pid: await startCollector(host, dir, want, opts.socket), reused: false, replaced }
-  } finally {
-    await releaseLock(host, `${dir}/collector.owner`, token)
-  }
+  }, (_v, note) => {
+    throw new Error(`busy: the launch itself completed, but ${note}`)
+  })
 }
+
+/** A release that did not come out clean turns the outcome into a failure that says so. */
+const noted = (o: Outcome, note: string): Outcome => ({ ok: false, text: `${o.text}; ${note}` })
 
 /**
  * `--unlock-launcher`: remove `collector.owner` only when its holder is provably gone.
@@ -399,7 +402,7 @@ export async function migrateLauncher(host: Host, root: string, session: string,
   } catch (error) {
     return { ok: false, text: (error as Error).message }
   }
-  try {
+  return await underLock(host, `${dir}/collector.owner`, token, async (): Promise<Outcome> => {
     const procs = await processes()
     if (!procs) return { ok: false, text: 'busy: ps -o pid=,ppid=,lstart=,args= failed; cannot prove that no old launcher runs' }
     // Only this process is left out: a matching parent is an old launcher too.
@@ -444,9 +447,7 @@ export async function migrateLauncher(host: Host, root: string, session: string,
     await mkdir(dest)
     for (const name of moving) await rename(`${dir}/${name}`, `${dest}/${name}`)
     return { ok: true, text: `moved ${moving.join(', ')} into ${dest}; the next launch starts a new collector` }
-  } finally {
-    await releaseLock(host, `${dir}/collector.owner`, token)
-  }
+  }, noted)
 }
 
 const CHANNELS = ['mod', 'node', 'mcp']
@@ -483,7 +484,7 @@ export async function handoverChannel(
     const who = typeof h === 'string' ? (h === 'unreadable' ? 'an unreadable holder' : 'an unknown state (see the log)') : holderText(h, await holderProvablyAlive(host, h))
     return { ok: false, text: `busy: ${lockPath} is held by ${who}. It is never taken over; if its holder is gone, rm ${shq(lockPath)}` }
   }
-  try {
+  return await underLock(host, lockPath, mine.token, async (): Promise<Outcome> => {
     const ch = await probeHolder(host, `${dir}/channel`)
     if ('absent' in ch) return { ok: true, text: `${dir} has no channel record; the first registrant picks the channel, nothing to hand over` }
     if ('unreadable' in ch) return { ok: false, text: `busy: ${ch.unreadable}; the channel is unknown, nothing is switched` }
@@ -496,7 +497,7 @@ export async function handoverChannel(
     } catch (error) {
       return { ok: false, text: (error as Error).message }
     }
-    try {
+    return await underLock(host, `${dir}/collector.owner`, owner, async (): Promise<Outcome> => {
       const procs = await ps()
       if (!procs) return { ok: false, text: 'busy: ps -o pid=,ppid=,lstart=,args= failed; cannot prove that the old channel is quiescent' }
       const hits = procs.filter(
@@ -523,14 +524,12 @@ export async function handoverChannel(
             `confirm that no ${old} caller (a collector, an MCP server, a Claude Code session with this plugin) runs or will start for it, then run: ${handoverCommand(session, to)}`,
         }
       }
-      if (!(await switchChannel(host, dir, to, mine.token))) return { ok: false, text: `could not switch ${dir}/channel (see the log); channel.lock stays held: check it, then rm ${shq(lockPath)}` }
+      if (!(await switchChannel(host, dir, to, mine.token))) {
+        return { ok: false, text: `could not switch ${dir}/channel (see the log); the ${old} channel is unchanged and keeps its authority` }
+      }
       return { ok: true, text: `session ${session}: ${old} → ${to}. The ${to} channel registers next and fences the ${old} activations; a late ${old} caller is refused` }
-    } finally {
-      await releaseLock(host, `${dir}/collector.owner`, owner)
-    }
-  } finally {
-    await releaseLock(host, lockPath, mine.token)
-  }
+    }, noted)
+  }, noted)
 }
 
 async function splitTui(hostPane: string, cwd: string, command: string[], session: string, root: string, socket?: string): Promise<string> {

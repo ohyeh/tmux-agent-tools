@@ -8,8 +8,9 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { sessionKey } from './ledger.ts'
-import { paneAlive, pasteInto, readCollectorRecord } from './collector.node.ts'
-import { deliveryIdOf } from './workers.ts'
+import { composerHolds, paneAlive, pasteInto, readCollectorRecord } from './collector.node.ts'
+import { nodeHost } from './host.node.ts'
+import { deliveryIdOf, heartbeat, newGate, reconcileOnce } from './workers.ts'
 
 const RACE = new URL('./workers.race.node.ts', import.meta.url).pathname
 const COLLECTOR = new URL('./collector.node.ts', import.meta.url).pathname
@@ -322,53 +323,61 @@ function privateServer(): { dir: string; sock: string; env: NodeJS.ProcessEnv; t
   return { dir, sock, env, tmux }
 }
 
-test('collector wake: a bracketed paste into the exact pane, then Enter; a gone pane is a drop', async t => {
+const FAKE = new URL('./fixtures/composer/fake-cursor.mjs', import.meta.url).pathname
+
+/** A private server whose one pane runs the fake cursor composer in `dir` (null when tmux cannot start). */
+async function fakeHost(draft = '', mode = 'idle') {
   const srv = privateServer()
-  const name = `tac-collector-${process.pid}`
-  if ((await srv.tmux(['new-session', '-d', '-s', name, '-x', '120', '-y', '20', 'cat'])).code !== 0) {
+  const state = mkdtempSync(join(tmpdir(), 'cursor-agent-fake-')) // the name lets `hostCli` find the CLI
+  writeFileSync(`${state}/mode`, mode)
+  if (draft) writeFileSync(`${state}/draft`, draft)
+  const name = `tac-fake-${process.pid}-${Math.random().toString(36).slice(2, 6)}`
+  const up = await srv.tmux(['new-session', '-d', '-s', name, '-x', '160', '-y', '30', `${process.execPath} ${FAKE} ${state}`])
+  const stop = async () => {
     await srv.tmux(['-S', srv.sock, 'kill-server'])
     rmSync(srv.dir, { recursive: true, force: true })
-    return t.skip('no private tmux server can start here')
+    rmSync(state, { recursive: true, force: true })
   }
+  if (up.code !== 0) {
+    await stop()
+    return null
+  }
+  const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
+  const log = () => (existsSync(`${state}/log`) ? readFileSync(`${state}/log`, 'utf8').trim().split('\n').filter(Boolean) : [])
+  const setMode = (m: string) => writeFileSync(`${state}/mode`, m)
+  const clear = () => writeFileSync(`${state}/clear`, '')
+  await new Promise(r => setTimeout(r, 400)) // the fake draws its first screen
+  return { srv, pane, log, setMode, clear, stop }
+}
+
+test('collector wake: a bracketed paste into the exact pane, then Enter; a gone pane is a drop', async t => {
+  const h = await fakeHost()
+  if (!h) return t.skip('no private tmux server can start here')
   try {
-    const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
-    assert.ok(await paneAlive(pane, srv.env))
-    assert.deepEqual(await pasteInto(pane, 'line one\nline two', srv.env), { text: 'line one\nline two' })
-    let screen = ''
-    for (let i = 0; i < 250 && !/line two/.test(screen); i++) {
-      screen = (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
-      if (!/line two/.test(screen)) await new Promise(r => setTimeout(r, 20))
-    }
-    assert.match(screen, /line one/)
-    assert.match(screen, /line two/)
-    assert.equal(await paneAlive('%999999', srv.env), false)
-    assert.match((await pasteInto('%999999', 'x', srv.env)).drop ?? '', /gone/)
+    assert.ok(await paneAlive(h.pane, h.srv.env))
+    assert.deepEqual(await pasteInto(h.pane, 'line one\nline two', h.srv.env, 'cursor'), { text: 'line one\nline two' })
+    assert.deepEqual(h.log(), ['PASTE:"line one\\nline two"', 'ENTER:idle:"line one\\nline two"'], 'one paste, then one Enter')
+    assert.equal(await paneAlive('%999999', h.srv.env), false)
+    assert.match((await pasteInto('%999999', 'x', h.srv.env, 'cursor')).drop ?? '', /gone/)
   } finally {
-    await srv.tmux(['-S', srv.sock, 'kill-server'])
-    rmSync(srv.dir, { recursive: true, force: true })
+    await h.stop()
   }
 })
 
 test('CLI collector and another session on one root: a dead owner\'s finished episode is claimed and delivered once', async t => {
   const w = world('dead')
   beatAt(w, 'dead', OLD)
-  const srv = privateServer()
-  const env = { ...srv.env, TMUX_AGENT_DIR: w.root }
-  const name = `p3-xh-${process.pid}`
-  if ((await srv.tmux(['new-session', '-d', '-s', name, '-x', '200', '-y', '30', 'cat'])).code !== 0) {
-    await srv.tmux(['-S', srv.sock, 'kill-server'])
-    rmSync(srv.dir, { recursive: true, force: true })
-    return t.skip('no private tmux server can start here')
-  }
+  const h = await fakeHost()
+  if (!h) return t.skip('no private tmux server can start here')
+  const env = { ...h.srv.env, TMUX_AGENT_DIR: w.root }
   try {
-    const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
-    assert.match(pane, /^%\d+$/)
+    assert.match(h.pane, /^%\d+$/)
     const once = (session: string) =>
       new Promise<number>(resolve =>
         execFile(
           process.execPath,
-          [COLLECTOR, '--session', session, '--cwd', w.cwd, '--pane', pane, '--once'],
-          { env, timeout: 20_000 },
+          [COLLECTOR, '--session', session, '--cwd', w.cwd, '--pane', h.pane, '--cli', 'cursor', '--once'],
+          { env, timeout: 30_000 },
           error => resolve(error ? (typeof error.code === 'number' ? error.code : -1) : 0),
         ),
       )
@@ -378,17 +387,164 @@ test('CLI collector and another session on one root: a dead owner\'s finished ep
     assert.deepEqual(delivered(w), [], 'the claim tick delivers nothing')
     assert.equal(gens(w).length, 1, 'one claim gen')
     await round()
-    // A paste shows up on the screen some time after the round; wait for it (with
-    // a bound) only when the ledger says nothing was delivered by record.
-    let screen = ''
-    for (let i = 0; i < 250; i++) {
-      screen = (await srv.tmux(['capture-pane', '-p', '-J', '-t', pane])).out
-      if (screen.includes('did it') || delivered(w).length > 0) break
-      await new Promise(r => setTimeout(r, 20))
-    }
-    const pasted = screen.includes('did it') ? 1 : 0
+    const pasted = h.log().filter(l => l.startsWith('ENTER:')).length
     assert.equal(delivered(w).length + pasted, 1, 'the claimant delivers once, the other session does not')
     assert.ok(acked(w))
+  } finally {
+    await h.stop()
+  }
+})
+
+/**
+ * D-paste at pass level: the real `reconcileOnce` with the collector's real `pasteInto` into a
+ * fake composer. The host log says what reached the host; the ledger says what was acked. A
+ * deferral is not a refusal: no failure count, no pause, no ack, and the next pass retries.
+ */
+async function scenario(mode: string, draft: string, body: (x: Awaited<ReturnType<typeof setup>> & { h: NonNullable<Awaited<ReturnType<typeof fakeHost>>> }) => Promise<void>, t: { skip: (m: string) => void }) {
+  const w = world('S')
+  const h = await fakeHost(draft, mode)
+  if (!h) return t.skip('no private tmux server can start here')
+  const x = setup(w, h)
+  try {
+    await body({ ...x, h })
+  } finally {
+    x.restore()
+    await h.stop()
+  }
+}
+
+function setup(w: World, h: NonNullable<Awaited<ReturnType<typeof fakeHost>>>) {
+  const saved = { dir: process.env.TMUX_AGENT_DIR, sock: process.env.TMUX_AGENT_TMUX_SOCKET }
+  process.env.TMUX_AGENT_DIR = w.root
+  process.env.TMUX_AGENT_TMUX_SOCKET = h.srv.sock
+  const gate = newGate()
+  const host = nodeHost({ owner: 'S', cwd: w.cwd, log: () => {}, submit: text => pasteInto(h.pane, text, process.env, 'cursor') })
+  return {
+    w,
+    gate,
+    beat: () => heartbeat(host, gate),
+    passes: async (n: number) => {
+      for (let i = 0; i < n; i++) await reconcileOnce(host, gate)
+    },
+    restore: () => {
+      for (const [k, v] of [['TMUX_AGENT_DIR', saved.dir], ['TMUX_AGENT_TMUX_SOCKET', saved.sock]] as const) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    },
+  }
+}
+
+const enters = (h: { log: () => string[] }) => h.log().filter(l => l.startsWith('ENTER:'))
+const DRAFT = 'R74-DRAFT-KEEPME unsent draft text'
+
+for (const c of [
+  { name: 'draft', mode: 'idle', draft: DRAFT, recover: (h: { clear: () => void }) => h.clear() },
+  { name: 'busy', mode: 'busy', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+  { name: 'permission', mode: 'permission', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+  { name: 'shell', mode: 'shell', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+  { name: 'unknown', mode: 'unknown', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+]) {
+  test(`D-paste: host ${c.name} -> nothing pasted, no Enter, no ack, no pause, reason kept; delivered once when it recovers`, async t => {
+    await scenario(c.mode, c.draft, async ({ w, gate, beat, passes, h }) => {
+      await beat() // registers the activation, so act/<n>.state can be published
+      await passes(5) // FAIL_MAX is 3: five deferrals must not pause
+      assert.deepEqual(h.log(), [], 'neither a paste nor an Enter reached the host')
+      assert.ok(!acked(w), 'a deferred notice is not acked')
+      assert.equal(gate.failures, 0, 'a deferral is not a refusal')
+      assert.equal(gate.paused, undefined)
+      assert.match(gate.deferred ?? '', new RegExp(`composer is ${c.name}`), 'the reason stays set while the condition holds')
+      const stateFile = `${w.v3}/.sessions/${sessionKey('S')}/act/${gate.activation}.state`
+      const published = JSON.parse(readFileSync(stateFile, 'utf8')) as { status: string; reason?: string }
+      assert.equal(published.status, 'collecting', 'a deferral is not a pause')
+      assert.match(published.reason ?? '', new RegExp(`composer is ${c.name}`), 'act/<n>.state carries the reason for the TUI and panel')
+      c.recover(h)
+      await new Promise(r => setTimeout(r, 400))
+      await passes(2)
+      assert.equal(enters(h).length, 1, 'delivered once after it recovered')
+      assert.ok(acked(w))
+      assert.equal(gate.deferred, undefined)
+    }, t)
+  })
+}
+
+test('D-paste: empty composer -> one paste, one Enter, acked once', async t => {
+  await scenario('idle', '', async ({ w, gate, passes, h }) => {
+    await passes(3)
+    assert.equal(h.log().filter(l => l.startsWith('PASTE:')).length, 1)
+    assert.equal(enters(h).length, 1)
+    assert.ok(acked(w))
+    assert.equal(gate.deferred, undefined)
+  }, t)
+})
+
+test('D-paste: the composer after the paste is not the pasted text -> no Enter, text left, blocked, no ack, no second paste', async t => {
+  await scenario('mangle', '', async ({ w, gate, passes, h }) => {
+    await passes(3)
+    assert.equal(h.log().filter(l => l.startsWith('PASTE:')).length, 1, 'pasted once; the leftover reads as a draft afterwards')
+    assert.deepEqual(enters(h), [], 'no Enter')
+    assert.ok(!acked(w))
+    assert.equal(gate.failures, 0)
+    assert.match(gate.deferred ?? '', /composer is draft/)
+  }, t)
+})
+
+test('D-paste: pasteInto reports blocked for a post-paste mismatch and never sends Enter', async t => {
+  const h = await fakeHost('', 'mangle')
+  if (!h) return t.skip('no private tmux server can start here')
+  try {
+    const r = await pasteInto(h.pane, 'the notice', h.srv.env, 'cursor')
+    assert.match(r.deferred ?? '', /^blocked: .*Enter not sent/)
+    assert.deepEqual(enters(h), [])
+  } finally {
+    await h.stop()
+  }
+})
+
+test('composerHolds: whitespace-insensitive equality, or the CLI placeholder covering every pasted line', () => {
+  assert.ok(composerHolds({ state: 'draft', text: 'a b\nc' }, 'a b c'))
+  assert.ok(composerHolds({ state: 'draft', text: '[Pasted text #1 +9 lines]' }, Array(9).fill('x').join('\n')))
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +3 lines]' }, Array(9).fill('x').join('\n')))
+  assert.ok(!composerHolds({ state: 'draft', text: 'old draft the notice' }, 'the notice'))
+  const long = Array.from({ length: 30 }, (_, i) => `line ${i} of the notice`).join('\n')
+  assert.ok(composerHolds({ state: 'draft', text: long.split('\n').slice(-6).join('\n    ') }, long), 'the visible tail of a long paste')
+  assert.ok(!composerHolds({ state: 'draft', text: 'old draft ' + long.split('\n').slice(-6).join('\n') }, long), 'foreign text before the tail')
+  assert.ok(!composerHolds({ state: 'draft', text: 'line 29 of the notice' }, long), 'a sliver of a long paste is not enough')
+  assert.ok(!composerHolds({ state: 'empty', text: '' }, 'the notice'))
+})
+
+const AGENT_TMUX = new URL('../agent-tmux', import.meta.url).pathname
+
+test('composer-state: every captured pane gets its class (real codex and cursor-agent captures; synthetic ones marked)', async t => {
+  const want: [string, string, string, string?][] = [
+    ['codex', 'codex-empty.txt', 'empty'],
+    ['codex', 'codex-multiline.txt', 'empty'],
+    ['codex', 'codex-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],
+    ['codex', 'codex-busy.txt', 'busy'],
+    ['codex', 'codex-permission.txt', 'permission'],
+    ['codex', 'codex-shell.synthetic.txt', 'shell'],
+    ['cursor', 'cursor-agent-empty.txt', 'empty'],
+    ['cursor', 'cursor-agent-multiline.txt', 'empty'],
+    ['cursor', 'cursor-agent-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],
+    ['cursor', 'cursor-agent-busy.txt', 'busy'],
+    ['claude', 'claude-empty.synthetic.txt', 'empty'],
+    ['claude', 'claude-draft.synthetic.txt', 'draft', 'half typed text'],
+    ['claude', 'claude-busy.synthetic.txt', 'busy'],
+    ['agy', 'codex-empty.txt', 'unknown'], // agy: no verified pattern set, never pastes
+    ['codex', 'cursor-agent-empty.txt', 'unknown'], // another CLI's screen is not recognised
+  ]
+  const srv = privateServer()
+  try {
+    for (const [i, [cli, file, state, text]] of want.entries()) {
+      const path = new URL(`./fixtures/composer/${file}`, import.meta.url).pathname
+      const up = await srv.tmux(['new-session', '-d', '-s', `f${i}`, '-x', '200', '-y', '50', `cat ${path}; sleep 60`])
+      if (up.code !== 0) return t.skip('no private tmux server can start here')
+      const pane = (await srv.tmux(['display-message', '-p', '-t', `f${i}`, '#{pane_id}'])).out.trim()
+      await new Promise(r => setTimeout(r, 300))
+      const out = await new Promise<string>(resolve => execFile(AGENT_TMUX, [cli, 'composer-state', '--pane', pane], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))
+      assert.equal(out.split('\n')[0], state, `${cli} ${file}`)
+      if (text) assert.equal(out.split('\n').slice(1).join('\n').trim(), text, `${file} composer text`)
+    }
   } finally {
     await srv.tmux(['-S', srv.sock, 'kill-server'])
     rmSync(srv.dir, { recursive: true, force: true })

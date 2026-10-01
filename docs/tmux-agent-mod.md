@@ -58,9 +58,24 @@ marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-t
   `rm` 子程序時，不會被接手。要手動清掉它，先確認沒有那個 `rm` 子程序（`ps -ax | grep "rm "`）。
   unlock 已拔鎖、但 `.unlock` 自己拔不掉時，結果是失敗（not ok），文字會寫出 `.unlock` 路徑、`rm` 的原始錯誤，
   以及清除用的 `rm '<路徑>'`。
-- `/workers cancel <name> <seq>`：只關掉那一輪（`acks/cancel`），不動 pane；`stop` 才殺 pane
+- `/workers cancel <name> <seq> [--force]`：只關掉那一輪（`acks/cancel`），不動 pane；`stop` 才殺 pane
   並把所有開著的輪次一起關掉。shell 上同一套是 `node skills/tmux-agent-tools/scripts/lib/workers.cli.node.ts
-  cancel <name> <seq> | unlock <name> [confirm]`。
+  cancel <name> <seq> [--force] | unlock <name> [confirm]`（`--session` 必填；沒有 session 的 viewer 不能 `--force`）。
+- 投遞的 reservation（plan §1c S8）：collector 在 submit 之前，於 action lock 內重查這一輪還開著，
+  再寫 `episodes/<seq>/delivering`（`{token, activation, session, at}`，tmp＋rename），放鎖後才 submit；
+  ack 之後在鎖內比對 token 才刪（token 不同＝已有新的 reservation，不刪）。submit 被拒也會刪。
+  讀這個 marker 的結果只有三種：`in-flight`（marker 的 activation 是該 session 目前權威的 activation 而且 live）、
+  `stale`（activation 已被取代，或 session non-live）、`unknown`（讀不到，不當 stale）。
+  - `stale` 或 `unknown` 的那一輪，band 與 TUI 的列都是 `unknown`，文字是 `unknown: 可能已送達`。
+    普通 `cancel` 在 `in-flight` 回 `in-flight`，在 `stale`／`unknown` 回 `unknown: 可能已送達` 而且**不關**。
+  - `cancel … --force`（TUI 選取那一列按 `-`，鍵位提示變成 `force-close`，一樣按兩次）只在 `stale` 時成立，
+    只寫 `acks/cancel`：之後的 reconcile 不再投遞、不重試。它不撤回已經送出的 submit，不寫 `done`，
+    也不說「沒送達」；回報文字維持 `unknown: 可能已送達`。`in-flight`、讀不到時 `--force` 也拒絕。
+  - 只有 reconcile 的 submit 會寫 marker。MCP 的 `wait` 回覆與 ack（`mcp-adapter`）走自己的 request-id 路徑，不經這個 marker。
+- resume 之後 pane 死掉：resume 出來、還沒 tell（沒有 episode）的 worker，pane 不在時列保留，狀態是 `exited`
+  （`resumed worker: its pane is gone …`）；`tmux ls` 沒回答時是 `unknown`，不是 `exited`。
+  用 `stop`（band 的 `✕`、TUI 的 `x`）記下「這是我停的」（`<name>/stopped`）後那一列才離開；
+  在這個 mod 之外用 `agent-tmux stop` 或手動關掉的，列會留著直到在這裡 stop 一次。
 
 ack 是目錄，不是 store key，所以沒有「誰蓋掉誰的 ack」，也沒有剪除與容量預算。
 0.11 以前的紀錄（state root 直下的 `<name>/dispatch.json`）不支援：不匯入、不計數、不顯示。
@@ -364,8 +379,10 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 - The ledger has no seq pointer file. The next activation or episode number is one past the max listed child (`allocateNext`, `skills/tmux-agent-tools/scripts/lib/ledger.ts:50`). Nothing writes or reads a pointer (plan R8.4).
 - A late launch-lifecycle fold after tell E2 lands on E1's path only. `stop` (`finalize_launch_envelope`) and a result read (`reconcile_launch_envelope`) fold only `$(agent_root_dir)/$name/result.json`. That is E1's path. E1 keeps its `status` and `episode`, and E2's `episodes/2/` stays byte-identical. A second stop does not fold again. `scripts/test-wrapper-limits-smoke` case c runs this with the real wrapper. The core side is `workers.contract.node.ts` (“a seq ≥ 2 result on the launch path”).
 - One tmux server for the whole chain. `TMUX_AGENT_TMUX_SOCKET` puts `-S` on every tmux call of `agent-tmux` (`TMUX_SOCKET_ARGS`) and of the node core (`host.node.ts`). `tmux-agent-commander` sets the variable from its own `$TMUX` socket when it is unset, exports it, and passes it to the `run-shell` collector. Without the variable and outside tmux, the chain uses tmux's default socket under `TMUX_TMPDIR`. `agent-tmux` never takes the server from `$TMUX`. `scripts/test-wrapper-limits-smoke` case b runs this with two private servers.
-- Name collision (plan R8.5, breaking): `start`, `resume`, and `start-ssh` never replace a live session. A live `<prefix>-<name>` makes them exit 1 before they touch any state of the name. tmux's own duplicate-session refusal in `new-session` covers a session that appears after the check. The launch writes the pane id that `new-session -P` printed to `<name>/pane-id`. `stop` refuses (exit 1) when the session of that name does not hold that pane. The core's `reserve` draws another name for a live session, so the refusal applies to a direct `--exact` launch.
+- Name collision (plan R8.5, breaking): `start`, `resume`, and `start-ssh` never replace a live session. A live `<prefix>-<name>` makes them exit 1 before they touch any state of the name. One per-name lock (`<name>/launch.lock`, `zsystem flock`; the OS drops it when its holder exits, so no stale lock and no takeover) covers the check, the state init, `new-session`, and the `pane-id` publication; a concurrent starter waits, then refuses without writing any of the winner's state. The launch publishes the pane id that `new-session -P` printed to `<name>/pane-id` through a temp file and rename, only after `new-session` succeeded. `stop` refuses (exit 1) when the session of that name does not hold that pane, or when `pane-id` is missing, empty, or unreadable. The core's `reserve` draws another name for a live session, so the refusal applies to a direct `--exact` launch.
 - An earlier launch's `result.json` and `stdout.log` are kept, not harvested. A new `start` or `resume` of the same name moves them (when they are not empty) into `<name>/legacy-<UTC time>-<pid>/` and prints that path on stderr. A result from a wrapper or collector from before an upgrade stays readable at that path. Nothing reads or delivers it from there on its own.
+- Incomplete reservation (plan R8.5): a `delivering` marker whose activation is gone is shown as `unknown: 可能已送達`, and `cancel --force` stops new attempts only. It cannot say whether the earlier submit reached the session, and it does not try to. The next activation of the same session delivers the notice again with the same `delivery_id` (at-least-once), so the marker is replaced then. A marker left because the action lock was busy at release time stays until the next delivery of that episode replaces it; `acks/done` or `acks/cancel` makes it irrelevant. When the action lock is busy (also a stuck one, `unlock`) or the episode directory is not writable, the notice is delivered with no marker, so a cancel in that window is not fenced (as before S8); the S8 fence holds whenever the lock is free. A worker directory that has no `worker.json` (a crash between its `mkdir` and its publish) is not drawn and is ignored by the collector; this change does not show or remove it (remove the directory by hand).
+- Resumed worker whose pane died (plan R8.5): it is shown only while it has no episode. After its first `tell` it follows the normal rule: once its pane is gone and its episode is delivered, the row leaves with the pane.
 - Polling cannot see some rewrites. The collector samples each result path at most once per tick (`POLL_MS` = 10 s, `workers.ts:124`). A pass reads at most `BATCH_MAX` = 20 workers within `COLLECT_BUDGET_MS` = 4 s, and the rest wait for the next tick. A read is stat, read, stat. A file whose mtime or size moved is read again next tick (`workers.ts:1281`). A snapshot's identity is the first 16 hex of sha256 of its bytes plus `floor(mtimeMs)` (`identity`, `workers.ts:1240`). So two rewrites are invisible: (1) a state that is overwritten before the next sample, which can be up to one tick plus the pass time, or longer when the batch defers the path; (2) a rewrite with the same bytes within the same mtime millisecond. On a filesystem with 1 s mtime resolution, that is the same second.
 - `.github/workflows/release.yml` has not run on GitHub yet. The Codex install with id `tmux-agent` was verified once before the last manifest change and has not been re-run.
 - `mock.clock` **確實**驅動 plugin 的 `$.clock.every`（本 mod 只用 `every`，
@@ -695,6 +712,19 @@ profile 名稱不會永遠掛在面板上），pane 還活著就照樣探測，�
 collector 活著。同一個判斷也寫進 `assign` 工具的回傳最後一句
 （`collector: active …` 或 `collector: NONE — …` 加上 `peek` 後讀 `result.json` 的路徑），
 `skills/using-tmux-agent-tools/SKILL.md` 的 COLLECTOR 一節就是拿這一句當分支條件。
+
+node collector 貼進 host pane 之前先探測 composer（plan D-paste、§1c S5）：
+`agent-tmux <cli> composer-state <name>|--pane %N` 依 pane capture 的 pattern 回
+`empty | draft | busy | permission | shell | unknown`（第一行；有 composer 時其餘行是它的文字）。
+cli 為 codex、cursor（cursor-agent）、claude；agy 沒有實機 capture，一律 `unknown`。
+collector 的 `--cli` 沒給時，從 pane 底下的 process 找出是哪個 CLI。
+只有 `empty` 才貼；貼完、送 Enter 之前再探測一次，composer 必須等於剛貼的文字（忽略空白差異，
+或是 CLI 自己的 `[Pasted text #1 +9 lines]` 佔位），否則不送 Enter、文字留在 composer、回報 blocked。
+其他狀態一律不貼、不送 Enter，結果是 deferred：不算拒收（不計入三次暫停）、不 ack，下一輪再試；
+原因（例如 `host composer is draft … nothing pasted, retrying`）留在 `gate.deferred`，條件不解除就一直顯示。
+保證只有這三條，不保證任意時刻插入的打字不會干擾（probe 到 Enter 之間沒有鎖）。
+已知限制：placeholder 文字是逐字比對，沒列出的 placeholder 會被當成 `draft`（不貼，安全方向）；
+cursor-agent 的 permission 對話框沒有實機 capture，認不得時是 `unknown`（同樣不貼）。
 
 同一輪探測還負責第四種狀態 `exited`：status 回 `exists:false`（session 沒了），但磁碟上沒有終態
 result；下一個 tick 會以 `exited` 通知一次，記在自己的 ack（`acks/exited/`，跟

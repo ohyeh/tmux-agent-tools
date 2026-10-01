@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
 
@@ -929,7 +929,7 @@ test('waiter bind: a stale binding record delivers E1 once after the action lock
   const lock = await takeLock(w.host, r.stateDir)
   if (!lock.ok) assert.fail('lock')
   await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: lock.token }))
-  assert.equal(await releaseLock(w.host, `${r.stateDir}/.action`, lock.token), true)
+  assert.equal((await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)).ok, true)
   writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
   const gate = newGate()
   await reconcile(w.host, gate, false)
@@ -1522,4 +1522,168 @@ test('Sol r6 N4: unlockWorker removed the lock but the guard rm failed — not o
   assert.ok(out.text.includes(`${lock}.unlock`) && /Permission denied/.test(out.text) && /left/.test(out.text), out.text)
   assert.throws(() => fs.lstatSync(lock), 'the lock itself is gone')
   assert.doesNotThrow(() => fs.lstatSync(`${lock}.unlock`), 'the guard is left')
+})
+
+
+// ── R8.5: a resumed worker whose pane died; an incomplete reservation (plan §1c S8, §11) ──
+
+/** Fake `tmux ls`: `alive` names the sessions it lists; `down` makes the call reject (no answer). */
+function tmuxLs(state: { alive: string[]; down?: boolean }) {
+  return {
+    answer: (argv: readonly string[]) => (argv[0] === 'tmux' && argv[1] === 'ls' ? { exitCode: 0, stdout: state.alive.join('\n'), stderr: '' } : undefined),
+    down: (host: Host): Host => ({
+      ...host,
+      run: async (argv, cwd, ms) => {
+        if (state.down && argv[0] === 'tmux' && argv[1] === 'ls') throw new Error('tmux ls timed out')
+        return host.run(argv, cwd, ms)
+      },
+    }),
+  }
+}
+
+test('R8.5 resume: a resumed worker whose pane died shows as exited (not running, not gone); unknown probe is unknown; stop clears it', async () => {
+  const live = { alive: [] as string[], down: false }
+  const t = tmuxLs(live)
+  const w = world({ answer: t.answer })
+  const host = t.down(w.host)
+  const out = await resumeWorker(host, 'codex 12345678-1234-1234-1234-123456789abc')
+  assert.ok(out.ok, out.text)
+  const d = (await scan(host, { claim: false })).visible[0]!
+  live.alive = [`codex-${d.name}`]
+  assert.deepEqual((await panelRows(host, newGate(), w.root)).map(r => r.state), ['delivered'], 'pane alive: as before')
+  live.alive = []
+  const dead = await panelRows(host, newGate(), w.root)
+  assert.deepEqual(dead.map(r => r.state), ['exited'], 'pane gone: the row stays and says so')
+  assert.match(dead[0]!.summary ?? '', /pane is gone/)
+  live.down = true
+  const unk = await panelRows(host, newGate(), w.root)
+  assert.deepEqual(unk.map(r => r.state), ['unknown'], 'no tmux answer: unknown, never exited')
+  assert.match(unk[0]!.summary ?? '', /unknown/)
+  live.down = false
+  const stop = await stopWorker(host, newGate(), d)
+  assert.ok(stop.ok, stop.text)
+  assert.ok(existsSync(`${w.v3}/${d.name}/stopped`))
+  assert.deepEqual(await panelRows(host, newGate(), w.root), [], 'stopped on purpose: the row leaves with its pane')
+})
+
+/** A marker as the delivering activation wrote it. */
+function markerFor(w: ReturnType<typeof world>, stateDir: string, session: string, activation: number, token = 'tok-old') {
+  mkdirSync(`${stateDir}/episodes/1/`, { recursive: true })
+  writeFileSync(`${stateDir}/episodes/1/delivering`, JSON.stringify({ token, activation, session, at: 1 }))
+}
+const registerGhost = async (w: ReturnType<typeof world>, acts: number, freshBeat = true) => {
+  const sd = sessionDirOf(w.v3, 'ghost')
+  let last = 0
+  for (let i = 0; i < acts; i++) last = (await registerActivation(w.host, sd, { pid: 1, pidStart: '', host: '', token: `t${i}` }))!
+  if (freshBeat) await beat(w.host, sd, last, Date.now())
+}
+
+test('S8: the delivering marker is written before the submit, carries this activation, and is gone after the ack', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  let during: { token?: string; activation?: number; session?: string } | undefined
+  const host: Host = {
+    ...w.host,
+    submit: async text => {
+      during = existsSync(`${r.stateDir}/episodes/1/delivering`) ? read(`${r.stateDir}/episodes/1/delivering`) : undefined
+      return w.host.submit(text)
+    },
+  }
+  const gate = newGate()
+  await reconcile(host, gate, false)
+  assert.equal(w.woken.length, 1)
+  assert.equal(during?.session, 'me')
+  assert.equal(during?.activation, gate.activation)
+  assert.match(during?.token ?? '', /^[0-9a-z]{12}$/)
+  assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/done`))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/delivering`), 'removed after the ack by its own token')
+})
+
+test('S8: a refused submit removes its marker; a newer token is never removed by an older delivery', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const refuse: Host = { ...w.host, submit: async () => ({ drop: 'busy' }) }
+  await reconcile(refuse, newGate(), false)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`))
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/delivering`), 'a refusal leaves no marker')
+  // B's newer marker is published while A's submit is out: A's late cleanup keeps it.
+  const host: Host = {
+    ...w.host,
+    submit: async text => {
+      writeFileSync(`${r.stateDir}/episodes/1/delivering`, JSON.stringify({ token: 'B-token', activation: 9, session: 'ghost', at: 2 }))
+      return w.host.submit(text)
+    },
+  }
+  await reconcile(host, newGate(), false)
+  assert.equal(read(`${r.stateDir}/episodes/1/delivering`).token, 'B-token')
+})
+
+test('S8 incomplete reservation: panel row says unknown: 可能已送達; cancel refuses; viewer cannot force; force closes only; no re-delivery; ack state unchanged', async () => {
+  const w = world()
+  const r = await assigned(w)
+  await registerGhost(w, 2) // activation 1 of `ghost` is superseded: the marker's owner is gone
+  markerFor(w, r.stateDir, 'ghost', 1)
+  const rows = await panelRows(w.host, newGate(), w.root)
+  assert.deepEqual(rows.map(x => [x.state, x.reservation]), [['unknown', 'stale']])
+  assert.match(rows[0]!.summary ?? '', /unknown: 可能已送達/)
+  assert.match(rows[0]!.summary ?? '', /cancel .* 1 --force/)
+  const plain = await cancelEpisode(w.host, r.name, 1)
+  assert.ok(!plain.ok)
+  assert.match(plain.text, /unknown: 可能已送達/)
+  assert.match(plain.text, /--force/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/cancel`), 'plain cancel closes nothing')
+  const viewer = await cancelEpisode({ ...w.host, owner: () => undefined }, r.name, 1, { force: true })
+  assert.ok(!viewer.ok)
+  assert.match(viewer.text, /read-only/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/cancel`), 'a viewer cannot force-close')
+  const acksBefore = existsSync(`${r.stateDir}/episodes/1/acks`) ? readdirSync(`${r.stateDir}/episodes/1/acks`) : []
+  const forced = await cancelEpisode(w.host, r.name, 1, { force: true })
+  assert.ok(forced.ok, forced.text)
+  assert.match(forced.text, /unknown: 可能已送達/)
+  assert.doesNotMatch(forced.text.replace('does not say it was not delivered', ''), /not delivered|未送達|沒有送達/, 'never claims it was not delivered')
+  assert.deepEqual(readdirSync(`${r.stateDir}/episodes/1/acks`).filter(a => !acksBefore.includes(a)), ['cancel'], 'only cancel is added; done is not claimed')
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  await reconcile(w.host, newGate(), false)
+  assert.equal(w.woken.length, 0, 'a later reconcile does not deliver it')
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`))
+})
+
+test('S8: a marker of the current live activation is in-flight (even force refuses); an unreadable marker is unknown, never stale', async () => {
+  const w = world()
+  const r = await assigned(w)
+  await registerGhost(w, 1) // its only activation, fresh beat: live and authoritative
+  markerFor(w, r.stateDir, 'ghost', 1)
+  assert.equal(await reservationOf(w.host, w.v3, `${r.stateDir}/episodes/1`), 'in-flight')
+  assert.deepEqual((await panelRows(w.host, newGate(), w.root)).map(x => x.reservation), [undefined])
+  const f = await cancelEpisode(w.host, r.name, 1, { force: true })
+  assert.ok(!f.ok)
+  assert.match(f.text, /in-flight/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
+  const denied = Object.assign(new Error('EACCES'), { code: 'EACCES' })
+  const host: Host = {
+    ...w.host,
+    read: async p => {
+      if (p.endsWith('/delivering')) throw denied
+      return w.host.read(p)
+    },
+  }
+  assert.equal(await reservationOf(host, w.v3, `${r.stateDir}/episodes/1`), 'unknown')
+  const u = await cancelEpisode(host, r.name, 1, { force: true })
+  assert.ok(!u.ok)
+  assert.match(u.text, /unknown: 可能已送達/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/cancel`), 'unknown is not dead: nothing closed')
+  assert.deepEqual((await panelRows(host, newGate(), w.root)).map(x => [x.state, x.reservation]), [['unknown', 'unknown']])
+})
+
+test('S8: a non-live marker owner (no heartbeat past the orphan window) is stale', async () => {
+  const w = world()
+  const r = await assigned(w)
+  await registerGhost(w, 1, false)
+  const sd = sessionDirOf(w.v3, 'ghost')
+  const old = (Date.now() - ORPHAN_MS - 5_000) / 1000
+  utimesSync(`${sd}/act/1`, old, old)
+  markerFor(w, r.stateDir, 'ghost', 1)
+  assert.equal(await reservationOf(w.host, w.v3, `${r.stateDir}/episodes/1`), 'stale')
 })

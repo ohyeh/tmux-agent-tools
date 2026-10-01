@@ -46,8 +46,8 @@ test('lock: the loser sees the holder; a non-holder cannot release; the holder c
   const second = await acquireLock(h, lock, holder('B'))
   assert.equal(second.ok, false)
   assert.equal(!second.ok && second.busy !== 'unknown' && second.busy !== 'unreadable' && second.busy.token, 'A')
-  assert.equal(await releaseLock(h, lock, 'B'), false)
-  assert.equal(await releaseLock(h, lock, 'A'), true)
+  assert.equal((await releaseLock(h, lock, 'B')).ok, false)
+  assert.equal((await releaseLock(h, lock, 'A')).ok, true)
   assert.equal((await acquireLock(h, lock, holder('B'))).ok, true)
 })
 
@@ -287,11 +287,11 @@ test('Sol#3 readHolder: absent only on ENOENT; a lock in an unsearchable dir (EA
     const probe = await ledger.probeHolder(h, lock)
     assert.ok('unreadable' in probe, JSON.stringify(probe))
     assert.match(probe.unreadable, /EACCES/)
-    assert.equal(await releaseLock(h, lock, 'A'), false, 'not released while unreadable')
+    assert.equal((await releaseLock(h, lock, 'A')).ok, false, 'not released while unreadable')
   } finally {
     chmodSync(dir, 0o755)
   }
-  assert.equal(await releaseLock(h, lock, 'A'), true)
+  assert.equal((await releaseLock(h, lock, 'A')).ok, true)
 })
 
 test('readHolder: the same unreadable answer is logged once, not on every reconcile pass', async () => {
@@ -325,4 +325,34 @@ test('Sol r6 N4: maintainLock whose guard rm fails returns not-ok, keeps that fn
   assert.ok(!m.ok && 'path' in m && m.path === `${lock}.unlock`)
   assert.ok(!m.ok && 'error' in m && /Permission denied/.test(m.error) && /exit 1/.test(m.error))
   assert.doesNotThrow(() => lstatSync(`${lock}.unlock`), 'the guard is left; it is never stolen')
+})
+
+const lstatOk = (p: string) => {
+  try {
+    lstatSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+test('Sol-r3 R3-6: a guard that cannot be removed is returned by releaseLock, not hidden; no auto-steal', async () => {
+  const base = host()
+  const lock = join(fresh(), 'held')
+  assert.equal((await acquireLock(base, lock, holder('old'))).ok, true)
+  const denied: Host = {
+    ...base,
+    run: async (a, c, m) => (a[0] === 'rm' && a[1] === `${lock}.unlock` ? { exitCode: 1, stdout: '', stderr: 'EACCES injected guard' } : base.run(a, c, m)),
+  }
+  const rel = await releaseLock(denied, lock, 'old')
+  assert.equal(rel.ok, false, 'a failed guard removal is not a clean release')
+  assert.equal(!rel.ok && rel.left, `${lock}.unlock`, 'the leftover guard is named')
+  assert.match(!rel.ok ? rel.error : '', /EACCES injected guard/)
+  assert.equal(lstatOk(lock), false, 'the target itself is gone')
+  assert.equal(lstatOk(`${lock}.unlock`), true, 'the guard remains')
+  // The next holder acquires, and its release is told why it cannot finish: never silently "true".
+  assert.equal((await acquireLock(base, lock, holder('next'))).ok, true)
+  const next = await releaseLock(base, lock, 'next')
+  assert.equal(next.ok, false)
+  assert.equal(lstatOk(lock), true, 'nothing is stolen: the next lock stays held behind the stale guard')
 })

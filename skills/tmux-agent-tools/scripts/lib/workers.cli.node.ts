@@ -7,7 +7,9 @@
 //   tell <name> <text-file>
 //   stop <name>
 //   rows                       read-only panel rows, one JSON array
-//   cancel <name> <seq>        close one episode (acks/cancel); the pane is untouched
+//   cancel <name> <seq> [--force]  close one episode (acks/cancel); the pane is untouched.
+//                              --force closes an episode whose delivery was reserved and never acknowledged
+//                              ("unknown: 可能已送達"): it only stops new attempts, it never says "not delivered"
 //   unlock <name> [confirm]    maintenance: remove a lock whose holder is provably gone
 // --session and --cwd are required (§3). A missing identity is a refusal, never "mine".
 // Exit: 0 ok; 1 refused or failed (the reason is printed); 2 bad arguments.
@@ -64,13 +66,14 @@ function finish(out: Outcome): void {
 
 async function main(): Promise<void> {
   floor()
-  let parsed: { values: { session?: string; cwd?: string; 'collector-down'?: string }; positionals: string[] }
+  let parsed: { values: { session?: string; cwd?: string; 'collector-down'?: string; force?: boolean }; positionals: string[] }
   try {
     parsed = parseArgs({
       options: {
         session: { type: 'string' },
         cwd: { type: 'string' },
         'collector-down': { type: 'string' },
+        force: { type: 'boolean' },
       },
       allowPositionals: true,
     })
@@ -123,8 +126,8 @@ async function main(): Promise<void> {
   }
   if (command === 'cancel') {
     const [name, seq] = rest
-    if (!name || !seq || rest.length !== 2 || !/^[0-9]+$/.test(seq)) bad('cancel takes <name> <seq>')
-    return finish(await cancelEpisode(host, name, Number(seq)))
+    if (!name || !seq || rest.length !== 2 || !/^[0-9]+$/.test(seq)) bad('cancel takes <name> <seq> [--force]')
+    return finish(await cancelEpisode(host, name, Number(seq), { force: !!parsed.values.force }))
   }
   if (command === 'unlock') {
     const [name, word] = rest

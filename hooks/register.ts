@@ -1053,10 +1053,14 @@ export const register: Register = on => {
       if (verb === 'cancel' || verb === 'unlock') {
         // By name, like stop/tell: an episode cancel never touches the pane (§5); unlock is
         // maintenance only and refuses a holder it cannot prove gone.
-        if (!target) return { text: verb === 'cancel' ? '/workers cancel <name> <seq>' : '/workers unlock <name> [confirm]' }
+        if (!target) return { text: verb === 'cancel' ? '/workers cancel <name> <seq> [--force]' : '/workers unlock <name> [confirm]' }
         await idNow(() => $.session.id())
         const word = message.trim()
-        const out = verb === 'cancel' ? await cancelEpisode(bound, target, /^[0-9]+$/.test(word) ? Number(word) : NaN) : await unlockWorker(bound, target, word || undefined)
+        const [seqWord = '', flag] = word.split(/\s+/)
+        const out =
+          verb === 'cancel'
+            ? await cancelEpisode(bound, target, /^[0-9]+$/.test(seqWord) && (!flag || flag === '--force') ? Number(seqWord) : NaN, { force: flag === '--force' })
+            : await unlockWorker(bound, target, word || undefined)
         if (panel.open) void panel.refresh?.()
         return { text: `${verb} "${target}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 400)}` }
       }

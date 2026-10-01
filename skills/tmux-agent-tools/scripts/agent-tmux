@@ -31,7 +31,7 @@ fi
 # help line cost a session two failed dispatches, 2026-08-21): without this guard
 # `agent-tmux assign ...` treats "assign" as a custom binary and dies on the next
 # token, and `agent-tmux list` prints help with exit 0 — a silent no-op success.
-case " assign brief start resume start-ssh attach send send-wait send-wait-literal wait wait-text wait-literal wait-and-capture capture result supervise list status stats ping probe watch env-doctor doctor setup self-test stop checkpoint " in
+case " assign brief start resume start-ssh attach send send-wait send-wait-literal wait wait-text wait-literal wait-and-capture capture composer-state result supervise list status stats ping probe watch env-doctor doctor setup self-test stop checkpoint " in
   *" $CLI "*)
     echo "agent-tmux: '$CLI' is a command, not a <cli>. Use: agent-tmux <cli> $CLI ..." >&2
     echo "  <cli>: claude | codex | agy | cursor | grok | <custom-binary>" >&2
@@ -354,6 +354,7 @@ Usage:
   agent-tmux <cli> resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   agent-tmux <cli> start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
   agent-tmux <cli> preflight [--json]
+  agent-tmux <cli> composer-state <name> | --pane %N
   agent-tmux <cli> attach <name>
   agent-tmux <cli> send [--allow-project-config] [--from-file <abs-path>] [--enter-count N] [--enter-delay S] <name> [text]
   agent-tmux <cli> send --key enter|up|down <name>
@@ -676,6 +677,18 @@ Flags:
   --no-timeout-error           SOFT timeout exits 0; session_gone still exits 1.
 HELP_EOF
       ;;
+    composer-state)
+      cat <<'HELP_EOF'
+agent-tmux <cli> composer-state <name>
+agent-tmux <cli> composer-state --pane %N
+
+Classify the host composer from the visible pane. Line 1 is one of
+empty | draft | busy | permission | shell | unknown; when a composer was
+found the remaining lines are its text. <cli> is codex, cursor (cursor-agent)
+or claude; agy and any other CLI are always unknown. unknown whenever not sure.
+Used by the node collector: it pastes only into `empty`.
+HELP_EOF
+      ;;
     capture)
       cat <<'HELP_EOF'
 agent-tmux capture [flags] <name> [lines]
@@ -986,15 +999,58 @@ session_target() {
 }
 
 # No replace (plan R8.5, Q-B): a live session of <name> is another worker's, so
-# start/resume refuse before any state of the name is touched. tmux's own
-# duplicate-session refusal in new-session closes the window after this check.
+# start/resume refuse before any state of the name is touched. One per-name
+# launch lock (<name>/launch.lock) covers this check, the state init, new-session,
+# and the pane-id publication, so two starters of one name cannot interleave:
+# the loser waits, then finds the winner's session and refuses without writing
+# any of the winner's state. The lock is an OS advisory lock like send.lock
+# (zsystem flock; macOS has no flock(1)): the OS drops it when the holder exits
+# for any reason, so there is no holder PID, no stale lock, and nothing to steal.
+# The descriptor is close-on-exec, so tmux's server never inherits it. It stays
+# held until publish_pane_id (or process exit).
+_LAUNCH_LOCK_FD=""
+acquire_launch_lock() {
+  local name="$1" subdir lock_file rc=0
+  subdir="$(ensure_agent_dir "$name")"
+  lock_file="$subdir/launch.lock"
+  zmodload zsh/system 2>/dev/null || { echo "launch lock unavailable on $name: zsh/system module is missing" >&2; exit 75; }
+  ( : >> "$lock_file" ) 2>/dev/null || { echo "launch lock unavailable on $name: cannot create $lock_file" >&2; exit 75; }
+  zsystem flock -t "$SEND_LOCK_DEFAULT_TIMEOUT" -i 0.1 -f _LAUNCH_LOCK_FD "$lock_file" || rc=$?
+  if (( rc == 2 )); then
+    echo "launch lock contended on $name after ${SEND_LOCK_DEFAULT_TIMEOUT}s: another start/resume of this name is still running. The lock is released by the OS when its holder exits, so wait for it or stop that process; $SELF never takes a lock over." >&2
+    exit 75
+  elif (( rc != 0 )); then
+    echo "launch lock unavailable on $name: cannot lock $lock_file" >&2
+    exit 75
+  fi
+}
+
 refuse_live_name() {
   local name="$1" session pane
+  acquire_launch_lock "$name"
   session="$(session_for_name "$name")"
   "$TMUX" "${TMUX_SOCKET_ARGS[@]}" has-session -t "$(session_target "$session")" 2>/dev/null || return 0
   pane="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$(session_target "$session")" '#{pane_id}' 2>/dev/null || true)"
   echo "session $session already exists (pane ${pane:-?}); agent-tmux never replaces a live worker. Stop it first ($SELF $CLI stop $name) or use another name." >&2
   exit 1
+}
+
+# Called right after a successful new-session -P: new-session wrote the pane id
+# to pane-id.new (a failed new-session exits first under set -e and leaves the
+# published pane-id alone). Rename publishes it atomically, then the launch
+# lock is released.
+publish_pane_id() {
+  local name="$1" dir
+  dir="$(agent_root_dir)/$name"
+  if [[ -s "$dir/pane-id.new" ]]; then
+    mv -f "$dir/pane-id.new" "$dir/pane-id"
+  else
+    # No pane id to bind: drop the previous run's binding too (stale is worse
+    # than missing); stop then refuses until the binding is restored.
+    rm -f "$dir/pane-id.new" "$dir/pane-id"
+    echo "new-session printed no pane id for $name; pane-id left unbound" >&2
+  fi
+  if [[ -n "$_LAUNCH_LOCK_FD" ]]; then zsystem flock -u "$_LAUNCH_LOCK_FD" 2>/dev/null || true; _LAUNCH_LOCK_FD=""; fi
 }
 
 # #P1 wrong-engine guard: when this CLI has no session for <name>, a same-name
@@ -2370,6 +2426,80 @@ _composer_holds_paste() {
   "$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane -J -p -S -60 -t "$(session_target "$1")" 2>/dev/null \
     | awk '/^[[:space:]]*(→|›|❯|>)[[:space:]]/ { last = $0 } END { print last }' \
     | grep -qE '^[[:space:]]*(→|›|❯|>)[[:space:]]+\[Pasted (text|Content)'
+}
+
+# composer-state (plan S5, D-paste): what the host's composer is doing right now.
+# stdout line 1 = one of empty | draft | busy | permission | shell | unknown; when the
+# composer was found, the rest is its text (the collector compares it with what it
+# pasted). Pattern-based on the visible pane; fixtures are real captures
+# (lib/fixtures/composer/). Order: permission/menu dialog, then busy, then the
+# composer; anything not recognised is unknown. The caller pastes only on `empty`.
+# agy has no verified pattern set (no capture), so it is always unknown.
+# ponytail: a CLI's placeholder text is matched literally; an unlisted one reads as
+# `draft` (no paste, shown as a reason), never as `empty`.
+_composer_classify() {
+  LC_ALL=C awk -v kind="$1" '
+    function strip_first(s, glyph) { sub("^ *" glyph "[ \302\240]*", "", s); return s }
+    { sub(/[ \t\r]+$/, ""); L[NR] = $0 }
+    END {
+      n = NR; while (n > 0 && L[n] == "") n--
+      if (kind == "unknown" || n == 0) { print "unknown"; exit }
+      lo = n - 16; if (lo < 1) lo = 1
+      for (i = lo; i <= n; i++)
+        if (L[i] ~ /Press enter to confirm or esc to cancel|Do you want to (proceed|make this edit|create)|\[y\/N\]|\(y\/n\)/ || L[i] ~ /^ *(→|›|❯) [0-9]+\. /) { print "permission"; exit }
+      g = 0; f = n + 1; text = ""
+      if (kind == "codex") {
+        for (i = lo; i <= n; i++) if (L[i] ~ /^ *›( |$)/) g = i
+        if (g) {
+          for (j = g + 1; j <= n; j++) if (L[j] ~ /Context [0-9]+% used|for shortcuts|tab to queue|esc to interrupt/) { f = j; break }
+          for (k = g - 1; k >= g - 4 && k >= 1; k--) if (L[k] ~ /esc to interrupt|^ *• Working \(/) { print "busy"; exit }
+          first = strip_first(L[g], "›"); ph = "Ask Codex to do anything"
+        }
+      } else if (kind == "cursor") {
+        for (i = lo; i <= n; i++) if (L[i] ~ /^ *▄▄▄▄▄/) g = i
+        if (g) {
+          f = 0; for (j = g + 1; j <= n; j++) if (L[j] ~ /^ *▀▀▀▀▀/) { f = j; break }
+          if (!f) g = 0
+        }
+        if (g) {
+          seen = 0
+          for (k = g - 1; k >= 1 && seen < 4; k--) { if (L[k] == "") continue; seen++; if (L[k] ~ /^ *\342[\240-\243]/) { print "busy"; exit } }
+          first = strip_first(L[g + 1], "→"); ph = "(Plan, search, build anything|Add a follow-up)"; g++
+        }
+      } else if (kind == "claude") {
+        for (i = lo; i <= n; i++) if (L[i] ~ /^ *❯([ \302\240]|$)/) g = i
+        if (g) {
+          for (j = g + 1; j <= n; j++) if (L[j] ~ /^ *─────/) { f = j; break }
+          for (k = g - 1; k >= g - 6 && k >= 1; k--) if (L[k] ~ /esc to interrupt/) { print "busy"; exit }
+          first = strip_first(L[g], "❯"); ph = "Try \".*\""
+        }
+      }
+      if (!g) { print (L[n] ~ /[$%#] *$/ ? "shell" : "unknown"); exit }
+      text = first
+      for (j = g + 1; j < f; j++) { line = L[j]; sub(/^ +/, "", line); text = text "\n" line }
+      sub(/\n+$/, "", text)
+      if (text == "" || text ~ ("^" ph "$")) { print "empty"; exit }
+      print "draft"; print text
+    }'
+}
+
+composer_state_session() {
+  require_tmux
+  local target
+  case "${1:-}" in
+    --pane)
+      if [[ ! "${2:-}" =~ '^%[0-9]+$' ]]; then echo "composer-state --pane needs a pane id like %3" >&2; exit 2; fi
+      target="$2" ;;
+    ""|--*)
+      echo "Usage: $SELF $CLI composer-state <name> | --pane %N" >&2; exit 2 ;;
+    *)
+      target="$(session_target "$(session_for_name "$1")")" ;;
+  esac
+  local kind=unknown cap
+  case "$CLI" in codex|claude) kind="$CLI" ;; cursor|cursor-agent) kind=cursor ;; esac
+  cap="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane -J -p -t "$target" 2>/dev/null)" \
+    || { echo "composer-state: cannot capture $target" >&2; exit 1; }
+  print -r -- "$cap" | _composer_classify "$kind"
 }
 
 _paste_submitted_whole() {
@@ -5088,11 +5218,13 @@ start_session() {
     # exit-time synthesis below only fills in when the worker wrote nothing.
     # ponytail: one generated pane command covers flag and subcommand forms.
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" -f "$TMUX_CONF" new-session -P -F '#{pane_id}' "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: <oneshot argv>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}${oneshot_command} > $(shell_quote "$stdout_path") 2>&1; cli_code=\$?; if [ ! -s $(shell_quote "$result_path") ]; then result_status=failed; if [ \"\$cli_code\" -eq 0 ]; then result_status=success; fi; result_summary=\$(LC_ALL=C sed -e 's/${_osc_esc}\[[0-9;?]*[A-Za-z]//g' -e 's/[^[:print:][:space:]]//g' $(shell_quote "$stdout_path") 2>/dev/null | tail -c 400 || true); [ -n \"\$result_summary\" ] || result_summary='(no output)'; $(shell_quote "$JQ") -n --arg status \"\$result_status\" --arg summary \"\$result_summary\" --arg stdout_path $(shell_quote "$stdout_path") --argjson exit_code \"\$cli_code\" '{schema_version:1,status:\$status,summary:\$summary,exit_code:\$exit_code,stdout_path:\$stdout_path,artifacts:[],errors:[]}' > $(shell_quote "$result_path") || true; fi; $(launch_envelope_inline_block "$name" "$launch_id"); printf '%s%s\n' '__AGENT_TMUX_ONESHOT_EXIT__' \"\$cli_code\"; code=\"\$cli_code\"; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\"" > "$(agent_root_dir)/$name/pane-id"
+      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: <oneshot argv>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}${oneshot_command} > $(shell_quote "$stdout_path") 2>&1; cli_code=\$?; if [ ! -s $(shell_quote "$result_path") ]; then result_status=failed; if [ \"\$cli_code\" -eq 0 ]; then result_status=success; fi; result_summary=\$(LC_ALL=C sed -e 's/${_osc_esc}\[[0-9;?]*[A-Za-z]//g' -e 's/[^[:print:][:space:]]//g' $(shell_quote "$stdout_path") 2>/dev/null | tail -c 400 || true); [ -n \"\$result_summary\" ] || result_summary='(no output)'; $(shell_quote "$JQ") -n --arg status \"\$result_status\" --arg summary \"\$result_summary\" --arg stdout_path $(shell_quote "$stdout_path") --argjson exit_code \"\$cli_code\" '{schema_version:1,status:\$status,summary:\$summary,exit_code:\$exit_code,stdout_path:\$stdout_path,artifacts:[],errors:[]}' > $(shell_quote "$result_path") || true; fi; $(launch_envelope_inline_block "$name" "$launch_id"); printf '%s%s\n' '__AGENT_TMUX_ONESHOT_EXIT__' \"\$cli_code\"; code=\"\$cli_code\"; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\"" > "$(agent_root_dir)/$name/pane-id.new"
+    publish_pane_id "$name"
     (( _scope_guard_inject )) && task_scope_guard_mark_injected "$name"
   else
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" -f "$TMUX_CONF" new-session -P -F '#{pane_id}' "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\"" > "$(agent_root_dir)/$name/pane-id"
+      "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${start_launch_flags}; code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\"" > "$(agent_root_dir)/$name/pane-id.new"
+    publish_pane_id "$name"
   fi
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
@@ -5510,7 +5642,8 @@ resume_session() {
   local color_prefix
   color_prefix="$(color_env_shell_prefix)"
   "$TMUX" "${TMUX_SOCKET_ARGS[@]}" -f "$TMUX_CONF" new-session -P -F '#{pane_id}' "${session_env_args[@]}" -d -s "$session" -c "$directory" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'session id: ${_sid_display}' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS} ${RESUME_KEYWORD} $(shell_quote "$cli_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\"" > "$(agent_root_dir)/$name/pane-id"
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'cwd: $directory' 'session id: ${_sid_display}' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; ${color_prefix}$(shell_quote "$CLI_BIN") ${LAUNCH_FLAGS} ${RESUME_KEYWORD} $(shell_quote "$cli_session_id"); code=\$?; $(sentinel_inline_block "$name"); printf '\n[agent-tmux] local command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\"" > "$(agent_root_dir)/$name/pane-id.new"
+  publish_pane_id "$name"
 
   spawn_max_fuse_watcher "$name" "$session" "$sentinel" "$on_exit_cmd" "$max_runtime" "$max_idle"
   run_on_start_hook "$name" "$session"
@@ -5614,7 +5747,8 @@ start_ssh_session() {
   remote_command="export TERM=xterm-256color; ${color_prefix}cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'agent-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && ${CLI} ${LAUNCH_FLAGS}; code=\$?; printf '\n[agent-tmux] remote command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
 
   "$TMUX" "${TMUX_SOCKET_ARGS[@]}" -f "$TMUX_CONF" new-session -P -F '#{pane_id}' "${session_env_args[@]}" -d -s "$session" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")" > "$(agent_root_dir)/$name/pane-id"
+    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")" > "$(agent_root_dir)/$name/pane-id.new"
+  publish_pane_id "$name"
 
   echo "agent: $name"
   echo "Started $session"
@@ -9058,8 +9192,13 @@ stop_session() {
   if "$TMUX" "${TMUX_SOCKET_ARGS[@]}" has-session -t "$(session_target "$session")" 2>/dev/null; then
     # Bound to the pane its launch created (pane-id, written by new-session -P):
     # a same-named session without that pane is not this worker's to kill.
+    # An empty or unreadable binding proves nothing, so it refuses too.
     bound="$(tr -d '[:space:]' < "$(agent_root_dir)/$name/pane-id" 2>/dev/null || true)"
-    if [[ -n "$bound" ]] && ! "$TMUX" "${TMUX_SOCKET_ARGS[@]}" list-panes -s -t "$(session_target "$session")" -F '#{pane_id}' 2>/dev/null | grep -Fxq -- "$bound"; then
+    if [[ -z "$bound" ]]; then
+      echo "refusing to stop $session: $(agent_root_dir)/$name/pane-id is missing, empty, or unreadable, so this session cannot be proven to be the worker $name launched. Check it ($SELF $CLI capture $name), then kill it with tmux directly if it is yours." >&2
+      exit 1
+    fi
+    if ! "$TMUX" "${TMUX_SOCKET_ARGS[@]}" list-panes -s -t "$(session_target "$session")" -F '#{pane_id}' 2>/dev/null | grep -Fxq -- "$bound"; then
       echo "refusing to stop $session: it does not hold pane $bound, the pane $name was launched in" >&2
       exit 1
     fi
@@ -9641,6 +9780,9 @@ case "$command" in
     ;;
   capture)
     capture_session "$@"
+    ;;
+  composer-state)
+    composer_state_session "$@"
     ;;
   result)
     result_session "$@"

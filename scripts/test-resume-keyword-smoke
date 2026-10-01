@@ -11,6 +11,10 @@ AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 
 WORK="$(mktemp -d -t tmux-agent-resume-kw.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
+# The bundled defaults are under test: a user profile in ~/.config/agent-tmux
+# (e.g. resume_keyword=resume) must not override them.
+export XDG_CONFIG_HOME="$WORK/config"
+unset AGENT_TMUX_PROFILE_DIR
 cleanup() {
   "$AGENT_TMUX" cursor stop rkw-cursor >/dev/null 2>&1 || true
   "$AGENT_TMUX" agy stop rkw-agy >/dev/null 2>&1 || true
@@ -53,4 +57,5 @@ assert "agy resumes by id with --conversation" "$(argv_of agy rkw-agy AGY)" \
   "--dangerously-skip-permissions --conversation $SID"
 
 echo "PASS=$PASS FAIL=$FAIL"
+(( FAIL == 0 ))
 (( FAIL == 0 ))
