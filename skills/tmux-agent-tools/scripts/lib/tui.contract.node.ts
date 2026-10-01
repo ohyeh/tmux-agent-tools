@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, symlinkSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
 import { execFile, spawn } from 'node:child_process'
 import { nodeHost } from './host.node.ts'
@@ -14,8 +14,6 @@ import {
   panelRows,
   wrapperCall,
   v3Of,
-  displayCells,
-  isFullwidth,
   CLEAR_ID,
   STOP_CONFIRM_MS,
   STOP_REPEAT_MS,
@@ -30,7 +28,14 @@ import {
   runTui,
   type TuiState,
   ANSI_LEAVE_ALT,
+  KeyParser,
+  ESC_WAIT_MS,
+  cellWidth,
+  graphemeWidth,
+  graphemes,
+  sanitizeAnsi,
 } from './tui.node.ts'
+import { eawOf, EAW_UNICODE_VERSION } from './eaw-table.ts'
 
 /** Wait for a condition with a deadline. A fixed sleep races a loaded machine (H6). */
 async function until(cond: () => boolean, ms = 5_000, what = 'condition'): Promise<void> {
@@ -351,9 +356,10 @@ test('key-state: cancel pending confirm via Escape, r, or selecting another row'
 
 test('render: display width bounds and wide CJK characters at widths 40, 80, 120', () => {
   const rCJK = mockRow('w-cjk', {
-    d: { profile: 'claude', name: '測試隊友', dir: '/Users/test/專案目錄', since: Date.now() - 120_000, goal: '處理繁體中文與CJK寬度測試' },
+    d: { profile: 'claude', name: '測試隊友👨‍👩‍👧', dir: '/Users/test/專案目錄', since: Date.now() - 120_000, goal: '處理繁體中文與CJK寬度測試' },
     state: 'running',
     idleSeconds: 300,
+    summary: 'failed: 🇹🇼 #️⃣ ❤ é ·±─ 中︎ 結果',
   })
   const rNeedsInput = mockRow('w-input', {
     d: { profile: 'codex', name: 'codex-worker', dir: '/tmp/repo', since: Date.now() - 60_000 },
@@ -382,17 +388,22 @@ test('render: display width bounds and wide CJK characters at widths 40, 80, 120
     statusMessage: 'stop 測試隊友 — ok',
     statusUntil: Date.now() + 5000,
     owner: 'mysessionid',
+    mirror: { id: 'w-cjk', lines: ['輸出 👨‍👩‍👧 🇹🇼 ok', '́lead · ±─█ 中文字中文字中文字中文字中文字中文字中文字中文字中文字中文字'] },
     quit: false,
   }
 
-  for (const width of [40, 80, 120]) {
+  const prev = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+  try {
+  for (const amb of ['1', '2'])
+  for (const width of [7, 40, 41, 80, 120]) {
+    process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = amb
     for (const height of [5, 10, 24]) {
       const lines = renderTuiLines(state, width, height, 1500)
       assert.ok(lines.length <= height, `rendered lines ${lines.length} must not exceed height ${height}`)
 
       for (const line of lines) {
         const plain = stripAnsi(line)
-        const cells = displayCells(plain)
+        const cells = cellWidth(plain)
         assert.ok(
           cells <= width,
           `line cell width ${cells} must not exceed ${width}: [${plain}]`,
@@ -404,28 +415,407 @@ test('render: display width bounds and wide CJK characters at widths 40, 80, 120
       }
     }
   }
+  } finally {
+    if (prev === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = prev
+  }
 })
 
 test('render: truncateAnsi cleanly cuts wide characters at exact boundaries', () => {
   // '專' (2 cells), '案' (2 cells), '目' (2 cells), '錄' (2 cells)
   const cjk = '專案目錄'
-  assert.equal(displayCells(cjk), 8)
+  assert.equal(cellWidth(cjk), 8)
 
   // Max 5 cells: '專'(2) + '案'(2) = 4 cells; '目' would make 6 > 5, so it stops at '專案'
   const cut5 = truncateAnsi(cjk, 5)
   assert.equal(cut5, '專案')
-  assert.equal(displayCells(cut5), 4)
+  assert.equal(cellWidth(cut5), 4)
 
   // Max 6 cells: '專'(2) + '案'(2) + '目'(2) = 6 cells
   const cut6 = truncateAnsi(cjk, 6)
   assert.equal(cut6, '專案目錄'.slice(0, 3))
-  assert.equal(displayCells(cut6), 6)
+  assert.equal(cellWidth(cut6), 6)
 
   // With ANSI colors
   const colored = '\x1b[32m專案目錄\x1b[0m'
   const cutColored = truncateAnsi(colored, 5)
   assert.equal(stripAnsi(cutColored), '專案')
-  assert.equal(displayCells(stripAnsi(cutColored)), 4)
+  assert.equal(cellWidth(stripAnsi(cutColored)), 4)
+})
+
+// R2.2: the old guard compared `file://${argv[1]}` with import.meta.url, which is
+// percent-encoded, so a path with a space ran nothing and exited 0.
+test('main guard: runs from a path with a space, %, #, and through a symlink', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'tui-guard-'))
+  const copy = join(tmp, 'a b%41#c')
+  cpSync(import.meta.dirname, copy, { recursive: true })
+  const link = join(tmp, 'link dir')
+  symlinkSync(copy, link)
+  const run = (script: string) =>
+    new Promise<{ code: number; err: string }>(resolve => {
+      execFile(process.execPath, [script, '--no-such-flag'], { timeout: 20_000 }, (error, _out, err) => {
+        resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, err })
+      })
+    })
+  for (const script of [join(copy, 'tui.node.ts'), join(link, 'tui.node.ts')]) {
+    const res = await run(script)
+    assert.equal(res.code, 2, `${script}: main() ran and rejected the flag\n${res.err}`)
+    assert.match(res.err, /^tui: /, script)
+  }
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+// -----------------------------------------------------------------------------
+// 2b. Width per plan §1c S7. Every expected cell count is written by hand.
+// -----------------------------------------------------------------------------
+
+function withAmbiguous<T>(value: string | undefined, fn: () => T): T {
+  const prev = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+  if (value === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+  else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = value
+  try {
+    return fn()
+  } finally {
+    if (prev === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = prev
+  }
+}
+
+test('width: S7 fixtures with hard-coded cell counts', () => {
+  withAmbiguous(undefined, () => {
+    const cases: [string, string, number][] = [
+      ['family ZWJ', '\u{1F468}‍\u{1F469}‍\u{1F467}', 2],
+      ['flag TW', '\u{1F1F9}\u{1F1FC}', 2],
+      ['keycap with FE0F', '#️⃣', 2],
+      ['keycap without FE0F', '#⃣', 2],
+      ['lone VS16', '️', 0],
+      ['A + ZWJ', 'A‍', 1],
+      ['中 + VS15', '中︎', 2],
+      ['text-presentation heart U+2764', '❤', 1],
+      ['heart U+2764 + VS16', '❤️', 2],
+      ['CJK', '中文字', 6],
+      ['middle dot (ambiguous)', '·', 2],
+      ['plus-minus (ambiguous)', '±', 2],
+      ['leading combining mark', '́', 0],
+      ['leading combining mark then a', '́a', 1],
+      ['e + combining acute', 'é', 1],
+      ['ASCII', 'abc', 3],
+    ]
+    for (const [name, text, cells] of cases) assert.equal(cellWidth(text), cells, name)
+    assert.equal(graphemeWidth('\u{1F468}‍\u{1F469}‍\u{1F467}'), 2, 'family is one grapheme of 2')
+  })
+})
+
+test('width: TMUX_AGENT_AMBIGUOUS_WIDTH=1 makes ambiguous characters one cell', () => {
+  withAmbiguous('1', () => {
+    assert.equal(cellWidth('·'), 1)
+    assert.equal(cellWidth('±'), 1)
+    assert.equal(cellWidth('中'), 2, 'W stays 2')
+  })
+  withAmbiguous('2', () => assert.equal(cellWidth('±'), 2))
+})
+
+test('width: the generated EAW table', () => {
+  assert.equal(EAW_UNICODE_VERSION, '17.0.0')
+  assert.equal(eawOf(0x4e2d), 'W') // 中
+  assert.equal(eawOf(0xff01), 'W') // fullwidth ! (F)
+  assert.equal(eawOf(0x00b7), 'A') // ·
+  assert.equal(eawOf(0x0041), undefined) // A (Na)
+  assert.equal(eawOf(0x2764), undefined) // ❤ (N)
+  assert.equal(eawOf(0x2fff0), 'W') // unassigned plane 2: W by the file's header default
+})
+
+test('width: truncation never splits a grapheme or an escape, and fits the width', () => {
+  withAmbiguous(undefined, () => {
+    assert.equal(truncateAnsi('a\u{1F468}‍\u{1F469}‍\u{1F467}b', 2), 'a')
+    assert.equal(truncateAnsi('éxyz', 1), 'é')
+    assert.equal(truncateAnsi('\u{1F1F9}\u{1F1FC}\u{1F1EF}\u{1F1F5}', 3), '\u{1F1F9}\u{1F1FC}')
+    assert.equal(truncateAnsi('\x1b[31m中文\x1b[0m', 3), '\x1b[31m中\x1b[0m')
+    const text = '\x1b[32mok 👨‍👩‍👧 中\x1b[1m文 #️⃣ é ·\x1b[0m end'
+    const all = graphemes(stripAnsi(text))
+    for (let max = 0; max <= 25; max++) {
+      const cut = truncateAnsi(text, max)
+      assert.ok(cellWidth(cut) <= max, `max ${max}: ${cellWidth(cut)}`)
+      const got = graphemes(stripAnsi(cut))
+      assert.deepEqual(got, all.slice(0, got.length), `max ${max}: a whole-grapheme prefix`)
+      assert.ok(!/\x1b(?!\[[0-9;]*m)/.test(cut), `max ${max}: no split escape`)
+    }
+  })
+})
+
+// -----------------------------------------------------------------------------
+// 2c. Untrusted text keeps only SGR
+// -----------------------------------------------------------------------------
+
+test('escape: OSC title is stripped (BEL and ST forms)', () => {
+  assert.equal(sanitizeAnsi('a\x1b]0;evil title\x07b'), 'ab')
+  assert.equal(sanitizeAnsi('a\x1b]2;evil\x1b\\b'), 'ab')
+})
+
+test('escape: OSC 52 clipboard write is stripped', () => {
+  assert.equal(sanitizeAnsi('x\x1b]52;c;ZXZpbA==\x07y'), 'xy')
+})
+
+test('escape: cursor movement and other CSI are stripped; SGR is kept', () => {
+  assert.equal(sanitizeAnsi('a\x1b[2J\x1b[H\x1b[10;5Hb\x1b[?25l\x1b[1A'), 'ab')
+  assert.equal(sanitizeAnsi('\x1b[31mred\x1b[0m'), '\x1b[31mred\x1b[0m')
+  assert.equal(sanitizeAnsi('\x1bc\x1b(Bz\x1bPq#0\x1b\\'), 'z', 'RIS, charset, DCS')
+  assert.equal(sanitizeAnsi('a\x9b2Jb\x07\x08\tc'), 'a2Jb c', 'C1 CSI, BEL, BS dropped; tab is a space')
+})
+
+test('escape: an incomplete escape at the end is dropped', () => {
+  assert.equal(sanitizeAnsi('ok\x1b[31'), 'ok')
+  assert.equal(sanitizeAnsi('ok\x1b]0;tit'), 'ok')
+  assert.equal(sanitizeAnsi('ok\x1b'), 'ok')
+})
+
+test('escape: CJK mixed with escapes, through the renderer', () => {
+  assert.equal(sanitizeAnsi('中\x1b]0;t\x07文\x1b[1A字'), '中文字')
+  const row = mockRow('w-esc', { state: 'delivered', summary: 'success: 完成\x1b]52;c;ZXZpbA==\x07了\x1b[2J' })
+  const state: TuiState = {
+    rows: [row],
+    all: [row],
+    showAll: false,
+    selected: 'w-esc',
+    adding: false,
+    resumeInput: '',
+    mirror: { id: 'w-esc', lines: ['輸出\x1b]0;pwned\x07中\x1b[H文\x1b[31m紅\x1b[0m', 'tail\x1b[3'] },
+    statusMessage: 'stop — FAILED: \x1b]0;x\x07錯誤',
+    statusUntil: Date.now() + 60_000,
+    quit: false,
+  }
+  const lines = renderTuiLines(state, 80, 24, Date.now())
+  const screen = lines.join('\n')
+  assert.ok(screen.includes('完成了'), screen)
+  assert.ok(screen.includes('輸出中文\x1b[31m紅'), screen)
+  assert.ok(screen.includes('錯誤'), screen)
+  // Only SGR may remain: every ESC starts `ESC [ digits/; m`.
+  assert.ok(!/\x1b(?!\[[0-9;]*m)/.test(screen), JSON.stringify(screen))
+})
+
+// -----------------------------------------------------------------------------
+// 2d. Streaming input
+// -----------------------------------------------------------------------------
+
+test('input: rq in one chunk is refresh, then quit (COALESCED_QUIT)', async () => {
+  assert.deepEqual(new KeyParser().feed('rq'), ['r', 'q'])
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-rq-'))
+  const host = quietHost('rq', root, root)
+  // runTui copies the host, so the counter is in place before it starts.
+  let refreshes = 0
+  let counting = false
+  const realNow = host.now
+  host.now = async () => {
+    if (counting) refreshes += 1
+    return realNow()
+  }
+  const run = runTui({ stdin, stdout, host, session: 'rq', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  counting = true
+  stdin.emit('data', 'rq')
+  const ended = await Promise.race([run.then(() => 'quit'), new Promise(r => setTimeout(() => r('hung'), 3_000))])
+  if (ended === 'hung') stdin.emit('data', 'q')
+  await run
+  assert.equal(ended, 'quit', 'rq in one chunk must quit')
+  assert.ok(refreshes > 0, 'the r ran a refresh before the q')
+})
+
+test('input: jk in one chunk moves down, then up', () => {
+  assert.deepEqual(new KeyParser().feed('jk'), ['j', 'k'])
+  const rows = [mockRow('a'), mockRow('b'), mockRow('c')]
+  let state: TuiState = { rows, all: rows, showAll: false, selected: 'b', adding: false, resumeInput: '', quit: false }
+  for (const key of new KeyParser().feed('jk')) state = nextKeyState(state, key, 1).state
+  assert.equal(state.selected, 'b', 'j to c, k back to b')
+})
+
+test('input: ESC and an arrow key split across chunks', () => {
+  const p = new KeyParser()
+  assert.deepEqual(p.feed('\x1b'), [])
+  assert.equal(p.pendingEsc(), true)
+  assert.deepEqual(p.feed('[A'), ['\x1b[A'], 'ESC + "[A" in the next chunk is Up')
+  assert.deepEqual(p.feed('\x1b['), [])
+  assert.deepEqual(p.feed('1;5'), [])
+  assert.deepEqual(p.feed('B'), ['\x1b[1;5B'])
+  assert.deepEqual(p.feed('\x1bO'), [])
+  assert.deepEqual(p.feed('A'), ['\x1bOA'], 'SS3 split')
+  assert.deepEqual(p.feed('\x1b'), [])
+  assert.deepEqual(p.flushEsc(), ['\x1b'], 'a lone ESC is let go by the timer')
+  assert.equal(p.pendingEsc(), false)
+  assert.deepEqual(p.feed('\x1b'), [])
+  assert.deepEqual(p.feed('q'), ['\x1b', 'q'], 'ESC then a plain key in the next chunk')
+})
+
+test('input: a lone ESC in runTui resolves after the wait and cancels the prompt', async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-esc-'))
+  const run = runTui({ stdin, stdout, host: quietHost('e', root, root), session: 'e', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', 'n')
+  await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
+  stdout.written = ''
+  const sent = Date.now()
+  stdin.emit('data', '\x1b')
+  await until(() => stdout.written.includes('workers'), 5_000, 'the render after ESC')
+  assert.ok(Date.now() - sent >= ESC_WAIT_MS - 5, 'ESC waited for a possible sequence')
+  assert.ok(!stdout.written.includes('<session-id>'), 'ESC closed the prompt')
+  stdin.emit('data', 'q')
+  await run
+})
+
+test('input: bracketed paste markers split across chunks', () => {
+  const p = new KeyParser()
+  assert.deepEqual(p.feed('\x1b[20'), [])
+  assert.deepEqual(p.feed('0~abc-'), [])
+  assert.deepEqual(p.feed('def\x1b[2'), [])
+  assert.deepEqual(p.feed('01~'), ['\x1b[200~abc-def\x1b[201~'])
+  const base: TuiState = { rows: [], all: [], showAll: false, adding: true, resumeInput: '', quit: false }
+  assert.equal(nextKeyState(base, '\x1b[200~abc-def\x1b[201~', 1).state.resumeInput, 'abc-def')
+  const pastedQ = new KeyParser().feed('\x1b[200~q\x1b[201~')
+  assert.deepEqual(pastedQ, ['\x1b[200~q\x1b[201~'])
+  assert.equal(nextKeyState({ ...base, adding: false }, pastedQ[0]!, 1).state.quit, false, 'a pasted q is not quit')
+})
+
+test('input: a UTF-8 character split across chunks arrives whole', async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-utf8-'))
+  const run = runTui({ stdin, stdout, host: quietHost('u', root, root), session: 'u', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', Buffer.from('n'))
+  const bytes = Buffer.from('中👍')
+  for (const cut of [[0, 1], [1, 3], [3, 5], [5, 7]]) stdin.emit('data', bytes.subarray(cut[0], cut[1]))
+  await until(() => stdout.written.includes(': 中👍█'), 5_000, 'the decoded text in the prompt')
+  assert.ok(!stdout.written.includes('�'))
+  stdin.emit('data', '\x1b')
+  stdin.emit('data', 'q')
+  await run
+})
+
+test('input: backspace deletes one grapheme (emoji, CJK, combining)', () => {
+  const base: TuiState = { rows: [], all: [], showAll: false, adding: true, resumeInput: '', quit: false }
+  const bs = (text: string) => nextKeyState({ ...base, resumeInput: text }, '\x7f', 1).state.resumeInput
+  assert.equal(bs('ab\u{1F468}‍\u{1F469}‍\u{1F467}'), 'ab')
+  assert.equal(bs('id\u{1F1F9}\u{1F1FC}'), 'id')
+  assert.equal(bs('中文'), '中')
+  assert.equal(bs('cé'), 'c')
+  assert.equal(bs(''), '')
+})
+
+// -----------------------------------------------------------------------------
+// 2e. Terminal state: one cleanup for every way out
+// -----------------------------------------------------------------------------
+
+function mockTty(raw = false) {
+  class In extends EventEmitter {
+    isTTY = true
+    isRaw = raw
+    setRawMode(r: boolean) {
+      this.isRaw = r
+    }
+    resume() {}
+    pause() {}
+  }
+  class Out extends EventEmitter {
+    columns = 80
+    rows = 24
+    written = ''
+    write(t: string) {
+      this.written += t
+      return true
+    }
+  }
+  return { stdin: new In() as any, stdout: new Out() as any }
+}
+
+function listenerCounts() {
+  return ['SIGWINCH', 'SIGINT', 'SIGTERM', 'exit'].map(e => process.listenerCount(e))
+}
+
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  test(`terminal: ${sig} restores the terminal through the one cleanup`, async () => {
+    const before = listenerCounts()
+    const { stdin, stdout } = mockTty()
+    const root = mkdtempSync(join(tmpdir(), 'tui-sig-'))
+    const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
+    await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+    process.emit(sig)
+    await run
+    assert.equal(stdin.isRaw, false)
+    assert.ok(stdout.written.endsWith(ANSI_LEAVE_ALT))
+    assert.deepEqual(listenerCounts(), before)
+    assert.equal(stdin.listenerCount('data') + stdin.listenerCount('end') + stdin.listenerCount('error'), 0)
+  })
+}
+
+test("terminal: stdin 'end' quits and restores", async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-end-'))
+  const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('end')
+  await run
+  assert.equal(stdin.isRaw, false)
+  assert.ok(stdout.written.endsWith(ANSI_LEAVE_ALT))
+})
+
+test("terminal: stdin 'error' rejects and restores", async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-err-'))
+  const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('error', new Error('EIO_STDIN'))
+  await assert.rejects(run, /EIO_STDIN/)
+  assert.equal(stdin.isRaw, false)
+  assert.ok(stdout.written.endsWith(ANSI_LEAVE_ALT))
+})
+
+test('terminal: an async rejection inside the refresh timer rejects and restores', async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-timer-'))
+  const host = quietHost('s', root, root)
+  let bomb = false
+  const realNow = host.now
+  host.now = () => (bomb ? Promise.reject(new Error('BOMB_IN_TIMER')) : realNow())
+  const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 20 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  bomb = true
+  const ended = await Promise.race([run.then(() => 'resolved', () => 'rejected'), new Promise(r => setTimeout(() => r('hung'), 3_000))])
+  if (ended === 'hung') stdin.emit('data', 'q')
+  assert.equal(ended, 'rejected', 'a rejection in the timer ends runTui')
+  await assert.rejects(run, /BOMB_IN_TIMER/)
+  assert.equal(stdin.isRaw, false)
+  assert.ok(stdout.written.endsWith(ANSI_LEAVE_ALT))
+})
+
+test('terminal: after a stop, an in-flight refresh does not render', async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-late-'))
+  const host = quietHost('s', root, root)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  const realNow = host.now
+  host.now = async () => {
+    await gate
+    return realNow()
+  }
+  const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 60_000 })
+  process.emit('SIGTERM')
+  await run
+  const after = stdout.written
+  release()
+  await new Promise(r => setTimeout(r, 50))
+  process.emit('SIGWINCH')
+  assert.equal(stdout.written, after, 'nothing is drawn after the leave-alt sequence')
+  assert.ok(after.endsWith(ANSI_LEAVE_ALT))
+})
+
+test('terminal: a tty that was already raw is left raw', async () => {
+  const { stdin, stdout } = mockTty(true)
+  const root = mkdtempSync(join(tmpdir(), 'tui-raw-'))
+  const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
+  stdin.emit('data', 'q')
+  await run
+  assert.equal(stdin.isRaw, true, 'restored to the entry state, raw')
 })
 
 // -----------------------------------------------------------------------------
@@ -731,14 +1121,34 @@ test('no-mutation core panelRows: reads a dead-owner orphan and mutates nothing'
 // 6. PTY run test
 // -----------------------------------------------------------------------------
 
-test('pty run: starts TUI in a real PTY, presses keys, quits, verifies screen output and restored tty', async () => {
+test('pty run: q, rq, Ctrl-C, SIGTERM, an exception, and an already-raw tty all restore the tty flags', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-pty-root-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-pty-repo-'))
   const tuiScript = join(import.meta.dirname, 'tui.node.ts')
+  // The exception case: the real runTui on a real tty, with a host whose clock
+  // rejects inside the refresh timer once the TUI is up.
+  const bombScript = join(root, 'bomb.ts')
+  writeFileSync(
+    bombScript,
+    `import { runTui } from ${JSON.stringify(pathToFileURL(tuiScript).href)}
+import { nodeHost } from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'host.node.ts')).href)}
+const [, , root, cwd] = process.argv as [string, string, string, string]
+const host = nodeHost({ owner: 'pty-bomb', cwd })
+const realNow = host.now
+let bomb = false
+setTimeout(() => (bomb = true), 300)
+host.now = () => (bomb ? Promise.reject(new Error('PTY_BOMB')) : realNow())
+await runTui({ host, session: 'pty-bomb', cwd, root, mirrorMs: 50 }).catch(err => {
+  process.stderr.write('tui error: ' + String(err) + '\\n')
+  process.exit(1)
+})
+`,
+  )
 
-  // Python PTY harness to run node tui.node.ts in an actual pseudo-terminal
+  // Python PTY harness: run the TUI in a real pseudo-terminal, act per scenario,
+  // and compare the slave's termios before start and after exit.
   const pythonScript = `
-import pty, os, select, sys, time, subprocess, termios
+import pty, os, select, sys, time, subprocess, termios, tty, signal
 
 master, slave = pty.openpty()
 env = dict(os.environ)
@@ -750,12 +1160,15 @@ env['TMUX_AGENT_TMUX_SOCKET'] = sys.argv[5]
 node_bin = sys.argv[2]
 tui_file = sys.argv[3]
 repo_dir = sys.argv[4]
+scenario = sys.argv[6]
+bomb_file = sys.argv[7]
 
-p = subprocess.Popen(
-    [node_bin, tui_file, '--session', 'pty-session', '--cwd', repo_dir],
-    stdin=slave, stdout=slave, stderr=slave, env=env
-)
-os.close(slave)
+if scenario == 'preraw':
+    tty.setraw(slave)
+pre_attr = termios.tcgetattr(slave)
+cmd = [node_bin, bomb_file, sys.argv[1], repo_dir] if scenario == 'exception' else [node_bin, tui_file, '--session', 'pty-session', '--cwd', repo_dir]
+p = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, env=env)
+# The slave stays open here so its termios can be read after the child exits.
 
 def read_some(master, seconds, until=None):
     # os.read on a PTY master blocks until bytes arrive. The old loops checked
@@ -782,13 +1195,22 @@ start = time.time()
 while time.time() - start < 3 and b'workers' not in output:
     output.extend(read_some(master, max(0.0, 3 - (time.time() - start)), b'workers'))
 
-# Send key 'r' (refresh), then key 'q' (quit)
 time.sleep(0.1)
-os.write(master, b'r')
-time.sleep(0.1)
-os.write(master, b'q')
+if scenario == 'q':
+    os.write(master, b'r')
+    time.sleep(0.1)
+    os.write(master, b'q')
+elif scenario == 'rq':
+    os.write(master, b'rq')  # one chunk: refresh, then quit
+elif scenario == 'ctrl-c':
+    os.write(master, b'\\x03')  # raw mode: Ctrl-C arrives as a key
+elif scenario == 'sigterm':
+    p.send_signal(signal.SIGTERM)
+elif scenario == 'preraw':
+    os.write(master, b'q')
+# 'exception': the TUI ends by itself.
 
-while time.time() - start < 5 and p.poll() is None:
+while time.time() - start < 6 and p.poll() is None:
     output.extend(read_some(master, 0.2))
 output.extend(read_some(master, 0.2))
 
@@ -797,15 +1219,13 @@ try:
 except subprocess.TimeoutExpired:
     p.kill()
     p.wait(timeout=3)
-post_attr = termios.tcgetattr(master)
+post_attr = termios.tcgetattr(slave)
+os.close(slave)
 os.close(master)
 
-# Write captured screen and status
-print("=== EXIT CODE ===")
-print(p.returncode)
-print("=== TTY RESTORED ===")
-# Check if ECHO and ICANON are restored (non-zero)
-print(bool(post_attr[3] & (termios.ECHO | termios.ICANON)))
+print("EXIT=%d" % p.returncode)
+print("PRE_CANON=%s" % bool(pre_attr[3] & termios.ICANON))
+print("SAME_TTY=%s" % (pre_attr == post_attr))
 print("=== SCREEN OUTPUT ===")
 print(output.decode('utf-8', errors='replace'))
 `
@@ -827,9 +1247,18 @@ print(output.decode('utf-8', errors='replace'))
     })
   const started = await tmuxS(['new-session', '-d', '-s', 'pty', '-x', '80', '-y', '24'])
   assert.equal(started.code, 0, started.err)
+  const scenarios: { name: string; exit: number; preCanon: boolean; screen: RegExp }[] = [
+    { name: 'q', exit: 0, preCanon: true, screen: /workers/ },
+    { name: 'rq', exit: 0, preCanon: true, screen: /workers/ },
+    { name: 'ctrl-c', exit: 0, preCanon: true, screen: /workers/ },
+    { name: 'sigterm', exit: 0, preCanon: true, screen: /workers/ },
+    { name: 'exception', exit: 1, preCanon: true, screen: /tui error: Error: PTY_BOMB/ },
+    { name: 'preraw', exit: 0, preCanon: false, screen: /workers/ },
+  ]
   try {
+    for (const sc of scenarios) {
     const res = await new Promise<{ code: number; stdout: string; stderr: string }>(resolve => {
-      const cp = spawn('python3', ['-c', pythonScript, root, nodeBin, tuiScript, repo, socket], {
+      const cp = spawn('python3', ['-c', pythonScript, root, nodeBin, tuiScript, repo, socket, sc.name, bombScript], {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       let out = ''
@@ -847,10 +1276,12 @@ print(output.decode('utf-8', errors='replace'))
       })
     })
 
-    assert.equal(res.code, 0, `python pty harness failed: ${res.stderr}`)
-    assert.ok(res.stdout.includes('=== EXIT CODE ===\n0'), 'TUI must exit with code 0 on q')
-    assert.ok(res.stdout.includes('=== TTY RESTORED ===\nTrue'), 'TTY flags must be restored after exit')
-    assert.ok(res.stdout.includes('workers'), 'Screen output must contain workers title')
+    assert.equal(res.code, 0, `${sc.name}: python pty harness failed: ${res.stderr}`)
+    assert.ok(res.stdout.includes(`EXIT=${sc.exit}\n`), `${sc.name}: exit ${sc.exit}\n${res.stdout}`)
+    assert.ok(res.stdout.includes(`PRE_CANON=${sc.preCanon ? 'True' : 'False'}\n`), `${sc.name}: start state`)
+    assert.ok(res.stdout.includes('SAME_TTY=True\n'), `${sc.name}: tty flags must equal the start state\n${res.stdout}`)
+    assert.match(res.stdout, sc.screen, `${sc.name}: screen`)
+    }
   } finally {
     await tmuxS(['kill-server'])
   }

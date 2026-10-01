@@ -192,6 +192,33 @@ Then symlink the bundled scripts into `~/.local/bin`:
 skills/tmux-agent-tools/scripts/install-bin ~/.local/bin
 ```
 
+## Workers TUI
+
+`tmux-agent-tui` is the full-screen view of the tmux-agent workers. It is a zsh
+entry beside `agent-tmux` that runs `lib/tui.node.ts`; it resolves its own
+directory through symlinks, so an `install-bin` link, an `npx skills` folder and
+a marketplace checkout all work, from any cwd.
+
+```bash
+tmux-agent-tui --session <session-id> --cwd <dir>   # owner: act on that session's workers
+tmux-agent-tui                                      # viewer: every worker, labeled, read-only
+```
+
+- Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI acts for
+  that session. Without one it is a viewer that only lists.
+- Needs Node >= 22.18 (`NODE=/path/to/node` picks one) and a terminal. With no
+  TTY it exits 2; for a JSON snapshot use `tmux-agent-dashboard`.
+  `TMUX_AGENT_DIR` and `TMUX_AGENT_TMUX_SOCKET` pass through.
+- In Claude Code, the mod's `[ ⧉ ]` opens it in a tmux split. Outside tmux, the
+  toast gives the full command to run in another terminal (over 200 characters,
+  the whole command is in the log).
+
+Upgrade: `install-bin` links only the scripts that exist when it runs, so a new
+script (such as `tmux-agent-tui`) has no link until you run it again. After you
+update the skill (`npx skills update`, or `claude plugin update`), run
+`install-bin ~/.local/bin` again. `agent-tmux <cli> doctor` and `setup` list the
+bundle scripts that `~/.local/bin` is missing.
+
 ## Usage
 
 ```bash

@@ -1,0 +1,103 @@
+#!/usr/bin/env zsh
+# Smoke for the tmux-agent-tui entry (plan R2.1): it runs from an install-bin
+# link in a path with a space, `%`, `#` and a non-ASCII char, from a cwd outside
+# the repo, checks the Node floor in the shell, refuses a non-TTY, and passes
+# --session/--cwd, TMUX_AGENT_DIR and TMUX_AGENT_TMUX_SOCKET to lib/tui.node.ts.
+# A stub node records argv and env, so no real TUI starts.
+set -euo pipefail
+zmodload zsh/zpty
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
+
+WORK="$(mktemp -d -t tmux-agent-tui-entry-smoke.XXXXXX)"
+WORK="${WORK:A}"
+trap 'zpty -d tui 2>/dev/null || true; rm -rf "$WORK"' EXIT
+
+ODD="$WORK/inst a%b#c ü"
+mkdir -p "$ODD" "$WORK/bin dir" "$WORK/stub" "$WORK/elsewhere"
+cp -R "$REPO_ROOT/skills/tmux-agent-tools/scripts" "$ODD/scripts"
+"$ODD/scripts/install-bin" "$WORK/bin dir" >/dev/null
+ENTRY="$WORK/bin dir/tmux-agent-tui"
+
+cat > "$WORK/stub/node" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then echo "v${STUB_NODE_VERSION:-22.18.0}"; exit 0; fi
+{
+  for a in "$@"; do printf 'arg=%s\n' "$a"; done
+  printf 'TMUX_AGENT_DIR=%s\n' "${TMUX_AGENT_DIR-}"
+  printf 'TMUX_AGENT_TMUX_SOCKET=%s\n' "${TMUX_AGENT_TMUX_SOCKET-}"
+  printf 'pwd=%s\n' "$PWD"
+} > "$STUB_OUT"
+EOF
+chmod +x "$WORK/stub/node"
+STUB_OUT="$WORK/stub.out"
+
+PASS=0
+FAIL=0
+check() {
+  local label="$1"; shift
+  if "$@"; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label" >&2; FAIL=$((FAIL + 1))
+  fi
+}
+has() { [[ "$1" == *"$2"* ]]; }
+
+cd "$WORK/elsewhere"
+
+echo "case: install-bin links the entry"
+check "link exists" test -L "$ENTRY"
+
+echo "case: --help needs no TTY and no node"
+rc=0; out="$(NODE=/nonexistent/node "$ENTRY" --help </dev/null 2>&1)" || rc=$?
+check "--help exit 0" test "$rc" -eq 0
+check "--help prints usage" has "$out" "Usage:"
+check "--help names the Node floor" has "$out" "22.18"
+
+echo "case: unknown argument"
+rc=0; out="$(NODE="$WORK/stub/node" "$ENTRY" --bogus </dev/null 2>&1)" || rc=$?
+check "unknown argument exit 2" test "$rc" -eq 2
+
+echo "case: no node"
+rc=0; out="$(NODE=/nonexistent/node "$ENTRY" </dev/null 2>&1)" || rc=$?
+check "no node exits nonzero" test "$rc" -ne 0
+check "no node says so" has "$out" "node not found"
+
+echo "case: node below the floor"
+rm -f "$STUB_OUT"
+rc=0; out="$(STUB_OUT="$STUB_OUT" STUB_NODE_VERSION=22.17.0 NODE="$WORK/stub/node" "$ENTRY" </dev/null 2>&1)" || rc=$?
+check "old node exits nonzero" test "$rc" -ne 0
+check "old node names its version and the floor" has "$out" "node 22.17.0"
+check "old node message names 22.18" has "$out" "floor 22.18"
+check "old node never runs the TUI" test ! -e "$STUB_OUT"
+
+echo "case: not a TTY"
+rc=0; out="$(STUB_OUT="$STUB_OUT" NODE="$WORK/stub/node" "$ENTRY" --session s1 </dev/null 2>&1)" || rc=$?
+check "non-TTY exit 2" test "$rc" -eq 2
+check "non-TTY says why" has "$out" "needs a terminal"
+check "non-TTY never runs the TUI" test ! -e "$STUB_OUT"
+
+echo "case: a TTY passes argv and env through (stub node on PATH)"
+cmd="unset NODE; export PATH=${(q)WORK}/stub:\$PATH STUB_OUT=${(q)STUB_OUT}"
+cmd+=" TMUX_AGENT_DIR=${(q)WORK}/'state dir' TMUX_AGENT_TMUX_SOCKET=${(q)WORK}/sock;"
+cmd+=" cd ${(q)WORK}/elsewhere && exec ${(q)ENTRY} --session 'sess 1' --cwd ${(q)ODD}"
+zpty -b tui "$cmd"
+for _ in {1..50}; do [[ -s "$STUB_OUT" ]] && break; /bin/sleep 0.1; done
+zpty -d tui 2>/dev/null || true
+got="$(cat "$STUB_OUT" 2>/dev/null || true)"
+expected="arg=${ODD:A}/scripts/lib/tui.node.ts
+arg=--session
+arg=sess 1
+arg=--cwd
+arg=$ODD
+TMUX_AGENT_DIR=$WORK/state dir
+TMUX_AGENT_TMUX_SOCKET=$WORK/sock
+pwd=$WORK/elsewhere"
+check "argv and env reach lib/tui.node.ts beside the resolved script" test "$got" = "$expected"
+[[ "$got" == "$expected" ]] || printf 'expected:\n%s\ngot:\n%s\n' "$expected" "$got" >&2
+
+echo
+echo "$PASS passed, $FAIL failed"
+(( FAIL == 0 ))

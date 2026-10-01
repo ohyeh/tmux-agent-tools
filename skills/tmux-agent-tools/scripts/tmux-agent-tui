@@ -1,0 +1,75 @@
+#!/usr/bin/env zsh
+# tmux-agent-tui: the full-screen workers TUI (lib/tui.node.ts) without the
+# long `node …/lib/tui.node.ts` line (plan R2.1, D-entry).
+#
+# Its own dir comes from `${0:A:h}` (symlinks resolved), so it runs the same
+# from an install-bin link, an `npx skills` folder, or a marketplace checkout,
+# and from a path with spaces, `%`, `#`, or non-ASCII characters.
+
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+NODE="${NODE:-$(command -v node 2>/dev/null || true)}"
+# The same floor as NODE_FLOOR in lib/tui.node.ts. It is checked here first:
+# an older node fails on the .ts file with a syntax error that names no version.
+FLOOR_MAJOR=22
+FLOOR_MINOR=18
+
+usage() {
+  cat <<'EOF'
+tmux-agent-tui - full-screen TUI for the tmux-agent workers of one session.
+
+Usage:
+  tmux-agent-tui [--session <id>] [--cwd <dir>]
+
+  --session <id>   Owner mode: act on this session's workers (tell, stop,
+                   resume, clear). Default: $TMUX_AGENT_SESSION.
+  --cwd <dir>      The session's directory. Default: the current directory.
+
+Without a session id the TUI is a viewer: it lists every worker, labeled,
+and is read-only.
+
+Needs Node >= 22.18 (set NODE=/path/to/node to pick one) and a terminal:
+stdin and stdout must be a TTY (for a JSON snapshot, use tmux-agent-dashboard).
+TMUX_AGENT_DIR (state root) and TMUX_AGENT_TMUX_SOCKET (tmux socket) are
+passed through to the TUI unchanged.
+
+Upgrade: a new script needs a new link. After updating the bundle, run its
+install-bin again (agent-tmux <cli> doctor says when a link is missing).
+EOF
+}
+
+require_node() {
+  [[ -n "$NODE" && -x "$NODE" ]] || {
+    echo "tmux-agent-tui: node not found; install Node >= $FLOOR_MAJOR.$FLOOR_MINOR or set NODE=/path/to/node" >&2
+    exit 1
+  }
+  local version major minor
+  version="$("$NODE" --version 2>/dev/null || true)"
+  version="${version#v}"
+  major="${version%%.*}"
+  minor="${${version#*.}%%.*}"
+  if [[ "$major" != <-> || "$minor" != <-> ]] || (( major < FLOOR_MAJOR || (major == FLOOR_MAJOR && minor < FLOOR_MINOR) )); then
+    echo "tmux-agent-tui: node ${version:-<no version>} ($NODE) is below the floor $FLOOR_MAJOR.$FLOOR_MINOR; install a newer Node or set NODE=/path/to/node" >&2
+    exit 1
+  fi
+}
+
+args=()
+while (( $# )); do
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    --session|--cwd)
+      (( $# >= 2 )) || { echo "tmux-agent-tui: $1 needs a value" >&2; exit 2; }
+      args+=("$1" "$2"); shift 2 ;;
+    --session=*|--cwd=*) args+=("$1"); shift ;;
+    *) echo "tmux-agent-tui: unknown argument: $1 (see --help)" >&2; exit 2 ;;
+  esac
+done
+
+require_node
+if [[ ! -t 0 || ! -t 1 ]]; then
+  echo "tmux-agent-tui: needs a terminal (stdin and stdout must be a TTY); for a JSON snapshot use tmux-agent-dashboard" >&2
+  exit 2
+fi
+exec "$NODE" "$SCRIPT_DIR/lib/tui.node.ts" "${args[@]}"

@@ -107,7 +107,7 @@ Full walkthrough: `references/core-workflow.md`.
 
 ## v5 ledger (non-Claude hosts)
 
-Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). Layout, ownership, and delivery are in the repository document `docs/tmux-agent-mod.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only.
+Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). The workers TUI is `scripts/tmux-agent-tui [--session <id>] [--cwd <dir>]`: with a session id it is the owner and acts on that session's workers; without one it is a read-only viewer. It needs Node >= 22.18 and a TTY (exit 2 otherwise; `--help` needs neither). After a skill update, re-run `scripts/install-bin`: it links only the scripts that existed when it last ran, and `agent-tmux <cli> doctor` names the missing links. Layout, ownership, and delivery are in the repository document `docs/tmux-agent-mod.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only.
 
 ## result.json completion contract
 

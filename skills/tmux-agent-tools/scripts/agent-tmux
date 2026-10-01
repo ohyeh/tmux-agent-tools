@@ -794,6 +794,9 @@ agent-tmux doctor          Check binaries + tmux + capture/wait behavior.
                            Also prints the engine version + install path so
                            two machines can eyeball version drift offline.
 agent-tmux setup           Emit combined JSON for doctor --json + self-test.
+                           Both name scripts of this bundle that have no
+                           link in ~/.local/bin (e.g. tmux-agent-tui after an
+                           upgrade): re-run install-bin to add them.
 agent-tmux self-test       End-to-end smoke without launching a real CLI.
 agent-tmux --version       Print the engine version and exit.
 
@@ -7201,6 +7204,19 @@ preflight_session() {
   return 0
 }
 
+# Scripts of this bundle with no link in ~/.local/bin although install-bin put
+# agent-tmux there: install-bin links only what existed when it ran, so a script
+# added by an upgrade (tmux-agent-tui) is missing until it runs again (plan D-upgrade).
+missing_bin_links() {
+  local dir="$HOME/.local/bin" f out=()
+  [[ -e "$dir/agent-tmux" ]] || return 0
+  for f in "${SELF:h}"/*(N.x); do
+    [[ "${f:t}" == "install-bin" ]] && continue
+    [[ -e "$dir/${f:t}" ]] || out+=("${f:t}")
+  done
+  print -r -- "${(j: :)out}"
+}
+
 doctor_session() {
   local output_json=0
   if [[ "${1:-}" == "--json" ]]; then
@@ -7259,6 +7275,11 @@ doctor_session() {
 
     add_doctor_check "approval" true "$PROFILE_APPROVAL"
 
+    # A hint, not a failure: every wrapper still works through agent-tmux.
+    local unlinked
+    unlinked="$(missing_bin_links)"
+    [[ -z "$unlinked" ]] || add_doctor_check "bin_links" true "~/.local/bin lacks: $unlinked; re-run ${SELF:h}/install-bin"
+
     if (( ok )); then
       printf '{"ok":true,"checks":[%s]}\n' "${(j:,:)checks}"
       return 0
@@ -7271,6 +7292,9 @@ doctor_session() {
   local preflight_out
   echo "version: $AGENT_TMUX_VERSION"
   echo "engine: $SELF"
+  local unlinked
+  unlinked="$(missing_bin_links)"
+  [[ -z "$unlinked" ]] || echo "bin_links: ~/.local/bin lacks: $unlinked; re-run '${SELF:h}/install-bin'"
   echo "tmux: $TMUX"
   if [[ -n "$CLI_BIN" && -x "$CLI_BIN" ]]; then
     echo "${CLI}: $CLI_BIN"

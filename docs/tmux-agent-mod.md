@@ -68,7 +68,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 | 面 | 用途 |
 |---|---|
-| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上）；按 `[ ⧉ ]` 時一次 `/bin/sh -c` 找 `node` 和 `agent-tmux` 旁的 `lib/tui.node.ts`，再一次 `tmux split-window` |
+| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上）；按 `[ ⧉ ]` 時一次 `/bin/sh -c` 找 `node`、`agent-tmux` 旁的 `lib/tui.node.ts` 與 `tmux-agent-tui`，在 tmux 裡再一次 `tmux split-window` |
 | `fs.read/write/list/stat` | 寫只在 state root 的 `.v3/` 底下：`worker.json`、每輪的 `dispatch.json`／`tell.md`／`waiter`、`brief.md`、`launch.exit`、`mod-assign.log`、`result.json`、activation 心跳。建目錄、`ln -sn` 鎖、`mv` 發佈、`rm` 走 `process.run`（引擎的 `fs` 沒有 mkdir／rename）。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
 | `fs.exists` | state root 之外兩種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；以及 `resume` 找 session id 在哪個 CLI 的 store（下面 `[ + ]` 那節列的路徑）。只問「在不在」 |
 | `store.get/set/keys/delete` | 只放 UI 偏好：面板開著沒（`tmux-agent.panel`）。交付帳不在 store（見上面 `.v3/`） |
@@ -441,9 +441,25 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 Claude Code 裡 mod 自己就是 collector，launcher 會再起一個，同一份結果可能送兩次；TUI
 只看不收（`collector health unknown — this view does not collect`）。
 
+TUI 結束時（`q`、Ctrl-C、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw）；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。
+
 TUI 的位置跟著 mod 已經在用的 `agent-tmux` 走（`PATH`、marketplace checkout、
-`npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。不在 tmux 裡時
-什麼都不切，toast 給出另一個終端機要跑的那一行 `node …/tui.node.ts --session <id>`。
+`npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。找不到 `node`、
+`lib/tui.node.ts` 或 `tmux-agent-tui` → `FAILED`。不在 tmux 裡時什麼都不切，也不自動開
+終端機 app：結果是 `ok`，toast 寫「已提供開啟指令」，加上完整、可直接執行的一行
+`'<絕對路徑>/tmux-agent-tui' --session '<id>' --cwd '<cwd>'`（每個參數都加單引號，
+空白與單引號都安全；mod 有 `TMUX_AGENT_DIR` 時前面加 `TMUX_AGENT_DIR='<root>'`）。整段
+超過 200 字時，完整指令寫進 log，toast 印「完整指令見 log」和前段。mod 的 tmux 呼叫
+都用預設 socket，所以指令不帶 socket。
+
+`tmux-agent-tui`（R2.1）就是這個入口：自己的目錄以 `${0:A:h}` 解開 symlink，所以
+install-bin 的 link、`npx skills`、marketplace 都能用，路徑含空白、`%`、`#`、非 ASCII
+也行。帶 `--session` 是 owner（能對該 session 的 worker 動作），不帶是 viewer（列出全部、
+唯讀）。先在 shell 檢查 Node ≥ 22.18（與 `lib/tui.node.ts` 的 `NODE_FLOOR` 同一個值），
+不是 TTY 時 exit 2；`--help` 不需要 TTY。`TMUX_AGENT_DIR`、`TMUX_AGENT_TMUX_SOCKET`
+原樣傳下去。升級：install-bin 只連結執行當下存在的腳本，更新 skill 之後要重跑
+`install-bin ~/.local/bin`；`agent-tmux <cli> doctor`／`setup` 會列出 `~/.local/bin` 少了
+哪些 link（`bin_links`，只是提示，不算失敗）。
 
 按鈕字樣：寬的終端機是 `[ + new ][ ↻ refresh ][ ⧉ tui ]`，放不下時只留符號；先讓出
 的是按鈕的字，再來是 `workers v…` 名稱，計數永遠留著。符號都是 East Asian Width N，

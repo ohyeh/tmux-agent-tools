@@ -1723,9 +1723,10 @@ function mockPanel(
   refuseWake = false,
   /** What `$.agent.list()` answers while the panel is open. `'reject'` throws. */
   agents: 'reject' | readonly { id: string; description: string; type: string; status: string }[] = [],
-): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[] } {
+): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[]; toasts: string[] } {
   const argv: (readonly string[])[] = []
   const statuses: unknown[] = []
+  const toasts: string[] = []
   const open: string[] = []
   const closed: string[] = []
   const logs: string[] = []
@@ -1762,7 +1763,10 @@ function mockPanel(
     if (agents === 'reject') throw new Error('agent.list refused')
     return { value: [...agents] }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('turn.complete', () => ({ text: '' }))
   on('prompt.submit', ($, e) => {
     if (refuseWake) throw new Error('engine says no')
@@ -1774,6 +1778,8 @@ function mockPanel(
     if (e.argv[0] === 'grep') return { value: { exitCode: typeof probe.grep === 'string' ? 0 : 1, stdout: typeof probe.grep === 'string' ? probe.grep : '', stderr: '' } }
     // `[ ⧉ ]`: the node + tui.node.ts lookup is `probe.sh`; the split names a pane.
     if (e.argv[0] === '/bin/sh' && typeof probe.sh === 'string') return { value: { exitCode: 0, stdout: probe.sh, stderr: '' } }
+    // `probe.sh: false`: the lookup finds no node or no script (`[ -x ]` fails, no output).
+    if (e.argv[0] === '/bin/sh' && probe.sh === false) return { value: { exitCode: 1, stdout: '', stderr: '' } }
     if (e.argv[0] === 'tmux' && e.argv[1] === 'split-window') return { value: { exitCode: 0, stdout: '%9\n', stderr: '' } }
     const isList = e.argv[0] === 'tmux' && e.argv[1] === 'list-sessions'
     const isCapturePane = e.argv[0] === 'tmux' && e.argv[1] === 'capture-pane'
@@ -1806,7 +1812,7 @@ function mockPanel(
       },
     }
   })
-  return { argv, open, closed, logs, statuses }
+  return { argv, open, closed, logs, statuses, toasts }
 }
 
 const captures = (argv: (readonly string[])[]) => argv.filter(a => a.includes('capture'))
@@ -3900,7 +3906,8 @@ describe('cursor review of 34e2a1e', () => {
     expect(cells.reduce((a, b) => a + b, 0), 'title bar plus the engine\'s " [-]" fit 80 columns').toBeLessThanOrEqual(80 - ' [-]'.length)
   })
 
-  const TUI_SH = '/opt/node/bin/node\n/skills/tmux-agent-tools/scripts/lib/tui.node.ts\n'
+  const TUI_SH = '/opt/node/bin/node\n/skills/tmux-agent-tools/scripts/lib/tui.node.ts\n/skills/tmux-agent-tools/scripts/tmux-agent-tui\n'
+  const wait50 = () => new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
 
   test('[ ⧉ ] splits the host pane with the TUI bound to this session (P7)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME, TMUX_PANE: '%5' })
@@ -3923,9 +3930,10 @@ describe('cursor review of 34e2a1e', () => {
       '/opt/node/bin/node',
       '/skills/tmux-agent-tools/scripts/lib/tui.node.ts',
     ])
+    expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI in %9 beside %5'])
   })
 
-  test('[ ⧉ ] outside tmux splits nothing and names the command to run', WITH_DRIVER, async ($, on) => {
+  test('[ ⧉ ] outside tmux splits nothing and hands over the full tmux-agent-tui command (ok, D-q2)', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     mockClock(on)
@@ -3935,9 +3943,50 @@ describe('cursor review of 34e2a1e', () => {
     await $.command.run(run('workers'))
     await $.ui.render(bandRender())
     await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
+    await wait50()
     expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
-    expect(p.logs.join('\n')).toContain('not inside tmux; in another terminal run: /opt/node/bin/node /skills/tmux-agent-tools/scripts/lib/tui.node.ts --session ')
+    expect(p.toasts).toEqual([
+      "tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行：'/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'",
+    ])
+    expect(p.logs.join('\n'), 'a short command needs no log line').not.toContain('tui open command')
+  })
+
+  test('[ ⧉ ] outside tmux: a command over 200 chars goes whole to the log, quoted, and the toast says so', WITH_DRIVER, async ($, on) => {
+    // A state root with a space and a single quote: the quoting must survive both.
+    const dir = `/state/it's here/${'d'.repeat(160)}`
+    mock.env(on, { HOME, TMUX_AGENT_DIR: dir })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+    const full = `TMUX_AGENT_DIR='/state/it'\\''s here/${'d'.repeat(160)}' '/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'`
+    expect(p.logs, 'the whole command, runnable as logged').toContain(`tmux-agent: tui open command: ${full}`)
+    expect(p.toasts).toHaveLength(1)
+    const toast = p.toasts[0]!
+    expect(toast.startsWith('tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行（完整指令見 log）：TMUX_AGENT_DIR=')).toBe(true)
+    expect(toast.endsWith('…'), 'the toast keeps a cut that act() does not cut again').toBe(true)
+    expect(toast.split('tmux-agent:').length - 1, 'prefix exactly once').toEqual(1)
+  })
+
+  test('[ ⧉ ] with no node or no tmux-agent-tui beside agent-tmux fails and splits nothing', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME, TMUX_PANE: '%5' })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: false })
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+    expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
+    expect(p.toasts).toHaveLength(1)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: no node, lib\/tui\.node\.ts or tmux-agent-tui beside /)
   })
 })
 
@@ -4842,7 +4891,8 @@ describe('resume', () => {
     const name = drawn(files, 'cursor-5ea32e6e')!
     // The resumed pane is up: a worker with nothing to deliver is listed while its session lives.
     probe.sessions.push(`cursor-cli-${name}`)
-    expect(out.text, 'the answer says nothing wakes it until a tell').toContain(`/workers tell ${name}`)
+    expect(out.text, 'the answer says nothing wakes it until a tell').toContain(`in the TUI select "${name}" and press t (tell)`)
+    expect(out.text, 'no /workers hint in the resume answer').not.toContain('/workers tell')
     expect(resumeArgv(panel.argv)).toEqual([['agent-tmux', 'cursor', 'resume', '--exact', v5('cursor-5ea32e6e'), '/work', ID]])
     expect(JSON.parse(files[`${V3}/${name}/worker.json`]!)).toMatchObject({ profile: 'cursor', name, dir: '/work', owner: 'sess-A', ownerCwd: '/work', origin: 'resume' })
     expect(Object.keys(files).some(k => k.startsWith(`${V3}/${name}/episodes/`)), 'no episode until the first tell (r5 F5-2)').toBe(false)
@@ -4938,5 +4988,53 @@ describe('resume', () => {
     expect(resumeArgv(panel.argv)).toEqual([['agent-tmux', 'cursor', 'resume', '--exact', v5('fix-it'), '/work', ID]])
     expect(drawn(files, 'fix-it')).toBeDefined()
     expect(keysOf(await $.ui.render(bandRender())), 'a resumed session closes the field').not.toContain('resume-input')
+  })
+
+  /** Every exclusive `mkdir <v3>/<name>` answers EACCES: reserve() reports `unknown` (H7). */
+  const refuseReserve = (on: On) => {
+    const st = runOf(on)
+    const inner = st.ledger!
+    st.ledger = argv =>
+      argv[0] === 'mkdir' && argv[1] !== '-p' && argv[1]!.startsWith(`${V3}/`) && !argv[1]!.slice(V3.length + 1).includes('/')
+        ? { value: { exitCode: 1, stdout: '', stderr: `mkdir: ${argv[1]}: Permission denied` } }
+        : inner(argv)
+  }
+
+  test('a reserve failure on the band resume toasts the prefix exactly once (R5.1, H7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    const files: Files = { [`${HOME}/.cursor/chats/b974ad48/${ID}/meta.json`]: JSON.stringify({ cwd: '/work' }) }
+    mockFs(on, files)
+    refuseReserve(on)
+    const panel = mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    type TypeInto = (t: { plugin: string; key: string; text: string; requestId: string; surface: 'terminal' }) => Promise<unknown>
+    const typeInto = ($.ui as unknown as { input: TypeInto }).input
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'add', requestId: 'above-prompt' })
+    await $.ui.render(bandRender())
+    await typeInto({ plugin: 'tmux-agent', key: 'resume-input', text: `cursor ${ID} fix-it`, requestId: 'above-prompt', surface: 'terminal' })
+    await settle()
+    expect(resumeArgv(panel.argv), 'nothing resumed').toEqual([])
+    expect(panel.toasts).toHaveLength(1)
+    expect(panel.toasts[0]).toMatch(/^tmux-agent: resume — FAILED: could not reserve /)
+    expect(panel.toasts[0]!.split('tmux-agent:').length - 1, 'prefix exactly once').toEqual(1)
+  })
+
+  test('a reserve failure on the assign tool keeps exactly one tmux-agent: prefix on the deny (R5.1)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, {})
+    refuseReserve(on)
+    mockPanel(on, { running: true })
+
+    await $.session.start(session())
+    const out = JSON.stringify(await $.tool.call(assignInput()))
+    expect(out).toMatch(/"tmux-agent: could not reserve /)
+    expect(out.split('tmux-agent:').length - 1, 'prefix exactly once').toEqual(1)
   })
 })

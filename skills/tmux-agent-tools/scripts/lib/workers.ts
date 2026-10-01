@@ -2256,7 +2256,10 @@ export function stopButtonLabel(name: string, armed: boolean): string {
  * launcher's second collector would deliver one result twice. The TUI is the
  * `lib/tui.node.ts` beside the `agent-tmux` this mod already runs (PATH, the
  * marketplace checkout, or an `npx skills` folder; a symlink is resolved), so it
- * follows however the wrapper was installed. Not in tmux: the command to run.
+ * follows however the wrapper was installed. Not in tmux: `ok`, with the
+ * `tmux-agent-tui` command to run in another terminal (plan D-q2: no terminal app
+ * is opened), every argument shell-quoted; over 200 chars the full line goes to
+ * the log. The mod's tmux calls use the default socket, so the line names none.
  */
 export async function openTuiBeside(host: Host, pane: string | undefined): Promise<Outcome> {
   const session = host.owner()
@@ -2268,22 +2271,26 @@ export async function openTuiBeside(host: Host, pane: string | undefined): Promi
     [
       '/bin/sh',
       '-c',
-      'w=$(command -v "$1") && w=$(realpath "$w") && t="${w%/*}/lib/tui.node.ts" && [ -f "$t" ] && n=$(command -v node) && printf "%s\\n%s\\n" "$n" "$t"',
+      'w=$(command -v "$1") && w=$(realpath "$w") && t="${w%/*}/lib/tui.node.ts" && e="${w%/*}/tmux-agent-tui" && [ -f "$t" ] && [ -x "$e" ] && n=$(command -v node) && printf "%s\\n%s\\n%s\\n" "$n" "$t" "$e"',
       'sh',
       bin,
     ],
     cwd,
     5_000,
   )
-  const [node, tui] = found.stdout.trim().split('\n')
-  if (found.exitCode !== 0 || !node || !tui) {
-    return { ok: false, text: `no node or lib/tui.node.ts beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}` }
+  const [node, tui, entry] = found.stdout.trim().split('\n')
+  if (found.exitCode !== 0 || !node || !tui || !entry) {
+    return { ok: false, text: `no node, lib/tui.node.ts or tmux-agent-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}` }
   }
   if (!pane || !/^%\d+$/.test(pane)) {
-    // `~` for HOME: the toast keeps 200 chars, and a marketplace path would push the id off the end.
-    const home = await host.envHome()
-    const short = (p: string) => (home && p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p)
-    return { ok: false, text: `not inside tmux; in another terminal run: ${short(node)} ${short(tui)} --session ${session}` }
+    // The root is named only when this host overrides it; the other terminal derives the default itself.
+    const dir = await host.envTmuxAgentDir()
+    const line = `${dir ? `TMUX_AGENT_DIR=${shq(dir)} ` : ''}${shq(entry)} --session ${shq(session)} --cwd ${shq(cwd)}`
+    const head = '不在 tmux 內，已提供開啟指令，請在另一個終端機執行'
+    if (`${head}：${line}`.length <= 200) return { ok: true, text: `${head}：${line}` }
+    host.log(`tmux-agent: tui open command: ${line}`)
+    const cut = `${head}（完整指令見 log）：`
+    return { ok: true, text: `${cut}${line.slice(0, 199 - cut.length)}…` }
   }
   const root = await rootOf(host)
   const split = await host.run(
@@ -2817,7 +2824,7 @@ export async function assignWorker(
   // An anonymous episode would be anyone's: every collector would deliver it (§3).
   if (!owner) return { deny: 'tmux-agent: this host has no session id; assign refuses to write an episode without an owner' }
   const res = await reserve(host, v3, input.name, { profile: input.profile, dir: input.dir, since, owner, ownerCwd: extra?.ownerCwd ?? '', origin: 'assign' }, input.dir)
-  if ('deny' in res) return res
+  if ('deny' in res) return { deny: `tmux-agent: ${res.deny}` }
   const { name, w: stateDir } = res
   const briefPath = `${stateDir}/brief.md`
   const logPath = `${stateDir}/mod-assign.log`
@@ -2890,18 +2897,18 @@ export async function reserve(
   draw: () => string = () => randomBase36(5),
 ): Promise<{ name: string; w: string } | { deny: string }> {
   const mk = await host.run(['mkdir', '-p', v3], '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
-  if (mk.exitCode !== 0) return { deny: `tmux-agent: could not create ${v3}: ${mk.stderr.trim()}` }
+  if (mk.exitCode !== 0) return { deny: `could not create ${v3}: ${mk.stderr.trim()}` }
   for (let i = 0; i < 2; i++) {
     const name = `${base.slice(0, 58)}.${draw()}`
     if (hasSession(await liveSessions(host, cwd), { name } as TmuxDispatch)) continue
     const w = `${v3}/${name}`
     const r = await mkdirExclusive(host, w)
     if (r === 'lost') continue
-    if (r === 'unknown') return { deny: `tmux-agent: could not reserve ${w} (see the log)` }
-    if (!(await publishWorker(host, w, { ...rec, name }, randomBase36(8)))) return { deny: `tmux-agent: could not publish ${w}/worker.json (see the log)` }
+    if (r === 'unknown') return { deny: `could not reserve ${w} (see the log)` }
+    if (!(await publishWorker(host, w, { ...rec, name }, randomBase36(8)))) return { deny: `could not publish ${w}/worker.json (see the log)` }
     return { name, w }
   }
-  return { deny: `tmux-agent: no free name for "${base}" after two draws; try again` }
+  return { deny: `no free name for "${base}" after two draws; try again` }
 }
 
 /** A session id as `agent-tmux resume` takes it (agent-tmux: `Invalid session id`). */
@@ -3058,7 +3065,7 @@ export async function resumeWorker(host: Host, text: string): Promise<Outcome> {
   const where = hit.cwd ? dir : `${dir} (this session's cwd: the store did not name one)`
   return {
     ok: true,
-    text: `resumed ${hit.profile} session ${input.id.slice(0, 8)} as "${name}" in ${where}. It has no task, so nothing wakes you until you give it one: /workers tell ${name} <text>`,
+    text: `resumed ${hit.profile} session ${input.id.slice(0, 8)} as "${name}" in ${where}. It has no task, so nothing wakes you until you give it one: in the TUI select "${name}" and press t (tell).`,
   }
 }
 
