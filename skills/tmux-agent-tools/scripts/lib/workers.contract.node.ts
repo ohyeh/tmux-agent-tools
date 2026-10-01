@@ -1936,6 +1936,51 @@ test('Sol R6-1: a delayed writer that re-creates the name meanwhile is never ove
   assert.equal(JSON.parse(readFileSync(`${aside}/worker.json`, 'utf8')).owner, 'A', "A's record is kept, not lost")
 })
 
+test('Sol R7-1: a clear whose aside name is taken refuses, and never removes what another clear keeps there', async () => {
+  const w = world()
+  const dir = `${w.v3}/clash.abcde`
+  mkdirSync(dir, { recursive: true })
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(dir, old, old)
+  let kept = ''
+  // Another clear drew the same suffix and keeps a whole record in that aside.
+  const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
+    if (argv[0] === 'mkdir' && argv[1]?.includes('/.clearing.clash.abcde.')) {
+      kept = `${argv[1]}/clash.abcde`
+      mkdirSync(kept, { recursive: true })
+      writeFileSync(`${kept}/worker.json`, JSON.stringify({ owner: 'B' }))
+    }
+    return w.host.run(argv, cwd, ms)
+  } }
+  const r = await clearIncomplete(host, 'clash.abcde')
+  assert.ok(!r.ok && /already exists \(another clear\); nothing is cleared/.test(r.text), r.text)
+  assert.equal(JSON.parse(readFileSync(`${kept}/worker.json`, 'utf8')).owner, 'B', "the other clear's record is intact")
+  assert.deepEqual(readdirSync(kept), ['worker.json'], 'nothing nested into it')
+  assert.ok(existsSync(dir), 'the reservation is not moved')
+})
+
+test('Sol R7-2: the reported restore command runs as given under a root with spaces and quotes', async () => {
+  world()
+  const root = mkdtempSync(join(tmpdir(), "space and 'quote-"))
+  process.env.TMUX_AGENT_DIR = root
+  const base = nodeHost({ owner: 'me', cwd: root, log: () => {}, submit: async () => undefined })
+  const dir = `${v3Of(root)}/q.abcde`
+  mkdirSync(dir, { recursive: true })
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(dir, old, old)
+  const host: Host = { ...base, run: async (argv, cwd, ms) => {
+    if (argv[0] === 'mv' && argv[1] === dir) writeFileSync(`${dir}/worker.json`, JSON.stringify({ owner: 'Q' }))
+    return base.run(argv, cwd, ms)
+  } }
+  const r = await clearIncomplete(host, 'q.abcde')
+  const cmd = r.text.match(/to restore: (mv .*), after checking /)?.[1]
+  assert.ok(!r.ok && cmd, r.text)
+  const sh = spawnSync('/bin/sh', ['-c', cmd!], { encoding: 'utf8' })
+  assert.equal(sh.status, 0, sh.stderr)
+  assert.equal(JSON.parse(readFileSync(`${dir}/worker.json`, 'utf8')).owner, 'Q', 'the record is restored at its name')
+  assert.deepEqual(readdirSync(v3Of(root)).filter(n => n.startsWith('.clearing.')), [], 'no empty container left')
+})
+
 test('Sol R5-1: a writer that publishes after the clear leaves a complete worker, never a half-cleared dir', async () => {
   const w = world()
   const dir = `${w.v3}/gone.abcde`

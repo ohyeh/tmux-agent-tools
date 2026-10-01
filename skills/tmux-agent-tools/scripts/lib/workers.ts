@@ -3222,9 +3222,18 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
   // re-creates the dir (host.write makes parents) with a whole worker.json: that is a
   // complete worker again, never a half-cleared one (Sol R5-1, accepted).
   const run = (argv: string[]) => host.run(argv, '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
-  const aside = `${v3Of(root)}/.clearing.${name}.${randomBase36(6)}`
+  // Own the aside container first (Sol R7-1): a random name alone can collide with another
+  // clear's, and `mv` into an existing dir nests; then rm -rf would remove a record kept there.
+  const box = `${v3Of(root)}/.clearing.${name}.${randomBase36(6)}`
+  const own = await mkdirExclusive(host, box)
+  if (own !== 'won') return { ok: false, text: own === 'lost' ? `${box} already exists (another clear); nothing is cleared; try again` : `${box} could not be created (see the log); nothing is cleared` }
+  const aside = `${box}/${name}`
   const mv = await run(['mv', w, aside])
-  if (mv.exitCode !== 0) return { ok: false, text: `could not move ${w} aside: ${mv.stderr.trim() || `exit ${mv.exitCode}`}; nothing is cleared` }
+  if (mv.exitCode !== 0) {
+    const rd = await run(['rmdir', box])
+    if (rd.exitCode !== 0) host.log(`tmux-agent: could not remove the empty ${box}: ${rd.stderr.trim() || `exit ${rd.exitCode}`}`)
+    return { ok: false, text: `could not move ${w} aside: ${mv.stderr.trim() || `exit ${mv.exitCode}`}; nothing is cleared` }
+  }
   const moved = await host.list(aside).catch((error: unknown) => {
     host.log(`tmux-agent: could not list ${aside}: ${String(error)}`)
     return undefined
@@ -3234,12 +3243,12 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
     // Keep the moved dir whole and say where it is (Sol R6-1): an automatic put-back can race a
     // delayed writer that re-creates the name, and overwrite its record. A human restores it.
     const why = moved ? `changed while clearing (${late.name})` : 'could not be re-listed after the move (see the log)'
-    const text = `"${name}" ${why}; it is kept whole at ${aside}; nothing is cleared (to restore: mv ${aside} ${w}, after checking ${w} does not exist)`
+    const text = `"${name}" ${why}; it is kept whole at ${aside}; nothing is cleared (to restore: mv ${shq(aside)} ${shq(w)} && rmdir ${shq(box)}, after checking ${w} does not exist)`
     host.log(`tmux-agent: ${text}`)
     return { ok: false, text }
   }
-  const rm = await run(['rm', '-rf', aside])
-  if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${aside}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }
+  const rm = await run(['rm', '-rf', box])
+  if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${box}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }
   return { ok: true, text: `cleared the unfinished reservation "${name}"` }
 }
 
