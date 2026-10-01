@@ -102,7 +102,9 @@ try {
   const ack = `${process.env.TMUX_AGENT_DIR}/.v3/${spawned.agent_id}/episodes/1/acks/done`;
   for (let i = 0; i < 100 && !existsSync(ack); i++) await new Promise((r) => setTimeout(r, 20));
   assert.ok(existsSync(ack), "acked after the response was flushed");
-  const again = await call("wait_tmux_agent", { agent_id: spawned.agent_id, seq: 1, timeoutSec: 0 });
+  // timeoutSec 2: already_acked lands as soon as the earlier delivery released its marker
+  // (within the call's deadline), so the close below does not meet that lock.
+  const again = await call("wait_tmux_agent", { agent_id: spawned.agent_id, seq: 1, timeoutSec: 2 });
   assert.equal(again.status, "already_acked");
   assert.equal(again.delivery_id, waited.delivery_id);
   console.log(`  ok   wait → completed + ack, re-wait → already_acked (delivery_id ${waited.delivery_id})`);

@@ -402,9 +402,10 @@ async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, result
   while (inFlightDeliveries.has(episodeDir)) {
     // The closing ack is the truth: once written, the episode is acked even while the
     // earlier delivery is still releasing its reservation. Give that release (a lock and an
-    // unlink) a short grace first, so a close right after this answer does not meet its lock.
+    // unlink) a short grace inside this call's deadline (never past it, Sol R5-3); a close
+    // that still meets the lock answers busy and can be retried.
     if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
-      await settledBy(inFlightDeliveries.get(episodeDir) || Promise.resolve(), Date.now() + RELEASE_GRACE_MS, extra && extra.signal);
+      await settledBy(inFlightDeliveries.get(episodeDir) || Promise.resolve(), Math.min(deadline, Date.now() + RELEASE_GRACE_MS), extra && extra.signal);
       return { status: "already_acked", delivery_id: deliveryId };
     }
     if (!(await settledBy(inFlightDeliveries.get(episodeDir), deadline, extra && extra.signal))) {

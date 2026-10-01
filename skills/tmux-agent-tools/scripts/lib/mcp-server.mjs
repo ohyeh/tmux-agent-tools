@@ -36454,7 +36454,7 @@ REPORT: Final status and summary in result.json`;
       const deliveryId = deliveryIdOf({ name: rec.name, seq: targetSeq, owner: desc && desc.owner || rec.owner });
       while (inFlightDeliveries.has(episodeDir)) {
         if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
-          await settledBy(inFlightDeliveries.get(episodeDir) || Promise.resolve(), Date.now() + RELEASE_GRACE_MS, extra && extra.signal);
+          await settledBy(inFlightDeliveries.get(episodeDir) || Promise.resolve(), Math.min(deadline, Date.now() + RELEASE_GRACE_MS), extra && extra.signal);
           return { status: "already_acked", delivery_id: deliveryId };
         }
         if (!await settledBy(inFlightDeliveries.get(episodeDir), deadline, extra && extra.signal)) {

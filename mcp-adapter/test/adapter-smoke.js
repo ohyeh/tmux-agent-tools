@@ -635,8 +635,8 @@ async function testCancelParkedResponse() {
   // The gate registered its activation under an earlier test's state root; give this root the
   // same registration (its dir) so the marker's activation is the live, authoritative one.
   fs.mkdirSync(path.join(dir, ".v3", ".sessions", sessionHex(marker.session), "act", String(marker.activation)), { recursive: true })
-  // The core now also requires the activation record `act/<n>.json` to trust a marker.
-  fs.writeFileSync(path.join(dir, ".v3", ".sessions", sessionHex(marker.session), "act", `${marker.activation}.json`), "{}")
+  // The core now also requires a whole activation record `act/<n>.json` to trust a marker.
+  fs.writeFileSync(path.join(dir, ".v3", ".sessions", sessionHex(marker.session), "act", `${marker.activation}.json`), JSON.stringify({ pid: process.pid, pidStart: "x", host: "h", token: "t" }))
   const cancelled = await cancelEpisode(await getHost(), sp.agent_id, 1);
   assert.equal(cancelled.ok, false, cancelled.text);
   assert.match(cancelled.text, /in-flight/);
@@ -889,8 +889,12 @@ async function testAckedWhileStillInFlight() {
   const first = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId: 7101, signal: new AbortController().signal } });
   assert.equal(first.status, "completed");
   fs.mkdirSync(path.join(dir, ".v3", sp.agent_id, "episodes/1/acks/done"), { recursive: true });
+  // The earlier delivery never settles here (no transport send): timeoutSec=0 must answer at
+  // once, not after the release grace (Sol R5-3).
+  const t0 = Date.now();
   const w = await waitTmuxAgent(sp.agent_id, 0, { seq: 1 });
   assert.deepEqual([w.status, w.delivery_id], ["already_acked", first.delivery_id], JSON.stringify(w));
+  assert.ok(Date.now() - t0 < 1000, `timeoutSec=0 is not extended by the grace: ${Date.now() - t0}ms`);
 }
 
 // R4-2: a busy action lock defers the notice: pending (not already_acked), no ack, no
