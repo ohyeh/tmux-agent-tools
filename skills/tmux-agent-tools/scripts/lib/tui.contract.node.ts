@@ -2280,6 +2280,7 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
 test('health on screen: observeView → the status line for collecting, paused, stale (C-health through runTui)', async () => {
   const cases: [Parameters<typeof writeAct>[2], RegExp][] = [
     [{ beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }, /收件：collecting（mod）/],
+    [{ beatAgoMs: 1_000, state: { channel: 'node', mode: 'auto', status: 'collecting', reason: 'host composer is busy; nothing pasted, retrying' } }, /收件：collecting（node） · host composer is busy/],
     [{ beatAgoMs: 120_000, state: { channel: 'node', mode: 'auto', status: 'paused', reason: 'refused 3 times' } }, /收件：paused（refused 3 times）/],
     [{ beatAgoMs: 200_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }, /收件：stale（beat 20\ds 前）/],
   ]
@@ -2289,6 +2290,22 @@ test('health on screen: observeView → the status line for collecting, paused, 
     const { screen } = await framed({ host: quietHost('S', root, root), root, cwd: root, session: 'S' })
     assert.match(screen, want)
     assert.doesNotMatch(screen, /內部 \?/)
+  }
+})
+
+test('health line: a collecting collector shows its published reason, cut to the width without wrapping', () => {
+  const reason = 'host composer is busy; nothing pasted, retrying'
+  const gate = newGate()
+  gate.viewHealth = { kind: 'collecting', channel: 'node', mode: 'auto', reason }
+  const state: TuiState = { rows: [], all: [], showAll: false, adding: false, resumeInput: '', quit: false }
+  assert.equal(healthText(gate.viewHealth), `收件：collecting（node） · ${reason}`)
+  const wide = renderTuiLines(state, 120, 10, 1_000, gate).map(stripAnsi)
+  assert.ok(wide.some(l => l.includes(`collecting（node） · ${reason}`)), wide.join('\n'))
+  for (const width of [30, 12, 5]) {
+    const lines = renderTuiLines(state, width, 10, 1_000, gate)
+    assert.ok(lines.length <= 10)
+    for (const l of lines) assert.ok(cellWidth(stripAnsi(l)) <= width, `width ${width}: ${stripAnsi(l)}`)
+    assert.ok(healthText(gate.viewHealth).startsWith(stripAnsi(lines[1]!)), stripAnsi(lines[1]!))
   }
 })
 

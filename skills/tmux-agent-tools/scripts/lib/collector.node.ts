@@ -128,6 +128,8 @@ export async function pasteInto(pane: string, text: string, env: NodeJS.ProcessE
   const kind = cli ?? (await hostCli(pane, env))
   if (!kind) return { deferred: `cannot tell which CLI runs in ${pane} (pass --cli); nothing pasted` }
   const before = await composerState(pane, kind, env)
+  // The composer was empty before our paste, so a draft that holds this notice is our own earlier, unsent paste.
+  if (composerHolds(before, text)) return { deferred: `an earlier notice is still in the composer of ${pane}; Enter not sent — press Enter or clear it; nothing pasted, retrying` }
   if (before.state !== 'empty') return { deferred: `host composer is ${before.state}${before.why ? ` (${before.why})` : ''}; nothing pasted, retrying` }
   const buffer = `tmux-agent-collector-${process.pid}`
   const steps: [string[], string?][] = [

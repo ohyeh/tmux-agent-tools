@@ -652,7 +652,7 @@ export function healthText(h: Health | undefined): string {
     case 'initializing':
       return '收件：initializing'
     case 'collecting':
-      return h.mode === 'on-request' ? '收件：MCP：host 呼叫 tool 時才收' : `收件：collecting（${h.channel}）`
+      return (h.mode === 'on-request' ? '收件：MCP：host 呼叫 tool 時才收' : `收件：collecting（${h.channel}）`) + (h.reason ? ` · ${h.reason}` : '')
     case 'paused':
       return `收件：paused（${h.reason}）`
     case 'stale':
@@ -808,7 +808,7 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): S
   const health = healthText(gate?.viewHealth)
   if (state.viewer) status.push(`\x1b[2mviewer — no session; ${READ_ONLY} · ${health}\x1b[0m`)
   else {
-    const ok = gate?.viewHealth?.kind === 'collecting'
+    const ok = gate?.viewHealth?.kind === 'collecting' && !gate.viewHealth.reason // a deferral shows in yellow
     status.push(`${ok ? '\x1b[2m' : '\x1b[33m'}${sanitizeAnsi(health)}\x1b[0m`)
   }
   if (state.adding) {

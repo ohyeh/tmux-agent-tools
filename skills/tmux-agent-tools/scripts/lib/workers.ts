@@ -2249,7 +2249,7 @@ export type ActState = {
 export type Health =
   | { kind: 'none' }
   | { kind: 'initializing' }
-  | { kind: 'collecting'; channel: Channel; mode: ActState['mode'] }
+  | { kind: 'collecting'; channel: Channel; mode: ActState['mode']; /** a deferral or register-left note the collector publishes while still collecting */ reason?: string }
   | { kind: 'paused'; channel: Channel; reason: string }
   | { kind: 'stale'; ageS?: number }
   | { kind: 'unknown'; reason: string }
@@ -2339,7 +2339,7 @@ export async function readActHealth(host: Host, v3: string, session: string, now
       return st ? { kind: 'stale', ageS: Math.max(0, Math.round((now - st.mtimeMs) / 1000)) } : { kind: 'stale' }
     }
     if (!s) return { kind: 'unknown', reason: `act/${n} beats but has no state (a collector older than this TUI?)` }
-    return { kind: 'collecting', channel: channel!, mode: s.mode === 'on-request' ? 'on-request' : 'auto' }
+    return { kind: 'collecting', channel: channel!, mode: s.mode === 'on-request' ? 'on-request' : 'auto', ...(typeof s.reason === 'string' && s.reason ? { reason: s.reason } : {}) }
   }
   return { kind: 'unknown', reason: 'registrations kept changing (變動中)' }
 }

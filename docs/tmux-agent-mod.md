@@ -489,7 +489,7 @@ TUI 的按鍵（plan R4.6；畫出來的每個鍵都有 handler，contract 測�
 才寫）。TUI 只讀最大的 n，配合 `sessionLiveness`：沒有 session 目錄或 activation →
 `無收件者`；剛註冊、grace 內 → `initializing`；`paused` → 顯示原因（暫停後不再
 beat，所以不當 stale）；beat 新鮮且 collecting → `collecting（mod|node）`，MCP 的
-on-request 寫成「MCP：host 呼叫 tool 時才收」；beat 超過 90 秒 → `stale（beat Ns 前）`；
+on-request 寫成「MCP：host 呼叫 tool 時才收」；collecting 時若 collector 帶著 `reason`（投遞被延後、或 register 殘留），接在後面顯示並改用黃色；beat 超過 90 秒 → `stale（beat Ns 前）`；
 讀不到、JSON 不合法、token 對不上、或讀的時候最大 n 一直變 → `unknown（原因）`。
 `act/<n>.state` 只給 TUI 看，不參與 fencing、claim 與 `sessionLiveness`。
 

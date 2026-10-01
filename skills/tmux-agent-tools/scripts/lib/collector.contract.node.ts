@@ -501,6 +501,19 @@ test('D-paste: pasteInto reports blocked for a post-paste mismatch and never sen
   }
 })
 
+test('D-paste: the composer already holds this notice (our blocked paste) -> a distinct reason, no keys, nothing pasted', async t => {
+  const h = await fakeHost('the notice')
+  if (!h) return t.skip('no private tmux server can start here')
+  try {
+    const r = await pasteInto(h.pane, 'the notice', h.srv.env, 'cursor')
+    assert.match(r.deferred ?? '', /earlier notice is still in the composer/)
+    assert.doesNotMatch(r.deferred ?? '', /composer is draft/)
+    assert.deepEqual(h.log(), [], 'no paste and no Enter reached the host')
+  } finally {
+    await h.stop()
+  }
+})
+
 test('composerHolds: whitespace-insensitive equality, or the CLI placeholder covering every pasted line', () => {
   assert.ok(composerHolds({ state: 'draft', text: 'a b\nc' }, 'a b c'))
   assert.ok(composerHolds({ state: 'draft', text: '[Pasted text #1 +9 lines]' }, Array(9).fill('x').join('\n')))
