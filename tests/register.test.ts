@@ -161,6 +161,9 @@ function mockClock(on: On, options?: { now?: number }) {
 const isDirIn = (files: Files, p: string) => p === '/' || Object.keys(files).some(k => k.startsWith(`${p}/`))
 const parentOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
 
+/** Every `ln -sn` the fake ledger ran, in order (a released lock is gone from `links`, so a test reads its holder here). */
+const lnSpy: { lock: string; target: string }[] = []
+
 /** The ledger's exclusive steps (ledger.ts `op`) against the fake filesystem; `undefined` = not a ledger step. */
 function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, number>, argv: readonly string[]): RunResult | undefined {
   const [cmd, ...a] = argv
@@ -172,6 +175,8 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
     files[`${p}/`] = ''
     mtimes.set(p, clockNow())
   }
+  // The one-per-process identity probe (workers.ts `processId`: the pid, host and start the lock holders record).
+  if (cmd === '/bin/sh' && String(a[1]).includes('echo "$PPID"')) return ok('4242\nfake-host\nThu Jan  1 00:00:00 1970\n')
   switch (cmd) {
     case 'mkdir': {
       if (a[0] === '-p') {
@@ -189,6 +194,7 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
       if (present(lock!)) return fail(`ln: ${lock}: File exists`)
       if (!isDir(parentOf(lock!))) return fail(`ln: ${lock}: No such file or directory`)
       links.set(lock!, target!)
+      lnSpy.push({ lock: lock!, target: target! })
       return ok()
     }
     case 'readlink':
@@ -402,6 +408,23 @@ describe('session id (R2-6)', () => {
     await $.turn.complete(turn())
     const realKey = [...new TextEncoder().encode('real-sess')].map(b => b.toString(16).padStart(2, '0')).join('')
     expect(Object.keys(files).some(k => k.includes(`/.sessions/${realKey}/`))).toBe(true)
+  })
+})
+
+describe('channel authority (S3)', () => {
+  test('the mod registers on the channel `mod`, and its channel.lock holder records this process (pid, start, host) like the action lock', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockClock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    mockSessionStart(on)
+    mockWake(on)
+    lnSpy.length = 0
+    await $.session.start(session())
+    const lock = lnSpy.find(l => l.lock.endsWith('/channel.lock'))
+    expect(lock, 'registration took channel.lock').toBeDefined()
+    expect(JSON.parse(lock!.target)).toMatchObject({ pid: 4242, host: 'fake-host', pidStart: 'Thu Jan  1 00:00:00 1970' })
+    expect(JSON.parse(lnSpy.find(l => l.lock.endsWith('/channel'))!.target).channel).toEqual('mod')
   })
 })
 

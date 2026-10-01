@@ -54,6 +54,10 @@ marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-t
   目錄，不進鎖（重複送只會 `EEXIST`）。鎖卡住（持有者當掉）時用 `/workers unlock <name>`：
   先回報持有者、要你確認所有對這個 worker 的動作都結束了，再打 `/workers unlock <name> confirm`；
   它只在持有者同一台機器、session 已不 live、pid 已不在（或被重用）時才拔鎖，否則照樣說 busy。
+  unlock 與一般 release 的 `rm` 都在維護區段 `<lock>.unlock` 內；它是被當掉的程序留下、且仍有未完成的
+  `rm` 子程序時，不會被接手。要手動清掉它，先確認沒有那個 `rm` 子程序（`ps -ax | grep "rm "`）。
+  unlock 已拔鎖、但 `.unlock` 自己拔不掉時，結果是失敗（not ok），文字會寫出 `.unlock` 路徑、`rm` 的原始錯誤，
+  以及清除用的 `rm '<路徑>'`。
 - `/workers cancel <name> <seq>`：只關掉那一輪（`acks/cancel`），不動 pane；`stop` 才殺 pane
   並把所有開著的輪次一起關掉。shell 上同一套是 `node skills/tmux-agent-tools/scripts/lib/workers.cli.node.ts
   cancel <name> <seq> | unlock <name> [confirm]`。
@@ -477,8 +481,27 @@ on-request 寫成「MCP：host 呼叫 tool 時才收」；beat 超過 90 秒 →
 在 `<sessionDir>/channel.lock`（action lock 規則：只有持有者釋放，不搶）裡一起做。
 別的通道用同一個 session id 註冊時被拒，不建 activation，所以不會 fence 現有的
 通道；它的 gate 停在 paused（`this session is collected by its <channel> channel …`）。
-channel 讀不到、或 `channel.lock` 被佔用 → 這一拍不註冊，下一拍再試；crash 留下的
-`channel.lock` 要手動 `rm`（log 印出路徑）。通知的每個 worker 區塊帶一行
+`channel.lock` 的持有者紀錄和 action lock 一樣帶 `pid`、`pidStart`、`host`（`processId`
+探測，mod 與 node 同一條路）：被佔用時，log 與 gate 的 `waiting` 狀態說出持有者是「還在跑」、
+「已經不在」或「無法證明」；只有「不是還在跑」才印 `rm '<path>'`，鎖從不被搶。
+channel 讀不到、沒寫 channel 名、或 `channel.lock` 被佔用（狀態 unknown／initializing）→
+任何通道都不註冊、不 fence，gate 的 `waiting` 寫原因（不是 paused），下一拍再試；不當成
+「還沒有 channel」。launcher 看到 channel 是別的通道時不起 node collector，印一行
+`no collector started: this session is collected by its <ch> channel …` 與換通道的指令，
+TUI 照開；channel 讀不到則 busy，什麼都不起。
+
+換通道只有一條路（要確認，同 `--migrate-launcher`）：
+`tmux-agent-tui --handover-channel <session> <mod|node|mcp> [--yes]`。順序固定
+`channel.lock` → `collector.owner`（launcher 持 `collector.owner` 時只讀 channel，不取
+`channel.lock`，所以不會反向）。兩把鎖都拿到後，用一次
+`ps -o pid=,ppid=,lstart=,args=` 快照證明舊通道的 registration caller 與它們的子 process
+都不在：args 同時含 session id 與 `launcher.node.ts`／`collector.node.ts`；舊通道是 mcp 時，
+任何 `mcp-server.mjs`／`tmux-agent-mcp` process 都算（它的 args 沒有 session id）。過期的
+heartbeat 不算 quiescence，也不讀。mod 跑在 Claude Code process 裡，`ps` 對不上 session，
+所以沒有 `--yes` 只印會做什麼；`--yes` 同時是你的確認：沒有舊通道的 caller 正在跑或會在
+這之後啟動（快照之後起來的 process 沒有 fence 擋得住）。換完之後，晚到的舊通道 caller 在
+`channel.lock` 內重讀 channel，被拒絕，不註冊、不 fence 新的 authority；新通道下一次註冊
+的 activation 才 fence 舊的。通知的每個 worker 區塊帶一行
 `delivery_id: <gen0 owner>/<name>/<seq>`：重報（at-least-once）時這一行不變，
 認領之後也不變。
 

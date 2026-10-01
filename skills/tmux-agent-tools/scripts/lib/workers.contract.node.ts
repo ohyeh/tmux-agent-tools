@@ -1503,3 +1503,23 @@ test('band width (S7): displayCells/truncateCells/fitCells use the TUI rules —
   assert.equal(truncateCells('éx', 1), 'é', 'a combining mark stays with its base')
   assert.equal(fitCells('中文字', 5), '中文…')
 })
+
+test('Sol r6 N4: unlockWorker removed the lock but the guard rm failed — not ok, guard path and errno in the text', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const fs = await import('node:fs')
+  const lock = `${r.stateDir}/.action`
+  const me = await processId(w.host)
+  fs.symlinkSync(JSON.stringify({ token: 't', activation: '', session: 'gone', host: me.host, pid: 999_999, pidStart: 'Thu Jan  1 00:00:00 1970' }), lock)
+  const denied: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) =>
+      argv[0] === 'rm' && argv[1] === `${lock}.unlock` ? { exitCode: 1, stdout: '', stderr: `rm: ${argv[1]}: Permission denied` } : w.host.run(argv, cwd, ms),
+  }
+  const out = await unlockWorker(denied, r.name, 'confirm')
+  assert.equal(out.ok, false, `ok despite a guard left behind: ${out.text}`)
+  assert.match(out.text, /unlocked/)
+  assert.ok(out.text.includes(`${lock}.unlock`) && /Permission denied/.test(out.text) && /left/.test(out.text), out.text)
+  assert.throws(() => fs.lstatSync(lock), 'the lock itself is gone')
+  assert.doesNotThrow(() => fs.lstatSync(`${lock}.unlock`), 'the guard is left')
+})

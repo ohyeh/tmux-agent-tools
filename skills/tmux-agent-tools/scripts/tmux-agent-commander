@@ -7,6 +7,17 @@ set -euo pipefail
 SELF="${0:A}"
 SCRIPT_DIR="${0:A:h}"
 
+# One server for the whole chain (plan R8.4): TMUX_AGENT_TMUX_SOCKET, else the
+# server this shell runs in ($TMUX's socket path), else tmux's default socket.
+# Exported, so agent-tmux, the node core and the collector all pass the same -S.
+if [[ -z "${TMUX_AGENT_TMUX_SOCKET:-}" && -n "${TMUX:-}" ]]; then
+  TMUX_AGENT_TMUX_SOCKET="${TMUX%%,*}"
+fi
+[[ -z "${TMUX_AGENT_TMUX_SOCKET:-}" ]] || export TMUX_AGENT_TMUX_SOCKET
+tmux_cmd() {
+  if [[ -n "${TMUX_AGENT_TMUX_SOCKET:-}" ]]; then command tmux -S "$TMUX_AGENT_TMUX_SOCKET" "$@"; else command tmux "$@"; fi
+}
+
 usage() {
   cat <<'EOF'
 tmux-agent-commander — collect worker results into a non-Claude pane
@@ -61,7 +72,7 @@ session_target() {
 }
 
 tmux_has() {
-  command tmux has-session -t "$(session_target "$1")" 2>/dev/null
+  tmux_cmd has-session -t "$(session_target "$1")" 2>/dev/null
 }
 
 # Session name agent-tmux will use: <prefix>-<name>, prefix from the profile
@@ -183,19 +194,19 @@ core_cli() {
 host_pane() {
   local session="$1" here
   if [[ -n "${TMUX_PANE:-}" && "${TMUX_PANE}" == %<-> && -n "${TMUX:-}" ]]; then
-    here="$(command tmux display-message -p '#S' 2>/dev/null || true)"
+    here="$(tmux_cmd display-message -p '#S' 2>/dev/null || true)"
     if [[ -n "$here" && "$here" == "$session" ]]; then
       print -r -- "$TMUX_PANE"
       return 0
     fi
   fi
-  command tmux display-message -p -t "$session" '#{pane_id}'
+  tmux_cmd display-message -p -t "$session" '#{pane_id}'
 }
 
 require_tmux_session() {
   local session
   [[ -n "${TMUX:-}" ]] || die "not inside tmux; run $1 from the commander's pane"
-  session="$(command tmux display-message -p '#S' 2>/dev/null)" || die "not inside tmux; tmux display-message failed"
+  session="$(tmux_cmd display-message -p '#S' 2>/dev/null)" || die "not inside tmux; tmux display-message failed"
   [[ -n "$session" ]] || die "not inside tmux; tmux display-message returned no session"
   print -r -- "$session"
 }
@@ -205,9 +216,9 @@ require_tmux_session() {
 install_worker_panel() {
   local session="$1" fmt
   fmt="#(${(qq)SELF} panel ${(qq)session})"
-  command tmux set-option -t "$(session_target "$session")" status 2
-  command tmux set-option -t "$(session_target "$session")" 'status-format[1]' "$fmt"
-  command tmux set-option -t "$(session_target "$session")" status-interval 2
+  tmux_cmd set-option -t "$(session_target "$session")" status 2
+  tmux_cmd set-option -t "$(session_target "$session")" 'status-format[1]' "$fmt"
+  tmux_cmd set-option -t "$(session_target "$session")" status-interval 2
 }
 
 cmd_start() {
@@ -251,7 +262,7 @@ cmd_start() {
   tmux_has "$session" || die "session ${session} is not up after start"
   log="$root/.commander-$(sanitize_owner "$session").log"
   # agent-tmux drops $TMUX before new-session, so the collector must too.
-  # TMUX_TMPDIR still selects the server. collect writes the pid file.
+  # The exported TMUX_AGENT_TMUX_SOCKET keeps it on this server. collect writes the pid file.
   local bgpid i claimed="" detail
   env -u TMUX nohup "$SELF" collect "$cli" "$name" >>"$log" 2>&1 &
   bgpid="$!"
@@ -339,7 +350,7 @@ cmd_collect() {
   fi
   pane="$(host_pane "$session" 2>/dev/null || true)"
   [[ "$pane" == %<-> ]] || die "host pane must be a %N id, got ${pane:-nothing}"
-  cwd="$(command tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
+  cwd="$(tmux_cmd display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
   [[ "$cwd" == /* ]] || die "host pane cwd is not an absolute path"
   print -r -- "$$" > "$pidfile"
   COLLECTOR_PIDFILE="$pidfile"
@@ -373,10 +384,10 @@ start_collector_from_server() {
   name="${mapped#*$'\n'}"
   log="$root/.commander-$(sanitize_owner "$session").log"
   # tmux expands % and # as formats before /bin/sh sees the command.
-  cmd="env -u TMUX ${(qq)SELF} collect ${(qq)cli} ${(qq)name} >> ${(qq)log} 2>&1"
+  cmd="env -u TMUX${TMUX_AGENT_TMUX_SOCKET:+ TMUX_AGENT_TMUX_SOCKET=${(qq)TMUX_AGENT_TMUX_SOCKET}} ${(qq)SELF} collect ${(qq)cli} ${(qq)name} >> ${(qq)log} 2>&1"
   cmd="${cmd//\%/%%}"
   cmd="${cmd//\#/##}"
-  command tmux run-shell -b -t "$(session_target "$session")" "$cmd"
+  tmux_cmd run-shell -b -t "$(session_target "$session")" "$cmd"
   print -r -- "collector started for ${session}"
 }
 
@@ -431,7 +442,7 @@ cmd_panel() {
     [[ "$width" == <-> ]] || die "width must be a non-negative integer"
   else
     local tw
-    tw="$(command tmux display -p '#{client_width}' 2>/dev/null || true)"
+    tw="$(tmux_cmd display -p '#{client_width}' 2>/dev/null || true)"
     tw="${tw//[[:space:]]/}"
     if [[ "$tw" == <-> && "$tw" -gt 0 ]]; then
       width="$tw"

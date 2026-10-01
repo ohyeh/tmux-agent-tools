@@ -1312,3 +1312,110 @@ test('Sol#14 a missing or unreadable agent-tmux wrapper is not a ready collector
     }
   }),
 )
+
+// ── Sol r6 re-review (sol-rereview-r6.json N1, N4) ──
+
+test('Sol r6 N1: a dead holder\'s orphan release child (rm still pending) cannot delete a newer holder\'s lock', { timeout: 60_000 }, async () => {
+  const w = lockDir()
+  try {
+    const shim = join(w.root, 'shim')
+    mkdirSync(shim)
+    const mark = join(w.root, 'rm-started')
+    writeFileSync(join(shim, 'rm'), `#!/bin/sh\n: > "${mark}"\nsleep 1.5\n/bin/rm "$@"\ncode=$?\n: > "${mark}.done"\nexit $code\n`, { mode: 0o755 })
+    const url = (f: string) => pathToFileURL(join(dirname(LAUNCHER), f)).href
+    // The parent takes the lock and starts a normal release; its `rm` child is the shim, which stalls before the unlink.
+    const code =
+      `const { nodeHost } = await import(${JSON.stringify(url('host.node.ts'))});` +
+      `const { acquireLock, releaseLock } = await import(${JSON.stringify(url('ledger.ts'))});` +
+      `const { processId } = await import(${JSON.stringify(url('workers.ts'))});` +
+      `const host = nodeHost({ log: () => {} }); const me = await processId(host);` +
+      `await acquireLock(host, ${JSON.stringify(w.lock)}, { token: 'old', session: 'lock-s', activation: 'launcher', ...me });` +
+      `await releaseLock(host, ${JSON.stringify(w.lock)}, 'old')`
+    const parent = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, PATH: `${shim}:${process.env.PATH}` }, stdio: 'ignore' })
+    const exited = new Promise(r => parent.once('exit', r))
+    await until(() => existsSync(mark), 'the release child to start')
+    parent.kill('SIGKILL')
+    await exited
+    const base = nodeHost({ log: () => {} })
+    const me = await processId(base)
+    const fresh: Holder = { token: 'new', session: 'lock-s', activation: 'launcher', ...me }
+    // B proves the holder dead and unlocks; C acquires. While the orphan rm is pending, B must be refused.
+    const b = await unlockLauncher(base, w.root, 'lock-s', true)
+    let c = (await acquireLock(base, w.lock, fresh)).ok
+    await until(() => existsSync(`${mark}.done`), 'the orphan rm to finish', 10_000)
+    if (!c) c = (await acquireLock(base, w.lock, fresh)).ok
+    assert.equal(b.ok, false, `B unlocked while the release child was pending: ${b.text}`)
+    assert.match(b.text, /pending|rm child/, 'the busy text tells how to confirm no mutation child runs')
+    assert.equal(c, true, 'C acquires once the old lock is gone')
+    assert.equal(holderOf(w.lock).token, 'new', 'the orphan rm deleted C\'s lock')
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('Sol r6 N4: unlock removed the lock but the guard rm failed — not ok, says the guard is left, with path and errno', async () => {
+  const w = lockDir()
+  try {
+    const base = nodeHost({ log: () => {} })
+    const me = await processId(base)
+    symlinkSync(JSON.stringify({ token: 'old', session: 'lock-s', activation: 'launcher', ...me, pidStart: DEAD_START }), w.lock)
+    const denied: Host = {
+      ...base,
+      run: async (argv, cwd, ms) =>
+        argv[0] === 'rm' && argv[1] === `${w.lock}.unlock` ? { exitCode: 1, stdout: '', stderr: `rm: ${argv[1]}: Permission denied` } : base.run(argv, cwd, ms),
+    }
+    const out = await unlockLauncher(denied, w.root, 'lock-s', true)
+    assert.equal(out.ok, false, `ok despite a guard left behind: ${out.text}`)
+    assert.ok(!linked(w.lock), 'the unlock itself ran')
+    assert.ok(linked(`${w.lock}.unlock`), 'the guard is left')
+    assert.match(out.text, /unlocked .*collector\.owner/)
+    assert.match(out.text, /collector\.owner\.unlock.*left/s)
+    assert.match(out.text, /Permission denied/)
+    assert.match(out.text, /rm '.*collector\.owner\.unlock'/)
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('S3: a session whose channel is mcp gets the TUI and a status line, no node collector (not started, refused, exited)', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('chan')
+      const pane = await hostPane(w.session)
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      mkdirSync(dir, { recursive: true })
+      symlinkSync(JSON.stringify({ channel: 'mcp', token: 't' }), `${dir}/channel`)
+      const l = spawnLauncher(w, pane)
+      await until(() => /no collector started/.test(l.out + l.err), 'launcher status')
+      assert.match(l.out, /tui %\d+ beside host %\d+; no collector started: this session is collected by its mcp channel/)
+      assert.match(l.out, /tmux-agent-tui --handover-channel '.*' node --yes/)
+      await sleep(500)
+      assert.equal(collectors(w.session).length, 0)
+      assert.ok(!existsSync(`${dir}/collector.json`) && !existsSync(`${dir}/act`), 'no record, no registration')
+      assert.ok(!linked(`${dir}/collector.owner`), 'the launcher lock is released')
+      assert.equal(l.closed, false, 'the launcher keeps watching the host pane')
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('S3: an unreadable channel record is unknown — busy, nothing started', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('chanbad')
+      const pane = await hostPane(w.session)
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(`${dir}/channel`, 'not a symlink')
+      const l = spawnLauncher(w, pane)
+      await until(() => l.closed, 'launcher exit')
+      assert.match(l.err, /busy: .*the channel of this session is unknown, so no collector is started/)
+      assert.equal(collectors(w.session).length, 0)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)

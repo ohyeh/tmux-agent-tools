@@ -3,12 +3,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   ack, acquireLock, allocateNext, claim, currentOwner, hasMark, mark, openEpisode, ORPHAN_MS, publishWorker, readDescriptor, readWorker, recoverEpisodes,
-  registerActivation, releaseLock, sessionKey, sessionLiveness, superseded, type Descriptor,
+  registerActivation, maintainLock, releaseLock, sessionKey, sessionLiveness, superseded, type Descriptor,
 } from './ledger.ts'
 import type { Host } from './workers.ts'
 import { nodeHost } from './host.node.ts'
@@ -309,4 +309,20 @@ test('readHolder: the same unreadable answer is logged once, not on every reconc
     chmodSync(dir, 0o755)
   }
   assert.equal(lines.filter(l => l.includes(lock)).length, 1, lines.join('\n'))
+})
+
+test('Sol r6 N4: maintainLock whose guard rm fails returns not-ok, keeps that fn ran, and carries path + the rm error', async () => {
+  const lock = join(fresh(), '.action')
+  const h = host()
+  const denied: Host = {
+    ...h,
+    run: async (argv, cwd, ms) =>
+      argv[0] === 'rm' && argv[1] === `${lock}.unlock` ? { exitCode: 1, stdout: '', stderr: `rm: ${argv[1]}: Permission denied` } : h.run(argv, cwd, ms),
+  }
+  const m = await maintainLock(denied, lock, holder('u'), async () => 42)
+  assert.equal(m.ok, false, 'ok despite a guard left behind')
+  assert.ok(!m.ok && 'ran' in m && m.value === 42, 'fn ran: its value is kept')
+  assert.ok(!m.ok && 'path' in m && m.path === `${lock}.unlock`)
+  assert.ok(!m.ok && 'error' in m && /Permission denied/.test(m.error) && /exit 1/.test(m.error))
+  assert.doesNotThrow(() => lstatSync(`${lock}.unlock`), 'the guard is left; it is never stolen')
 })

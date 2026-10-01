@@ -104,8 +104,10 @@ export async function readCollectorRecord(path: string): Promise<CollectorRecord
   } catch (error) {
     throw new Error(`${path} is not JSON (${(error as Error).message})`)
   }
-  const strings = [r?.pidStart, r?.host, r?.session, r?.pane, r?.socket, r?.cwd, r?.token]
-  if (Number.isInteger(r?.pid) && r.pid > 0 && strings.every(v => typeof v === 'string' && v)) return r
+  // Every field of D-collector-id; `nonce` is optional but a string when present.
+  const strings = [r?.pidStart, r?.host, r?.session, r?.pane, r?.socket, r?.cwd, r?.coreVersion, r?.token]
+  const nonceOk = r?.nonce === undefined || (typeof r.nonce === 'string' && r.nonce !== '')
+  if (Number.isInteger(r?.pid) && r.pid > 0 && strings.every(v => typeof v === 'string' && v) && nonceOk) return r
   throw new Error(`${path} is not a complete collector record`)
 }
 
@@ -182,7 +184,7 @@ async function main(): Promise<void> {
   } catch (error) {
     notReady((error as Error).message)
   }
-  if (!(await heartbeat(host, gate))) notReady(gate.paused ?? 'could not register or beat this activation (see above)')
+  if (!(await heartbeat(host, gate))) notReady(gate.paused ?? gate.waiting ?? 'could not register or beat this activation (see above)')
   const me = await processId(host)
   if (me.pid !== process.pid || !me.pidStart || !me.host) notReady(`could not read this process's own id (got pid ${me.pid || '?'})`)
   const sock = await serverSocket(pane)

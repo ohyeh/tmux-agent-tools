@@ -241,7 +241,13 @@ processed them); a cancel, a send error or a crash before the ack leaves it
 unacked, and a later wait reports it again with the same `delivery_id`. This is
 at-least-once: dedup by `delivery_id`. A session has one delivery channel (the
 mod, the node collector, or MCP): the first one to register owns it, and
-another channel on the same session id is refused and does not collect.
+another channel on the same session id is refused and does not collect. To move
+a session to another channel, stop the old channel's callers (a node collector, the
+MCP server, a Claude Code session with the plugin) and run
+`tmux-agent-tui --handover-channel <session> <mod|node|mcp>`; without `--yes` it
+only prints what it would do, with `--yes` it checks `ps` once and switches. A
+stale heartbeat does not count as "stopped". The launcher starts no node
+collector on a session that another channel owns and says so.
 
 Register it with its absolute path, for example:
 
@@ -255,6 +261,8 @@ result. `scripts/test-version-sync-smoke` fails when a rebuild does not
 reproduce the committed bytes.
 
 ## Usage
+
+`start`, `resume`, and `start-ssh` never replace a live session of the same name (breaking since the R8.5 change): they exit 1 and leave the first worker untouched. `stop` refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`). A new launch of a name moves the earlier `result.json` and `stdout.log` into `<name>/legacy-<UTC time>-<pid>/`. `TMUX_AGENT_TMUX_SOCKET=<path>` puts `-S <path>` on every tmux call of `agent-tmux`, the node core, and `tmux-agent-commander`. The commander sets it from its own `$TMUX` when it is unset.
 
 ```bash
 agent-tmux codex start --exact worker ~/github/project 'Read the repo and report status.'

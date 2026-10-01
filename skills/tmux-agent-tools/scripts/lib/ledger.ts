@@ -119,39 +119,85 @@ export async function acquireLock(host: Host, lock: string, holder: Holder): Pro
   return { ok: false, busy: (await readHolder(host, lock)) ?? 'unknown' }
 }
 
-/** Only the holder releases, and only its own instance. No stealing (§5). */
+/**
+ * Low-level removal of our own lock: re-read, check the token, `rm`. No maintenance
+ * section: it is for code already inside one (`maintainLock`'s guard, an unlock's fn).
+ * `error` is the raw cause (exit code + rm stderr), never a bare false.
+ */
+export async function unlinkHeld(host: Host, lock: string, token: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const h = await readHolder(host, lock)
+  if (!h || h === 'unreadable' || h.token !== token) {
+    host.log(`tmux-agent: release of ${lock} refused: not held by ${token}`)
+    return { ok: false, error: `${lock} is not held by ${token}` }
+  }
+  const r = await op(host, ['rm', lock])
+  if (r.exitCode === 0) return { ok: true }
+  return { ok: false, error: `rm ${lock} failed (exit ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim()}` : ''})` }
+}
+
+const RELEASE_TRIES = 20
+const RELEASE_WAIT_S = '0.05'
+
+/**
+ * Only the holder releases, and only its own instance. No stealing (§5). The `rm` runs
+ * inside the lock's maintenance section (`<lock>.unlock`): a holder that dies with its
+ * `rm` child still pending leaves the guard held by a dead process, so no unlock can
+ * judge the holder dead, remove it and let a new holder in before that child lands.
+ * A guard held by a live section is waited out briefly; a stale one is never taken over.
+ */
 export async function releaseLock(host: Host, lock: string, token: string): Promise<boolean> {
   const h = await readHolder(host, lock)
   if (!h || h === 'unreadable' || h.token !== token) {
     host.log(`tmux-agent: release of ${lock} refused: not held by ${token}`)
     return false
   }
-  const r = await op(host, ['rm', lock])
-  return r.exitCode === 0
+  const section: Holder = { ...h, token: `${token}.release`, activation: 'release' }
+  for (let i = 0; i < RELEASE_TRIES; i++) {
+    const m = await maintainLock(host, lock, section, () => unlinkHeld(host, lock, token))
+    if (m.ok || 'ran' in m) {
+      if (!m.ok) host.log(`tmux-agent: released ${lock} but left ${m.path}: ${m.error}`)
+      return m.value.ok
+    }
+    if (m.busy === 'unknown' || m.busy === 'unreadable') break
+    await op(host, ['sleep', RELEASE_WAIT_S])
+  }
+  host.log(`tmux-agent: could not enter the maintenance section ${lock}.unlock; ${lock} stays held`)
+  return false
 }
 
 /**
- * The maintenance section of `lock` (§5 unlock). Every caller that removes another
- * holder's `lock` runs inside `<lock>.unlock`, itself an action lock held by this
- * process. So holder-read → liveness check → rm is one section: a second unlock cannot
- * judge the same dead holder, and then remove a newer holder's lock after the first
- * unlock removed the dead one. `<lock>.unlock` is never taken over: a dead holder of it
- * is `busy` like any other, and is cleared by hand.
+ * The maintenance section of `lock` (§5). Every mutation that removes `lock` — an
+ * unlock of another holder, or the holder's own release — runs inside `<lock>.unlock`,
+ * itself an action lock held by this process. So holder-read → liveness check → rm is
+ * one section: a second unlock cannot judge the same dead holder, and then remove a
+ * newer holder's lock after the first unlock removed the dead one. `<lock>.unlock` is
+ * never taken over: a dead holder of it is `busy` like any other, and is cleared by
+ * hand once no `rm` child of that section is still running.
+ *
+ * `ran: true` = `fn` ran but our own guard could not be removed: not ok, and the guard
+ * stays held. The guard is released with the low-level `unlinkHeld`, never `releaseLock`.
  */
-export async function maintainLock<T>(
-  host: Host,
-  lock: string,
-  me: Holder,
-  fn: () => Promise<T>,
-): Promise<{ ok: true; value: T } | { ok: false; busy: Holder | 'unreadable' | 'unknown'; path: string }> {
+export type Maintained<T> =
+  | { ok: true; value: T }
+  | { ok: false; busy: Holder | 'unreadable' | 'unknown'; path: string }
+  | { ok: false; ran: true; value: T; path: string; error: string }
+
+export async function maintainLock<T>(host: Host, lock: string, me: Holder, fn: () => Promise<T>): Promise<Maintained<T>> {
   const path = `${lock}.unlock`
   const m = await acquireLock(host, path, me)
   if (!m.ok) return { ok: false, busy: m.busy, path }
+  let value: T
   try {
-    return { ok: true, value: await fn() }
-  } finally {
-    if (!(await releaseLock(host, path, me.token))) host.log(`tmux-agent: could not release ${path}; the next unlock reports it busy`)
+    value = await fn()
+  } catch (error) {
+    const g = await unlinkHeld(host, path, me.token)
+    if (!g.ok) host.log(`tmux-agent: ${path} left behind after an error: ${g.error}`)
+    throw error
   }
+  const g = await unlinkHeld(host, path, me.token)
+  if (g.ok) return { ok: true, value }
+  host.log(`tmux-agent: could not release ${path}: ${g.error}; the next unlock reports it busy`)
+  return { ok: false, ran: true, value, path, error: g.error }
 }
 
 // ── acks (§5): create-once directories ─────────────────────────────────────────
@@ -319,14 +365,22 @@ export async function superseded(host: Host, sessionDir: string, n: number): Pro
 
 // ── channel authority (plan §1c S3): one delivery channel per session ──────────
 
+export type ChannelRegistration =
+  | { n: number }
+  | { refused: string }
+  /** `channel.lock` is held (or its state is unknown): the holder, for the caller's status line. */
+  | { busy: Holder | 'unreadable' | 'unknown'; path: string }
+  /** The channel record cannot be read or names no channel; or a ledger step failed (see the log). */
+  | { unknown: string }
+
 /**
  * Register an activation on the session's one delivery channel. `<sessionDir>/channel`
  * is a symlink to `{channel, token}`, created once by `ln -sn`: the first registrant
  * wins. The channel check and `registerActivation` run inside `<sessionDir>/channel.lock`
  * (an action lock: only its holder releases it, it is never taken over), so a channel
  * read outside the lock never counts. Another channel → `{ refused: <channel> }`, no
- * registration. A busy lock or an unreadable channel → `undefined`: no registration
- * this tick, and never read as "no channel yet".
+ * registration. A busy lock, an unreadable channel or a failed step → `busy`/`unknown`:
+ * no registration this tick, and never read as "no channel yet".
  */
 export async function registerOnChannel(
   host: Host,
@@ -334,44 +388,48 @@ export async function registerOnChannel(
   channel: string,
   me: Holder,
   record: ActivationRecord,
-): Promise<{ n: number } | { refused: string } | undefined> {
+): Promise<ChannelRegistration> {
   const mk = await op(host, ['mkdir', '-p', sessionDir])
   if (mk.exitCode !== 0) {
     host.log(`tmux-agent: mkdir ${sessionDir}: ${mk.stderr.trim() || `exit ${mk.exitCode}`}`)
-    return undefined
+    return { unknown: `could not create ${sessionDir}` }
   }
   const lockPath = `${sessionDir}/channel.lock`
   const lock = await acquireLock(host, lockPath, me)
-  if (!lock.ok) {
-    const who = typeof lock.busy === 'string' ? lock.busy : `session ${lock.busy.session} (token ${lock.busy.token})`
-    host.log(`tmux-agent: ${lockPath} is held by ${who}; not registering this tick. A holder that crashed keeps it: rm '${lockPath}' once it is gone`)
-    return undefined
-  }
+  if (!lock.ok) return { busy: lock.busy, path: lockPath }
   try {
     const path = `${sessionDir}/channel`
     let p = await probeHolder(host, path)
     if ('absent' in p) {
       const c = contest(host, `channel ${path}`, await op(host, ['ln', '-sn', JSON.stringify({ channel, token: me.token }), path]))
-      if (c === 'unknown') return undefined
+      if (c === 'unknown') return { unknown: `could not create ${path}` }
       if (c === 'won') return withN(await registerActivation(host, sessionDir, record))
       p = await probeHolder(host, path)
     }
-    if (!('holder' in p)) {
-      host.log(`tmux-agent: ${'unreadable' in p ? p.unreadable : `${path} vanished`}; not registering this tick`)
-      return undefined
-    }
+    if (!('holder' in p)) return { unknown: 'unreadable' in p ? p.unreadable : `${path} vanished` }
     const owner = (p.holder as unknown as { channel?: unknown }).channel
-    if (typeof owner !== 'string' || !owner) {
-      host.log(`tmux-agent: ${path} names no channel; not registering this tick`)
-      return undefined
-    }
+    if (typeof owner !== 'string' || !owner) return { unknown: `${path} names no channel` }
     if (owner !== channel) return { refused: owner }
     return withN(await registerActivation(host, sessionDir, record))
   } finally {
     if (!(await releaseLock(host, lockPath, me.token))) host.log(`tmux-agent: could not release ${lockPath}; the next registration reports it busy`)
   }
 }
-const withN = (n: number | undefined) => (n === undefined ? undefined : { n })
+/**
+ * The handover's switch (plan §1c S3): the caller holds `channel.lock`, so no registration
+ * runs. `rm` then `ln -sn`: a crash between them leaves `channel.lock` held, which keeps
+ * every registration out until an operator looks. `false` = the switch did not happen.
+ */
+export async function switchChannel(host: Host, sessionDir: string, to: string, token: string): Promise<boolean> {
+  const path = `${sessionDir}/channel`
+  const rm = await op(host, ['rm', '-f', path])
+  if (rm.exitCode !== 0) {
+    host.log(`tmux-agent: rm ${path}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`)
+    return false
+  }
+  return contest(host, `channel ${path}`, await op(host, ['ln', '-sn', JSON.stringify({ channel: to, token }), path])) === 'won'
+}
+const withN = (n: number | undefined): ChannelRegistration => (n === undefined ? { unknown: 'could not register an activation (see the log)' } : { n })
 
 // ── episodes (§2, §8): allocation, immutable descriptor, markers, recovery ──────
 

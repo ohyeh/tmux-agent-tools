@@ -3,6 +3,7 @@
 //   node launcher.node.ts --session <id> --cwd <abs> [--pane %N] -- <tui command…>
 //   node launcher.node.ts --unlock-launcher <session> [--yes]
 //   node launcher.node.ts --migrate-launcher <session> [--yes]
+//   node launcher.node.ts --handover-channel <session> <mod|node|mcp> [--yes]
 //
 // The host pane is `--pane`, or `$TMUX_PANE` when `--pane` is omitted. It must
 // match `%N` and it must be alive (exit 2 otherwise). The TUI is a horizontal
@@ -47,6 +48,16 @@
 // is never taken over either (a dead one is busy, and removed by hand).
 // Both maintenance commands print what they would do without `--yes`.
 //
+// Channel authority (plan §1c S3): `<sessionDir>/channel` names the one delivery channel
+// (mod, node or mcp) of the session. The launcher starts a node collector only when that
+// channel is node or not yet chosen; another channel owns the session → no collector,
+// a status line, and the TUI still opens. An unreadable channel record is busy, never
+// "not chosen". `--handover-channel <session> <to>` is the only way to change it: it takes
+// `channel.lock`, then `collector.owner` (this order, never reversed: the launcher holds
+// `collector.owner` and only reads `channel`), proves with one `ps` snapshot that the old
+// channel's registration callers and their children are gone, and switches. A stale heartbeat
+// is not quiescence and is not read at all.
+//
 // Closing the TUI does not stop the collector (detached; this process watches
 // only the host pane). When the host pane vanishes, the collector exits on its
 // own and this process exits 1 with `host pane %N is gone`. Without `--socket`,
@@ -62,8 +73,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { paneAlive, readCollectorRecord, serverSocket, type CollectorRecord } from './collector.node.ts'
 import { nodeHost } from './host.node.ts'
-import { acquireLock, maintainLock, probeHolder, releaseLock, type Holder } from './ledger.ts'
-import { holderProvablyAlive, processId, randomBase36, rootOf, sessionDirOf, unlockBusyText, v3Of, type Host } from './workers.ts'
+import { acquireLock, maintainLock, probeHolder, releaseLock, switchChannel, unlinkHeld, type Holder } from './ledger.ts'
+import { holderProvablyAlive, maintainedOutcome, processId, randomBase36, rootOf, sessionDirOf, v3Of, type Host } from './workers.ts'
 
 const NODE_FLOOR = [22, 18, 0]
 /** How long a launcher waits for a lock whose holder provably runs (the holder's check-and-spawn). */
@@ -76,6 +87,7 @@ const USAGE = [
   'usage: node launcher.node.ts --session <id> --cwd <abs> [--pane %N] [--socket <abs>] -- <tui command…>',
   '       node launcher.node.ts --unlock-launcher <session> [--yes]',
   '       node launcher.node.ts --migrate-launcher <session> [--yes]',
+  '       node launcher.node.ts --handover-channel <session> <mod|node|mcp> [--yes]',
 ].join('\n')
 
 export type Outcome = { ok: boolean; text: string }
@@ -94,6 +106,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 export const unlockCommand = (session: string) => `tmux-agent-tui --unlock-launcher ${shq(session)} --yes`
 export const migrateCommand = (session: string) => `tmux-agent-tui --migrate-launcher ${shq(session)} --yes`
+export const handoverCommand = (session: string, to: string) => `tmux-agent-tui --handover-channel ${shq(session)} ${to} --yes`
 
 function tmux(args: string[], socket?: string): Promise<{ code: number; out: string; err: string }> {
   const full = socket ? ['-S', socket, ...args] : args
@@ -247,7 +260,7 @@ async function startCollector(host: Host, dir: string, want: Want, explicitSocke
 export async function ensureCollector(
   host: Host,
   opts: { session: string; cwd: string; pane: string; root: string; socket?: string },
-): Promise<{ pid: number; reused: boolean; replaced?: { pid: number; exited: boolean } }> {
+): Promise<{ skipped: string } | { pid: number; reused: boolean; replaced?: { pid: number; exited: boolean } }> {
   const dir = sessionDirOf(v3Of(opts.root), opts.session)
   await mkdir(dir, { recursive: true })
   const token = await takeLauncherLock(host, dir, opts.session)
@@ -258,6 +271,20 @@ export async function ensureCollector(
         `busy: ${dir} has files of the launcher before plan R6 (${legacy.join(', ')}); an old launcher or collector may still run. ` +
           `Nothing is started. Run: ${migrateCommand(opts.session)}`,
       )
+    }
+    // Read only (channel.lock is not taken here: handover takes it first, then this lock).
+    const ch = await probeHolder(host, `${dir}/channel`)
+    if ('unreadable' in ch) throw new Error(`busy: ${ch.unreadable}; the channel of this session is unknown, so no collector is started`)
+    if ('holder' in ch) {
+      const owner = (ch.holder as unknown as { channel?: unknown }).channel
+      if (typeof owner !== 'string' || !owner) throw new Error(`busy: ${dir}/channel names no channel; the channel of this session is unknown, so no collector is started`)
+      if (owner !== 'node') {
+        return {
+          skipped:
+            `no collector started: this session is collected by its ${owner} channel (one delivery channel per session). ` +
+            `To collect with a node collector instead, run: ${handoverCommand(opts.session, 'node')}`,
+        }
+      }
     }
     const socket = await serverSocket(opts.pane)
     if (!socket) throw new Error(`could not read the tmux socket path of pane ${opts.pane}`)
@@ -300,7 +327,7 @@ export async function unlockLauncher(host: Host, root: string, session: string, 
   const m = await maintainLock(host, lock, { token: randomBase36(12), session, activation: 'unlock', ...me }, async () =>
     unlockHeld(host, lock, session, yes, await probeHolder(host, lock)),
   )
-  return m.ok ? m.value : { ok: false, text: await unlockBusyText(host, m) }
+  return maintainedOutcome(host, m)
 }
 
 async function unlockHeld(host: Host, lock: string, session: string, yes: boolean, p: Awaited<ReturnType<typeof probeHolder>>): Promise<Outcome> {
@@ -311,11 +338,12 @@ async function unlockHeld(host: Host, lock: string, session: string, yes: boolea
   const who = holderText(h, alive)
   if (alive !== false) return { ok: false, text: `not unlocking ${lock}: its holder is ${who}` }
   if (!yes) return { ok: false, text: `${lock} is held by ${who}. To remove it, run: ${unlockCommand(session)}` }
-  if (!(await releaseLock(host, lock, h.token))) return { ok: false, text: `${lock} changed while checking; nothing removed` }
+  const gone = await unlinkHeld(host, lock, h.token)
+  if (!gone.ok) return { ok: false, text: `${lock} changed or could not be removed (${gone.error}); nothing removed` }
   return { ok: true, text: `unlocked ${lock} (its holder ${who})` }
 }
 
-type Proc = { pid: number; ppid: number; line: string }
+export type Proc = { pid: number; ppid: number; line: string }
 
 /** Every process with its parent and full args (`ps -o pid=,ppid=,lstart=,args=`); `undefined` = ps failed. */
 function processes(): Promise<Proc[] | undefined> {
@@ -336,6 +364,21 @@ function processes(): Promise<Proc[] | undefined> {
     )
   })
 }
+
+/** `hits` and their descendants by ppid (a dead launcher's orphans are reparented and not found). */
+function family(procs: Proc[], hits: Proc[]): { hits: Proc[]; kids: Proc[] } {
+  const seen = new Set(hits.map(p => p.pid))
+  const tree = [...hits]
+  for (let i = 0; i < tree.length; i++) {
+    for (const p of procs) {
+      if (p.ppid !== tree[i]!.pid || seen.has(p.pid) || p.pid === process.pid) continue
+      seen.add(p.pid)
+      tree.push(p)
+    }
+  }
+  return { hits, kids: tree.slice(hits.length) }
+}
+const listProcs = (ps: Proc[]) => ps.map(p => `pid ${p.pid}: ${p.line.slice(0, 200)}`).join('; ')
 
 /**
  * `--migrate-launcher` (plan §1c S2): move the legacy `collector.lock` / `collector.pid`
@@ -364,23 +407,12 @@ export async function migrateLauncher(host: Host, root: string, session: string,
       p => p.pid !== process.pid && p.line.includes(session) && (p.line.includes('launcher.node.ts') || p.line.includes('collector.node.ts')),
     )
     if (hits.length) {
-      // Their descendants by ppid (a dead launcher's orphans are reparented and not found).
-      const seen = new Set(hits.map(p => p.pid))
-      const tree = [...hits]
-      for (let i = 0; i < tree.length; i++) {
-        for (const p of procs) {
-          if (p.ppid !== tree[i]!.pid || seen.has(p.pid) || p.pid === process.pid) continue
-          seen.add(p.pid)
-          tree.push(p)
-        }
-      }
-      const kids = tree.slice(hits.length)
-      const list = (ps: Proc[]) => ps.map(p => `pid ${p.pid}: ${p.line.slice(0, 200)}`).join('; ')
+      const { kids } = family(procs, hits)
       return {
         ok: false,
         text:
-          `busy: a launcher or collector for session ${session} still runs: ${list(hits)}` +
-          `${kids.length ? `; and its descendants: ${list(kids)}` : ''}. ` +
+          `busy: a launcher or collector for session ${session} still runs: ${listProcs(hits)}` +
+          `${kids.length ? `; and its descendants: ${listProcs(kids)}` : ''}. ` +
           'Confirm it is the old one, stop it (SIGTERM), then migrate again',
       }
     }
@@ -417,6 +449,90 @@ export async function migrateLauncher(host: Host, root: string, session: string,
   }
 }
 
+const CHANNELS = ['mod', 'node', 'mcp']
+
+/**
+ * `--handover-channel <session> <to>` (plan §1c S3): the only way to change the session's
+ * channel. Order: `channel.lock`, then `collector.owner`, never reversed. Under both, one
+ * `ps` snapshot must show none of the old channel's registration callers (a launcher or
+ * collector naming the session; for mcp any MCP server process, since its args carry no
+ * session id) nor a child of one. The beat is never read: a stale heartbeat is not
+ * quiescence. The mod runs inside a Claude Code process that `ps` cannot tie to a session,
+ * and nothing fences a caller that starts after the snapshot, so `--yes` also confirms that
+ * no old-channel caller runs or starts meanwhile. A late registration of the old channel
+ * re-reads `channel` inside `channel.lock` and is refused (ledger.ts `registerOnChannel`).
+ */
+export async function handoverChannel(
+  host: Host,
+  root: string,
+  session: string,
+  to: string,
+  yes: boolean,
+  ps: () => Promise<Proc[] | undefined> = processes,
+): Promise<Outcome> {
+  if (!CHANNELS.includes(to)) return { ok: false, text: `the target channel is one of ${CHANNELS.join(', ')} (got ${JSON.stringify(to)})` }
+  const dir = sessionDirOf(v3Of(root), session)
+  if (!(await host.exists(dir))) return { ok: true, text: `${dir} does not exist; the session has no channel to hand over` }
+  const me = await processId(host)
+  if (!(me.pid > 0 && me.pidStart && me.host)) return { ok: false, text: 'busy: could not read this process id (ps); not taking a lock that nobody could later prove dead' }
+  const lockPath = `${dir}/channel.lock`
+  const mine: Holder = { token: randomBase36(12), session, activation: 'handover', ...me }
+  const lock = await acquireLock(host, lockPath, mine)
+  if (!lock.ok) {
+    const h = lock.busy
+    const who = typeof h === 'string' ? (h === 'unreadable' ? 'an unreadable holder' : 'an unknown state (see the log)') : holderText(h, await holderProvablyAlive(host, h))
+    return { ok: false, text: `busy: ${lockPath} is held by ${who}. It is never taken over; if its holder is gone, rm ${shq(lockPath)}` }
+  }
+  try {
+    const ch = await probeHolder(host, `${dir}/channel`)
+    if ('absent' in ch) return { ok: true, text: `${dir} has no channel record; the first registrant picks the channel, nothing to hand over` }
+    if ('unreadable' in ch) return { ok: false, text: `busy: ${ch.unreadable}; the channel is unknown, nothing is switched` }
+    const old = (ch.holder as unknown as { channel?: unknown }).channel
+    if (typeof old !== 'string' || !old) return { ok: false, text: `busy: ${dir}/channel names no channel; nothing is switched` }
+    if (old === to) return { ok: true, text: `session ${session} is already collected by its ${to} channel` }
+    let owner: string
+    try {
+      owner = await takeLauncherLock(host, dir, session)
+    } catch (error) {
+      return { ok: false, text: (error as Error).message }
+    }
+    try {
+      const procs = await ps()
+      if (!procs) return { ok: false, text: 'busy: ps -o pid=,ppid=,lstart=,args= failed; cannot prove that the old channel is quiescent' }
+      const hits = procs.filter(
+        p =>
+          p.pid !== process.pid &&
+          ((p.line.includes(session) && (p.line.includes('launcher.node.ts') || p.line.includes('collector.node.ts'))) ||
+            (old === 'mcp' && (p.line.includes('mcp-server.mjs') || p.line.includes('tmux-agent-mcp')))),
+      )
+      if (hits.length) {
+        const { kids } = family(procs, hits)
+        return {
+          ok: false,
+          text:
+            `busy: a ${old} channel caller for session ${session} still runs: ${listProcs(hits)}` +
+            `${kids.length ? `; and its descendants: ${listProcs(kids)}` : ''}. A stale heartbeat is not quiescence: stop it, then hand over again`,
+        }
+      }
+      if (!yes) {
+        return {
+          ok: false,
+          text:
+            `would switch session ${session} from its ${old} channel to ${to}. ps shows no ${old} caller for it, but that is one snapshot` +
+            `${old === 'mod' ? ' and the mod runs inside a Claude Code process that ps cannot tie to a session' : ''}: ` +
+            `confirm that no ${old} caller (a collector, an MCP server, a Claude Code session with this plugin) runs or will start for it, then run: ${handoverCommand(session, to)}`,
+        }
+      }
+      if (!(await switchChannel(host, dir, to, mine.token))) return { ok: false, text: `could not switch ${dir}/channel (see the log); channel.lock stays held: check it, then rm ${shq(lockPath)}` }
+      return { ok: true, text: `session ${session}: ${old} → ${to}. The ${to} channel registers next and fences the ${old} activations; a late ${old} caller is refused` }
+    } finally {
+      await releaseLock(host, `${dir}/collector.owner`, owner)
+    }
+  } finally {
+    await releaseLock(host, lockPath, mine.token)
+  }
+}
+
 async function splitTui(hostPane: string, cwd: string, command: string[], session: string, root: string, socket?: string): Promise<string> {
   // The pane's environment is the tmux session's, not this process's. The collector
   // was started with this root; the TUI has to see the same ledger.
@@ -437,7 +553,7 @@ async function main(): Promise<void> {
   const have = process.versions.node.split('.').map(Number)
   const below = NODE_FLOOR.findIndex((n, i) => have[i]! !== n)
   if (below >= 0 && have[below]! < NODE_FLOOR[below]!) usage(`node ${process.versions.node} is below the floor ${NODE_FLOOR.join('.')}`)
-  let values: { session?: string; cwd?: string; pane?: string; socket?: string; 'unlock-launcher'?: string; 'migrate-launcher'?: string; yes?: boolean }
+  let values: { session?: string; cwd?: string; pane?: string; socket?: string; 'unlock-launcher'?: string; 'migrate-launcher'?: string; 'handover-channel'?: string; yes?: boolean }
   let positionals: string[]
   try {
     const parsed = parseArgs({
@@ -448,6 +564,7 @@ async function main(): Promise<void> {
         socket: { type: 'string' },
         'unlock-launcher': { type: 'string' },
         'migrate-launcher': { type: 'string' },
+        'handover-channel': { type: 'string' },
         yes: { type: 'boolean' },
       },
       allowPositionals: true,
@@ -459,6 +576,17 @@ async function main(): Promise<void> {
   }
   const unlock = values['unlock-launcher']
   const migrate = values['migrate-launcher']
+  const handover = values['handover-channel']
+  if (handover !== undefined) {
+    if (unlock !== undefined || migrate !== undefined) usage('--handover-channel is a separate command')
+    if (!handover) usage('a session id is required')
+    if (positionals.length !== 1) usage('--handover-channel takes <session> <mod|node|mcp>')
+    const root = await rootOf(nodeHost())
+    if (!root) usage('no state root (set TMUX_AGENT_DIR, XDG_STATE_HOME, or HOME)')
+    const out = await handoverChannel(nodeHost(), root, handover, positionals[0]!, values.yes === true)
+    process.stdout.write(`tmux-agent-launcher: ${out.text}\n`)
+    process.exit(out.ok ? 0 : 1)
+  }
   if (unlock !== undefined || migrate !== undefined) {
     if (unlock !== undefined && migrate !== undefined) usage('--unlock-launcher and --migrate-launcher are separate commands')
     const session = unlock ?? migrate!
@@ -486,11 +614,15 @@ async function main(): Promise<void> {
   if (!root) usage('no state root (set TMUX_AGENT_DIR, XDG_STATE_HOME, or HOME)')
   const ensured = await ensureCollector(nodeHost(), { session, cwd, pane, root, socket })
   const tui = await splitTui(pane, cwd, positionals, session, root, socket)
-  const old = ensured.replaced
-  process.stdout.write(
-    `tmux-agent-launcher: tui ${tui} beside host ${pane}; collector ${ensured.pid} ${ensured.reused ? 'reused' : 'started'}` +
-      `${old ? `; replaced collector ${old.pid}${old.exited ? '' : ' (still exiting; the new activation fences it, §4)'}` : ''}\n`,
-  )
+  if ('skipped' in ensured) {
+    process.stdout.write(`tmux-agent-launcher: tui ${tui} beside host ${pane}; ${ensured.skipped}\n`)
+  } else {
+    const old = ensured.replaced
+    process.stdout.write(
+      `tmux-agent-launcher: tui ${tui} beside host ${pane}; collector ${ensured.pid} ${ensured.reused ? 'reused' : 'started'}` +
+        `${old ? `; replaced collector ${old.pid}${old.exited ? '' : ' (still exiting; the new activation fences it, §4)'}` : ''}\n`,
+    )
+  }
   for (;;) {
     if (!(await paneAlive(pane))) {
       process.stderr.write(`tmux-agent-launcher: host pane ${pane} is gone\n`)

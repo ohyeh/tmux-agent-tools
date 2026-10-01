@@ -43,6 +43,14 @@ Maintenance of the launcher (lib/launcher.node.ts); no TTY needed. Without
                    parent included), nor a child of one. The check is one ps
                    snapshot and the old launcher takes no lock: --yes confirms
                    that no old launcher or collector will start meanwhile.
+  tmux-agent-tui --handover-channel <session> <mod|node|mcp> [--yes]
+                   Switch the session's one delivery channel (channel) to <to>.
+                   Takes channel.lock, then collector.owner, and only when one ps
+                   snapshot shows no registration caller of the old channel (a
+                   launcher or collector naming the session; for mcp any MCP server
+                   process) nor a child of one. A stale heartbeat is not
+                   quiescence. --yes confirms that no old-channel caller (a Claude
+                   Code session with this plugin included) runs or starts meanwhile.
 
 Needs Node >= 22.18 (set NODE=/path/to/node to pick one) and a terminal:
 stdin and stdout must be a TTY (for a JSON snapshot, use tmux-agent-dashboard).
@@ -71,7 +79,7 @@ require_node() {
 }
 
 case "${1:-}" in
-  --unlock-launcher|--migrate-launcher)
+  --unlock-launcher|--migrate-launcher|--handover-channel)
     require_node
     exec "$NODE" "$SCRIPT_DIR/lib/launcher.node.ts" "$@" ;;
 esac

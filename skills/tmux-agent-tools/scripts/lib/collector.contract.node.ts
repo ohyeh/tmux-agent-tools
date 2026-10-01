@@ -408,3 +408,31 @@ test('Sol#2 readCollectorRecord: only ENOENT is absent; bad JSON, an incomplete 
   await assert.rejects(readCollectorRecord(path), /EISDIR/)
   rmSync(dir, { recursive: true, force: true })
 })
+
+test('Sol r6 N5: from a valid record, dropping or corrupting any required field makes it not complete (throws); nonce is optional but typed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'crec-'))
+  const path = `${dir}/collector.json`
+  const valid = { pid: 4242, pidStart: 'Thu Jan  1 00:00:00 1970', host: 'h', session: 's', pane: '%1', socket: '/tmp/x', cwd: '/tmp', coreVersion: '0.43.0', token: 't' }
+  writeFileSync(path, JSON.stringify(valid))
+  assert.deepEqual(await readCollectorRecord(path), valid, 'the valid record is read')
+  writeFileSync(path, JSON.stringify({ ...valid, nonce: 'n' }))
+  assert.equal((await readCollectorRecord(path))?.nonce, 'n', 'a present nonce is kept')
+  const bad: [string, unknown][] = [['dropped', undefined], ['empty', ''], ['number', 7], ['null', null], ['object', {}]]
+  for (const key of Object.keys(valid)) {
+    for (const [what, v] of bad) {
+      if (key === 'pid' && (what === 'empty' || what === 'number')) continue
+      const r: Record<string, unknown> = { ...valid, [key]: v }
+      writeFileSync(path, JSON.stringify(r))
+      await assert.rejects(readCollectorRecord(path), new RegExp(path), `${key} ${what} was accepted`)
+    }
+  }
+  for (const pid of [0, -1, 1.5, '4242']) {
+    writeFileSync(path, JSON.stringify({ ...valid, pid }))
+    await assert.rejects(readCollectorRecord(path), new RegExp(path), `pid ${JSON.stringify(pid)} was accepted`)
+  }
+  for (const nonce of [7, null, '', {}]) {
+    writeFileSync(path, JSON.stringify({ ...valid, nonce }))
+    await assert.rejects(readCollectorRecord(path), new RegExp(path), `nonce ${JSON.stringify(nonce)} was accepted`)
+  }
+  rmSync(dir, { recursive: true, force: true })
+})

@@ -30,6 +30,7 @@ import {
   recoverEpisodes,
   registerOnChannel,
   releaseLock,
+  unlinkHeld,
   sessionKey,
   sessionLiveness,
   superseded,
@@ -37,6 +38,7 @@ import {
   UNKNOWN,
   type Contest,
   type Holder,
+  type Maintained,
   type WorkerRecord,
 } from './ledger.ts'
 
@@ -525,6 +527,8 @@ export type Gate = {
   nextAttemptAt: number
   /** Why this activation stopped collecting, drawn as-is on the band; unset = collecting. */
   paused?: string
+  /** Why the last registration tick registered nothing (channel.lock busy, channel state unknown); retried next tick. */
+  waiting?: string
   /** A view's reading of its session's collector (`act/<n>.state` + beat, C-health). Unset on the collector. */
   viewHealth?: Health
   /** A view's last scan error (errno or Error name): the ledger could not be read. */
@@ -2780,16 +2784,37 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
  */
 async function registerChannelActivation(host: Host, gate: Gate, dir: string): Promise<number | undefined> {
   const channel = gate.channel ?? 'mod'
-  // ponytail: no process id in this holder (held for a few syscalls; a crashed one is
-  // named by session + token and cleared by hand). Add processId when a channel unlock exists.
-  const me: Holder = { token: gate.token, session: host.owner() ?? '', activation: '', host: '', pid: 0, pidStart: '' }
+  // The holder records this process like an action lock does (processId, one probe per
+  // process), so a crashed holder is named by pid + start and `holderProvablyAlive` can
+  // answer for it; an unknown answer stays busy.
+  const id = await processId(host)
+  const me: Holder = { token: gate.token, session: host.owner() ?? '', activation: '', ...id }
   const r = await registerOnChannel(host, dir, channel, me, { pid: 0, pidStart: '', host: '', token: gate.token })
-  if (r && 'refused' in r) {
+  if ('n' in r) {
+    gate.waiting = undefined
+    return r.n
+  }
+  if ('refused' in r) {
     gate.paused = `this session is collected by its ${r.refused} channel (one delivery channel per session); this ${channel} channel does not collect`
     host.log(`tmux-agent: ${gate.paused}`)
     return undefined
   }
-  return r?.n
+  // Unknown or initializing is never "free": nothing registers, nothing is fenced, and it is retried.
+  const why = 'unknown' in r ? `the channel state is unknown (${r.unknown})` : `${await busyChannelLock(host, r.busy, r.path)}`
+  gate.waiting = `${why}; this ${channel} channel does not register this tick`
+  host.log(`tmux-agent: ${gate.waiting}`)
+  return undefined
+}
+
+/** `channel.lock` is held: who, and whether that process runs. It is never taken over; a dead holder's lock is removed by hand. */
+async function busyChannelLock(host: Host, h: Holder | 'unreadable' | 'unknown', path: string): Promise<string> {
+  if (typeof h === 'string') return `${path} is ${h === 'unreadable' ? 'held by a holder that cannot be read' : 'in an unknown state (see the log)'}`
+  const alive = await holderProvablyAlive(host, h)
+  const state = alive === true ? 'still running' : alive === false ? 'gone' : 'not provably alive or dead'
+  return (
+    `${path} is held by pid ${h.pid || '?'} on ${h.host || '?'} (session ${h.session || '?'}): ${state}. It is never taken over` +
+    `${alive === true ? '' : `. If no registration runs for it, rm '${path.replace(/'/g, `'\\''`)}'`}`
+  )
 }
 
 /** The worker's action lock (§5), held by this activation's token. */
@@ -2883,7 +2908,23 @@ export async function unlockWorker(host: Host, name: string, word?: string): Pro
   const m = await maintainLock(host, lock, { token: randomBase36(12), session: host.owner() ?? '', activation: 'unlock', ...self }, async () =>
     unlockHeld(host, v3, name, lock, word, await probeHolder(host, lock)),
   )
-  return m.ok ? m.value : { ok: false, text: `"${name}": ${await unlockBusyText(host, m)}` }
+  return maintainedOutcome(host, m, `"${name}": `)
+}
+
+/**
+ * The Outcome of a `maintainLock` section: `fn`'s own Outcome, or not ok when the section
+ * was refused (busy) or ran but left its guard behind. The second names what ran, the guard
+ * path, the raw rm error and how to clear it; it is never reported as plain success.
+ */
+export async function maintainedOutcome(host: Host, m: Maintained<Outcome>, prefix = ''): Promise<Outcome> {
+  if (m.ok) return m.value
+  if ('busy' in m) return { ok: false, text: `${prefix}${await unlockBusyText(host, m)}` }
+  return {
+    ok: false,
+    text:
+      `${prefix}${m.value.text}; but the guard ${m.path} was left behind (${m.error}). Until it is removed, later unlocks and releases of this lock report busy. ` +
+      `If no unlock or release runs, remove it by hand: rm '${m.path.replace(/'/g, `'\\''`)}'`,
+  }
 }
 
 /**
@@ -2898,8 +2939,8 @@ export async function unlockBusyText(host: Host, m: { busy: Holder | 'unreadable
     who = `pid ${h.pid || '?'} on ${h.host || '?'}: ${alive === true ? 'still running' : alive === false ? 'gone' : 'not provably alive or dead'}`
   } else who = h === 'unreadable' ? 'its holder cannot be read' : 'its state is unknown (see the log)'
   return (
-    `busy: another unlock holds ${m.path} (${who}). It is never taken over. ` +
-    `If no unlock runs, remove it by hand (rm '${m.path.replace(/'/g, `'\\''`)}'), then unlock again`
+    `busy: an unlock or release holds ${m.path} (${who}). It is never taken over. ` +
+    `If none runs and no 'rm' child of it is still pending (check: ps -ax | grep "rm "), remove it by hand (rm '${m.path.replace(/'/g, `'\\''`)}'), then unlock again`
   )
 }
 
@@ -2933,7 +2974,8 @@ async function unlockHeld(
   if (alive === true) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
   if (alive === undefined) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
   // Only that exact holder instance is removed (release checks the token again).
-  if (!(await releaseLock(host, lock, h.token))) return { ok: false, text: `"${name}": the lock changed while checking; nothing removed` }
+  const gone = await unlinkHeld(host, lock, h.token)
+  if (!gone.ok) return { ok: false, text: `"${name}": the lock changed or could not be removed (${gone.error}); nothing removed` }
   host.log(`tmux-agent: unlocked "${name}" (holder ${who}: pid gone or reused)`)
   return { ok: true, text: `unlocked "${name}" (the holder ${who} is gone)` }
 }

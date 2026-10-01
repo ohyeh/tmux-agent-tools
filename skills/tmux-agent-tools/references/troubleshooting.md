@@ -153,9 +153,9 @@ Same pattern for `keychain:` → install `security` (macOS only).
 
 You ran a non-locked write directly into the JSONL file. The audit chain uses an advisory lock — bypassing it is the supported way to corrupt the chain. Use `tmux-agent-audit rotate` for rotation; never `mv audit.jsonl audit.jsonl.1` by hand.
 
-## Two `start --exact same-name` killed the first session
+## `start --exact` says the session already exists
 
-By design — single-caller invariant. Wrapper state under `$TMUX_AGENT_DIR/<name>/` is not lock-protected. Use different agent names for parallel work, or use `tmux-agent-fanout` which handles naming for you.
+A live session of that name is another worker's, and `start`/`resume`/`start-ssh` never replace it (exit 1, before any state of the name is touched). Stop it first (`agent-tmux <cli> stop <name>`), or use a different name. `tmux-agent-fanout` and the core `assign` choose names for you. `stop` also refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`).
 
 ## Fanout hangs for ~10 minutes when one wrapper binary is missing
 
