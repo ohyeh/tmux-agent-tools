@@ -548,6 +548,7 @@ describe('ownership', () => {
     expect(cwds.length, 'the peeks did run').toBeGreaterThan(0)
     expect(cwds, 'no spawn from a missing cwd').not.toContain('/gone/wt')
     expect(logs.filter(l => l.includes('/gone/wt is gone')).length, 'said once, not per call').toEqual(1)
+    expect(logs.filter(l => l.startsWith('tmux-agent: ')), '$.ui.log adds the plugin name; the line must not repeat it').toEqual([])
   })
 
   test('a delivered orphan is not claimed: its owner stays the session that dispatched it', WITH_DRIVER, async ($, on) => {
@@ -3965,7 +3966,7 @@ describe('cursor review of 34e2a1e', () => {
     await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
     await wait50()
     const full = `TMUX_AGENT_DIR='/state/it'\\''s here/${'d'.repeat(160)}' '/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'`
-    expect(p.logs, 'the whole command, runnable as logged').toContain(`tmux-agent: tui open command: ${full}`)
+    expect(p.logs, 'the whole command, runnable as logged').toContain(`tui open command: ${full}`)
     expect(p.toasts).toHaveLength(1)
     const toast = p.toasts[0]!
     expect(toast.startsWith('tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行（完整指令見 log）：TMUX_AGENT_DIR=')).toBe(true)
@@ -3987,6 +3988,7 @@ describe('cursor review of 34e2a1e', () => {
     expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
     expect(p.toasts).toHaveLength(1)
     expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: no node, lib\/tui\.node\.ts or tmux-agent-tui beside /)
+    expect(p.toasts[0], 'names the remedy for an older skill install').toContain('re-run its install-bin')
   })
 })
 

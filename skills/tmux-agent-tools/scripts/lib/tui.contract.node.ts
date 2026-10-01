@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, cpSync, symlinkSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, symlinkSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -17,6 +17,13 @@ import {
   CLEAR_ID,
   STOP_CONFIRM_MS,
   STOP_REPEAT_MS,
+  sessionDirOf,
+  readActHealth,
+  writeActState,
+  heartbeat,
+  episodeDetail,
+  resumeWorker,
+  type Health,
 } from './workers.ts'
 import {
   nextKeyState,
@@ -34,6 +41,17 @@ import {
   graphemeWidth,
   graphemes,
   sanitizeAnsi,
+  layoutOf,
+  tuiLayout,
+  healthText,
+  emptyText,
+  detailText,
+  wrapCells,
+  MUTATING_KEYS,
+  READ_ONLY,
+  PAGE_DOWN,
+  PAGE_UP,
+  ANSI_CLEAR_HOME,
 } from './tui.node.ts'
 import { eawOf, EAW_UNICODE_VERSION } from './eaw-table.ts'
 
@@ -1378,7 +1396,7 @@ async function framed(opts: {
   return { screen: stripAnsi(stdout.written), writes: stdout.writes }
 }
 
-test('view probe: permission is needs-input, project is read, collector health is unknown', async () => {
+test('view probe: permission is needs-input, project is read, health with no session dir is 無收件者', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-view-root-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-view-repo-'))
   writePermissionWorker(root, repo, 'owner')
@@ -1405,7 +1423,9 @@ test('view probe: permission is needs-input, project is read, collector health i
   assert.match(screen, /w\.abcde/)
   assert.match(screen, /needs input — permission/)
   assert.match(screen, /proj-a/)
-  assert.match(screen, /collector health unknown/)
+  // C-health: this session never registered (no session dir) → no collector, not `unknown`.
+  assert.match(screen, /收件：無收件者/)
+  assert.doesNotMatch(screen, /內部 \?/)
   assert.doesNotMatch(screen, /viewer — no session/)
   assert.equal(submits, 0)
   assert.equal(existsSync(join(root, '.v3', 'w.abcde', 'episodes', '2', 'claims')), false)
@@ -1420,7 +1440,7 @@ test('viewer: no session shows the owner worker and says viewer', async () => {
     writePermissionWorker(root, repo, 'owner')
     const host = quietHost(undefined, repo, root)
     const { screen } = await framed({ host, root, cwd: repo })
-    assert.match(screen, /viewer — no session; not a collecting owner/)
+    assert.match(screen, /viewer — no session; 唯讀；帶 --session 才能操作 · 收件：無收件者/)
     assert.match(screen, /w\.abcde/)
     assert.doesNotMatch(screen, /No workers outstanding/)
   } finally {
@@ -1574,5 +1594,687 @@ test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', {
   } finally {
     await tmuxS(['kill-server'])
     rmSync(parent, { recursive: true, force: true })
+  }
+})
+
+// -----------------------------------------------------------------------------
+// 8. R4: health, layout, detail, viewer, key hints, cancel/unlock, empty states
+// -----------------------------------------------------------------------------
+
+/** One open episode with an optional result. Owner = the session that shows it. */
+function writeWorker(
+  root: string,
+  repo: string,
+  owner: string,
+  name: string,
+  result?: { status: string; summary: string; episode?: number },
+): string {
+  const worker = join(root, '.v3', name)
+  const ep = join(worker, 'episodes', '1')
+  const since = Date.now() - 60_000
+  mkdirSync(join(ep, 'sent'), { recursive: true })
+  writeFileSync(join(ep, 'dispatch.json'), JSON.stringify({ seq: 1, since, owner, resultPath: join(ep, 'result.json'), origin: 'assign' }))
+  writeFileSync(join(worker, 'worker.json'), JSON.stringify({ profile: 'codex', name, dir: repo, ownerCwd: repo, owner, since, origin: 'assign' }))
+  if (result) writeFileSync(join(ep, 'result.json'), JSON.stringify({ schema_version: 1, episode: 1, ...result }))
+  return ep
+}
+
+/** `act/<n>` of session `S` under `root`, as a collector leaves it. Returns the act dir. */
+function writeAct(
+  root: string,
+  n: number,
+  opts: { token?: string; beatAgoMs?: number; state?: Record<string, unknown> | string; record?: string | false } = {},
+): string {
+  const act = join(sessionDirOf(v3Of(root), 'S'), 'act')
+  mkdirSync(join(act, String(n)), { recursive: true })
+  const token = opts.token ?? `tok${n}`
+  if (opts.record !== false) writeFileSync(join(act, `${n}.json`), opts.record ?? JSON.stringify({ pid: 0, pidStart: '', host: '', token }))
+  if (opts.state !== undefined) {
+    writeFileSync(join(act, `${n}.state`), typeof opts.state === 'string' ? opts.state : JSON.stringify({ token, updatedAt: 1, ...opts.state }))
+  }
+  if (opts.beatAgoMs !== undefined) {
+    const beat = join(act, `${n}.beat`)
+    writeFileSync(beat, '1')
+    const t = (Date.now() - opts.beatAgoMs) / 1000
+    utimesSync(beat, t, t)
+  }
+  return act
+}
+
+const fsHost = (root: string) => quietHost('S', root, root)
+
+/** treeSnap, but a file this test made unreadable is compared by mtime alone. */
+function snapOrStat(dir: string): Map<string, string> {
+  const out = new Map<string, string>()
+  const walk = (p: string) => {
+    for (const e of readdirSync(p, { withFileTypes: true })) {
+      const full = join(p, e.name)
+      const st = statSync(full)
+      if (e.isDirectory()) {
+        out.set(`${full.slice(dir.length)}/`, String(st.mtimeMs))
+        walk(full)
+        continue
+      }
+      let body = ''
+      try {
+        body = readFileSync(full, 'utf8')
+      } catch {}
+      out.set(full.slice(dir.length), `${st.mtimeMs}\n${body}`)
+    }
+  }
+  walk(dir)
+  return out
+}
+
+test('health: C-health fixtures, each with its hard-coded state', async () => {
+  const cases: { name: string; build: (root: string) => void; want: Health; text: string }[] = [
+    { name: 'no session dir', build: () => {}, want: { kind: 'none' }, text: '收件：無收件者' },
+    {
+      name: 'session dir, no activation',
+      build: root => mkdirSync(join(sessionDirOf(v3Of(root), 'S'), 'act'), { recursive: true }),
+      want: { kind: 'none' },
+      text: '收件：無收件者',
+    },
+    {
+      name: 'mod collecting, fresh beat',
+      build: root => writeAct(root, 1, { beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }),
+      want: { kind: 'collecting', channel: 'mod', mode: 'auto' },
+      text: '收件：collecting（mod）',
+    },
+    {
+      name: 'node collecting, fresh beat',
+      build: root => writeAct(root, 1, { beatAgoMs: 1_000, state: { channel: 'node', mode: 'auto', status: 'collecting' } }),
+      want: { kind: 'collecting', channel: 'node', mode: 'auto' },
+      text: '收件：collecting（node）',
+    },
+    {
+      name: 'mcp on-request, fresh beat',
+      build: root => writeAct(root, 1, { beatAgoMs: 1_000, state: { channel: 'mcp', mode: 'on-request', status: 'collecting' } }),
+      want: { kind: 'collecting', channel: 'mcp', mode: 'on-request' },
+      text: '收件：MCP：host 呼叫 tool 時才收',
+    },
+    {
+      name: 'paused 120s ago: paused, not stale (a paused collector stops beating)',
+      build: root => writeAct(root, 1, { beatAgoMs: 120_000, state: { channel: 'node', mode: 'auto', status: 'paused', reason: 'collector paused after 3 delivery refusals' } }),
+      want: { kind: 'paused', channel: 'node', reason: 'collector paused after 3 delivery refusals' },
+      text: '收件：paused（collector paused after 3 delivery refusals）',
+    },
+    {
+      name: 'collecting state, beat 200s old',
+      build: root => writeAct(root, 1, { beatAgoMs: 200_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }),
+      want: { kind: 'stale', ageS: 200 },
+      text: '收件：stale（beat 200s 前）',
+    },
+    {
+      name: 'max n just registered (no record, no beat) while n=1 collects: initializing, no look back',
+      build: root => {
+        writeAct(root, 1, { beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } })
+        writeAct(root, 2, { record: false })
+      },
+      want: { kind: 'initializing' },
+      text: '收件：initializing',
+    },
+    {
+      name: 'old n writes late (paused) after n=2 collects: only max n counts',
+      build: root => {
+        writeAct(root, 2, { beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } })
+        writeAct(root, 1, { beatAgoMs: 0, state: { channel: 'mod', mode: 'auto', status: 'paused', reason: 'superseded' } })
+      },
+      want: { kind: 'collecting', channel: 'mod', mode: 'auto' },
+      text: '收件：collecting（mod）',
+    },
+    {
+      name: 'half-written state',
+      build: root => writeAct(root, 1, { beatAgoMs: 1_000, state: '{"token":"tok1","chan' }),
+      want: { kind: 'unknown', reason: 'act/1 is not valid JSON (half-written?)' },
+      text: '收件：unknown（act/1 is not valid JSON (half-written?)）',
+    },
+    {
+      name: 'state of another registration (token mismatch)',
+      build: root => writeAct(root, 1, { beatAgoMs: 1_000, state: { token: 'other', channel: 'mod', mode: 'auto', status: 'collecting' } }),
+      want: { kind: 'unknown', reason: 'act/1.state token does not match its registration' },
+      text: '收件：unknown（act/1.state token does not match its registration）',
+    },
+    {
+      name: 'beats but no state (a collector from before R4)',
+      build: root => writeAct(root, 1, { beatAgoMs: 1_000 }),
+      want: { kind: 'unknown', reason: 'act/1 beats but has no state (a collector older than this TUI?)' },
+      text: '收件：unknown（act/1 beats but has no state (a collector older than this TUI?)）',
+    },
+    {
+      name: 'EACCES on the state file',
+      build: root => {
+        const act = writeAct(root, 1, { beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } })
+        chmodSync(join(act, '1.state'), 0o000)
+      },
+      want: { kind: 'unknown', reason: 'act/1 could not be read' },
+      text: '收件：unknown（act/1 could not be read）',
+    },
+  ]
+  for (const c of cases) {
+    const root = mkdtempSync(join(tmpdir(), 'tui-health-'))
+    c.build(root)
+    const before = snapOrStat(root)
+    const got = await readActHealth(fsHost(root), v3Of(root), 'S', Date.now())
+    assert.deepEqual(got, c.want, c.name)
+    assert.equal(healthText(got), c.text, c.name)
+    // The TUI only reads: paths, mtimes and contents are unchanged.
+    const after = snapOrStat(root)
+    assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort(), c.name)
+    for (const [path, body] of before) assert.equal(after.get(path), body, `${c.name}: mutated ${path}`)
+  }
+  assert.equal(healthText(undefined), '收件：unknown（尚未讀取）')
+  assert.equal(healthText({ kind: 'stale' }), '收件：stale（從未 beat）')
+})
+
+test('health: max n changing while read is read again; changing every time is unknown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-health-race-'))
+  writeAct(root, 1, { beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } })
+  writeAct(root, 2, { beatAgoMs: 1_000, state: { channel: 'node', mode: 'auto', status: 'collecting' } })
+  const act = join(sessionDirOf(v3Of(root), 'S'), 'act')
+  // A list of act/ that grows by one on each read: the first read sees n=1 only.
+  const grow = (always: boolean) => {
+    const host = fsHost(root)
+    const list = host.list
+    let calls = 0
+    host.list = async path => {
+      const real = await list(path)
+      if (path !== act) return real
+      calls += 1
+      if (!always && calls > 1) return real
+      const keep = String(Math.min(calls, 2))
+      const extra = always ? [{ name: String(calls + 2), kind: 'dir' }] : []
+      return [...real.filter(e => !/^\d+$/.test(e.name) || e.name <= keep), ...extra]
+    }
+    return host
+  }
+  assert.deepEqual(await readActHealth(grow(false), v3Of(root), 'S', Date.now()), { kind: 'collecting', channel: 'node', mode: 'auto' })
+  assert.deepEqual(await readActHealth(grow(true), v3Of(root), 'S', Date.now()), { kind: 'unknown', reason: 'registrations kept changing (變動中)' })
+})
+
+test('health writer: heartbeat publishes act/<n>.state for its channel, once per change; a pause rewrites it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-health-writer-'))
+  const base = nodeHost({ owner: 'S', cwd: root })
+  base.envTmuxAgentDir = async () => root
+  const mvs: string[] = []
+  const host = {
+    ...base,
+    run: async (argv: readonly string[], cwd: string, ms: number) => {
+      if (argv[0] === 'mv') mvs.push(String(argv[2]))
+      return base.run(argv, cwd, ms)
+    },
+  }
+  for (const [channel, want] of [
+    [undefined, { kind: 'collecting', channel: 'mod', mode: 'auto' }],
+    ['node', { kind: 'collecting', channel: 'node', mode: 'auto' }],
+    ['mcp', { kind: 'collecting', channel: 'mcp', mode: 'on-request' }],
+  ] as const) {
+    const gate = newGate()
+    if (channel) gate.channel = channel
+    assert.equal(await heartbeat(host, gate), true)
+    assert.deepEqual(await readActHealth(host, v3Of(root), 'S', Date.now()), want)
+    const state = JSON.parse(readFileSync(join(sessionDirOf(v3Of(root), 'S'), 'act', `${gate.activation}.state`), 'utf8'))
+    assert.equal(state.token, gate.token)
+    assert.equal(state.status, 'collecting')
+    const n = mvs.length
+    assert.equal(await heartbeat(host, gate), true)
+    assert.equal(mvs.length, n, 'an unchanged state is not published again')
+    gate.paused = 'collector paused after 3 delivery refusals (refused: busy) — restart this session to resume'
+    await writeActState(host, gate)
+    assert.equal(mvs.length, n + 1)
+    assert.deepEqual(await readActHealth(host, v3Of(root), 'S', Date.now()), {
+      kind: 'paused',
+      channel: channel ?? 'mod',
+      reason: 'collector paused after 3 delivery refusals (refused: busy) — restart this session to resume',
+    })
+  }
+  // No tmp file is left beside the states.
+  const act = readdirSync(join(sessionDirOf(v3Of(root), 'S'), 'act'))
+  assert.deepEqual(act.filter(f => !/^\d+(\.json|\.beat|\.state)?$/.test(f)), [])
+})
+
+test('layout: one function sizes every section; hard-coded fixtures (R4.1, R4.2)', () => {
+  // [height, input] → expected. The sum of the sections never exceeds the height.
+  const fixtures: [number, Parameters<typeof layoutOf>[1], ReturnType<typeof layoutOf>][] = [
+    [24, { status: 1, rows: 3, sel: 2, selExtra: 2, footer: 1 }, { status: 1, first: 0, list: 3, hidden: 0, more: 0, selExtra: 2, body: 14, footer: 1 }],
+    [24, { status: 1, rows: 1, sel: 0, selExtra: 1, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 1, body: 18, footer: 0 }],
+    [60, { status: 1, rows: 1, sel: 0, selExtra: 1, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 1, body: 54, footer: 0 }],
+    [60, { status: 1, rows: 3, sel: 0, selExtra: 2, footer: 1 }, { status: 1, first: 0, list: 3, hidden: 0, more: 0, selExtra: 2, body: 50, footer: 1 }],
+    [10, { status: 1, rows: 5, sel: 4, selExtra: 2, footer: 0 }, { status: 1, first: 0, list: 5, hidden: 0, more: 0, selExtra: 2, body: 0, footer: 0 }],
+    [10, { status: 1, rows: 9, sel: 8, selExtra: 2, footer: 1 }, { status: 1, first: 5, list: 4, hidden: 5, more: 1, selExtra: 2, body: 0, footer: 1 }],
+    [10, { status: 1, rows: 1, sel: 0, selExtra: 2, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 2, body: 3, footer: 0 }],
+    [3, { status: 1, rows: 4, sel: 3, selExtra: 2, footer: 1 }, { status: 1, first: 3, list: 1, hidden: 3, more: 0, selExtra: 0, body: 0, footer: 0 }],
+    [5, { status: 2, rows: 0, sel: -1, selExtra: 0, footer: 3 }, { status: 2, first: 0, list: 0, hidden: 0, more: 0, selExtra: 0, body: 0, footer: 2 }],
+  ]
+  for (const [height, input, want] of fixtures) {
+    const got = layoutOf(height, input)
+    assert.deepEqual(got, want, `height ${height} ${JSON.stringify(input)}`)
+    const used = 1 + got.status + got.list + got.selExtra + (got.body ? got.body + 2 : 0) + got.more + got.footer
+    assert.ok(used <= height, `height ${height}: ${used} lines`)
+  }
+})
+
+test('mirror: capture asks for the layout body; a resize drops the capture started before it (R4.1, R4.2)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-mirror-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-mirror-repo-'))
+  writeWorker(root, repo, 'S', 'mir.abcde')
+  const host = quietHost('S', repo, root)
+  const tails: string[] = []
+  let hold: (() => void) | undefined
+  host.run = async argv => {
+    if (argv[0] === 'agent-tmux' && argv.includes('capture')) {
+      tails.push(argv[argv.indexOf('--tail') + 1]!)
+      if (tails.length === 1) {
+        await new Promise<void>(r => (hold = r))
+        return { exitCode: 0, stdout: 'STALE-80x24\n', stderr: '' }
+      }
+      return { exitCode: 0, stdout: 'FRESH-120x60\n', stderr: '' }
+    }
+    if (argv[0] === 'agent-tmux' && argv.includes('status')) return { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' }
+    return { exitCode: 0, stdout: '', stderr: '' }
+  }
+  const { stdin, stdout } = mockTty()
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 30 })
+  try {
+    await until(() => stdout.written.includes('mir.abcde'), 5_000, 'the row')
+    stdin.emit('data', 'j')
+    await until(() => tails.length === 1 && !!hold, 5_000, 'the first capture')
+    assert.equal(tails[0], '18', '80x24, one selected row: 18 mirror rows')
+    stdout.columns = 120
+    stdout.rows = 60
+    stdout.emit('resize')
+    hold!()
+    await until(() => stdout.written.includes('FRESH-120x60'), 5_000, 'the capture at the new size')
+    assert.equal(tails.at(-1), '54', '120x60: 54 mirror rows')
+    assert.ok(!stdout.written.includes('STALE-80x24'), 'a capture sized before the resize is never drawn')
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
+test('detail: the whole result, past SUMMARY_MAX, with row and result state apart; PgDn reaches the end (R4.3)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-detail-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-detail-repo-'))
+  const long = `開始${'中文摘要'.repeat(3_000)}END-MARKER`
+  const ep = writeWorker(root, repo, 'S', 'det.abcde', { status: 'success', summary: long })
+  const host = quietHost('S', repo, root)
+  const d = { profile: 'codex', name: 'det.abcde', dir: repo, since: 1, seq: 1, resultPath: join(ep, 'result.json') }
+  const det = await episodeDetail(host, d)
+  assert.equal(det.kind, 'result')
+  assert.equal(det.kind === 'result' && det.summary?.length, 12_012, 'not cut at SUMMARY_MAX (12000)')
+  assert.equal(det.kind === 'result' && det.status, 'success')
+  assert.equal(det.kind === 'result' && det.otherEpisode, false)
+  const row = { ...mockRow('det', { state: 'finished' }), d }
+  const lines = detailText(row, det)
+  assert.equal(lines[0], 'row: finished · codex det.abcde · episode 1')
+  assert.equal(lines[1], `result: success · ${join(ep, 'result.json')}`)
+  assert.equal(lines[2], 'summary:')
+  assert.ok(lines[3]!.endsWith('END-MARKER'))
+  // Other kinds, hard-coded.
+  assert.deepEqual(await episodeDetail(host, { ...d, resultPath: join(ep, 'none.json') }), { kind: 'no-result', resultPath: join(ep, 'none.json') })
+  assert.deepEqual(await episodeDetail(host, { profile: 'codex', name: 'r', dir: repo, since: 1 }), { kind: 'no-episode' })
+  writeFileSync(join(ep, 'bad.json'), '[1')
+  assert.deepEqual(await episodeDetail(host, { ...d, resultPath: join(ep, 'bad.json') }), {
+    kind: 'error',
+    resultPath: join(ep, 'bad.json'),
+    reason: 'result.json is not a JSON object',
+  })
+  writeFileSync(join(ep, 'locked.json'), '{}')
+  chmodSync(join(ep, 'locked.json'), 0o000)
+  assert.deepEqual(await episodeDetail(host, { ...d, resultPath: join(ep, 'locked.json') }), {
+    kind: 'error',
+    resultPath: join(ep, 'locked.json'),
+    reason: 'result.json could not be read (see the log)',
+  })
+  writeFileSync(join(ep, 'other.json'), JSON.stringify({ status: 'failed', summary: 's', episode: 7, blocked_reason: 'quota' }))
+  assert.deepEqual(detailText({ ...mockRow('o', { state: 'running' }), d }, await episodeDetail(host, { ...d, resultPath: join(ep, 'other.json') })), [
+    'row: running · codex det.abcde · episode 1',
+    `result: failed (names another episode) · ${join(ep, 'other.json')}`,
+    'blocked: quota',
+    'summary:',
+    's',
+  ])
+  assert.deepEqual(detailText(mockRow('p', { project: true }), { kind: 'project' }), ['project session p: not a ledger worker; no episode, no result'])
+
+  // Through runTui: Enter expands, PgDn pages to the end, Enter collapses.
+  const { stdin, stdout } = mockTty()
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000 })
+  try {
+    await until(() => stdout.written.includes('det.abcde'), 5_000, 'the row')
+    stdin.emit('data', 'j')
+    stdin.emit('data', '\r')
+    await until(() => stdout.written.includes('detail 1–'), 5_000, 'the detail view')
+    const total = Number(/detail 1–\d+ of (\d+)/.exec(stripAnsi(stdout.written))![1])
+    assert.ok(total > 300, `a long summary wraps to many lines: ${total}`)
+    for (let i = 0; i < Math.ceil(total / 10) && !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'); i++) {
+      stdin.emit('data', PAGE_DOWN)
+      await new Promise(r => setTimeout(r, 2))
+    }
+    await until(() => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'), 5_000, 'the end of the summary')
+    const last = stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+    assert.match(last, new RegExp(`detail \\d+–${total} of ${total}`))
+    stdin.emit('data', PAGE_UP)
+    stdin.emit('data', '\r')
+    await until(() => !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('detail '), 5_000, 'collapse')
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
+test('wrap: CJK and emoji wrap by cells and never split a grapheme', () => {
+  assert.deepEqual(wrapCells('中文字ab👨‍👩‍👧c', 4), ['中文', '字ab', '👨‍👩‍👧c'])
+  assert.deepEqual(wrapCells('x\x1b]0;t\x07y\nz', 5), ['xy', 'z'])
+  assert.deepEqual(wrapCells('中', 1), [''])
+})
+
+/** A state with one running worker that has an episode, selected; owner mode. */
+function ownerState(): TuiState {
+  const r = mockRow('w1', { state: 'running', d: { profile: 'codex', name: 'w1', dir: '/tmp/r', since: 1 } })
+  r.d.seq = 1
+  return { rows: [r], all: [r], showAll: false, selected: 'w1', adding: false, resumeInput: '', quit: false, owner: 'S' }
+}
+
+test('viewer: every mutating key is read-only in the key layer (D-viewer)', () => {
+  const s = { ...ownerState(), viewer: true }
+  assert.deepEqual([...MUTATING_KEYS].sort(), ['+', '-', 'C', 'I', 'N', 'T', 'U', 'X', 'c', 'i', 'n', 't', 'x'])
+  for (const key of MUTATING_KEYS) {
+    for (const now of [1_000, 1_000 + STOP_REPEAT_MS + 1]) {
+      const r = nextKeyState(s, key, now)
+      assert.equal(r.action, undefined, `viewer ${key}`)
+      assert.equal(r.state.adding, false, `viewer ${key}`)
+      assert.equal(r.state.armedStop, undefined, `viewer ${key}`)
+      assert.equal(r.state.statusMessage, READ_ONLY, `viewer ${key}`)
+    }
+  }
+  // Reading still works.
+  assert.equal(nextKeyState(s, '\r', 1).action?.type, 'detail')
+  assert.equal(nextKeyState(s, 'r', 1).action?.type, 'refresh')
+})
+
+test('viewer: x, -, U, t, c over a real ledger change nothing on disk and run nothing that writes (D-viewer)', async () => {
+  const prev = process.env.TMUX_AGENT_SESSION
+  delete process.env.TMUX_AGENT_SESSION
+  try {
+    const root = mkdtempSync(join(tmpdir(), 'tui-viewer-ro-'))
+    const repo = mkdtempSync(join(tmpdir(), 'tui-viewer-ro-repo-'))
+    writeWorker(root, repo, 'owner', 'ro.abcde', { status: 'success', summary: '完成' })
+    const host = quietHost(undefined, repo, root)
+    const ran: string[] = []
+    host.run = async argv => {
+      ran.push(argv.join(' '))
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    const before = treeSnap(root)
+    const keys = ['j', 'x', 'x', '-', '-', 'U', 'U', 't', 'hello\r', 'c', 'c', '+', 'n']
+    const { screen } = await framed({ host, root, cwd: repo, keys })
+    assert.match(screen, /ro\.abcde/)
+    assert.match(screen, new RegExp(READ_ONLY))
+    const after = treeSnap(root)
+    assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
+    for (const [path, body] of before) assert.equal(after.get(path), body, `mutated ${path}`)
+    assert.deepEqual(ran.filter(c => /\b(stop|send|kill|interrupt|mkdir|mv|ln|rm)\b/.test(c)), [], ran.join('\n'))
+  } finally {
+    if (prev === undefined) delete process.env.TMUX_AGENT_SESSION
+    else process.env.TMUX_AGENT_SESSION = prev
+  }
+})
+
+test('hints: every key the header and the row show has a handler; no /workers command text (R4.6)', () => {
+  const owner = ownerState()
+  const viewer = { ...owner, viewer: true }
+  for (const s of [owner, viewer, { ...owner, selected: undefined }]) {
+    const screen = renderTuiLines(s, 200, 30, 1_000).map(stripAnsi).join('\n')
+    const keys = new Set([...screen.matchAll(/\[ (\S+) /g)].map(m => m[1]!))
+    if (/a all · j\/k select/.test(screen)) for (const k of ['a', 'j', 'k']) keys.add(k)
+    if (/Enter (detail|mirror)/.test(screen)) keys.add('\r')
+    assert.ok(keys.size >= (s.viewer ? 2 : 5), `${[...keys]}\n${screen}`)
+    for (const key of keys) {
+      const r = nextKeyState(s, key, 1_000)
+      const handled = r.action !== undefined || JSON.stringify(r.state) !== JSON.stringify(s)
+      assert.ok(handled, `key ${JSON.stringify(key)} is shown but does nothing\n${screen}`)
+    }
+  }
+  const header = stripAnsi(renderTuiLines(owner, 200, 30, 1_000)[0]!)
+  assert.match(header, /\[ n resume \] \[ \+ assign \] \[ r refresh \] \[ c clear \] \[ q quit \]  a all · j\/k select/)
+  const row = renderTuiLines(owner, 200, 30, 1_000).map(stripAnsi).find(l => l.includes('[ t tell ]'))!
+  assert.match(row, /\[ t tell \] \[ i interrupt \] \[ x stop \] \[ - cancel \] \[ U unlock \]  Enter detail/)
+  // Narrow: hints shorten in order (words, then keys only), never past the width.
+  assert.match(stripAnsi(renderTuiLines(owner, 60, 30, 1_000)[0]!), /\[ n \] \[ \+ \] \[ r \] \[ c \] \[ q \]/)
+  // No `/workers …` command anywhere in the TUI source (the import path is not one).
+  const src = readFileSync(join(import.meta.dirname, 'tui.node.ts'), 'utf8')
+  assert.deepEqual(src.split('\n').filter(l => /\/workers(?!\.ts')/.test(l)), [])
+})
+
+test('resume: the Outcome names the TUI key, not a /workers command (D-new)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-resume-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-resume-repo-'))
+  const base = nodeHost({ owner: 'S', cwd: repo })
+  base.envTmuxAgentDir = async () => root
+  base.envHome = async () => root
+  const host = {
+    ...base,
+    run: async (argv: readonly string[], cwd: string, ms: number) =>
+      argv[0] === 'agent-tmux' ? { exitCode: 0, stdout: '', stderr: '' } : base.run(argv, cwd, ms),
+  }
+  const out = await resumeWorker(host, 'codex 12345678-1234-1234-1234-123456789abc')
+  assert.equal(out.ok, true, out.text)
+  assert.doesNotMatch(out.text, /\/workers/)
+  assert.match(out.text, /in the TUI select "codex-12345678\.[0-9a-z]{5}" and press t \(tell\)\.$/)
+})
+
+test('key-state: t and + open their input lines; Enter sends tell or assign (D-new)', () => {
+  const s = ownerState()
+  const t = nextKeyState(s, 't', 1).state
+  assert.equal(t.adding, true)
+  assert.equal(t.inputKind, 'tell')
+  assert.equal(t.inputFor, 'w1')
+  const typed = nextKeyState({ ...t, resumeInput: ' go on ' }, '\r', 1)
+  assert.deepEqual(typed.action, { type: 'tell', row: s.rows[0], text: 'go on' })
+  assert.equal(typed.state.adding, false)
+  const plus = nextKeyState(s, '+', 1).state
+  assert.equal(plus.inputKind, 'assign')
+  assert.deepEqual(nextKeyState({ ...plus, resumeInput: 'codex rev /tmp/brief.md' }, '\r', 1).action, { type: 'assign', value: 'codex rev /tmp/brief.md' })
+  assert.equal(nextKeyState({ ...s, selected: undefined }, 't', 1).state.adding, false)
+  const screen = renderTuiLines(t, 120, 20, 1).map(stripAnsi).join('\n')
+  assert.match(screen, /t tell w1: █/)
+})
+
+test('key-state: - and U confirm by a second press and act on the selected row (C-cancel)', () => {
+  const s = ownerState()
+  const row = s.rows[0]!
+  for (const [key, type, id] of [
+    ['-', 'cancel', 'cancel:w1'],
+    ['U', 'unlock', 'unlock:w1'],
+  ] as const) {
+    const one = nextKeyState(s, key, 1_000)
+    assert.equal(one.action, undefined)
+    assert.deepEqual(one.state.armedStop, { id, from: 1_000, until: 1_000 + STOP_CONFIRM_MS })
+    assert.equal(nextKeyState(one.state, key, 1_100).action, undefined, 'a fast second press only debounces')
+    assert.deepEqual(nextKeyState(one.state, key, 1_000 + STOP_REPEAT_MS).action, { type, row })
+    assert.equal(nextKeyState(one.state, key, 1_000 + STOP_CONFIRM_MS + 1).action, undefined, 'an expired arm re-arms')
+    assert.equal(nextKeyState(one.state, '\x1b', 1_200).state.armedStop, undefined)
+  }
+  const noEp = { ...s, rows: [{ ...row, d: { ...row.d, seq: 0 } }] }
+  const r = nextKeyState(noEp, '-', 1)
+  assert.equal(r.action, undefined)
+  assert.equal(r.state.statusMessage, 'cancel — "w1" has no episode yet')
+})
+
+test('cancel and unlock: the TUI keys run the same core calls as workers.cli.node.ts (C-cancel)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-cancel-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-cancel-repo-'))
+  const base = nodeHost({ owner: 'S', cwd: repo })
+  base.envTmuxAgentDir = async () => root
+  const outside = new Set(['git', 'sh', 'tmux', 'agent-tmux'])
+  const host = {
+    ...base,
+    run: async (argv: readonly string[], cwd: string, ms: number) =>
+      outside.has(argv[0]!) ? { exitCode: 0, stdout: '', stderr: '' } : base.run(argv, cwd, ms),
+  }
+  const r = await assignWorker(
+    host,
+    { profile: 'claude', name: 'can', dir: repo, brief: 'GOAL: g\nACCEPTANCE: a\nREPORT: r\n' },
+    { owner: 'S', ownerCwd: repo },
+  )
+  if ('deny' in r) assert.fail(r.deny)
+  const pause = (ms: number) => new Promise(res => setTimeout(res, ms))
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 200
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000 })
+  const shown = () => stripAnsi(stdout.written)
+  try {
+    await until(() => shown().includes(r.name), 5_000, 'the row')
+    stdin.emit('data', 'j')
+    stdin.emit('data', 'U')
+    await pause(STOP_REPEAT_MS + 50)
+    stdin.emit('data', 'U')
+    await until(() => shown().includes(`unlock ${r.name} — ok: "${r.name}" is not locked`), 5_000, 'unlockWorker text')
+    stdin.emit('data', '-')
+    await until(() => shown().includes('cancel episode 1? press again'), 5_000, 'the arm')
+    await pause(STOP_REPEAT_MS + 50)
+    stdin.emit('data', '-')
+    await until(
+      () => shown().includes(`cancelled episode 1 of "${r.name}"; its pane is untouched, and nothing more is delivered for that episode`),
+      5_000,
+      'cancelEpisode text',
+    )
+    assert.ok(existsSync(join(r.stateDir, 'episodes', '1', 'acks', 'cancel')), 'acks/cancel written by the core')
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
+test('empty states: none outstanding, filtered out, read failure — hard-coded (R4.7)', async () => {
+  const base: TuiState = { rows: [], all: [], showAll: false, adding: false, resumeInput: '', quit: false }
+  assert.equal(emptyText(base), 'No workers outstanding.')
+  const theirs = mockRow('t1', { holder: 'deadbeef' })
+  assert.equal(emptyText({ ...base, all: [theirs] }), 'No rows shown: 1 worker(s) of other sessions are filtered out — press a to show all')
+  assert.equal(emptyText({ ...base, all: [theirs], loadError: 'EACCES' }), 'Could not read the ledger: EACCES')
+  const shownAll = nextKeyState({ ...base, all: [theirs] }, 'a', 1).state
+  assert.equal(shownAll.rows.length, 1, 'a shows the filtered rows')
+
+  // Read failure through runTui: an unreadable .v3 is an incomplete scan with its errno.
+  const root = mkdtempSync(join(tmpdir(), 'tui-empty-'))
+  mkdirSync(join(root, '.v3'))
+  chmodSync(join(root, '.v3'), 0o000)
+  try {
+    const { screen } = await framed({ host: quietHost('S', root, root), root, cwd: root, session: 'S' })
+    assert.match(screen, /Could not read the ledger: EACCES/)
+  } finally {
+    chmodSync(join(root, '.v3'), 0o755)
+  }
+})
+
+test('pty sizes: 120x60, 80x24, 40x10, 2 rows — last row selected, CJK summaries, no line past the width, resize re-lays out', { timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-ptysz-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-ptysz-repo-'))
+  const home = mkdtempSync(join(tmpdir(), 'tui-ptysz-home-'))
+  for (const [i, name] of ['a.abcde', 'b.abcde', 'c.abcde'].entries()) {
+    writeWorker(root, repo, 'owner', name, { status: 'success', summary: `完成第${i + 1}項：繁體中文摘要，寬度測試 👨‍👩‍👧 🇹🇼 結果${'很長'.repeat(30)}` })
+  }
+  const py = `
+import pty, os, select, sys, time, subprocess, termios, struct, fcntl, signal, base64
+cols, rows, cols2, rows2 = (int(x) for x in sys.argv[4:8])
+master, slave = pty.openpty()
+def size(c, r):
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', r, c, 0, 0))
+size(cols, rows)
+env = {'PATH': os.path.dirname(sys.argv[1]) + ':/usr/bin:/bin', 'HOME': sys.argv[8], 'TMUX_AGENT_DIR': sys.argv[3], 'LANG': 'en_US.UTF-8'}
+pre = termios.tcgetattr(slave)
+p = subprocess.Popen([sys.argv[1], sys.argv[2], '--session', 'owner', '--cwd', sys.argv[9]], stdin=slave, stdout=slave, stderr=slave, env=env)
+out = bytearray()
+def pump(seconds, until=None):
+    end = time.time() + seconds
+    while time.time() < end and (until is None or until not in out):
+        r, _, _ = select.select([master], [], [], max(0, end - time.time()))
+        if not r: break
+        try: chunk = os.read(master, 65536)
+        except OSError: break
+        if not chunk: break
+        out.extend(chunk)
+pump(8, b'c.abcde' if rows > 2 else b'3 worker(s)')
+pump(0.3)
+os.write(master, b'k')
+pump(0.8)
+mark = len(out)
+if cols2:
+    size(cols2, rows2)
+    p.send_signal(signal.SIGWINCH)
+    pump(0.8)
+    os.write(master, b'k')
+    pump(0.8)
+os.write(master, b'q')
+try: p.wait(timeout=5)
+except subprocess.TimeoutExpired: p.kill(); p.wait()
+pump(0.2)
+post = termios.tcgetattr(slave)
+print('EXIT=%d' % p.returncode)
+print('SAME_TTY=%s' % (pre == post))
+print('MARK=%d' % mark)
+print('OUT=' + base64.b64encode(bytes(out)).decode())
+`
+  const frames = (bytes: Buffer) => bytes.toString('utf8').split(ANSI_CLEAR_HOME).slice(1).map(f => f.replace(ANSI_LEAVE_ALT, ''))
+  const check = (frame: string, cols: number, rows: number, what: string) => {
+    // The pty's ONLCR turns the TUI's \r\n into \r\r\n.
+    const lines = frame.split(/\r*\n/)
+    assert.ok(lines.length <= rows, `${what}: ${lines.length} lines > ${rows}`)
+    for (const l of lines) assert.ok(cellWidth(stripAnsi(l)) <= cols, `${what}: ${cellWidth(stripAnsi(l))} cells > ${cols}: [${stripAnsi(l)}]`)
+  }
+  const scenarios: [number, number, number, number][] = [
+    [120, 60, 40, 10],
+    [80, 24, 120, 60],
+    [40, 10, 0, 0],
+    [80, 2, 0, 0],
+  ]
+  for (const [cols, rows, cols2, rows2] of scenarios) {
+    const what = `${cols}x${rows}${cols2 ? `→${cols2}x${rows2}` : ''}`
+    const res = await new Promise<{ code: number; out: string; err: string }>(resolve => {
+      execFile(
+        'python3',
+        ['-c', py, process.execPath, join(import.meta.dirname, 'tui.node.ts'), root, String(cols), String(rows), String(cols2), String(rows2), home, repo],
+        { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+        (error, stdout, stderr) => resolve({ code: error ? -1 : 0, out: stdout, err: stderr }),
+      )
+    })
+    assert.equal(res.code, 0, `${what}: ${res.err}`)
+    assert.match(res.out, /EXIT=0\n/, `${what}\n${res.out.slice(0, 400)}`)
+    assert.match(res.out, /SAME_TTY=True\n/, what)
+    const mark = Number(/MARK=(\d+)/.exec(res.out)![1])
+    const bytes = Buffer.from(/OUT=(\S*)/.exec(res.out)![1]!, 'base64')
+    const before = frames(bytes.subarray(0, mark))
+    assert.ok(before.length > 0, `${what}: no frame`)
+    const sel = before.at(-1)!
+    check(sel, cols, rows, what)
+    const plain = stripAnsi(sel)
+    if (rows > 2) {
+      assert.match(plain, /3: \S*\s*› c\.abcde/, `${what}: the last row is selected\n${plain}`)
+      assert.match(plain, /完成第3項/, `${what}: its CJK summary is shown`)
+    } else {
+      assert.match(plain, /3 worker\(s\) · 收件：無收件者 · window too small \(2 rows\)/, plain)
+    }
+    if (cols2) {
+      const after = frames(bytes.subarray(mark))
+      assert.ok(after.length > 0, `${what}: no frame after the resize`)
+      check(after.at(-1)!, cols2, rows2, `${what} after resize`)
+      assert.match(stripAnsi(after.at(-1)!), /› [abc]\.abcde/, `${what}: still a selected row`)
+    }
+  }
+})
+
+test('health on screen: observeView → the status line for collecting, paused, stale (C-health through runTui)', async () => {
+  const cases: [Parameters<typeof writeAct>[2], RegExp][] = [
+    [{ beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }, /收件：collecting（mod）/],
+    [{ beatAgoMs: 120_000, state: { channel: 'node', mode: 'auto', status: 'paused', reason: 'refused 3 times' } }, /收件：paused（refused 3 times）/],
+    [{ beatAgoMs: 200_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }, /收件：stale（beat 20\ds 前）/],
+  ]
+  for (const [act, want] of cases) {
+    const root = mkdtempSync(join(tmpdir(), 'tui-health-screen-'))
+    writeAct(root, 1, act)
+    const { screen } = await framed({ host: quietHost('S', root, root), root, cwd: root, session: 'S' })
+    assert.match(screen, want)
+    assert.doesNotMatch(screen, /內部 \?/)
   }
 })

@@ -97,6 +97,8 @@ const MOD_VERSION = '0.42.0'
 // Tool names as literals here: the engine resolves a `tool.call` matcher only
 // from a constant in this file (imported ones validate as `tool=?`). The core
 // keeps its copy for the text it writes; this check fails typecheck on drift.
+/** The core's log lines start with `tmux-agent: ` for the node hosts' log files; `$.ui.log` adds the plugin name itself. */
+const engineLine = (text: string) => text.replace(/^tmux-agent: /, '')
 const TOOL = 'mcp__tmux-agent__assign'
 const TELL_TOOL = 'mcp__tmux-agent__tell'
 const STOP_TOOL = 'mcp__tmux-agent__stop'
@@ -205,7 +207,7 @@ export const register: Register = on => {
       storeDelete: key => beneath.store.delete(key),
       submit: text => beneath.prompt.submit({ text }),
       toast: text => beneath.ui.toast(text),
-      log: text => beneath.ui.log(text),
+      log: text => beneath.ui.log(engineLine(text)),
       run: async (argv, cwd, timeoutMs) => {
         const call = await wrapperCall(host, argv)
         return beneath.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) })
@@ -251,7 +253,7 @@ export const register: Register = on => {
         waiterRegisterLogged = true
         const kind = error instanceof Error ? error.name : typeof error
         try {
-          await $.ui.log(`tmux-agent: tmux-waiter register failed: ${kind}: ${String(error)}`)
+          await $.ui.log(`tmux-waiter register failed: ${kind}: ${String(error)}`)
         } catch {
           // The spawn hook still denies. A surface with no log does not take the session down.
         }
@@ -276,7 +278,7 @@ export const register: Register = on => {
       storeDelete: key => $.store.delete(key),
       submit: text => $.prompt.submit({ text }),
       toast: text => $.ui.toast(text),
-      log: text => $.ui.log(text),
+      log: text => $.ui.log(engineLine(text)),
       run: async (argv, cwd, timeoutMs) => {
         const call = await wrapperCall(host, argv)
         return $.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) })
@@ -1233,7 +1235,7 @@ export const register: Register = on => {
     $.clock.after(0, () =>
       $.command.run({ command: 'reload-plugins' }).then(
         () => undefined,
-        err => $.ui.log(`tmux-agent: /reload-plugins failed: ${String(err)}`),
+        err => $.ui.log(`/reload-plugins failed: ${String(err)}`),
       ),
     )
     return { result: `/reload-plugins is queued for when this turn ends (mod ${MOD_VERSION} now).` }

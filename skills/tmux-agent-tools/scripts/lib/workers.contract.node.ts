@@ -285,6 +285,25 @@ test('activation: a reload registers a newer activation; the older one stops col
   assert.equal(await heartbeat(w.host, b), true)
 })
 
+test('S1 (a): after a newer activation registers, the older one starts no new round of delivery', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const old = newGate()
+  await reconcile(w.host, old, false)
+  assert.equal(old.activation, 1)
+  const fresh = newGate()
+  assert.equal(await heartbeat(w.host, fresh), true)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  await reconcile(w.host, old, false)
+  await reconcile(w.host, old, false)
+  assert.deepEqual(w.woken, [], 'the superseded activation submits nothing, on any later round')
+  assert.match(old.paused ?? '', /superseded/)
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/acks/done`), 'and acks nothing')
+  await reconcile(w.host, fresh, false)
+  assert.equal(w.woken.length, 1, 'the newer activation delivers it')
+  assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/done`))
+})
+
 test('activation: two first beats of one gate register once', async () => {
   const w = world()
   const g = newGate()
@@ -709,6 +728,26 @@ function lstartOf(tz: string): string {
   assert.equal(r.status, 0, r.stderr)
   return r.stdout.trim()
 }
+
+test('unlock (R6.0): a broken ps and a kill -0 without ESRCH is unknown, not gone — the lock stays', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const fs = await import('node:fs')
+  const lock = `${r.stateDir}/.action`
+  const me = await processId(w.host)
+  fs.symlinkSync(JSON.stringify({ token: 't', activation: '', session: 'gone', host: me.host, pid: 999_999, pidStart: 'Thu Jan  1 00:00:00 1970' }), lock)
+  const broken: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) =>
+      argv[4] === '999999'
+        ? { exitCode: 1, stdout: '', stderr: argv[3] === 'ps' ? 'ps: broken' : 'kill: Operation not permitted' }
+        : w.host.run(argv, cwd, ms),
+  }
+  const out = await unlockWorker(broken, r.name, 'confirm')
+  assert.ok(!out.ok)
+  assert.match(out.text, /could not check pid 999999/)
+  assert.ok(fs.readlinkSync(lock).includes('999999'), 'the lock is kept')
+})
 
 test('unlock lstart (R2-1): a live holder is kept when the recorded start is UTC and the process TZ is not', async () => {
   const utc = lstartOf('UTC')

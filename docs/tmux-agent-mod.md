@@ -439,7 +439,35 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 標題列的 `[ ⧉ ]`（hotkey `t`）把 Claude Code 所在的 tmux pane（`$TMUX_PANE`）切一半，
 右邊跑 `lib/tui.node.ts --session <這個 session>`，焦點留在左邊。不走 launcher：在
 Claude Code 裡 mod 自己就是 collector，launcher 會再起一個，同一份結果可能送兩次；TUI
-只看不收（`collector health unknown — this view does not collect`）。
+只看不收；狀態列的「收件」讀的是 mod 自己寫的 `act/<n>.state`（見下）。
+
+TUI 的按鍵（plan R4.6；畫出來的每個鍵都有 handler，contract 測試逐一檢查）：
+
+- 標題列：`[ n resume ]`（按 session id 接回）、`[ + assign ]`（輸入
+  `<profile> <name> <brief 檔>`，走 core 的 `assign`，與 MCP、mod 同一條路）、
+  `[ r refresh ]`、`[ c clear ]`（按兩次）、`[ q quit ]`；`a` 切換全部／只看自己，
+  `j`／`k`、方向鍵、`1`–`9` 選列。寬度不夠時先拿掉 `a all · j/k select`，再只留鍵。
+- 選中的列：`[ t tell ]`（追話）、`[ i interrupt ]`、`[ x stop ]`（按兩次）、
+  `[ - cancel ]`（按兩次；關掉這個 episode，pane 不動，與 `workers.cli.node.ts cancel`
+  同一個 core 呼叫）、`[ U unlock ]`（按兩次；維護用，與 `unlock <name> confirm` 同一個
+  core 呼叫，只在持有者確定已死時才移除鎖）。`Enter` 打開細節：row 狀態與 result 狀態
+  分開列、完整 summary（不受 12000 字截斷）、blocked 原因、result 路徑；`PgUp`／`PgDn`
+  捲動，`Enter` 或 `Esc` 收合。
+- 版面（R4.1）：一個函式依高度、寬度、選中列與展開狀態分配各區塊的行數；鏡像抓的
+  行數就是它算出的 viewport。縮放時重算，縮放前開始的 capture 結果直接丟掉。
+- 空狀態三種：沒有 outstanding、被篩選掉（按 `a` 看全部）、讀取失敗（附 errno）。
+- 不帶 `--session` 的 viewer 是唯讀：`x c i n t + - U` 都只顯示
+  「唯讀；帶 --session 才能操作」，不動 ledger、ack、pane。
+
+「收件」狀態（C-health）：每個收件通道（mod、node collector；MCP 在 R7）在
+`heartbeat` 與投遞被拒三次而暫停時，以 temp＋rename 寫自己那個 activation 的
+`act/<n>.state`（`{token, channel, mode, status, reason?, updatedAt}`，只在內容變了
+才寫）。TUI 只讀最大的 n，配合 `sessionLiveness`：沒有 session 目錄或 activation →
+`無收件者`；剛註冊、grace 內 → `initializing`；`paused` → 顯示原因（暫停後不再
+beat，所以不當 stale）；beat 新鮮且 collecting → `collecting（mod|node）`，MCP 的
+on-request 寫成「MCP：host 呼叫 tool 時才收」；beat 超過 90 秒 → `stale（beat Ns 前）`；
+讀不到、JSON 不合法、token 對不上、或讀的時候最大 n 一直變 → `unknown（原因）`。
+`act/<n>.state` 只給 TUI 看，不參與 fencing、claim 與 `sessionLiveness`。
 
 TUI 結束時（`q`、Ctrl-C、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw）；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。
 

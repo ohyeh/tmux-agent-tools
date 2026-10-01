@@ -188,6 +188,76 @@ test('an ack that cannot be written is logged and re-reported, never read as del
   assert.ok(acked(w))
 })
 
+// §1c S1: at-least-once. One tuple (gen-0 owner, name, seq) is acked once; every
+// re-report of it is the same notice (same worker, same result path), whoever sends it.
+const notices = (w: World) => delivered(w).map(l => l.split('\t').slice(2).join('\t'))
+const doneDirs = (w: World) => (existsSync(`${w.ep}/acks`) ? readdirSync(`${w.ep}/acks`).filter(k => k === 'done') : [])
+
+function sameNotice(w: World, n: number): void {
+  const all = notices(w)
+  assert.equal(all.length, n, all.join('\n'))
+  assert.ok(all.every(t => t === all[0]), 'every report of the tuple is the same notice')
+  assert.match(all[0]!, new RegExp(`"${w.name}" on codex`))
+  assert.ok(all[0]!.includes(`result: ${w.v3}/${w.name}/result.json`))
+}
+
+test('S1 (b): three activations past the guard all submit; the tuple (A, name, 1) is acked once', async () => {
+  const w = world('A')
+  const held: Promise<Run>[] = []
+  for (let i = 0; i < 3; i++) {
+    rmSync(`${w.root}/held.A`, { force: true })
+    held.push(pass(w, 'A', { HOLD_SUBMIT: '1' }))
+    await until(() => existsSync(`${w.root}/held.A`), `activation ${i + 1} to hang inside submit`)
+  }
+  writeFileSync(`${w.root}/go.A`, '')
+  const runs = await Promise.all(held)
+  assert.deepEqual(runs.map(r => r.activation), [1, 2, 3])
+  sameNotice(w, 3)
+  assert.deepEqual(doneDirs(w), ['done'], 'one ack dir: one mkdir won, the others lost')
+  rmSync(`${w.root}/go.A`)
+  await pass(w, 'A')
+  assert.equal(notices(w).length, 3, 'acked: no further report')
+})
+
+test('S1 (c): a re-report after a mid-delivery crash is the same notice from a new activation', async () => {
+  const w = world('A')
+  assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
+  await pass(w, 'A')
+  sameNotice(w, 2)
+  const acts = delivered(w).map(l => l.split('\t')[1])
+  assert.notEqual(acts[0], acts[1], 'two activations, one tuple')
+  assert.deepEqual(doneDirs(w), ['done'])
+})
+
+test('AT_LEAST_ONCE_BOUND_PROBE: two ack failures, then the third attempt delivers the same notice and acks once', async () => {
+  const w = world('A')
+  chmodSync(w.ep, 0o555)
+  try {
+    await pass(w, 'A')
+    await pass(w, 'A')
+    assert.equal(notices(w).length, 2)
+    assert.deepEqual(doneDirs(w), [])
+  } finally {
+    chmodSync(w.ep, 0o755)
+  }
+  await pass(w, 'A')
+  sameNotice(w, 3)
+  assert.deepEqual(doneDirs(w), ['done'])
+  await pass(w, 'A')
+  assert.equal(notices(w).length, 3)
+})
+
+test('AT_LEAST_ONCE_BOUND_PROBE: two submits that each crash before the ack, then the third delivers the same notice and acks once', async () => {
+  const w = world('A')
+  for (let i = 0; i < 2; i++) assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
+  assert.deepEqual(doneDirs(w), [])
+  await pass(w, 'A')
+  sameNotice(w, 3)
+  assert.deepEqual(doneDirs(w), ['done'])
+  await pass(w, 'A')
+  assert.equal(notices(w).length, 3)
+})
+
 test('an exited-but-open orphan (F1): a dead owner, acks/exited, a late result — one claim gen, one delivery, closed done', async () => {
   const w = world('X')
   beatAt(w, 'X', OLD)

@@ -1,21 +1,30 @@
-// A full-screen terminal TUI of /workers for any host (Codex, Cursor, agy, plain shell),
-// sharing the Claude mod's row model, actions, and confirmations from the core (p0-contract.md §9).
+// A full-screen terminal TUI of the workers panel for any host (Codex, Cursor, agy,
+// plain shell), sharing the Claude mod's row model, actions, and confirmations from
+// the core (p0-contract.md §9).
 //
 // Usage: node tui.node.ts [--session <id>] [--cwd <dir>]
-// Keys:
-//   r       refresh rows and clear selection
-//   q       quit the TUI (restoring the terminal)
-//   x       stop selected worker (press-twice confirmation)
-//   c       clear all workers (press-twice confirmation)
-//   n       resume a CLI session by id (opens input prompt)
-//   i       interrupt running/stalled worker
-//   a       toggle show all / others' workers
-//   1-9     select / deselect row 1..9
-//   j / k   select next / previous row
-//   Esc     cancel pending confirm or deselect row
+// Without a session it is a viewer: every row, read-only (D-viewer).
+// Keys (header):
+//   n       resume a CLI session by id (input line)
+//   +       assign a new worker: <profile> <name> <brief-file> (input line)
+//   r       refresh rows and clear the selection
+//   c       clear all workers (press twice)
+//   q       quit (the terminal is restored)
+//   a       toggle all / only this session's workers
+//   1-9, j / k, Up / Down   select a row
+// Keys (selected row):
+//   t       tell: send the worker a follow-up (input line)
+//   i       interrupt a running or stalled worker
+//   x       stop the worker (press twice)
+//   -       cancel its episode (press twice; the pane is untouched)
+//   U       unlock its action lock, maintenance (press twice; only a provably gone holder)
+//   Enter   detail view; PgUp / PgDn scroll it
+//   Esc     cancel a confirmation, close the detail, or deselect
 
 import { parseArgs } from 'node:util'
 import { realpathSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { StringDecoder } from 'node:string_decoder'
 import {
@@ -35,16 +44,21 @@ import {
   STOP_CONFIRM_MS,
   STOP_REPEAT_MS,
   MIRROR_MS,
-  MIRROR_ROWS,
-  MIRROR_MIN_ROWS,
+  UNLOCK_WORD,
+  type EpisodeDetail,
+  type Health,
   rootOf,
   stopWorker,
   stopAll,
   interruptWorker,
   resumeWorker,
+  tellWorker,
+  assignWorker,
+  cancelEpisode,
+  unlockWorker,
+  episodeDetail,
   mirrorOf,
   mirrorProject,
-  collectorDown,
   exactSessionTarget,
   observeView,
 } from './workers.ts'
@@ -220,20 +234,61 @@ export function sanitizeAnsi(text: string): string {
   return out
 }
 
+/** Width-wrapped plain lines of untrusted text: escapes stripped, graphemes never split. */
+export function wrapCells(text: string, width: number): string[] {
+  if (width < 1) return []
+  const amb = ambiguousWidth()
+  const out: string[] = []
+  for (const para of text.split('\n')) {
+    let line = ''
+    let cur = 0
+    for (const g of graphemes(stripAnsi(sanitizeAnsi(para)))) {
+      const w = graphemeWidth(g, amb)
+      if (w > width) continue // a 2-cell grapheme in a 1-cell window
+      if (cur + w > width) {
+        out.push(line)
+        line = ''
+        cur = 0
+      }
+      line += g
+      cur += w
+    }
+    out.push(line)
+  }
+  return out
+}
+
+/** What the input line is for. Unset `inputKind` = resume. */
+export type InputKind = 'resume' | 'tell' | 'assign'
+
 export interface TuiState {
   rows: PanelRow[]
   all: PanelRow[]
   showAll: boolean
   selected?: string
+  /** One press-twice confirmation: a row id (stop), CLEAR_ID, `cancel:<id>` or `unlock:<id>`. */
   armedStop?: { id: string; from: number; until: number }
   adding: boolean
   resumeInput: string
+  inputKind?: InputKind
+  /** The row a `tell` input is for. */
+  inputFor?: string
   mirror?: { id: string; lines: string[] }
+  /** Enter on the selected row: its detail replaces the mirror. */
+  expanded?: boolean
+  detail?: { id: string; lines: string[] }
+  /** First detail line shown (PgUp/PgDn). */
+  scroll?: number
+  /** Body rows of the last layout and the last scroll offset; runTui sets both. */
+  page?: number
+  scrollMax?: number
   statusMessage?: string
   statusUntil?: number
   owner?: string
-  /** No --session and no TMUX_AGENT_SESSION. Rows are shown; the band says viewer. */
+  /** No --session and no TMUX_AGENT_SESSION: every row, read-only (D-viewer). */
   viewer?: boolean
+  /** Why the ledger could not be read (the third empty state). */
+  loadError?: string
   quit: boolean
 }
 
@@ -244,9 +299,20 @@ export type TuiAction =
   | { type: 'stopAll' }
   | { type: 'interrupt'; row: PanelRow }
   | { type: 'resume'; value: string }
+  | { type: 'tell'; row: PanelRow; text: string }
+  | { type: 'assign'; value: string }
+  | { type: 'cancel'; row: PanelRow }
+  | { type: 'unlock'; row: PanelRow }
+  | { type: 'detail' }
 
 const PASTE_START = '\x1b[200~'
 const PASTE_END = '\x1b[201~'
+export const PAGE_UP = '\x1b[5~'
+export const PAGE_DOWN = '\x1b[6~'
+export const READ_ONLY = '唯讀；帶 --session 才能操作'
+/** Keys that act on the ledger or a pane. A viewer gets READ_ONLY for each (D-viewer). */
+export const MUTATING_KEYS: ReadonlySet<string> = new Set(['x', 'X', 'c', 'C', 'i', 'I', 'n', 'N', 't', 'T', '+', '-', 'U'])
+const STATUS_MS = 5_000
 
 /** Printable resume text from one key or one bracketed paste. Control keys are undefined. */
 export function resumeText(key: string): string | undefined {
@@ -350,20 +416,49 @@ export class KeyParser {
   }
 }
 
+/**
+ * Press-twice confirmation (stop, clear, cancel, unlock): the first press arms `id`
+ * for STOP_CONFIRM_MS; a second press after STOP_REPEAT_MS fires; a faster one only
+ * debounces; an expired arm re-arms.
+ */
+function pressTwice(state: TuiState, id: string, now: number, action: TuiAction): { state: TuiState; action?: TuiAction } {
+  const armed = state.armedStop
+  if (armed?.id === id && now < armed.until) {
+    if (now - armed.from >= STOP_REPEAT_MS) return { state: { ...state, armedStop: undefined }, action }
+    return { state: { ...state, armedStop: { ...armed, from: now } } }
+  }
+  return { state: { ...state, armedStop: { id, from: now, until: now + STOP_CONFIRM_MS } } }
+}
+
+const say = (state: TuiState, text: string, now: number): { state: TuiState } => ({
+  state: { ...state, statusMessage: text, statusUntil: now + STATUS_MS },
+})
+
+/** Selection moved: the mirror, the detail and any confirmation belong to the old row. */
+const reselect = (state: TuiState, selected: string | undefined): TuiState => ({
+  ...state,
+  selected,
+  mirror: undefined,
+  armedStop: undefined,
+  expanded: false,
+  detail: undefined,
+  scroll: 0,
+})
+
 export function nextKeyState(state: TuiState, key: string, now: number): { state: TuiState; action?: TuiAction } {
   if (state.adding) {
-    if (key === '\x1b') {
-      return { state: { ...state, adding: false, resumeInput: '' } }
-    }
+    const closed: TuiState = { ...state, adding: false, resumeInput: '', inputKind: undefined, inputFor: undefined }
+    if (key === '\x1b') return { state: closed }
     if (key === '\r' || key === '\n') {
       const val = state.resumeInput.trim()
-      if (!val) {
-        return { state: { ...state, adding: false, resumeInput: '' } }
+      if (!val) return { state: closed }
+      if (state.inputKind === 'tell') {
+        const row = state.rows.find(r => r.id === state.inputFor)
+        if (!row) return say(closed, 'tell — that row is gone', now)
+        return { state: closed, action: { type: 'tell', row, text: val } }
       }
-      return {
-        state: { ...state, adding: false, resumeInput: '' },
-        action: { type: 'resume', value: val },
-      }
+      if (state.inputKind === 'assign') return { state: closed, action: { type: 'assign', value: val } }
+      return { state: closed, action: { type: 'resume', value: val } }
     }
     if (key === '\x7f' || key === '\b') {
       return { state: { ...state, resumeInput: graphemes(state.resumeInput).slice(0, -1).join('') } }
@@ -379,108 +474,88 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
     return { state: { ...state, quit: true }, action: { type: 'quit' } }
   }
 
+  // The one read-only gate: no key a viewer presses reaches an action (D-viewer).
+  if (state.viewer && MUTATING_KEYS.has(key)) return say(state, READ_ONLY, now)
+
   if (key === 'r' || key === 'R') {
-    return {
-      state: { ...state, selected: undefined, mirror: undefined, armedStop: undefined },
-      action: { type: 'refresh' },
-    }
+    return { state: reselect(state, undefined), action: { type: 'refresh' } }
   }
 
+  const row = state.selected ? state.rows.find(x => x.id === state.selected) : undefined
+
   if (key === 'n' || key === 'N') {
-    return {
-      state: { ...state, adding: true, resumeInput: '' },
-    }
+    return { state: { ...state, adding: true, resumeInput: '', inputKind: 'resume' } }
+  }
+
+  if (key === '+') {
+    return { state: { ...state, adding: true, resumeInput: '', inputKind: 'assign' } }
+  }
+
+  if (key === 't' || key === 'T') {
+    if (!row || row.project) return { state }
+    return { state: { ...state, adding: true, resumeInput: '', inputKind: 'tell', inputFor: row.id } }
   }
 
   if (key === 'a' || key === 'A') {
     const showAll = !state.showAll
     const panelLike = { rows: state.rows, all: state.all, showAll, selected: state.selected }
     setRows(panelLike as any, state.all)
-    return {
-      state: {
-        ...state,
-        showAll,
-        rows: panelLike.rows,
-        selected: panelLike.selected,
-        mirror: undefined,
-      },
-    }
+    const next = panelLike.selected === state.selected ? { ...state, mirror: undefined } : reselect(state, panelLike.selected)
+    return { state: { ...next, showAll, rows: panelLike.rows, selected: panelLike.selected } }
   }
 
   if (key === 'c' || key === 'C') {
-    const clearable = state.rows.some(r => !r.project)
-    if (!clearable) return { state }
-    const armed = state.armedStop
-    if (armed?.id === CLEAR_ID) {
-      if (now < armed.until && now - armed.from >= STOP_REPEAT_MS) {
-        return {
-          state: { ...state, armedStop: undefined },
-          action: { type: 'stopAll' },
-        }
-      }
-      if (now < armed.until && now - armed.from < STOP_REPEAT_MS) {
-        return {
-          state: { ...state, armedStop: { ...armed, from: now } },
-        }
-      }
-      return {
-        state: { ...state, armedStop: { id: CLEAR_ID, from: now, until: now + STOP_CONFIRM_MS } },
-      }
-    }
-    return {
-      state: { ...state, armedStop: { id: CLEAR_ID, from: now, until: now + STOP_CONFIRM_MS } },
-    }
+    if (!state.rows.some(r => !r.project)) return { state }
+    return pressTwice(state, CLEAR_ID, now, { type: 'stopAll' })
   }
 
   if (key === 'x' || key === 'X') {
-    if (!state.selected) return { state }
-    const r = state.rows.find(x => x.id === state.selected)
-    if (!r || r.project) return { state }
+    if (!row || row.project) return { state }
+    return pressTwice(state, row.id, now, { type: 'stop', row })
+  }
 
-    const armed = state.armedStop
-    if (armed?.id === r.id) {
-      if (now < armed.until && now - armed.from >= STOP_REPEAT_MS) {
-        return {
-          state: { ...state, armedStop: undefined },
-          action: { type: 'stop', row: r },
-        }
-      }
-      if (now < armed.until && now - armed.from < STOP_REPEAT_MS) {
-        return {
-          state: { ...state, armedStop: { ...armed, from: now } },
-        }
-      }
-      return {
-        state: { ...state, armedStop: { id: r.id, from: now, until: now + STOP_CONFIRM_MS } },
-      }
-    }
-    return {
-      state: { ...state, armedStop: { id: r.id, from: now, until: now + STOP_CONFIRM_MS } },
-    }
+  if (key === '-') {
+    if (!row || row.project) return { state }
+    // A resumed worker has no episode until its first tell (seq 0).
+    if (!row.d.seq) return say(state, `cancel — "${row.d.name}" has no episode yet`, now)
+    return pressTwice(state, `cancel:${row.id}`, now, { type: 'cancel', row })
+  }
+
+  if (key === 'U') {
+    if (!row || row.project) return { state }
+    return pressTwice(state, `unlock:${row.id}`, now, { type: 'unlock', row })
   }
 
   if (key === 'i' || key === 'I') {
-    if (!state.selected) return { state }
-    const r = state.rows.find(x => x.id === state.selected)
-    if (r && !r.project && (r.state === 'running' || r.state === 'stalled')) {
-      return { state, action: { type: 'interrupt', row: r } }
+    if (row && !row.project && (row.state === 'running' || row.state === 'stalled')) {
+      return { state, action: { type: 'interrupt', row } }
     }
     return { state }
+  }
+
+  if (key === '\r' || key === '\n') {
+    if (!row) return { state }
+    const expanded = !state.expanded
+    return {
+      state: { ...state, expanded, scroll: 0, armedStop: undefined, ...(expanded ? {} : { detail: undefined }) },
+      ...(expanded ? { action: { type: 'detail' } as const } : {}),
+    }
+  }
+
+  if (key === PAGE_UP || key === PAGE_DOWN) {
+    if (!state.expanded) return { state }
+    const page = Math.max(1, state.page ?? 1)
+    const max = state.scrollMax ?? Number.MAX_SAFE_INTEGER
+    const cur = Math.min(state.scroll ?? 0, max)
+    const scroll = key === PAGE_UP ? Math.max(0, cur - page) : Math.min(max, cur + page)
+    return { state: { ...state, scroll } }
   }
 
   if (/^[1-9]$/.test(key)) {
     const idx = Number(key) - 1
     if (idx < state.rows.length) {
       const target = state.rows[idx]!
-      const newSelected = state.selected === target.id ? undefined : target.id
-      return {
-        state: {
-          ...state,
-          selected: newSelected,
-          mirror: undefined,
-          armedStop: undefined,
-        },
-      }
+      return { state: reselect(state, state.selected === target.id ? undefined : target.id) }
     }
     return { state }
   }
@@ -489,40 +564,230 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
     if (state.rows.length === 0) return { state }
     const curIdx = state.selected ? state.rows.findIndex(r => r.id === state.selected) : -1
     const nextIdx = curIdx <= 0 ? state.rows.length - 1 : curIdx - 1
-    return {
-      state: {
-        ...state,
-        selected: state.rows[nextIdx]!.id,
-        mirror: undefined,
-        armedStop: undefined,
-      },
-    }
+    return { state: reselect(state, state.rows[nextIdx]!.id) }
   }
 
   if (key === '\x1b[B' || key === 'j') {
     if (state.rows.length === 0) return { state }
     const curIdx = state.selected ? state.rows.findIndex(r => r.id === state.selected) : -1
     const nextIdx = curIdx < 0 || curIdx >= state.rows.length - 1 ? 0 : curIdx + 1
-    return {
-      state: {
-        ...state,
-        selected: state.rows[nextIdx]!.id,
-        mirror: undefined,
-        armedStop: undefined,
-      },
-    }
+    return { state: reselect(state, state.rows[nextIdx]!.id) }
   }
 
   if (key === '\x1b') {
-    if (state.armedStop) {
-      return { state: { ...state, armedStop: undefined } }
-    }
-    if (state.selected) {
-      return { state: { ...state, selected: undefined, mirror: undefined } }
-    }
+    if (state.armedStop) return { state: { ...state, armedStop: undefined } }
+    if (state.expanded) return { state: { ...state, expanded: false, detail: undefined, scroll: 0 } }
+    if (state.selected) return { state: reselect(state, undefined) }
   }
 
   return { state }
+}
+
+/** The collector health line (C-health); `undefined` = not read yet. */
+export function healthText(h: Health | undefined): string {
+  if (!h) return '收件：unknown（尚未讀取）'
+  switch (h.kind) {
+    case 'none':
+      return '收件：無收件者'
+    case 'initializing':
+      return '收件：initializing'
+    case 'collecting':
+      return h.mode === 'on-request' ? '收件：MCP：host 呼叫 tool 時才收' : `收件：collecting（${h.channel}）`
+    case 'paused':
+      return `收件：paused（${h.reason}）`
+    case 'stale':
+      return `收件：stale（${h.ageS === undefined ? '從未 beat' : `beat ${h.ageS}s 前`}）`
+    case 'unknown':
+      return `收件：unknown（${h.reason}）`
+  }
+}
+
+const hint = (key: string, label: string, words: boolean) => (words ? `[ ${key} ${label} ]` : `[ ${key} ]`)
+
+/** Header key hints, longest first; the renderer takes the first that fits (R4.6). */
+export function headerHints(state: TuiState, now: number): string[] {
+  const clearArmed = state.armedStop?.id === CLEAR_ID && now < state.armedStop.until
+  const keys: [string, string][] = state.viewer
+    ? [['r', 'refresh'], ['q', 'quit']]
+    : [
+        ['n', 'resume'],
+        ['+', 'assign'],
+        ['r', 'refresh'],
+        ...(state.rows.some(r => !r.project) ? [['c', clearButtonLabel(clearArmed)] as [string, string]] : []),
+        ['q', 'quit'],
+      ]
+  const words = keys.map(([k, l]) => hint(k, l, true)).join(' ')
+  const short = keys.map(([k, l]) => hint(k, l, false)).join(' ')
+  return [`${words}  a all · j/k select`, words, short, hint('q', 'quit', false)]
+}
+
+/** The selected row's key hints, longest first. */
+export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
+  if (r.project) return ['project session · read-only  Enter detail', 'read-only']
+  if (state.viewer) return [`${READ_ONLY}  Enter detail`, '唯讀']
+  const armed = (id: string) => state.armedStop?.id === id && now < state.armedStop.until
+  const keys: [string, string][] = [['t', 'tell']]
+  if (r.state === 'running' || r.state === 'stalled') keys.push(['i', 'interrupt'])
+  keys.push(['x', stopButtonLabel(r.d.name, armed(r.id))])
+  if (r.d.seq) keys.push(['-', armed(`cancel:${r.id}`) ? `cancel episode ${r.d.seq}? press again` : 'cancel'])
+  keys.push(['U', armed(`unlock:${r.id}`) ? 'unlock (maintenance)? press again' : 'unlock'])
+  const tail = armed(r.id) ? `  \x1b[31mends its tmux session · ${Math.ceil((state.armedStop!.until - now) / 1000)}s\x1b[0m` : ''
+  return [
+    `${keys.map(([k, l]) => hint(k, l, true)).join(' ')}  Enter ${state.expanded ? 'mirror' : 'detail'}${tail}`,
+    keys.map(([k, l]) => hint(k, l, true)).join(' ') + tail,
+    keys.map(([k, l]) => hint(k, l, false)).join(' '),
+  ]
+}
+
+function fitFirst(options: string[], width: number): string {
+  return options.find(o => cellWidth(o) <= width) ?? truncateAnsi(options.at(-1) ?? '', width)
+}
+
+/** The first empty state that holds (R4.7): read failure, filtered out, nothing outstanding. */
+export function emptyText(state: TuiState): string {
+  if (state.loadError) return `Could not read the ledger: ${state.loadError}`
+  if (state.all.length) return `No rows shown: ${state.all.length} worker(s) of other sessions are filtered out — press a to show all`
+  return 'No workers outstanding.'
+}
+
+/** Lines of the detail view (R4.3): row state and result state are separate lines. */
+export function detailText(r: PanelRow, det: EpisodeDetail | { kind: 'project' }): string[] {
+  if (det.kind === 'project') return [`project session ${r.d.name}: not a ledger worker; no episode, no result`]
+  const out = [`row: ${r.state} · ${r.d.profile} ${r.d.name} · episode ${r.d.seq ?? 0}`]
+  if (det.kind === 'no-episode') out.push('result: none — no episode yet (a resumed worker gets one at its first tell)')
+  else if (det.kind === 'no-result') out.push(`result: not written yet · ${det.resultPath}`)
+  else if (det.kind === 'error') out.push(`result: unreadable — ${det.reason} · ${det.resultPath}`)
+  else {
+    out.push(`result: ${det.status ?? '(no status)'}${det.otherEpisode ? ' (names another episode)' : ''} · ${det.resultPath}`)
+  }
+  const blocked = r.blockedReason ?? (det.kind === 'result' ? det.blockedReason : undefined)
+  if (blocked) out.push(`blocked: ${blocked}`)
+  if (det.kind === 'result') {
+    out.push(det.summary ? 'summary:' : 'summary: (none)')
+    if (det.summary) out.push(...det.summary.split('\n'))
+  }
+  return out
+}
+
+/** Mirror or detail rows below the selected row; fewer and it is not drawn. */
+export const BODY_MIN = 3
+/** The body's separator and its last line (see-whole / scroll position). */
+const BODY_CHROME = 2
+
+export type TuiLayout = {
+  status: number
+  /** Index of the first row shown, how many are shown, how many are not. */
+  first: number
+  list: number
+  hidden: number
+  /** The `+N more` line. */
+  more: number
+  /** Lines under the selected row before the body (summary, key hints). */
+  selExtra: number
+  /** Mirror or detail content rows: what capture asks for (R4.2). */
+  body: number
+  footer: number
+}
+
+/**
+ * The one layout (R4.1): title 1, then status lines, then at least one row (the
+ * selected one), its extra lines, the footer, then more rows, and what is left is
+ * the body. Every count is clamped, so the sum never exceeds `height`.
+ */
+export function layoutOf(
+  height: number,
+  p: { status: number; rows: number; sel: number; selExtra: number; footer: number },
+): TuiLayout {
+  let left = Math.max(0, height - 1)
+  const status = Math.min(p.status, left)
+  left -= status
+  if (p.rows === 0 || left === 0) {
+    return { status, first: 0, list: 0, hidden: p.rows, more: 0, selExtra: 0, body: 0, footer: Math.min(p.footer, left) }
+  }
+  left -= 1
+  const selExtra = p.sel >= 0 ? Math.min(p.selExtra, left) : 0
+  left -= selExtra
+  const footer = Math.min(p.footer, left)
+  left -= footer
+  const moreFor = (n: number) => (n < p.rows ? 1 : 0)
+  const want = BODY_MIN + BODY_CHROME
+  const reserve = p.sel >= 0 && moreFor(1) + want <= left ? want : 0
+  let list = 1
+  while (list < p.rows && list + moreFor(list + 1) + reserve <= left) list += 1
+  left -= list - 1
+  const more = moreFor(list) && left >= 1 ? 1 : 0
+  left -= more
+  const body = p.sel >= 0 && left >= want ? left - BODY_CHROME : 0
+  const first = p.sel >= 0 ? Math.max(0, Math.min(p.sel - list + 1, p.rows - list)) : 0
+  return { status, first, list, hidden: p.rows - list, more, selExtra, body, footer }
+}
+
+type Sections = { title: string; status: string[]; selExtra: string[]; footer: string[]; sel: number }
+
+function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): Sections {
+  const tmuxRunning = state.rows.filter(r => !r.project && !r.terminal).length
+  const me = state.owner
+  const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning}`
+  const hints = headerHints(state, now)
+  let title = ''
+  outer: for (const h of hints) {
+    for (const t of [` workers · ${counts} `, ` ${counts} `]) {
+      if (cellWidth(t) + cellWidth(h) <= width) {
+        title = `${t}${h}`
+        break outer
+      }
+    }
+  }
+  if (!title) title = ` ${counts} ${hints.at(-1)}`
+  const titleLine = `${ANSI_FG_BLACK}${ANSI_BG_CYAN}${ANSI_BOLD}${padCells(truncateAnsi(title, width), width)}${ANSI_RESET}`
+
+  const status: string[] = []
+  const health = healthText(gate?.viewHealth)
+  if (state.viewer) status.push(`\x1b[2mviewer — no session; ${READ_ONLY} · ${health}\x1b[0m`)
+  else {
+    const ok = gate?.viewHealth?.kind === 'collecting'
+    status.push(`${ok ? '\x1b[2m' : '\x1b[33m'}${sanitizeAnsi(health)}\x1b[0m`)
+  }
+  if (state.adding) {
+    const label =
+      state.inputKind === 'tell'
+        ? `t tell ${state.rows.find(r => r.id === state.inputFor)?.d.name ?? '?'}`
+        : state.inputKind === 'assign'
+          ? '+ assign <profile> <name> <brief-file>'
+          : 'n resume [profile] <session-id> [name]'
+    status.push(`  ${label}: ${state.resumeInput}█`)
+  }
+  if (state.rows.length === 0) status.push(`\x1b[2m${sanitizeAnsi(emptyText(state))}\x1b[0m`)
+
+  const sel = state.rows.findIndex(r => r.id === state.selected)
+  const selExtra: string[] = []
+  if (sel >= 0) {
+    const r = state.rows[sel]!
+    if (r.summary && !state.expanded) {
+      const sumColor = r.summary.startsWith('success') ? '\x1b[32m' : '\x1b[33m'
+      selExtra.push(`    ${sumColor}${sanitizeAnsi(r.summary)}\x1b[0m`)
+    }
+    selExtra.push(`    ${fitFirst(rowHints(state, r, now), Math.max(0, width - 4))}`)
+  }
+
+  const footer: string[] = []
+  const others = othersLine(state.all)
+  if (others) {
+    const glyphColor = others.running ? '\x1b[32m' : '\x1b[2m'
+    footer.push(`${glyphColor}◌\x1b[0m [ a ${state.showAll ? '只看自己' : '展開'} · ${others.text} ]`)
+  }
+  if (state.statusMessage && now < (state.statusUntil ?? 0)) {
+    footer.push(`\x1b[36mtmux-agent: ${sanitizeAnsi(state.statusMessage)}\x1b[0m`)
+  }
+  return { title: titleLine, status, selExtra, footer, sel }
+}
+
+/** The layout runTui sizes the capture and the detail page with: the same one render draws. */
+export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number } {
+  const s = sectionsOf(state, width, now, gate)
+  const lay = layoutOf(height, { status: s.status.length, rows: state.rows.length, sel: s.sel, selExtra: s.selExtra.length, footer: s.footer.length })
+  const detailTotal = state.expanded && state.detail && state.detail.id === state.selected ? wrapCells(state.detail.lines.join('\n'), width).length : 0
+  return { ...lay, detailTotal }
 }
 
 export function renderTuiLines(
@@ -533,160 +798,45 @@ export function renderTuiLines(
   gate?: Gate,
 ): string[] {
   if (width < 1 || height < 1) return []
-
-  const down = gate ? collectorDown(gate) : undefined
-  const healthUnknown = !down && gate?.viewHealth === 'unknown'
-  const tmuxRunning = state.rows.filter(r => !r.project && !r.terminal).length
-  const me = state.owner
-  const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning} · 內部 ?`
-  const clearable = state.rows.some(r => !r.project)
-  const clearArmed = state.armedStop?.id === CLEAR_ID && now < state.armedStop.until
-  const clearLabel = clearButtonLabel(clearArmed)
-  const clearBtn = clearable ? `[ ✕ ${clearLabel} ]` : ''
-
-  const btnParts = ['[ + new ]', '[ ↻ refresh ]']
-  if (clearBtn) btnParts.push(clearBtn)
-  btnParts.push('[ quit ]')
-  const buttonsStr = btnParts.join(' ')
-  const buttonCells = cellWidth(buttonsStr)
-
-  const fullTitle = ` workers · ${counts} `
-  let titleText = ` workers `
-  if (cellWidth(fullTitle) + buttonCells <= width) {
-    titleText = fullTitle
-  } else if (cellWidth(` ${counts} `) + buttonCells <= width) {
-    titleText = ` ${counts} `
-  }
-
-  const titleCells = cellWidth(titleText) + buttonCells
-  const hintRoom = Math.max(0, width - titleCells)
-  let hint = ''
-  for (const piece of ['  /workers stop <name>', ' · /workers tell <name> <text>']) {
-    if (cellWidth(hint) + cellWidth(piece) + 1 > hintRoom) break
-    hint += piece
-  }
-
-  const titleContent = `${titleText}${buttonsStr}${padCells(hint, hintRoom)}`
-  const titleLine = `${ANSI_FG_BLACK}${ANSI_BG_CYAN}${ANSI_BOLD}${truncateAnsi(titleContent, width)}${ANSI_RESET}`
-
-  if (height <= 1) {
-    return [titleLine]
-  }
-
+  const s = sectionsOf(state, width, now, gate)
   if (height <= 2) {
-    const compactMsg = `${state.rows.length} worker(s); window too small (${height} rows) — /workers N · /workers stop <name>`
-    return [titleLine, truncateAnsi(compactMsg, width)]
+    const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
+    return [s.title, truncateAnsi(compact, width)].slice(0, height)
   }
+  const lay = layoutOf(height, { status: s.status.length, rows: state.rows.length, sel: s.sel, selExtra: s.selExtra.length, footer: s.footer.length })
+  const fit = (line: string) => truncateAnsi(line, width)
+  const lines: string[] = [s.title, ...s.status.slice(0, lay.status).map(fit)]
 
-  const others = othersLine(state.all)
-  const selIndex = state.rows.findIndex(r => r.id === state.selected)
-  const selected = selIndex >= 0 ? state.rows[selIndex] : undefined
-
-  const fixed =
-    1 +
-    (state.adding ? 1 : 0) +
-    (down ? 1 : 0) +
-    (state.viewer ? 1 : 0) +
-    (healthUnknown ? 1 : 0) +
-    (others ? 1 : 0) +
-    (state.statusMessage && now < (state.statusUntil ?? 0) ? 1 : 0) +
-    (selected ? 1 + (selected.summary ? 1 : 0) : 0) +
-    (state.rows.length ? 0 : 1)
-
-  const reserve = selected ? 1 + MIRROR_MIN_ROWS : 0
-  const fitsAt = (n: number) => fixed + n + (n < state.rows.length ? 1 : 0) + reserve <= height
-
-  let shownRows = state.rows.length
-  while (shownRows > 1 && !fitsAt(shownRows)) shownRows -= 1
-
-  const first = selected
-    ? Math.max(0, Math.min(selIndex - shownRows + 1, state.rows.length - shownRows))
-    : 0
-  const hidden = state.rows.length - shownRows
-
-  const used = fixed + shownRows + (hidden > 0 ? 1 : 0)
-  const room = height - used - 1
-  const mirrorAvailable = room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
-
-  const lines: string[] = [titleLine]
-
-  if (down) {
-    lines.push(truncateAnsi(`\x1b[2m⚠ ${down}\x1b[0m`, width))
-  }
-
-  if (state.viewer) {
-    lines.push(truncateAnsi('\x1b[2mviewer — no session; not a collecting owner\x1b[0m', width))
-  }
-
-  if (healthUnknown) {
-    lines.push(truncateAnsi('\x1b[2mcollector health unknown — this view does not collect\x1b[0m', width))
-  }
-
-  if (state.adding) {
-    lines.push(truncateAnsi(`  + [profile] <session-id> [name]: ${state.resumeInput}█`, width))
-  }
-
-  if (state.rows.length === 0) {
-    lines.push(truncateAnsi('\x1b[2mNo workers outstanding.\x1b[0m', width))
-  }
-
-  for (let i = 0; i < state.rows.length; i++) {
-    if (i < first || i >= first + shownRows) continue
+  for (let i = lay.first; i < lay.first + lay.list; i++) {
     const r = state.rows[i]!
-    const isSelected = r.id === state.selected
+    const isSelected = i === s.sel
     const digitPrefix = i < 9 ? `${i + 1}: ` : '   '
     const color = r.project ? ANSI_COLOR_MAP['blue'] : (ANSI_COLOR_MAP[STATE_COLOR[r.state]] ?? '')
     const glyphStr = `${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}`
-    const labelStr = sanitizeAnsi(rowLabel(r, isSelected))
-    const rowLine = `${digitPrefix}${glyphStr}${labelStr}`
-    lines.push(truncateAnsi(rowLine, width))
-
-    if (isSelected) {
-      if (r.summary) {
-        const sumColor = r.summary.startsWith('success') ? '\x1b[32m' : '\x1b[33m'
-        lines.push(truncateAnsi(`    ${sumColor}${sanitizeAnsi(r.summary)}\x1b[0m`, width))
-      }
-      const ctrlParts: string[] = []
-      if (r.state === 'running' || r.state === 'stalled') {
-        ctrlParts.push('[ ↯ interrupt ]')
-      }
-      const armed = state.armedStop?.id === r.id && now < state.armedStop.until
-      ctrlParts.push(`[ ✕ ${stopButtonLabel(r.d.name, armed)} ]`)
-      if (armed) {
-        const secs = Math.ceil((state.armedStop!.until - now) / 1000)
-        ctrlParts.push(`\x1b[31mends its tmux session · ${secs}s\x1b[0m`)
-      }
-      lines.push(truncateAnsi(`    ${ctrlParts.join('  ')}`, width))
-
-      if (mirrorAvailable > 0 && state.mirror && state.mirror.id === r.id) {
-        lines.push(truncateAnsi(`\x1b[2m${'─'.repeat(Math.min(width, 60))}\x1b[0m`, width))
-        const tailLines = state.mirror.lines.slice(-mirrorAvailable)
-        for (const ml of tailLines) {
-          lines.push(truncateAnsi(sanitizeAnsi(ml) || ' ', width))
-        }
-        const seeWhole = r.project
-          ? `See it whole: tmux attach -t ${exactSessionTarget(r.d.name)}`
-          : `See it whole: agent-tmux ${r.d.profile} attach ${r.d.name}`
-        lines.push(truncateAnsi(`\x1b[2m${seeWhole}\x1b[0m`, width))
-      } else if (mirrorAvailable === 0 && height < 12) {
-        lines.push(truncateAnsi(`\x1b[2mBand too short to mirror — enlarge the window.\x1b[0m`, width))
-      }
+    lines.push(fit(`${digitPrefix}${glyphStr}${sanitizeAnsi(rowLabel(r, isSelected))}`))
+    if (!isSelected) continue
+    lines.push(...s.selExtra.slice(s.selExtra.length - lay.selExtra).map(fit))
+    if (lay.body === 0) continue
+    const rule = `\x1b[2m${'─'.repeat(Math.max(0, Math.min(width, 60) - 1))}\x1b[0m`
+    if (state.expanded) {
+      const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), width) : ['loading…']
+      const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - lay.body))
+      lines.push(fit(rule))
+      for (const l of all.slice(top, top + lay.body)) lines.push(l || ' ')
+      const end = Math.min(all.length, top + lay.body)
+      lines.push(fit(`\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · PgUp/PgDn scroll · Enter mirror\x1b[0m`))
+    } else if (state.mirror && state.mirror.id === r.id) {
+      lines.push(fit(rule))
+      for (const ml of state.mirror.lines.slice(-lay.body)) lines.push(fit(sanitizeAnsi(ml) || ' '))
+      const seeWhole = r.project
+        ? `See it whole: tmux attach -t ${exactSessionTarget(r.d.name)}`
+        : `See it whole: agent-tmux ${r.d.profile} attach ${r.d.name}`
+      lines.push(fit(`\x1b[2m${seeWhole}\x1b[0m`))
     }
   }
 
-  if (hidden > 0) {
-    lines.push(truncateAnsi(`\x1b[2m  +${hidden} more — /workers N selects row N\x1b[0m`, width))
-  }
-
-  if (others) {
-    const glyphColor = others.running ? '\x1b[32m' : '\x1b[2m'
-    lines.push(truncateAnsi(`${glyphColor}◌\x1b[0m [ ${state.showAll ? '只看自己' : '展開'} · ${others.text} ]`, width))
-  }
-
-  if (state.statusMessage && now < (state.statusUntil ?? 0)) {
-    lines.push(truncateAnsi(`\x1b[36mtmux-agent: ${sanitizeAnsi(state.statusMessage)}\x1b[0m`, width))
-  }
-
+  if (lay.more) lines.push(fit(`\x1b[2m  +${lay.hidden} more — j/k moves the selection\x1b[0m`))
+  lines.push(...s.footer.slice(s.footer.length - lay.footer).map(fit))
   return lines.slice(0, height)
 }
 
@@ -776,10 +926,18 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   let refreshing = false
   let capturing = false
   let timer: NodeJS.Timeout | undefined
+  // Bumped on every resize: a capture started before it was sized for the old
+  // layout and is dropped when it lands (R4.1).
+  let generation = 0
+
+  const layout = () => tuiLayout(state, width, height, Date.now(), gate)
 
   // After quit (or any stop) nothing more is drawn, even by an action still in flight.
   const render = () => {
     if (stopped) return
+    const lay = layout()
+    state.page = lay.body
+    state.scrollMax = Math.max(0, lay.detailTotal - lay.body)
     const lines = renderTuiLines(state, width, height, Date.now(), gate)
     stdout.write(ANSI_CLEAR_HOME + lines.join('\r\n'))
   }
@@ -789,10 +947,15 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     refreshing = true
     try {
       if (root) await observeView(host, gate, root)
+      state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
       const rows = await panelRows(host, gate, root)
       state.all = rows
       const panelLike = { rows: state.rows, all: state.all, showAll: state.showAll, selected: state.selected }
+      const was = state.rows.find(r => r.id === state.selected)
       setRows(panelLike as any, rows)
+      // A row id carries its episode (`name#seq`): after a tell the selection follows the worker.
+      if (was && !panelLike.selected) panelLike.selected = panelLike.rows.find(r => r.project === was.project && r.d.name === was.d.name)?.id
+      if (panelLike.selected !== state.selected) state = { ...state, expanded: false, detail: undefined, scroll: 0, mirror: undefined }
       state.rows = panelLike.rows
       state.selected = panelLike.selected
       return true
@@ -805,17 +968,31 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (!state.selected || capturing) return
     const row = state.rows.find(r => r.id === state.selected)
     if (!row) return
+    const rows = layout().body
+    if (rows < 1) return
+    const gen = generation
     capturing = true
     try {
-      const lines = row.project
-        ? await mirrorProject(host, row.d.name, MIRROR_ROWS)
-        : await mirrorOf(host, row.d, MIRROR_ROWS)
-      if (state.selected === row.id) {
+      const lines = row.project ? await mirrorProject(host, row.d.name, rows) : await mirrorOf(host, row.d, rows)
+      if (gen === generation && state.selected === row.id) {
         state.mirror = { id: row.id, lines }
       }
     } finally {
       capturing = false
     }
+  }
+
+  // Read-only, whole (R4.3). A read error is shown in the detail, not thrown.
+  const loadDetail = async () => {
+    const row = state.rows.find(r => r.id === state.selected)
+    if (!row || !state.expanded) return
+    const det: EpisodeDetail | { kind: 'project' } = row.project ? { kind: 'project' } : await episodeDetail(host, row.d)
+    if (state.selected === row.id && state.expanded) state.detail = { id: row.id, lines: detailText(row, det) }
+  }
+
+  const say = (text: string) => {
+    state.statusMessage = text
+    state.statusUntil = Date.now() + STATUS_MS
   }
 
   // Every way out — q, an exception (key, first load, or timer), SIGINT, SIGTERM,
@@ -841,6 +1018,8 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   const onResize = () => {
     width = stdout.columns || 80
     height = stdout.rows || 24
+    generation += 1
+    state.mirror = undefined
     try {
       render()
     } catch (err) {
@@ -945,9 +1124,60 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     }
     if (action.type === 'resume') {
       const out = await resumeWorker(host, action.value)
-      state.statusMessage = `resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-      state.statusUntil = Date.now() + 5000
+      say(`resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       if (out.ok) await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'tell') {
+      const out = await tellWorker(host, action.row.d, action.text)
+      say(`tell ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'assign') {
+      // `<profile> <name> <brief-file>`: the file is the rest, so a path may hold spaces.
+      const [profile, name, ...file] = action.value.split(/\s+/)
+      if (!profile || !name || !file.length) {
+        say('assign — FAILED: assign takes <profile> <name> <brief-file>')
+        render()
+        return
+      }
+      const path = resolve(cwd, file.join(' '))
+      const brief = await readFile(path, 'utf8').catch((error: Error) => error)
+      if (brief instanceof Error) {
+        say(`assign — FAILED: cannot read the brief ${path}: ${brief.message}`)
+        render()
+        return
+      }
+      const h = gate.viewHealth
+      const got = await assignWorker(host, { profile, name, dir: cwd, brief }, {
+        owner: session ?? '',
+        ownerCwd: cwd,
+        down: () => (h && h.kind !== 'collecting' && h.kind !== 'initializing' ? healthText(h) : undefined),
+      })
+      say('deny' in got ? `assign — FAILED: ${got.deny}` : `assign — ok: ${got.receipt}`)
+      await refreshRows()
+      render()
+      return
+    }
+    // Same core calls as `workers.cli.node.ts cancel|unlock`; the second press is the confirm.
+    if (action.type === 'cancel') {
+      const out = await cancelEpisode(host, action.row.d.name, action.row.d.seq ?? 0)
+      say(`cancel ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'unlock') {
+      const out = await unlockWorker(host, action.row.d.name, UNLOCK_WORD)
+      say(`unlock ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
+      render()
+      return
+    }
+    if (action.type === 'detail') {
+      await loadDetail()
       render()
       return
     }
@@ -974,7 +1204,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       const tick = async () => {
         const fresh = await refreshRows()
         if (state.selected && !stopped) {
-          await captureSelected()
+          await (state.expanded ? loadDetail() : captureSelected())
         }
         if (fresh) render()
       }

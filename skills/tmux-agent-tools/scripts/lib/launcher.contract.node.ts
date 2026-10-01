@@ -5,12 +5,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { type ChildProcess, execFile, execFileSync, spawn } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { sessionDirOf, v3Of } from './workers.ts'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { nodeHost } from './host.node.ts'
+import { acquireLock, releaseLock, type Holder } from './ledger.ts'
+import { takeLauncherLock, unlockLauncher } from './launcher.node.ts'
+import { holderProvablyAlive, processId, sessionDirOf, v3Of, type Host } from './workers.ts'
 
-const LAUNCHER = new URL('./launcher.node.ts', import.meta.url).pathname
+const LAUNCHER = fileURLToPath(new URL('./launcher.node.ts', import.meta.url))
 const SOCK = `tac-test-${process.pid}`
 
 let gate = Promise.resolve()
@@ -78,18 +82,22 @@ async function live(tag: string): Promise<Live> {
   return { root, cwd, session, env, socketPath, children: [] }
 }
 
+/** SIGTERM the collector `collector.json` names (the launcher writes no pid file). */
+function killRecorded(root: string, session: string): void {
+  try {
+    const pid = Number(JSON.parse(readFileSync(`${sessionDirOf(v3Of(root), session)}/collector.json`, 'utf8')).pid)
+    if (pid > 0) process.kill(pid, 'SIGTERM')
+  } catch {
+    // no collector, or already dead
+  }
+}
+
 async function cleanup(w: Live | undefined): Promise<void> {
   if (!w) return
   for (const child of w.children) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
   }
-  const pidPath = `${sessionDirOf(v3Of(w.root), w.session)}/collector.pid`
-  try {
-    const pid = Number(readFileSync(pidPath, 'utf8').trim().split(/\s+/)[0])
-    if (pid > 0) process.kill(pid, 'SIGTERM')
-  } catch {
-    // no collector, or already dead
-  }
+  killRecorded(w.root, w.session)
   await sleep(200)
   await tmux(['kill-server'])
   rmSync(w.root, { recursive: true, force: true })
@@ -99,11 +107,15 @@ function hostPane(session: string): Promise<string> {
   return tmux(['display-message', '-p', '-t', session, '#{pane_id}']).then(r => r.out.trim())
 }
 
-function spawnLauncher(w: Live, pane: string): ChildProcess & { out: string; err: string; closed: boolean } {
+function spawnLauncher(
+  w: Live,
+  pane: string,
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; launcher?: string } = {},
+): ChildProcess & { out: string; err: string; closed: boolean } {
   const child = spawn(
     process.execPath,
-    [LAUNCHER, '--session', w.session, '--cwd', w.cwd, '--pane', pane, '--', 'sh', '-c', 'cat'],
-    { env: w.env, stdio: ['ignore', 'pipe', 'pipe'] },
+    [opts.launcher ?? LAUNCHER, '--session', w.session, '--cwd', opts.cwd ?? w.cwd, '--pane', pane, '--', 'sh', '-c', 'cat'],
+    { env: opts.env ?? w.env, stdio: ['ignore', 'pipe', 'pipe'] },
   ) as ChildProcess & { out: string; err: string; closed: boolean }
   child.out = ''
   child.err = ''
@@ -454,6 +466,487 @@ exit 0
           await sleep(100)
         }
       }
+    }
+  }),
+)
+
+// ── C-lock (plan §1b): `collector.owner` is the core action lock, never taken over ──
+
+const LIB = (f: string) => pathToFileURL(fileURLToPath(new URL(f, import.meta.url))).href
+
+/**
+ * One contender as its own OS process: take the launcher lock, hold it `HOLD` ms,
+ * release it only when `RELEASE=1` (otherwise exit holding it: a crashed launcher).
+ * `CRASH=after-ln`: exit 9 right after the `ln -sn` that took the lock.
+ */
+const CONTENDER = `
+const { takeLauncherLock } = await import(process.env.L)
+const { nodeHost } = await import(process.env.H)
+const { releaseLock } = await import(process.env.LE)
+const base = nodeHost({ log: () => {} })
+const host = { ...base, run: async (argv, cwd, ms) => {
+  const r = await base.run(argv, cwd, ms)
+  if (process.env.CRASH === 'after-ln' && argv[0] === 'ln' && r.exitCode === 0) process.exit(9)
+  return r
+} }
+const say = o => process.stdout.write(JSON.stringify({ ...o, at: Date.now() }) + '\\n')
+try {
+  const token = await takeLauncherLock(host, process.env.DIR, process.env.S)
+  say({ won: token })
+  await new Promise(r => setTimeout(r, Number(process.env.HOLD || 0)))
+  if (process.env.RELEASE === '1') say({ released: await releaseLock(host, process.env.DIR + '/collector.owner', token) })
+} catch (error) {
+  say({ busy: error.message })
+}
+`
+
+type Said = { won?: string; released?: boolean; busy?: string; at: number }
+
+function contender(dir: string, env: Record<string, string> = {}): Promise<{ code: number; said: Said[] }> {
+  return new Promise(resolve => {
+    execFile(
+      process.execPath,
+      ['--input-type=module', '-e', CONTENDER],
+      {
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, L: LIB('./launcher.node.ts'), H: LIB('./host.node.ts'), LE: LIB('./ledger.ts'), DIR: dir, S: 'lock-s', ...env },
+      },
+      (error, stdout) => {
+        const said = stdout.trim().split('\n').filter(Boolean).map(l => JSON.parse(l) as Said)
+        resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, said })
+      },
+    )
+  })
+}
+
+function lockDir(): { root: string; dir: string; lock: string } {
+  const root = mkdtempSync(join(tmpdir(), 'clock-'))
+  const dir = sessionDirOf(v3Of(root), 'lock-s')
+  mkdirSync(dir, { recursive: true })
+  return { root, dir, lock: `${dir}/collector.owner` }
+}
+
+const holderOf = (lock: string) => JSON.parse(readlinkSync(lock)) as Holder
+/** The lock is a symlink to a JSON string, never a real path: `existsSync` follows it and says false. */
+const linked = (path: string) => {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function maintenance(root: string, args: string[]): Promise<{ code: number; out: string }> {
+  return new Promise(resolve => {
+    execFile(process.execPath, [LAUNCHER, ...args], { encoding: 'utf8', timeout: 30_000, env: { ...process.env, TMUX_AGENT_DIR: root } }, (error, stdout, stderr) => {
+      resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: `${stdout}${stderr}` })
+    })
+  })
+}
+
+test('C-lock: 6 concurrent acquires, exactly one wins; its crash leaves busy + the unlock command, never a steal', { timeout: 60_000 }, async () => {
+  const w = lockDir()
+  try {
+    const runs = await Promise.all(Array.from({ length: 6 }, () => contender(w.dir, { HOLD: '1500' })))
+    const said = runs.flatMap(r => r.said)
+    const winners = said.filter(s => s.won)
+    assert.equal(winners.length, 1, JSON.stringify(said))
+    const busy = said.filter(s => s.busy)
+    assert.equal(busy.length, 5)
+    for (const b of busy) {
+      assert.match(b.busy!, /gone/, 'the losers waited while it ran, then saw it gone')
+      assert.match(b.busy!, /--unlock-launcher 'lock-s' --yes/)
+    }
+    assert.equal(holderOf(w.lock).token, winners[0]!.won, 'nobody took the dead holder\'s lock over')
+    const again = await contender(w.dir)
+    assert.match(again.said[0]?.busy ?? '', /gone/)
+    assert.equal(holderOf(w.lock).token, winners[0]!.won)
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('C-lock: crash right after the ln -sn publish → busy (no steal); unlock needs --yes; then acquire succeeds', { timeout: 60_000 }, async () => {
+  const w = lockDir()
+  try {
+    const crashed = await contender(w.dir, { CRASH: 'after-ln' })
+    assert.equal(crashed.code, 9)
+    const dead = holderOf(w.lock)
+    assert.match((await contender(w.dir)).said[0]?.busy ?? '', /gone/)
+    const ask = await maintenance(w.root, ['--unlock-launcher', 'lock-s'])
+    assert.equal(ask.code, 1, ask.out)
+    assert.match(ask.out, /--unlock-launcher 'lock-s' --yes/)
+    assert.equal(holderOf(w.lock).token, dead.token, 'without --yes nothing is removed')
+    const done = await maintenance(w.root, ['--unlock-launcher', 'lock-s', '--yes'])
+    assert.equal(done.code, 0, done.out)
+    assert.ok(!linked(w.lock))
+    const next = await contender(w.dir, { RELEASE: '1' })
+    assert.ok(next.said[0]?.won, JSON.stringify(next.said))
+    assert.equal(next.said[1]?.released, true)
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('C-lock: a holder alive for more than 10s is never stolen; a delayed release lets the waiter in after it', { timeout: 60_000 }, async () => {
+  const w = lockDir()
+  try {
+    const holder = contender(w.dir, { HOLD: '11000', RELEASE: '1' })
+    await until(() => linked(w.lock), 'the holder to take the lock')
+    const token = holderOf(w.lock).token
+    const waiter = contender(w.dir, { RELEASE: '1' })
+    await sleep(10_500)
+    assert.equal(holderOf(w.lock).token, token, 'still the first holder after 10.5s')
+    const unlock = await maintenance(w.root, ['--unlock-launcher', 'lock-s', '--yes'])
+    assert.equal(unlock.code, 1)
+    assert.match(unlock.out, /still running/)
+    const [h, x] = await Promise.all([holder, waiter])
+    const released = h.said.find(s => s.released)!
+    const won = x.said.find(s => s.won)
+    assert.ok(won, JSON.stringify(x.said))
+    assert.ok(won.at >= released.at, 'the waiter won only after the release')
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+/** A node host whose holder probes answer as given (`ps` exit/out, `kill -0` exit/err). */
+function probing(ps: { exitCode: number; stdout: string }, kill?: { exitCode: number; stderr: string }): Host {
+  const base = nodeHost({ log: () => {} })
+  return {
+    ...base,
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === '/bin/sh' && argv[3] === 'ps') return { ...ps, stderr: '' }
+      if (argv[0] === '/bin/sh' && argv[3] === 'kill') return kill ? { exitCode: kill.exitCode, stdout: '', stderr: kill.stderr } : base.run(argv, cwd, ms)
+      return base.run(argv, cwd, ms)
+    },
+  }
+}
+
+test('R6.0 holderProvablyAlive: only ESRCH or another lstart is dead; EPERM and a failed ps are unknown', async () => {
+  const me = await processId(nodeHost())
+  const h = { host: me.host, pid: me.pid, pidStart: me.pidStart }
+  assert.equal(await holderProvablyAlive(nodeHost(), h), true)
+  assert.equal(await holderProvablyAlive(nodeHost(), { ...h, pidStart: 'Thu Jan  1 00:00:00 1970' }), false, 'pid reuse')
+  assert.equal(await holderProvablyAlive(probing({ exitCode: 1, stdout: '' }, { exitCode: 1, stderr: 'sh: kill: (1) - Operation not permitted' }), h), undefined, 'EPERM')
+  assert.equal(await holderProvablyAlive(probing({ exitCode: 1, stdout: '' }, { exitCode: 0, stderr: '' }), h), undefined, 'ps failed, the pid exists')
+  assert.equal(await holderProvablyAlive(probing({ exitCode: 2, stdout: '' }, { exitCode: 127, stderr: 'sh: kill: not found' }), h), undefined, 'ps error')
+  assert.equal(await holderProvablyAlive(probing({ exitCode: 1, stdout: '' }, { exitCode: 1, stderr: 'sh: kill: (9) - No such process' }), h), false, 'ESRCH')
+  assert.equal(await holderProvablyAlive(nodeHost(), { ...h, host: `${me.host}-other` }), undefined, 'another host')
+})
+
+test('C-lock: EPERM or a ps error on the holder → busy at once, and --unlock-launcher refuses', async () => {
+  const w = lockDir()
+  try {
+    const me = await processId(nodeHost())
+    symlinkSync(JSON.stringify({ token: 'other', session: 'lock-s', activation: 'launcher', ...me }), w.lock)
+    for (const host of [
+      probing({ exitCode: 1, stdout: '' }, { exitCode: 1, stderr: 'sh: kill: (1) - Operation not permitted' }),
+      probing({ exitCode: 2, stdout: '' }, { exitCode: 127, stderr: 'kill: not found' }),
+    ]) {
+      const t0 = Date.now()
+      await assert.rejects(takeLauncherLock(host, w.dir, 'lock-s'), /busy: .*not provably alive or dead.*--unlock-launcher/)
+      assert.ok(Date.now() - t0 < 5_000, 'an unprovable holder is reported, not waited for')
+      const out = await unlockLauncher(host, w.root, 'lock-s', true)
+      assert.equal(out.ok, false)
+      assert.equal(holderOf(w.lock).token, 'other')
+    }
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('C-lock: pid reuse (same pid, another pidStart) is provably dead: unlock is allowed', async () => {
+  const w = lockDir()
+  try {
+    const me = await processId(nodeHost())
+    symlinkSync(JSON.stringify({ token: 'old', session: 'lock-s', activation: 'launcher', ...me, pidStart: 'Thu Jan  1 00:00:00 1970' }), w.lock)
+    await assert.rejects(takeLauncherLock(nodeHost(), w.dir, 'lock-s'), /gone/)
+    const out = await unlockLauncher(nodeHost(), w.root, 'lock-s', true)
+    assert.equal(out.ok, true, out.text)
+    assert.ok(!linked(w.lock))
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('C-lock: an old holder\'s late finally never deletes the new lock', async () => {
+  const w = lockDir()
+  try {
+    const host = nodeHost({ log: () => {} })
+    const me = await processId(host)
+    symlinkSync(JSON.stringify({ token: 'old', session: 'lock-s', activation: 'launcher', ...me, pidStart: 'Thu Jan  1 00:00:00 1970' }), w.lock)
+    assert.equal((await unlockLauncher(host, w.root, 'lock-s', true)).ok, true)
+    const fresh = await acquireLock(host, w.lock, { token: 'new', session: 'lock-s', activation: 'launcher', ...me })
+    assert.equal(fresh.ok, true)
+    assert.equal(await releaseLock(host, w.lock, 'old'), false, 'the old holder\'s finally')
+    assert.equal(holderOf(w.lock).token, 'new')
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+// ── §1c S2 legacy migration and R6.2 collector identity, on private tmux servers ──
+
+/** A process whose full args name `script` and the session, as an old launcher's or collector's would. */
+function fake(w: Live, script: string, extra: string[] = []): ChildProcess {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', script, '--session', w.session, ...extra], { stdio: 'ignore' })
+  w.children.push(child)
+  return child
+}
+
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+const record = (w: Live) => JSON.parse(readFileSync(`${sessionDirOf(v3Of(w.root), w.session)}/collector.json`, 'utf8'))
+const hasRecord = (w: Live) => existsSync(`${sessionDirOf(v3Of(w.root), w.session)}/collector.json`)
+
+async function busyLaunch(w: Live, pane: string): Promise<string> {
+  const child = spawnLauncher(w, pane)
+  await until(() => child.closed, 'the launcher to stop', 20_000)
+  assert.equal(child.exitCode, 1, child.out + child.err)
+  return child.err
+}
+
+test('S2: launcher holds the legacy lock dir, no pid yet — busy + migrate; migrate refuses while it runs, then moves', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('s2a')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      mkdirSync(`${dir}/collector.lock`, { recursive: true })
+      const old = fake(w, 'launcher.node.ts')
+      const pane = await hostPane(w.session)
+      const err = await busyLaunch(w, pane)
+      assert.match(err, /busy: .*collector\.lock.*--migrate-launcher/)
+      assert.ok(!hasRecord(w), 'no fake readiness')
+      assert.equal(collectors(w.session).length, 0, 'nothing started')
+      const refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+      assert.equal(refused.code, 1, refused.out)
+      assert.match(refused.out, new RegExp(`busy: .*pid ${old.pid}`))
+      assert.ok(existsSync(`${dir}/collector.lock`), 'nothing moved while the old launcher runs')
+      assert.ok(alive(old.pid!), 'migrate kills nothing')
+      old.kill('SIGTERM')
+      await until(() => !alive(old.pid!), 'the old launcher to exit')
+      const dry = await maintenance(w.root, ['--migrate-launcher', w.session])
+      assert.equal(dry.code, 1)
+      assert.match(dry.out, /would move collector\.lock/)
+      const moved = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+      assert.equal(moved.code, 0, moved.out)
+      const legacy = readdirSync(dir).filter(n => n.startsWith('legacy-'))
+      assert.equal(legacy.length, 1)
+      assert.ok(existsSync(`${dir}/${legacy[0]}/collector.lock`), 'moved, not deleted')
+      assert.ok(!existsSync(`${dir}/collector.lock`))
+      const status = await ready(spawnLauncher(w, pane))
+      assert.equal(status.how, 'started')
+      assert.equal(record(w).pid, status.pid)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('S2: legacy collector dead but its launcher alive — busy; no reuse, no kill', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('s2b')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      const gone = spawn(process.execPath, ['-e', ''])
+      await new Promise(r => gone.on('exit', r))
+      const pane = await hostPane(w.session)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(`${dir}/collector.pid`, `${gone.pid} ${pane}\n`)
+      const old = fake(w, 'launcher.node.ts')
+      assert.match(await busyLaunch(w, pane), /busy: .*collector\.pid.*--migrate-launcher/)
+      assert.ok(!hasRecord(w))
+      const refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+      assert.equal(refused.code, 1)
+      assert.ok(alive(old.pid!))
+      assert.ok(existsSync(`${dir}/collector.pid`))
+      old.kill('SIGTERM')
+      await until(() => !alive(old.pid!), 'the old launcher to exit')
+      const moved = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+      assert.equal(moved.code, 0, moved.out)
+      assert.ok(!existsSync(`${dir}/collector.pid`))
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('S2: a live legacy collector whose pid file names this pane number on another socket — busy, not reused, not killed', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('s2c')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      const pane = await hostPane(w.session)
+      const old = fake(w, 'collector.node.ts', ['--pane', pane, '--socket', '/elsewhere/other.sock'])
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(`${dir}/collector.pid`, `${old.pid} ${pane}\n`)
+      assert.match(await busyLaunch(w, pane), /busy: .*--migrate-launcher/)
+      assert.ok(!hasRecord(w), 'no reuse by pane number')
+      const refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+      assert.equal(refused.code, 1)
+      assert.match(refused.out, /SIGTERM/)
+      assert.ok(alive(old.pid!), 'not killed')
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('S2: a legacy collector without state — the launcher starts its own (readiness from its own pid), the old one untouched', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('s2d')
+      const pane = await hostPane(w.session)
+      const old = fake(w, 'collector.node.ts', ['--pane', pane])
+      const status = await ready(spawnLauncher(w, pane))
+      assert.equal(status.how, 'started')
+      assert.notEqual(status.pid, old.pid)
+      assert.equal(record(w).pid, status.pid)
+      assert.ok(alive(old.pid!), 'no wrong kill')
+      const nothing = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+      assert.equal(nothing.code, 0)
+      assert.match(nothing.out, /nothing to migrate/)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('R6.2: another pane of the same session → the old collector is stopped, a new one started for that pane', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('r62p')
+      const pane = await hostPane(w.session)
+      const first = await ready(spawnLauncher(w, pane))
+      const split = await tmux(['split-window', '-d', '-t', pane, '-P', '-F', '#{pane_id}', 'cat'])
+      const other = split.out.trim()
+      assert.match(other, /^%\d+$/)
+      const child = spawnLauncher(w, other)
+      const second = await ready(child)
+      assert.equal(second.how, 'started')
+      assert.notEqual(second.pid, first.pid)
+      assert.match(child.out, new RegExp(`replaced collector ${first.pid}`))
+      await until(() => !alive(first.pid), 'the old collector to exit')
+      assert.equal(record(w).pane, other)
+      assert.equal(collectors(w.session).length, 1)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('R6.2: the same pane number on another tmux socket is not the same collector', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    const other = `${SOCK}-b`
+    const tmuxB = (args: string[]) => {
+      const env = { ...process.env }
+      delete env.TMUX
+      delete env.TMUX_PANE
+      return new Promise<string>(resolve => execFile('tmux', ['-L', other, ...args], { encoding: 'utf8', env, timeout: 20_000 }, (_e, out) => resolve((out ?? '').trim())))
+    }
+    try {
+      w = await live('r62s')
+      const pane = await hostPane(w.session)
+      const first = await ready(spawnLauncher(w, pane))
+      await tmuxB(['kill-server'])
+      await tmuxB(['new-session', '-d', '-s', 'b', '-x', '200', '-y', '40', 'cat'])
+      const paneB = await tmuxB(['display-message', '-p', '-t', 'b', '#{pane_id}'])
+      const socketB = await tmuxB(['display-message', '-p', '-t', 'b', '#{socket_path}'])
+      const pidB = await tmuxB(['display-message', '-p', '-t', 'b', '#{pid}'])
+      assert.equal(paneB, pane, 'both fresh servers number their first pane alike')
+      const second = await ready(spawnLauncher(w, paneB, { env: { ...w.env, TMUX: `${socketB},${pidB},0` } }))
+      assert.equal(second.how, 'started', 'not reused across sockets')
+      assert.notEqual(second.pid, first.pid)
+      assert.equal(record(w).socket, socketB)
+      assert.notEqual(socketB, w.socketPath)
+      await until(() => !alive(first.pid), 'the old collector to exit')
+    } finally {
+      await cleanup(w)
+      await tmuxB(['kill-server'])
+    }
+  }),
+)
+
+test('R6.2: a relaunch with another cwd starts a collector for that cwd', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('r62c')
+      const pane = await hostPane(w.session)
+      const first = await ready(spawnLauncher(w, pane))
+      assert.equal(record(w).cwd, w.cwd)
+      const moved = join(w.root, 'repo2')
+      mkdirSync(moved)
+      const second = await ready(spawnLauncher(w, pane, { cwd: moved }))
+      assert.equal(second.how, 'started')
+      assert.notEqual(second.pid, first.pid)
+      assert.equal(record(w).cwd, moved)
+      const third = await ready(spawnLauncher(w, pane, { cwd: moved }))
+      assert.equal(third.how, 'reused')
+      assert.equal(third.pid, second.pid)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('R6.2: an install path with a space runs, and its collector is found again', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('r62sp')
+      const lib = join(w.root, 'install dir', 'scripts', 'lib')
+      cpSync(fileURLToPath(new URL('.', import.meta.url)), lib, { recursive: true, filter: src => !src.includes('/fixtures') })
+      const launcher = join(lib, 'launcher.node.ts')
+      const pane = await hostPane(w.session)
+      const first = await ready(spawnLauncher(w, pane, { launcher }))
+      assert.equal(first.how, 'started')
+      assert.ok(collectors(w.session).some(l => l.includes('install dir/scripts/lib/collector.node.ts')))
+      const second = await ready(spawnLauncher(w, pane, { launcher }))
+      assert.equal(second.how, 'reused')
+      assert.equal(second.pid, first.pid)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('R6.2: an unwritable collector.log or a collector that exits before ready is an error, with no record left', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('r62e')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      mkdirSync(dir, { recursive: true })
+      const pane = await hostPane(w.session)
+      writeFileSync(`${dir}/collector.log`, '')
+      chmodSync(`${dir}/collector.log`, 0o000)
+      assert.match(await busyLaunch(w, pane), /could not open .*collector\.log.*no collector started/)
+      assert.ok(!hasRecord(w))
+      assert.equal(collectors(w.session).length, 0)
+      chmodSync(`${dir}/collector.log`, 0o644)
+      writeFileSync(`${dir}/act`, 'not a directory')
+      assert.match(await busyLaunch(w, pane), /the collector exited \(code 1\) before it was ready; collector\.log: .*not ready/s)
+      assert.ok(!hasRecord(w), 'no fake readiness')
+      assert.ok(!linked(`${dir}/collector.owner`), 'the lock is released on the error path')
+      assert.equal(collectors(w.session).length, 0)
+    } finally {
+      await cleanup(w)
     }
   }),
 )

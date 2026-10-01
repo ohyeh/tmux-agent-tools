@@ -9,11 +9,22 @@
 //   --pane     the host pane, as `%N` (required: a name or index can point elsewhere)
 //   --once     one reconcile pass, then exit (tests, cron)
 // Exit: 0 when the pane is gone or --once finished; 1 when the collector paused
-// (superseded by a newer activation, or refused deliveries); 2 on bad arguments.
+// (superseded by a newer activation, or refused deliveries) or could not get ready;
+// 2 on bad arguments.
+//
+// Readiness (plan D-collector-id): without --once, the collector first registers and
+// beats its activation (§4), then publishes `<sessionDir>/collector.json` (temp +
+// rename): `{pid, pidStart, host, session, pane, socket, cwd, coreVersion, token}`.
+// `socket` is the tmux server's `#{socket_path}` as this process resolves it. No
+// record is published before that first beat, so a record proves a ready collector
+// only while its pid still runs with that pidStart (the launcher checks both).
 import { execFile } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { readFile, rename, writeFile } from 'node:fs/promises'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { nodeHost } from './host.node.ts'
-import { heartbeat, newGate, POLL_MS, reconcileOnce } from './workers.ts'
+import { heartbeat, newGate, POLL_MS, processId, reconcileOnce, rootOf, sessionDirOf, v3Of } from './workers.ts'
 
 const NODE_FLOOR = [22, 18, 0]
 const TMUX_MS = 5_000
@@ -49,6 +60,49 @@ export async function pasteInto(pane: string, text: string, env: NodeJS.ProcessE
     if (r.code !== 0) return { drop: `tmux ${args[0]} into ${pane} failed (exit ${r.code}): ${r.err.trim().slice(-200)}` }
   }
   return { text }
+}
+
+/** The tmux server this process reaches for `pane`: its socket path, or `undefined`. */
+export async function serverSocket(pane: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const r = await tmux(['display-message', '-p', '-t', pane, '#{socket_path}'], undefined, env)
+  return r.code === 0 && r.out.trim().startsWith('/') ? r.out.trim() : undefined
+}
+
+/** `collector.json`: published once, after the readiness handshake. */
+export type CollectorRecord = {
+  pid: number
+  pidStart: string
+  host: string
+  session: string
+  pane: string
+  socket: string
+  cwd: string
+  coreVersion: string
+  token: string
+}
+
+/** The record as published; `undefined` = absent or not a complete record. Other read errors throw. */
+export async function readCollectorRecord(path: string): Promise<CollectorRecord | undefined> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+  try {
+    const r = JSON.parse(text) as CollectorRecord
+    const strings = [r?.pidStart, r?.host, r?.session, r?.pane, r?.socket, r?.cwd, r?.token]
+    return Number.isInteger(r?.pid) && r.pid > 0 && strings.every(v => typeof v === 'string' && v) ? r : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** `AGENT_TMUX_VERSION` of the wrapper beside lib/, the version every install ships. */
+async function coreVersion(): Promise<string> {
+  const text = await readFile(fileURLToPath(new URL('../agent-tmux', import.meta.url)), 'utf8').catch(() => '')
+  return /^AGENT_TMUX_VERSION='([^']+)'$/m.exec(text)?.[1] ?? 'unknown'
 }
 
 function usage(why: string): never {
@@ -87,6 +141,7 @@ async function main(): Promise<void> {
   const log = (text: string) => process.stderr.write(`${new Date().toISOString()} ${text}\n`)
   const host = nodeHost({ owner: session, cwd, log, submit: text => pasteInto(pane, text) })
   const gate = newGate()
+  gate.channel = 'node' // act/<n>.state (C-health): written by heartbeat and the refusal pause
   const stopIfPaused = () => {
     if (!gate.paused) return
     log(`tmux-agent-collector: paused — ${gate.paused}`)
@@ -97,6 +152,35 @@ async function main(): Promise<void> {
     stopIfPaused()
     return
   }
+  function notReady(why: string): never {
+    log(`tmux-agent-collector: not ready — ${why}; exiting`)
+    process.exit(1)
+  }
+  if (!(await heartbeat(host, gate))) notReady(gate.paused ?? 'could not register or beat this activation (see above)')
+  const me = await processId(host)
+  if (me.pid !== process.pid || !me.pidStart || !me.host) notReady(`could not read this process's own id (got pid ${me.pid || '?'})`)
+  const sock = await serverSocket(pane)
+  if (!sock) notReady(`could not read the tmux socket path of pane ${pane}`)
+  const root = (await rootOf(host))!
+  const record: CollectorRecord = {
+    pid: process.pid,
+    pidStart: me.pidStart,
+    host: me.host,
+    session,
+    pane,
+    socket: sock,
+    cwd,
+    coreVersion: await coreVersion(),
+    token: gate.token,
+  }
+  const path = `${sessionDirOf(v3Of(root), session)}/collector.json`
+  try {
+    await writeFile(`${path}.${process.pid}.tmp`, JSON.stringify(record))
+    await rename(`${path}.${process.pid}.tmp`, path)
+  } catch (error) {
+    notReady(`could not publish ${path}: ${String(error)}`)
+  }
+  log(`tmux-agent-collector: ready — activation ${gate.activation}, pane ${pane}, socket ${sock}`)
   // The beat has its own clock, as in the mod: a slow pass must not let a peer adopt (§4).
   const beat = setInterval(() => {
     if (!gate.paused) void heartbeat(host, gate).catch(error => log(`tmux-agent-collector: beat failed: ${String(error)}`))
@@ -113,4 +197,12 @@ async function main(): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) await main()
+// The module URL is the real path (symlinks resolved, `%20` for a space); argv[1] is as typed.
+const isMain = (() => {
+  try {
+    return !!process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+  } catch {
+    return false // imported by a process whose argv[1] is not a file
+  }
+})()
+if (isMain) await main()

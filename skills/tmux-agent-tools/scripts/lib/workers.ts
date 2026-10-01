@@ -541,11 +541,14 @@ export type Gate = {
   nextAttemptAt: number
   /** Why this activation stopped collecting, drawn as-is on the band; unset = collecting. */
   paused?: string
-  /**
-   * A view cannot see another process's `paused`. Unset on the collector.
-   * `unknown` is drawn as unknown — a missing pause is not a healthy collector.
-   */
-  viewHealth?: 'unknown'
+  /** A view's reading of its session's collector (`act/<n>.state` + beat, C-health). Unset on the collector. */
+  viewHealth?: Health
+  /** A view's last scan error (errno or Error name): the ledger could not be read. */
+  viewError?: string
+  /** The delivery channel this gate collects for; its `act/<n>.state` says so. Default `mod`. */
+  channel?: Channel
+  /** `act/<n>.state` as last published (`n|status|reason`): write on change only. */
+  stateWritten?: string
   /** This activation's registration number under the session dir (§4); unset until the first beat. */
   activation?: number
   /** The one registration in flight: two clocks' first beats must not register twice. */
@@ -823,10 +826,11 @@ async function ackNames(host: Host, dir: string): Promise<string[] | undefined> 
 
 /**
  * Same probe as `unlock`: `TZ=UTC LC_ALL=C` lstart. `true` = this holder instance
- * is still running. `false` = same host and the pid is absent or its lstart differs.
- * `undefined` = not provable (unknown is not gone).
+ * is still running. `false` = same host and either its pid runs with another lstart
+ * (reused) or `kill -0` says ESRCH ("No such process"). `undefined` = not provable:
+ * EPERM, a `ps` that exits nonzero for any other reason, no answer (unknown is not gone).
  */
-async function holderProvablyAlive(host: Host, holder: Holder): Promise<boolean | undefined> {
+export async function holderProvablyAlive(host: Host, holder: Pick<Holder, 'host' | 'pid' | 'pidStart'>): Promise<boolean | undefined> {
   if (!holder.host || !(holder.pid > 0) || !holder.pidStart) return undefined
   const me = await processId(host)
   if (!me.host || holder.host !== me.host) return undefined
@@ -836,8 +840,12 @@ async function holderProvablyAlive(host: Host, holder: Holder): Promise<boolean 
   if (!ps) return undefined
   const start = ps.stdout.trim()
   if (ps.exitCode === 0 && start === holder.pidStart) return true
-  if (ps.exitCode === 0 && start && start !== holder.pidStart) return false
-  if (ps.exitCode !== 0 && !start) return false
+  if (ps.exitCode === 0 && start) return false
+  // `ps -p` exits nonzero both for a gone pid and for a broken ps: only ESRCH is gone.
+  const kill = await host
+    .run(['/bin/sh', '-c', 'LC_ALL=C kill -0 "$1" 2>&1', 'kill', String(holder.pid)], '/', 5_000)
+    .catch(() => undefined)
+  if (kill && kill.exitCode !== 0 && /no such process/i.test(`${kill.stdout}${kill.stderr}`)) return false
   return undefined
 }
 
@@ -2014,6 +2022,7 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
       gate.nextAttemptAt = now + (BACKOFF_MS[gate.failures - 1] ?? 0)
       if (gate.failures >= FAIL_MAX) {
         gate.paused = `collector paused after ${FAIL_MAX} delivery refusals (${refusal}) — restart this session to resume`
+        await writeActState(host, gate)
         host.log(
           `tmux-agent: delivery paused after ${FAIL_MAX} refusals (${refusal}); ` +
             `${done.length} result(s) still on disk under ${v3}. ` +
@@ -2058,16 +2067,167 @@ export async function recoverUnsent(host: Host, dirs: readonly string[]): Promis
  *
  * Status uses the same probe as `flagStalls` with wakes off (no claim, no
  * submit, no toast). Legacy count and project rows are the reads `reconcile`
- * already does. Collector pause lives in the collector process and has no
- * file, so `viewHealth` is `unknown`.
+ * already does. Collector health is read from this session's `act/<n>.state`
+ * and beat (C-health); a view without a session has no collector (`none`).
  */
 export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
-  gate.viewHealth = 'unknown'
+  const me = host.owner()
+  gate.viewHealth = me ? await readActHealth(host, v3Of(root), me, await host.now()) : { kind: 'none' }
   const scanned = await scan(host, { claim: false })
+  gate.viewError = scanned.error ?? (scanned.complete ? undefined : 'some worker records could not be read (see the log)')
   await refreshProjects(host, gate, scanned.visible)
   // `visible` is the set `panelRows` draws. Probing only `dispatches` would
   // leave another session's row as `running` when its pane is waiting.
   await flagStalls(host, gate, v3Of(root), scanned.visible, scanned.visible, false)
+}
+
+// ── collector health (plan §1b C-health) ───────────────────────────────────────
+
+export type Channel = 'mod' | 'node' | 'mcp'
+/** `act/<n>.state`: a TUI's observation only. Never read by fencing, claim or `sessionLiveness`. */
+export type ActState = {
+  token: string
+  channel: Channel
+  mode: 'auto' | 'on-request'
+  status: 'collecting' | 'paused'
+  reason?: string
+  updatedAt: number
+}
+export type Health =
+  | { kind: 'none' }
+  | { kind: 'initializing' }
+  | { kind: 'collecting'; channel: Channel; mode: ActState['mode'] }
+  | { kind: 'paused'; channel: Channel; reason: string }
+  | { kind: 'stale'; ageS?: number }
+  | { kind: 'unknown'; reason: string }
+
+let stateTmp = 0
+/**
+ * Publish this activation's `act/<n>.state` (tmp + rename) when its status or reason
+ * changed. Every channel that collects calls it for its own n: the mod and the node
+ * collector through `heartbeat` and the delivery-refusal pause (MCP: R7). A superseded
+ * activation does not write: it is never the max n a reader reads. A failure is logged, never fatal.
+ */
+export async function writeActState(host: Host, gate: Gate): Promise<void> {
+  const id = host.owner()
+  const root = await rootOf(host)
+  const n = gate.activation
+  if (!id || !root || n === undefined) return
+  const status = gate.paused ? 'paused' : 'collecting'
+  const key = `${n}|${status}|${gate.paused ?? ''}`
+  if (gate.stateWritten === key) return
+  const channel = gate.channel ?? 'mod'
+  const body: ActState = {
+    token: gate.token,
+    channel,
+    mode: channel === 'mcp' ? 'on-request' : 'auto',
+    status,
+    ...(gate.paused ? { reason: gate.paused } : {}),
+    updatedAt: await host.now(),
+  }
+  const path = `${sessionDirOf(v3Of(root), id)}/act/${n}.state`
+  const tmp = `${path}.${gate.token}.${++stateTmp}`
+  try {
+    await host.write(tmp, JSON.stringify(body))
+    const mv = await host.run(['mv', tmp, path], '/', 5_000)
+    if (mv.exitCode !== 0) throw new Error(mv.stderr.trim() || `mv exit ${mv.exitCode}`)
+    gate.stateWritten = key
+  } catch (error) {
+    host.log(`tmux-agent: could not publish ${path}: ${String(error)}`)
+  }
+}
+
+/** Torn reads of the max activation are retried this many times, then `unknown`. */
+const HEALTH_READS = 3
+
+/**
+ * A session's collector as a view sees it (C-health), read-only: max n, then its
+ * `.json`, `.state` and liveness (`sessionLiveness`, never a second grace), then max n
+ * again; a moved max is read again, up to HEALTH_READS times. Order: no session dir or
+ * no activation → none; no record or beat inside the grace → initializing; paused (a
+ * paused collector stops beating) → paused; live + collecting → collecting; beat past
+ * ORPHAN_MS → stale; any read error, bad JSON, or token mismatch → unknown + reason.
+ */
+export async function readActHealth(host: Host, v3: string, session: string, now: number): Promise<Health> {
+  const dir = sessionDirOf(v3, session)
+  for (let i = 0; i < HEALTH_READS; i++) {
+    const there = await host.exists(dir).catch((error: unknown) => String(error))
+    if (typeof there === 'string') return { kind: 'unknown', reason: `session dir: ${there}` }
+    if (!there) return { kind: 'none' }
+    const acts = await numericChildren(host, `${dir}/act`)
+    if (!acts) return { kind: 'unknown', reason: 'act/ could not be listed' }
+    const n = acts.at(-1)
+    if (n === undefined) return { kind: 'none' }
+    const record = await readOrAbsent(host, `${dir}/act/${n}.json`)
+    const state = await readOrAbsent(host, `${dir}/act/${n}.state`)
+    const live = await sessionLiveness(host, dir, now)
+    const again = await numericChildren(host, `${dir}/act`)
+    if (again?.at(-1) !== n) continue
+    if (record === UNKNOWN || state === UNKNOWN) return { kind: 'unknown', reason: `act/${n} could not be read` }
+    if (live === 'unknown') return { kind: 'unknown', reason: `act/${n} beat could not be read` }
+    if (live === 'initializing') return { kind: 'initializing' }
+    let s: Partial<ActState> | undefined
+    let token: unknown
+    try {
+      s = state === undefined ? undefined : (JSON.parse(state) as Partial<ActState>)
+      token = record === undefined ? undefined : (JSON.parse(record) as { token?: unknown }).token
+    } catch {
+      return { kind: 'unknown', reason: `act/${n} is not valid JSON (half-written?)` }
+    }
+    const channel = s?.channel === 'mod' || s?.channel === 'node' || s?.channel === 'mcp' ? s.channel : undefined
+    if (s && (!channel || (s.status !== 'collecting' && s.status !== 'paused') || typeof s.token !== 'string')) {
+      return { kind: 'unknown', reason: `act/${n}.state is not a valid state` }
+    }
+    if (s && s.token !== token) return { kind: 'unknown', reason: `act/${n}.state token does not match its registration` }
+    if (s?.status === 'paused') return { kind: 'paused', channel: channel!, reason: typeof s.reason === 'string' && s.reason ? s.reason : 'no reason given' }
+    if (live === 'non-live') {
+      const st = await host.stat(`${dir}/act/${n}.beat`).catch(() => undefined)
+      return st ? { kind: 'stale', ageS: Math.max(0, Math.round((now - st.mtimeMs) / 1000)) } : { kind: 'stale' }
+    }
+    if (!s) return { kind: 'unknown', reason: `act/${n} beats but has no state (a collector older than this TUI?)` }
+    return { kind: 'collecting', channel: channel!, mode: s.mode === 'on-request' ? 'on-request' : 'auto' }
+  }
+  return { kind: 'unknown', reason: 'registrations kept changing (變動中)' }
+}
+
+// ── episode detail (plan R4.3) ─────────────────────────────────────────────────
+
+export type EpisodeDetail =
+  | { kind: 'no-episode' }
+  | { kind: 'no-result'; resultPath: string }
+  | { kind: 'error'; resultPath: string; reason: string }
+  | {
+      kind: 'result'
+      resultPath: string
+      status?: string
+      summary?: string
+      blockedReason?: string
+      /** The result names another episode than this row's. */
+      otherEpisode: boolean
+    }
+
+/** The row's episode result, read-only and whole (no SUMMARY_MAX cut). Absent and unreadable differ. */
+export async function episodeDetail(host: Host, d: TmuxDispatch): Promise<EpisodeDetail> {
+  if (!d.resultPath) return { kind: 'no-episode' }
+  const text = await readOrAbsent(host, d.resultPath)
+  if (text === UNKNOWN) return { kind: 'error', resultPath: d.resultPath, reason: 'result.json could not be read (see the log)' }
+  if (text === undefined || !text.trim()) return { kind: 'no-result', resultPath: d.resultPath }
+  const raw = parseJson(text) as
+    | { status?: unknown; summary?: unknown; blocked_reason?: unknown; episode?: unknown; body?: { status?: unknown; summary?: unknown; blocked_reason?: unknown; episode?: unknown } }
+    | undefined
+  if (!raw || typeof raw !== 'object') return { kind: 'error', resultPath: d.resultPath, reason: 'result.json is not a JSON object' }
+  const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+  const status = str(raw.status ?? raw.body?.status)
+  const summary = str(raw.summary ?? raw.body?.summary)
+  const blockedReason = str(raw.blocked_reason ?? raw.body?.blocked_reason)
+  return {
+    kind: 'result',
+    resultPath: d.resultPath,
+    ...(status ? { status } : {}),
+    ...(summary ? { summary } : {}),
+    ...(blockedReason ? { blockedReason } : {}),
+    otherEpisode: !episodeMatches(raw.episode ?? raw.body?.episode, d.seq),
+  }
 }
 
 /** A delivered teammate left alone this long is stopped (Q-1, decided 2026-09-25). */
@@ -2280,7 +2440,7 @@ export async function openTuiBeside(host: Host, pane: string | undefined): Promi
   )
   const [node, tui, entry] = found.stdout.trim().split('\n')
   if (found.exitCode !== 0 || !node || !tui || !entry) {
-    return { ok: false, text: `no node, lib/tui.node.ts or tmux-agent-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}` }
+    return { ok: false, text: `no node, lib/tui.node.ts or tmux-agent-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}; an older skill install? update it and re-run its install-bin` }
   }
   if (!pane || !/^%\d+$/.test(pane)) {
     // The root is named only when this host overrides it; the other terminal derives the default itself.
@@ -2454,12 +2614,12 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
     }
     const cancelled = open.length ? `; cancelled episode(s) ${open.join(', ')}` : ''
     return run.exitCode === 0
-      ? { ok: true, text: `stopped "${d.name}" on ${d.profile}${cancelled}; it no longer appears in /workers and nothing will be delivered for it` }
+      ? { ok: true, text: `stopped "${d.name}" on ${d.profile}${cancelled}; its row leaves the workers panel and nothing will be delivered for it` }
       : {
           ok: false,
           text:
             `stop for "${d.name}" exited ${run.exitCode} (${(run.stderr || run.stdout).trim().slice(-300)})${cancelled}; ` +
-            `the row was dropped from /workers anyway. If the tmux session is still alive, call ${STOP_TOOL} with all: true`,
+            `the row was dropped from the workers panel anyway. If the tmux session is still alive, call ${STOP_TOOL} with all: true`,
         }
   } finally {
     await releaseLock(host, `${w}/.action`, lock.token)
@@ -2613,6 +2773,8 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
       return false
     }
   }
+  // State before beat: a beat a reader sees always has its state beside it (C-health).
+  await writeActState(host, gate)
   await beat(host, dir, gate.activation, await host.now()).catch((error: unknown) => {
     host.log(`tmux-agent: could not beat: ${String(error)}`)
   })
@@ -2718,16 +2880,13 @@ export async function unlockWorker(host: Host, name: string, word?: string): Pro
   const live = h.session ? await sessionLiveness(host, sessionDirOf(v3, h.session), await host.now()) : 'unknown'
   if (live !== 'non-live') return { ok: false, text: `not unlocking "${name}": holder ${who} — its session is ${live}` }
   if (!h.pid || !h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} records no process to check` }
-  const ps = await host
-    .run(['/bin/sh', '-c', 'TZ=UTC LC_ALL=C ps -o lstart= -p "$1"', 'ps', String(h.pid)], '/', 5_000)
-    .catch(() => undefined)
-  if (!ps) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
-  const start = ps.stdout.trim()
-  if (ps.exitCode === 0 && start === h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
-  if (ps.exitCode !== 0 && start) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
+  // The shared probe: only ESRCH or a reused pid is gone; a broken ps is unknown, not dead.
+  const alive = await holderProvablyAlive(host, h)
+  if (alive === true) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
+  if (alive === undefined) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
   // Only that exact holder instance is removed (release checks the token again).
   if (!(await releaseLock(host, lock, h.token))) return { ok: false, text: `"${name}": the lock changed while checking; nothing removed` }
-  host.log(`tmux-agent: unlocked "${name}" (holder ${who}: ${ps.exitCode === 0 ? 'pid reused' : 'pid gone'})`)
+  host.log(`tmux-agent: unlocked "${name}" (holder ${who}: pid gone or reused)`)
   return { ok: true, text: `unlocked "${name}" (the holder ${who} is gone)` }
 }
 const busyText = (name: string, busy: unknown) =>
