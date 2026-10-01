@@ -83,5 +83,28 @@ release_notes_test="$(CHANGELOG_VERSION="$changelog_version" ruby -e '
 ')"
 assert "release.yml release notes pattern does not leak old 0.10.x sections" "$release_notes_test" "clean"
 
+# The MCP bundle (plan R7.1, §1c S6) is generated and committed: a rebuild must
+# reproduce its bytes and its license notice, and its banner names the release.
+# The rebuild goes to a temp dir and is compared with cmp, so the check neither
+# edits the tree nor passes on an untracked file (git diff would).
+bundle_dir=skills/tmux-agent-tools/scripts/lib
+if [[ ! -d mcp-adapter/node_modules/esbuild ]]; then
+  echo "  FAIL esbuild missing: run npm --prefix mcp-adapter ci" >&2
+  FAIL=$((FAIL + 1))
+else
+  rebuild_dir="$(mktemp -d)"
+  node mcp-adapter/build.mjs --out "$rebuild_dir"
+  for f in mcp-server.mjs mcp-server.LICENSES.txt; do
+    if cmp -s "$rebuild_dir/$f" "$bundle_dir/$f"; then same=same; else same=differs; fi
+    assert "rebuild reproduces $bundle_dir/$f (node mcp-adapter/build.mjs)" "$same" "same"
+    if git check-ignore -q "$bundle_dir/$f"; then ignored=ignored; else ignored=committable; fi
+    assert "$bundle_dir/$f is not git-ignored" "$ignored" "committable"
+  done
+  rm -rf "$rebuild_dir"
+fi
+assert "$bundle_dir/mcp-server.mjs banner version matches CHANGELOG" \
+  "$(sed -n '1s|^// tmux-agent-mcp v\([0-9.]*\)\. .*|\1|p' "$bundle_dir/mcp-server.mjs")" \
+  "$changelog_version"
+
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

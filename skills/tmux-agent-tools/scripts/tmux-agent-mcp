@@ -1,0 +1,47 @@
+#!/usr/bin/env zsh
+# tmux-agent-mcp: the tmux-agent-tools MCP server over stdio (plan R7.2).
+# It runs lib/mcp-server.mjs, the self-contained bundle that mcp-adapter/build.mjs
+# makes, so an install needs no repo checkout, npm, or node_modules.
+#
+# stdout is the MCP protocol only; every diagnostic goes to stderr.
+# Its own dir comes from `${0:A:h}` (symlinks resolved), the same as tmux-agent-tui.
+
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+NODE="${NODE:-$(command -v node 2>/dev/null || true)}"
+# The core's node floor (strip-only TypeScript), as in tmux-agent-tui.
+FLOOR_MAJOR=22
+FLOOR_MINOR=18
+
+case "${1:-}" in
+  -h|--help)
+    cat >&2 <<'EOF'
+tmux-agent-mcp - the tmux-agent-tools MCP server (stdio).
+
+Usage:
+  tmux-agent-mcp        Speak MCP on stdin/stdout. A host CLI starts it.
+
+Register it with the absolute path of this script, for example:
+  codex mcp add tmux-agent -- /abs/path/to/tmux-agent-mcp
+
+Needs Node >= 22.18 (set NODE=/path/to/node to pick one). TMUX_AGENT_DIR
+(state root) and TMUX_AGENT_SESSION (session id) are passed through unchanged.
+EOF
+    exit 0 ;;
+esac
+
+[[ -n "$NODE" && -x "$NODE" ]] || {
+  echo "tmux-agent-mcp: node not found; install Node >= $FLOOR_MAJOR.$FLOOR_MINOR or set NODE=/path/to/node" >&2
+  exit 1
+}
+version="$("$NODE" --version 2>/dev/null || true)"
+version="${version#v}"
+major="${version%%.*}"
+minor="${${version#*.}%%.*}"
+if [[ "$major" != <-> || "$minor" != <-> ]] || (( major < FLOOR_MAJOR || (major == FLOOR_MAJOR && minor < FLOOR_MINOR) )); then
+  echo "tmux-agent-mcp: node ${version:-<no version>} ($NODE) is below the floor $FLOOR_MAJOR.$FLOOR_MINOR; install a newer Node or set NODE=/path/to/node" >&2
+  exit 1
+fi
+
+exec "$NODE" "$SCRIPT_DIR/lib/mcp-server.mjs" "$@"

@@ -59,6 +59,12 @@ jobs:
             abort("#{path}: missing body") unless body.to_s.include?("agent-tmux")
           '
 
+      # test-mod-typecheck-smoke checks the node core files with @types/node from
+      # mcp-adapter's lockfile; test-version-sync-smoke (below) rebuilds the MCP
+      # bundle with its esbuild.
+      - name: Install mcp-adapter dev dependencies
+        run: npm --prefix mcp-adapter ci
+
       - name: Run wrapper self-tests
         run: |
           skills/tmux-agent-tools/scripts/agent-tmux codex self-test
@@ -539,11 +545,6 @@ jobs:
           printf '%s\n' '#!/bin/sh' 'sleep 300' > "$stub_cli_dir/codex"
           chmod +x "$stub_cli_dir/claude" "$stub_cli_dir/codex"
           echo "$stub_cli_dir" >> "$GITHUB_PATH"
-
-      # test-mod-typecheck-smoke checks the node core files with @types/node from
-      # mcp-adapter's lockfile.
-      - name: Install mcp-adapter dev dependencies
-        run: npm --prefix mcp-adapter ci
 
       - name: Run full smoke suite
         run: scripts/run-all-smokes

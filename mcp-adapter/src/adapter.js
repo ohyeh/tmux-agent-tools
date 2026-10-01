@@ -4,23 +4,12 @@ const os = require("node:os");
 const path = require("node:path");
 
 function resolveCoreModule(moduleRelPath) {
-  // README launches `node <repo>/mcp-adapter/src/server.js`, so the sibling
-  // `skills/.../scripts/lib` path is the checkout (and a marketplace clone of it).
-  // The other two are the installs `agentTmuxBin` already searches (workers.ts AGENT_TMUX_HOMES).
-  const home = os.homedir();
-  const candidates = [
-    process.env.TMUX_AGENT_CORE_DIR && path.join(process.env.TMUX_AGENT_CORE_DIR, moduleRelPath),
-    path.resolve(__dirname, "../../skills/tmux-agent-tools/scripts/lib", moduleRelPath),
-    path.join(home, ".claude/plugins/marketplaces/tmux-agent-tools/skills/tmux-agent-tools/scripts/lib", moduleRelPath),
-    path.join(home, ".agents/skills/tmux-agent-tools/scripts/lib", moduleRelPath),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return require(candidate);
-    }
-  }
-  throw new Error(`Unable to resolve core module "${moduleRelPath}". Searched paths:\n${candidates.join("\n")}`);
+  // The bundle (src/entry.mjs → scripts/lib/mcp-server.mjs) imports the core that
+  // ships beside it and hands it over here before this file runs.
+  const bundled = globalThis.__tmuxAgentCore;
+  if (bundled) return bundled[moduleRelPath];
+  // src/ runs (adapter-smoke, `node mcp-adapter/src/server.js`): the checkout's skill tree.
+  return require(path.resolve(__dirname, "../../skills/tmux-agent-tools/scripts/lib", moduleRelPath));
 }
 
 const {

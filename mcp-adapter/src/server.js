@@ -22,7 +22,8 @@ function toolResult(value) {
 function createServer() {
   const server = new McpServer({
     name: "codex-tmux-agent-adapter",
-    version: "1.0.0",
+    // build.mjs defines this as the release version; src/ runs report the package version.
+    version: typeof __TMUX_AGENT_VERSION__ === "string" ? __TMUX_AGENT_VERSION__ : "1.0.0",
   });
 
   server.registerTool("spawn_tmux_agent", {
@@ -87,4 +88,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer };
+module.exports = { createServer, main };

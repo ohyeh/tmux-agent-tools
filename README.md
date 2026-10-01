@@ -219,6 +219,27 @@ update the skill (`npx skills update`, or `claude plugin update`), run
 `install-bin ~/.local/bin` again. `agent-tmux <cli> doctor` and `setup` list the
 bundle scripts that `~/.local/bin` is missing.
 
+## MCP server
+
+`tmux-agent-mcp` is the workers lifecycle as an MCP server over stdio
+(`spawn_tmux_agent`, `send_tmux_agent`, `wait_tmux_agent`, `read_tmux_agent`,
+`close_tmux_agent`). It runs `lib/mcp-server.mjs`, one self-contained file
+(the MCP SDK and zod bundled; licenses in `lib/mcp-server.LICENSES.txt`) that
+loads the core `.ts` files beside it. An install of the skill is enough: no repo
+checkout, no `npm install`, no `node_modules`. Needs Node >= 22.18. Its stdout
+is the MCP protocol only; diagnostics go to stderr.
+
+Register it with its absolute path, for example:
+
+```bash
+codex mcp add tmux-agent -- /abs/path/to/skills/tmux-agent-tools/scripts/tmux-agent-mcp
+```
+
+The bundle is generated: after a change in `mcp-adapter/src` or a version bump,
+run `npm --prefix mcp-adapter ci && node mcp-adapter/build.mjs` and commit the
+result. `scripts/test-version-sync-smoke` fails when a rebuild does not
+reproduce the committed bytes.
+
 ## Usage
 
 ```bash

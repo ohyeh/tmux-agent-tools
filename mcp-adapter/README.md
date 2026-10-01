@@ -10,17 +10,26 @@ Small MCP server exposing a Codex-shaped lifecycle over `tmux-agent-tools` worke
 
 ## Installation
 
-Install dependencies, then register the adapter with each host:
+The install layout is the bundle: `skills/tmux-agent-tools/scripts/tmux-agent-mcp` runs `scripts/lib/mcp-server.mjs`, which needs no `npm install`. Register it with its absolute path (MCP registration is stored in the host CLI config and must resolve from any working directory):
 
 ```sh
-npm install
-codex mcp add tmux-agent-adapter -- node <repo>/mcp-adapter/src/server.js
-claude mcp add tmux-agent-adapter node <repo>/mcp-adapter/src/server.js
+codex mcp add tmux-agent -- /abs/path/to/skills/tmux-agent-tools/scripts/tmux-agent-mcp
 ```
 
-Substitute `<repo>/mcp-adapter/src/server.js` with the real absolute path on your machine because MCP registration is stored in the host CLI config and must resolve from any working directory.
+## Build
 
-That launch path is the install layout. `mcp-adapter/src/adapter.js` loads the core from `../../skills/tmux-agent-tools/scripts/lib/*.ts` (the repo, or a marketplace clone of it). If that file is missing it tries the same two installs `agent-tmux` already uses: `~/.claude/plugins/marketplaces/tmux-agent-tools/skills/tmux-agent-tools/scripts/lib` and `~/.agents/skills/tmux-agent-tools/scripts/lib`. `TMUX_AGENT_CORE_DIR` overrides both.
+`build.mjs` bundles `src/entry.mjs` (this adapter, the MCP SDK and zod) with esbuild into `skills/tmux-agent-tools/scripts/lib/mcp-server.mjs`, and writes the bundled packages' licenses to `mcp-server.LICENSES.txt` beside it. The core is not bundled: `entry.mjs` imports `workers.ts`, `ledger.ts` and `host.node.ts` from the bundle's own directory (symlinks resolved) with Node's type stripping. The build is deterministic and embeds the release version (`.claude-plugin/plugin.json`), so after a source change or a version bump run it and commit both files:
+
+```sh
+npm ci
+node build.mjs            # or: node build.mjs --out <dir>
+```
+
+`scripts/test-version-sync-smoke` rebuilds to a temp dir and fails when the bytes differ; `scripts/test-mcp-bundle-smoke` runs the bundle from a copy of only the skill dir.
+
+## Development
+
+`node mcp-adapter/src/server.js` runs from source and loads the core from `../../skills/tmux-agent-tools/scripts/lib/*.ts` in the checkout (needs `npm ci` here). `npm test` drives that path.
 
 ## Why this is the real native extension point
 
