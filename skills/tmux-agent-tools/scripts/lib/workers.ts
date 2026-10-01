@@ -3229,32 +3229,14 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
     host.log(`tmux-agent: could not list ${aside}: ${String(error)}`)
     return undefined
   })
-  const late = moved ? moved.find(e => !e.name.startsWith('worker.json.')) : { name: '(unlistable)' }
+  const late = moved ? moved.find(e => !e.name.startsWith('worker.json.')) : { name: '' }
   if (late) {
-    // Put back without ever landing inside another dir (`mv aside w` nests when w exists, Sol R5-1):
-    // win the name with an exclusive mkdir first, then move each entry into that empty dir.
-    const keep = (why: string) => ({ ok: false, text: `"${name}" changed while clearing (${late.name}); ${why}; it is kept at ${aside}` })
-    if (!moved) return keep('the moved dir could not be listed')
-    const won = await mkdirExclusive(host, w)
-    if (won !== 'won') return keep(won === 'lost' ? `a new reservation took "${name}" meanwhile` : `${w} could not be re-created (see the log)`)
-    const done: string[] = []
-    for (const e of moved) {
-      const m = await run(['mv', `${aside}/${e.name}`, `${w}/${e.name}`])
-      if (m.exitCode === 0) {
-        done.push(e.name)
-        continue
-      }
-      // Never leave the record split across two dirs: undo the moves made so far.
-      const stuck: string[] = []
-      for (const n of done) if ((await run(['mv', `${w}/${n}`, `${aside}/${n}`])).exitCode !== 0) stuck.push(n)
-      const fail = `moving ${e.name} back failed: ${m.stderr.trim() || `exit ${m.exitCode}`}`
-      if (stuck.length) return { ok: false, text: `"${name}" changed while clearing (${late.name}); ${fail}; split: ${stuck.join(', ')} in ${w}, the rest in ${aside}` }
-      await run(['rmdir', w])
-      return keep(fail)
-    }
-    const rd = await run(['rmdir', aside])
-    if (rd.exitCode !== 0) host.log(`tmux-agent: could not remove the empty ${aside}: ${rd.stderr.trim() || `exit ${rd.exitCode}`}`)
-    return { ok: false, text: `"${name}" changed while clearing (${late.name}); put back, nothing is cleared` }
+    // Keep the moved dir whole and say where it is (Sol R6-1): an automatic put-back can race a
+    // delayed writer that re-creates the name, and overwrite its record. A human restores it.
+    const why = moved ? `changed while clearing (${late.name})` : 'could not be re-listed after the move (see the log)'
+    const text = `"${name}" ${why}; it is kept whole at ${aside}; nothing is cleared (to restore: mv ${aside} ${w}, after checking ${w} does not exist)`
+    host.log(`tmux-agent: ${text}`)
+    return { ok: false, text }
   }
   const rm = await run(['rm', '-rf', aside])
   if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${aside}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }

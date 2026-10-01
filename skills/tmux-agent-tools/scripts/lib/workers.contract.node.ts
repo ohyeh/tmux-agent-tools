@@ -1894,7 +1894,7 @@ test('R4-10: a worker dir without worker.json is an unknown maintenance row; cle
   assert.ok(!(await clearIncomplete(w.host, real.name)).ok, 'a complete worker is never cleared this way')
 })
 
-test('R4-10 fence: a worker.json published while clearing is put back, never removed', async () => {
+test('R4-10 fence: a worker.json published while clearing is kept whole aside, never removed', async () => {
   const w = world()
   const dir = `${w.v3}/late.abcde`
   mkdirSync(dir, { recursive: true })
@@ -1902,58 +1902,38 @@ test('R4-10 fence: a worker.json published while clearing is put back, never rem
   utimesSync(dir, old, old)
   // The writer's rename lands just before the move: the moved dir now holds worker.json.
   const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
-    if (argv[0] === 'mv' && argv[1] === dir) writeFileSync(`${dir}/worker.json`, '{}')
+    if (argv[0] === 'mv' && argv[1] === dir) writeFileSync(`${dir}/worker.json`, JSON.stringify({ owner: 'A' }))
     return w.host.run(argv, cwd, ms)
   } }
   const r = await clearIncomplete(host, 'late.abcde')
-  assert.ok(!r.ok && /changed while clearing \(worker\.json\); put back/.test(r.text), r.text)
-  assert.ok(existsSync(`${dir}/worker.json`), 'the published record is back in place')
+  assert.ok(!r.ok && /changed while clearing \(worker\.json\); it is kept whole at .*\.clearing\.late\.abcde\..*; nothing is cleared \(to restore: mv /.test(r.text), r.text)
+  const aside = r.text.match(/kept whole at (\S+);/)![1]!
+  assert.equal(JSON.parse(readFileSync(`${aside}/worker.json`, 'utf8')).owner, 'A', 'the published record is kept')
+  assert.equal(existsSync(dir), false, 'nothing is put back automatically')
 })
 
-test('Sol R5-1: put back never nests into a new same-name reservation; it keeps the moved dir and says where', async () => {
+test('Sol R6-1: a delayed writer that re-creates the name meanwhile is never overwritten by the kept record', async () => {
   const w = world()
   const dir = `${w.v3}/aba.abcde`
   mkdirSync(dir, { recursive: true })
   const old = new Date(Date.now() - 3 * ORPHAN_MS)
   utimesSync(dir, old, old)
-  // The original writer publishes just before the move; a new reserve then takes the same name.
+  // A publishes into the moved dir; B (delayed) re-creates the name with its own record.
   const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
     const r = await w.host.run(argv, cwd, ms)
     if (argv[0] === 'mv' && argv[1] === dir && r.exitCode === 0) {
-      writeFileSync(`${argv[2]}/worker.json`, JSON.stringify({ owner: 'OLD' }))
+      writeFileSync(`${argv[2]}/worker.json`, JSON.stringify({ owner: 'A' }))
       mkdirSync(dir)
-      writeFileSync(`${dir}/worker.json`, JSON.stringify({ owner: 'NEW' }))
+      writeFileSync(`${dir}/worker.json`, JSON.stringify({ owner: 'B' }))
     }
     return r
   } }
   const r = await clearIncomplete(host, 'aba.abcde')
-  assert.ok(!r.ok && /a new reservation took "aba\.abcde" meanwhile; it is kept at .*\.clearing\.aba\.abcde\./.test(r.text), r.text)
-  assert.deepEqual(readdirSync(dir), ['worker.json'], 'nothing nested inside the new reservation')
-  assert.equal(JSON.parse(readFileSync(`${dir}/worker.json`, 'utf8')).owner, 'NEW')
-  const aside = r.text.match(/kept at (\S+)$/)![1]!
-  assert.equal(JSON.parse(readFileSync(`${aside}/worker.json`, 'utf8')).owner, 'OLD', 'the old record is kept, not lost')
-})
-
-test('put-back that fails midway undoes its moves: the record is never split across two dirs', async () => {
-  const w = world()
-  const dir = `${w.v3}/split.abcde`
-  mkdirSync(dir, { recursive: true })
-  const old = new Date(Date.now() - 3 * ORPHAN_MS)
-  utimesSync(dir, old, old)
-  const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
-    if (argv[0] === 'mv' && argv[1] === dir) {
-      writeFileSync(`${dir}/worker.json`, '{}')
-      writeFileSync(`${dir}/worker.json.tmp1`, '{}')
-    }
-    // The second entry's move back fails.
-    if (argv[0] === 'mv' && argv[2] === `${dir}/${'worker.json.tmp1'}`) return { exitCode: 1, stdout: '', stderr: 'injected EIO' }
-    return w.host.run(argv, cwd, ms)
-  } }
-  const r = await clearIncomplete(host, 'split.abcde')
-  assert.ok(!r.ok && /moving worker\.json\.tmp1 back failed: injected EIO; it is kept at /.test(r.text), r.text)
-  const aside = r.text.match(/kept at (\S+)$/)![1]!
-  assert.deepEqual(readdirSync(aside).sort(), ['worker.json', 'worker.json.tmp1'], 'every entry is back in the kept dir')
-  assert.equal(existsSync(dir), false, 'no half dir left at the name')
+  assert.ok(!r.ok && /kept whole at /.test(r.text), r.text)
+  assert.deepEqual(readdirSync(dir), ['worker.json'], 'nothing moved into the new dir')
+  assert.equal(JSON.parse(readFileSync(`${dir}/worker.json`, 'utf8')).owner, 'B', "B's record is untouched")
+  const aside = r.text.match(/kept whole at (\S+);/)![1]!
+  assert.equal(JSON.parse(readFileSync(`${aside}/worker.json`, 'utf8')).owner, 'A', "A's record is kept, not lost")
 })
 
 test('Sol R5-1: a writer that publishes after the clear leaves a complete worker, never a half-cleared dir', async () => {
