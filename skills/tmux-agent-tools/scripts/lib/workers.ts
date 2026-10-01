@@ -2250,6 +2250,56 @@ export function stopButtonLabel(name: string, armed: boolean): string {
   return armed ? `stop ${name}? press again` : 'stop'
 }
 
+/**
+ * `[ ⧉ tui ]`: the full-screen TUI in a tmux split beside the host pane, bound
+ * to this session. No launcher: in Claude Code the mod is the collector, and the
+ * launcher's second collector would deliver one result twice. The TUI is the
+ * `lib/tui.node.ts` beside the `agent-tmux` this mod already runs (PATH, the
+ * marketplace checkout, or an `npx skills` folder; a symlink is resolved), so it
+ * follows however the wrapper was installed. Not in tmux: the command to run.
+ */
+export async function openTuiBeside(host: Host, pane: string | undefined): Promise<Outcome> {
+  const session = host.owner()
+  const cwd = host.cwd()
+  if (!session || !cwd) return { ok: false, text: 'no session id or cwd yet' }
+  const { bin, missing } = await agentTmuxBin(host)
+  if (missing) return { ok: false, text: missing }
+  const found = await host.run(
+    [
+      '/bin/sh',
+      '-c',
+      'w=$(command -v "$1") && w=$(realpath "$w") && t="${w%/*}/lib/tui.node.ts" && [ -f "$t" ] && n=$(command -v node) && printf "%s\\n%s\\n" "$n" "$t"',
+      'sh',
+      bin,
+    ],
+    cwd,
+    5_000,
+  )
+  const [node, tui] = found.stdout.trim().split('\n')
+  if (found.exitCode !== 0 || !node || !tui) {
+    return { ok: false, text: `no node or lib/tui.node.ts beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}` }
+  }
+  if (!pane || !/^%\d+$/.test(pane)) {
+    // `~` for HOME: the toast keeps 200 chars, and a marketplace path would push the id off the end.
+    const home = await host.envHome()
+    const short = (p: string) => (home && p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p)
+    return { ok: false, text: `not inside tmux; in another terminal run: ${short(node)} ${short(tui)} --session ${session}` }
+  }
+  const root = await rootOf(host)
+  const split = await host.run(
+    [
+      'tmux', 'split-window', '-t', pane, '-h', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
+      '-e', `TMUX_AGENT_SESSION=${session}`,
+      ...(root ? ['-e', `TMUX_AGENT_DIR=${root}`] : []),
+      node, tui, '--session', session, '--cwd', cwd,
+    ],
+    cwd,
+    5_000,
+  )
+  if (split.exitCode !== 0) return { ok: false, text: `tmux split-window: ${split.stderr.trim() || `exit ${split.exitCode}`}` }
+  return { ok: true, text: `TUI in ${split.stdout.trim()} beside ${pane}` }
+}
+
 export async function rememberPanel(host: Host, open: boolean): Promise<void> {
   const id = host.owner()
   if (!id) return

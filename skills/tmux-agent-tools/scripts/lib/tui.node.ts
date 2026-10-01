@@ -383,9 +383,9 @@ export function renderTuiLines(
   const clearable = state.rows.some(r => !r.project)
   const clearArmed = state.armedStop?.id === CLEAR_ID && now < state.armedStop.until
   const clearLabel = clearButtonLabel(clearArmed)
-  const clearBtn = clearable ? `[ ${clearLabel} ]` : ''
+  const clearBtn = clearable ? `[ ✕ ${clearLabel} ]` : ''
 
-  const btnParts = ['[ + ]', '[ refresh ]']
+  const btnParts = ['[ + new ]', '[ ↻ refresh ]']
   if (clearBtn) btnParts.push(clearBtn)
   btnParts.push('[ quit ]')
   const buttonsStr = btnParts.join(' ')
@@ -489,10 +489,10 @@ export function renderTuiLines(
       }
       const ctrlParts: string[] = []
       if (r.state === 'running' || r.state === 'stalled') {
-        ctrlParts.push('[ interrupt ]')
+        ctrlParts.push('[ ↯ interrupt ]')
       }
       const armed = state.armedStop?.id === r.id && now < state.armedStop.until
-      ctrlParts.push(`[ ${stopButtonLabel(r.d.name, armed)} ]`)
+      ctrlParts.push(`[ ✕ ${stopButtonLabel(r.d.name, armed)} ]`)
       if (armed) {
         const secs = Math.ceil((state.armedStop!.until - now) / 1000)
         ctrlParts.push(`\x1b[31mends its tmux session · ${secs}s\x1b[0m`)

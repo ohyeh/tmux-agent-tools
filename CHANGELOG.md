@@ -3,6 +3,8 @@
 ## Unreleased
 
 - `assign`: a CLI not up by `AGENT_TMUX_START_READY_TIMEOUT` (default 45s) is no longer judged failed. The brief stays unsent, the worker is left running, and the diagnostic names the `send --from-file` command that sends it by hand, so the agent decides from the pane (a self-update or slow sign-in can outlast any fixed window; cursor-agent did on 2026-09-30). A CLI that exits during boot fails at once as an exit. `scripts/test-assign-dialog-smoke` covers both.
+- mod `[ ⧉ ]` (plan P7, hotkey `t`): opens the full-screen TUI in a tmux split beside the host pane, bound to this session, focus left on the host. No launcher: the mod is the collector in Claude Code, and the launcher's second collector could deliver a result twice. The TUI is found beside the `agent-tmux` the mod already runs (PATH, marketplace checkout, or an `npx skills` folder; symlinks resolved), so it follows the install. Outside tmux nothing is split and the toast names the command for another terminal. `permissions.txt` adds the `TMUX_PANE` env read. Tests: `register.test.ts` (split argv, no launcher; outside-tmux command).
+- Button labels: band and TUI share one glyph set — `+ new`, `↻ refresh`, `⧉ tui`, `✕ clear`, `✕ stop`, `↯ interrupt`; `hide` is dim. On a short band the words go first (glyphs stay), then the name; the counts never. Every glyph is East Asian Width N (one cell in a CJK terminal).
 
 ## v0.42.0 - 2026-09-30
 

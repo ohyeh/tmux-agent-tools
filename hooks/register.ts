@@ -64,6 +64,7 @@ import {
   rowLabel,
   clearButtonLabel,
   stopButtonLabel,
+  openTuiBeside,
   rememberPanel,
   tellWorker,
   stopAll,
@@ -571,16 +572,21 @@ export const register: Register = on => {
     // `[ clear ]` stops every worker this mod started; drawn only when there is one.
     const clearable = panel.rows.some(r => !r.project)
     const clearArmed = panel.armedStop?.id === CLEAR_ID && now < panel.armedStop.until
-    const clearLabel = clearButtonLabel(clearArmed)
-    const buttonCells =
-      displayCells('[ + ]') +
-      displayCells('[ refresh ]') +
+    const clearLabel = `✕ ${clearButtonLabel(clearArmed)}`
+    // One glyph per action, every glyph one cell (East Asian Width N, so a CJK
+    // terminal does not widen it). What goes first when the bar is short: the
+    // words beside a glyph, then the name; the counts never.
+    const cellsOf = (words: boolean) =>
+      displayCells(words ? '[ + new ][ ↻ refresh ][ ⧉ tui ]' : '[ + ][ ↻ ][ ⧉ ]') +
       (clearable ? displayCells(`[ ${clearLabel} ]`) : 0) +
       displayCells('[ hide ]') +
       displayCells(' [-]')
-    // Too narrow for the name and version (60 columns: 69 cells): the counts are
-    // what the bar is for, so the name goes first, never a count.
     const full = ` workers v${MOD_VERSION} · ${counts} `
+    const words = displayCells(full) + cellsOf(true) <= width
+    const addLabel = words ? '+ new' : '+'
+    const refreshLabel = words ? '↻ refresh' : '↻'
+    const tuiLabel = words ? '⧉ tui' : '⧉'
+    const buttonCells = cellsOf(words)
     const titleText = displayCells(full) + buttonCells <= width ? full : ` ${counts} `
     const titleCells = displayCells(titleText) + buttonCells
     const hintRoom = Math.max(0, width - titleCells)
@@ -603,7 +609,7 @@ export const register: Register = on => {
           // Resume a CLI session by id as a teammate; the field is one row below.
           Button({
             key: 'add',
-            label: '+',
+            label: addLabel,
             hotkey: 'n',
             onPress: () => {
               panel.adding = !panel.adding
@@ -614,7 +620,7 @@ export const register: Register = on => {
           // again would (asked 2026-09-29), and a pending confirm is dropped.
           Button({
             key: 'refresh',
-            label: 'refresh',
+            label: refreshLabel,
             hotkey: 'r',
             onPress: () => {
               panel.selected = undefined
@@ -623,6 +629,14 @@ export const register: Register = on => {
               $.ui.invalidate('ui.render')
               void panel.refresh?.()
             },
+          }),
+          // The full-screen TUI beside this pane (plan P7); outside tmux the toast
+          // names the command to run in another terminal.
+          Button({
+            key: 'tui',
+            label: tuiLabel,
+            hotkey: 't',
+            onPress: () => void act('tui', async host => openTuiBeside(host, await $.env.get('TMUX_PANE'))),
           }),
           ...(clearable
             ? [
@@ -644,7 +658,7 @@ export const register: Register = on => {
           Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
           // Last and apart from refresh: hiding is undone by /workers, but it should
           // not sit one key away from the button people press most.
-          Button({ key: 'close', label: 'hide', hotkey: 'q', onPress: () => void panel.close?.() }),
+          Button({ key: 'close', label: 'hide', hotkey: 'q', dimColor: true, onPress: () => void panel.close?.() }),
         ],
       }),
     )
@@ -783,7 +797,7 @@ export const register: Register = on => {
                   Text({ children: '  ' }),
                   Button({
                     key: `interrupt:${r.id}`,
-                    label: 'interrupt',
+                    label: '↯ interrupt',
                     hotkey: 'i',
                     onPress: () => void act(`interrupt ${r.d.name}`, host => interruptWorker(host, r.d)),
                   }),
@@ -792,7 +806,7 @@ export const register: Register = on => {
             Text({ children: '  ' }),
             Button({
               key: `stop:${r.id}`,
-              label: stopButtonLabel(r.d.name, armed),
+              label: `✕ ${stopButtonLabel(r.d.name, armed)}`,
               hotkey: 'x',
               onPress: () => pressTwice(r.id, () => void act(`stop ${r.d.name}`, host => stopWorker(host, gate, r.d))),
             }),

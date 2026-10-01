@@ -1772,6 +1772,9 @@ function mockPanel(
     argv.push(e.argv)
     // grep over a session log (resume's cwd lookup): `probe.grep` is its stdout.
     if (e.argv[0] === 'grep') return { value: { exitCode: typeof probe.grep === 'string' ? 0 : 1, stdout: typeof probe.grep === 'string' ? probe.grep : '', stderr: '' } }
+    // `[ ⧉ ]`: the node + tui.node.ts lookup is `probe.sh`; the split names a pane.
+    if (e.argv[0] === '/bin/sh' && typeof probe.sh === 'string') return { value: { exitCode: 0, stdout: probe.sh, stderr: '' } }
+    if (e.argv[0] === 'tmux' && e.argv[1] === 'split-window') return { value: { exitCode: 0, stdout: '%9\n', stderr: '' } }
     const isList = e.argv[0] === 'tmux' && e.argv[1] === 'list-sessions'
     const isCapturePane = e.argv[0] === 'tmux' && e.argv[1] === 'capture-pane'
     const isCapture = e.argv.includes('capture') || isCapturePane
@@ -3895,6 +3898,46 @@ describe('cursor review of 34e2a1e', () => {
       return p.label !== undefined ? `[ ${p.label} ]`.length : textOf(c).length
     })
     expect(cells.reduce((a, b) => a + b, 0), 'title bar plus the engine\'s " [-]" fit 80 columns').toBeLessThanOrEqual(80 - ' [-]'.length)
+  })
+
+  const TUI_SH = '/opt/node/bin/node\n/skills/tmux-agent-tools/scripts/lib/tui.node.ts\n'
+
+  test('[ ⧉ ] splits the host pane with the TUI bound to this session (P7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME, TMUX_PANE: '%5' })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    expect(keysOf(await $.ui.render(bandRender()))).toContain('tui')
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
+    const split = p.argv.find(a => a[0] === 'tmux' && a[1] === 'split-window')
+    expect(split, 'one split-window, no launcher (the mod is the collector)').toBeDefined()
+    expect(p.argv.some(a => a.some(x => x.includes('launcher.node.ts')))).toBe(false)
+    const s = split ?? []
+    expect(s.slice(2, 5)).toEqual(['-t', '%5', '-h'])
+    expect(s).toContain(`TMUX_AGENT_SESSION=${s[s.indexOf('--session') + 1]}`)
+    expect(s.slice(s.indexOf('/opt/node/bin/node'), s.indexOf('/opt/node/bin/node') + 2)).toEqual([
+      '/opt/node/bin/node',
+      '/skills/tmux-agent-tools/scripts/lib/tui.node.ts',
+    ])
+  })
+
+  test('[ ⧉ ] outside tmux splits nothing and names the command to run', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
+    expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
+    expect(p.logs.join('\n')).toContain('not inside tmux; in another terminal run: /opt/node/bin/node /skills/tmux-agent-tools/scripts/lib/tui.node.ts --session ')
   })
 })
 

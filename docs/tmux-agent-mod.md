@@ -68,7 +68,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 | 面 | 用途 |
 |---|---|
-| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上） |
+| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上）；按 `[ ⧉ ]` 時一次 `/bin/sh -c` 找 `node` 和 `agent-tmux` 旁的 `lib/tui.node.ts`，再一次 `tmux split-window` |
 | `fs.read/write/list/stat` | 寫只在 state root 的 `.v3/` 底下：`worker.json`、每輪的 `dispatch.json`／`tell.md`／`waiter`、`brief.md`、`launch.exit`、`mod-assign.log`、`result.json`、activation 心跳。建目錄、`ln -sn` 鎖、`mv` 發佈、`rm` 走 `process.run`（引擎的 `fs` 沒有 mkdir／rename）。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
 | `fs.exists` | state root 之外兩種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；以及 `resume` 找 session id 在哪個 CLI 的 store（下面 `[ + ]` 那節列的路徑）。只問「在不在」 |
 | `store.get/set/keys/delete` | 只放 UI 偏好：面板開著沒（`tmux-agent.panel`）。交付帳不在 store（見上面 `.v3/`） |
@@ -433,6 +433,21 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 第一次變成 `clear all? press again`，5 秒內再按一次才執行。它停掉的是這個專案裡這個 mod
 派出、還有 tmux session 的每個 worker，等同 `mcp__tmux-agent__stop` 帶 `all: true`。
 `shell` 列和專案列都不算，因為那些不是 mod 派的。沒有 worker 時這顆按鈕不畫。
+
+### `[ ⧉ ]`：在旁邊開全螢幕 TUI（plan P7）
+
+標題列的 `[ ⧉ ]`（hotkey `t`）把 Claude Code 所在的 tmux pane（`$TMUX_PANE`）切一半，
+右邊跑 `lib/tui.node.ts --session <這個 session>`，焦點留在左邊。不走 launcher：在
+Claude Code 裡 mod 自己就是 collector，launcher 會再起一個，同一份結果可能送兩次；TUI
+只看不收（`collector health unknown — this view does not collect`）。
+
+TUI 的位置跟著 mod 已經在用的 `agent-tmux` 走（`PATH`、marketplace checkout、
+`npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。不在 tmux 裡時
+什麼都不切，toast 給出另一個終端機要跑的那一行 `node …/tui.node.ts --session <id>`。
+
+按鈕字樣：寬的終端機是 `[ + new ][ ↻ refresh ][ ⧉ tui ]`，放不下時只留符號；先讓出
+的是按鈕的字，再來是 `workers v…` 名稱，計數永遠留著。符號都是 East Asian Width N，
+CJK 終端機也只佔一格。`[ hide ]` 畫成 dim（次要動作）。
 
 ### `[ + ]`：按 session id 接回成隊友 (0.11.0)
 
