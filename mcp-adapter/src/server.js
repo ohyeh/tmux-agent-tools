@@ -8,11 +8,13 @@ const {
   ensureAdapterLive,
   getHost,
   readTmuxAgent,
+  retireSession,
   sendTmuxAgent,
   settleAllUnsent,
   settleWhenWritten,
   spawnTmuxAgent,
   waitTmuxAgent,
+  WAIT_CAP_SEC,
 } = require("./adapter");
 
 /**
@@ -20,18 +22,30 @@ const {
  * `write` returns true, before the bytes reach the pipe; this one resolves on the
  * write callback. A parked wait ack (adapter.js `holdAck`) runs once the response to
  * its request is flushed as a success; an error response, a write error or a close
- * settles it unsent.
+ * settles it unsent. A closed stdin or a broken stdout means the host is gone (R8 F3):
+ * `onhostgone(reason)` fires once per cause so `main` can shut down in order; a stdout
+ * 'error' always has a listener, so a late write to a dead pipe cannot crash the process.
  */
 class AckingStdioTransport extends StdioServerTransport {
   constructor(stdin = process.stdin, stdout = process.stdout) {
     super(stdin, stdout);
     this.out = stdout;
+    this.closing = new Promise((resolve) => { this.markClosing = resolve; });
+    const gone = (reason) => this.onhostgone?.(reason);
+    stdin.once("end", () => gone("stdin ended"));
+    stdin.once("close", () => gone("stdin closed"));
+    stdout.on?.("error", (err) => gone(`stdout error: ${err.message}`));
   }
 
   send(message) {
-    const written = new Promise((resolve) => {
-      this.out.write(serializeMessage(message), (err) => resolve(err || null));
-    });
+    // A write callback that never returns must not outlive close(); a sync throw is a write error.
+    const written = Promise.race([new Promise((resolve) => {
+      try {
+        this.out.write(serializeMessage(message), (err) => resolve(err || null));
+      } catch (err) {
+        resolve(err);
+      }
+    }), this.closing]);
     const response = message.id !== undefined && ("result" in message || "error" in message);
     const acked = response
       ? settleWhenWritten(message.id, written.then((err) => !err && "result" in message && !message.result?.isError))
@@ -43,6 +57,7 @@ class AckingStdioTransport extends StdioServerTransport {
   }
 
   async close() {
+    this.markClosing(new Error("transport closed"));
     await settleAllUnsent();
     return super.close();
   }
@@ -88,7 +103,8 @@ function createServer() {
     title: "Wait for tmux-agent-tools worker",
     description:
       "Wait for one episode's result (seq from spawn/send; default: the latest at call time). " +
-      "At-least-once: a re-report carries the same delivery_id; dedup by it.",
+      `At-least-once: a re-report carries the same delivery_id; dedup by it. One call waits at most ${WAIT_CAP_SEC}s; ` +
+      'if it returns {status:"pending"} (reason "wait_again" or "starting"), call it again with the same agent_id and seq.',
     inputSchema: {
       agent_id: z.string().min(1),
       timeoutSec: z.number().int().nonnegative().optional(),
@@ -116,9 +132,25 @@ function createServer() {
   return server;
 }
 
-async function main(transport = new AckingStdioTransport()) {
+/**
+ * The host going away (stdin end/close, stdout error) is an orderly shutdown, not a crash
+ * and not an orphan: settle unsent responses as not-acked (the next owner re-reports the
+ * same delivery_id), free this session's claim, exit. Bounded, so a stuck cleanup cannot
+ * keep the process alive.
+ */
+async function main(transport = new AckingStdioTransport(), exit = process.exit) {
   await ensureAdapterLive(await getHost());
   const server = createServer();
+  let stopping;
+  transport.onhostgone = (reason) => {
+    stopping ??= (async () => {
+      process.stderr.write(`[mcp-adapter] host gone (${reason}); shutting down\n`);
+      const cleanup = transport.close().then(retireSession);
+      const bound = new Promise((resolve) => setTimeout(resolve, 5000).unref());
+      await Promise.race([cleanup, bound]).catch((err) => process.stderr.write(`[mcp-adapter] shutdown: ${err}\n`));
+      exit(0);
+    })();
+  };
   await server.connect(transport);
 }
 

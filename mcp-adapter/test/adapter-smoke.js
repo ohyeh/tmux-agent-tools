@@ -10,6 +10,7 @@ const {
   NO_BACKGROUND_JOBS_GUARD,
   NO_CASCADE_GUARD,
   NO_EXTERNAL_SIDE_EFFECTS_GUARD,
+  WAIT_CAP_SEC,
   closeTmuxAgent,
   getHost,
   readTmuxAgent,
@@ -382,10 +383,7 @@ async function testRestartWaitsOnWorkerFromBeforeRestart() {
   const owner1 = workerOwner(dir, sp.agent_id);
   const s2 = await startServer(dir);
   try {
-    const early = await call(s2, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
-    assert.deepEqual([early.status, early.reason], ["failed", "not_owner"], "the old owner's beat is still fresh");
-    assert.equal(early.detail.owner, owner1);
-    assert.ok(ageSessionBeats(dir) >= 2);
+    // s1 closed in order (stdin ended): it retired its beat, so the claim is free at once.
     const w = await call(s2, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 1 });
     assert.equal(w.status, "completed");
     assert.equal(w.body.summary, "survived restart");
@@ -505,7 +503,6 @@ async function testAckBoundariesInProcess() {
   const overlap = waitTmuxAgent(sp1.agent_id, 1, { seq: 1 });
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(doneAck(dir, sp1.agent_id), false, "write returned, callback pending: no ack yet");
-  p1.ac.abort(); // a cancel that lands mid-write changes nothing
   pendingCb();
   await sending;
   assert.ok(doneAck(dir, sp1.agent_id), "acked after the write callback");
@@ -557,11 +554,94 @@ async function testAckBoundariesInProcess() {
   await transport(() => {}).close();
   await reReport(sp6, p6.w, "transport close");
   assert.ok(writes.length >= 4);
+
+  const promptly = async (sp, w, why) => {
+    const again = await Promise.race([
+      waitTmuxAgent(sp.agent_id, 0, { seq: 1 }),
+      new Promise((r) => setTimeout(() => r({ status: "hung" }), 3000)),
+    ]);
+    assert.equal(again.status, "completed", `${why}: next wait(timeoutSec=0) is not stuck`);
+    assert.equal(again.delivery_id, w.delivery_id, `${why}: same delivery_id`);
+  };
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(String(e));
+  process.on("unhandledRejection", onUnhandled);
+
+  // 7. Close while the write callback never returns; abort and a late error callback follow.
+  const sp7 = await finished("r73-midwrite-close");
+  const p7 = await parked(sp7);
+  let cb7;
+  const t7 = transport((cb) => (cb7 = cb));
+  const sending7 = t7.send({ jsonrpc: "2.0", id: p7.requestId, result: { structuredContent: p7.w, content: [] } });
+  await t7.close();
+  p7.ac.abort();
+  await assert.rejects(
+    Promise.race([sending7, new Promise((_, rej) => setTimeout(() => rej(new Error("send hung after close")), 3000))]),
+    /closed/,
+    "close settles the in-flight send",
+  );
+  assert.equal(doneAck(dir, sp7.agent_id), false, "mid-write close: no ack");
+  await promptly(sp7, p7.w, "mid-write close");
+  cb7(new Error("EPIPE late (injected)")); // error callback after close: no double settle
+  await new Promise((r) => setTimeout(r, 50));
+
+  // 8. Cancel while the write callback never returns (no close).
+  const sp8 = await finished("r73-midwrite-abort");
+  const p8 = await parked(sp8);
+  const t8 = transport(() => {});
+  void t8.send({ jsonrpc: "2.0", id: p8.requestId, result: { structuredContent: p8.w, content: [] } });
+  p8.ac.abort();
+  await promptly(sp8, p8.w, "mid-write abort");
+
+  // 9. stdout.write throws synchronously.
+  const sp9 = await finished("r73-syncthrow");
+  const p9 = await parked(sp9);
+  const t9 = new AckingStdioTransport(new PassThrough(), { write() { throw new Error("ERR_STREAM_DESTROYED (injected)"); } });
+  await assert.rejects(t9.send({ jsonrpc: "2.0", id: p9.requestId, result: { structuredContent: p9.w, content: [] } }), /ERR_STREAM_DESTROYED/);
+  assert.equal(doneAck(dir, sp9.agent_id), false, "sync throw: no ack");
+  await promptly(sp9, p9.w, "sync write throw");
+
+  await new Promise((r) => setTimeout(r, 50));
+  process.off("unhandledRejection", onUnhandled);
+  assert.deepEqual(unhandled, [], "no unhandled rejection");
 }
 
 // D-mcp-ack seq binding: E1 is still waited on while a send opens E2; each wait stays on
 // its episode, the ids differ; a late E1 wait after E2 exists gets E1; a late result and
 // malformed input or an IO error lose nothing.
+async function testCancelParkedResponse() {
+  // Sol R3-4 (CANCEL_PARKED_RESPONSE): a completed wait parked before its send holds a
+  // `delivering` marker, so a cancel answers in-flight instead of "nothing more is delivered".
+  const { AckingStdioTransport } = require("../src/server.js");
+  const { PassThrough } = require("node:stream");
+  const { cancelEpisode } = require("../../skills/tmux-agent-tools/scripts/lib/workers.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r34-cancel-"));
+  process.env.TMUX_AGENT_DIR = dir;
+  process.env.FAKE_AGENT_TMUX_ROOT = dir;
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r34", name: "r34" });
+  writeResult(sp.result_path, { summary: "r34" });
+  const requestId = 900;
+  const w = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId, signal: new AbortController().signal } });
+  assert.equal(w.status, "completed");
+  const ep = path.join(dir, ".v3", sp.agent_id, "episodes", "1");
+  const marker = JSON.parse(fs.readFileSync(path.join(ep, "delivering"), "utf8"));
+  assert.match(marker.token, /^[0-9a-z]{12}$/);
+  assert.equal(typeof marker.activation, "number");
+  assert.ok(marker.session, "the marker names the session");
+  // The gate registered its activation under an earlier test's state root; give this root the
+  // same registration (its dir) so the marker's activation is the live, authoritative one.
+  fs.mkdirSync(path.join(dir, ".v3", ".sessions", sessionHex(marker.session), "act", String(marker.activation)), { recursive: true })
+  const cancelled = await cancelEpisode(await getHost(), sp.agent_id, 1);
+  assert.equal(cancelled.ok, false, cancelled.text);
+  assert.match(cancelled.text, /in-flight/);
+  assert.equal(fs.existsSync(path.join(ep, "acks", "cancel")), false, "cancel closed nothing");
+  const t = new AckingStdioTransport(new PassThrough(), { write(_c, cb) { setImmediate(cb); return true; } });
+  await t.send({ jsonrpc: "2.0", id: requestId, result: { structuredContent: w, content: [] } });
+  assert.ok(doneAck(dir, sp.agent_id), "flushed: acked");
+  assert.equal(fs.existsSync(path.join(ep, "acks", "cancel")), false);
+  assert.equal(fs.existsSync(path.join(ep, "delivering")), false, "marker cleared by its token after the ack");
+}
+
 async function testEpisodesLateResultMalformedAndIoError() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-e1e2-"));
   process.env.TMUX_AGENT_DIR = dir;
@@ -650,7 +730,206 @@ async function testChannelAuthorityModAndMcpBothTry() {
   }
 }
 
+// ── R8 host-failure fixtures (F1 F2 F3 F4 F7) ────────────────────────────────────
+
+/** Raw newline-delimited JSON-RPC over a server child's stdio (no SDK client). */
+function rawRpc(child) {
+  let id = 0;
+  const pending = new Map();
+  let buf = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buf += chunk;
+    for (let i; (i = buf.indexOf("\n")) >= 0;) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      if (!line.trim()) continue;
+      const m = JSON.parse(line);
+      pending.get(m.id)?.(m);
+    }
+  });
+  const send = (o) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...o })}\n`);
+  const request = (method, params) => new Promise((resolve) => {
+    id += 1;
+    pending.set(id, resolve);
+    send({ id, method, params });
+  });
+  return {
+    request,
+    async start() {
+      await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "1" } });
+      send({ method: "notifications/initialized" });
+    },
+    async tool(name, args) {
+      return (await request("tools/call", { name, arguments: args })).result.structuredContent;
+    },
+  };
+}
+
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+async function poll(p, what, ms = 6000) {
+  for (let t = Date.now(); Date.now() - t < ms && !(await p());) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(await p(), `timed out waiting for ${what}`);
+}
+const withEnv = async (vars, fn) => {
+  const old = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(old)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+  }
+};
+const freshState = (tag) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `r8-${tag}-`));
+  process.env.TMUX_AGENT_DIR = dir;
+  process.env.FAKE_AGENT_TMUX_ROOT = dir;
+  return dir;
+};
+
+// F2: the brief carries no literal `undefined`.
+async function testBriefHasNoUndefined() {
+  const dir = freshState("f2");
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "plain task", name: "r8-f2" });
+  const brief = fs.readFileSync(path.join(dir, ".v3", sp.agent_id, "brief.md"), "utf8");
+  assert.ok(!/undefined/.test(brief), `brief has a literal undefined:\n${brief}`);
+}
+
+// F1: between spawn and a finished launch an absent session is `starting`, not dead.
+async function testSpawnThenWaitIsStartingNotDead() {
+  const dir = freshState("f1");
+  const sp = await withEnv({ FAKE_ASSIGN_DELAY_MS: "1500", FAKE_STATUS_ABSENT_BEFORE_ASSIGN: "1" }, async () => {
+    const spawned = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "slow launch", name: "r8-f1" });
+    const early = await waitTmuxAgent(spawned.agent_id, 0, { seq: 1 });
+    assert.equal(early.status, "pending", `an immediate wait: ${JSON.stringify(early)}`);
+    assert.equal(early.reason, "starting");
+    return spawned;
+  });
+  // A launch that finished with a failure is a failure, with the wrapper's own reason.
+  await withEnv({ FAKE_ASSIGN_EXIT: "3", FAKE_DEAD_SESSION: "1" }, async () => {
+    const failed = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "bad launch", name: "r8-f1b" });
+    await poll(() => fs.existsSync(path.join(dir, ".v3", failed.agent_id, "launch.exit")), "launch.exit");
+    const w = await waitTmuxAgent(failed.agent_id, 0, { seq: 1 });
+    assert.deepEqual([w.status, w.reason], ["failed", "launch_failed"], JSON.stringify(w));
+    assert.match(String(w.detail), /exited 3/);
+  });
+  assert.ok(sp.agent_id);
+}
+
+// F7: one wait call stays under the host's tool-call timeout; same delivery semantics after.
+async function testWaitCallIsCapped() {
+  const dir = freshState("f7");
+  assert.ok(WAIT_CAP_SEC > 0 && WAIT_CAP_SEC <= 45, `WAIT_CAP_SEC=${WAIT_CAP_SEC}`);
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "cap", name: "r8-f7" });
+  const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("wait outlived the cap")), 5000)).catch((e) => e);
+  const capped = await Promise.race([waitTmuxAgent(sp.agent_id, 600, { seq: 1, capSec: 1 }), guard]);
+  assert.ok(!(capped instanceof Error), String(capped));
+  assert.deepEqual([capped.status, capped.reason, capped.seq], ["pending", "wait_again", 1], JSON.stringify(capped));
+  const own = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, capSec: 5 });
+  assert.equal(own.status, "timed_out", "the caller's own shorter timeout is not a cap");
+  writeResult(sp.result_path, { summary: "after cap" });
+  const done = await waitTmuxAgent(sp.agent_id, 600, { seq: 1, capSec: 1 });
+  assert.equal(done.status, "completed");
+  assert.equal(done.delivery_id, `${workerOwner(dir, sp.agent_id)}/${sp.agent_id}/1`);
+}
+
+// F3 host: a stand-in for codex. Spawns the server, spawns a worker, leaves a wait in flight.
+async function hostMode(dir, errFile, codeFile) {
+  const env = childEnv(dir, { PATH: `${FIXTURE_BIN}${path.delimiter}${process.env.PATH}` });
+  const server = spawn("sh", ["-c", '"$0" "$1" --server none 2>"$2"; echo $? >"$3"', process.execPath, __filename, errFile, codeFile], {
+    env,
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  const rpc = rawRpc(server);
+  await rpc.start();
+  const sp = await rpc.tool("spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "orphan check", name: "r8-f3" });
+  console.log(JSON.stringify(sp));
+  void rpc.request("tools/call", { name: "wait_tmux_agent", arguments: { agent_id: sp.agent_id, seq: 1, timeoutSec: 30 } });
+  setTimeout(() => console.log("waiting"), 300);
+  setInterval(() => {}, 1000);
+}
+
+// F3: kill the host; the server must exit cleanly (no EPIPE crash, no orphan) and free its claim.
+async function testHostKilledServerShutsDownClean() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r8-f3-"));
+  const errFile = path.join(dir, "server.err");
+  const codeFile = path.join(dir, "server.code");
+  const host = spawn(process.execPath, [__filename, "--host", dir, errFile, codeFile], { stdio: ["ignore", "pipe", "inherit"] });
+  let out = "";
+  host.stdout.on("data", (c) => (out += c));
+  await poll(() => out.includes("waiting"), "host ready");
+  const sp = JSON.parse(out.split("\n")[0]);
+  const owner = workerOwner(dir, sp.agent_id);
+  const pid = Number(owner.split("-").at(-2));
+  assert.ok(pidAlive(pid), "the server runs before the host dies");
+  host.kill("SIGKILL");
+  try {
+    await poll(() => !pidAlive(pid), `server pid ${pid} to exit after its host died (orphan)`, 5000);
+  } finally {
+    if (pidAlive(pid)) process.kill(pid, "SIGKILL");
+  }
+  await poll(() => fs.existsSync(codeFile), "server exit code");
+  const stderr = fs.readFileSync(errFile, "utf8");
+  assert.ok(!/EPIPE|Unhandled|Emitted 'error'/.test(stderr), `server crashed:\n${stderr}`);
+  assert.equal(fs.readFileSync(codeFile, "utf8").trim(), "0");
+  // The next owner takes the claim at once (no 90 s wait) and reports the same delivery_id.
+  writeResult(sp.result_path, { summary: "after host death" });
+  const next = await startServer(dir);
+  try {
+    const w = await call(next, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 1 });
+    assert.equal(w.status, "completed", JSON.stringify(w));
+    assert.equal(w.delivery_id, `${owner}/${sp.agent_id}/1`);
+  } finally {
+    await next.close();
+  }
+}
+
+// F3 transport: a dead stdout or a closed stdin tells the owner; a stdout 'error' never throws.
+async function testTransportReportsGoneHost() {
+  const { PassThrough } = require("node:stream");
+  const { AckingStdioTransport } = require("../src/server.js");
+  for (const [what, trip] of [["stdout error", (i, o) => o.emit("error", new Error("write EPIPE"))], ["stdin end", (i) => i.emit("end")], ["stdin close", (i) => i.emit("close")]]) {
+    const i = new PassThrough();
+    const o = new PassThrough();
+    const t = new AckingStdioTransport(i, o);
+    let reason;
+    t.onhostgone = (r) => (reason = r);
+    trip(i, o);
+    assert.ok(reason, `${what}: onhostgone not called`);
+  }
+}
+
+// F4: the launch outlives its host's process group; the brief still goes out.
+async function testLaunchSurvivesHostGroupKill() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r8-f4-"));
+  const server = spawn(process.execPath, [path.join(REPO, "src/server.js")], {
+    detached: true,
+    env: childEnv(dir, { PATH: `${FIXTURE_BIN}${path.delimiter}${process.env.PATH}`, FAKE_ASSIGN_DELAY_MS: "1200" }),
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  const rpc = rawRpc(server);
+  await rpc.start();
+  const sp = await rpc.tool("spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "brief must survive", name: "r8-f4" });
+  process.kill(-server.pid, "SIGKILL");
+  const state = path.join(dir, ".v3", sp.agent_id);
+  await poll(() => fs.existsSync(path.join(state, "launch.exit")), "the launch receipt after the host group was killed");
+  assert.equal(fs.readFileSync(path.join(state, "launch.exit"), "utf8").trim(), "0");
+  assert.ok(fs.existsSync(path.join(state, "assigned")), "assign ran to its end");
+  assert.match(fs.readFileSync(path.join(state, "prompt.txt"), "utf8"), /brief must survive/);
+}
+
 async function main() {
+  if (process.argv[2] === "--host") {
+    await hostMode(...process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "--server") {
     await serveWithCut(process.argv[3]);
     return;
@@ -668,6 +947,15 @@ async function main() {
     if (which.includes("b")) await testClosedEpisodeNotClaimedByOtherOwner();
     if (which.includes("c")) await testNoProcessIdIsToolError();
     console.log(`findings ${which} ok`);
+    return;
+  }
+
+  if (process.argv[2] === "--r8") {
+    // One R8 fixture alone: `node test/adapter-smoke.js --r8 testBriefHasNoUndefined`.
+    process.env.PATH = `${FIXTURE_BIN}${path.delimiter}${process.env.PATH}`;
+    await { testBriefHasNoUndefined, testSpawnThenWaitIsStartingNotDead, testWaitCallIsCapped, testTransportReportsGoneHost, testHostKilledServerShutsDownClean, testLaunchSurvivesHostGroupKill }[process.argv[3]]();
+    stopHeartbeat();
+    console.log(`${process.argv[3]} ok`);
     return;
   }
 
@@ -878,8 +1166,17 @@ async function main() {
   await testSameHostReload();
   await testCrashBeforeAndAfterAck();
   await testAckBoundariesInProcess();
+  await testCancelParkedResponse();
   await testEpisodesLateResultMalformedAndIoError();
   await testChannelAuthorityModAndMcpBothTry();
+
+  // R8 host failures
+  await testBriefHasNoUndefined();
+  await testSpawnThenWaitIsStartingNotDead();
+  await testWaitCallIsCapped();
+  await testTransportReportsGoneHost();
+  await testHostKilledServerShutsDownClean();
+  await testLaunchSurvivesHostGroupKill();
 
   stopHeartbeat();
   console.log("adapter smoke ok");

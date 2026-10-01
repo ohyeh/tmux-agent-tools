@@ -36109,6 +36109,7 @@ var require_stdio2 = __commonJS({
 var require_adapter = __commonJS({
   "mcp-adapter/src/adapter.js"(exports, module) {
     "use strict";
+    var fs = __require("node:fs");
     var path = __require("node:path");
     function resolveCoreModule(moduleRelPath) {
       const bundled = globalThis.__tmuxAgentCore;
@@ -36118,19 +36119,23 @@ var require_adapter = __commonJS({
     var {
       CLOSED_ACKS,
       POLL_MS,
-      REQUIRED_RESULT_LINE,
+      STALL_SECONDS,
       TERMINAL,
       ackFinished,
       assignWorker,
       deliveryIdOf,
       episodeMatches,
       heartbeat,
+      launchFailure,
       missingSections,
       newGate,
       observationOf,
       peekWorker,
       processId,
+      releaseDeliveries,
+      reserveDeliveries,
       rootOf,
+      sessionDirOf,
       stillOurs,
       stopWorker,
       tellWorker,
@@ -36145,6 +36150,7 @@ var require_adapter = __commonJS({
     } = resolveCoreModule("ledger.ts");
     var { nodeHost } = resolveCoreModule("host.node.ts");
     var REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
+    var WAIT_CAP_SEC = 40;
     var NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
     var NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";
     var NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unless explicitly authorized.";
@@ -36227,15 +36233,6 @@ var require_adapter = __commonJS({
       }
       return null;
     }
-    function buildWorkerPrompt(task, resultPath) {
-      return `${task}
-
-Write final JSON to this exact path: ${resultPath}
-${REQUIRED_RESULT_LINE}
-${NO_CASCADE_GUARD}
-${NO_BACKGROUND_JOBS_GUARD}
-${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
-    }
     function formatBrief(task) {
       const missing = missingSections(task);
       if (missing.length === 0) return task;
@@ -36247,7 +36244,6 @@ ${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
         brief += `
 
 ACCEPTANCE: Result JSON must include schema_version, status, summary, artifacts, and errors.
-${REQUIRED_RESULT_LINE}
 ${NO_CASCADE_GUARD}
 ${NO_BACKGROUND_JOBS_GUARD}
 ${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
@@ -36352,6 +36348,14 @@ REPORT: Final status and summary in result.json`;
       }
       return { rec, name, workerDir, root, v3 };
     }
+    function detachedLaunch(host) {
+      const isLaunch = (argv) => argv[0] === "sh" && argv[1] === "-c" && /^nohup sh -c /.test(argv[2] || "");
+      const detach = "require('node:child_process').spawn('sh',['-c',process.argv[1]],{detached:true,stdio:'ignore'}).unref()";
+      return {
+        ...host,
+        run: (argv, cwd, timeoutMs) => host.run(isLaunch(argv) ? [process.execPath, "-e", detach, argv[2]] : argv, cwd, timeoutMs)
+      };
+    }
     async function spawnTmuxAgent(request) {
       const cli = String(request.cli || "").trim();
       const repoPath = String(request.repoPath || "").trim();
@@ -36364,7 +36368,7 @@ REPORT: Final status and summary in result.json`;
       const baseName = safeBaseName(cli, request.name);
       const brief = formatBrief(task);
       const res = await assignWorker(
-        host,
+        detachedLaunch(host),
         { profile: cli, name: baseName, dir: repoPath, brief },
         { owner: host.owner(), ownerCwd: repoPath }
       );
@@ -36457,6 +36461,7 @@ REPORT: Final status and summary in result.json`;
         } catch (err) {
           host.log(`${deliveryId}: ack failed: ${err}`);
         } finally {
+          await releaseDeliveries(host, v3, [{ f: out.finished, token: out.token }]).catch((err) => host.log(`${deliveryId}: marker not cleared: ${err}`));
           release();
         }
       };
@@ -36475,23 +36480,26 @@ REPORT: Final status and summary in result.json`;
         void settle(false);
         return;
       }
-      const entry = { settle };
+      let running;
+      const entry = {
+        settle(ok) {
+          running ??= (async () => {
+            if (pendingAcks.get(extra.requestId) === entry) pendingAcks.delete(extra.requestId);
+            await settle(ok);
+          })();
+          return running;
+        }
+      };
       pendingAcks.set(extra.requestId, entry);
-      extra.signal?.addEventListener("abort", () => {
-        if (pendingAcks.get(extra.requestId) !== entry) return;
-        pendingAcks.delete(extra.requestId);
-        void settle(false);
-      }, { once: true });
+      extra.signal?.addEventListener("abort", () => void entry.settle(false), { once: true });
     }
     async function settleWhenWritten(id, written) {
       const entry = pendingAcks.get(id);
       if (!entry) return;
-      pendingAcks.delete(id);
-      await entry.settle(await written);
+      await entry.settle(await written.catch(() => false));
     }
     async function settleAllUnsent() {
       const all = [...pendingAcks.values()];
-      pendingAcks.clear();
       await Promise.all(all.map((e) => e.settle(false)));
     }
     async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body) {
@@ -36549,7 +36557,9 @@ REPORT: Final status and summary in result.json`;
       if (ours.length !== 1) {
         return { status: "failed", reason: "not_owner", detail: "episode owner changed before delivery (\xA73.3)" };
       }
-      return { finished: ours[0] };
+      const [held] = await reserveDeliveries(host, gate, v3, [ours[0]]);
+      if (!held) return { status: "already_acked" };
+      return { finished: held.f, token: held.token };
     }
     async function episodeOf(host, workerDir, agentId, seq) {
       let targetSeq = seq;
@@ -36581,12 +36591,25 @@ REPORT: Final status and summary in result.json`;
       const resultPath = desc && typeof desc === "object" && desc.resultPath || `${workerDir}/result.json`;
       return { targetSeq, episodeDir, desc, resultPath };
     }
+    async function launchOutcome(host, workerDir) {
+      const ep1 = await readDescriptor(host, `${workerDir}/episodes/1`);
+      if (!ep1 || ep1 === "unknown" || ep1.origin !== "launch") return { state: "ended" };
+      const failure = await launchFailure(host, workerDir, ep1.since);
+      if (failure === "unknown") return { state: "starting" };
+      if (failure) return { state: "failed", failure };
+      const receipt = await existsOrThrow(host, `${workerDir}/launch.exit`) ? String(await host.read(`${workerDir}/launch.exit`)).trim() : "";
+      if (receipt) return { state: "ended" };
+      return await host.now() - ep1.since < STALL_SECONDS * 1e3 ? { state: "starting" } : { state: "ended" };
+    }
     async function waitTmuxAgent(agentId, timeoutSec = 600, opts = {}) {
       const host = await getHost();
       await ensureAdapterLive(host);
       const { rec, name, workerDir, v3 } = await getWorker(host, agentId);
       const { targetSeq, episodeDir, desc, resultPath } = await episodeOf(host, workerDir, agentId, opts.seq);
-      const deadline = Date.now() + Math.max(0, Number(timeoutSec)) * 1e3;
+      const asked = Math.max(0, Number(timeoutSec));
+      const capSec = opts.capSec ?? WAIT_CAP_SEC;
+      const deadline = Date.now() + Math.min(asked, capSec) * 1e3;
+      let starting = false;
       for (; ; ) {
         const exists = await existsOrThrow(host, resultPath);
         if (exists) {
@@ -36654,7 +36677,15 @@ REPORT: Final status and summary in result.json`;
           }
           const statusBlocked = classifyBlocked(statusJson);
           if (statusBlocked) return statusBlocked;
+          starting = false;
           if (isDeadStatus(statusJson)) {
+            const launch = await launchOutcome(host, workerDir);
+            if (launch.state === "failed") {
+              return { status: "failed", reason: "launch_failed", detail: launch.failure };
+            }
+            starting = launch.state === "starting";
+          }
+          if (isDeadStatus(statusJson) && !starting) {
             return {
               status: "failed",
               reason: "dead_session",
@@ -36666,6 +36697,15 @@ REPORT: Final status and summary in result.json`;
           break;
         }
         await new Promise((r) => setTimeout(r, 100));
+      }
+      if (starting) return { status: "pending", reason: "starting", seq: targetSeq };
+      if (asked > capSec) {
+        return {
+          status: "pending",
+          reason: "wait_again",
+          seq: targetSeq,
+          detail: `no result within ${capSec}s (the per-call bound); call wait_tmux_agent again with the same agent_id and seq`
+        };
       }
       const existsAfter = await existsOrThrow(host, resultPath);
       if (!existsAfter) {
@@ -36758,6 +36798,19 @@ REPORT: Final status and summary in result.json`;
       }
       return { closed: true };
     }
+    async function retireSession() {
+      stopHeartbeat();
+      for (const [id, gate] of gates) {
+        if (gate.activation === void 0) continue;
+        try {
+          const host = await getHost();
+          const dir = sessionDirOf(v3Of(await rootOf(host)), id);
+          fs.utimesSync(`${dir}/act/${gate.activation}.beat`, 0, 0);
+        } catch (err) {
+          log(`could not retire session ${id}: ${err}`);
+        }
+      }
+    }
     function stopHeartbeat() {
       for (const timer of beatTimers.values()) clearInterval(timer);
       beatTimers.clear();
@@ -36766,13 +36819,13 @@ REPORT: Final status and summary in result.json`;
       NO_BACKGROUND_JOBS_GUARD,
       NO_CASCADE_GUARD,
       NO_EXTERNAL_SIDE_EFFECTS_GUARD,
-      REQUIRED_RESULT_LINE,
-      buildWorkerPrompt,
+      WAIT_CAP_SEC,
       closeTmuxAgent,
       ensureAdapterLive,
       getHost,
       getWorker,
       readTmuxAgent,
+      retireSession,
       resolveCoreModule,
       sendTmuxAgent,
       settleAllUnsent,
@@ -36797,21 +36850,34 @@ var require_server3 = __commonJS({
       ensureAdapterLive,
       getHost,
       readTmuxAgent,
+      retireSession,
       sendTmuxAgent,
       settleAllUnsent,
       settleWhenWritten,
       spawnTmuxAgent,
-      waitTmuxAgent
+      waitTmuxAgent,
+      WAIT_CAP_SEC
     } = require_adapter();
     var AckingStdioTransport = class extends StdioServerTransport {
       constructor(stdin = process.stdin, stdout = process.stdout) {
         super(stdin, stdout);
         this.out = stdout;
+        this.closing = new Promise((resolve) => {
+          this.markClosing = resolve;
+        });
+        const gone = (reason) => this.onhostgone?.(reason);
+        stdin.once("end", () => gone("stdin ended"));
+        stdin.once("close", () => gone("stdin closed"));
+        stdout.on?.("error", (err) => gone(`stdout error: ${err.message}`));
       }
       send(message) {
-        const written = new Promise((resolve) => {
-          this.out.write(serializeMessage(message), (err) => resolve(err || null));
-        });
+        const written = Promise.race([new Promise((resolve) => {
+          try {
+            this.out.write(serializeMessage(message), (err) => resolve(err || null));
+          } catch (err) {
+            resolve(err);
+          }
+        }), this.closing]);
         const response = message.id !== void 0 && ("result" in message || "error" in message);
         const acked = response ? settleWhenWritten(message.id, written.then((err) => !err && "result" in message && !message.result?.isError)) : Promise.resolve();
         return written.then(async (err) => {
@@ -36820,6 +36886,7 @@ var require_server3 = __commonJS({
         });
       }
       async close() {
+        this.markClosing(new Error("transport closed"));
         await settleAllUnsent();
         return super.close();
       }
@@ -36857,7 +36924,7 @@ var require_server3 = __commonJS({
       }, async ({ agent_id, message }) => toolResult(await sendTmuxAgent(agent_id, message)));
       server.registerTool("wait_tmux_agent", {
         title: "Wait for tmux-agent-tools worker",
-        description: "Wait for one episode's result (seq from spawn/send; default: the latest at call time). At-least-once: a re-report carries the same delivery_id; dedup by it.",
+        description: `Wait for one episode's result (seq from spawn/send; default: the latest at call time). At-least-once: a re-report carries the same delivery_id; dedup by it. One call waits at most ${WAIT_CAP_SEC}s; if it returns {status:"pending"} (reason "wait_again" or "starting"), call it again with the same agent_id and seq.`,
         inputSchema: {
           agent_id: z.string().min(1),
           timeoutSec: z.number().int().nonnegative().optional(),
@@ -36881,9 +36948,21 @@ var require_server3 = __commonJS({
       }, async ({ agent_id }) => toolResult(await closeTmuxAgent(agent_id)));
       return server;
     }
-    async function main2(transport = new AckingStdioTransport()) {
+    async function main2(transport = new AckingStdioTransport(), exit = process.exit) {
       await ensureAdapterLive(await getHost());
       const server = createServer();
+      let stopping;
+      transport.onhostgone = (reason) => {
+        stopping ??= (async () => {
+          process.stderr.write(`[mcp-adapter] host gone (${reason}); shutting down
+`);
+          const cleanup = transport.close().then(retireSession);
+          const bound = new Promise((resolve) => setTimeout(resolve, 5e3).unref());
+          await Promise.race([cleanup, bound]).catch((err) => process.stderr.write(`[mcp-adapter] shutdown: ${err}
+`));
+          exit(0);
+        })();
+      };
       await server.connect(transport);
     }
     if (__require.main === module) {

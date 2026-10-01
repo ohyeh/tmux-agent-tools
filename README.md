@@ -249,6 +249,19 @@ only prints what it would do, with `--yes` it checks `ps` once and switches. A
 stale heartbeat does not count as "stopped". The launcher starts no node
 collector on a session that another channel owns and says so.
 
+Host failures: one `wait_tmux_agent` call lasts at most 40 s (cursor-agent drops a
+tool call at about 62 s). A longer `timeoutSec` ends with `{"status":"pending",
+"reason":"wait_again"}`: call it again with the same `agent_id` and `seq`; nothing
+was delivered or acked, and the delivery semantics are unchanged. Right after
+`spawn_tmux_agent`, while `agent-tmux assign` has not finished and the tmux
+session is not up yet, a wait answers `{"status":"pending","reason":"starting"}`,
+never `dead_session`; a launch that exited non-zero answers `failed` /
+`launch_failed`, and `dead_session` needs a finished launch. The launch runs in
+its own session, so a host that exits right after `spawn` does not cut off the
+brief. When the host goes away (stdin closed, stdout broken) the server settles
+unsent responses as not-acked, retires its heartbeat so the next session claims
+at once, and exits; it neither crashes on `EPIPE` nor stays behind as an orphan.
+
 Register it with its absolute path, for example:
 
 ```bash
@@ -262,7 +275,7 @@ reproduce the committed bytes.
 
 ## Usage
 
-`start`, `resume`, and `start-ssh` never replace a live session of the same name (breaking since the R8.5 change): they exit 1 and leave the first worker untouched. `stop` refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`). A new launch of a name moves the earlier `result.json` and `stdout.log` into `<name>/legacy-<UTC time>-<pid>/`. `TMUX_AGENT_TMUX_SOCKET=<path>` puts `-S <path>` on every tmux call of `agent-tmux`, the node core, and `tmux-agent-commander`. The commander sets it from its own `$TMUX` when it is unset.
+`start`, `resume`, and `start-ssh` never replace a live session of the same name (breaking since the R8.5 change): they exit 1 and leave the first worker untouched. `stop` refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`), or when that file is missing, empty, or unreadable. One per-name lock (`<name>/launch.lock`) covers the live-name check, the state init, and the `pane-id` write, so two starters of one name cannot interleave. A new launch of a name moves the earlier `result.json` and `stdout.log` into `<name>/legacy-<UTC time>-<pid>/`. `TMUX_AGENT_TMUX_SOCKET=<path>` puts `-S <path>` on every tmux call of `agent-tmux`, the node core, and `tmux-agent-commander`. The commander sets it from its own `$TMUX` when it is unset.
 
 ```bash
 agent-tmux codex start --exact worker ~/github/project 'Read the repo and report status.'

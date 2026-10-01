@@ -1,3 +1,4 @@
+const fs = require("node:fs");
 const path = require("node:path");
 
 function resolveCoreModule(moduleRelPath) {
@@ -12,19 +13,23 @@ function resolveCoreModule(moduleRelPath) {
 const {
   CLOSED_ACKS,
   POLL_MS,
-  REQUIRED_RESULT_LINE,
+  STALL_SECONDS,
   TERMINAL,
   ackFinished,
   assignWorker,
   deliveryIdOf,
   episodeMatches,
   heartbeat,
+  launchFailure,
   missingSections,
   newGate,
   observationOf,
   peekWorker,
   processId,
+  releaseDeliveries,
+  reserveDeliveries,
   rootOf,
+  sessionDirOf,
   stillOurs,
   stopWorker,
   tellWorker,
@@ -42,6 +47,10 @@ const {
 const { nodeHost } = resolveCoreModule("host.node.ts");
 
 const REQUIRED_RESULT_FIELDS = ["schema_version", "status", "summary", "artifacts", "errors"];
+// One wait call must end before the host gives up on the tool call: cursor-agent times one
+// out at about 62 s (R8 F7). A longer `timeoutSec` returns `pending` at this bound; the
+// caller calls wait again. A conservative margin: each loop also runs a 5 s status probe.
+const WAIT_CAP_SEC = 40;
 const NO_CASCADE_GUARD = "Do not spawn additional tmux sessions or delegate further.";
 const NO_BACKGROUND_JOBS_GUARD = "Do not start background jobs unless explicitly requested.";
 const NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unless explicitly authorized.";
@@ -140,16 +149,6 @@ function parseJsonLoose(text) {
   return null;
 }
 
-function buildWorkerPrompt(task, resultPath) {
-  return `${task}
-
-Write final JSON to this exact path: ${resultPath}
-${REQUIRED_RESULT_LINE}
-${NO_CASCADE_GUARD}
-${NO_BACKGROUND_JOBS_GUARD}
-${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
-}
-
 function formatBrief(task) {
   const missing = missingSections(task);
   if (missing.length === 0) return task;
@@ -158,7 +157,7 @@ function formatBrief(task) {
     brief = `GOAL: ${brief}`;
   }
   if (missing.includes("ACCEPTANCE")) {
-    brief += `\n\nACCEPTANCE: Result JSON must include schema_version, status, summary, artifacts, and errors.\n${REQUIRED_RESULT_LINE}\n${NO_CASCADE_GUARD}\n${NO_BACKGROUND_JOBS_GUARD}\n${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
+    brief += `\n\nACCEPTANCE: Result JSON must include schema_version, status, summary, artifacts, and errors.\n${NO_CASCADE_GUARD}\n${NO_BACKGROUND_JOBS_GUARD}\n${NO_EXTERNAL_SIDE_EFFECTS_GUARD}`;
   }
   if (missing.includes("REPORT")) {
     brief += `\n\nREPORT: Final status and summary in result.json`;
@@ -265,6 +264,25 @@ async function getWorker(host, agentId) {
   return { rec, name, workerDir, root, v3 };
 }
 
+/**
+ * The launch child must outlive the MCP host (R8 F4). `assignWorker` backgrounds
+ * `agent-tmux assign` with `nohup sh -c ... &`, which stays in the host's process group:
+ * a host that exits right after `spawn` and takes its group down kills the assign before
+ * it sends the brief. Run that one line through a detached (own session) node spawn.
+ * ponytail: matches workers.ts's launch line by shape; the F4 fixture fails if it changes.
+ * Upgrade: setsid in workers.ts itself.
+ */
+function detachedLaunch(host) {
+  const isLaunch = (argv) => argv[0] === "sh" && argv[1] === "-c" && /^nohup sh -c /.test(argv[2] || "");
+  const detach =
+    "require('node:child_process').spawn('sh',['-c',process.argv[1]],{detached:true,stdio:'ignore'}).unref()";
+  return {
+    ...host,
+    run: (argv, cwd, timeoutMs) =>
+      host.run(isLaunch(argv) ? [process.execPath, "-e", detach, argv[2]] : argv, cwd, timeoutMs),
+  };
+}
+
 async function spawnTmuxAgent(request) {
   const cli = String(request.cli || "").trim();
   const repoPath = String(request.repoPath || "").trim();
@@ -279,7 +297,7 @@ async function spawnTmuxAgent(request) {
   const brief = formatBrief(task);
 
   const res = await assignWorker(
-    host,
+    detachedLaunch(host),
     { profile: cli, name: baseName, dir: repoPath, brief },
     { owner: host.owner(), ownerCwd: repoPath }
   );
@@ -393,6 +411,8 @@ async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, result
     } catch (err) {
       host.log(`${deliveryId}: ack failed: ${err}`);
     } finally {
+      // After the ack (or an unsent response): clear this delivery's marker by its token.
+      await releaseDeliveries(host, v3, [{ f: out.finished, token: out.token }]).catch((err) => host.log(`${deliveryId}: marker not cleared: ${err}`));
       release();
     }
   };
@@ -414,32 +434,40 @@ function holdAck(extra, settle) {
     void settle(false);
     return;
   }
-  const entry = { settle };
+  // One idempotent guard: the write callback, close, abort and a write throw all settle
+  // through here, and the entry stays findable until the first of them lands.
+  // A second caller (close after the write callback, or the reverse) awaits the first
+  // settle to the end, so `send` and `close` both finish after the marker is cleared.
+  let running;
+  const entry = {
+    settle(ok) {
+      running ??= (async () => {
+        if (pendingAcks.get(extra.requestId) === entry) pendingAcks.delete(extra.requestId);
+        await settle(ok);
+      })();
+      return running;
+    },
+  };
   pendingAcks.set(extra.requestId, entry);
-  // Cancelled before the send began: the SDK sends nothing (protocol.js), so release here.
-  extra.signal?.addEventListener("abort", () => {
-    if (pendingAcks.get(extra.requestId) !== entry) return;
-    pendingAcks.delete(extra.requestId);
-    void settle(false);
-  }, { once: true });
+  // Cancelled before or during the send: the response may never land, so release unacked.
+  extra.signal?.addEventListener("abort", () => void entry.settle(false), { once: true });
 }
 
 /**
  * The transport's half of S4: the response to `id` is being written, and `written`
- * resolves true once its bytes are flushed as a success. Taken out of the map first,
- * so a cancel that lands mid-write cannot settle it twice.
+ * resolves true once its bytes are flushed as a success. The entry stays in the map
+ * until settled, so close or abort mid-write still finds it; the guard makes a second
+ * settle a no-op. A rejected `written` counts as unsent.
  */
 async function settleWhenWritten(id, written) {
   const entry = pendingAcks.get(id);
   if (!entry) return;
-  pendingAcks.delete(id);
-  await entry.settle(await written);
+  await entry.settle(await written.catch(() => false));
 }
 
 /** Transport closed: nothing parked can be sent any more. */
 async function settleAllUnsent() {
   const all = [...pendingAcks.values()];
-  pendingAcks.clear();
   await Promise.all(all.map((e) => e.settle(false)));
 }
 
@@ -499,7 +527,12 @@ async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resu
   if (ours.length !== 1) {
     return { status: "failed", reason: "not_owner", detail: "episode owner changed before delivery (§3.3)" };
   }
-  return { finished: ours[0] };
+  // Reserve before the transport may send (plan §1c S8, Sol R3-4): the same `delivering`
+  // marker the collector writes, so cancel reads it and answers in-flight, not "unsent".
+  // A busy lock or unwritable marker comes back with token '' (delivered unreserved).
+  const [held] = await reserveDeliveries(host, gate, v3, [ours[0]]);
+  if (!held) return { status: "already_acked" };
+  return { finished: held.f, token: held.token };
 }
 
 /**
@@ -538,14 +571,38 @@ async function episodeOf(host, workerDir, agentId, seq) {
   return { targetSeq, episodeDir, desc, resultPath };
 }
 
-/** `opts.seq`: the episode to wait on (default: the max now). `opts.extra`: the MCP request (see deliverEpisode). */
+/**
+ * What the launch receipt says about an absent session (R8 F1): `starting` while the
+ * launch has not finished (no `launch.exit` yet, and not older than STALL_SECONDS),
+ * `failed` when it exited non-zero, `ended` otherwise (the session really is gone).
+ * Only the assign's own first episode has a receipt; a worker without one is `ended`.
+ */
+async function launchOutcome(host, workerDir) {
+  const ep1 = await readDescriptor(host, `${workerDir}/episodes/1`);
+  if (!ep1 || ep1 === "unknown" || ep1.origin !== "launch") return { state: "ended" };
+  const failure = await launchFailure(host, workerDir, ep1.since);
+  if (failure === "unknown") return { state: "starting" };
+  if (failure) return { state: "failed", failure };
+  const receipt = (await existsOrThrow(host, `${workerDir}/launch.exit`)) ? String(await host.read(`${workerDir}/launch.exit`)).trim() : "";
+  if (receipt) return { state: "ended" };
+  return (await host.now()) - ep1.since < STALL_SECONDS * 1000 ? { state: "starting" } : { state: "ended" };
+}
+
+/**
+ * `opts.seq`: the episode to wait on (default: the max now). `opts.extra`: the MCP request
+ * (see deliverEpisode). `opts.capSec`: the per-call bound (default WAIT_CAP_SEC); a longer
+ * `timeoutSec` ends at it with `pending`, and the caller waits again (R8 F7).
+ */
 async function waitTmuxAgent(agentId, timeoutSec = 600, opts = {}) {
   const host = await getHost();
   await ensureAdapterLive(host);
   const { rec, name, workerDir, v3 } = await getWorker(host, agentId);
   const { targetSeq, episodeDir, desc, resultPath } = await episodeOf(host, workerDir, agentId, opts.seq);
 
-  const deadline = Date.now() + Math.max(0, Number(timeoutSec)) * 1000;
+  const asked = Math.max(0, Number(timeoutSec));
+  const capSec = opts.capSec ?? WAIT_CAP_SEC;
+  const deadline = Date.now() + Math.min(asked, capSec) * 1000;
+  let starting = false;
 
   for (;;) {
     // 1. Result file check
@@ -619,7 +676,15 @@ async function waitTmuxAgent(agentId, timeoutSec = 600, opts = {}) {
       }
       const statusBlocked = classifyBlocked(statusJson);
       if (statusBlocked) return statusBlocked;
+      starting = false;
       if (isDeadStatus(statusJson)) {
+        const launch = await launchOutcome(host, workerDir);
+        if (launch.state === "failed") {
+          return { status: "failed", reason: "launch_failed", detail: launch.failure };
+        }
+        starting = launch.state === "starting";
+      }
+      if (isDeadStatus(statusJson) && !starting) {
         return {
           status: "failed",
           reason: "dead_session",
@@ -634,6 +699,16 @@ async function waitTmuxAgent(agentId, timeoutSec = 600, opts = {}) {
     await new Promise((r) => setTimeout(r, 100));
   }
 
+  // Not terminal: tell the caller to call again. Nothing was delivered, nothing is lost.
+  if (starting) return { status: "pending", reason: "starting", seq: targetSeq };
+  if (asked > capSec) {
+    return {
+      status: "pending",
+      reason: "wait_again",
+      seq: targetSeq,
+      detail: `no result within ${capSec}s (the per-call bound); call wait_tmux_agent again with the same agent_id and seq`,
+    };
+  }
   const existsAfter = await existsOrThrow(host, resultPath);
   if (!existsAfter) {
     return { status: "timed_out", reason: "missing_result", result_path: resultPath };
@@ -733,6 +808,25 @@ async function closeTmuxAgent(agentId) {
   return { closed: true };
 }
 
+/**
+ * The host is gone (stdin ended, stdout broke): stop beating and backdate this
+ * session's own beat, so the next owner claims at once instead of waiting out ORPHAN_MS
+ * behind a dead process (R8 F3). Call after unsent responses are settled.
+ */
+async function retireSession() {
+  stopHeartbeat();
+  for (const [id, gate] of gates) {
+    if (gate.activation === undefined) continue;
+    try {
+      const host = await getHost();
+      const dir = sessionDirOf(v3Of(await rootOf(host)), id);
+      fs.utimesSync(`${dir}/act/${gate.activation}.beat`, 0, 0);
+    } catch (err) {
+      log(`could not retire session ${id}: ${err}`);
+    }
+  }
+}
+
 function stopHeartbeat() {
   for (const timer of beatTimers.values()) clearInterval(timer);
   beatTimers.clear();
@@ -742,13 +836,13 @@ module.exports = {
   NO_BACKGROUND_JOBS_GUARD,
   NO_CASCADE_GUARD,
   NO_EXTERNAL_SIDE_EFFECTS_GUARD,
-  REQUIRED_RESULT_LINE,
-  buildWorkerPrompt,
+  WAIT_CAP_SEC,
   closeTmuxAgent,
   ensureAdapterLive,
   getHost,
   getWorker,
   readTmuxAgent,
+  retireSession,
   resolveCoreModule,
   sendTmuxAgent,
   settleAllUnsent,

@@ -57,13 +57,16 @@ if (command === "assign") {
   const repoPath = args[i + 1];
   const briefPath = args[i + 2];
   ensure(name);
+  // Knobs for the host-failure fixtures: a slow launch, and a launch that fails.
+  if (process.env.FAKE_ASSIGN_DELAY_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_ASSIGN_DELAY_MS));
   if (briefPath && fs.existsSync(briefPath)) {
     fs.copyFileSync(briefPath, statePath(name, "brief.md"));
     fs.copyFileSync(briefPath, statePath(name, "prompt.txt"));
   }
   fs.writeFileSync(statePath(name, "repo.txt"), repoPath || "");
+  fs.writeFileSync(statePath(name, "assigned"), "1");
   console.log(`agent: ${name}`);
-  process.exit(0);
+  process.exit(Number(process.env.FAKE_ASSIGN_EXIT || 0));
 }
 
 if (command === "start") {
@@ -168,6 +171,11 @@ if (command === "result" && args[0] === "--json") {
 
 if (command === "status" && args[0] === "--json") {
   const name = args[1];
+  // The tmux session is not up until `assign` has finished (F1).
+  if (process.env.FAKE_STATUS_ABSENT_BEFORE_ASSIGN === "1" && !fs.existsSync(statePath(name, "assigned"))) {
+    console.log(JSON.stringify({ schema_version: 1, name, exists: false }));
+    process.exit(1);
+  }
   if (process.env.FAKE_DEAD_SESSION === "1") {
     console.log(JSON.stringify({ schema_version: 1, name, running: false }));
     process.exit(1);
