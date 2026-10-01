@@ -264,25 +264,6 @@ async function getWorker(host, agentId) {
   return { rec, name, workerDir, root, v3 };
 }
 
-/**
- * The launch child must outlive the MCP host (R8 F4). `assignWorker` backgrounds
- * `agent-tmux assign` with `nohup sh -c ... &`, which stays in the host's process group:
- * a host that exits right after `spawn` and takes its group down kills the assign before
- * it sends the brief. Run that one line through a detached (own session) node spawn.
- * ponytail: matches workers.ts's launch line by shape; the F4 fixture fails if it changes.
- * Upgrade: setsid in workers.ts itself.
- */
-function detachedLaunch(host) {
-  const isLaunch = (argv) => argv[0] === "sh" && argv[1] === "-c" && /^nohup sh -c /.test(argv[2] || "");
-  const detach =
-    "require('node:child_process').spawn('sh',['-c',process.argv[1]],{detached:true,stdio:'ignore'}).unref()";
-  return {
-    ...host,
-    run: (argv, cwd, timeoutMs) =>
-      host.run(isLaunch(argv) ? [process.execPath, "-e", detach, argv[2]] : argv, cwd, timeoutMs),
-  };
-}
-
 async function spawnTmuxAgent(request) {
   const cli = String(request.cli || "").trim();
   const repoPath = String(request.repoPath || "").trim();
@@ -297,7 +278,7 @@ async function spawnTmuxAgent(request) {
   const brief = formatBrief(task);
 
   const res = await assignWorker(
-    detachedLaunch(host),
+    host,
     { profile: cli, name: baseName, dir: repoPath, brief },
     { owner: host.owner(), ownerCwd: repoPath }
   );

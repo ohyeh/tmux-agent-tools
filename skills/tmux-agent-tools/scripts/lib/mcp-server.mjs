@@ -36348,14 +36348,6 @@ REPORT: Final status and summary in result.json`;
       }
       return { rec, name, workerDir, root, v3 };
     }
-    function detachedLaunch(host) {
-      const isLaunch = (argv) => argv[0] === "sh" && argv[1] === "-c" && /^nohup sh -c /.test(argv[2] || "");
-      const detach = "require('node:child_process').spawn('sh',['-c',process.argv[1]],{detached:true,stdio:'ignore'}).unref()";
-      return {
-        ...host,
-        run: (argv, cwd, timeoutMs) => host.run(isLaunch(argv) ? [process.execPath, "-e", detach, argv[2]] : argv, cwd, timeoutMs)
-      };
-    }
     async function spawnTmuxAgent(request) {
       const cli = String(request.cli || "").trim();
       const repoPath = String(request.repoPath || "").trim();
@@ -36368,7 +36360,7 @@ REPORT: Final status and summary in result.json`;
       const baseName = safeBaseName(cli, request.name);
       const brief = formatBrief(task);
       const res = await assignWorker(
-        detachedLaunch(host),
+        host,
         { profile: cli, name: baseName, dir: repoPath, brief },
         { owner: host.owner(), ownerCwd: repoPath }
       );

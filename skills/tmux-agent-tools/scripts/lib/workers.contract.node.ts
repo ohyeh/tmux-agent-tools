@@ -4,14 +4,14 @@
 // agent-tmux — is answered by the test.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
-import { ORPHAN_MS, registerActivation, beat, releaseLock } from './ledger.ts'
+import { ORPHAN_MS, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
@@ -73,8 +73,11 @@ test('assign: v5 name, worker.json, E1 descriptor + sent, launch on the producer
   assert.equal(e1.goal, 'probe')
   assert.ok(existsSync(`${r.stateDir}/episodes/1/sent`))
   assert.ok(!existsSync(`${r.stateDir}/.action`), 'the lock is released')
-  const launch = w.calls.find(c => c.argv[0] === 'sh')!.argv[2]!
-  // The child is shell-quoted twice (nohup sh -c '<child>'): check the words, not the quoting.
+  const detach = w.calls.find(c => c.argv[0] === 'sh')!.argv
+  assert.equal(detach[1], '-c')
+  assert.match(detach[2]!, /^set -m; nohup /, 'the launch runs in a process group of its own')
+  const launch = detach[4]!
+  // The child is one `sh -c` line: check the words, not the quoting.
   assert.ok(launch.includes('TMUX_AGENT_DIR=') && launch.includes(w.v3), launch)
   assert.match(launch, /assign.*--detach.*--result-path.*result\.json.*--episode.*1.*brief\.md/)
 })
@@ -1686,4 +1689,94 @@ test('S8: a non-live marker owner (no heartbeat past the orphan window) is stale
   utimesSync(`${sd}/act/1`, old, old)
   markerFor(w, r.stateDir, 'ghost', 1)
   assert.equal(await reservationOf(w.host, w.v3, `${r.stateDir}/episodes/1`), 'stale')
+})
+
+test('R3-6: a worker lock whose guard cannot be removed is told to the operator by cancel', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const stuck: Host = {
+    ...w.host,
+    run: async (a, c, m) => (a[0] === 'rm' && a[1]?.endsWith('/.action.unlock') ? { exitCode: 1, stdout: '', stderr: 'EACCES injected guard' } : w.host.run(a, c, m)),
+  }
+  const out = await cancelEpisode(stuck, r.name, 1)
+  assert.equal(out.ok, true, 'the cancel itself happened')
+  assert.match(out.text, /release of .*\.action is incomplete: its guard .*\.action\.unlock remains \(.*EACCES injected guard/, out.text)
+  assert.ok(w.logs.some(l => l.includes('left')), 'the ledger log names the leftover')
+})
+
+test('R3-6: a release that fails in assign is carried by the receipt, not dropped', async () => {
+  const w = world()
+  const stuck: Host = {
+    ...w.host,
+    run: async (a, c, m) => (a[0] === 'rm' && a[1]?.endsWith('/.action.unlock') ? { exitCode: 1, stdout: '', stderr: 'EACCES injected guard' } : w.host.run(a, c, m)),
+  }
+  const r = await assignWorker(stuck, { profile: 'astra', name: 'w', dir: w.repo, brief: BRIEF }, { owner: 'me', ownerCwd: w.repo })
+  assert.ok('receipt' in r, JSON.stringify(r))
+  assert.match(r.receipt, /guard .*\.action\.unlock remains/, r.receipt)
+})
+
+test('F4: the launch survives the death of the host process group (own session; launch.exit written, brief sent)', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'f4-bin-'))
+  const root = mkdtempSync(join(tmpdir(), 'f4-root-'))
+  const repo = mkdtempSync(join(tmpdir(), 'f4-repo-'))
+  spawnSync('git', ['init', '-q', repo])
+  // Slow enough that the group kill lands while the assign still runs.
+  writeFileSync(join(bin, 'agent-tmux'), `#!/bin/sh\nsleep 1.5\ncp "\${10}" "$TMUX_AGENT_DIR/$8/prompt.txt"\n`)
+  chmodSync(join(bin, 'agent-tmux'), 0o755)
+  const helper = `
+    import { nodeHost } from ${JSON.stringify(new URL('./host.node.ts', import.meta.url).href)}
+    import { assignWorker } from ${JSON.stringify(new URL('./workers.ts', import.meta.url).href)}
+    const host = nodeHost({ owner: 'me', cwd: ${JSON.stringify(repo)}, log: () => {}, submit: async () => undefined })
+    const r = await assignWorker(host, { profile: 'astra', name: 'w', dir: ${JSON.stringify(repo)}, brief: ${JSON.stringify(BRIEF)} }, { owner: 'me', ownerCwd: ${JSON.stringify(repo)} })
+    console.log('DONE ' + JSON.stringify(r))
+    setInterval(() => {}, 1000)
+  `
+  const host = spawn(process.execPath, ['--input-type=module', '-e', helper], {
+    detached: true,
+    env: { ...process.env, TMUX_AGENT_DIR: root, PATH: `${bin}:${process.env.PATH}` },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  })
+  let out = ''
+  host.stdout!.on('data', d => (out += d))
+  const until = async (ok: () => boolean, what: string) => {
+    for (let i = 0; i < 100 && !ok(); i++) await new Promise(r => setTimeout(r, 100))
+    assert.ok(ok(), what)
+  }
+  try {
+    await until(() => out.includes('DONE '), `the host assigned (got ${out})`)
+    process.kill(-host.pid!, 'SIGKILL')
+    const { name } = JSON.parse(out.slice(out.indexOf('{')))
+    const state = join(v3Of(root), name)
+    await until(() => existsSync(join(state, 'launch.exit')), 'launch.exit after the host group was killed')
+    assert.equal(readFileSync(join(state, 'launch.exit'), 'utf8').trim(), '0')
+    assert.match(readFileSync(join(state, 'prompt.txt'), 'utf8'), /GOAL: probe/, 'the brief was sent')
+  } finally {
+    try {
+      process.kill(-host.pid!, 'SIGKILL')
+    } catch {}
+  }
+})
+
+test('E1: gate.deferred is cleared once the delivery it was set for is gone (episode cancelled)', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  gate.deferred = 'composer is draft'
+  assert.equal((await cancelEpisode(w.host, r.name, 1)).ok, true)
+  await reconcile(w.host, gate, false)
+  assert.equal(gate.deferred, undefined)
+})
+
+test('R3-6: a channel registration whose guard cannot be removed (ChannelRegistration.left) reaches act/<n>.state', async () => {
+  const w = world()
+  const stuck: Host = {
+    ...w.host,
+    run: async (a, c, m) => (a[0] === 'rm' && a[1]?.endsWith('/channel.lock.unlock') ? { exitCode: 1, stdout: '', stderr: 'EACCES injected guard' } : w.host.run(a, c, m)),
+  }
+  const gate = newGate()
+  assert.equal(await heartbeat(stuck, gate), true, 'the activation is registered')
+  assert.match(gate.registerLeft ?? '', /channel\.lock.* guard .*remains/, 'the leftover guard is kept on the gate')
+  await writeActState(stuck, gate)
+  const state = JSON.parse(readFileSync(`${w.v3}/.sessions/${sessionKey('me')}/act/${gate.activation}.state`, 'utf8'))
+  assert.match(state.reason, /guard .*channel\.lock\.unlock remains/, 'the operator reads it in act/<n>.state')
 })

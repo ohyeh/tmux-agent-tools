@@ -30,7 +30,7 @@ import {
   readWorker,
   recoverEpisodes,
   registerOnChannel,
-  releaseLock,
+  underLock,
   unlinkHeld,
   sessionKey,
   sessionLiveness,
@@ -537,6 +537,8 @@ export type Gate = {
   waiting?: string
   /** Why the last delivery was deferred (host composer not empty, paste blocked); kept while it holds, cleared by a delivery. Published in `act/<n>.state` as `reason`. */
   deferred?: string
+  /** The registration's own guard that could not be removed (`ChannelRegistration.left`): the activation is registered, but the next one reports the channel busy until it is rm'd by hand. Published in `act/<n>.state` as `reason`. */
+  registerLeft?: string
   /** A view's reading of its session's collector (`act/<n>.state` + beat, C-health). Unset on the collector. */
   viewHealth?: Health
   /** A view's last scan error (errno or Error name): the ledger could not be read. */
@@ -737,7 +739,7 @@ export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: 
       for (const f of mine) out.push({ f, token: '' })
       continue
     }
-    try {
+    await underLock(host, `${w}/.action`, lock.token, async () => {
       for (const f of mine) {
         const ep = episodeDirOf(v3, f.d)
         if (!f.d.seq) {
@@ -758,9 +760,7 @@ export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: 
           out.push({ f, token: '' })
         }
       }
-    } finally {
-      await releaseLock(host, `${w}/.action`, lock.token)
-    }
+    }, releaseLog(host))
   }
   return out
 }
@@ -775,7 +775,7 @@ export async function releaseDeliveries(host: Host, v3: string, held: readonly {
       host.log(`tmux-agent: ${name} is locked; its delivery marker stays until the next delivery replaces it`)
       continue
     }
-    try {
+    await underLock(host, `${w}/.action`, lock.token, async () => {
       for (const h of held.filter(x => x.f.d.name === name && x.token)) {
         const path = `${episodeDirOf(v3, h.f.d)}/${DELIVERING}`
         const m = parseJson((await readOrAbsent(host, path)) ?? '') as { token?: unknown } | undefined
@@ -784,9 +784,7 @@ export async function releaseDeliveries(host: Host, v3: string, held: readonly {
         const rm = await host.run(['rm', '-f', path], '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
         if (rm.exitCode !== 0) host.log(`tmux-agent: could not remove ${path}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`)
       }
-    } finally {
-      await releaseLock(host, `${w}/.action`, lock.token)
-    }
+    }, releaseLog(host))
   }
 }
 
@@ -2063,17 +2061,15 @@ export async function releaseEndedWaiters(host: Host, gate: Gate, v3: string, wa
     // Waiter bind/release is serialized by the action lock (§8). Busy: the next tick retries.
     const lock = await takeLock(host, `${v3}/${d.name}`)
     if (!lock.ok) continue
-    try {
+    await underLock(host, `${v3}/${d.name}/.action`, lock.token, async () => {
       const dir = episodeDirOf(v3, d)
       // Re-read under the lock: only the waiter this pass saw end is released.
-      if ((await waiterOf(host, dir, `${v3}/${d.name}`)) !== d.waiter) continue
+      if ((await waiterOf(host, dir, `${v3}/${d.name}`)) !== d.waiter) return
       // The waiter binds THIS episode only (§2); an empty record means none.
       await host.write(`${dir}/waiter`, '{}').catch((error: unknown) => {
         host.log(`tmux-agent: could not release the waiter of ${d.name}: ${String(error)}`)
       })
-    } finally {
-      await releaseLock(host, `${v3}/${d.name}/.action`, lock.token)
-    }
+    }, releaseLog(host))
   }
 }
 
@@ -2124,6 +2120,11 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
   // Held waiters (still running) are in neither list: not acked, not submitted.
   const parted = await partitionWaiters(host, gate, done)
   if (!parted.deliver.length && !parted.silent.length) {
+    // The delivery `deferred` was set for is gone (acked, cancelled, or its worker left): the reason no longer holds.
+    if (gate.deferred) {
+      gate.deferred = undefined
+      await writeActState(host, gate)
+    }
     // Quiet ticks only: a stop is a subprocess inside the hook's budget.
     if (probeStalls) await autoStop(host, gate, v3, s.quiet, now)
     return
@@ -2207,12 +2208,10 @@ export async function recoverUnsent(host: Host, dirs: readonly string[]): Promis
   for (const w of dirs) {
     const lock = await takeLock(host, w)
     if (!lock.ok) continue
-    try {
+    await underLock(host, `${w}/.action`, lock.token, async () => {
       const changed = await recoverEpisodes(host, w)
       if (changed?.length) host.log(`tmux-agent: recovered ${w.slice(w.lastIndexOf('/') + 1)}: ${changed.join(', ')}`)
-    } finally {
-      await releaseLock(host, `${w}/.action`, lock.token)
-    }
+    }, releaseLog(host))
   }
 }
 
@@ -2268,7 +2267,7 @@ export async function writeActState(host: Host, gate: Gate): Promise<void> {
   const n = gate.activation
   if (!id || !root || n === undefined) return
   const status = gate.paused ? 'paused' : 'collecting'
-  const reason = gate.paused ?? gate.deferred
+  const reason = gate.paused ?? gate.deferred ?? gate.registerLeft
   const key = `${n}|${status}|${reason ?? ''}`
   if (gate.stateWritten === key) return
   const channel = gate.channel ?? 'mod'
@@ -2635,7 +2634,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
   const w = `${v3Of(root)}/${d.name}`
   const lock = await takeLock(host, w)
   if (!lock.ok) return { ok: false, text: busyText(d.name, lock.busy) }
-  try {
+  return await underLock<Outcome & { seq?: number }>(host, `${w}/.action`, lock.token, async () => {
     // A crashed earlier action is settled first (§8), never re-sent.
     // An unreadable earlier episode is unsettled: opening a new one would send on top of it.
     if ((await recoverEpisodes(host, w)) === undefined) {
@@ -2701,9 +2700,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
       }
     }
     return { ok: true, seq: ep.seq, text: `sent to "${d.name}" on ${d.profile} as episode ${ep.seq}; its result goes to ${ep.resultPath}${moved}` }
-  } finally {
-    await releaseLock(host, `${w}/.action`, lock.token)
-  }
+  }, releaseNote)
 }
 
 /**
@@ -2739,7 +2736,7 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
   const w = `${v3Of(root)}/${d.name}`
   const lock = await takeLock(host, w)
   if (!lock.ok) return { ok: false, text: busyText(d.name, lock.busy) }
-  try {
+  return await underLock<Outcome>(host, `${w}/.action`, lock.token, async () => {
     const listed = await numericChildren(host, `${w}/episodes`)
     if (!listed) return { ok: false, text: `not stopping "${d.name}": its episodes could not be read (see the log)` }
     const seqs = listed
@@ -2779,9 +2776,7 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
             `stop for "${d.name}" exited ${run.exitCode} (${(run.stderr || run.stdout).trim().slice(-300)})${cancelled}; ` +
             `the row was dropped from the workers panel anyway. If the tmux session is still alive, call ${STOP_TOOL} with all: true`,
         }
-  } finally {
-    await releaseLock(host, `${w}/.action`, lock.token)
-  }
+  }, releaseNote)
 }
 
 /**
@@ -2959,6 +2954,7 @@ async function registerChannelActivation(host: Host, gate: Gate, dir: string): P
   const r = await registerOnChannel(host, dir, channel, me, { pid: 0, pidStart: '', host: '', token: gate.token })
   if ('n' in r) {
     gate.waiting = undefined
+    gate.registerLeft = r.left
     return r.n
   }
   if ('refused' in r) {
@@ -2982,6 +2978,16 @@ async function busyChannelLock(host: Host, h: Holder | 'unreadable' | 'unknown',
     `${path} is held by pid ${h.pid || '?'} on ${h.host || '?'} (session ${h.session || '?'}): ${state}. It is never taken over` +
     `${alive === true ? '' : `. If no registration runs for it, rm '${path.replace(/'/g, `'\\''`)}'`}`
   )
+}
+
+/**
+ * A release that leaves a guard behind is never swallowed (`underLock`): a text result
+ * carries the note to the operator; a path with no result to carry it logs it.
+ */
+const releaseNote = <T extends { text: string }>(v: T, note: string): T => ({ ...v, text: `${v.text}; ${note}` })
+const releaseLog = (host: Host) => <T>(v: T, note: string): T => {
+  host.log(`tmux-agent: ${note}`)
+  return v
 }
 
 /** The worker's action lock (§5), held by this activation's token. */
@@ -3039,7 +3045,7 @@ export async function cancelEpisode(host: Host, name: string, seq: number, opts:
   const ep = `${w}/episodes/${seq}`
   const lock = await takeLock(host, w)
   if (!lock.ok) return { ok: false, text: busyText(name, lock.busy) }
-  try {
+  return await underLock<Outcome>(host, `${w}/.action`, lock.token, async () => {
     const desc = await readDescriptor(host, ep)
     if (desc === 'unknown') return { ok: false, text: `episode ${seq} of "${name}" could not be read (see the log)` }
     if (!desc) return { ok: false, text: `"${name}" has no episode ${seq}` }
@@ -3069,9 +3075,7 @@ export async function cancelEpisode(host: Host, name: string, seq: number, opts:
       }
     }
     return { ok: true, text: `cancelled episode ${seq} of "${name}"; its pane is untouched, and nothing more is delivered for that episode` }
-  } finally {
-    await releaseLock(host, `${w}/.action`, lock.token)
-  }
+  }, releaseNote)
 }
 
 export const UNLOCK_WORD = 'confirm'
@@ -3226,6 +3230,14 @@ export function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promi
 }
 
 /**
+ * Runs the launch line (`$1`) in the background and returns at once. `set -m`
+ * puts the background job in a process group of its own, so a host killed with
+ * its group (R8 F4) does not take the launch with it; nohup covers SIGHUP. POSIX
+ * sh only: the mod path needs no node on PATH.
+ */
+const DETACH_LAUNCH = 'set -m; nohup sh -c "$1" >/dev/null 2>&1 &'
+
+/**
  * The assign tool's body, shared with the runtime-tmux spawn hook and every
  * other host (it takes a Host, never the engine's `$`). `extra` carries the
  * dispatching session's owner and cwd.
@@ -3272,7 +3284,8 @@ export async function assignWorker(
   const goal = goalOf(input.brief)
   const lock = await takeLock(host, stateDir)
   if (!lock.ok) return { deny: `tmux-agent: ${busyText(name, lock.busy)}` }
-  try {
+  let released: string | undefined
+  const denied = await underLock<{ deny: string } | undefined>(host, `${stateDir}/.action`, lock.token, async () => {
     // E1, inside the lock: descriptor first, then the launch on the producer route (§8).
     const ep = await openEpisode(host, stateDir, lock.token, seq => ({
       seq,
@@ -3288,19 +3301,25 @@ export async function assignWorker(
     // outlasts it, so it runs detached from a shell that exits at once. The child
     // writes its OWN exit code to launch.exit — the launch receipt the collector
     // reads, so a failed launch reaches the session instead of silence.
-    // ponytail: shell-level detach; upgrade when the engine offers a spawn op.
+    // The launch must outlive the host (a host killed with its process group would
+    // take a backgrounded child with it, before the brief is sent or launch.exit is
+    // written): a node `spawn` puts it in its own session; macOS has no `setsid`.
     const argv = [tool.bin, input.profile, 'assign', '--detach', '--result-path', ep.resultPath, '--episode', '1', name, input.dir, briefPath]
     const child = `TMUX_AGENT_DIR=${shq(v3)} ${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
-    const run = await host.run(['sh', '-c', `nohup sh -c ${shq(child)} >/dev/null 2>&1 &`], input.dir, 5_000)
+    const run = await host.run(['sh', '-c', DETACH_LAUNCH, 'sh', child], input.dir, 5_000)
     if (run.exitCode !== 0) {
       await mark(host, `${stateDir}/episodes/1`, 'aborted')
       return { deny: `tmux-agent: could not launch assign: ${(run.stderr || run.stdout).trim().slice(-400)}` }
     }
     await mark(host, `${stateDir}/episodes/1`, 'sent')
     if (extra?.bindWaiter) await extra.bindWaiter(stateDir, lock.token)
-  } finally {
-    await releaseLock(host, `${stateDir}/.action`, lock.token)
-  }
+    return undefined
+  }, (v, note) => {
+    if (v) return { deny: `${v.deny}; ${note}` }
+    released = note
+    return v
+  })
+  if (denied) return denied
   // The receipt says who will deliver. A caller reading "collector: active" may
   // end its turn and wait to be woken; anything else means nobody is listening
   // and the caller must harvest itself — the SKILL's proxy/harvest path.
@@ -3312,7 +3331,7 @@ export async function assignWorker(
     receipt:
       `launch requested for "${name}" on ${input.profile} (launch log: ${logPath}). ` +
       'This is NOT proof the worker started; the collector reports either the launch ' +
-      `failure or the terminal result, whichever lands in ${stateDir}. ${collector}.`,
+      `failure or the terminal result, whichever lands in ${stateDir}. ${collector}.${released ? ` ${released}.` : ''}`,
     name,
     stateDir,
   }
