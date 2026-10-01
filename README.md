@@ -121,6 +121,7 @@ Its credential-free `fake` participants are covered by CI; real `codex`/`claude`
   Layout, ownership, and delivery are in
   [`docs/tmux-agent-mod.md`](docs/tmux-agent-mod.md) (收集端). Bash guard
   (`tool.call`) stays on the Claude mod only.
+- Per-host evidence and open blockers: [`docs/support-matrix.md`](docs/support-matrix.md).
 
 ## Install Skill With skills.sh
 
