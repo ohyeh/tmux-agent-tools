@@ -291,6 +291,7 @@ test('dashboard fixture and schema: keys, totals, and values match contract', as
 
     const snap = await dashboard({ host: hostEmpty, now, sessions: [] })
     assert.equal(snap.schema_version, 1)
+    assert.ok(snap.totals, 'snap.totals is present')
     assert.equal(snap.totals.total, 3)
     assert.equal(snap.sessions.length, 3)
 
@@ -348,6 +349,7 @@ test('dashboard fixture and schema: keys, totals, and values match contract', as
     const fixturePath = join(fileURLToPath(new URL('.', import.meta.url)), 'fixtures/dashboard.fixture.json')
     const fixture = JSON.parse(readFileSync(fixturePath, 'utf8')) as DashboardSnapshot
     assert.equal(fixture.schema_version, 1)
+    assert.ok(fixture.totals, 'fixture.totals is present')
     assert.equal(fixture.totals.total, fixture.sessions.length)
     assert.equal(
       fixture.totals.running + fixture.totals.exited + fixture.totals.stopped,
@@ -587,6 +589,7 @@ test('dashboard calls host.run with tmux-agent-sessions list --json when session
     const snap = await dashboard({ host })
     assert.equal(snap.sessions.length, 1)
     assert.equal(snap.sessions[0]?.name, 'shell-worker')
+    assert.ok(snap.totals, 'snap.totals is present')
     assert.equal(snap.totals.running, 1)
   } finally {
     delete process.env.TMUX_AGENT_DIR
@@ -640,6 +643,7 @@ test('no-mutation: panel and dashboard over an orphan with dead owner mutate not
 
     // Call dashboard
     const dashSnap = await dashboard({ host })
+    assert.ok(dashSnap.totals, 'dashSnap.totals is present')
     assert.ok(dashSnap.totals.total >= 0)
 
     // Capture state root after observing
@@ -760,7 +764,7 @@ test('finding R3/R12: no-mutation with live fleet pane compares root before and 
   chmodSync(userDir, 0o700)
   const socketPath = join(userDir, 'default')
   const execTmux = (args: string[]) => {
-    const env = { ...process.env, TMUX_TMPDIR: socketDir }
+    const env: NodeJS.ProcessEnv = { ...process.env, TMUX_TMPDIR: socketDir }
     delete env.TMUX
     delete env.TMUX_PANE
     return execFileSync('tmux', ['-S', socketPath, ...args], { env, encoding: 'utf8', timeout: 20_000 })

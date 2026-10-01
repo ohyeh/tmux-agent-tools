@@ -122,7 +122,7 @@ test('claim: aged owner beats on a closed episode do not open a new gen', async 
   const old = (now - ORPHAN_MS - 5_000) / 1000
   utimesSync(join(act, '1.beat'), old, old)
   const out = await claim(host('other'), root, ep, dead, 'other', now)
-  assert.ok(out === 'held' || out === 'closed', `claim returned ${out}`)
+  assert.equal(out, 'held', 'claim on a closed episode reports held')
   assert.equal(existsSync(join(ep, 'claims')), false, 'closed episode must not gain a claim gen')
 })
 

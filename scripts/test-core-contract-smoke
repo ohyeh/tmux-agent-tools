@@ -17,19 +17,54 @@ if [[ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | head -1)" != "$floor" ]]
   exit 1
 fi
 
-# A hung test used to sit until the job timeout. Each test dies at this bound.
+# A hung test used to sit until the job timeout. Each test FILE dies at this bound.
 timeout_ms=120000
 for arg in "$@"; do
   if [[ "$arg" == --test-timeout=* ]]; then
     timeout_ms="${arg#*=}"
   fi
 done
-if out="$(node --test --test-timeout="$timeout_ms" --test-reporter=tap ./*.contract.node.ts 2>&1)"; then
-  echo "  ok   core contract (node $have):$(print -r -- "$out" | rg -o '^# (pass|fail) \d+' | tr '\n' ' ' | sed 's/# / /g')"
+# The per-test bound cannot stop a file whose process never exits after its tests
+# (H6). The whole run has its own bound, and the result is split into fail
+# (assertions), timeout (a test, a file, or the whole run ran out of time), and
+# error (nonzero exit with neither — a crash, a loader error, no TAP summary).
+run_timeout_s="${CORE_CONTRACT_RUN_TIMEOUT_S:-600}"
+timeout_bin="$(command -v timeout || command -v gtimeout || true)"
+if [[ -z "$timeout_bin" ]]; then
+  echo "  FAIL timeout or gtimeout is required for the run bound" >&2
+  exit 1
+fi
+set +e
+out="$("$timeout_bin" --kill-after=15s "${run_timeout_s}s" \
+  node --test --test-timeout="$timeout_ms" --test-reporter=tap ./*.contract.node.ts </dev/null 2>&1)"
+code=$?
+set -e
+count() { print -r -- "$out" | rg -o "^# $1 \\d+" | rg -o '\d+' | tail -1 || true; }
+pass="$(count pass)"; fail="$(count fail)"; cancelled="$(count cancelled)"
+# Under `node --test`, --test-timeout bounds each FILE; a file that runs out of time
+# (a test still running, or the file not exiting after its tests) is counted as
+# cancelled and its top-level `not ok N - <file>` carries "test timed out". Any
+# other top-level file failure is an error outside a test (a load error).
+file_fails="$(print -r -- "$out" | rg -c '^not ok \d+ - \S+\.contract\.node\.ts$' || true)"
+file_timeouts="$(print -r -- "$out" | rg -A8 '^not ok \d+ - \S+\.contract\.node\.ts$' | rg -c "error: 'test timed out after" || true)"
+pass="${pass:-0}"; fail="${fail:-0}"; cancelled="${cancelled:-0}"
+file_fails="${file_fails:-0}"; file_timeouts="${file_timeouts:-0}"
+timeouts=$cancelled
+errors=$(( file_fails - file_timeouts ))
+fails=$(( fail - errors ))
+(( fails < 0 )) && fails=0
+if (( code == 124 || code == 137 )); then
+  timeouts=$(( timeouts + 1 ))
+elif (( code != 0 && fails == 0 && timeouts == 0 && errors == 0 )); then
+  errors=1
+fi
+summary="pass $pass fail $fails error $errors timeout $timeouts (exit $code)"
+if (( code == 0 && fails == 0 && errors == 0 && timeouts == 0 )); then
+  echo "  ok   core contract (node $have): $summary"
   echo "1 passed, 0 failed"
 else
   print -r -- "$out" >&2
-  echo "  FAIL core contract tests (node $have)" >&2
+  echo "  FAIL core contract tests (node $have): $summary" >&2
   echo "0 passed, 1 failed" >&2
   exit 1
 fi

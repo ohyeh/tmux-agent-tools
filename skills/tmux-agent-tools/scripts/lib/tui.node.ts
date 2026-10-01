@@ -644,114 +644,140 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     }
   }
 
+  const onResize = () => {
+    width = stdout.columns || 80
+    height = stdout.rows || 24
+    render()
+  }
+  const onExit = () => cleanup()
+  const onSig = () => {
+    cleanup()
+    process.exit(0)
+  }
+
+  // Every listener runTui adds is removed here, so a second runTui in the same
+  // process starts from the same listener counts (H6: a leaked handler outlived the TUI).
   let cleanedUp = false
   const cleanup = () => {
     if (cleanedUp) return
     cleanedUp = true
     if (timer) clearInterval(timer)
+    stdin.off('data', onData)
+    stdout.off('resize', onResize)
+    process.off('SIGWINCH', onResize)
+    process.off('exit', onExit)
+    process.off('SIGINT', onSig)
+    process.off('SIGTERM', onSig)
     restoreTerminal(stdin, stdout)
   }
 
+  // Input is read from the first byte: enterTerminal resumes stdin, and a flowing
+  // stream with no 'data' listener drops what arrives. The listener is attached
+  // before the first refresh, so a key typed while the ledger loads (or a test's
+  // early `q`) is kept (H6). Keys run one at a time, in arrival order.
+  let finish: { resolve: () => void; reject: (err: unknown) => void } | undefined
+  const done = new Promise<void>((resolve, reject) => {
+    finish = { resolve, reject }
+  })
+  // A key can fail before `await done` below is reached; mark it handled here so
+  // that is not an unhandled rejection. `await done` still throws it.
+  done.catch(() => {})
+  let chain: Promise<void> = Promise.resolve()
+  let stopped = false
+  const onData = (data: Buffer | string) => {
+    chain = chain.then(async () => {
+      if (stopped) return
+      try {
+        for (const key of inputEvents(String(data))) {
+          const result = nextKeyState(state, key, Date.now())
+          state = result.state
+          if (result.action) await handleAction(result.action)
+          if (state.quit) {
+            stopped = true
+            finish?.resolve()
+            return
+          }
+        }
+        render()
+      } catch (err) {
+        stopped = true
+        finish?.reject(err)
+      }
+    })
+  }
+
+  const handleAction = async (action: TuiAction) => {
+    if (action.type === 'quit') {
+      state.quit = true
+      return
+    }
+    if (action.type === 'refresh') {
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'stop') {
+      const out = await stopWorker(host, gate, action.row.d)
+      state.statusMessage = `stop ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
+      state.statusUntil = Date.now() + 5000
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'stopAll') {
+      const out = await stopAll(host, gate)
+      state.statusMessage = `clear — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
+      state.statusUntil = Date.now() + 5000
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'interrupt') {
+      const out = await interruptWorker(host, action.row.d)
+      state.statusMessage = `interrupt ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
+      state.statusUntil = Date.now() + 5000
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'resume') {
+      const out = await resumeWorker(host, action.value)
+      state.statusMessage = `resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
+      state.statusUntil = Date.now() + 5000
+      if (out.ok) await refreshRows()
+      render()
+      return
+    }
+  }
+
   enterTerminal(stdin, stdout)
+  stdin.on('data', onData)
+  stdout.on('resize', onResize)
+  process.on('SIGWINCH', onResize)
+  process.on('exit', onExit)
+  process.on('SIGINT', onSig)
+  process.on('SIGTERM', onSig)
 
   try {
-    await refreshRows()
-    render()
-
-    const onResize = () => {
-      width = stdout.columns || 80
-      height = stdout.rows || 24
-      render()
-    }
-
-    stdout.on('resize', onResize)
-    process.on('SIGWINCH', onResize)
-
-    const onExit = () => cleanup()
-    const onSig = () => {
-      cleanup()
-      process.exit(0)
-    }
-
-    process.on('exit', onExit)
-    process.on('SIGINT', onSig)
-    process.on('SIGTERM', onSig)
-
-    timer = setInterval(async () => {
-      if (state.quit) return
-      const fresh = await refreshRows()
-      if (state.selected) {
-        await captureSelected()
-      }
-      if (fresh) render()
-    }, options.mirrorMs ?? MIRROR_MS)
-
-    const handleAction = async (action: TuiAction) => {
-      if (action.type === 'quit') {
-        state.quit = true
-        return
-      }
-      if (action.type === 'refresh') {
-        await refreshRows()
-        render()
-        return
-      }
-      if (action.type === 'stop') {
-        const out = await stopWorker(host, gate, action.row.d)
-        state.statusMessage = `stop ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-        state.statusUntil = Date.now() + 5000
-        await refreshRows()
-        render()
-        return
-      }
-      if (action.type === 'stopAll') {
-        const out = await stopAll(host, gate)
-        state.statusMessage = `clear — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-        state.statusUntil = Date.now() + 5000
-        await refreshRows()
-        render()
-        return
-      }
-      if (action.type === 'interrupt') {
-        const out = await interruptWorker(host, action.row.d)
-        state.statusMessage = `interrupt ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-        state.statusUntil = Date.now() + 5000
-        await refreshRows()
-        render()
-        return
-      }
-      if (action.type === 'resume') {
-        const out = await resumeWorker(host, action.value)
-        state.statusMessage = `resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-        state.statusUntil = Date.now() + 5000
-        if (out.ok) await refreshRows()
-        render()
-        return
-      }
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      const onData = async (data: Buffer | string) => {
-        try {
-          for (const key of inputEvents(String(data))) {
-            const result = nextKeyState(state, key, Date.now())
-            state = result.state
-            if (result.action) await handleAction(result.action)
-            if (state.quit) {
-              stdin.off('data', onData)
-              resolve()
-              return
-            }
-          }
-          render()
-        } catch (err) {
-          stdin.off('data', onData)
-          reject(err)
-        }
-      }
-      stdin.on('data', onData)
+    // `q` during a slow first load quits at once; it does not wait for the load.
+    const first = refreshRows().then(() => {
+      if (!stopped) render()
     })
+    first.catch(() => {})
+    await Promise.race([first, done])
+    if (!stopped) {
+      timer = setInterval(async () => {
+        if (stopped) return
+        const fresh = await refreshRows()
+        if (state.selected && !stopped) {
+          await captureSelected()
+        }
+        if (fresh && !stopped) render()
+      }, options.mirrorMs ?? MIRROR_MS)
+      await done
+    }
   } finally {
+    stopped = true
     cleanup()
   }
 }

@@ -249,8 +249,11 @@ test('collector wake: a bracketed paste into the exact pane, then Enter; a gone 
     const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
     assert.ok(await paneAlive(pane, srv.env))
     assert.deepEqual(await pasteInto(pane, 'line one\nline two', srv.env), { text: 'line one\nline two' })
-    await new Promise(r => setTimeout(r, 300))
-    const screen = (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
+    let screen = ''
+    for (let i = 0; i < 250 && !/line two/.test(screen); i++) {
+      screen = (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
+      if (!/line two/.test(screen)) await new Promise(r => setTimeout(r, 20))
+    }
     assert.match(screen, /line one/)
     assert.match(screen, /line two/)
     assert.equal(await paneAlive('%999999', srv.env), false)
@@ -290,8 +293,14 @@ test('CLI collector and another session on one root: a dead owner\'s finished ep
     assert.deepEqual(delivered(w), [], 'the claim tick delivers nothing')
     assert.equal(gens(w).length, 1, 'one claim gen')
     await round()
-    await new Promise(r => setTimeout(r, 300))
-    const screen = (await srv.tmux(['capture-pane', '-p', '-J', '-t', pane])).out
+    // A paste shows up on the screen some time after the round; wait for it (with
+    // a bound) only when the ledger says nothing was delivered by record.
+    let screen = ''
+    for (let i = 0; i < 250; i++) {
+      screen = (await srv.tmux(['capture-pane', '-p', '-J', '-t', pane])).out
+      if (screen.includes('did it') || delivered(w).length > 0) break
+      await new Promise(r => setTimeout(r, 20))
+    }
     const pasted = screen.includes('did it') ? 1 : 0
     assert.equal(delivered(w).length + pasted, 1, 'the claimant delivers once, the other session does not')
     assert.ok(acked(w))

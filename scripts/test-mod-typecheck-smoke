@@ -21,9 +21,25 @@ fi
 echo "typechecking the mod (hooks, tests, types, scripts/lib) against tsconfig.json"
 if npx -p typescript tsc --noEmit -p tsconfig.json; then
   echo "  ok   mod typecheck clean"
-  echo "1 passed, 0 failed"
 else
   echo "  FAIL mod typecheck reported errors (above)" >&2
   echo "0 passed, 1 failed" >&2
+  exit 1
+fi
+
+# The node-run core files (`lib/*.node.ts`) are excluded above (no node typings
+# in the mod tree). They get their own config with @types/node from mcp-adapter.
+if [[ ! -d mcp-adapter/node_modules/@types/node ]]; then
+  echo "  FAIL @types/node missing: run npm --prefix mcp-adapter ci" >&2
+  echo "1 passed, 1 failed" >&2
+  exit 1
+fi
+echo "typechecking the node core files against tsconfig.node.json"
+if npx -p typescript tsc --noEmit -p tsconfig.node.json; then
+  echo "  ok   node core typecheck clean"
+  echo "2 passed, 0 failed"
+else
+  echo "  FAIL node core typecheck reported errors (above)" >&2
+  echo "1 passed, 1 failed" >&2
   exit 1
 fi

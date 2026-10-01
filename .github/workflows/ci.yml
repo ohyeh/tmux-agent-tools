@@ -540,6 +540,11 @@ jobs:
           chmod +x "$stub_cli_dir/claude" "$stub_cli_dir/codex"
           echo "$stub_cli_dir" >> "$GITHUB_PATH"
 
+      # test-mod-typecheck-smoke checks the node core files with @types/node from
+      # mcp-adapter's lockfile.
+      - name: Install mcp-adapter dev dependencies
+        run: npm --prefix mcp-adapter ci
+
       - name: Run full smoke suite
         run: scripts/run-all-smokes
 

@@ -32,6 +32,15 @@ import {
   ANSI_LEAVE_ALT,
 } from './tui.node.ts'
 
+/** Wait for a condition with a deadline. A fixed sleep races a loaded machine (H6). */
+async function until(cond: () => boolean, ms = 5_000, what = 'condition'): Promise<void> {
+  const end = Date.now() + ms
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out after ${ms}ms waiting for ${what}`)
+    await new Promise(r => setTimeout(r, 10))
+  }
+}
+
 /** Filesystem host whose `run` does not exec. Keeps a TUI test off the default tmux server. */
 function quietHost(owner: string | undefined, cwd: string, root: string) {
   const host = nodeHost({ owner, cwd })
@@ -457,10 +466,7 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
       mirrorMs: 60_000,
     })
 
-    // Wait microtask for initial render
-    await new Promise(r => setTimeout(r, 50))
-    const initialOutput = mockStdout.written
-    assert.ok(initialOutput.includes('workers'))
+    await until(() => mockStdout.written.includes('workers'), 5_000, 'the first render')
 
     // Trigger resize to 120x30
     mockStdout.columns = 120
@@ -468,9 +474,7 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
     mockStdout.written = ''
     process.emit('SIGWINCH')
 
-    await new Promise(r => setTimeout(r, 20))
-    assert.ok(mockStdout.written.length > 0, 'SIGWINCH must trigger re-render')
-    assert.ok(mockStdout.written.includes('workers'))
+    await until(() => mockStdout.written.includes('workers'), 5_000, 'SIGWINCH to re-render')
   } finally {
     mockStdin.emit('data', 'q')
     await tuiPromise
@@ -534,8 +538,7 @@ test('restore: runTui restores terminal on normal quit', async () => {
     mirrorMs: 60_000,
   })
 
-  await new Promise(r => setTimeout(r, 30))
-  assert.equal(mockStdin.isRaw, true, 'entered raw mode')
+  await until(() => mockStdin.isRaw === true, 5_000, 'raw mode')
 
   // Quit
   mockStdin.emit('data', 'q')
@@ -589,6 +592,74 @@ test('restore: runTui restores terminal when an exception occurs in the loop', a
   assert.ok(mockStdout.written.includes(ANSI_LEAVE_ALT), 'alt screen must be left even after exception')
 })
 
+// H6: runTui attached its stdin listener only after the first refresh; a key
+// that arrived during a slow first load was dropped and runTui never resolved.
+test('input: a q sent before the first refresh completes quits at once (H6)', async () => {
+  class MockStdout extends EventEmitter {
+    columns = 80
+    rows = 24
+    written = ''
+    write(chunk: string) {
+      this.written += chunk
+      return true
+    }
+  }
+  class MockStdin extends EventEmitter {
+    isTTY = true
+    isRaw = false
+    setRawMode(raw: boolean) {
+      this.isRaw = raw
+    }
+  }
+  const mockStdin = new MockStdin() as any
+  const mockStdout = new MockStdout() as any
+  const root = mkdtempSync(join(tmpdir(), 'tui-slow-'))
+  const slow = quietHost('slow', root, root)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  const realNow = slow.now
+  slow.now = async () => {
+    await gate
+    return realNow()
+  }
+  const started = Date.now()
+  const run = runTui({ stdin: mockStdin, stdout: mockStdout, host: slow, session: 'slow', cwd: root, root, mirrorMs: 60_000 })
+  mockStdin.emit('data', 'q')
+  const quitFirst = await Promise.race([run.then(() => 'quit'), new Promise(r => setTimeout(() => r('hung'), 2_000))])
+  release()
+  if (quitFirst === 'hung') {
+    // The early q was dropped. Quit for real so the test fails here instead of hanging.
+    await until(() => mockStdin.listenerCount('data') > 0, 5_000, 'the stdin listener')
+    mockStdin.emit('data', 'q')
+  }
+  await run
+  assert.equal(quitFirst, 'quit', 'q during the first load must end runTui without waiting for the load')
+  assert.ok(Date.now() - started < 2_000)
+  assert.equal(mockStdin.isRaw, false, 'terminal restored')
+  assert.equal(mockStdin.listenerCount('data'), 0, 'stdin listener removed')
+})
+
+test('cleanup: two runTui calls leave process and stream listener counts unchanged (H6)', async () => {
+  const count = () => ({
+    winch: process.listenerCount('SIGWINCH'),
+    int: process.listenerCount('SIGINT'),
+    term: process.listenerCount('SIGTERM'),
+    exit: process.listenerCount('exit'),
+  })
+  const before = count()
+  for (const n of [1, 2]) {
+    const stdout = Object.assign(new EventEmitter(), { columns: 80, rows: 24, write: () => true }) as any
+    const stdin = Object.assign(new EventEmitter(), { isTTY: true, setRawMode() {} }) as any
+    const root = mkdtempSync(join(tmpdir(), `tui-count-${n}-`))
+    const run = runTui({ stdin, stdout, host: quietHost('count', root, root), session: 'count', cwd: root, root, mirrorMs: 60_000 })
+    stdin.emit('data', 'q')
+    await run
+    assert.equal(stdin.listenerCount('data'), 0)
+    assert.equal(stdout.listenerCount('resize'), 0)
+  }
+  assert.deepEqual(count(), before, 'runTui must remove every listener it added')
+})
+
 // -----------------------------------------------------------------------------
 // 5. No-mutation check over a root with a dead owner's orphan
 // -----------------------------------------------------------------------------
@@ -603,7 +674,7 @@ test('no-mutation core panelRows: reads a dead-owner orphan and mutates nothing'
   const outside = new Set(['git', 'sh', 'tmux', 'agent-tmux'])
   const deadHost = {
     ...base,
-    run: async (argv: readonly string[], cwd?: string, ms?: number) => {
+    run: async (argv: readonly string[], cwd: string, ms: number) => {
       if (outside.has(argv[0]!)) return { exitCode: 0, stdout: '', stderr: '' }
       return base.run(argv, cwd, ms)
     },
@@ -946,7 +1017,7 @@ test('no-mutation tui: runTui renders, refreshes, and leaves paths, mtimes, and 
   const outside = new Set(['git', 'sh', 'tmux', 'agent-tmux'])
   const deadHost = {
     ...base,
-    run: async (argv: readonly string[], cwd?: string, ms?: number) => {
+    run: async (argv: readonly string[], cwd: string, ms: number) => {
       if (outside.has(argv[0]!)) return { exitCode: 0, stdout: '', stderr: '' }
       return base.run(argv, cwd, ms)
     },
