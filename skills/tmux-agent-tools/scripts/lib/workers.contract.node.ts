@@ -1934,6 +1934,28 @@ test('Sol R5-1: put back never nests into a new same-name reservation; it keeps 
   assert.equal(JSON.parse(readFileSync(`${aside}/worker.json`, 'utf8')).owner, 'OLD', 'the old record is kept, not lost')
 })
 
+test('put-back that fails midway undoes its moves: the record is never split across two dirs', async () => {
+  const w = world()
+  const dir = `${w.v3}/split.abcde`
+  mkdirSync(dir, { recursive: true })
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(dir, old, old)
+  const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
+    if (argv[0] === 'mv' && argv[1] === dir) {
+      writeFileSync(`${dir}/worker.json`, '{}')
+      writeFileSync(`${dir}/worker.json.tmp1`, '{}')
+    }
+    // The second entry's move back fails.
+    if (argv[0] === 'mv' && argv[2] === `${dir}/${'worker.json.tmp1'}`) return { exitCode: 1, stdout: '', stderr: 'injected EIO' }
+    return w.host.run(argv, cwd, ms)
+  } }
+  const r = await clearIncomplete(host, 'split.abcde')
+  assert.ok(!r.ok && /moving worker\.json\.tmp1 back failed: injected EIO; it is kept at /.test(r.text), r.text)
+  const aside = r.text.match(/kept at (\S+)$/)![1]!
+  assert.deepEqual(readdirSync(aside).sort(), ['worker.json', 'worker.json.tmp1'], 'every entry is back in the kept dir')
+  assert.equal(existsSync(dir), false, 'no half dir left at the name')
+})
+
 test('Sol R5-1: a writer that publishes after the clear leaves a complete worker, never a half-cleared dir', async () => {
   const w = world()
   const dir = `${w.v3}/gone.abcde`

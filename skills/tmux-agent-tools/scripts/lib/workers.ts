@@ -3237,9 +3237,20 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
     if (!moved) return keep('the moved dir could not be listed')
     const won = await mkdirExclusive(host, w)
     if (won !== 'won') return keep(won === 'lost' ? `a new reservation took "${name}" meanwhile` : `${w} could not be re-created (see the log)`)
+    const done: string[] = []
     for (const e of moved) {
       const m = await run(['mv', `${aside}/${e.name}`, `${w}/${e.name}`])
-      if (m.exitCode !== 0) return keep(`moving ${e.name} back failed: ${m.stderr.trim() || `exit ${m.exitCode}`}`)
+      if (m.exitCode === 0) {
+        done.push(e.name)
+        continue
+      }
+      // Never leave the record split across two dirs: undo the moves made so far.
+      const stuck: string[] = []
+      for (const n of done) if ((await run(['mv', `${w}/${n}`, `${aside}/${n}`])).exitCode !== 0) stuck.push(n)
+      const fail = `moving ${e.name} back failed: ${m.stderr.trim() || `exit ${m.exitCode}`}`
+      if (stuck.length) return { ok: false, text: `"${name}" changed while clearing (${late.name}); ${fail}; split: ${stuck.join(', ')} in ${w}, the rest in ${aside}` }
+      await run(['rmdir', w])
+      return keep(fail)
     }
     const rd = await run(['rmdir', aside])
     if (rd.exitCode !== 0) host.log(`tmux-agent: could not remove the empty ${aside}: ${rd.stderr.trim() || `exit ${rd.exitCode}`}`)
