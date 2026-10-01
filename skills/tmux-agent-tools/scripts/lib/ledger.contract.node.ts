@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   ack, acquireLock, allocateNext, claim, currentOwner, hasMark, mark, openEpisode, ORPHAN_MS, publishWorker, readDescriptor, readWorker, recoverEpisodes,
-  registerActivation, maintainLock, releaseLock, sessionKey, sessionLiveness, superseded, type Descriptor,
+  registerActivation, maintainLock, releaseLock, underLock, sessionKey, sessionLiveness, superseded, type Descriptor,
 } from './ledger.ts'
 import type { Host } from './workers.ts'
 import { nodeHost } from './host.node.ts'
@@ -355,4 +355,15 @@ test('Sol-r3 R3-6: a guard that cannot be removed is returned by releaseLock, no
   const next = await releaseLock(base, lock, 'next')
   assert.equal(next.ok, false)
   assert.equal(lstatOk(lock), true, 'nothing is stolen: the next lock stays held behind the stale guard')
+})
+
+test('Sol r4 R4-6: underLock whose body throws still logs a failed release and rethrows the body error; releaseLock logs a target rm failure', async () => {
+  const logs: string[] = []
+  const base = nodeHost({ owner: 'me', log: t => logs.push(t) })
+  const lock = join(fresh(), '.action')
+  assert.ok((await acquireLock(base, lock, holder('ours'))).ok)
+  const bad: Host = { ...base, run: async (a, c, m) => (a[0] === 'rm' && a[1] === lock ? { exitCode: 1, stdout: '', stderr: 'EACCES target rm' } : base.run(a, c, m)) }
+  await assert.rejects(underLock(bad, lock, 'ours', async () => { throw new Error('body EIO') }, v => v), /body EIO/)
+  assert.ok(lstatSync(lock).isSymbolicLink(), 'the lock is still there')
+  assert.ok(logs.some(l => /EACCES target rm/.test(l) && /stays held|release of/.test(l)), logs.join('\n'))
 })

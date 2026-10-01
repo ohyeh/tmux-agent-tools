@@ -7,6 +7,7 @@
 //   tell <name> <text-file>
 //   stop <name>
 //   rows                       read-only panel rows, one JSON array
+//   cancel <name>                clear a worker dir with no worker.json (refused while a writer may still publish).
 //   cancel <name> <seq> [--force]  close one episode (acks/cancel); the pane is untouched.
 //                              --force closes an episode whose delivery was reserved and never acknowledged
 //                              ("unknown: 可能已送達"): it only stops new attempts, it never says "not delivered"
@@ -19,6 +20,7 @@ import { nodeHost } from './host.node.ts'
 import {
   assignWorker,
   cancelEpisode,
+  clearIncomplete,
   newGate,
   panelRows,
   rootOf,
@@ -126,7 +128,9 @@ async function main(): Promise<void> {
   }
   if (command === 'cancel') {
     const [name, seq] = rest
-    if (!name || !seq || rest.length !== 2 || !/^[0-9]+$/.test(seq)) bad('cancel takes <name> <seq> [--force]')
+    // `cancel <name>` alone clears a worker dir with no worker.json (an unfinished reservation).
+    if (name && rest.length === 1) return finish(await clearIncomplete(host, name))
+    if (!name || !seq || rest.length !== 2 || !/^[0-9]+$/.test(seq)) bad('cancel takes <name> <seq> [--force], or <name> alone for an unfinished reservation')
     return finish(await cancelEpisode(host, name, Number(seq), { force: !!parsed.values.force }))
   }
   if (command === 'unlock') {

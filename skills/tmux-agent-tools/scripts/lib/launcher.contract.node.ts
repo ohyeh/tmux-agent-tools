@@ -496,13 +496,15 @@ try {
   const token = await takeLauncherLock(host, process.env.DIR, process.env.S)
   say({ won: token })
   await new Promise(r => setTimeout(r, Number(process.env.HOLD || 0)))
+  // releasing is stamped before the unlink: a waiter can win before released is written.
+  if (process.env.RELEASE === '1') say({ releasing: true })
   if (process.env.RELEASE === '1') say({ released: (await releaseLock(host, process.env.DIR + '/collector.owner', token)).ok })
 } catch (error) {
   say({ busy: error.message })
 }
 `
 
-type Said = { won?: string; released?: boolean; busy?: string; at: number }
+type Said = { won?: string; releasing?: boolean; released?: boolean; busy?: string; at: number }
 
 function contender(dir: string, env: Record<string, string> = {}): Promise<{ code: number; said: Said[] }> {
   return new Promise(resolve => {
@@ -586,7 +588,7 @@ test('C-lock: crash right after the ln -sn publish → busy (no steal); unlock n
     assert.ok(!linked(w.lock))
     const next = await contender(w.dir, { RELEASE: '1' })
     assert.ok(next.said[0]?.won, JSON.stringify(next.said))
-    assert.equal(next.said[1]?.released, true)
+    assert.equal(next.said.find(s => 'released' in s)?.released, true)
   } finally {
     rmSync(w.root, { recursive: true, force: true })
   }
@@ -605,10 +607,11 @@ test('C-lock: a holder alive for more than 10s is never stolen; a delayed releas
     assert.equal(unlock.code, 1)
     assert.match(unlock.out, /still running/)
     const [h, x] = await Promise.all([holder, waiter])
-    const released = h.said.find(s => s.released)!
+    const releasing = h.said.find(s => s.releasing)!
+    assert.ok(h.said.find(s => s.released), JSON.stringify(h.said))
     const won = x.said.find(s => s.won)
     assert.ok(won, JSON.stringify(x.said))
-    assert.ok(won.at >= released.at, 'the waiter won only after the release')
+    assert.ok(won.at >= releasing.at, 'the waiter won only after the release began')
   } finally {
     rmSync(w.root, { recursive: true, force: true })
   }

@@ -233,6 +233,45 @@ assert "g: the session survives the unreadable binding" "$(tmux_b has-session -t
 "$AGENT_TMUX" fakecli stop gname >/dev/null 2>&1 || true
 assert "g: stop with a valid binding still stops it" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" no
 
+print -r -- "case h: a stop that verified the old pane cannot kill a replacement launched under the same name"
+# Shim tmux: the first kill-session of a process with SCUT set reports at-kill, then waits (the cut between identity check and kill).
+cat > "$WORK/bin/tmux-stopcut" <<SHIM
+#!/bin/bash
+if [ -n "\${SCUT:-}" ] && [ "\$1" = kill-session ] && [ ! -e "$WORK/stopcut-done" ]; then
+  : > "$WORK/stopcut-done"; : > "$WORK/at-kill"
+  for _ in \$(seq 1 300); do [ -e "$WORK/release-kill" ] && break; sleep 0.1; done
+fi
+exec "$REAL_TMUX" "\$@"
+SHIM
+chmod +x "$WORK/bin/tmux-stopcut"
+"$AGENT_TMUX" fakecli start --exact hname "$WORK/repo" >/dev/null 2>&1
+H="$TMUX_AGENT_DIR/hname"
+old="$(tr -d '[:space:]' < "$H/pane-id")"
+SCUT=1 TMUX="$WORK/bin/tmux-stopcut" "$AGENT_TMUX" fakecli stop hname >"$WORK/hs.out" 2>&1 &
+pid_s=$!
+for (( i = 0; i < 100; i++ )); do [[ -e "$WORK/at-kill" ]] && break; sleep 0.1; done
+assert "h: stop reached the cut point" "$([[ -e "$WORK/at-kill" ]] && echo yes || echo no)" yes
+tmux_b kill-session -t '=wlim-hname'
+"$AGENT_TMUX" fakecli start --exact hname "$WORK/repo" >"$WORK/hb.out" 2>&1 &
+pid_n=$!
+sleep 1.5
+: > "$WORK/release-kill"
+wait $pid_s || true
+code_n=0; wait $pid_n || code_n=$?
+new="$(tmux_b display-message -p -t '=wlim-hname:' '#{pane_id}' 2>/dev/null || true)"
+print -r -- "  h: old=$old replacement=$new start_exit=$code_n"
+assert "h: the replacement start exits 0" "$code_n" 0
+assert "h: the replacement session survives the stale stop" "$(tmux_b has-session -t '=wlim-hname' 2>/dev/null && echo yes || echo no)" yes
+assert "h: pane-id is the replacement pane" "$(tr -d '[:space:]' < "$H/pane-id")" "$new"
+"$AGENT_TMUX" fakecli stop hname >/dev/null 2>&1 || true
+
+print -r -- "case h: stop of an unknown name keeps the old refusal and creates nothing"
+code=0
+out="$("$AGENT_TMUX" fakecli stop nosuchname 2>&1)" || code=$?
+assert "h: unknown name exits as before (0)" "$code" 0
+assert_contains "h: unknown name says Already stopped" "$out" "Already stopped"
+assert "h: no <state>/<name> dir was created" "$([[ -e "$TMUX_AGENT_DIR/nosuchname" ]] && echo yes || echo no)" no
+
 print -r -- "case f: the protocol docs name no \`current\` seq pointer"
 hits="$(cd "$REPO_ROOT" && grep -n '`current`' docs/tmux-agent-mod.md README.md skills/tmux-agent-tools/SKILL.md skills/tmux-agent-tools/references/*.md || true)"
 assert "f: no \`current\` in the protocol docs" "$hits" ""

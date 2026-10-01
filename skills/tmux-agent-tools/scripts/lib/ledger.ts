@@ -165,7 +165,10 @@ export async function releaseLock(host: Host, lock: string, token: string): Prom
   const section: Holder = { ...h, token: `${token}.release`, activation: 'release' }
   for (let i = 0; i < RELEASE_TRIES; i++) {
     const m = await maintainLock(host, lock, section, () => unlinkHeld(host, lock, token))
-    if (m.ok) return m.value
+    if (m.ok) {
+      if (!m.value.ok) host.log(`tmux-agent: release of ${lock} failed: ${m.value.error}`)
+      return m.value
+    }
     if ('ran' in m) {
       host.log(`tmux-agent: release of ${lock} left ${m.path}: ${m.error}`)
       return { ok: false, error: m.value.ok ? m.error : `${m.value.error}; ${m.error}`, left: m.path }
@@ -192,7 +195,9 @@ export async function underLock<T>(
   try {
     v = await body()
   } catch (error) {
-    await releaseLock(host, lock, token)
+    // The body error stays the main one; a release that failed on top of it is logged, not lost.
+    const r = await releaseLock(host, lock, token)
+    if (!r.ok) host.log(`tmux-agent: ${releasedText(lock, r)}`)
     throw error
   }
   const r = await releaseLock(host, lock, token)

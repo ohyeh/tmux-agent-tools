@@ -2475,6 +2475,8 @@ _composer_classify() {
         }
       }
       if (!g) { print (L[n] ~ /[$%#] *$/ ? "shell" : "unknown"); exit }
+      # A prompt glyph alone is not a composer (a shell may draw one): codex and claude must also show their footer / frame under it.
+      if (f > n) { print "unknown"; exit }
       text = first
       for (j = g + 1; j < f; j++) { line = L[j]; sub(/^ +/, "", line); text = text "\n" line }
       sub(/\n+$/, "", text)
@@ -9182,13 +9184,19 @@ stop_session() {
     exit 2
   fi
 
+  # Same per-name launch lock as start/resume: a replacement cannot be launched
+  # between the identity check below and the kill / envelope write (R4-3). The OS
+  # drops it at exit; released explicitly after the envelope.
+  # A name with no agent dir has nothing to protect (and the lock would create the dir): skip it.
+  [[ -d "$(agent_root_dir)/$name" ]] && acquire_launch_lock "$name"
+
   # Kill the safety-fuse watcher (issue #105) BEFORE tearing down tmux so
   # the watcher cannot race a sentinel write against a clean stop.
   kill_max_fuse_watcher "$name"
 
   local session
   session="$(session_for_name "$name")"
-  local stopped=0 bound
+  local stopped=0 bound ident
   if "$TMUX" "${TMUX_SOCKET_ARGS[@]}" has-session -t "$(session_target "$session")" 2>/dev/null; then
     # Bound to the pane its launch created (pane-id, written by new-session -P):
     # a same-named session without that pane is not this worker's to kill.
@@ -9198,11 +9206,18 @@ stop_session() {
       echo "refusing to stop $session: $(agent_root_dir)/$name/pane-id is missing, empty, or unreadable, so this session cannot be proven to be the worker $name launched. Check it ($SELF $CLI capture $name), then kill it with tmux directly if it is yours." >&2
       exit 1
     fi
-    if ! "$TMUX" "${TMUX_SOCKET_ARGS[@]}" list-panes -s -t "$(session_target "$session")" -F '#{pane_id}' 2>/dev/null | grep -Fxq -- "$bound"; then
+    # Resolve the bound pane to its session id (unique per server, never reused):
+    # the kill targets that identity, not the reusable session name.
+    ident="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$bound" '#{session_name}|#{session_id}' 2>/dev/null || true)"
+    if [[ "${ident%%|*}" != "$session" || -z "${ident##*|}" ]]; then
       echo "refusing to stop $session: it does not hold pane $bound, the pane $name was launched in" >&2
       exit 1
     fi
-    "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session")"
+    if ! "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "${ident##*|}" 2>/dev/null \
+       && "$TMUX" "${TMUX_SOCKET_ARGS[@]}" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq -- "$bound"; then
+      echo "kill-session of $session (${ident##*|}) failed while its pane $bound is still alive" >&2
+      exit 1
+    fi
     stopped=1
     echo "Stopped $session"
   else
@@ -9212,6 +9227,7 @@ stop_session() {
   # Terminal envelope: guarantee result.json + a launch_end ledger event even
   # when the agent never wrote a result (merge preserves agent fields).
   finalize_launch_envelope "$name" "stopped"
+  if [[ -n "$_LAUNCH_LOCK_FD" ]]; then zsystem flock -u "$_LAUNCH_LOCK_FD" 2>/dev/null || true; _LAUNCH_LOCK_FD=""; fi
 
   local transcript_path
   transcript_path="$(transcript_path_for "$name")"

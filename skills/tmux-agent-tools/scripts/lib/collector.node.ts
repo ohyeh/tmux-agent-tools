@@ -99,8 +99,8 @@ export async function hostCli(pane: string, env: NodeJS.ProcessEnv = process.env
 
 /**
  * The composer holds what was pasted: its text equals the paste with all whitespace
- * ignored (a TUI re-wraps), or is the visible tail of a long paste, or it is the CLI's own `[Pasted text #1 +9 lines]` /
- * `[Pasted Content 1234 chars]` placeholder (+M lines: M covers every line pasted).
+ * ignored (a TUI re-wraps), or is a provable suffix of a long paste (the composer scrolls), or it is the CLI's own
+ * `[Pasted text #1 +9 lines]` / `[Pasted Content 1234 chars]` placeholder with exactly this paste's line / char count.
  */
 export function composerHolds(c: Composer, pasted: string): boolean {
   if (c.state !== 'draft') return false
@@ -109,11 +109,15 @@ export function composerHolds(c: Composer, pasted: string): boolean {
   if (seen === flat(pasted)) return true
   // A long paste scrolls inside the composer (cursor-agent shows only its last rows). The composer was
   // empty before the paste, so what it shows must be part of the paste, and most of it: a mismatch fails.
-  if (seen.length >= Math.min(flat(pasted).length, 80) && flat(pasted).includes(seen)) return true
-  const ph = /^\[Pasted (?:text|Content)[^\]]*\]$/.exec(c.text.trim())
-  if (!ph) return false
-  const lines = /\+(\d+) lines?/.exec(ph[0])
-  return !lines || Number(lines[1]) >= pasted.split('\n').length
+  // Only a provable suffix counts (a middle fragment may hide a lost head or tail).
+  if (seen.length >= Math.min(flat(pasted).length, 80) && flat(pasted).endsWith(seen)) return true
+  // A CLI placeholder is exact: its line / char count must be this paste's. Unknown or mismatched -> not held.
+  const lines = /^\[Pasted text #\d+ \+(\d+) lines?\]$/.exec(c.text.trim())
+  if (lines) {
+    return Number(lines[1]) === pasted.split('\n').length // agent-tmux:2418: M is the number of lines (newlines + 1)
+  }
+  const chars = /^\[Pasted Content (\d+) chars\]$/.exec(c.text.trim())
+  return !!chars && Number(chars[1]) === pasted.length
 }
 
 /**
@@ -125,8 +129,11 @@ export function composerHolds(c: Composer, pasted: string): boolean {
  */
 export async function pasteInto(pane: string, text: string, env: NodeJS.ProcessEnv = process.env, cli?: string): Promise<{ text?: string; drop?: string; deferred?: string }> {
   if (!(await paneAlive(pane, env))) return { drop: `host pane ${pane} is gone` }
-  const kind = cli ?? (await hostCli(pane, env))
-  if (!kind) return { deferred: `cannot tell which CLI runs in ${pane} (pass --cli); nothing pasted` }
+  // --cli only picks the parser; the CLI must also be running in the pane (a shell drawing a CLI-like prompt gets no paste, no Enter).
+  const running = await hostCli(pane, env)
+  const kind = cli ?? running
+  if (!kind) return { deferred: `no known CLI (codex, claude, cursor-agent, agy) runs in ${pane}; nothing pasted` }
+  if (running !== (kind === 'cursor-agent' ? 'cursor' : kind)) return { deferred: `${kind} is not running in ${pane} (found ${running ?? 'no known CLI'}); nothing pasted, no Enter` }
   const before = await composerState(pane, kind, env)
   // The composer was empty before our paste, so a draft that holds this notice is our own earlier, unsent paste.
   if (composerHolds(before, text)) return { deferred: `an earlier notice is still in the composer of ${pane}; Enter not sent — press Enter or clear it; nothing pasted, retrying` }

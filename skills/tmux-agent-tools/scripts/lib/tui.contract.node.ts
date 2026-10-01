@@ -2649,6 +2649,8 @@ test('R8.5: a stale delivery reservation shows "unknown: 可能已送達" and - 
   const gd = join(sessionDirOf(v3Of(root), 'ghost'), 'act')
   mkdirSync(join(gd, '1'), { recursive: true })
   mkdirSync(join(gd, '2'), { recursive: true })
+  writeFileSync(join(gd, '1.json'), '{}')
+  writeFileSync(join(gd, '2.json'), '{}')
   writeFileSync(join(r.stateDir, 'episodes', '1', 'delivering'), JSON.stringify({ token: 'old', activation: 1, session: 'ghost', at: 1 }))
   const pause = (ms: number) => new Promise(res => setTimeout(res, ms))
   const { stdin, stdout } = mockTty()
@@ -2691,5 +2693,22 @@ test('R8.5 key-state: - on a stale reservation arms force-close; the viewer stay
   assert.deepEqual(nextKeyState(one.state, '-', 1_000 + STOP_REPEAT_MS).action, { type: 'cancel', row, force: true })
   const v = nextKeyState({ ...t, viewer: true }, '-', 1_000)
   assert.equal(v.action, undefined)
+  assert.equal(v.state.statusMessage, READ_ONLY)
+})
+
+test('R4-10 key-state: an incomplete reservation row clears with - (press twice); x, t, U do not reach a worker action', () => {
+  const s = ownerState()
+  const row = { ...s.rows[0]!, state: 'unknown' as const, incomplete: true as const, d: { ...s.rows[0]!.d, seq: 0 } }
+  const t = { ...s, rows: [row], all: [row], selected: row.id }
+  assert.match(rowHints(t, row, 1).join('\n'), /- clear/)
+  const one = nextKeyState(t, '-', 1_000)
+  assert.equal(one.action, undefined)
+  assert.deepEqual(nextKeyState(one.state, '-', 1_000 + STOP_REPEAT_MS).action, { type: 'clear', row })
+  for (const k of ['x', 't', 'U', 'i']) {
+    const r = nextKeyState(t, k, 1_000)
+    assert.equal(r.action, undefined, k)
+    assert.match(r.state.statusMessage ?? '', /no worker\.json/, k)
+  }
+  const v = nextKeyState({ ...t, viewer: true }, '-', 1_000)
   assert.equal(v.state.statusMessage, READ_ONLY)
 })

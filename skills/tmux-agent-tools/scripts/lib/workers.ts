@@ -524,6 +524,8 @@ export type PanelRow = {
   project?: boolean
   /** A project row that is a shell-started agent-tmux worker: its result status. */
   shell?: string
+  /** A worker dir with no complete `worker.json` (§11): `d` is a stub, the only action is `clearIncomplete`. */
+  incomplete?: true
 }
 
 /** Per-activation delivery state. A reload drops it; losing it only costs attempts. */
@@ -710,10 +712,15 @@ export async function reservationOf(host: Host, v3: string, epDir: string): Prom
   const text = await readOrAbsent(host, `${epDir}/${DELIVERING}`)
   if (text === undefined) return 'none'
   if (text === UNKNOWN) return 'unknown'
-  const m = parseJson(text) as { session?: unknown; activation?: unknown } | undefined
-  if (typeof m?.session !== 'string' || !m.session || typeof m.activation !== 'number') return 'unknown'
+  // The read boundary: a marker is trusted only with its whole identity (token, session,
+  // activation, at) and an activation record on disk. Anything else is unknown, never in-flight.
+  const m = parseJson(text) as { token?: unknown; session?: unknown; activation?: unknown; at?: unknown } | undefined
+  if (typeof m?.token !== 'string' || !m.token || typeof m.session !== 'string' || !m.session) return 'unknown'
+  if (!Number.isInteger(m.activation) || (m.activation as number) < 1 || typeof m.at !== 'number') return 'unknown'
   const dir = sessionDirOf(v3, m.session)
-  const sup = await superseded(host, dir, m.activation)
+  const known = await host.exists(`${dir}/act/${m.activation}.json`).catch(() => undefined)
+  if (known !== true) return 'unknown'
+  const sup = await superseded(host, dir, m.activation as number)
   if (sup === undefined) return 'unknown'
   if (sup) return 'stale'
   const live = await sessionLiveness(host, dir, await host.now())
@@ -723,9 +730,15 @@ export async function reservationOf(host: Host, v3: string, epDir: string): Prom
 /**
  * Reserve each notice's episode before its submit (§1c S8): under the worker's action
  * lock, re-check that the episode is open, then publish the marker (tmp + rename).
- * A busy lock or an unwritable marker does not hold the notice back: it goes out unreserved (token '').
+ * Only a notice that holds a marker (or has no episode seq to mark) is returned. A busy
+ * lock, an unreadable ack list or an unwritable marker DEFERS that notice: it is left out
+ * of the result with its reason logged, so nothing goes out unreserved (a cancel in that
+ * window would otherwise land beside a done). The next pass retakes the lock and retries.
+ * A caller that must tell "deferred" from "closed" (both are absent from the result) passes
+ * `deferred`: each deferred notice is pushed there with its reason as it was at deferral time.
  */
-export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: readonly Finished[]): Promise<{ f: Finished; token: string }[]> {
+export type Deferral = { f: Finished; why: 'locked' | 'acks' | 'marker' }
+export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: readonly Finished[], deferred: Deferral[] = []): Promise<{ f: Finished; token: string }[]> {
   const out: { f: Finished; token: string }[] = []
   const names = [...new Set(fs.map(f => f.d.name))]
   for (const name of names) {
@@ -733,10 +746,8 @@ export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: 
     const w = `${v3}/${name}`
     const lock = await takeLock(host, w, undefined, String(gate.activation ?? ''))
     if (!lock.ok) {
-      // Best effort: a stuck or foreign lock must not stop delivery (F3). No marker is
-      // written then, so a cancel in that window is not fenced (docs: known limits).
-      host.log(`tmux-agent: ${name} is locked by another action; delivering without a delivery marker`)
-      for (const f of mine) out.push({ f, token: '' })
+      host.log(`tmux-agent: ${name} is locked by another action; its notice waits for the next pass (not delivered unreserved)`)
+      deferred.push(...mine.map(f => ({ f, why: 'locked' as const })))
       continue
     }
     await underLock(host, `${w}/.action`, lock.token, async () => {
@@ -747,7 +758,12 @@ export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: 
           continue
         }
         const acks = await ackNames(host, ep)
-        if (!acks || acks.some(n => CLOSED_ACKS.includes(n))) continue
+        if (!acks) {
+          host.log(`tmux-agent: could not read the acks of ${idOf(f.d)}; its notice waits for the next pass`)
+          deferred.push({ f, why: 'acks' })
+          continue
+        }
+        if (acks.some(n => CLOSED_ACKS.includes(n))) continue
         const token = randomBase36(12)
         const marker = { token, activation: gate.activation, session: host.owner() ?? '', at: await host.now() }
         const wrote = await publish(host, `${ep}/${DELIVERING}`, JSON.stringify(marker), token).catch((error: unknown) => {
@@ -756,13 +772,42 @@ export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: 
         })
         if (wrote) out.push({ f, token })
         else {
-          host.log(`tmux-agent: could not write the delivery marker of ${idOf(f.d)}; delivering without it`)
-          out.push({ f, token: '' })
+          host.log(`tmux-agent: could not write the delivery marker of ${idOf(f.d)}; its notice waits for the next pass`)
+          deferred.push({ f, why: 'marker' })
         }
       }
     }, releaseLog(host))
   }
   return out
+}
+
+/** Why a notice waits (R4-2): the reason recorded at deferral time; for a busy lock also who holds it, whether that holder is provably alive, and the way to clear it. */
+async function lockDeferral(host: Host, v3: string, deferred: readonly Deferral[]): Promise<string> {
+  const parts: string[] = []
+  for (const name of [...new Set(deferred.map(x => x.f.d.name))]) {
+    const why = deferred.find(x => x.f.d.name === name)!.why
+    const lock = `${v3}/${name}/.action`
+    if (why === 'acks') {
+      parts.push(`${name}: its ack list could not be read (see the log)`)
+      continue
+    }
+    if (why === 'marker') {
+      parts.push(`${name}: its delivery marker could not be written (see the log)`)
+      continue
+    }
+    const p = await probeHolder(host, lock)
+    if ('absent' in p) {
+      parts.push(`${name}: ${lock} was held by another action; it is free now, the next pass retries`)
+    } else if ('unreadable' in p) {
+      parts.push(`${name}: ${lock} is held and cannot be read (${p.unreadable})`)
+    } else {
+      const h = p.holder
+      const alive = await holderProvablyAlive(host, h)
+      const state = alive === true ? 'still running' : alive === false ? 'gone' : 'not provably alive or dead'
+      parts.push(`${name}: ${lock} held by session ${h.session || '?'} pid ${h.pid || '?'} on ${h.host || '?'} (${state}); once it is gone: /workers unlock ${name} confirm`)
+    }
+  }
+  return `delivery waits: ${parts.join('; ')}`
 }
 
 /** After the ack (or a refused submit): under the lock, remove each marker that still carries this call's token. */
@@ -862,6 +907,8 @@ export type Scan = {
   quiet: TmuxDispatch[]
   /** Worker dirs holding an episode without `sent`, or an incomplete one: recovery under the lock (§8). */
   unsent: string[]
+  /** Worker dirs with no complete `worker.json`: a reservation that did not finish publishing (§11). Shown as maintenance rows, never read as dead. */
+  incomplete: string[]
   complete: boolean
   /** Errno or Error name when the v3 root could not be checked or listed. */
   error?: string
@@ -985,7 +1032,7 @@ function errorClass(error: unknown): string {
  * view passes false and writes nothing (workers-core C3).
  */
 export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> {
-  const empty = (): Scan => ({ dispatches: [], visible: [], episodes: new Map(), reported: new Set(), acked: new Map(), quiet: [], unsent: [], complete: false, withheld: new Set() })
+  const empty = (): Scan => ({ dispatches: [], visible: [], episodes: new Map(), reported: new Set(), acked: new Map(), quiet: [], unsent: [], incomplete: [], complete: false, withheld: new Set() })
   const now = await host.now()
   const root = await rootOf(host)
   if (!root) return empty()
@@ -1020,7 +1067,11 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
     // No complete worker.json: a reservation that crashed before publishing (§11).
     // A record whose fields could not have come from assign or resume is not a
     // worker: its dir and profile reach argv and the prompt (the trusted boundary).
-    if (!rec || rec.name !== entry.name || !isName(rec.profile) || !isAbsDir(rec.dir)) continue
+    if (!rec) {
+      out.incomplete.push(entry.name)
+      continue
+    }
+    if (rec.name !== entry.name || !isName(rec.profile) || !isAbsDir(rec.dir)) continue
     // Another project's teammate is not ours to list, deliver, tell or stop.
     if (!sameProject(host, rec)) continue
     const seqs = await numericChildren(host, `${w}/episodes`)
@@ -1800,8 +1851,9 @@ export function elapsed(ms: number): string {
  * One `tmux ls` per tick for the whole fleet.
  *
  * `process.run` resolves with ANY exit code once tmux has exited, and rejects
- * only when tmux could not start or was still running at the timeout. So a
- * resolved run is tmux's own answer and is the truth, exit code included:
+ * only when tmux could not start or was still running at the timeout (nodeHost
+ * resolves those as a negative exit code instead). So a run with an exit code >= 0
+ * is tmux's own answer and is the truth, exit code included:
  * `no server running` exits 1 with nothing on stdout, and an empty fleet is
  * then what the panel must show (observed 2026-09-18: a delivered teammate
  * stayed listed after the whole tmux server was gone, because exit 1 was
@@ -1810,7 +1862,10 @@ export function elapsed(ms: number): string {
  * tick (observed 2026-09-17: two live workers vanished from /workers mid-turn).
  */
 export async function liveSessions(host: Host, cwd: string, gate?: Gate): Promise<Set<string>> {
-  const run = await host.run(['tmux', 'ls', '-F', '#S'], cwd, LIVE_PROBE_MS).catch(() => undefined)
+  const asked = await host.run(['tmux', 'ls', '-F', '#S'], cwd, LIVE_PROBE_MS).catch(() => undefined)
+  // nodeHost resolves a timeout or a missing binary as a NEGATIVE exit code: that is no
+  // answer from tmux, the same as a rejection. A positive exit is tmux's own ("no server").
+  const run = asked && asked.exitCode >= 0 ? asked : undefined
   if (gate) gate.aliveKnown = !!run
   if (!run) return gate?.alive ?? new Set()
   const alive = run.exitCode === 0 ? new Set(run.stdout.split('\n').map(l => l.trim()).filter(Boolean)) : new Set<string>()
@@ -1933,6 +1988,21 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       ...(reservation ? { reservation } : {}),
       ...(blockedReason ? { blockedReason } : {}),
       terminal: done,
+    })
+  }
+  for (const name of scanned.incomplete) {
+    const born = v3 ? await host.stat(`${v3}/${name}`).catch(() => undefined) : undefined
+    const age = born ? Math.max(0, now - born.mtimeMs) : 0
+    rows.push({
+      id: `incomplete:${name}`,
+      d: { profile: '', name, dir: '', since: now - age, seq: 0 },
+      state: 'unknown',
+      ageMs: age,
+      terminal: false,
+      incomplete: true,
+      summary: born && age > ORPHAN_MS
+        ? `no worker.json for ${Math.round(age / 1000)}s: a reservation that never finished; clear it (cancel ${name} / TUI -)`
+        : 'initializing: no worker.json yet (a writer may still publish it); clear is refused until it is old enough',
     })
   }
   const cwd = host.cwd() ?? ''
@@ -2133,7 +2203,13 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
   const silent = await stillOurs(host, gate, v3, parted.silent)
   if (!deliver || !silent) return
 
-  const reserved = await reserveDeliveries(host, gate, v3, deliver)
+  const deferredFs: Deferral[] = []
+  const reserved = await reserveDeliveries(host, gate, v3, deliver, deferredFs)
+  if (deferredFs.length) {
+    // Same lifecycle as the composer deferral: shown in act/<n>.state, cleared on a delivery or when the notice is gone.
+    gate.deferred = await lockDeferral(host, v3, deferredFs)
+    await writeActState(host, gate)
+  }
   const { text, included } = reserved.length ? payloadOf(reserved.map(r => r.f)) : { text: '', included: [] as Finished[] }
   const held = reserved.filter(r => included.includes(r.f))
   // Reserved but not in the payload (it was cut): not sent, so not held.
@@ -2185,7 +2261,7 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
 
   gate.failures = 0
   gate.nextAttemptAt = 0
-  if (gate.deferred) {
+  if (gate.deferred && !deferredFs.length) {
     gate.deferred = undefined
     await writeActState(host, gate)
   }
@@ -2513,6 +2589,7 @@ export function rowRepo(dir: string): string {
 /** Human-readable status mark for a row */
 export function rowMark(r: PanelRow): string {
   if (r.project) return r.shell ? `shell · ${r.shell}` : '專案'
+  if (r.incomplete) return 'unknown — no worker.json (unfinished reservation)'
   return r.state === 'finished'
     ? 'finished — awaiting delivery'
     : r.state === 'delivered'
@@ -3103,6 +3180,49 @@ export async function unlockWorker(host: Host, name: string, word?: string): Pro
 }
 
 /**
+ * Clear a worker dir that has no `worker.json` (§11). The missing record is not proof of
+ * death: a writer between `mkdir` and its publish owns the dir for a moment. So this refuses
+ * while the dir is younger than ORPHAN_MS (the same grace as an initializing session), or
+ * holds anything but a half-published `worker.json.<tmp>`; it removes only that dir.
+ */
+export async function clearIncomplete(host: Host, name: string): Promise<Outcome> {
+  if (!NAME_RE.test(name)) return { ok: false, text: 'clear takes <name>' }
+  if (!host.owner()) return { ok: false, text: 'clearing an unfinished reservation needs a session id: a view without one is read-only' }
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const w = `${v3Of(root)}/${name}`
+  const rec = await readWorker(host, w)
+  if (rec === 'unknown') return { ok: false, text: `"${name}": worker.json could not be read (see the log); nothing is cleared` }
+  if (rec) return { ok: false, text: `"${name}" has a complete worker.json: it is a worker, not an unfinished reservation` }
+  const entries = await host.list(w).catch((error: unknown) => {
+    host.log(`tmux-agent: could not list ${w}: ${String(error)}`)
+    return undefined
+  })
+  if (!entries) return { ok: false, text: `"${name}" could not be listed (see the log); nothing is cleared` }
+  const other = entries.find(e => !e.name.startsWith('worker.json.'))
+  if (other) return { ok: false, text: `"${name}" holds ${other.name}: not a bare unfinished reservation; nothing is cleared` }
+  const born = await host.stat(w).catch(() => undefined)
+  const age = born ? (await host.now()) - born.mtimeMs : undefined
+  if (age === undefined) return { ok: false, text: `"${name}" could not be stat'ed (see the log); nothing is cleared` }
+  if (age <= ORPHAN_MS) return { ok: false, text: `"${name}" is ${Math.round(age / 1000)}s old: a writer may still publish its worker.json; try again after ${ORPHAN_MS / 1000}s` }
+  // Fence (rename(2)): move the dir aside first, so a late writer's publish into `w` fails
+  // instead of landing in a dir about to be removed; then re-check what was moved.
+  const run = (argv: string[]) => host.run(argv, '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  const aside = `${v3Of(root)}/.clearing.${name}.${randomBase36(6)}`
+  const mv = await run(['mv', w, aside])
+  if (mv.exitCode !== 0) return { ok: false, text: `could not move ${w} aside: ${mv.stderr.trim() || `exit ${mv.exitCode}`}; nothing is cleared` }
+  const moved = await host.list(aside).catch(() => undefined)
+  const late = moved ? moved.find(e => !e.name.startsWith('worker.json.')) : { name: '(unlistable)' }
+  if (late) {
+    const back = await run(['mv', aside, w])
+    return { ok: false, text: `"${name}" changed while clearing (${late.name}); ${back.exitCode === 0 ? 'put back, nothing is cleared' : `left at ${aside}: ${back.stderr.trim()}`}` }
+  }
+  const rm = await run(['rm', '-rf', aside])
+  if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${aside}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }
+  return { ok: true, text: `cleared the unfinished reservation "${name}"` }
+}
+
+/**
  * The Outcome of a `maintainLock` section: `fn`'s own Outcome, or not ok when the section
  * was refused (busy) or ran but left its guard behind. The second names what ran, the guard
  * path, the raw rm error and how to clear it; it is never reported as plain success.
@@ -3157,10 +3277,8 @@ async function unlockHeld(
   }
   const me = await processId(host)
   if (!h.host || !me.host || h.host !== me.host) return { ok: false, text: `not unlocking "${name}": held by ${who}, not provably this host (${me.host || '?'})` }
-  const live = h.session ? await sessionLiveness(host, sessionDirOf(v3, h.session), await host.now()) : 'unknown'
-  if (live !== 'non-live') return { ok: false, text: `not unlocking "${name}": holder ${who} — its session is ${live}` }
   if (!h.pid || !h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} records no process to check` }
-  // The shared probe: only ESRCH or a reused pid is gone; a broken ps is unknown, not dead.
+  // The shared probe (a live session does not keep a dead process's lock): only ESRCH or a reused pid is gone; a broken ps is unknown, not dead.
   const alive = await holderProvablyAlive(host, h)
   if (alive === true) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
   if (alive === undefined) return { ok: false, text: `not unlocking "${name}": could not check pid ${h.pid}` }
@@ -3237,8 +3355,11 @@ export function reconcileOnce(host: Host, gate: Gate, probeStalls = true): Promi
  * launch with the reason instead of running it unprotected.
  */
 const DETACH_LAUNCH = [
-  'if command -v setsid >/dev/null 2>&1; then setsid nohup sh -c "$1" >/dev/null 2>&1 &',
-  `elif command -v perl >/dev/null 2>&1; then perl -e 'setpgrp(0, 0); exec @ARGV' nohup sh -c "$1" >/dev/null 2>&1 &`,
+  // `$2` = the launch log, `$3` = launch.exit. The detacher's own stderr goes to the log, and a
+  // detacher or exec failure (setsid/nohup/perl could not start the child) writes its exit code
+  // to launch.exit: the child writes it itself only once it runs.
+  'if command -v setsid >/dev/null 2>&1; then (setsid nohup sh -c "$1" >>"$2" 2>&1 || echo $? >"$3") </dev/null >/dev/null 2>&1 &',
+  `elif command -v perl >/dev/null 2>&1; then (perl -e 'setpgrp(0, 0) or die "setpgrp: $!\\n"; exec @ARGV or die "exec: $!\\n"' nohup sh -c "$1" >>"$2" 2>&1 || echo $? >"$3") </dev/null >/dev/null 2>&1 &`,
   'else echo "tmux-agent: cannot detach the launch: neither setsid nor perl is on PATH" >&2; exit 127; fi',
 ].join(' ')
 
@@ -3311,7 +3432,7 @@ export async function assignWorker(
     // written): a node `spawn` puts it in its own session; macOS has no `setsid`.
     const argv = [tool.bin, input.profile, 'assign', '--detach', '--result-path', ep.resultPath, '--episode', '1', name, input.dir, briefPath]
     const child = `TMUX_AGENT_DIR=${shq(v3)} ${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
-    const run = await host.run(['sh', '-c', DETACH_LAUNCH, 'sh', child], input.dir, 5_000)
+    const run = await host.run(['sh', '-c', DETACH_LAUNCH, 'sh', child, logPath, exitPath], input.dir, 5_000)
     if (run.exitCode !== 0) {
       await mark(host, `${stateDir}/episodes/1`, 'aborted')
       return { deny: `tmux-agent: could not launch assign: ${(run.stderr || run.stdout).trim().slice(-400)}` }

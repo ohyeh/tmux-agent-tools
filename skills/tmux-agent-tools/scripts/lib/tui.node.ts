@@ -55,6 +55,7 @@ import {
   tellWorker,
   assignWorker,
   cancelEpisode,
+  clearIncomplete,
   unlockWorker,
   episodeDetail,
   mirrorOf,
@@ -279,6 +280,7 @@ export type TuiAction =
   | { type: 'assign'; value: string }
   | { type: 'cancel'; row: PanelRow; force?: boolean }
   | { type: 'unlock'; row: PanelRow }
+  | { type: 'clear'; row: PanelRow }
   | { type: 'detail' }
 
 const PASTE_START = '\x1b[200~'
@@ -543,6 +545,11 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
 
   const row = state.selected ? state.rows.find(x => x.id === state.selected) : undefined
 
+  // A dir with no worker.json is not a worker yet: only `-` (clear) acts on it.
+  if (row?.incomplete && ['x', 'X', 't', 'T', 'i', 'I', 'U'].includes(key)) {
+    return say(state, `${row.d.name} — no worker.json yet; press - to clear it once it is old enough`, now)
+  }
+
   if (key === 'n' || key === 'N') {
     return { state: { ...state, adding: true, resumeInput: '', inputKind: 'resume' } }
   }
@@ -576,6 +583,7 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
 
   if (key === '-') {
     if (!row || row.project) return { state }
+    if (row.incomplete) return pressTwice(state, `cancel:${row.id}`, now, { type: 'clear', row })
     // A resumed worker has no episode until its first tell (seq 0).
     if (!row.d.seq) return say(state, `cancel — "${row.d.name}" has no episode yet`, now)
     return pressTwice(state, `cancel:${row.id}`, now, { type: 'cancel', row, ...(row.reservation === 'stale' ? { force: true } : {}) })
@@ -687,6 +695,7 @@ export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
   if (state.viewer) return [`${READ_ONLY}  Enter detail`, '唯讀']
   const armed = (id: string) => state.armedStop?.id === id && now < state.armedStop.until
   const keys: [string, string][] = [['t', 'tell']]
+  if (r.incomplete) return [`${hint('-', armed(`cancel:${r.id}`) ? 'clear unfinished reservation? press again' : 'clear', true)}  no worker.json`, hint('-', 'clear', true), hint('-', 'clear', false)]
   if (r.state === 'running' || r.state === 'stalled') keys.push(['i', 'interrupt'])
   keys.push(['x', stopButtonLabel(r.d.name, armed(r.id))])
   if (r.d.seq) {
@@ -1249,6 +1258,13 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (action.type === 'cancel') {
       const out = await cancelEpisode(host, action.row.d.name, action.row.d.seq ?? 0, { force: action.force === true })
       say(`cancel ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'clear') {
+      const out = await clearIncomplete(host, action.row.d.name)
+      say(`clear ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       await refreshRows()
       render()
       return

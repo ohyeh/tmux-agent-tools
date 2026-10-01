@@ -174,7 +174,8 @@ test('a submit already past its last check may land twice (allowed re-report); t
 
 test('an ack that cannot be written is logged and re-reported, never read as delivered', async () => {
   const w = world('A')
-  chmodSync(w.ep, 0o555)
+  mkdirSync(`${w.ep}/acks`, { recursive: true }) // the marker (R4-2) needs the episode dir writable; only the ack is refused
+  chmodSync(`${w.ep}/acks`, 0o555)
   try {
     const r = await pass(w, 'A')
     assert.equal(delivered(w).length, 1)
@@ -182,7 +183,7 @@ test('an ack that cannot be written is logged and re-reported, never read as del
     await pass(w, 'A')
     assert.equal(delivered(w).length, 2)
   } finally {
-    chmodSync(w.ep, 0o755)
+    chmodSync(`${w.ep}/acks`, 0o755)
   }
   await pass(w, 'A')
   await pass(w, 'A')
@@ -247,14 +248,15 @@ test('S1 (c): a claim does not change the delivery_id (gen0 = the descriptor own
 
 test('AT_LEAST_ONCE_BOUND_PROBE: two ack failures, then the third attempt delivers the same notice and acks once', async () => {
   const w = world('A')
-  chmodSync(w.ep, 0o555)
+  mkdirSync(`${w.ep}/acks`, { recursive: true }) // the marker (R4-2) needs the episode dir writable; only the ack is refused
+  chmodSync(`${w.ep}/acks`, 0o555)
   try {
     await pass(w, 'A')
     await pass(w, 'A')
     assert.equal(notices(w).length, 2)
     assert.deepEqual(doneDirs(w), [])
   } finally {
-    chmodSync(w.ep, 0o755)
+    chmodSync(`${w.ep}/acks`, 0o755)
   }
   await pass(w, 'A')
   sameNotice(w, 3)
@@ -526,6 +528,37 @@ test('composerHolds: whitespace-insensitive equality, or the CLI placeholder cov
   assert.ok(!composerHolds({ state: 'empty', text: '' }, 'the notice'))
 })
 
+test('R4-5 composerHolds: a middle fragment, or a placeholder whose count is not this paste, is not held', () => {
+  const p300 = Array.from({ length: 100 }, (_, i) => String(i).padStart(3, '0')).join('')
+  assert.ok(!composerHolds({ state: 'draft', text: p300.slice(100, 200) }, p300), 'middle-only 100/300 chars')
+  assert.ok(composerHolds({ state: 'draft', text: p300.slice(-100) }, p300), 'a provable suffix')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted Content 1 chars]' }, p300), '1 char for 300')
+  assert.ok(composerHolds({ state: 'draft', text: '[Pasted Content 300 chars]' }, p300), 'exact char count')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted Content 301 chars]' }, p300), 'off by one')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted thing #1 +9 lines]' }, Array(9).fill('x').join('\n')), 'unknown placeholder')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +30 lines]' }, Array(9).fill('x').join('\n')), 'more lines than pasted')
+})
+
+test('R4-1 pasteInto: a real shell with PS1="› " under the codex parser gets no paste and no Enter', async t => {
+  const srv = privateServer()
+  const mark = `${srv.dir}/R4_SHELL_EXECUTED`
+  try {
+    const up = await srv.tmux(['new-session', '-d', '-s', 'sh', '-x', '120', '-y', '30', "env PS1='› ' bash --norc --noprofile -i"])
+    if (up.code !== 0) return t.skip('no private tmux server can start here')
+    const pane = (await srv.tmux(['display-message', '-p', '-t', 'sh', '#{pane_id}'])).out.trim()
+    await new Promise(r => setTimeout(r, 600))
+    const r = await pasteInto(pane, `touch ${mark}`, srv.env, 'codex')
+    assert.match(r.deferred ?? '', /not running|nothing pasted/)
+    await new Promise(r => setTimeout(r, 300))
+    assert.equal(existsSync(mark), false, 'the shell never ran the notice')
+    const cap = (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
+    assert.doesNotMatch(cap, /touch /, 'nothing was pasted into the shell')
+  } finally {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+  }
+})
+
 const AGENT_TMUX = new URL('../agent-tmux', import.meta.url).pathname
 
 test('composer-state: every captured pane gets its class (real codex and cursor-agent captures; synthetic ones marked)', async t => {
@@ -536,6 +569,7 @@ test('composer-state: every captured pane gets its class (real codex and cursor-
     ['codex', 'codex-busy.txt', 'busy'],
     ['codex', 'codex-permission.txt', 'permission'],
     ['codex', 'codex-shell.synthetic.txt', 'shell'],
+    ['codex', 'codex-shell-glyph.synthetic.txt', 'unknown'], // R4-1: a shell drawing the codex prompt glyph has no footer
     ['cursor', 'cursor-agent-empty.txt', 'empty'],
     ['cursor', 'cursor-agent-multiline.txt', 'empty'],
     ['cursor', 'cursor-agent-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],

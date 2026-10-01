@@ -315,6 +315,7 @@ echo "case: R8.5 a dead resumed pane and an incomplete reservation (TUI wording,
   const hex = [...Buffer.from('ghost')].map(b => b.toString(16).padStart(2, '0')).join('')
   fs.mkdirSync(path.join(v3, '.sessions', hex, 'act', '1'), { recursive: true })
   fs.mkdirSync(path.join(v3, '.sessions', hex, 'act', '2'), { recursive: true })
+  for (const n of [1, 2]) fs.writeFileSync(path.join(v3, '.sessions', hex, 'act', n + '.json'), '{}')
 " "$TMUX_AGENT_DIR" "$WORK/repo"
 RC="$TMUX_AGENT_DIR/.v3/rc.abcde/episodes/1"
 RD="$TMUX_AGENT_DIR/.v3/rd.abcde/episodes/1"

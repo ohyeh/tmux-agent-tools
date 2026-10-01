@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
 
@@ -749,9 +749,7 @@ test('unlock (F6, §5): maintenance only — needs confirm; refuses a live proce
   const n = (await registerActivation(w.host, sd, { pid: 1, pidStart: '', host: '', token: 'x' }))!
   await beat(w.host, sd, n, Date.now())
   hold({})
-  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /session is live/)
-  const old = (Date.now() - ORPHAN_MS - 5_000) / 1000
-  utimesSync(`${sd}/act/${n}.beat`, old, old)
+  // A live session does not keep a dead process's lock (C-lock): the provably gone pid is what counts.
   const done = await unlockWorker(w.host, r.name, 'confirm')
   assert.ok(done.ok, done.text)
   assert.throws(() => fs.readlinkSync(lock), 'removed')
@@ -773,7 +771,7 @@ test('workers CLI (F6): cancel and unlock on the shared ledger; bad arguments ex
   assert.equal(c.code, 0, c.out)
   assert.ok(existsSync(`${r.stateDir}/episodes/1/acks/cancel`))
   assert.equal((await run([...id, 'unlock', r.name])).code, 0)
-  assert.equal((await run([...id, 'cancel', r.name])).code, 2)
+  assert.equal((await run([...id, 'cancel', r.name, 'x'])).code, 2)
   assert.equal((await run([...id, 'nope'])).code, 2)
   assert.equal((await run([...id, 'cancel', r.name, '7'])).code, 1)
 })
@@ -953,7 +951,7 @@ test('waiter bind: a binding record is not delivered while its token holds the a
   await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)
 })
 
-test('waiter bind: a binding record whose token differs from the lock holder is delivered', async () => {
+test('waiter bind: a binding record whose token differs from the lock holder is delivered once the lock is free (R4-2: a busy lock defers, never delivers unreserved)', async () => {
   const w = world()
   const r = await assigned(w)
   const lock = await takeLock(w.host, r.stateDir)
@@ -961,8 +959,10 @@ test('waiter bind: a binding record whose token differs from the lock holder is 
   await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: 'not-the-holder' }))
   writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
   await reconcile(w.host, newGate(), false)
-  assert.equal(w.woken.length, 1)
+  assert.equal(w.woken.length, 0, 'the action lock is busy: the notice waits, it is not sent unreserved')
   await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)
+  await reconcile(w.host, newGate(), false)
+  assert.equal(w.woken.length, 1)
 })
 
 test('closing snapshot without identity (R2-5): a stat failure does not write done', async () => {
@@ -1104,6 +1104,10 @@ test('finding F3: dead holder pid with a live session delivers finished E1 once'
   const holder = { token: 'dead-token', session: 'me', activation: '1', host: me.host, pid: 2147483646, pidStart: 'Thu Jan  1 00:00:00 1970' }
   symlinkSync(JSON.stringify(holder), `${r.stateDir}/.action`)
   await w.host.write(`${r.stateDir}/episodes/1/waiter`, JSON.stringify({ binding: true, token: 'dead-token' }))
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 0, 'a dead holder still holds the lock (never taken over): the notice waits (R4-2)')
+  const unlocked = await unlockWorker(w.host, r.name, 'confirm')
+  assert.ok(unlocked.ok, `the session is live but the holder process is provably gone: ${unlocked.text}`)
   await reconcile(w.host, gate, false)
   assert.equal(w.woken.length, 1, 'finished E1 is delivered')
   await reconcile(w.host, gate, false)
@@ -1779,4 +1783,210 @@ test('R3-6: a channel registration whose guard cannot be removed (ChannelRegistr
   await writeActState(stuck, gate)
   const state = JSON.parse(readFileSync(`${w.v3}/.sessions/${sessionKey('me')}/act/${gate.activation}.state`, 'utf8'))
   assert.match(state.reason, /guard .*channel\.lock\.unlock remains/, 'the operator reads it in act/<n>.state')
+})
+
+
+// ── Sol round 4 (R4-2, R4-8, R4-9, R4-10, R4-11) ──
+
+/** The notice the collector or the MCP adapter would deliver for episode 1 of `r`. */
+function finishedOf(r: { name: string; stateDir: string }, repo: string) {
+  const d = read(`${r.stateDir}/episodes/1/dispatch.json`)
+  return { d: { ...d, name: r.name, dir: repo, profile: 'astra' }, path: d.resultPath, status: 'success', summary: 'probe', observation: 'unattributed-probe-1' }
+}
+
+test('R4-2: a busy action lock defers the notice (no unreserved delivery); once free it reserves, and a cancel in between wins alone', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  await heartbeat(w.host, gate)
+  const f = finishedOf(r, w.repo)
+  const lock = await takeLock(w.host, r.stateDir)
+  if (!lock.ok) assert.fail('lock')
+  const deferred: unknown[] = []
+  assert.deepEqual(await reserveDeliveries(w.host, gate, w.v3, [f], deferred as never[]), [], 'busy: nothing is deliverable')
+  assert.equal(deferred.length, 1, 'and the caller can tell it from a closed episode')
+  assert.ok(w.logs.some(l => /locked by another action/.test(l)), w.logs.join('\n'))
+  await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)
+  assert.ok((await cancelEpisode(w.host, r.name, 1)).ok)
+  assert.deepEqual(await reserveDeliveries(w.host, gate, w.v3, [f]), [], 'closed by the cancel: not deliverable, not deferred')
+  assert.equal(w.woken.length, 0)
+})
+
+test('R4-2: a marker that cannot be published defers the notice; nothing is returned to submit', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  await heartbeat(w.host, gate)
+  const bad: Host = { ...w.host, run: async (a, c, m) => (a[0] === 'mv' && a.at(-1)!.endsWith('/delivering') ? { exitCode: 1, stdout: '', stderr: 'EIO marker rename' } : w.host.run(a, c, m)) }
+  assert.deepEqual(await reserveDeliveries(bad, gate, w.v3, [finishedOf(r, w.repo)]), [])
+  assert.ok(!existsSync(`${r.stateDir}/episodes/1/delivering`))
+  const ok = await reserveDeliveries(w.host, gate, w.v3, [finishedOf(r, w.repo)])
+  assert.equal(ok.length, 1, 'the next pass reserves')
+  assert.ok(ok[0]!.token)
+})
+
+test('R4-8: a tmux ls that resolves with a negative exit (nodeHost timeout) is unknown, never an exited pane', async () => {
+  const w = world()
+  const out = await resumeWorker(w.host, 'codex 12345678-1234-1234-1234-123456789abc')
+  assert.ok(out.ok, out.text)
+  const timeout: Host = { ...w.host, run: async (a, c, m) => (a[0] === 'tmux' && a[1] === 'ls' ? { exitCode: -1, stdout: '', stderr: 'Error: ETIMEDOUT tmux ls' } : w.host.run(a, c, m)) }
+  const gate = newGate()
+  const rows = await panelRows(timeout, gate, w.root)
+  assert.deepEqual(rows.map(r => r.state), ['unknown'])
+  assert.equal(gate.aliveKnown, false)
+  const down: Host = { ...w.host, run: async (a, c, m) => (a[0] === 'tmux' && a[1] === 'ls' ? { exitCode: 1, stdout: '', stderr: 'no server running on /tmp/tmux-1/default' } : w.host.run(a, c, m)) }
+  assert.deepEqual((await panelRows(down, newGate(), w.root)).map(r => r.state), ['exited'], 'tmux\'s own no-server answer is an empty set')
+})
+
+test('R4-9: a marker with an impossible activation, a missing record or missing identity is unknown, never in-flight', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  await heartbeat(w.host, gate)
+  const ep = `${r.stateDir}/episodes/1`
+  const put = (m: Record<string, unknown>) => writeFileSync(`${ep}/delivering`, JSON.stringify(m))
+  const full = { token: 't', session: 'me', activation: gate.activation, at: 1 }
+  put(full)
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'in-flight', 'control: a valid marker of the live activation')
+  put({ session: 'me', activation: 999 })
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'unknown', 'no token, no at, activation 999')
+  put({ ...full, activation: 999 })
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'unknown', 'identity complete but no such activation record')
+  put({ ...full, at: 'x' })
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'unknown', 'at is not a time')
+  const second = await registerActivation(w.host, sessionDirOf(w.v3, 'me'), { pid: 1, pidStart: '', host: '', token: 'again' })
+  assert.ok(second && second > gate.activation!)
+  put(full)
+  assert.equal(await reservationOf(w.host, w.v3, ep), 'stale', 'a valid older record that a newer one superseded')
+})
+
+test('R4-10: a worker dir without worker.json is an unknown maintenance row; clear refuses while a writer may publish, then removes it', async () => {
+  const w = world()
+  mkdirSync(`${w.v3}/incomplete.abcde`, { recursive: true })
+  const rows = await panelRows(w.host, newGate(), w.root)
+  assert.deepEqual(rows.map(r => [r.d.name, r.state, r.incomplete]), [['incomplete.abcde', 'unknown', true]])
+  assert.match(rows[0]!.summary ?? '', /initializing/)
+  assert.match(rowMark(rows[0]!), /no worker\.json/)
+  const young = await clearIncomplete(w.host, 'incomplete.abcde')
+  assert.ok(!young.ok && /writer may still publish/.test(young.text), young.text)
+  assert.ok(existsSync(`${w.v3}/incomplete.abcde`))
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(`${w.v3}/incomplete.abcde`, old, old)
+  assert.match((await panelRows(w.host, newGate(), w.root))[0]!.summary ?? '', /never finished/)
+  writeFileSync(`${w.v3}/incomplete.abcde/episodes`, 'x')
+  assert.ok(!(await clearIncomplete(w.host, 'incomplete.abcde')).ok, 'anything but a half-published worker.json.<tmp> is refused')
+  rmSync(`${w.v3}/incomplete.abcde/episodes`)
+  utimesSync(`${w.v3}/incomplete.abcde`, old, old)
+  const done = await clearIncomplete(w.host, 'incomplete.abcde')
+  assert.ok(done.ok, done.text)
+  assert.ok(!existsSync(`${w.v3}/incomplete.abcde`))
+  assert.deepEqual(await panelRows(w.host, newGate(), w.root), [])
+  const real = await assigned(w)
+  assert.ok(!(await clearIncomplete(w.host, real.name)).ok, 'a complete worker is never cleared this way')
+})
+
+test('R4-10 fence: a worker.json published while clearing is put back, never removed', async () => {
+  const w = world()
+  const dir = `${w.v3}/late.abcde`
+  mkdirSync(dir, { recursive: true })
+  const old = new Date(Date.now() - 3 * ORPHAN_MS)
+  utimesSync(dir, old, old)
+  // The writer's rename lands just before the move: the moved dir now holds worker.json.
+  const host: Host = { ...w.host, run: async (argv, cwd, ms) => {
+    if (argv[0] === 'mv' && argv[1] === dir) writeFileSync(`${dir}/worker.json`, '{}')
+    return w.host.run(argv, cwd, ms)
+  } }
+  const r = await clearIncomplete(host, 'late.abcde')
+  assert.ok(!r.ok && /changed while clearing \(worker\.json\); put back/.test(r.text), r.text)
+  assert.ok(existsSync(`${dir}/worker.json`), 'the published record is back in place')
+})
+
+test('R4-11: a detacher that fails (setsid exits 23) leaves launch.exit and its stderr in the launch log', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'wbin-'))
+  writeFileSync(`${bin}/setsid`, '#!/bin/sh\necho "setsid: injected EACCES" >&2\nexit 23\n')
+  writeFileSync(`${bin}/agent-tmux`, '#!/bin/sh\nexit 0\n')
+  chmodSync(`${bin}/setsid`, 0o755)
+  chmodSync(`${bin}/agent-tmux`, 0o755)
+  const root = mkdtempSync(join(tmpdir(), 'wcore-'))
+  const repo = mkdtempSync(join(tmpdir(), 'wrepo-'))
+  const was = { path: process.env.PATH, dir: process.env.TMUX_AGENT_DIR }
+  process.env.TMUX_AGENT_DIR = root
+  process.env.PATH = `${bin}:${was.path}`
+  try {
+    const host = nodeHost({ owner: 'me', cwd: repo, log: () => {} })
+    const r = await assignWorker(host, { profile: 'astra', name: 'w', dir: repo, brief: BRIEF }, { owner: 'me', ownerCwd: repo })
+    if ('deny' in r) assert.fail(r.deny)
+    const exit = `${r.stateDir}/launch.exit`
+    for (let i = 0; i < 60 && !existsSync(exit); i++) await new Promise(res => setTimeout(res, 50))
+    assert.equal(readFileSync(exit, 'utf8').trim(), '23')
+    assert.match(readFileSync(`${r.stateDir}/mod-assign.log`, 'utf8'), /setsid: injected EACCES/)
+  } finally {
+    process.env.PATH = was.path
+    process.env.TMUX_AGENT_DIR = was.dir
+  }
+})
+
+test('R4-2 visibility: a busy action lock during reconcile names the lock and holder in the act state; delivered once and the reason cleared after release', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  assert.equal(await heartbeat(w.host, gate), true)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const lock = await takeLock(w.host, r.stateDir)
+  if (!lock.ok) assert.fail('lock')
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 0)
+  const stateFile = `${w.v3}/.sessions/${sessionKey('me')}/act/${gate.activation}.state`
+  const reason = read(stateFile).reason as string
+  assert.ok(reason.includes(`${r.stateDir}/.action`) && /held by session me pid \d+/.test(reason) && reason.includes(`unlock ${r.name} confirm`), reason)
+  await releaseLock(w.host, `${r.stateDir}/.action`, lock.token)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 1)
+  assert.equal(read(stateFile).reason, undefined, 'cleared by the delivery')
+})
+
+test('C-lock: unlock confirm removes a provably dead holder of a live session; a running holder and another host are refused', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const gate = newGate()
+  assert.equal(await heartbeat(w.host, gate), true)
+  const me = await processId(w.host)
+  const lock = `${r.stateDir}/.action`
+  const hold = (h: Record<string, unknown>) => {
+    rmSync(lock, { force: true })
+    symlinkSync(JSON.stringify({ token: 't', session: 'me', activation: '1', host: me.host, pid: 2147483646, pidStart: 'Thu Jan  1 00:00:00 1970', ...h }), lock)
+  }
+  hold({ pid: process.pid, pidStart: me.pidStart })
+  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /still running/)
+  hold({ host: 'elsewhere' })
+  assert.match((await unlockWorker(w.host, r.name, 'confirm')).text, /not provably this host/)
+  hold({})
+  assert.ok((await unlockWorker(w.host, r.name, 'confirm')).ok)
+  assert.throws(() => readlinkSync(lock), 'removed')
+})
+
+test('R4-11 follow-up: a launch slower than host.run\'s timeout does not hold assign back (the detacher subshell owns no pipe of the caller)', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'wbin-'))
+  writeFileSync(`${bin}/agent-tmux`, '#!/bin/sh\nsleep 6\nexit 0\n')
+  chmodSync(`${bin}/agent-tmux`, 0o755)
+  const root = mkdtempSync(join(tmpdir(), 'wcore-'))
+  const repo = mkdtempSync(join(tmpdir(), 'wrepo-'))
+  const was = { path: process.env.PATH, dir: process.env.TMUX_AGENT_DIR }
+  process.env.TMUX_AGENT_DIR = root
+  process.env.PATH = `${bin}:${was.path}`
+  try {
+    const host = nodeHost({ owner: 'me', cwd: repo, log: () => {} })
+    const t0 = Date.now()
+    const r = await assignWorker(host, { profile: 'astra', name: 'w', dir: repo, brief: BRIEF }, { owner: 'me', ownerCwd: repo })
+    const took = Date.now() - t0
+    if ('deny' in r) assert.fail(r.deny)
+    assert.ok(took < 1_000, `assign returned after ${took} ms`)
+    assert.match(r.receipt, /launch requested/)
+    assert.ok(!existsSync(`${r.stateDir}/launch.exit`), 'the launch is still running')
+    for (let i = 0; i < 160 && !existsSync(`${r.stateDir}/launch.exit`); i++) await new Promise(res => setTimeout(res, 100))
+    assert.equal(readFileSync(`${r.stateDir}/launch.exit`, 'utf8').trim(), '0')
+  } finally {
+    process.env.PATH = was.path
+    process.env.TMUX_AGENT_DIR = was.dir
+  }
 })

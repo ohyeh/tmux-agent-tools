@@ -562,6 +562,8 @@ describe('ownership', () => {
       // `ghost` delivered under activation 1 and then restarted as activation 2.
       [`${V3}/.sessions/${hex('ghost')}/act/1/`]: '',
       [`${V3}/.sessions/${hex('ghost')}/act/2/`]: '',
+      [`${V3}/.sessions/${hex('ghost')}/act/1.json`]: '{}',
+      [`${V3}/.sessions/${hex('ghost')}/act/2.json`]: '{}',
       [`${V3}/w1/episodes/1/delivering`]: JSON.stringify({ token: 'old', activation: 1, session: 'ghost', at: 0 }),
     }
     mockFs(on, files)
