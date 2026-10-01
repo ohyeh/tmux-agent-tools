@@ -469,7 +469,7 @@ on-request 寫成「MCP：host 呼叫 tool 時才收」；beat 超過 90 秒 →
 讀不到、JSON 不合法、token 對不上、或讀的時候最大 n 一直變 → `unknown（原因）`。
 `act/<n>.state` 只給 TUI 看，不參與 fencing、claim 與 `sessionLiveness`。
 
-TUI 結束時（`q`、Ctrl-C、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw）；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。
+TUI 結束時（`q`、Ctrl-C（任何模式，輸入列開著也一樣）、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw），並關掉 bracketed paste；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。還原的某一步失敗時，其他步驟照做，每個錯誤在離開 alt screen 後印到 stderr，TUI 以 exit 1 結束（按 `q` 結束也一樣）。啟動時任何一步（raw mode、resume、alt screen）失敗，TUI 不啟動：已做的步驟還原，錯誤印出，exit 1。TUI 開著時 terminal 是 bracketed paste（DECSET 2004）：貼上的 `q`、`x` 是文字，不是按鍵。
 
 TUI 的位置跟著 mod 已經在用的 `agent-tmux` 走（`PATH`、marketplace checkout、
 `npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。找不到 `node`、

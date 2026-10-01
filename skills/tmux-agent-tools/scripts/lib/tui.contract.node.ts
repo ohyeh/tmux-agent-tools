@@ -52,6 +52,7 @@ import {
   PAGE_DOWN,
   PAGE_UP,
   ANSI_CLEAR_HOME,
+  padCells,
 } from './tui.node.ts'
 import { eawOf, EAW_UNICODE_VERSION } from './eaw-table.ts'
 
@@ -1139,7 +1140,7 @@ test('no-mutation core panelRows: reads a dead-owner orphan and mutates nothing'
 // 6. PTY run test
 // -----------------------------------------------------------------------------
 
-test('pty run: q, rq, Ctrl-C, SIGTERM, an exception, and an already-raw tty all restore the tty flags', { timeout: 90_000 }, async () => {
+test('pty run: q, rq, Ctrl-C, Ctrl-C in the prompt (Sol#10), SIGTERM, an exception, and an already-raw tty all restore the tty flags', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-pty-root-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-pty-repo-'))
   const tuiScript = join(import.meta.dirname, 'tui.node.ts')
@@ -1222,6 +1223,10 @@ elif scenario == 'rq':
     os.write(master, b'rq')  # one chunk: refresh, then quit
 elif scenario == 'ctrl-c':
     os.write(master, b'\\x03')  # raw mode: Ctrl-C arrives as a key
+elif scenario == 'ctrl-c-prompt':
+    os.write(master, b'n')  # open the resume prompt
+    output.extend(read_some(master, 2, b'<session-id>'))
+    os.write(master, b'\\x03')
 elif scenario == 'sigterm':
     p.send_signal(signal.SIGTERM)
 elif scenario == 'preraw':
@@ -1269,6 +1274,7 @@ print(output.decode('utf-8', errors='replace'))
     { name: 'q', exit: 0, preCanon: true, screen: /workers/ },
     { name: 'rq', exit: 0, preCanon: true, screen: /workers/ },
     { name: 'ctrl-c', exit: 0, preCanon: true, screen: /workers/ },
+    { name: 'ctrl-c-prompt', exit: 0, preCanon: true, screen: /<session-id>/ },
     { name: 'sigterm', exit: 0, preCanon: true, screen: /workers/ },
     { name: 'exception', exit: 1, preCanon: true, screen: /tui error: Error: PTY_BOMB/ },
     { name: 'preraw', exit: 0, preCanon: false, screen: /workers/ },
@@ -2277,4 +2283,227 @@ test('health on screen: observeView → the status line for collecting, paused, 
     assert.match(screen, want)
     assert.doesNotMatch(screen, /內部 \?/)
   }
+})
+
+// -----------------------------------------------------------------------------
+// 9. Sol r6 findings 7, 8, 10–13: paste mode, split sequences, Ctrl-C, terminal
+//    errors, colon SGR, SGR inside a grapheme
+// -----------------------------------------------------------------------------
+
+const tick = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+test('Sol#7 paste mode: entry enables bracketed paste (DECSET 2004), the one cleanup disables it', async () => {
+  const t = mockTty()
+  enterTerminal(t.stdin, t.stdout)
+  assert.ok(t.stdout.written.includes('\x1b[?2004h'), 'entry enables 2004')
+  t.stdout.written = ''
+  restoreTerminal(t.stdin, t.stdout, { raw: false, flowing: false })
+  assert.ok(t.stdout.written.includes('\x1b[?2004l'), 'restore disables 2004')
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-paste-'))
+  const run = runTui({ stdin, stdout, host: quietHost('p', root, root), session: 'p', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  assert.ok(stdout.written.includes('\x1b[?2004h'), 'runTui enables 2004')
+  stdin.emit('data', 'q')
+  await run
+  assert.ok(stdout.written.lastIndexOf('\x1b[?2004l') > stdout.written.lastIndexOf('\x1b[?2004h'), 'the cleanup turns 2004 off last')
+})
+
+test('Sol#8 split sequence: the ESC timer lets go only a lone ESC; a CSI, SS3 or paste prefix waits for its end', async () => {
+  const p = new KeyParser()
+  assert.deepEqual(p.feed('\x1b[3'), [])
+  assert.deepEqual(p.flushEsc(), [], 'a CSI prefix is not let go as keys')
+  assert.deepEqual(p.feed('~q'), ['\x1b[3~', 'q'])
+  assert.deepEqual(p.feed('\x1bO'), [])
+  assert.deepEqual(p.flushEsc(), [], 'an SS3 prefix is not let go as keys')
+  assert.deepEqual(p.feed('B'), ['\x1bOB'])
+  assert.deepEqual(p.feed('\x1b[20'), [])
+  assert.deepEqual(p.flushEsc(), [], 'a paste-start prefix is not let go as keys')
+  assert.deepEqual(p.feed('0~q\x1b[201~'), ['\x1b[200~q\x1b[201~'])
+  assert.deepEqual(p.feed('\x1b[2\x03'), ['\x03'], 'a CSI cut by a control byte is dropped whole; the control key stays')
+  assert.deepEqual(p.feed('\x1b'), [])
+  assert.deepEqual(p.flushEsc(), ['\x1b'], 'a lone ESC is still let go')
+
+  // runTui, real timer: the paste-start marker is cut with a gap > ESC_WAIT_MS
+  // while the prompt is open. The pasted q is prompt text; the TUI does not quit.
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-split-'))
+  const run = runTui({ stdin, stdout, host: quietHost('s8', root, root), session: 's8', cwd: root, root, mirrorMs: 60_000 })
+  let ended = false
+  run.then(() => (ended = true), () => (ended = true))
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', 'n')
+  await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
+  stdin.emit('data', '\x1b[20')
+  await tick(ESC_WAIT_MS * 4)
+  stdin.emit('data', '0~q\x1b[201~')
+  try {
+    await until(() => ended || stdout.written.includes(': q█'), 3_000, 'the pasted q in the prompt')
+    assert.equal(ended, false, 'the split paste quit the TUI')
+    assert.ok(stdout.written.includes(': q█'))
+  } finally {
+    stdin.emit('data', '\x1b')
+    await tick(ESC_WAIT_MS * 2)
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
+test('Sol#10 Ctrl-C quits from every mode: list, prompt (n, t, +), confirm', async () => {
+  const rows = [mockRow('a')]
+  const base: TuiState = { rows, all: rows, showAll: false, selected: 'a', adding: false, resumeInput: '', quit: false }
+  const modes: TuiState[] = [
+    base,
+    { ...base, adding: true, inputKind: 'resume' },
+    { ...base, adding: true, inputKind: 'tell', inputFor: 'a', resumeInput: 'hi' },
+    { ...base, adding: true, inputKind: 'assign' },
+    { ...base, armedStop: { id: 'a', from: 0, until: 1e12 } },
+  ]
+  for (const s of modes) {
+    const r = nextKeyState(s, '\x03', 1)
+    assert.equal(r.state.quit, true, `adding=${s.adding} kind=${s.inputKind} armed=${!!s.armedStop}`)
+    assert.deepEqual(r.action, { type: 'quit' })
+  }
+  assert.equal(nextKeyState({ ...base, adding: true }, 'q', 1).state.quit, false, 'a typed q in the prompt is text')
+
+  // runTui: prompt open, Ctrl-C ends the run through the one cleanup.
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-ctrlc-'))
+  const run = runTui({ stdin, stdout, host: quietHost('c', root, root), session: 'c', cwd: root, root, mirrorMs: 60_000 })
+  let ended = false
+  run.then(() => (ended = true), () => (ended = true))
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', 'n')
+  await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
+  stdin.emit('data', '\x03')
+  try {
+    await until(() => ended, 3_000, 'Ctrl-C in the prompt to end the run')
+  } finally {
+    if (!ended) {
+      stdin.emit('data', '\x1b')
+      await tick(ESC_WAIT_MS * 2)
+      stdin.emit('data', 'q')
+    }
+    await run
+  }
+  assert.equal(stdin.isRaw, false, 'raw mode restored')
+  assert.ok(stdout.written.endsWith(ANSI_LEAVE_ALT), 'alt screen left last')
+})
+
+test('Sol#11 setup: setRawMode(true) EIO stops startup with the error; nothing is left set', async () => {
+  const before = listenerCounts()
+  const { stdin, stdout } = mockTty()
+  stdin.setRawMode = (r: boolean) => {
+    if (r) throw Object.assign(new Error('EIO_RAW'), { code: 'EIO' })
+    stdin.isRaw = r
+  }
+  assert.throws(() => enterTerminal(stdin, stdout), /terminal setup failed: setRawMode\(true\): EIO_RAW/)
+  assert.equal(stdout.written, '', 'no alt screen on a failed setup')
+  const root = mkdtempSync(join(tmpdir(), 'tui-eio-in-'))
+  await assert.rejects(
+    runTui({ stdin, stdout, host: quietHost('e', root, root), session: 'e', cwd: root, root, mirrorMs: 60_000 }),
+    /terminal setup failed: setRawMode\(true\): EIO_RAW/,
+  )
+  assert.equal(stdout.written, '', 'runTui drew nothing')
+  assert.equal(stdin.listenerCount('data'), 0, 'no stdin listener left')
+  assert.deepEqual(listenerCounts(), before, 'no process listener left')
+
+  // A later step fails: the steps done before it are undone.
+  const t = mockTty()
+  const write = t.stdout.write.bind(t.stdout)
+  t.stdout.write = (s: string) => {
+    if (s.includes('\x1b[?1049h')) throw Object.assign(new Error('EIO_WRITE'), { code: 'EIO' })
+    return write(s)
+  }
+  assert.throws(() => enterTerminal(t.stdin, t.stdout), /terminal setup failed: enter alt screen: EIO_WRITE/)
+  assert.equal(t.stdin.isRaw, false, 'raw mode undone')
+})
+
+test('Sol#11 teardown: setRawMode(false) EIO is reported on stderr after the alt screen is left; the other steps still run; runTui rejects (exit 1)', async () => {
+  const { stdin, stdout } = mockTty()
+  const order: string[] = []
+  stdin.setRawMode = (r: boolean) => {
+    if (!r) throw Object.assign(new Error('EIO_RESTORE'), { code: 'EIO' })
+    stdin.isRaw = r
+  }
+  let paused = false
+  stdin.pause = () => {
+    paused = true
+  }
+  const write = stdout.write.bind(stdout)
+  stdout.write = (s: string) => {
+    if (s.includes(ANSI_LEAVE_ALT)) order.push('leave')
+    return write(s)
+  }
+  const realErr = process.stderr.write
+  let err = ''
+  const root = mkdtempSync(join(tmpdir(), 'tui-eio-out-'))
+  const run = runTui({ stdin, stdout, host: quietHost('e', root, root), session: 'e', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  process.stderr.write = ((s: string) => {
+    err += s
+    order.push('stderr')
+    return true
+  }) as any
+  try {
+    stdin.emit('data', 'q')
+    await assert.rejects(run, /terminal restore failed: setRawMode\(false\): EIO_RESTORE/, 'a quit with a failed restore is not a success')
+  } finally {
+    process.stderr.write = realErr
+  }
+  assert.match(err, /setRawMode\(false\): EIO_RESTORE/)
+  assert.ok(paused, 'stdin paused despite the raw-mode error')
+  assert.deepEqual(order, ['leave', 'stderr'], 'the error is printed after the alt screen is left')
+  const errors = restoreTerminal(stdin, stdout, { raw: false, flowing: false })
+  assert.deepEqual(errors.map(e => e.message), ['setRawMode(false): EIO_RESTORE'])
+})
+
+test('Sol#12 colon SGR: one grammar for sanitize, strip, width, pad, truncate and render', () => {
+  const sgr = '\x1b[38:2::255:0:0m中\x1b[0m'
+  assert.equal(sanitizeAnsi(sgr), sgr, 'kept')
+  assert.equal(stripAnsi(sgr), '中')
+  assert.equal(cellWidth(sgr), 2)
+  assert.equal(padCells(sgr, 4), sgr + '  ')
+  assert.equal(truncateAnsi(sgr, 2), sgr, 'fits: unchanged')
+  assert.equal(truncateAnsi('\x1b[38:2::255:0:0m中文\x1b[0m', 3), '\x1b[38:2::255:0:0m中\x1b[0m')
+  const row = mockRow('w-sgr')
+  const state: TuiState = {
+    rows: [row],
+    all: [row],
+    showAll: false,
+    selected: 'w-sgr',
+    adding: false,
+    resumeInput: '',
+    mirror: { id: 'w-sgr', lines: [sgr] },
+    quit: false,
+  }
+  const lines = renderTuiLines(state, 12, 24, Date.now())
+  assert.ok(lines.includes(sgr), `the mirror line is drawn unchanged: ${JSON.stringify(lines)}`)
+})
+
+test('Sol#13 SGR inside a grapheme: truncation cuts only at whole visible graphemes', () => {
+  withAmbiguous(undefined, () => {
+    const family = '\u{1F468}\x1b[31m‍\u{1F469}‍\u{1F467}b'
+    assert.equal(cellWidth(family), 3)
+    const cut = truncateAnsi(family, 2)
+    assert.equal(stripAnsi(cut), '\u{1F468}‍\u{1F469}‍\u{1F467}', 'the whole ZWJ family')
+    assert.equal(cut, '\u{1F468}\x1b[31m‍\u{1F469}‍\u{1F467}\x1b[0m', 'the SGR stays where it was')
+    assert.equal(truncateAnsi(family, 1), '', 'a 2-cell family does not fit 1 cell')
+    // Combining enclosing keycap (U+20E3) after an SGR: the keycap is 2 cells.
+    const keycap = '1\x1b[1m⃣x'
+    assert.equal(cellWidth(keycap), 3)
+    assert.equal(truncateAnsi(keycap, 2), '1\x1b[1m⃣\x1b[0m')
+    assert.equal(truncateAnsi(keycap, 1), '')
+    const accent = 'e\x1b[1ḿx'
+    assert.equal(truncateAnsi(accent, 1), 'e\x1b[1ḿ\x1b[0m')
+    for (const text of [family, keycap, accent, '❤\x1b[31m️ab']) {
+      const all = graphemes(stripAnsi(text))
+      for (let max = 0; max <= 5; max++) {
+        const got = truncateAnsi(text, max)
+        assert.ok(cellWidth(got) <= max, `${JSON.stringify(text)} max ${max}: ${cellWidth(got)} cells`)
+        const gs = graphemes(stripAnsi(got))
+        assert.deepEqual(gs, all.slice(0, gs.length), `${JSON.stringify(text)} max ${max}: a whole-grapheme prefix`)
+      }
+    }
+  })
 })

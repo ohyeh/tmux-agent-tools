@@ -25,17 +25,26 @@
 //   names this session, pane, tmux socket path and cwd, and its pid provably runs
 //   with the recorded start time. A different pane, socket or cwd: SIGTERM, wait
 //   for it to exit (a straggler is fenced by the new activation, §4), then start
-//   one. Dead or reused pid: start one. Unprovable (EPERM, ps error): busy.
-//   A started collector counts only after it publishes its record; an early exit,
-//   a spawn error, or no record in time is an error, and nothing is written for it.
+//   one. Dead or reused pid: start one. Unprovable (EPERM, ps error), or a record
+//   that cannot be read or parsed (only ENOENT is absent): busy.
+//   A started collector counts only after it publishes its record with this start's
+//   `--nonce`, its own pid, and a start time that pid provably runs with; an early
+//   exit, a spawn error, a record read error, or no record in time is an error (the
+//   child is stopped), and nothing is written for it.
 // - `collector.log`: the collector's stderr (including `host pane %N is gone`).
 // - Legacy (the launcher before plan R6): a `collector.lock` dir and a
 //   `collector.pid` file. While either exists the launcher does nothing but name
 //   `--migrate-launcher`, which moves them (never deletes) into `legacy-<ts>/`
-//   once `ps` shows no launcher or collector process for this session.
+//   once `ps` shows no launcher or collector process for this session (its own
+//   parent included) and no descendant of one. Limit: that `ps` is one snapshot
+//   and the old launcher takes no lock, so nothing fences an old launcher started
+//   after it; `--yes` is the operator's confirmation that none will start.
 //
 // `--unlock-launcher` removes `collector.owner` only when its holder is provably
 // gone (dead pid, or the pid runs with another start time) and `--yes` is given.
+// It reads, checks and removes inside `collector.owner.unlock` (ledger.ts
+// `maintainLock`), so two unlocks cannot remove a newer holder's lock; that lock
+// is never taken over either (a dead one is busy, and removed by hand).
 // Both maintenance commands print what they would do without `--yes`.
 //
 // Closing the TUI does not stop the collector (detached; this process watches
@@ -53,8 +62,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { paneAlive, readCollectorRecord, serverSocket, type CollectorRecord } from './collector.node.ts'
 import { nodeHost } from './host.node.ts'
-import { acquireLock, readHolder, releaseLock, type Holder } from './ledger.ts'
-import { holderProvablyAlive, processId, randomBase36, rootOf, sessionDirOf, v3Of, type Host } from './workers.ts'
+import { acquireLock, maintainLock, probeHolder, releaseLock, type Holder } from './ledger.ts'
+import { holderProvablyAlive, processId, randomBase36, rootOf, sessionDirOf, unlockBusyText, v3Of, type Host } from './workers.ts'
 
 const NODE_FLOOR = [22, 18, 0]
 /** How long a launcher waits for a lock whose holder provably runs (the holder's check-and-spawn). */
@@ -174,7 +183,7 @@ async function stopCollector(host: Host, r: CollectorRecord): Promise<boolean> {
   return false
 }
 
-async function startCollector(dir: string, want: Want, explicitSocket: string | undefined): Promise<number> {
+async function startCollector(host: Host, dir: string, want: Want, explicitSocket: string | undefined): Promise<number> {
   const logPath = `${dir}/collector.log`
   let log
   try {
@@ -182,7 +191,10 @@ async function startCollector(dir: string, want: Want, explicitSocket: string | 
   } catch (error) {
     throw new Error(`could not open ${logPath}: ${(error as Error).message}; no collector started`)
   }
-  const args = [COLLECTOR, '--session', want.session, '--cwd', want.cwd, '--pane', want.pane]
+  // This start's token: a record left by any other start (a dead collector whose pid
+  // the child reuses) cannot carry it.
+  const nonce = randomBase36(16)
+  const args = [COLLECTOR, '--session', want.session, '--cwd', want.cwd, '--pane', want.pane, '--nonce', nonce]
   const env = { ...process.env }
   if (explicitSocket) {
     args.push('--socket', explicitSocket)
@@ -202,8 +214,17 @@ async function startCollector(dir: string, want: Want, explicitSocket: string | 
     for (;;) {
       const why = await Promise.race([ended, sleep(100).then(() => undefined)])
       if (why) throw new Error(`the collector ${why}; collector.log: ${await logTail(logPath)}`)
-      const rec = await readCollectorRecord(`${dir}/collector.json`).catch(() => undefined)
-      if (child.pid && rec?.pid === child.pid && sameCollector(rec, want)) return child.pid
+      // Only a confirmed-absent record is waited for; any other read error is the answer.
+      let rec: CollectorRecord | undefined
+      try {
+        rec = await readCollectorRecord(`${dir}/collector.json`)
+      } catch (error) {
+        child.kill('SIGTERM')
+        throw new Error(`could not read the record of collector ${child.pid ?? '?'}: ${(error as Error).message}; stopped it. collector.log: ${await logTail(logPath)}`)
+      }
+      if (child.pid && rec?.nonce === nonce && rec.pid === child.pid && sameCollector(rec, want) && (await holderProvablyAlive(host, rec)) === true) {
+        return child.pid
+      }
       if (Date.now() > deadline) {
         child.kill('SIGTERM')
         throw new Error(`collector ${child.pid ?? '?'} published no collector.json within ${READY_MS / 1000}s; stopped it. collector.log: ${await logTail(logPath)}`)
@@ -236,7 +257,15 @@ export async function ensureCollector(
     const socket = await serverSocket(opts.pane)
     if (!socket) throw new Error(`could not read the tmux socket path of pane ${opts.pane}`)
     const want: Want = { session: opts.session, cwd: opts.cwd, pane: opts.pane, socket }
-    const cur = await readCollectorRecord(`${dir}/collector.json`)
+    let cur: CollectorRecord | undefined
+    try {
+      cur = await readCollectorRecord(`${dir}/collector.json`)
+    } catch (error) {
+      throw new Error(
+        `busy: ${(error as Error).message}; a collector may still run, so none is started. ` +
+          `If none runs for this session, move ${dir}/collector.json aside and launch again`,
+      )
+    }
     let replaced: { pid: number; exited: boolean } | undefined
     if (cur) {
       const alive = await holderProvablyAlive(host, cur)
@@ -246,18 +275,33 @@ export async function ensureCollector(
       if (alive && sameCollector(cur, want)) return { pid: cur.pid, reused: true }
       if (alive) replaced = { pid: cur.pid, exited: await stopCollector(host, cur) }
     }
-    return { pid: await startCollector(dir, want, opts.socket), reused: false, replaced }
+    return { pid: await startCollector(host, dir, want, opts.socket), reused: false, replaced }
   } finally {
     await releaseLock(host, `${dir}/collector.owner`, token)
   }
 }
 
-/** `--unlock-launcher`: remove `collector.owner` only when its holder is provably gone. */
+/**
+ * `--unlock-launcher`: remove `collector.owner` only when its holder is provably gone.
+ * The read, the check and the rm run inside the lock's maintenance section.
+ */
 export async function unlockLauncher(host: Host, root: string, session: string, yes: boolean): Promise<Outcome> {
   const lock = `${sessionDirOf(v3Of(root), session)}/collector.owner`
-  const h = await readHolder(host, lock)
-  if (!h) return { ok: true, text: `${lock} is not held; nothing to unlock` }
-  if (h === 'unreadable') return { ok: false, text: `${lock} names no readable holder; not removing it` }
+  // Absent or unreadable: nothing is removed, so it is answered outside the section.
+  const pre = await probeHolder(host, lock)
+  if (!('holder' in pre)) return unlockHeld(host, lock, session, yes, pre)
+  const me = await processId(host)
+  if (!(me.pid > 0 && me.pidStart && me.host)) return { ok: false, text: 'busy: could not read this process id (ps); not unlocking' }
+  const m = await maintainLock(host, lock, { token: randomBase36(12), session, activation: 'unlock', ...me }, async () =>
+    unlockHeld(host, lock, session, yes, await probeHolder(host, lock)),
+  )
+  return m.ok ? m.value : { ok: false, text: await unlockBusyText(host, m) }
+}
+
+async function unlockHeld(host: Host, lock: string, session: string, yes: boolean, p: Awaited<ReturnType<typeof probeHolder>>): Promise<Outcome> {
+  if ('absent' in p) return { ok: true, text: `${lock} is not held; nothing to unlock` }
+  if ('unreadable' in p) return { ok: false, text: `busy: ${p.unreadable}; not removing it` }
+  const h = p.holder
   const alive = await holderProvablyAlive(host, h)
   const who = holderText(h, alive)
   if (alive !== false) return { ok: false, text: `not unlocking ${lock}: its holder is ${who}` }
@@ -266,21 +310,21 @@ export async function unlockLauncher(host: Host, root: string, session: string, 
   return { ok: true, text: `unlocked ${lock} (its holder ${who})` }
 }
 
-type Proc = { pid: number; line: string }
+type Proc = { pid: number; ppid: number; line: string }
 
-/** Every process with its full args (`ps -o pid=,lstart=,args=`); `undefined` = ps failed. */
+/** Every process with its parent and full args (`ps -o pid=,ppid=,lstart=,args=`); `undefined` = ps failed. */
 function processes(): Promise<Proc[] | undefined> {
   return new Promise(resolve => {
     execFile(
       'ps',
-      ['-ax', '-ww', '-o', 'pid=,lstart=,args='],
+      ['-ax', '-ww', '-o', 'pid=,ppid=,lstart=,args='],
       { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } },
       (error, stdout) => {
         if (error) return resolve(undefined)
         const procs: Proc[] = []
         for (const raw of stdout.split('\n')) {
-          const m = /^\s*(\d+)\s+(.*)$/.exec(raw)
-          if (m) procs.push({ pid: Number(m[1]), line: m[2]! })
+          const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(raw)
+          if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), line: m[3]! })
         }
         resolve(procs)
       },
@@ -292,7 +336,10 @@ function processes(): Promise<Proc[] | undefined> {
  * `--migrate-launcher` (plan §1c S2): move the legacy `collector.lock` / `collector.pid`
  * (and `collector.log`) into `legacy-<ts>/`, never delete them. Only when `ps` shows no
  * launcher or collector process naming this session (a substring match on the full
- * args: any hit is busy) and the legacy pid is provably dead or provably not a collector.
+ * args: any hit is busy, this process's parent and other ancestors included), no
+ * descendant of one, and the legacy pid is provably dead or provably not a collector.
+ * The scan is one snapshot and old code takes no lock, so `--yes` also confirms that
+ * no old launcher starts meanwhile (no fence can enforce it).
  */
 export async function migrateLauncher(host: Host, root: string, session: string, yes: boolean): Promise<Outcome> {
   const dir = sessionDirOf(v3Of(root), session)
@@ -306,15 +353,29 @@ export async function migrateLauncher(host: Host, root: string, session: string,
   }
   try {
     const procs = await processes()
-    if (!procs) return { ok: false, text: 'busy: ps -o pid=,lstart=,args= failed; cannot prove that no old launcher runs' }
+    if (!procs) return { ok: false, text: 'busy: ps -o pid=,ppid=,lstart=,args= failed; cannot prove that no old launcher runs' }
+    // Only this process is left out: a matching parent is an old launcher too.
     const hits = procs.filter(
-      p => p.pid !== process.pid && p.pid !== process.ppid && p.line.includes(session) && (p.line.includes('launcher.node.ts') || p.line.includes('collector.node.ts')),
+      p => p.pid !== process.pid && p.line.includes(session) && (p.line.includes('launcher.node.ts') || p.line.includes('collector.node.ts')),
     )
     if (hits.length) {
+      // Their descendants by ppid (a dead launcher's orphans are reparented and not found).
+      const seen = new Set(hits.map(p => p.pid))
+      const tree = [...hits]
+      for (let i = 0; i < tree.length; i++) {
+        for (const p of procs) {
+          if (p.ppid !== tree[i]!.pid || seen.has(p.pid) || p.pid === process.pid) continue
+          seen.add(p.pid)
+          tree.push(p)
+        }
+      }
+      const kids = tree.slice(hits.length)
+      const list = (ps: Proc[]) => ps.map(p => `pid ${p.pid}: ${p.line.slice(0, 200)}`).join('; ')
       return {
         ok: false,
         text:
-          `busy: a launcher or collector for session ${session} still runs: ${hits.map(p => `pid ${p.pid}: ${p.line.slice(0, 200)}`).join('; ')}. ` +
+          `busy: a launcher or collector for session ${session} still runs: ${list(hits)}` +
+          `${kids.length ? `; and its descendants: ${list(kids)}` : ''}. ` +
           'Confirm it is the old one, stop it (SIGTERM), then migrate again',
       }
     }
@@ -334,7 +395,14 @@ export async function migrateLauncher(host: Host, root: string, session: string,
       }
     }
     const moving = [...legacy, ...((await stat(`${dir}/collector.log`).then(() => true, () => false)) ? ['collector.log'] : [])]
-    if (!yes) return { ok: false, text: `would move ${moving.join(', ')} from ${dir} into legacy-<time>/. To do it, run: ${migrateCommand(session)}` }
+    if (!yes) {
+      return {
+        ok: false,
+        text:
+          `would move ${moving.join(', ')} from ${dir} into legacy-<time>/. This ps check is one snapshot and the old launcher ` +
+          `takes no lock: confirm that no old launcher or collector for this session will start, then run: ${migrateCommand(session)}`,
+      }
+    }
     const dest = `${dir}/legacy-${new Date().toISOString().replace(/[:.]/g, '-')}`
     await mkdir(dest)
     for (const name of moving) await rename(`${dir}/${name}`, `${dest}/${name}`)

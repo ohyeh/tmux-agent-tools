@@ -65,15 +65,49 @@ export async function allocateNext(host: Host, dir: string, tries = 8): Promise<
 export type Holder = { token: string; session: string; activation: string; host: string; pid: number; pidStart: string }
 export type Lock = { ok: true; token: string } | { ok: false; busy: Holder | 'unreadable' | 'unknown' }
 
-export async function readHolder(host: Host, lock: string): Promise<Holder | 'unreadable' | undefined> {
+/**
+ * The lock's holder, `absent` (confirmed: not listed in its dir, or its dir is ENOENT),
+ * or `unreadable` with why: a list error (EACCES, EIO), a listed lock readlink cannot
+ * read, or a target that is not a holder record.
+ */
+export async function probeHolder(host: Host, lock: string): Promise<{ holder: Holder } | { absent: true } | { unreadable: string }> {
   const r = await op(host, ['readlink', lock])
-  if (r.exitCode !== 0) return undefined
+  if (r.exitCode !== 0) {
+    // BSD readlink prints nothing on any failure: the dir listing tells absent from an error.
+    const failed = `readlink ${lock} failed (exit ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim()}` : ''})`
+    const dir = lock.slice(0, lock.lastIndexOf('/')) || '/'
+    let names: string[]
+    try {
+      names = (await host.list(dir)).map(e => e.name)
+    } catch (error) {
+      if (!(await host.exists(dir).catch(() => true))) return { absent: true }
+      return { unreadable: `${failed}; could not list ${dir}: ${String(error)}` }
+    }
+    if (!names.includes(lock.slice(dir.length + 1))) return { absent: true }
+    return { unreadable: `${failed}, but it is listed in ${dir}` }
+  }
   try {
     const h = JSON.parse(r.stdout.trim()) as Holder
-    return typeof h?.token === 'string' ? h : 'unreadable'
+    if (typeof h?.token === 'string') return { holder: h }
   } catch {
-    return 'unreadable'
+    // not JSON: below
   }
+  return { unreadable: `${lock} names no holder record (${JSON.stringify(r.stdout.trim().slice(0, 80))})` }
+}
+
+/** Each distinct unreadable answer is logged once per process: reconcile reads the same locks every tick. */
+const saidUnreadable = new Set<string>()
+
+/** `undefined` only when the lock is confirmed absent; every other non-holder answer is `unreadable`. */
+export async function readHolder(host: Host, lock: string): Promise<Holder | 'unreadable' | undefined> {
+  const p = await probeHolder(host, lock)
+  if ('holder' in p) return p.holder
+  if ('absent' in p) return undefined
+  if (!saidUnreadable.has(p.unreadable)) {
+    saidUnreadable.add(p.unreadable)
+    host.log(`tmux-agent: ${p.unreadable}`)
+  }
+  return 'unreadable'
 }
 
 /** Acquire and holder publication are one `ln -sn`: a lock without a holder cannot exist. */
@@ -94,6 +128,30 @@ export async function releaseLock(host: Host, lock: string, token: string): Prom
   }
   const r = await op(host, ['rm', lock])
   return r.exitCode === 0
+}
+
+/**
+ * The maintenance section of `lock` (§5 unlock). Every caller that removes another
+ * holder's `lock` runs inside `<lock>.unlock`, itself an action lock held by this
+ * process. So holder-read → liveness check → rm is one section: a second unlock cannot
+ * judge the same dead holder, and then remove a newer holder's lock after the first
+ * unlock removed the dead one. `<lock>.unlock` is never taken over: a dead holder of it
+ * is `busy` like any other, and is cleared by hand.
+ */
+export async function maintainLock<T>(
+  host: Host,
+  lock: string,
+  me: Holder,
+  fn: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; busy: Holder | 'unreadable' | 'unknown'; path: string }> {
+  const path = `${lock}.unlock`
+  const m = await acquireLock(host, path, me)
+  if (!m.ok) return { ok: false, busy: m.busy, path }
+  try {
+    return { ok: true, value: await fn() }
+  } finally {
+    if (!(await releaseLock(host, path, me.token))) host.log(`tmux-agent: could not release ${path}; the next unlock reports it busy`)
+  }
 }
 
 // ── acks (§5): create-once directories ─────────────────────────────────────────

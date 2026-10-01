@@ -67,8 +67,10 @@ import { eawOf } from './eaw-table.ts'
 
 export const NODE_FLOOR = [22, 18, 0]
 
-export const ANSI_ENTER_ALT = '\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H'
-export const ANSI_LEAVE_ALT = '\x1b[?25h\x1b[?1049l'
+// `?2004h` turns on bracketed paste: the terminal wraps a paste in ESC[200~ … ESC[201~,
+// so a pasted `q` or `x` is text, not a key (KeyParser). `?2004l` turns it off again.
+export const ANSI_ENTER_ALT = '\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H'
+export const ANSI_LEAVE_ALT = '\x1b[?2004l\x1b[?25h\x1b[?1049l'
 export const ANSI_HIDE_CURSOR = '\x1b[?25l'
 export const ANSI_SHOW_CURSOR = '\x1b[?25h'
 export const ANSI_CLEAR_HOME = '\x1b[2J\x1b[H'
@@ -87,7 +89,13 @@ export const ANSI_COLOR_MAP: Record<string, string> = {
   blue: '\x1b[34m',
 }
 
-export const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g
+// The one SGR grammar: `ESC [ params m`, params from `0-9 ; :` (colon sub-parameters,
+// as in `ESC[38:2::255:0:0m`). sanitizeAnsi keeps exactly these; stripAnsi, cellWidth
+// and truncateAnsi read them as zero width.
+const SGR_PARAMS = '[0-9;:]*'
+const SGR_RE = new RegExp(`^\\x1b\\[${SGR_PARAMS}m$`)
+const SGR_SPLIT_RE = new RegExp(`(\\x1b\\[${SGR_PARAMS}m)`)
+export const ANSI_RE = new RegExp(`\\x1b\\[${SGR_PARAMS}[a-zA-Z]`, 'g')
 export function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, '')
 }
@@ -151,28 +159,31 @@ export function padCells(text: string, width: number): string {
   return gap > 0 ? text + ' '.repeat(gap) : text
 }
 
-const SGR_SPLIT_RE = /(\x1b\[[0-9;:]*m)/
-
 /** `text` cut to `maxWidth` cells. Never splits a grapheme or an SGR escape. */
 export function truncateAnsi(text: string, maxWidth: number): string {
   if (cellWidth(text) <= maxWidth) return text
   const amb = ambiguousWidth()
-  let out = ''
-  let cur = 0
-  let hadEscape = false
+  // Odd parts are SGR. The cut is found on the SGR-free text, so an SGR inside a
+  // grapheme (ZWJ family, combining mark) cannot split it; then the original is
+  // copied up to that cut, SGR tokens included where they were.
   const parts = text.split(SGR_SPLIT_RE)
-  outer: for (let p = 0; p < parts.length; p++) {
+  let left = 0
+  let cur = 0
+  for (const g of graphemes(parts.filter((_, p) => p % 2 === 0).join(''))) {
+    cur += graphemeWidth(g, amb)
+    if (cur > maxWidth) break
+    left += g.length
+  }
+  let out = ''
+  let hadEscape = false
+  for (let p = 0; p < parts.length && left > 0; p++) {
     if (p % 2 === 1) {
       out += parts[p]
       hadEscape = true
       continue
     }
-    for (const g of graphemes(parts[p]!)) {
-      const w = graphemeWidth(g, amb)
-      if (cur + w > maxWidth) break outer
-      out += g
-      cur += w
-    }
+    out += parts[p]!.slice(0, left)
+    left -= Math.min(left, parts[p]!.length)
   }
   return hadEscape ? out + ANSI_RESET : out
 }
@@ -199,7 +210,7 @@ export function sanitizeAnsi(text: string): string {
         if (j >= text.length) break
         if (code(j) >= 0x40 && code(j) <= 0x7e) {
           const seq = text.slice(i, j + 1)
-          if (/^\x1b\[[0-9;:]*m$/.test(seq)) out += seq
+          if (SGR_RE.test(seq)) out += seq
           i = j + 1
         } else i = j
         continue
@@ -334,9 +345,14 @@ export const ESC_WAIT_MS = 50
  * Decoded stdin text → keys, across chunk boundaries. A key is one grapheme, one
  * control character, one CSI (`ESC [ … final`) or SS3 (`ESC O x`) sequence, a lone
  * ESC, or a whole bracketed paste (kept wrapped in its markers, so a pasted `q`
- * is text, not quit). A partial sequence waits for the next chunk; a lone ESC (or
- * a partial sequence) is let go by `flushEsc()`, which the caller runs after
- * ESC_WAIT_MS with no new input.
+ * is text, not quit). A partial sequence waits for the next chunk. Only a lone ESC
+ * is let go by `flushEsc()`, which the caller runs after ESC_WAIT_MS with no new
+ * input: a started CSI (`ESC [`), SS3 (`ESC O`) or paste marker stays buffered until
+ * it ends, so its tail never becomes keys. A CSI or SS3 cut by a byte that cannot
+ * belong to it is dropped whole; that byte (Ctrl-C, say) is read as a key.
+ * ponytail: no time bound on a started sequence or paste; one that never ends eats
+ * the next final byte (a plain key) or, for a paste, all input until ESC[201~. Add
+ * an idle bound that drops it with a status line if a terminal is seen to do that.
  */
 export class KeyParser {
   private buf = ''
@@ -379,17 +395,22 @@ export class KeyParser {
       }
       if (b[i] === '\x1b') {
         const rest = b.slice(i)
-        let len = 0 // 0 = incomplete, -1 = lone ESC
-        if (rest.length === 1) len = 0
+        const final = (k: number) => rest.charCodeAt(k) >= 0x40 && rest.charCodeAt(k) <= 0x7e
+        let len = 0 // 0 = incomplete, -1 = ESC alone (then a plain key), -k = drop k bytes
+        if (rest.length === 1) len = force ? -1 : 0
         else if (rest[1] === '[') {
           let j = 2
           while (j < rest.length && rest.charCodeAt(j) >= 0x20 && rest.charCodeAt(j) <= 0x3f) j++
           if (j >= rest.length) len = 0
-          else len = rest.charCodeAt(j) >= 0x40 && rest.charCodeAt(j) <= 0x7e ? j + 1 : -1
-        } else if (rest[1] === 'O') len = rest.length >= 3 ? 3 : 0
+          else len = final(j) ? j + 1 : -j
+        } else if (rest[1] === 'O') len = rest.length < 3 ? 0 : final(2) ? 3 : -2
         else len = -1
-        if (len === 0 && !force) break
-        if (len <= 0) {
+        if (len === 0) break
+        if (len < -1) {
+          i -= len
+          continue
+        }
+        if (len === -1) {
           out.push('\x1b')
           i += 1
           continue
@@ -446,6 +467,8 @@ const reselect = (state: TuiState, selected: string | undefined): TuiState => ({
 })
 
 export function nextKeyState(state: TuiState, key: string, now: number): { state: TuiState; action?: TuiAction } {
+  // Raw mode turns Ctrl-C into a key (no SIGINT): it quits from every mode, prompt included.
+  if (key === '\x03') return { state: { ...state, quit: true }, action: { type: 'quit' } }
   if (state.adding) {
     const closed: TuiState = { ...state, adding: false, resumeInput: '', inputKind: undefined, inputFor: undefined }
     if (key === '\x1b') return { state: closed }
@@ -470,7 +493,7 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
     return { state }
   }
 
-  if (key === 'q' || key === 'Q' || key === '\x03') {
+  if (key === 'q' || key === 'Q') {
     return { state: { ...state, quit: true }, action: { type: 'quit' } }
   }
 
@@ -846,44 +869,60 @@ export interface TerminalEntry {
   flowing: boolean
 }
 
+/** Runs one terminal step; a failure comes back named after the step. */
+function termStep(name: string, fn: () => unknown): Error | undefined {
+  try {
+    fn()
+    return undefined
+  } catch (err) {
+    return new Error(`${name}: ${err instanceof Error ? err.message : String(err)}`, { cause: err })
+  }
+}
+
 /**
- * `setRawMode(false)` makes libuv restore the termios it saved when raw mode was
- * first entered, so a tty that was already raw before the TUI stays raw.
+ * Best effort: every step runs even when one before it fails, and each failure is
+ * returned (the caller reports it). `setRawMode(false)` makes libuv restore the
+ * termios it saved when raw mode was first entered, so a tty that was already raw
+ * before the TUI stays raw.
  */
 export function restoreTerminal(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WriteStream,
   entry: TerminalEntry = { raw: false, flowing: false },
-): void {
-  try {
-    if (stdin.isTTY && typeof stdin.setRawMode === 'function') {
-      stdin.setRawMode(entry.raw)
-    }
-    if (!entry.flowing && typeof stdin.pause === 'function') {
-      stdin.pause()
-    }
-  } catch {}
-  try {
-    stdout.write(ANSI_LEAVE_ALT)
-  } catch {}
+): Error[] {
+  const steps = [
+    termStep(`setRawMode(${entry.raw})`, () => {
+      if (stdin.isTTY && typeof stdin.setRawMode === 'function') stdin.setRawMode(entry.raw)
+    }),
+    termStep('pause stdin', () => {
+      if (!entry.flowing && typeof stdin.pause === 'function') stdin.pause()
+    }),
+    termStep('leave alt screen', () => stdout.write(ANSI_LEAVE_ALT)),
+  ]
+  return steps.filter((e): e is Error => e !== undefined)
 }
 
+/**
+ * A step that fails stops the setup: the steps done before it are undone and the
+ * error is thrown, so the TUI never runs on a half-set terminal.
+ */
 export function enterTerminal(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WriteStream,
 ): TerminalEntry {
   const entry = { raw: stdin.isRaw === true, flowing: stdin.readableFlowing === true }
-  try {
-    if (stdin.isTTY && typeof stdin.setRawMode === 'function') {
-      stdin.setRawMode(true)
-    }
-    if (typeof stdin.resume === 'function') {
-      stdin.resume()
-    }
-  } catch {}
-  try {
-    stdout.write(ANSI_ENTER_ALT)
-  } catch {}
+  const steps: [string, () => unknown][] = [
+    ['setRawMode(true)', () => stdin.isTTY && typeof stdin.setRawMode === 'function' && stdin.setRawMode(true)],
+    ['resume stdin', () => typeof stdin.resume === 'function' && stdin.resume()],
+    ['enter alt screen', () => stdout.write(ANSI_ENTER_ALT)],
+  ]
+  for (const [k, [name, fn]] of steps.entries()) {
+    const err = termStep(name, fn)
+    if (!err) continue
+    const undo = k > 0 ? restoreTerminal(stdin, stdout, entry) : []
+    const also = undo.length ? `; undo failed too: ${undo.map(e => e.message).join('; ')}` : ''
+    throw new Error(`terminal setup failed: ${err.message}${also}`, { cause: err })
+  }
   return entry
 }
 
@@ -1034,6 +1073,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   // process starts from the same listener counts (H6: a leaked handler outlived the TUI).
   let entry: TerminalEntry | undefined
   let cleanedUp = false
+  let restoreErrors: Error[] = []
   const cleanup = () => {
     if (cleanedUp) return
     cleanedUp = true
@@ -1047,7 +1087,9 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     process.off('exit', onExit)
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
-    restoreTerminal(stdin, stdout, entry)
+    // Printed after the alt screen is left (the last restore step), so it stays readable.
+    restoreErrors = restoreTerminal(stdin, stdout, entry)
+    for (const err of restoreErrors) process.stderr.write(`tui: terminal restore failed: ${err.message}\n`)
   }
 
   // Input is read from the first byte: enterTerminal resumes stdin, and a flowing
@@ -1217,6 +1259,8 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     stopped = true
     cleanup()
   }
+  // A quit that left the tty broken is not a success: main exits 1, so a wrapper sees it.
+  if (restoreErrors.length) throw new Error(`terminal restore failed: ${restoreErrors.map(e => e.message).join('; ')}`)
 }
 
 async function main(): Promise<void> {

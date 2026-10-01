@@ -3,21 +3,24 @@
 // `reconcileOnce` and `heartbeat` as the Claude mod; only the wake differs — a
 // bracketed paste into the host's exact tmux pane id, then Enter.
 //
-// Usage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--socket <abs>] [--once]
+// Usage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--socket <abs>] [--nonce <s>] [--once]
 //   --session  the host session id this collector delivers for (required, §3)
 //   --cwd      the project dir; orphans are adoptable only in the same cwd (required, §3)
 //   --pane     the host pane, as `%N` (required: a name or index can point elsewhere)
+//   --nonce    the launcher's token for this one start, copied into collector.json
 //   --once     one reconcile pass, then exit (tests, cron)
 // Exit: 0 when the pane is gone or --once finished; 1 when the collector paused
 // (superseded by a newer activation, or refused deliveries) or could not get ready;
 // 2 on bad arguments.
 //
-// Readiness (plan D-collector-id): without --once, the collector first registers and
-// beats its activation (§4), then publishes `<sessionDir>/collector.json` (temp +
-// rename): `{pid, pidStart, host, session, pane, socket, cwd, coreVersion, token}`.
-// `socket` is the tmux server's `#{socket_path}` as this process resolves it. No
-// record is published before that first beat, so a record proves a ready collector
-// only while its pid still runs with that pidStart (the launcher checks both).
+// Readiness (plan D-collector-id): without --once, the collector reads its core version
+// (`AGENT_TMUX_VERSION` of `../agent-tmux`; a read or parse error is not ready), then
+// registers and beats its activation (§4): a beat that is not written is not ready.
+// Only then it publishes `<sessionDir>/collector.json` (temp + rename):
+// `{pid, pidStart, host, session, pane, socket, cwd, coreVersion, token, nonce}`.
+// `socket` is the tmux server's `#{socket_path}` as this process resolves it. A record
+// proves a ready collector only while its pid still runs with that pidStart (the
+// launcher checks both), and a launcher that started it accepts only its own `nonce`.
 import { execFile } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { readFile, rename, writeFile } from 'node:fs/promises'
@@ -79,34 +82,49 @@ export type CollectorRecord = {
   cwd: string
   coreVersion: string
   token: string
+  /** The `--nonce` of the start that published it (absent when started without one). */
+  nonce?: string
 }
 
-/** The record as published; `undefined` = absent or not a complete record. Other read errors throw. */
+/**
+ * The record as published; `undefined` only when it is absent (ENOENT). A read error,
+ * bad JSON or an incomplete record throws, naming the path: it is unknown, not absent.
+ */
 export async function readCollectorRecord(path: string): Promise<CollectorRecord | undefined> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-    throw error
+    throw new Error(`${path}: ${String(error)}`)
   }
+  let r: CollectorRecord
   try {
-    const r = JSON.parse(text) as CollectorRecord
-    const strings = [r?.pidStart, r?.host, r?.session, r?.pane, r?.socket, r?.cwd, r?.token]
-    return Number.isInteger(r?.pid) && r.pid > 0 && strings.every(v => typeof v === 'string' && v) ? r : undefined
-  } catch {
-    return undefined
+    r = JSON.parse(text) as CollectorRecord
+  } catch (error) {
+    throw new Error(`${path} is not JSON (${(error as Error).message})`)
   }
+  const strings = [r?.pidStart, r?.host, r?.session, r?.pane, r?.socket, r?.cwd, r?.token]
+  if (Number.isInteger(r?.pid) && r.pid > 0 && strings.every(v => typeof v === 'string' && v)) return r
+  throw new Error(`${path} is not a complete collector record`)
 }
 
-/** `AGENT_TMUX_VERSION` of the wrapper beside lib/, the version every install ships. */
+/** `AGENT_TMUX_VERSION` of the wrapper beside lib/, the version every install ships. Throws with the path. */
 async function coreVersion(): Promise<string> {
-  const text = await readFile(fileURLToPath(new URL('../agent-tmux', import.meta.url)), 'utf8').catch(() => '')
-  return /^AGENT_TMUX_VERSION='([^']+)'$/m.exec(text)?.[1] ?? 'unknown'
+  const path = fileURLToPath(new URL('../agent-tmux', import.meta.url))
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    throw new Error(`could not read the core version from ${path}: ${String(error)}`)
+  }
+  const version = /^AGENT_TMUX_VERSION='([^']+)'$/m.exec(text)?.[1]
+  if (!version) throw new Error(`${path} has no AGENT_TMUX_VERSION='…' line`)
+  return version
 }
 
 function usage(why: string): never {
-  process.stderr.write(`tmux-agent-collector: ${why}\nusage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--socket <abs>] [--once]\n`)
+  process.stderr.write(`tmux-agent-collector: ${why}\nusage: node collector.node.ts --session <id> --cwd <dir> --pane <%N> [--socket <abs>] [--nonce <s>] [--once]\n`)
   process.exit(2)
 }
 
@@ -114,7 +132,7 @@ async function main(): Promise<void> {
   const have = process.versions.node.split('.').map(Number)
   const below = NODE_FLOOR.findIndex((n, i) => have[i]! !== n) // first differing part decides
   if (below >= 0 && have[below]! < NODE_FLOOR[below]!) usage(`node ${process.versions.node} is below the floor ${NODE_FLOOR.join('.')}`)
-  let values: { session?: string; cwd?: string; pane?: string; once?: boolean; socket?: string }
+  let values: { session?: string; cwd?: string; pane?: string; once?: boolean; socket?: string; nonce?: string }
   try {
     ;({ values } = parseArgs({
       options: {
@@ -123,12 +141,13 @@ async function main(): Promise<void> {
         pane: { type: 'string' },
         once: { type: 'boolean' },
         socket: { type: 'string' },
+        nonce: { type: 'string' },
       },
     }))
   } catch (error) {
     usage(String((error as Error).message))
   }
-  const { session, cwd, pane, once, socket } = values
+  const { session, cwd, pane, once, socket, nonce } = values
   if (socket) {
     if (!socket.startsWith('/')) usage('--socket must be an absolute path')
     process.env.TMUX_AGENT_TMUX_SOCKET = socket
@@ -156,6 +175,13 @@ async function main(): Promise<void> {
     log(`tmux-agent-collector: not ready — ${why}; exiting`)
     process.exit(1)
   }
+  // Before registering: a start that cannot get ready must not fence the running activation.
+  let version = ''
+  try {
+    version = await coreVersion()
+  } catch (error) {
+    notReady((error as Error).message)
+  }
   if (!(await heartbeat(host, gate))) notReady(gate.paused ?? 'could not register or beat this activation (see above)')
   const me = await processId(host)
   if (me.pid !== process.pid || !me.pidStart || !me.host) notReady(`could not read this process's own id (got pid ${me.pid || '?'})`)
@@ -170,8 +196,9 @@ async function main(): Promise<void> {
     pane,
     socket: sock,
     cwd,
-    coreVersion: await coreVersion(),
+    coreVersion: version,
     token: gate.token,
+    ...(nonce ? { nonce } : {}),
   }
   const path = `${sessionDirOf(v3Of(root), session)}/collector.json`
   try {

@@ -5,7 +5,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { type ChildProcess, execFile, execFileSync, spawn } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -910,13 +910,13 @@ test('R6.2: an install path with a space runs, and its collector is found again'
     let w: Live | undefined
     try {
       w = await live('r62sp')
-      const lib = join(w.root, 'install dir', 'scripts', 'lib')
-      cpSync(fileURLToPath(new URL('.', import.meta.url)), lib, { recursive: true, filter: src => !src.includes('/fixtures') })
-      const launcher = join(lib, 'launcher.node.ts')
+      const launcher = install(w, 'install dir')
       const pane = await hostPane(w.session)
       const first = await ready(spawnLauncher(w, pane, { launcher }))
       assert.equal(first.how, 'started')
       assert.ok(collectors(w.session).some(l => l.includes('install dir/scripts/lib/collector.node.ts')))
+      const version = /^AGENT_TMUX_VERSION='([^']+)'$/m.exec(readFileSync(join(SCRIPTS, 'agent-tmux'), 'utf8'))![1]
+      assert.equal(record(w).coreVersion, version, 'the version of the wrapper in that install')
       const second = await ready(spawnLauncher(w, pane, { launcher }))
       assert.equal(second.how, 'reused')
       assert.equal(second.pid, first.pid)
@@ -944,6 +944,308 @@ test('R6.2: an unwritable collector.log or a collector that exits before ready i
       assert.match(await busyLaunch(w, pane), /the collector exited \(code 1\) before it was ready; collector\.log: .*not ready/s)
       assert.ok(!hasRecord(w), 'no fake readiness')
       assert.ok(!linked(`${dir}/collector.owner`), 'the lock is released on the error path')
+      assert.equal(collectors(w.session).length, 0)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+// ── Sol r6 review (sol-review-r6.json items 1–6, 14): one named fixture per failure ──
+
+const DEAD_START = 'Thu Jan  1 00:00:00 1970'
+
+test('Sol#1 launcher unlock: A and B unlock one dead holder, C acquires at A\'s rm cut point — C\'s lock survives', async () => {
+  const w = lockDir()
+  try {
+    const base = nodeHost({ log: () => {} })
+    const me = await processId(base)
+    symlinkSync(JSON.stringify({ token: 'old', session: 'lock-s', activation: 'launcher', ...me, pidStart: DEAD_START }), w.lock)
+    const fresh: Holder = { token: 'new', session: 'lock-s', activation: 'launcher', ...me }
+    let armed = true
+    let b: { ok: boolean; text: string } | undefined
+    let c = false
+    const a: Host = {
+      ...base,
+      run: async (argv, cwd, ms) => {
+        if (armed && argv[0] === 'rm' && argv[1] === w.lock) {
+          armed = false
+          b = await unlockLauncher(base, w.root, 'lock-s', true)
+          c = (await acquireLock(base, w.lock, fresh)).ok
+        }
+        return base.run(argv, cwd, ms)
+      },
+    }
+    const outA = await unlockLauncher(a, w.root, 'lock-s', true)
+    assert.equal(armed, false, 'the cut point was reached')
+    assert.equal(outA.ok, true, outA.text)
+    assert.equal(b?.ok, false, `B unlocked while A's unlock ran: ${b?.text}`)
+    assert.match(b!.text, /collector\.owner\.unlock/)
+    if (!c) c = (await acquireLock(base, w.lock, fresh)).ok
+    assert.equal(c, true, 'C acquires once A removed the dead holder')
+    const late = await unlockLauncher(base, w.root, 'lock-s', true)
+    assert.equal(late.ok, false, late.text)
+    assert.equal(holderOf(w.lock).token, 'new', 'C\'s lock survives both unlocks')
+    assert.ok(!linked(`${w.lock}.unlock`), 'the unlock lock is released')
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('Sol#1 launcher unlock: a dead unlock holder is never taken over — busy, and how to clear it', async () => {
+  const w = lockDir()
+  try {
+    const base = nodeHost({ log: () => {} })
+    const me = await processId(base)
+    symlinkSync(JSON.stringify({ token: 'old', session: 'lock-s', activation: 'launcher', ...me, pidStart: DEAD_START }), w.lock)
+    symlinkSync(JSON.stringify({ token: 'u', session: 'lock-s', activation: 'unlock', ...me, pidStart: DEAD_START }), `${w.lock}.unlock`)
+    const out = await unlockLauncher(base, w.root, 'lock-s', true)
+    assert.equal(out.ok, false, out.text)
+    assert.match(out.text, /busy: .*collector\.owner\.unlock.*gone.*rm /)
+    assert.equal(holderOf(w.lock).token, 'old', 'nothing removed')
+    assert.equal(holderOf(`${w.lock}.unlock`).token, 'u', 'the dead unlock holder is not taken over')
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('Sol#3 launcher unlock: a readlink error (EACCES) is busy with the errno, never "not held"', async () => {
+  const w = lockDir()
+  try {
+    const base = nodeHost({ log: () => {} })
+    const me = await processId(base)
+    symlinkSync(JSON.stringify({ token: 'old', session: 'lock-s', activation: 'launcher', ...me, pidStart: DEAD_START }), w.lock)
+    const denied: Host = {
+      ...base,
+      run: async (argv, cwd, ms) =>
+        argv[0] === 'readlink' && argv[1] === w.lock ? { exitCode: 1, stdout: '', stderr: '' } : base.run(argv, cwd, ms), // BSD readlink is silent
+      list: async path => {
+        if (path === w.dir) throw Object.assign(new Error(`EACCES: permission denied, scandir '${path}'`), { code: 'EACCES' })
+        return base.list(path)
+      },
+    }
+    const out = await unlockLauncher(denied, w.root, 'lock-s', true)
+    assert.equal(out.ok, false, out.text)
+    assert.doesNotMatch(out.text, /not held/)
+    assert.match(out.text, /busy: .*EACCES/)
+    assert.equal(holderOf(w.lock).token, 'old')
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+/** The scripts dir of this checkout: `lib/` and the `agent-tmux` wrapper beside it. */
+const SCRIPTS = fileURLToPath(new URL('..', import.meta.url))
+
+/**
+ * A copy of the install tree a collector needs (`scripts/lib` and `scripts/agent-tmux`)
+ * under `<root>/<name>`; `collector` replaces `lib/collector.node.ts`. Returns the launcher.
+ */
+function install(w: Live, name: string, opts: { collector?: string; wrapper?: boolean } = {}): string {
+  const scripts = join(w.root, name, 'scripts')
+  cpSync(fileURLToPath(new URL('.', import.meta.url)), join(scripts, 'lib'), { recursive: true, filter: src => !src.includes('/fixtures') })
+  if (opts.wrapper !== false) cpSync(join(SCRIPTS, 'agent-tmux'), join(scripts, 'agent-tmux'))
+  if (opts.collector) {
+    renameSync(join(scripts, 'lib', 'collector.node.ts'), join(scripts, 'lib', 'collector.real.node.ts'))
+    writeFileSync(join(scripts, 'lib', 'collector.node.ts'), opts.collector)
+  }
+  return join(scripts, 'lib', 'launcher.node.ts')
+}
+
+/**
+ * A stand-in collector: publishes a record for this pane, socket and cwd at once
+ * (`STUB_MODE` bends it), writes its pid to `stub.pid`, and exits 0 after 4s. The
+ * launcher's imports come from the real module, renamed beside it.
+ */
+const STUB = `
+export { paneAlive, readCollectorRecord, serverSocket } from './collector.real.node.ts'
+import { execFileSync } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
+import { parseArgs } from 'node:util'
+import { sessionDirOf, v3Of } from './workers.ts'
+// Imported by the launcher, nothing runs; run as the collector, it publishes.
+if (process.argv[1]?.endsWith('collector.node.ts')) {
+  const { values: v } = parseArgs({ options: { session: { type: 'string' }, cwd: { type: 'string' }, pane: { type: 'string' }, socket: { type: 'string' }, nonce: { type: 'string' } } })
+  const dir = sessionDirOf(v3Of(process.env.TMUX_AGENT_DIR), v.session)
+  const run = (cmd, args, env = {}) => execFileSync(cmd, args, { encoding: 'utf8', env: { ...process.env, ...env } }).trim()
+  const rec = {
+    pid: process.pid,
+    pidStart: run('ps', ['-o', 'lstart=', '-p', String(process.pid)], { TZ: 'UTC', LC_ALL: 'C' }),
+    host: run('hostname', []),
+    session: v.session, pane: v.pane, cwd: v.cwd,
+    socket: run('tmux', ['display-message', '-p', '-t', v.pane, '#{socket_path}']),
+    coreVersion: 'stub', token: 'stub', nonce: v.nonce,
+  }
+  const mode = process.env.STUB_MODE
+  if (mode === 'stale-start') rec.pidStart = 'Thu Jan  1 00:00:00 1970'
+  if (mode === 'no-nonce') delete rec.nonce
+  writeFileSync(dir + '/stub.pid', String(process.pid))
+  writeFileSync(dir + '/collector.json', mode === 'malformed' ? '{"pid": ' + process.pid : JSON.stringify(rec))
+  setTimeout(() => process.exit(0), 4000)
+}
+`
+
+test('Sol#2 a malformed or incomplete collector.json is unknown, not absent: busy with the reason, nothing started', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('sol2')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      mkdirSync(dir, { recursive: true })
+      const pane = await hostPane(w.session)
+      for (const text of ['{"pid": 4', '{"pid": 4}']) {
+        writeFileSync(`${dir}/collector.json`, text)
+        assert.match(await busyLaunch(w, pane), /busy: .*collector\.json/)
+        assert.equal(readFileSync(`${dir}/collector.json`, 'utf8'), text, 'left as it was')
+        assert.equal(collectors(w.session).length, 0, 'no second collector')
+      }
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('Sol#2 readiness polling: a malformed record from the started child is an error at once, and the child is stopped', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('sol2p')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      const launcher = install(w, 'stub', { collector: STUB })
+      const pane = await hostPane(w.session)
+      const child = spawnLauncher(w, pane, { launcher, env: { ...w.env, STUB_MODE: 'malformed' } })
+      const t0 = Date.now()
+      await until(() => child.closed, 'the launcher to stop', 20_000)
+      assert.equal(child.exitCode, 1, child.out + child.err)
+      assert.match(child.err, /could not read .*collector\.json/)
+      assert.ok(Date.now() - t0 < 3_500, 'reported before the child exits on its own')
+      const stub = Number(readFileSync(`${dir}/stub.pid`, 'utf8'))
+      await until(() => !alive(stub), 'the child to be stopped', 2_000)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('Sol#4 a first beat that cannot be written blocks readiness: no collector.json, the launch fails', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('sol4')
+      const dir = sessionDirOf(v3Of(w.root), w.session)
+      mkdirSync(`${dir}/act/1.beat`, { recursive: true }) // the beat file of activation 1 cannot be written (EISDIR)
+      const pane = await hostPane(w.session)
+      assert.match(await busyLaunch(w, pane), /exited \(code 1\) before it was ready; collector\.log: .*could not beat.*not ready/s)
+      assert.ok(!hasRecord(w), 'no fake readiness')
+      assert.equal(collectors(w.session).length, 0)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
+test('Sol#5 migrate: a live old launcher that is the maintenance process\'s own parent is busy; nothing moves', { timeout: 60_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mig-'))
+  const session = `sol5-${process.pid}-p`
+  const dir = sessionDirOf(v3Of(root), session)
+  mkdirSync(`${dir}/collector.lock`, { recursive: true })
+  const PARENT = `
+const { execFile } = require('node:child_process')
+execFile(process.execPath, [process.env.L, '--migrate-launcher', process.env.S, '--yes'], { encoding: 'utf8' }, (e, out, err) => {
+  process.stdout.write(JSON.stringify({ code: e ? e.code : 0, out: out + err, parent: process.pid }))
+})`
+  try {
+    const r = await new Promise<{ code: number; out: string; parent: number }>((resolve, reject) =>
+      execFile(
+        process.execPath,
+        ['-e', PARENT, 'launcher.node.ts', '--session', session],
+        { encoding: 'utf8', timeout: 30_000, env: { ...process.env, TMUX_AGENT_DIR: root, L: LAUNCHER, S: session } },
+        (error, stdout) => (error ? reject(error) : resolve(JSON.parse(stdout))),
+      ),
+    )
+    assert.equal(r.code, 1, r.out)
+    assert.match(r.out, new RegExp(`busy: .*pid ${r.parent}\\b`))
+    assert.ok(existsSync(`${dir}/collector.lock`), 'nothing moved')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('Sol#5 migrate: the busy answer names the descendants of a live old launcher', { timeout: 60_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mig-'))
+  const session = `sol5-${process.pid}-d`
+  const dir = sessionDirOf(v3Of(root), session)
+  mkdirSync(`${dir}/collector.lock`, { recursive: true })
+  const pidFile = join(root, 'child.pid')
+  const OLD = `
+const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+require('node:fs').writeFileSync(process.env.CHILD, String(c.pid))
+setInterval(() => {}, 1000)`
+  const old = spawn(process.execPath, ['-e', OLD, 'launcher.node.ts', '--session', session], { stdio: 'ignore', env: { ...process.env, CHILD: pidFile } })
+  let kid = 0
+  try {
+    await until(() => existsSync(pidFile) && readFileSync(pidFile, 'utf8').length > 0, 'the old launcher\'s child')
+    kid = Number(readFileSync(pidFile, 'utf8'))
+    const out = await maintenance(root, ['--migrate-launcher', session, '--yes'])
+    assert.equal(out.code, 1, out.out)
+    assert.match(out.out, new RegExp(`busy: .*pid ${old.pid}\\b`))
+    assert.match(out.out, new RegExp(`pid ${kid}\\b`), 'its child is named too')
+    assert.ok(existsSync(`${dir}/collector.lock`))
+  } finally {
+    old.kill('SIGTERM')
+    if (kid > 0) {
+      try {
+        process.kill(kid, 'SIGTERM')
+      } catch {
+        // already gone
+      }
+    }
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+for (const [mode, what] of [
+  ['stale-start', 'the child\'s pid with another start time (a reused pid\'s stale record)'],
+  ['no-nonce', 'the child\'s pid and start time but not this start\'s nonce'],
+] as const) {
+  test(`Sol#6 readiness: a record with ${what} is not this start's handshake; the child's exit is the error`, { timeout: 60_000 }, () =>
+    exclusive(async () => {
+      let w: Live | undefined
+      try {
+        w = await live(`sol6${mode[0]}`)
+        const launcher = install(w, 'stub', { collector: STUB })
+        const pane = await hostPane(w.session)
+        const child = spawnLauncher(w, pane, { launcher, env: { ...w.env, STUB_MODE: mode } })
+        await until(() => child.closed, 'the launcher to stop', 20_000)
+        assert.equal(child.exitCode, 1, child.out + child.err)
+        assert.doesNotMatch(child.out, /started|reused/)
+        assert.match(child.err, /the collector exited \(code 0\) before it was ready/)
+      } finally {
+        await cleanup(w)
+      }
+    }),
+  )
+}
+
+test('Sol#14 a missing or unreadable agent-tmux wrapper is not a ready collector: the error names it, no record', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('sol14')
+      const pane = await hostPane(w.session)
+      const missing = install(w, 'nowrap', { wrapper: false })
+      const child = spawnLauncher(w, pane, { launcher: missing })
+      await until(() => child.closed, 'the launcher to stop', 20_000)
+      assert.equal(child.exitCode, 1, child.out + child.err)
+      assert.match(child.err, /before it was ready; collector\.log: .*not ready.*nowrap\/scripts\/agent-tmux.*ENOENT/s)
+      assert.ok(!hasRecord(w))
+      const locked = install(w, 'locked')
+      chmodSync(join(w.root, 'locked', 'scripts', 'agent-tmux'), 0o000)
+      const second = spawnLauncher(w, pane, { launcher: locked })
+      await until(() => second.closed, 'the launcher to stop', 20_000)
+      assert.equal(second.exitCode, 1, second.out + second.err)
+      assert.match(second.err, /before it was ready; collector\.log: .*not ready.*locked\/scripts\/agent-tmux.*EACCES/s)
+      assert.ok(!hasRecord(w))
       assert.equal(collectors(w.session).length, 0)
     } finally {
       await cleanup(w)

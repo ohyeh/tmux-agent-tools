@@ -8,7 +8,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { sessionKey } from './ledger.ts'
-import { paneAlive, pasteInto } from './collector.node.ts'
+import { paneAlive, pasteInto, readCollectorRecord } from './collector.node.ts'
 
 const RACE = new URL('./workers.race.node.ts', import.meta.url).pathname
 const COLLECTOR = new URL('./collector.node.ts', import.meta.url).pathname
@@ -219,7 +219,10 @@ test('S1 (b): three activations past the guard all submit; the tuple (A, name, 1
   assert.equal(notices(w).length, 3, 'acked: no further report')
 })
 
-test('S1 (c): a re-report after a mid-delivery crash is the same notice from a new activation', async () => {
+// S1 (c) asks for one delivery_id per (owner, name, seq) on every re-report. The paste
+// channel carries no id yet (R7 / S4), so this test claims only what holds today: the
+// re-report is byte-identical text from a new activation, and the tuple is acked once.
+test('S1 (c) today, without a delivery_id: a re-report after a mid-delivery crash repeats the notice text from a new activation', async () => {
   const w = world('A')
   assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
   await pass(w, 'A')
@@ -228,6 +231,8 @@ test('S1 (c): a re-report after a mid-delivery crash is the same notice from a n
   assert.notEqual(acts[0], acts[1], 'two activations, one tuple')
   assert.deepEqual(doneDirs(w), ['done'])
 })
+
+test.todo('S1(c) delivery_id per (owner,name,seq) — R7/S4')
 
 test('AT_LEAST_ONCE_BOUND_PROBE: two ack failures, then the third attempt delivers the same notice and acks once', async () => {
   const w = world('A')
@@ -378,4 +383,18 @@ test('CLI collector and another session on one root: a dead owner\'s finished ep
     await srv.tmux(['-S', srv.sock, 'kill-server'])
     rmSync(srv.dir, { recursive: true, force: true })
   }
+})
+
+test('Sol#2 readCollectorRecord: only ENOENT is absent; bad JSON, an incomplete record or a read error throws with the path', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'crec-'))
+  const path = `${dir}/collector.json`
+  assert.equal(await readCollectorRecord(path), undefined, 'ENOENT')
+  for (const text of ['{"pid": 4', '{"pid": 4}', 'null']) {
+    writeFileSync(path, text)
+    await assert.rejects(readCollectorRecord(path), new RegExp(`${path}`))
+  }
+  rmSync(path)
+  mkdirSync(path)
+  await assert.rejects(readCollectorRecord(path), /EISDIR/)
+  rmSync(dir, { recursive: true, force: true })
 })

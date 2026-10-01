@@ -16,10 +16,12 @@ import {
   claim as claimEpisode,
   currentOwner,
   hasMark,
+  maintainLock,
   mark,
   mkdirExclusive,
   numericChildren,
   openEpisode,
+  probeHolder,
   publishWorker,
   readDescriptor,
   readHolder,
@@ -2775,9 +2777,14 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
   }
   // State before beat: a beat a reader sees always has its state beside it (C-health).
   await writeActState(host, gate)
-  await beat(host, dir, gate.activation, await host.now()).catch((error: unknown) => {
+  // A beat that is not written is not a beat: peers see this session go non-live, so
+  // this tick does not collect, and a collector's first beat fails its readiness.
+  try {
+    await beat(host, dir, gate.activation, await host.now())
+  } catch (error) {
     host.log(`tmux-agent: could not beat: ${String(error)}`)
-  })
+    return false
+  }
   return true
 }
 
@@ -2863,9 +2870,46 @@ export async function unlockWorker(host: Host, name: string, word?: string): Pro
   if (!root) return { ok: false, text: 'no state root' }
   const v3 = v3Of(root)
   const lock = `${v3}/${name}/.action`
-  const h = await readHolder(host, lock)
-  if (!h) return { ok: true, text: `"${name}" is not locked` }
-  if (h === 'unreadable') return { ok: false, text: `"${name}": the lock holder cannot be read; not removing it` }
+  // Absent or unreadable: nothing is removed, so it is answered outside the section.
+  const pre = await probeHolder(host, lock)
+  if (!('holder' in pre)) return unlockHeld(host, v3, name, lock, word, pre)
+  const self = await processId(host)
+  if (!(self.pid > 0 && self.pidStart && self.host)) return { ok: false, text: `not unlocking "${name}": could not read this process id (ps)` }
+  // Read, check and remove inside the lock's maintenance section (ledger.ts maintainLock).
+  const m = await maintainLock(host, lock, { token: randomBase36(12), session: host.owner() ?? '', activation: 'unlock', ...self }, async () =>
+    unlockHeld(host, v3, name, lock, word, await probeHolder(host, lock)),
+  )
+  return m.ok ? m.value : { ok: false, text: `"${name}": ${await unlockBusyText(host, m)}` }
+}
+
+/**
+ * `maintainLock` refused: another unlock holds `<lock>.unlock`, or it could not be read.
+ * Never taken over; the operator removes a dead one by hand.
+ */
+export async function unlockBusyText(host: Host, m: { busy: Holder | 'unreadable' | 'unknown'; path: string }): Promise<string> {
+  const h = m.busy
+  let who: string
+  if (typeof h === 'object') {
+    const alive = await holderProvablyAlive(host, h)
+    who = `pid ${h.pid || '?'} on ${h.host || '?'}: ${alive === true ? 'still running' : alive === false ? 'gone' : 'not provably alive or dead'}`
+  } else who = h === 'unreadable' ? 'its holder cannot be read' : 'its state is unknown (see the log)'
+  return (
+    `busy: another unlock holds ${m.path} (${who}). It is never taken over. ` +
+    `If no unlock runs, remove it by hand (rm '${m.path.replace(/'/g, `'\\''`)}'), then unlock again`
+  )
+}
+
+async function unlockHeld(
+  host: Host,
+  v3: string,
+  name: string,
+  lock: string,
+  word: string | undefined,
+  p: Awaited<ReturnType<typeof probeHolder>>,
+): Promise<Outcome> {
+  if ('absent' in p) return { ok: true, text: `"${name}" is not locked` }
+  if ('unreadable' in p) return { ok: false, text: `"${name}" is busy: ${p.unreadable}; not removing it` }
+  const h = p.holder
   const who = `session ${h.session || '?'} pid ${h.pid || '?'} on ${h.host || '?'}`
   if (word !== UNLOCK_WORD) {
     return {

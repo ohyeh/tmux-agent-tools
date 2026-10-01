@@ -5,7 +5,8 @@
 # read back with `capture-pane`. Checks: header key hints; j/k selection; Enter
 # detail with the whole summary; a CJK summary never wraps (no line past the
 # width, `capture-pane -J`); r refresh; resize to 80x24 and 40x10; t tell reaches
-# the worker and its result shows; x (twice) stops a worker; a viewer (no
+# the worker and its result shows; a real paste (`paste-buffer -p`) of x, q, qx
+# is text, not keys; x (twice) stops a worker; a viewer (no
 # --session) pressing x - U t c + n changes nothing on disk; q exits and the
 # pane's stty is unchanged. Bounded polls only; the whole smoke has a deadline.
 set -euo pipefail
@@ -214,6 +215,24 @@ keys "$P" Enter
 check "the tell was sent" wait_for "$P" "tell $B — ok: sent to" 75
 check "the tell's result reaches the row" wait_for "$P" 'E2E-TELL-DONE' 150
 check "episode 2 result on disk" sh -c "grep -q E2E-TELL-DONE '$TMUX_AGENT_DIR'/.v3/'$B'/episodes/2/result.json"
+
+echo "case: a real paste is text, not keys (bracketed paste, Sol#7)"
+# paste-buffer -p brackets the paste only when the TUI turned on mode 2004.
+paste() { print -rn -- "$2" > "$WORK/paste.txt"; T load-buffer -b e2e "$WORK/paste.txt"; T paste-buffer -p -b e2e -t "$1"; }
+for _ in {1..4}; do screen "$P" | grep -q "› $A" && break; keys "$P" j; /bin/sleep 0.2; done
+check "A is selected for the paste" wait_for "$P" "› $A" 25
+paste "$P" x
+/bin/sleep 1
+check "a pasted x does not arm the stop" sh -c "! tmux capture-pane -p -t '$P' | grep -q 'press again'"
+paste "$P" q
+/bin/sleep 1
+check "a pasted q does not quit" sh -c "! tmux capture-pane -p -t '$P' | grep -q 'TUI_EXIT'"
+keys "$P" n
+check "the resume prompt opens" wait_for "$P" '<session-id>' 25
+paste "$P" qx
+check "a pasted qx is prompt text" wait_for "$P" ': qx█' 25
+keys "$P" Escape
+check "Escape closes the prompt" sh -c "for i in \$(seq 1 25); do tmux capture-pane -p -t '$P' | grep -q '<session-id>' || exit 0; sleep 0.2; done; exit 1"
 
 echo "case: x twice stops a worker (owner)"
 for _ in {1..4}; do screen "$P" | grep -q "› $A" && break; keys "$P" j; /bin/sleep 0.2; done

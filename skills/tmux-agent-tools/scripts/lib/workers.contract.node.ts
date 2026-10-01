@@ -1322,3 +1322,79 @@ test('gap B6: a result.json written for an episode after stop cancelled it is no
   assert.equal(w.woken.length, 1, 'subsequent pass delivers nothing more')
 })
 
+
+// ── Sol r6 review (sol-review-r6.json items 1, 3, 4) ──
+
+const DEAD_START = 'Thu Jan  1 00:00:00 1970'
+
+test('Sol#1 worker unlock: A and B unlock one dead holder, C takes the lock at A\'s rm cut point — C\'s lock survives', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const lock = `${r.stateDir}/.action`
+  const me = await processId(w.host)
+  symlinkSync(JSON.stringify({ token: 'old', activation: '', session: 'gone', host: me.host, pid: 999_999, pidStart: DEAD_START }), lock)
+  let armed = true
+  let b: { ok: boolean; text: string } | undefined
+  let c = false
+  const a: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) => {
+      if (armed && argv[0] === 'rm' && argv[1] === lock) {
+        armed = false
+        b = await unlockWorker(w.host, r.name, 'confirm')
+        c = (await takeLock(w.host, r.stateDir, 'new')).ok
+      }
+      return w.host.run(argv, cwd, ms)
+    },
+  }
+  const outA = await unlockWorker(a, r.name, 'confirm')
+  assert.equal(armed, false, 'the cut point was reached')
+  assert.ok(outA.ok, outA.text)
+  assert.equal(b?.ok, false, `B unlocked while A's unlock ran: ${b?.text}`)
+  assert.match(b!.text, /\.action\.unlock/)
+  if (!c) c = (await takeLock(w.host, r.stateDir, 'new')).ok
+  assert.ok(c, 'C takes the lock once A removed the dead holder')
+  const late = await unlockWorker(w.host, r.name, 'confirm')
+  assert.equal(late.ok, false, late.text)
+  assert.equal(JSON.parse(readlinkSync(lock)).token, 'new', 'C\'s lock survives both unlocks')
+})
+
+test('Sol#3 worker unlock: a readlink error (EACCES) is busy with the errno, never "not locked"', async () => {
+  const w = world()
+  const r = await assigned(w)
+  const lock = `${r.stateDir}/.action`
+  const me = await processId(w.host)
+  symlinkSync(JSON.stringify({ token: 'old', activation: '', session: 'gone', host: me.host, pid: 999_999, pidStart: DEAD_START }), lock)
+  const denied: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) =>
+      argv[0] === 'readlink' && argv[1] === lock ? { exitCode: 1, stdout: '', stderr: '' } : w.host.run(argv, cwd, ms), // BSD readlink is silent
+    list: async path => {
+      if (path === r.stateDir) throw Object.assign(new Error(`EACCES: permission denied, scandir '${path}'`), { code: 'EACCES' })
+      return w.host.list(path)
+    },
+  }
+  for (const word of [undefined, 'confirm']) {
+    const out = await unlockWorker(denied, r.name, word)
+    assert.equal(out.ok, false, out.text)
+    assert.doesNotMatch(out.text, /not locked/)
+    assert.match(out.text, /EACCES/)
+  }
+  assert.equal(JSON.parse(readlinkSync(lock)).token, 'old')
+})
+
+test('Sol#4 heartbeat: a beat that cannot be written is not a successful beat', async () => {
+  const w = world()
+  const failing: Host = {
+    ...w.host,
+    write: async (path, text) => {
+      if (path.endsWith('.beat')) throw Object.assign(new Error(`EACCES: permission denied, open '${path}'`), { code: 'EACCES' })
+      return w.host.write(path, text)
+    },
+  }
+  const gate = newGate()
+  assert.equal(await heartbeat(failing, gate), false, 'registered, but the first beat failed')
+  assert.ok(w.logs.some(l => /could not beat: .*EACCES/.test(l)), w.logs.join('\n'))
+  assert.equal(await heartbeat(failing, gate), false, 'a later failed beat is not success either')
+  assert.equal(await heartbeat(w.host, gate), true, 'a beat that lands is')
+})

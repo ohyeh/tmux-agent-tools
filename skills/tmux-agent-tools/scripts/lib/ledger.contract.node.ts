@@ -272,3 +272,41 @@ test('finding N4 / M6: recoverEpisodes returns undefined when checking aborted m
   const res = await recoverEpisodes(errorHost, w)
   assert.equal(res, undefined, 'recovery must return undefined when aborted check throws')
 })
+
+test('Sol#3 readHolder: absent only on ENOENT; a lock in an unsearchable dir (EACCES) is unreadable, and the probe keeps the errno', async () => {
+  const h = host()
+  const dir = join(fresh(), 'd')
+  mkdirSync(dir)
+  const lock = `${dir}/lock`
+  assert.equal(await (await import('./ledger.ts')).readHolder(h, lock), undefined, 'ENOENT is absent')
+  assert.equal((await acquireLock(h, lock, holder('A'))).ok, true)
+  chmodSync(dir, 0o000)
+  try {
+    const ledger = await import('./ledger.ts')
+    assert.equal(await ledger.readHolder(h, lock), 'unreadable')
+    const probe = await ledger.probeHolder(h, lock)
+    assert.ok('unreadable' in probe, JSON.stringify(probe))
+    assert.match(probe.unreadable, /EACCES/)
+    assert.equal(await releaseLock(h, lock, 'A'), false, 'not released while unreadable')
+  } finally {
+    chmodSync(dir, 0o755)
+  }
+  assert.equal(await releaseLock(h, lock, 'A'), true)
+})
+
+test('readHolder: the same unreadable answer is logged once, not on every reconcile pass', async () => {
+  const lines: string[] = []
+  const h = nodeHost({ owner: 'me', log: (t: string) => lines.push(t) })
+  const dir = join(fresh(), 'd')
+  mkdirSync(dir)
+  const lock = `${dir}/lock`
+  assert.equal((await acquireLock(h, lock, holder('A'))).ok, true)
+  chmodSync(dir, 0o000)
+  try {
+    const { readHolder } = await import('./ledger.ts')
+    for (let i = 0; i < 3; i++) assert.equal(await readHolder(h, lock), 'unreadable')
+  } finally {
+    chmodSync(dir, 0o755)
+  }
+  assert.equal(lines.filter(l => l.includes(lock)).length, 1, lines.join('\n'))
+})

@@ -33,11 +33,16 @@ Maintenance of the launcher (lib/launcher.node.ts); no TTY needed. Without
 --yes each prints what it would do and changes nothing:
   tmux-agent-tui --unlock-launcher <session> [--yes]
                    Remove the session's launcher lock (collector.owner), only
-                   when its holder process is provably gone.
+                   when its holder process is provably gone. One unlock runs at
+                   a time (collector.owner.unlock); a crashed one stays busy
+                   and is removed by hand.
   tmux-agent-tui --migrate-launcher <session> [--yes]
                    Move the old launcher's collector.lock / collector.pid /
                    collector.log into legacy-<time>/, only when no launcher or
-                   collector process for that session runs.
+                   collector process for that session runs (this command's own
+                   parent included), nor a child of one. The check is one ps
+                   snapshot and the old launcher takes no lock: --yes confirms
+                   that no old launcher or collector will start meanwhile.
 
 Needs Node >= 22.18 (set NODE=/path/to/node to pick one) and a terminal:
 stdin and stdout must be a TTY (for a JSON snapshot, use tmux-agent-dashboard).
