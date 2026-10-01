@@ -203,17 +203,20 @@ async function startCollector(host: Host, dir: string, want: Want, explicitSocke
     env.TMUX_AGENT_TMUX_SOCKET = explicitSocket
   }
   const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', log.fd, log.fd], env })
+  // Latched: an exit seen while a check below is awaited still stops readiness.
+  let endedWhy: string | undefined
   const ended = new Promise<string>(resolve => {
-    child.once('error', error => resolve(`could not start: ${error.message}`))
-    child.once('exit', (code, signal) => resolve(`exited (${signal ?? `code ${code}`}) before it was ready`))
+    const end = (why: string) => resolve((endedWhy ??= why))
+    child.once('error', error => end(`could not start: ${error.message}`))
+    child.once('exit', (code, signal) => end(`exited (${signal ?? `code ${code}`}) before it was ready`))
   })
   child.unref()
   await log.close()
   const deadline = Date.now() + READY_MS
   try {
     for (;;) {
-      const why = await Promise.race([ended, sleep(100).then(() => undefined)])
-      if (why) throw new Error(`the collector ${why}; collector.log: ${await logTail(logPath)}`)
+      await Promise.race([ended, sleep(100)])
+      if (endedWhy) throw new Error(`the collector ${endedWhy}; collector.log: ${await logTail(logPath)}`)
       // Only a confirmed-absent record is waited for; any other read error is the answer.
       let rec: CollectorRecord | undefined
       try {
@@ -223,6 +226,8 @@ async function startCollector(host: Host, dir: string, want: Want, explicitSocke
         throw new Error(`could not read the record of collector ${child.pid ?? '?'}: ${(error as Error).message}; stopped it. collector.log: ${await logTail(logPath)}`)
       }
       if (child.pid && rec?.nonce === nonce && rec.pid === child.pid && sameCollector(rec, want) && (await holderProvablyAlive(host, rec)) === true) {
+        // Checked after the awaits, synchronously: a child that ended meanwhile is not ready.
+        if (endedWhy) throw new Error(`the collector ${endedWhy}; collector.log: ${await logTail(logPath)}`)
         return child.pid
       }
       if (Date.now() > deadline) {

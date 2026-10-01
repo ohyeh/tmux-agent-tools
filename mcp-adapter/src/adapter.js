@@ -1,6 +1,3 @@
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 
 function resolveCoreModule(moduleRelPath) {
@@ -19,13 +16,14 @@ const {
   TERMINAL,
   ackFinished,
   assignWorker,
+  deliveryIdOf,
   episodeMatches,
   heartbeat,
   missingSections,
   newGate,
   observationOf,
-  payloadOf,
   peekWorker,
+  processId,
   rootOf,
   stillOurs,
   stopWorker,
@@ -50,81 +48,52 @@ const NO_EXTERNAL_SIDE_EFFECTS_GUARD = "Do not create external side effects unle
 
 const gates = new Map();
 const beatTimers = new Map();
-let cachedSessionId = null;
-let deliveryCount = 0;
+// Episode dir → the delivery in flight in this process; held until its ack is settled.
 const inFlightDeliveries = new Map();
+// JSON-RPC request id → settle(sent) of a `completed` wait response (plan §1c S4).
+const pendingAcks = new Map();
 
 function gateFor(sessionId) {
   let gate = gates.get(sessionId);
   if (!gate) {
     gate = newGate();
+    // One delivery channel per session (plan §1c S3); also the `act/<n>.state` channel (C-health).
+    gate.channel = "mcp";
     gates.set(sessionId, gate);
   }
   return gate;
 }
 
-function deliveries() {
-  return deliveryCount;
-}
+const log = (text) => process.stderr.write(`[mcp-adapter] ${text}\n`);
+let ownId;
 
-function getStateRoot() {
-  const dir = process.env.TMUX_AGENT_DIR || path.join(os.homedir(), ".local/state/tmux-agent-tools");
-  return path.resolve(dir);
-}
-
-function readPersistedSessionId(idFile) {
-  try {
-    return fs.readFileSync(idFile, "utf8").trim();
-  } catch (err) {
-    // ENOTDIR: `.v3` is a file. Fall through so mkdir reports that EEXIST.
-    if (err && (err.code === "ENOENT" || err.code === "ENOTDIR")) return "";
-    throw err;
-  }
-}
-
-function getStableSessionId(root) {
-  if (process.env.TMUX_AGENT_SESSION) {
-    return process.env.TMUX_AGENT_SESSION;
-  }
-  if (cachedSessionId) {
-    return cachedSessionId;
-  }
-  const v3 = v3Of(root);
-  const idFile = path.join(v3, ".mcp-session-id");
-  const existing = readPersistedSessionId(idFile);
-  if (existing) {
-    cachedSessionId = existing;
-    return existing;
-  }
-  fs.mkdirSync(v3, { recursive: true });
-  const newId = `mcp-session-${crypto.randomUUID()}`;
-  try {
-    fs.writeFileSync(idFile, `${newId}\n`, { encoding: "utf8", flag: "wx" });
-  } catch (err) {
-    if (err && err.code === "EEXIST") {
-      const winner = readPersistedSessionId(idFile);
-      if (winner) {
-        cachedSessionId = winner;
-        return winner;
+/**
+ * This server's session (plan D-mcp-id, §1b C-mcp-id): `TMUX_AGENT_SESSION`, else
+ * `mcp-<hostname>-<pid>-<pidStart>` of this process (pidStart = epoch seconds). Hosts
+ * start one stdio server per conversation, so one process is one session; a restart
+ * is a new session. No id → the tool call fails; no owner is minted.
+ */
+function sessionId() {
+  if (process.env.TMUX_AGENT_SESSION) return Promise.resolve(process.env.TMUX_AGENT_SESSION);
+  if (!ownId) {
+    ownId = processId(nodeHost({ log })).then((me) => {
+      const start = Date.parse(`${me.pidStart} UTC`) / 1000;
+      if (!(me.pid > 0) || !me.host || !Number.isFinite(start)) {
+        const err = new Error("could not read this process's pid, host and start time (ps); no session id");
+        err.code = "NO_SESSION_ID";
+        throw err;
       }
-    }
-    throw err;
+      return `mcp-${me.host}-${me.pid}-${start}`;
+    });
+    ownId.catch(() => {
+      ownId = undefined;
+    });
   }
-  cachedSessionId = newId;
-  return newId;
+  return ownId;
 }
 
-function getHost(cwd) {
-  const root = getStateRoot();
-  const sessionId = getStableSessionId(root);
-  return nodeHost({
-    owner: sessionId,
-    cwd: cwd || process.cwd(),
-    log: (text) => process.stderr.write(`[mcp-adapter] ${text}\n`),
-    // The MCP tool result is this host's delivery channel (§8). Accepting is what
-    // lets ack close the episode; the default drop would leave it open for a peer (§3).
-    submit: async () => ({}),
-  });
+async function getHost(cwd) {
+  return nodeHost({ owner: await sessionId(), cwd: cwd || process.cwd(), log });
 }
 
 async function ensureAdapterLive(host) {
@@ -304,7 +273,7 @@ async function spawnTmuxAgent(request) {
     throw new Error("spawn_tmux_agent requires cli, repoPath, and task");
   }
 
-  const host = getHost(repoPath);
+  const host = await getHost(repoPath);
   await ensureAdapterLive(host);
   const baseName = safeBaseName(cli, request.name);
   const brief = formatBrief(task);
@@ -325,6 +294,8 @@ async function spawnTmuxAgent(request) {
   return {
     agent_id: name,
     name,
+    // The launch episode; `wait`/`read` take it to stay on this episode (C-mcp-ack).
+    seq: 1,
     wrapper: `agent-tmux ${cli}`,
     cwd: repoPath,
     result_path: resultPath,
@@ -332,7 +303,7 @@ async function spawnTmuxAgent(request) {
 }
 
 async function sendTmuxAgent(agentId, message) {
-  const host = getHost();
+  const host = await getHost();
   await ensureAdapterLive(host);
   const { rec, name, workerDir } = await getWorker(host, agentId);
 
@@ -346,23 +317,26 @@ async function sendTmuxAgent(agentId, message) {
   };
 
   const outcome = await tellWorker(host, dispatch, String(message || ""));
+  // The episode this tell opened, also when the send may have arrived (C-mcp-ack).
+  const seq = outcome.seq === undefined ? {} : { seq: outcome.seq };
   if (!outcome.ok) {
     const json = parseJsonLoose(outcome.text);
     const blocked = classifyBlocked(json);
-    if (blocked) return blocked;
+    if (blocked) return { ...blocked, ...seq };
     if (outcome.text.includes("login_prompt") || outcome.text.includes("permission_prompt")) {
       const match = outcome.text.match(/(login_prompt|permission_prompt)/);
-      return { status: "blocked", blocked_reason: match ? match[1] : "blocked", diagnostic: outcome.text };
+      return { status: "blocked", blocked_reason: match ? match[1] : "blocked", diagnostic: outcome.text, ...seq };
     }
     if (outcome.text.includes("busy") || outcome.text.includes("held by")) {
-      return { status: "blocked", blocked_reason: "busy", diagnostic: outcome.text };
+      return { status: "blocked", blocked_reason: "busy", diagnostic: outcome.text, ...seq };
     }
-    return { status: "unconfirmed", reason: outcome.text };
+    return { status: "unconfirmed", reason: outcome.text, ...seq };
   }
 
   return {
     status: "submitted",
     completion_source: "result_json",
+    ...seq,
   };
 }
 
@@ -373,24 +347,100 @@ async function closedAcks(host, episodeDir) {
   return entries.filter((e) => e.kind === "dir").map((e) => e.name);
 }
 
-async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body) {
-  if (inFlightDeliveries.has(episodeDir)) {
-    await inFlightDeliveries.get(episodeDir);
-    if ((await closedAcks(host, episodeDir)).some((name) => CLOSED_ACKS.includes(name))) {
-      return { status: "already_acked" };
-    }
-  }
+/**
+ * Deliver one finished episode as this wait's response (plan D-mcp-ack, §1c S4).
+ * Delivered = the response bytes were flushed to stdout (the transport's write
+ * callback), not "the client processed them". So the ack runs after that flush:
+ * `extra` (the tool call's request) parks the ack under its request id until the
+ * transport settles it; cancel, a send error, an error response or a transport close
+ * settle it unsent (no ack). No `extra` = a direct caller that IS the channel: ack now.
+ * The episode stays in flight in this process until the ack is settled, so an
+ * overlapping wait waits for it and then sees the closing ack. At-least-once: a crash
+ * between flush and ack re-reports the same `delivery_id` on a later wait.
+ */
+async function deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, extra) {
+  const deliveryId = deliveryIdOf({ name: rec.name, seq: targetSeq, owner: (desc && desc.owner) || rec.owner });
+  while (inFlightDeliveries.has(episodeDir)) await inFlightDeliveries.get(episodeDir);
   let notifyDone;
   const inFlight = new Promise((resolve) => {
     notifyDone = resolve;
   });
   inFlightDeliveries.set(episodeDir, inFlight);
-  try {
-    return await doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body);
-  } finally {
+  const release = () => {
     inFlightDeliveries.delete(episodeDir);
     notifyDone();
+  };
+  let out;
+  try {
+    out = await doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body);
+  } catch (err) {
+    release();
+    throw err;
   }
+  if (!out.finished) {
+    release();
+    return out.status === "already_acked" ? { ...out, delivery_id: deliveryId } : out;
+  }
+  let acked;
+  const settle = async (sent) => {
+    try {
+      if (!sent) {
+        host.log(`${deliveryId}: response not sent (cancelled, send error or closed); not acked, a later wait re-reports it`);
+        return;
+      }
+      acked = await ackFinished(host, v3, out.finished);
+      if (acked === "unknown") host.log(`${deliveryId}: ack failed after the response was sent; a later wait re-reports the same delivery_id`);
+    } catch (err) {
+      host.log(`${deliveryId}: ack failed: ${err}`);
+    } finally {
+      release();
+    }
+  };
+  const completed = { status: "completed", delivery_id: deliveryId, seq: targetSeq, body };
+  if (extra && extra.requestId !== undefined) {
+    holdAck(extra, settle);
+    return completed;
+  }
+  await settle(true);
+  if (acked === "won") return completed;
+  if (acked === "lost") return { status: "already_acked", delivery_id: deliveryId };
+  return { status: "failed", reason: "ack_failed", detail: `${rec.name}#${targetSeq}`, delivery_id: deliveryId };
+}
+
+/** Park `settle` until the transport flushes (or fails) the response to this request. */
+function holdAck(extra, settle) {
+  // Cancelled while the handler ran: the SDK sends nothing and the abort event is past.
+  if (extra.signal?.aborted) {
+    void settle(false);
+    return;
+  }
+  const entry = { settle };
+  pendingAcks.set(extra.requestId, entry);
+  // Cancelled before the send began: the SDK sends nothing (protocol.js), so release here.
+  extra.signal?.addEventListener("abort", () => {
+    if (pendingAcks.get(extra.requestId) !== entry) return;
+    pendingAcks.delete(extra.requestId);
+    void settle(false);
+  }, { once: true });
+}
+
+/**
+ * The transport's half of S4: the response to `id` is being written, and `written`
+ * resolves true once its bytes are flushed as a success. Taken out of the map first,
+ * so a cancel that lands mid-write cannot settle it twice.
+ */
+async function settleWhenWritten(id, written) {
+  const entry = pendingAcks.get(id);
+  if (!entry) return;
+  pendingAcks.delete(id);
+  await entry.settle(await written);
+}
+
+/** Transport closed: nothing parked can be sent any more. */
+async function settleAllUnsent() {
+  const all = [...pendingAcks.values()];
+  pendingAcks.clear();
+  await Promise.all(all.map((e) => e.settle(false)));
 }
 
 async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body) {
@@ -404,7 +454,8 @@ async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resu
   const me = host.owner();
   const gate = me ? gateFor(me) : undefined;
   if (!me || !gate || gate.activation === undefined) {
-    return { status: "failed", reason: "not_live", detail: "no session activation; refusing to deliver (§3)" };
+    const why = (gate && gate.paused) || "no session activation; refusing to deliver (§3)";
+    return { status: "failed", reason: "not_live", detail: why };
   }
   const gen0 = (desc && desc.owner) || rec.owner;
   let cur = await currentOwner(host, episodeDir, gen0);
@@ -448,41 +499,29 @@ async function doDeliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resu
   if (ours.length !== 1) {
     return { status: "failed", reason: "not_owner", detail: "episode owner changed before delivery (§3.3)" };
   }
-  let answer;
-  try {
-    answer = await host.submit(payloadOf(ours).text);
-  } catch (err) {
-    host.log(`submit failed: ${err}`);
-    return { status: "failed", reason: "delivery_refused", detail: String(err) };
-  }
-  if (answer && answer.drop) {
-    host.log(`submit refused: ${answer.drop}`);
-    return { status: "failed", reason: "delivery_refused", detail: answer.drop };
-  }
-  const ackResult = await ackFinished(host, v3, ours[0]);
-  if (ackResult === "won") {
-    deliveryCount += 1;
-    return { status: "completed", body };
-  }
-  if (ackResult === "lost") {
-    return { status: "already_acked" };
-  }
-  host.log(`ackFinished failed for ${rec.name}#${targetSeq}`);
-  return { status: "failed", reason: "ack_failed", detail: `${rec.name}#${targetSeq}` };
+  return { finished: ours[0] };
 }
 
-async function waitTmuxAgent(agentId, timeoutSec = 600) {
-  const host = getHost();
-  await ensureAdapterLive(host);
-  const { rec, name, workerDir, v3 } = await getWorker(host, agentId);
-
-  const seqs = await numericChildren(host, `${workerDir}/episodes`);
-  if (seqs == null) {
-    const err = new Error(`IO error reading episodes for agent_id: ${agentId}`);
-    err.code = "IO_ERROR";
+/**
+ * The episode a wait/read is about, fixed once at call time (D-mcp-ack): `seq` when
+ * given (it must name an episode with a descriptor), else the max seq now. Its
+ * resultPath comes from the immutable descriptor.
+ */
+async function episodeOf(host, workerDir, agentId, seq) {
+  let targetSeq = seq;
+  if (targetSeq === undefined) {
+    const seqs = await numericChildren(host, `${workerDir}/episodes`);
+    if (seqs == null) {
+      const err = new Error(`IO error reading episodes for agent_id: ${agentId}`);
+      err.code = "IO_ERROR";
+      throw err;
+    }
+    targetSeq = seqs.length ? Math.max(...seqs) : 1;
+  } else if (!Number.isInteger(targetSeq) || targetSeq < 1) {
+    const err = new Error(`seq must be a positive integer, got ${JSON.stringify(seq)}`);
+    err.code = "INVALID_SEQ";
     throw err;
   }
-  const targetSeq = seqs.length ? Math.max(...seqs) : 1;
   const episodeDir = `${workerDir}/episodes/${targetSeq}`;
   const desc = await readDescriptor(host, episodeDir);
   if (desc === "unknown") {
@@ -490,7 +529,21 @@ async function waitTmuxAgent(agentId, timeoutSec = 600) {
     err.code = "IO_ERROR";
     throw err;
   }
+  if (seq !== undefined && !desc) {
+    const err = new Error(`agent_id ${agentId} has no episode ${seq}`);
+    err.code = "INVALID_SEQ";
+    throw err;
+  }
   const resultPath = (desc && typeof desc === "object" && desc.resultPath) || `${workerDir}/result.json`;
+  return { targetSeq, episodeDir, desc, resultPath };
+}
+
+/** `opts.seq`: the episode to wait on (default: the max now). `opts.extra`: the MCP request (see deliverEpisode). */
+async function waitTmuxAgent(agentId, timeoutSec = 600, opts = {}) {
+  const host = await getHost();
+  await ensureAdapterLive(host);
+  const { rec, name, workerDir, v3 } = await getWorker(host, agentId);
+  const { targetSeq, episodeDir, desc, resultPath } = await episodeOf(host, workerDir, agentId, opts.seq);
 
   const deadline = Date.now() + Math.max(0, Number(timeoutSec)) * 1000;
 
@@ -540,7 +593,7 @@ async function waitTmuxAgent(agentId, timeoutSec = 600) {
           } else if (!episodeMatches(body.episode, targetSeq)) {
             // Episode does not match; wait until done or deadline
           } else {
-            return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body);
+            return await deliverEpisode(host, v3, rec, desc, targetSeq, episodeDir, resultPath, text, body, opts.extra);
           }
         }
       }
@@ -588,25 +641,11 @@ async function waitTmuxAgent(agentId, timeoutSec = 600) {
   return { status: "timed_out", reason: "timeout" };
 }
 
-async function readTmuxAgent(agentId) {
-  const host = getHost();
+async function readTmuxAgent(agentId, seq) {
+  const host = await getHost();
   await ensureAdapterLive(host);
   const { rec, name, workerDir } = await getWorker(host, agentId);
-
-  const seqs = await numericChildren(host, `${workerDir}/episodes`);
-  if (seqs == null) {
-    const err = new Error(`IO error reading episodes for agent_id: ${agentId}`);
-    err.code = "IO_ERROR";
-    throw err;
-  }
-  const targetSeq = seqs.length ? Math.max(...seqs) : 1;
-  const desc = await readDescriptor(host, `${workerDir}/episodes/${targetSeq}`);
-  if (desc === "unknown") {
-    const err = new Error(`IO error reading descriptor for agent_id: ${agentId}`);
-    err.code = "IO_ERROR";
-    throw err;
-  }
-  const resultPath = (desc && typeof desc === "object" && desc.resultPath) || `${workerDir}/result.json`;
+  const { resultPath } = await episodeOf(host, workerDir, agentId, seq);
 
   if (await existsOrThrow(host, resultPath)) {
     let text;
@@ -674,7 +713,7 @@ async function readTmuxAgent(agentId) {
 }
 
 async function closeTmuxAgent(agentId) {
-  const host = getHost();
+  const host = await getHost();
   await ensureAdapterLive(host);
   const { rec, name, workerDir } = await getWorker(host, agentId);
 
@@ -706,13 +745,14 @@ module.exports = {
   REQUIRED_RESULT_LINE,
   buildWorkerPrompt,
   closeTmuxAgent,
-  deliveries,
   ensureAdapterLive,
   getHost,
   getWorker,
   readTmuxAgent,
   resolveCoreModule,
   sendTmuxAgent,
+  settleAllUnsent,
+  settleWhenWritten,
   spawnTmuxAgent,
   stopHeartbeat,
   waitTmuxAgent,

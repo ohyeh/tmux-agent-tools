@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { sessionKey } from './ledger.ts'
 import { paneAlive, pasteInto, readCollectorRecord } from './collector.node.ts'
+import { deliveryIdOf } from './workers.ts'
 
 const RACE = new URL('./workers.race.node.ts', import.meta.url).pathname
 const COLLECTOR = new URL('./collector.node.ts', import.meta.url).pathname
@@ -219,20 +220,29 @@ test('S1 (b): three activations past the guard all submit; the tuple (A, name, 1
   assert.equal(notices(w).length, 3, 'acked: no further report')
 })
 
-// S1 (c) asks for one delivery_id per (owner, name, seq) on every re-report. The paste
-// channel carries no id yet (R7 / S4), so this test claims only what holds today: the
-// re-report is byte-identical text from a new activation, and the tuple is acked once.
-test('S1 (c) today, without a delivery_id: a re-report after a mid-delivery crash repeats the notice text from a new activation', async () => {
+test('S1 (c): a re-report after a mid-delivery crash, from a new activation, carries the same delivery_id <gen0>/<name>/<seq>', async () => {
   const w = world('A')
   assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
   await pass(w, 'A')
   sameNotice(w, 2)
   const acts = delivered(w).map(l => l.split('\t')[1])
   assert.notEqual(acts[0], acts[1], 'two activations, one tuple')
+  const ids = notices(w).map(t => /delivery_id: (\S+)/.exec(t)?.[1])
+  assert.deepEqual(ids, [`A/${w.name}/1`, `A/${w.name}/1`])
   assert.deepEqual(doneDirs(w), ['done'])
 })
 
-test.todo('S1(c) delivery_id per (owner,name,seq) — R7/S4')
+test('S1 (c): a claim does not change the delivery_id (gen0 = the descriptor owner); another seq has another id', async () => {
+  const w = world('X')
+  beatAt(w, 'X', OLD)
+  await pass(w, 'B') // claims gen 1
+  await pass(w, 'B') // delivers
+  assert.deepEqual(by(w), ['B'])
+  assert.equal(/delivery_id: (\S+)/.exec(notices(w)[0]!)?.[1], `X/${w.name}/1`)
+  const d = { profile: 'codex', name: w.name, dir: w.cwd, since: 0, owner: 'B', adoptedFrom: 'X' }
+  assert.equal(deliveryIdOf({ ...d, seq: 1 }), `X/${w.name}/1`)
+  assert.equal(deliveryIdOf({ ...d, seq: 2 }), `X/${w.name}/2`)
+})
 
 test('AT_LEAST_ONCE_BOUND_PROBE: two ack failures, then the third attempt delivers the same notice and acks once', async () => {
   const w = world('A')

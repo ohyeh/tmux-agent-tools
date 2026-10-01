@@ -5,7 +5,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
@@ -310,6 +310,94 @@ test('activation: two first beats of one gate register once', async () => {
   await Promise.all([heartbeat(w.host, g), heartbeat(w.host, g)])
   assert.equal(await heartbeat(w.host, g), true)
   assert.equal(g.paused, undefined)
+})
+
+// ── S3 channel authority: one delivery channel per session ─────────────────────
+
+const actsOf = (w: ReturnType<typeof world>) => {
+  const act = `${sessionDirOf(w.v3, 'me')}/act`
+  return existsSync(act) ? readdirSync(act).filter(f => /^\d+$/.test(f)).sort() : []
+}
+const channelOf = (w: ReturnType<typeof world>) => JSON.parse(readlinkSync(`${sessionDirOf(w.v3, 'me')}/channel`))
+
+test('S3: mod and MCP both try one session — exactly one channel registers; the other is refused for good and fences nothing', async () => {
+  const w = world()
+  const mod = newGate()
+  const mcp = newGate()
+  mcp.channel = 'mcp'
+  // Both first beats at once: one may find channel.lock busy and try again next tick.
+  await Promise.all([heartbeat(w.host, mod), heartbeat(w.host, mcp)])
+  for (let i = 0; i < 3; i++) await Promise.all([mod, mcp].filter(g => !g.paused).map(g => heartbeat(w.host, g)))
+  const won = channelOf(w).channel
+  const [winner, loser] = won === 'mod' ? [mod, mcp] : [mcp, mod]
+  assert.equal(winner.paused, undefined)
+  assert.equal(loser.activation, undefined, 'the refused channel registers no activation')
+  assert.match(loser.paused ?? '', new RegExp(`collected by its ${won} channel`))
+  assert.deepEqual(actsOf(w), ['1'], 'one registration: the winner is not fenced')
+  assert.equal(await heartbeat(w.host, winner), true)
+  assert.ok(!existsSync(`${sessionDirOf(w.v3, 'me')}/channel.lock`), 'the mutation lock is released')
+  // A reload of the winning channel still fences the older one (S1 (a)).
+  const reload = newGate()
+  reload.channel = winner.channel
+  assert.equal(await heartbeat(w.host, reload), true)
+  assert.equal(await heartbeat(w.host, winner), false)
+})
+
+test('S3 cut point: A (mcp) waits outside the lock; B hands the session over to node; A re-reads inside the lock and is refused — no false fence', async () => {
+  const w = world()
+  const sd = sessionDirOf(w.v3, 'me')
+  const first = newGate()
+  first.channel = 'mcp'
+  assert.equal(await heartbeat(w.host, first), true) // channel = mcp, act/1
+  let release!: () => void
+  const parked = new Promise<void>(r => (release = r))
+  let atCut!: () => void
+  const reached = new Promise<void>(r => (atCut = r))
+  const a: Host = {
+    ...w.host,
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'ln' && String(argv[3]).endsWith('/channel.lock')) {
+        atCut()
+        await parked
+      }
+      return w.host.run(argv, cwd, ms)
+    },
+  }
+  const late = newGate()
+  late.channel = 'mcp'
+  const aBeat = heartbeat(a, late)
+  await reached
+  // B: the handover's effect, done under channel.lock as the maintenance command would.
+  symlinkSync(JSON.stringify({ token: 'B', session: 'me', activation: '', host: '', pid: 0, pidStart: '' }), `${sd}/channel.lock`)
+  rmSync(`${sd}/channel`)
+  symlinkSync(JSON.stringify({ channel: 'node', token: 'B' }), `${sd}/channel`)
+  const node = (await registerActivation(w.host, sd, { pid: 0, pidStart: '', host: '', token: 'B' }))!
+  rmSync(`${sd}/channel.lock`)
+  release()
+  assert.equal(await aBeat, false)
+  assert.equal(late.activation, undefined)
+  assert.match(late.paused ?? '', /collected by its node channel/)
+  assert.deepEqual(actsOf(w), ['1', String(node)], 'A registered nothing: the node authority stays the max activation')
+  assert.equal(channelOf(w).channel, 'node')
+})
+
+test('S3: an unreadable channel record or a held channel.lock registers nothing this tick, and is not read as "no channel"', async () => {
+  const w = world()
+  const sd = sessionDirOf(w.v3, 'me')
+  mkdirSync(sd, { recursive: true })
+  writeFileSync(`${sd}/channel`, 'not a symlink')
+  const g = newGate()
+  assert.equal(await heartbeat(w.host, g), false)
+  assert.equal(g.paused, undefined, 'unknown is retried, not a refusal')
+  assert.deepEqual(actsOf(w), [])
+  rmSync(`${sd}/channel`)
+  symlinkSync(JSON.stringify({ token: 'dead', session: 'gone', activation: '', host: '', pid: 0, pidStart: '' }), `${sd}/channel.lock`)
+  assert.equal(await heartbeat(w.host, g), false)
+  assert.deepEqual(actsOf(w), [])
+  assert.ok(w.logs.some(l => l.includes(`rm '${sd}/channel.lock'`)), w.logs.join('\n'))
+  rmSync(`${sd}/channel.lock`)
+  assert.equal(await heartbeat(w.host, g), true)
+  assert.equal(channelOf(w).channel, 'mod')
 })
 
 test('observation identity: a byte- and metadata-preserving rewrite is no notice; same bytes with a moved mtime is one; other bytes with the same size and mtime is one (R3-1, F4-2)', async () => {

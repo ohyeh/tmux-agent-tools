@@ -2,7 +2,8 @@
 # Clean-install smoke for the MCP bundle (plan R7.1/R7.2): copy ONLY the skill
 # dir to a temp path with a space, outside the repo, with no node_modules on any
 # resolution path and NODE_PATH unset. Start tmux-agent-mcp through a symlink and
-# drive raw JSON-RPC: initialize, tools/list, then spawn → read → close against
+# drive raw JSON-RPC: initialize, tools/list, then spawn → wait (delivery_id, ack)
+# → wait again (already_acked, same id) → read → close against
 # the fake agent-tmux (mcp-adapter/test/fixtures/bin). stdout must be JSON-RPC only.
 
 set -euo pipefail
@@ -38,7 +39,7 @@ env -u NODE_PATH -u TMUX -u TMUX_PANE -u TMUX_AGENT_SESSION \
   MCP_BIN="$tmp/bin/tmux-agent-mcp" WORK="$tmp/work" EXPECTED_VERSION="$expected_version" \
   node --input-type=module - <<'EOF'
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import assert from "node:assert/strict";
 
 const child = spawn(process.env.MCP_BIN, [], { stdio: ["pipe", "pipe", "pipe"] });
@@ -89,10 +90,25 @@ try {
 
   const spawned = await call("spawn_tmux_agent", { cli: "fake", repoPath: process.env.WORK, task: "bundle smoke", name: "bundle-rpc" });
   assert.match(spawned.agent_id, /^bundle-rpc\.[0-9a-z]{5}$/);
-  writeFileSync(spawned.result_path, JSON.stringify({ schema_version: 1, status: "done", summary: "bundle ok", artifacts: [], errors: [] }));
-  assert.equal((await call("read_tmux_agent", { agent_id: spawned.agent_id })).status, "done");
+  assert.equal(spawned.seq, 1);
+  writeFileSync(spawned.result_path, JSON.stringify({ schema_version: 1, status: "success", summary: "bundle ok", artifacts: [], errors: [], episode: 1 }));
+  const owner = JSON.parse(readFileSync(`${process.env.TMUX_AGENT_DIR}/.v3/${spawned.agent_id}/worker.json`, "utf8")).owner;
+  assert.match(owner, /^mcp-[^/]+-\d+-\d+$/, "D-mcp-id: one session per server process");
+  const waited = await call("wait_tmux_agent", { agent_id: spawned.agent_id, seq: spawned.seq, timeoutSec: 2 });
+  assert.equal(waited.status, "completed");
+  assert.equal(waited.body.summary, "bundle ok");
+  assert.equal(waited.delivery_id, `${owner}/${spawned.agent_id}/1`);
+  // The ack lands after the response's write callback: the next wait sees it closed.
+  const ack = `${process.env.TMUX_AGENT_DIR}/.v3/${spawned.agent_id}/episodes/1/acks/done`;
+  for (let i = 0; i < 100 && !existsSync(ack); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(existsSync(ack), "acked after the response was flushed");
+  const again = await call("wait_tmux_agent", { agent_id: spawned.agent_id, seq: 1, timeoutSec: 0 });
+  assert.equal(again.status, "already_acked");
+  assert.equal(again.delivery_id, waited.delivery_id);
+  console.log(`  ok   wait → completed + ack, re-wait → already_acked (delivery_id ${waited.delivery_id})`);
+  assert.equal((await call("read_tmux_agent", { agent_id: spawned.agent_id, seq: 1 })).status, "success");
   assert.equal((await call("close_tmux_agent", { agent_id: spawned.agent_id })).closed, true);
-  console.log(`  ok   lifecycle spawn → read → close (${spawned.agent_id})`);
+  console.log(`  ok   lifecycle spawn → wait → read → close (${spawned.agent_id})`);
 } finally {
   // Heartbeat timers may keep the server up past stdin EOF: stop it here.
   child.kill();

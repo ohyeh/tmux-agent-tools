@@ -28,7 +28,7 @@ import {
   readHolder,
   readWorker,
   recoverEpisodes,
-  registerActivation,
+  registerOnChannel,
   releaseLock,
   sessionKey,
   sessionLiveness,
@@ -627,6 +627,11 @@ export const isAbsDir = (v: unknown): v is string => typeof v === 'string' && v.
 
 
 export const idOf = (d: TmuxDispatch) => `${d.name}#${d.seq ?? 0}`
+/**
+ * The id a host dedups re-reports by (plan §1c S1 (c), S4): `<gen0 owner>/<name>/<seq>`.
+ * gen0 is the descriptor's owner, so the id does not change when the episode is claimed.
+ */
+export const deliveryIdOf = (d: TmuxDispatch) => `${d.adoptedFrom ?? d.owner ?? ''}/${d.name}/${d.seq ?? 0}`
 /** The ack of a launch-failed notice: it closes the notice, not the episode (see `collect`). */
 export const LAUNCH_ACK = '#launch'
 export const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
@@ -1362,6 +1367,7 @@ export function payloadOf(done: readonly Finished[]): { text: string; included: 
       ...(f.d.adoptedFrom ? [`  adopted from session ${f.d.adoptedFrom} (it stopped collecting)`] : []),
       `  dir: ${f.d.dir}`,
       `  result: ${f.path}`,
+      `  delivery_id: ${deliveryIdOf(f.d)} (a re-report of a notice already handled has the same id)`,
       fence(summary, f.path),
     ].join('\n')
   for (const f of done) {
@@ -2453,7 +2459,8 @@ export async function rememberPanel(host: Host, open: boolean): Promise<void> {
   await host.storeSet(PANEL_KEY, open ? [id, ...others].slice(0, 20) : others)
 }
 
-export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Promise<Outcome> {
+/** `seq` = the episode this tell opened, also when the send may or may not have arrived. */
+export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Promise<Outcome & { seq?: number }> {
   const root = await rootOf(host)
   if (!root) return { ok: false, text: 'no state root' }
   const w = `${v3Of(root)}/${d.name}`
@@ -2504,6 +2511,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
       await mark(host, epDir, 'sent')
       return {
         ok: false,
+        seq: ep.seq,
         text:
           `send to ${d.name} failed (exit ${sent.exitCode}): ${(sent.stderr || sent.stdout).trim().slice(-400)}. ` +
           `It may still have reached the pane: episode ${ep.seq} stays watched, and a result it writes is delivered. ` +
@@ -2517,12 +2525,13 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
     if (cut) {
       return {
         ok: false,
+        seq: ep.seq,
         text:
           `send to "${d.name}" did not finish within ${TELL_SEND_MS / 1000}s and was stopped (${cut.slice(-200)}); ` +
           `the message may have arrived. Peek at "${d.name}" before telling it again${moved}`,
       }
     }
-    return { ok: true, text: `sent to "${d.name}" on ${d.profile} as episode ${ep.seq}; its result goes to ${ep.resultPath}${moved}` }
+    return { ok: true, seq: ep.seq, text: `sent to "${d.name}" on ${d.profile} as episode ${ep.seq}; its result goes to ${ep.resultPath}${moved}` }
   } finally {
     await releaseLock(host, `${w}/.action`, lock.token)
   }
@@ -2732,7 +2741,7 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
   }
   const dir = sessionDirOf(v3Of(root), id)
   if (gate.activation === undefined) {
-    gate.registering ??= registerActivation(host, dir, { pid: 0, pidStart: '', host: '', token: gate.token })
+    gate.registering ??= registerChannelActivation(host, gate, dir)
     gate.activation = await gate.registering
     if (gate.activation === undefined) {
       gate.registering = undefined
@@ -2762,6 +2771,25 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
     return false
   }
   return true
+}
+
+/**
+ * Register this activation on its gate's channel (plan §1c S3, `registerOnChannel`). A
+ * session another channel collects for refuses it for good: the gate pauses with the
+ * reason, as a superseded one does.
+ */
+async function registerChannelActivation(host: Host, gate: Gate, dir: string): Promise<number | undefined> {
+  const channel = gate.channel ?? 'mod'
+  // ponytail: no process id in this holder (held for a few syscalls; a crashed one is
+  // named by session + token and cleared by hand). Add processId when a channel unlock exists.
+  const me: Holder = { token: gate.token, session: host.owner() ?? '', activation: '', host: '', pid: 0, pidStart: '' }
+  const r = await registerOnChannel(host, dir, channel, me, { pid: 0, pidStart: '', host: '', token: gate.token })
+  if (r && 'refused' in r) {
+    gate.paused = `this session is collected by its ${r.refused} channel (one delivery channel per session); this ${channel} channel does not collect`
+    host.log(`tmux-agent: ${gate.paused}`)
+    return undefined
+  }
+  return r?.n
 }
 
 /** The worker's action lock (§5), held by this activation's token. */

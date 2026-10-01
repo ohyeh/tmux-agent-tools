@@ -37,6 +37,10 @@ import {
   ANSI_LEAVE_ALT,
   KeyParser,
   ESC_WAIT_MS,
+  SEQ_IDLE_MS,
+  SEQ_MAX,
+  PASTE_MAX,
+  INPUT_DROPPED,
   cellWidth,
   graphemeWidth,
   graphemes,
@@ -1815,6 +1819,8 @@ test('health writer: heartbeat publishes act/<n>.state for its channel, once per
     ['node', { kind: 'collecting', channel: 'node', mode: 'auto' }],
     ['mcp', { kind: 'collecting', channel: 'mcp', mode: 'on-request' }],
   ] as const) {
+    // One session has one channel (S3): drop the previous channel's record, as a handover would.
+    rmSync(join(sessionDirOf(v3Of(root), 'S'), 'channel'), { force: true })
     const gate = newGate()
     if (channel) gate.channel = channel
     assert.equal(await heartbeat(host, gate), true)
@@ -2346,6 +2352,72 @@ test('Sol#8 split sequence: the ESC timer lets go only a lone ESC; a CSI, SS3 or
     await tick(ESC_WAIT_MS * 2)
     stdin.emit('data', 'q')
     await run
+  }
+})
+
+test('Sol-r2#N2 parser bounds: Ctrl-C in an open paste, the idle bound, and an over-long CSI or paste never stay buffered', () => {
+  const p = new KeyParser()
+  assert.deepEqual(p.feed('\x1b[200~abc'), [])
+  assert.deepEqual(p.feed('q\x03'), ['\x03'], 'Ctrl-C in an open paste is read as Ctrl-C; the partial is dropped')
+  assert.equal(p.waitMs(), undefined, 'nothing is left open')
+  assert.deepEqual(p.feed('q'), ['q'])
+  assert.deepEqual(p.feed('\x1b[200~abc'), [])
+  assert.equal(p.waitMs(), SEQ_IDLE_MS, 'an open paste has the idle bound')
+  assert.deepEqual(p.expire(), [INPUT_DROPPED], 'the idle bound drops the paste')
+  assert.deepEqual(p.feed('q'), ['q'], 'normal keys again')
+  assert.deepEqual(p.feed('\x1b[12'), [])
+  assert.equal(p.waitMs(), SEQ_IDLE_MS)
+  assert.deepEqual(p.expire(), [INPUT_DROPPED], 'the idle bound drops a started CSI')
+  assert.deepEqual(p.feed('\x1b'), [])
+  assert.equal(p.waitMs(), ESC_WAIT_MS, 'a lone ESC keeps its short wait')
+  assert.deepEqual(p.expire(), ['\x1b'])
+  // A huge unfinished CSI: dropped once past SEQ_MAX, its rest (`+`, a mutating key) skipped.
+  const big = new KeyParser()
+  const seen: string[] = []
+  seen.push(...big.feed('\x1b['))
+  for (let n = 0; n < 2_000; n++) seen.push(...big.feed('1;+'.repeat(100)))
+  assert.deepEqual(seen, [INPUT_DROPPED])
+  assert.ok((big as unknown as { buf: string }).buf.length <= SEQ_MAX, 'memory bounded')
+  assert.deepEqual(big.feed('~q'), ['q'], 'the final byte ends the skip; q is a key')
+  // A huge paste: dropped past PASTE_MAX, the rest skipped up to its end marker.
+  const paste = new KeyParser()
+  const got: string[] = [...paste.feed('\x1b[200~')]
+  for (let n = 0; n < 40; n++) got.push(...paste.feed('xq'.repeat(PASTE_MAX / 16)))
+  assert.ok((paste as unknown as { paste: string }).paste.length <= PASTE_MAX, 'memory bounded')
+  got.push(...paste.feed('xq\x1b[201~q'))
+  assert.deepEqual(got, [INPUT_DROPPED, 'q'], 'only the drop notice and the key after the end marker')
+})
+
+test('Sol-r2#N2 runTui: an unterminated paste then Ctrl-C ends the run and restores the terminal; idle time alone frees the keys', async () => {
+  for (const how of ['ctrl-c', 'idle'] as const) {
+    const { stdin, stdout } = mockTty()
+    const root = mkdtempSync(join(tmpdir(), 'tui-n2-'))
+    const run = runTui({ stdin, stdout, host: quietHost('n2', root, root), session: 'n2', cwd: root, root, mirrorMs: 60_000 })
+    let ended = false
+    run.then(() => (ended = true), () => (ended = true))
+    await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+    stdin.emit('data', '\x1b[200~abc')
+    await tick(ESC_WAIT_MS * 4)
+    try {
+      if (how === 'ctrl-c') {
+        stdin.emit('data', 'q\x03')
+        await until(() => ended, 3_000, `${how}: Ctrl-C in an open paste to end the run`)
+      } else {
+        await until(() => stdout.written.includes('dropped an unfinished paste'), SEQ_IDLE_MS + 3_000, `${how}: the drop status`)
+        assert.equal(ended, false)
+        stdin.emit('data', 'q')
+        await until(() => ended, 3_000, `${how}: q after the idle bound to end the run`)
+      }
+    } finally {
+      if (!ended) {
+        stdin.emit('data', '\x1b[201~')
+        await tick(ESC_WAIT_MS * 2)
+        stdin.emit('data', 'q')
+      }
+      await run
+    }
+    assert.equal(stdin.isRaw, false, `${how}: raw mode restored`)
+    assert.ok(stdout.written.endsWith(ANSI_LEAVE_ALT), `${how}: alt screen left last`)
   }
 })
 

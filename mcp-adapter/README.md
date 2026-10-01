@@ -49,7 +49,7 @@ The adapter runs on the shared `workers-core` through `nodeHost`:
 
 - `spawn_tmux_agent` → `assignWorker` (reserves v5 `<base>.<5 base36>` worker identity, publishes `worker.json`, opens episode 1 on the producer route `--result-path ... --episode 1`)
 - `send_tmux_agent` → `tellWorker` (takes per-worker `.action` lock, allocates episode seq, sends via `--result-path ... --episode <seq>`)
-- `wait_tmux_agent` → one delivery of that episode through the core (`claim` when this session is not the owner, `submit`, then `ackFinished`), only while this process's activation is still the session's max (§3, §3.3, §4, §8)
+- `wait_tmux_agent` → one delivery of that episode (`seq`, else the max seq at call time) through the core (`claim` when this session is not the owner), only while this process's activation is still the session's max (§3, §3.3, §4, §8). The response carries `delivery_id` = `<gen0 owner>/<name>/<seq>`; `ackFinished` runs after the response's stdout write callback (`AckingStdioTransport`, plan §1c S4), so delivery is at-least-once
 - `read_tmux_agent` → reads `result.json` if available, or pane status/capture via `peekWorker`
 - `close_tmux_agent` → `stopWorker` (takes action lock, writes `acks/cancel` for all open episodes, kills pane)
 

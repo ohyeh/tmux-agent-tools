@@ -305,23 +305,37 @@ export function resumeText(key: string): string | undefined {
 
 /** How long a lone ESC waits for the rest of an escape sequence. */
 export const ESC_WAIT_MS = 50
+/** Idle bound: a started CSI/SS3 or an open paste with no new byte for this long is dropped. */
+export const SEQ_IDLE_MS = 1_000
+/** Size bounds: an unfinished CSI parameter stream / an open paste longer than this is dropped. */
+export const SEQ_MAX = 256
+export const PASTE_MAX = 65_536
+/** Emitted by KeyParser (never read from input): an unfinished sequence was dropped. */
+export const INPUT_DROPPED = '\x00dropped'
 
 /**
  * Decoded stdin text → keys, across chunk boundaries. A key is one grapheme, one
  * control character, one CSI (`ESC [ … final`) or SS3 (`ESC O x`) sequence, a lone
  * ESC, or a whole bracketed paste (kept wrapped in its markers, so a pasted `q`
  * is text, not quit). A partial sequence waits for the next chunk. Only a lone ESC
- * is let go by `flushEsc()`, which the caller runs after ESC_WAIT_MS with no new
- * input: a started CSI (`ESC [`), SS3 (`ESC O`) or paste marker stays buffered until
- * it ends, so its tail never becomes keys. A CSI or SS3 cut by a byte that cannot
+ * is let go after ESC_WAIT_MS with no new input (`waitMs()` tells the caller when to
+ * run `expire()`): a started CSI (`ESC [`), SS3 (`ESC O`) or paste marker stays
+ * buffered until it ends or a bound drops it, so its tail never becomes keys. A CSI or SS3 cut by a byte that cannot
  * belong to it is dropped whole; that byte (Ctrl-C, say) is read as a key.
- * ponytail: no time bound on a started sequence or paste; one that never ends eats
- * the next final byte (a plain key) or, for a paste, all input until ESC[201~. Add
- * an idle bound that drops it with a status line if a terminal is seen to do that.
+ * Bounds (a sequence that never ends must not hold the TUI): `expire()` after
+ * SEQ_IDLE_MS with no new input drops a started CSI/SS3 or an open paste. A CSI parameter stream past SEQ_MAX is dropped and the rest of it
+ * skipped up to its final byte; a paste past PASTE_MAX is dropped and the rest of
+ * it skipped up to ESC[201~. Each drop emits INPUT_DROPPED (a status line), never
+ * the dropped bytes as keys. Ctrl-C (0x03) inside an open paste drops the paste and
+ * is read as Ctrl-C, so one press quits (inside a CSI/SS3 it already cuts it): a
+ * stuck parser never needs a second key, and quit restores the terminal. Limit: a
+ * paste whose text holds a raw 0x03 quits the TUI.
  */
 export class KeyParser {
   private buf = ''
   private paste: string | undefined
+  private pasteOver = false // the open paste passed PASTE_MAX: skip to its end marker
+  private skipCsi = false // an over-long CSI was dropped: skip its rest
 
   feed(text: string): string[] {
     this.buf += text
@@ -337,24 +351,66 @@ export class KeyParser {
     return this.drain(true)
   }
 
+  /** When the caller runs `expire()`: ESC_WAIT_MS for a lone ESC, SEQ_IDLE_MS for a started sequence or paste. */
+  waitMs(): number | undefined {
+    if (this.paste === undefined && this.buf === '\x1b') return ESC_WAIT_MS
+    return this.paste !== undefined || this.skipCsi || this.buf ? SEQ_IDLE_MS : undefined
+  }
+
+  /** Idle bound reached: a lone ESC is a key; a started sequence or paste is dropped. */
+  expire(): string[] {
+    if (this.paste === undefined && this.buf === '\x1b') return this.flushEsc()
+    const dropped = this.paste !== undefined || this.buf !== ''
+    this.buf = ''
+    this.paste = undefined
+    this.pasteOver = false
+    this.skipCsi = false
+    return dropped ? [INPUT_DROPPED] : []
+  }
+
   private drain(force: boolean): string[] {
     const out: string[] = []
     const b = this.buf
     let i = 0
+    const param = (k: number) => b.charCodeAt(k) >= 0x20 && b.charCodeAt(k) <= 0x3f
     while (i < b.length) {
+      if (this.skipCsi) {
+        while (i < b.length && param(i)) i++
+        if (i === b.length) break
+        this.skipCsi = false
+        if (b.charCodeAt(i) >= 0x40 && b.charCodeAt(i) <= 0x7e) i++
+        continue
+      }
       if (this.paste !== undefined) {
         const end = b.indexOf(PASTE_END, i)
+        const cc = b.indexOf('\x03', i)
+        if (cc >= 0 && (end < 0 || cc < end)) {
+          this.paste = undefined
+          this.pasteOver = false
+          out.push('\x03')
+          i = cc + 1
+          continue
+        }
         if (end < 0) {
           // Keep a tail that may be the start of the end marker.
           let keep = Math.min(PASTE_END.length - 1, b.length - i)
           while (keep > 0 && !PASTE_END.startsWith(b.slice(b.length - keep))) keep--
-          this.paste += b.slice(i, b.length - keep)
+          if (!this.pasteOver) this.paste += b.slice(i, b.length - keep)
+          if (this.paste.length > PASTE_MAX) {
+            this.paste = ''
+            this.pasteOver = true
+            out.push(INPUT_DROPPED)
+          }
           i = b.length - keep
           break
         }
         const text = this.paste + b.slice(i, end)
-        if (text) out.push(PASTE_START + text + PASTE_END)
+        if (this.pasteOver) {
+          // already reported when it passed PASTE_MAX
+        } else if (text.length > PASTE_MAX) out.push(INPUT_DROPPED)
+        else if (text) out.push(PASTE_START + text + PASTE_END)
         this.paste = undefined
+        this.pasteOver = false
         i = end + PASTE_END.length
         continue
       }
@@ -366,6 +422,12 @@ export class KeyParser {
         else if (rest[1] === '[') {
           let j = 2
           while (j < rest.length && rest.charCodeAt(j) >= 0x20 && rest.charCodeAt(j) <= 0x3f) j++
+          if (j >= rest.length && j > SEQ_MAX) {
+            this.skipCsi = true
+            out.push(INPUT_DROPPED)
+            i = b.length
+            break
+          }
           if (j >= rest.length) len = 0
           else len = final(j) ? j + 1 : -j
         } else if (rest[1] === 'O') len = rest.length < 3 ? 0 : final(2) ? 3 : -2
@@ -434,6 +496,7 @@ const reselect = (state: TuiState, selected: string | undefined): TuiState => ({
 export function nextKeyState(state: TuiState, key: string, now: number): { state: TuiState; action?: TuiAction } {
   // Raw mode turns Ctrl-C into a key (no SIGINT): it quits from every mode, prompt included.
   if (key === '\x03') return { state: { ...state, quit: true }, action: { type: 'quit' } }
+  if (key === INPUT_DROPPED) return say(state, 'input — dropped an unfinished paste or escape sequence (no end in time or too long)', now)
   if (state.adding) {
     const closed: TuiState = { ...state, adding: false, resumeInput: '', inputKind: undefined, inputFor: undefined }
     if (key === '\x1b') return { state: closed }
@@ -1087,11 +1150,12 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (escTimer) clearTimeout(escTimer)
     escTimer = undefined
     runKeys(parser.feed(typeof data === 'string' ? data : decoder.write(data)))
-    if (parser.pendingEsc()) {
+    const ms = parser.waitMs()
+    if (ms !== undefined) {
       escTimer = setTimeout(() => {
         escTimer = undefined
-        runKeys(parser.flushEsc())
-      }, ESC_WAIT_MS)
+        runKeys(parser.expire())
+      }, ms)
     }
   }
 

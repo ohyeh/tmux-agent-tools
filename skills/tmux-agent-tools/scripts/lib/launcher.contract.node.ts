@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, execFile, execFileSync, spawn } from 'node:child_process'
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { nodeHost } from './host.node.ts'
 import { acquireLock, releaseLock, type Holder } from './ledger.ts'
@@ -1226,6 +1226,66 @@ for (const [mode, what] of [
     }),
   )
 }
+
+/**
+ * ensureCollector in its own process (env selects the private tmux and the state
+ * root). `DIE=1`: the liveness probe of the started child (a `ps -o lstart=` for a
+ * pid not this process) gets its real answer, then the child is killed and the
+ * answer held until the kill shows, so the child ends inside that await.
+ */
+const READINESS = `
+const { ensureCollector } = await import(process.env.L)
+const { nodeHost } = await import(process.env.H)
+const base = nodeHost({ log: () => {} })
+const host = { ...base, run: async (argv, cwd, ms) => {
+  const r = await base.run(argv, cwd, ms)
+  const pid = Number(argv[4])
+  if (process.env.DIE === '1' && argv[3] === 'ps' && pid > 0 && pid !== process.pid && r.exitCode === 0) {
+    process.kill(pid, 'SIGKILL')
+    for (let i = 0; i < 100; i++) {
+      try { process.kill(pid, 0) } catch { break }
+      await new Promise(res => setTimeout(res, 20))
+    }
+    await new Promise(res => setTimeout(res, 300))
+  }
+  return r
+} }
+const say = o => process.stdout.write(JSON.stringify(o) + '\\n')
+try {
+  say({ pid: (await ensureCollector(host, { session: process.env.S, cwd: process.env.C, pane: process.env.P, root: process.env.TMUX_AGENT_DIR })).pid })
+} catch (error) {
+  say({ error: error.message })
+}
+`
+
+test('Sol-r2#N3 readiness: a child that exits while its liveness probe is awaited is the early-exit error; the healthy start is ready', { timeout: 60_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('solr2n3')
+      const launcher = install(w, 'stub', { collector: STUB })
+      const pane = await hostPane(w.session)
+      const run = (die: boolean) =>
+        new Promise<{ pid?: number; error?: string }>(resolve => {
+          execFile(
+            process.execPath,
+            ['--input-type=module', '-e', READINESS],
+            { encoding: 'utf8', timeout: 30_000, env: { ...w!.env, L: pathToFileURL(launcher).href, H: pathToFileURL(join(dirname(launcher), 'host.node.ts')).href, S: w!.session, C: w!.cwd, P: pane, DIE: die ? '1' : '' } },
+            (_error, stdout) => resolve(JSON.parse(stdout.trim().split('\n').pop() || '{}')),
+          )
+        })
+      const dying = await run(true)
+      assert.equal(dying.pid, undefined, `a dead pid was returned as ready: ${JSON.stringify(dying)}`)
+      assert.match(dying.error ?? '', /the collector exited \(SIGKILL\) before it was ready/)
+      rmSync(`${sessionDirOf(v3Of(w.root), w.session)}/collector.json`, { force: true })
+      const healthy = await run(false)
+      assert.ok((healthy.pid ?? 0) > 0, JSON.stringify(healthy))
+      process.kill(healthy.pid!, 0) // alive: throws if not
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
 
 test('Sol#14 a missing or unreadable agent-tmux wrapper is not a ready collector: the error names it, no record', { timeout: 60_000 }, () =>
   exclusive(async () => {

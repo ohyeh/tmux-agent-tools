@@ -229,6 +229,20 @@ loads the core `.ts` files beside it. An install of the skill is enough: no repo
 checkout, no `npm install`, no `node_modules`. Needs Node >= 22.18. Its stdout
 is the MCP protocol only; diagnostics go to stderr.
 
+Delivery: each server process is its own session (`$TMUX_AGENT_SESSION`, else
+`mcp-<hostname>-<pid>-<start>`), so a restart is a new session; it can still
+`wait` on a worker from before the restart by `agent_id`, and claims it once the
+old process's heartbeat is past 90 s. `spawn_tmux_agent` and `send_tmux_agent`
+return the episode `seq`; `wait_tmux_agent`/`read_tmux_agent` with `seq` stay on
+that episode (without it, the latest episode at call time). A `completed` wait
+carries `delivery_id` = `<first owner>/<agent_id>/<seq>`. The episode is acked
+only after the response bytes are flushed to stdout (not when the client has
+processed them); a cancel, a send error or a crash before the ack leaves it
+unacked, and a later wait reports it again with the same `delivery_id`. This is
+at-least-once: dedup by `delivery_id`. A session has one delivery channel (the
+mod, the node collector, or MCP): the first one to register owns it, and
+another channel on the same session id is refused and does not collect.
+
 Register it with its absolute path, for example:
 
 ```bash

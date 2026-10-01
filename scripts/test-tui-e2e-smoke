@@ -8,7 +8,9 @@
 # the worker and its result shows; a real paste (`paste-buffer -p`) of x, q, qx
 # is text, not keys; x (twice) stops a worker; a viewer (no
 # --session) pressing x - U t c + n changes nothing on disk; q exits and the
-# pane's stty is unchanged. Bounded polls only; the whole smoke has a deadline.
+# pane's stty is unchanged; an unterminated paste (`send-keys -H` of ESC[200~abc)
+# then Ctrl-C exits and `stty -a` is unchanged (Sol-r2#N2). Bounded polls only;
+# the whole smoke has a deadline.
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
@@ -143,9 +145,11 @@ RUN="$WORK/run-tui"
 cat > "$RUN" <<EOF
 #!/bin/zsh -f
 stty -g > ${(q)WORK}/stty.\$1.before
+stty -a > ${(q)WORK}/stty-a.\$1.before
 if [[ "\$1" == owner ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
 else tmux-agent-tui --cwd ${(q)WORK}/repo; fi
 echo "TUI_EXIT=\$?"
+stty -a > ${(q)WORK}/stty-a.\$1.after
 stty -g > ${(q)WORK}/stty.\$1.after
 exec sleep 600
 EOF
@@ -279,6 +283,17 @@ keys "$V" q
 check "the viewer exited 0" wait_for "$V" 'TUI_EXIT=0' 50
 for _ in {1..25}; do [[ -s "$WORK/stty.viewer.after" ]] && break; /bin/sleep 0.2; done
 check "viewer: stty after == stty before" cmp -s "$WORK/stty.viewer.before" "$WORK/stty.viewer.after"
+
+echo "case: an unterminated paste then Ctrl-C exits; stty -a is unchanged (Sol-r2#N2)"
+T new-session -d -s ctrlc -x 120 -y 40 "$RUN ctrlc"
+CC="=ctrlc:"
+check "the Ctrl-C TUI drew B" wait_for "$CC" "$B"
+T send-keys -t "$CC" -H 1b 5b 32 30 30 7e 61 62 63 # ESC[200~abc, no ESC[201~
+/bin/sleep 0.3
+T send-keys -t "$CC" -H 03
+check "Ctrl-C in an open paste exits the TUI" wait_for "$CC" 'TUI_EXIT=0' 50
+for _ in {1..25}; do [[ -s "$WORK/stty.ctrlc.after" ]] && break; /bin/sleep 0.2; done
+check "Ctrl-C: stty -a after == stty -a before" cmp -s "$WORK/stty-a.ctrlc.before" "$WORK/stty-a.ctrlc.after"
 
 (( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; echo "--- tree diff"; diff "$WORK/tree.before" "$WORK/tree.after" 2>/dev/null | head -20 || true; }
 echo

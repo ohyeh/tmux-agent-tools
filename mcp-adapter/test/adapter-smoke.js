@@ -70,35 +70,6 @@ function runAdapterChildRaw(dir, args, extra) {
   });
 }
 
-// Both creators pass the missing-file check, then block inside write until the
-// peer is there. That is the concurrent first-create window.
-function installIdWriteBarrier() {
-  const barrier = process.env.RACE_BARRIER;
-  if (!barrier) {
-    throw new Error("RACE_BARRIER is required");
-  }
-  const realWrite = fs.writeFileSync;
-  let passed = false;
-  fs.writeFileSync = (file, data, options) => {
-    const target = typeof file === "string" ? file : "";
-    if (!passed && target.endsWith(`${path.sep}.mcp-session-id`)) {
-      passed = true;
-      realWrite(path.join(barrier, `ready-${process.pid}`), "1");
-      const deadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        const ready = fs.readdirSync(barrier).filter((name) => name.startsWith("ready-")).length;
-        if (ready >= 2) break;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-      }
-      const ready = fs.readdirSync(barrier).filter((name) => name.startsWith("ready-")).length;
-      if (ready < 2) {
-        throw new Error("session id create barrier timed out");
-      }
-    }
-    return realWrite(file, data, options);
-  };
-}
-
 function ageSessionBeats(dir) {
   const sessions = path.join(dir, ".v3", ".sessions");
   const old = (Date.now() - 90_000 - 10 * 60 * 1000) / 1000;
@@ -140,7 +111,7 @@ async function runChild(kind, args) {
     return;
   }
   if (kind === "wait") {
-    const waited = await waitTmuxAgent(args[0], 1);
+    const waited = await waitTmuxAgent(args[0], 1, args[1] ? { seq: Number(args[1]) } : {});
     process.stdout.write(JSON.stringify(waited));
     return;
   }
@@ -152,7 +123,7 @@ async function runChild(kind, args) {
         task: "persist",
         name: "adapter-persist",
       });
-      process.stdout.write(JSON.stringify({ threw: false, code: null, owner: getHost(repo).owner() }));
+      process.stdout.write(JSON.stringify({ threw: false, code: null, owner: (await getHost(repo)).owner() }));
     } catch (err) {
       process.stdout.write(JSON.stringify({
         threw: true,
@@ -161,11 +132,6 @@ async function runChild(kind, args) {
         owner: null,
       }));
     }
-    return;
-  }
-  if (kind === "race-id") {
-    installIdWriteBarrier();
-    process.stdout.write(getHost(repo).owner());
     return;
   }
   throw new Error(`unknown child ${kind}`);
@@ -193,14 +159,16 @@ async function testClosedEpisodeNotClaimedByOtherOwner() {
   assert.equal(fs.existsSync(path.join(dir, ".v3", first.agent_id, "episodes", "1", "claims")), false);
 }
 
-async function testPersistFailureIsToolError() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-persist-"));
-  fs.writeFileSync(path.join(dir, ".v3"), "not-a-directory\n");
-  const out = runAdapterChild(dir, ["persist"]);
-  assert.equal(out.threw, true, `persist failure must fail the tool call, owner=${out.owner} code=${out.code}`);
-  assert.equal(out.code, "EEXIST");
+// D-mcp-id: no provable process id (ps fails) → the tool call fails; no owner is minted.
+async function testNoProcessIdIsToolError() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-noid-"));
+  const shim = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-ps-shim-"));
+  fs.writeFileSync(path.join(shim, "ps"), "#!/bin/sh\necho 'ps: injected failure' >&2\nexit 1\n", { mode: 0o755 });
+  const out = runAdapterChild(dir, ["persist"], { PATH: `${shim}${path.delimiter}${process.env.PATH}` });
+  assert.equal(out.threw, true, `no session id must fail the tool call, owner=${out.owner} code=${out.code}`);
+  assert.equal(out.code, "NO_SESSION_ID");
   assert.equal(out.owner, null);
-  assert.doesNotMatch(JSON.stringify(out), /ephemeral/);
+  assert.equal(fs.existsSync(path.join(dir, ".v3")), false, "nothing was written without an owner");
 }
 
 async function testOverlappingWaitInSameProcessDeliversOnce() {
@@ -303,18 +271,390 @@ async function testWaitTerminalAndEpisodeChecks() {
   assert.equal(fs.existsSync(path.join(dir, ".v3", sp3.agent_id, "episodes", "1", "acks", "done")), false);
 }
 
-async function testConcurrentSessionId() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-id-race-"));
-  const barrier = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-id-barrier-"));
-  const [left, right] = await Promise.all([
-    runAdapterChildRaw(dir, ["race-id"], { RACE_BARRIER: barrier }),
-    runAdapterChildRaw(dir, ["race-id"], { RACE_BARRIER: barrier }),
+// ── R7.3 fixtures: D-mcp-id, D-mcp-ack (plan §1c S1 (c), S3, S4) ─────────────────
+
+const REPO = path.resolve(__dirname, "..");
+const FIXTURE_BIN = path.join(__dirname, "fixtures/bin");
+const sessionHex = (id) => Buffer.from(id, "utf8").toString("hex");
+const workerOwner = (dir, agent) => JSON.parse(fs.readFileSync(path.join(dir, ".v3", agent, "worker.json"), "utf8")).owner;
+const doneAck = (dir, agent, seq = 1) => fs.existsSync(path.join(dir, ".v3", agent, "episodes", String(seq), "acks", "done"));
+const actsOf = (dir, session) => {
+  const act = path.join(dir, ".v3", ".sessions", sessionHex(session), "act");
+  return fs.existsSync(act) ? fs.readdirSync(act).filter((f) => /^\d+$/.test(f)).sort() : [];
+};
+const channelOf = (dir, session) =>
+  JSON.parse(fs.readlinkSync(path.join(dir, ".v3", ".sessions", sessionHex(session), "channel"))).channel;
+// The ack lands after the server's write callback, so a client may read the response first.
+async function eventually(p, what) {
+  for (let i = 0; i < 150 && !p(); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(p(), `timed out waiting for ${what}`);
+}
+const writeResult = (file, o = {}) =>
+  fs.writeFileSync(file, JSON.stringify({ schema_version: 1, status: "success", summary: "ok", artifacts: [], errors: [], episode: 1, ...o }));
+
+/** One MCP server process (`--server <cut>`, see serveWithCut) on state root `dir`. */
+async function startServer(dir, extra = {}, cut = "none") {
+  const client = new Client({ name: `r73-${cut}`, version: "1.0.0" });
+  const env = childEnv(dir, { PATH: `${FIXTURE_BIN}${path.delimiter}${process.env.PATH}`, ...extra });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [__filename, "--server", cut],
+    cwd: REPO,
+    env,
+    stderr: "pipe",
+  });
+  await client.connect(transport);
+  return client;
+}
+
+async function call(client, name, args) {
+  const r = await client.callTool({ name, arguments: args });
+  assert.ok(!r.isError, `${name} failed: ${JSON.stringify(r)}`);
+  return r.structuredContent;
+}
+
+/**
+ * The server with a cut point on the stdout write of a `completed` wait response:
+ * before-write = crash before any byte is written; write-no-cb = the write is issued
+ * and the process dies before its callback (S4: write returned, callback pending);
+ * flushed-no-ack = the bytes are flushed, then the process dies before the ack.
+ */
+async function serveWithCut(cut) {
+  const { AckingStdioTransport, main: serve } = require("../src/server.js");
+  const out = {
+    write(chunk, cb) {
+      if (cut !== "none" && String(chunk).includes('"status":"completed"')) {
+        if (cut === "before-write") process.exit(9);
+        if (cut === "write-no-cb") {
+          process.stdout.write(chunk);
+          process.exit(9);
+        }
+        if (cut === "flushed-no-ack") return process.stdout.write(chunk, () => process.exit(9));
+      }
+      return process.stdout.write(chunk, cb);
+    },
+  };
+  await serve(new AckingStdioTransport(process.stdin, out));
+}
+
+// D-mcp-id: two different host processes, each with its own session, each assign + wait.
+async function testTwoHostProcessesEachAssignAndWait() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-two-hosts-"));
+  const [h1, h2] = await Promise.all([startServer(dir), startServer(dir)]);
+  try {
+    const [a, b] = await Promise.all([
+      call(h1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "host one", name: "r73-h1" }),
+      call(h2, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "host two", name: "r73-h2" }),
+    ]);
+    assert.equal(a.seq, 1);
+    writeResult(a.result_path, { summary: "one" });
+    writeResult(b.result_path, { summary: "two" });
+    const [wa, wb] = await Promise.all([
+      call(h1, "wait_tmux_agent", { agent_id: a.agent_id, seq: a.seq, timeoutSec: 2 }),
+      call(h2, "wait_tmux_agent", { agent_id: b.agent_id, seq: b.seq, timeoutSec: 2 }),
+    ]);
+    const oa = workerOwner(dir, a.agent_id);
+    const ob = workerOwner(dir, b.agent_id);
+    assert.match(oa, /^mcp-[^/]+-\d+-\d+$/);
+    assert.notEqual(oa, ob, "one session per host process");
+    assert.deepEqual([wa.status, wb.status], ["completed", "completed"]);
+    assert.equal(wa.delivery_id, `${oa}/${a.agent_id}/1`);
+    assert.equal(wb.delivery_id, `${ob}/${b.agent_id}/1`);
+    await eventually(() => doneAck(dir, a.agent_id) && doneAck(dir, b.agent_id), "both acks");
+    // No false fence (S3): each session has its one mcp registration, nobody superseded it.
+    assert.deepEqual([actsOf(dir, oa), actsOf(dir, ob)], [["1"], ["1"]]);
+    assert.deepEqual([channelOf(dir, oa), channelOf(dir, ob)], ["mcp", "mcp"]);
+    const state = JSON.parse(fs.readFileSync(path.join(dir, ".v3", ".sessions", sessionHex(oa), "act", "1.state"), "utf8"));
+    assert.deepEqual([state.channel, state.mode, state.status], ["mcp", "on-request", "collecting"], "C-health MCP writer");
+  } finally {
+    await Promise.all([h1.close(), h2.close()]);
+  }
+}
+
+// D-mcp-id restart: a new process is a new session; it waits on the old process's worker
+// by agent_id (from disk), claims it once the old beat expired, and keeps gen0 in the id.
+async function testRestartWaitsOnWorkerFromBeforeRestart() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-restart-"));
+  const s1 = await startServer(dir);
+  const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "survive restart", name: "r73-restart" });
+  await s1.close();
+  writeResult(sp.result_path, { summary: "survived restart" });
+  const owner1 = workerOwner(dir, sp.agent_id);
+  const s2 = await startServer(dir);
+  try {
+    const early = await call(s2, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
+    assert.deepEqual([early.status, early.reason], ["failed", "not_owner"], "the old owner's beat is still fresh");
+    assert.equal(early.detail.owner, owner1);
+    assert.ok(ageSessionBeats(dir) >= 2);
+    const w = await call(s2, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 1 });
+    assert.equal(w.status, "completed");
+    assert.equal(w.body.summary, "survived restart");
+    assert.equal(w.delivery_id, `${owner1}/${sp.agent_id}/1`, "gen0 stays in the id after the claim");
+    const claimed = fs.readFileSync(path.join(dir, ".v3", sp.agent_id, "episodes", "1", "claims", "1", "owner"), "utf8").trim();
+    assert.notEqual(claimed, owner1);
+    await eventually(() => doneAck(dir, sp.agent_id), "the ack");
+  } finally {
+    await s2.close();
+  }
+}
+
+// Same host reload (TMUX_AGENT_SESSION unchanged): the newer activation fences the older
+// one (S1 (a)); the reload delivers.
+async function testSameHostReload() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-reload-"));
+  const env = { TMUX_AGENT_SESSION: "host-S" };
+  const s1 = await startServer(dir, env);
+  const s2 = await startServer(dir, env);
+  try {
+    const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "reload", name: "r73-reload" });
+    writeResult(sp.result_path);
+    const old = await call(s1, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
+    assert.deepEqual([old.status, old.reason], ["failed", "not_live"]);
+    assert.match(JSON.stringify(old.detail), /superseded/);
+    assert.equal(doneAck(dir, sp.agent_id), false);
+    const fresh = await call(s2, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 1 });
+    assert.equal(fresh.status, "completed");
+    assert.equal(fresh.delivery_id, `host-S/${sp.agent_id}/1`);
+    assert.deepEqual(actsOf(dir, "host-S"), ["1", "2"]);
+  } finally {
+    await Promise.all([s1.close(), s2.close()]);
+  }
+}
+
+// S4 / S1 (c): a crash before ack (every cut) leaves no ack; the next process re-reports
+// the SAME delivery_id; once acked (crash after ack), a later process gets already_acked.
+async function testCrashBeforeAndAfterAck() {
+  for (const cut of ["before-write", "write-no-cb", "flushed-no-ack"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `r73-crash-${cut}-`));
+    const s1 = await startServer(dir, {}, cut);
+    const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: cut, name: "r73-crash" });
+    writeResult(sp.result_path, { summary: cut });
+    const owner1 = workerOwner(dir, sp.agent_id);
+    const first = await s1
+      .callTool({ name: "wait_tmux_agent", arguments: { agent_id: sp.agent_id, seq: 1, timeoutSec: 1 } })
+      .then((r) => r.structuredContent, () => undefined);
+    await s1.close();
+    assert.equal(doneAck(dir, sp.agent_id), false, `${cut}: no ack without a flushed response`);
+    if (cut === "before-write") assert.equal(first, undefined, "nothing reached the client");
+    ageSessionBeats(dir);
+    const s2 = await startServer(dir);
+    const again = await call(s2, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 1 });
+    await eventually(() => doneAck(dir, sp.agent_id), `${cut}: the ack`);
+    await s2.close();
+    assert.equal(again.status, "completed", `${cut}: re-reported`);
+    assert.equal(again.delivery_id, `${owner1}/${sp.agent_id}/1`);
+    if (first) assert.equal(first.delivery_id, again.delivery_id, `${cut}: a re-report carries the same delivery_id`);
+    assert.ok(doneAck(dir, sp.agent_id), `${cut}: acked once the response is flushed`);
+    // Crash after ack: the process is gone; the next one sees a closed episode.
+    ageSessionBeats(dir);
+    const s3 = await startServer(dir);
+    const after = await call(s3, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
+    await s3.close();
+    assert.equal(after.status, "already_acked");
+    assert.equal(after.body, undefined);
+    assert.equal(after.delivery_id, again.delivery_id);
+  }
+}
+
+// S4 in one process: the ack waits for the write callback; cancel before send, a send
+// error, an error response, an isError result and a transport close all leave no ack,
+// release the episode, and the next wait re-reports the same delivery_id.
+async function testAckBoundariesInProcess() {
+  const { AckingStdioTransport } = require("../src/server.js");
+  const { PassThrough } = require("node:stream");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-ack-"));
+  process.env.TMUX_AGENT_DIR = dir;
+  process.env.FAKE_AGENT_TMUX_ROOT = dir;
+  const writes = [];
+  const transport = (behave) =>
+    new AckingStdioTransport(new PassThrough(), {
+      write(chunk, cb) {
+        writes.push(String(chunk));
+        behave(cb);
+        return true;
+      },
+    });
+  let nextId = 100;
+  async function finished(name) {
+    const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: name, name });
+    writeResult(sp.result_path, { summary: name });
+    return sp;
+  }
+  const parked = async (sp) => {
+    const ac = new AbortController();
+    const requestId = nextId++;
+    const w = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId, signal: ac.signal } });
+    assert.equal(w.status, "completed");
+    assert.equal(doneAck(dir, sp.agent_id), false, "parked: no ack before the response is written");
+    return { w, ac, requestId };
+  };
+  const reReport = async (sp, w, why) => {
+    assert.equal(doneAck(dir, sp.agent_id), false, `${why}: no ack`);
+    const again = await waitTmuxAgent(sp.agent_id, 1, { seq: 1 });
+    assert.equal(again.status, "completed", `${why}: released and re-reported`);
+    assert.equal(again.delivery_id, w.delivery_id, `${why}: same delivery_id`);
+    assert.ok(doneAck(dir, sp.agent_id));
+  };
+
+  // 1. Write issued, callback pending → no ack; an overlapping wait waits; callback → ack.
+  let pendingCb;
+  const t1 = transport((cb) => (pendingCb = cb));
+  const sp1 = await finished("r73-pending");
+  const p1 = await parked(sp1);
+  const sending = t1.send({ jsonrpc: "2.0", id: p1.requestId, result: { structuredContent: p1.w, content: [] } });
+  const overlap = waitTmuxAgent(sp1.agent_id, 1, { seq: 1 });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(doneAck(dir, sp1.agent_id), false, "write returned, callback pending: no ack yet");
+  p1.ac.abort(); // a cancel that lands mid-write changes nothing
+  pendingCb();
+  await sending;
+  assert.ok(doneAck(dir, sp1.agent_id), "acked after the write callback");
+  const o = await overlap;
+  assert.equal(o.status, "already_acked");
+  assert.equal(o.delivery_id, p1.w.delivery_id);
+  assert.match(p1.w.delivery_id, new RegExp(`/${sp1.agent_id}/1$`));
+
+  // 2. Handler returned, cancelled before the send.
+  const sp2 = await finished("r73-cancel");
+  const p2 = await parked(sp2);
+  p2.ac.abort();
+  await reReport(sp2, p2.w, "cancel before send");
+
+  // 2b. Cancelled while the handler ran (the signal is already aborted): released, not parked.
+  const sp2b = await finished("r73-cancel-early");
+  const early = await waitTmuxAgent(sp2b.agent_id, 1, { seq: 1, extra: { requestId: nextId++, signal: AbortSignal.abort() } });
+  assert.equal(early.status, "completed");
+  assert.equal(doneAck(dir, sp2b.agent_id), false, "cancel during the handler: no ack");
+  const next = await Promise.race([
+    waitTmuxAgent(sp2b.agent_id, 1, { seq: 1 }),
+    new Promise((r) => setTimeout(() => r({ status: "hung" }), 5000)),
   ]);
-  assert.equal(left, right);
-  assert.equal(fs.readFileSync(path.join(dir, ".v3", ".mcp-session-id"), "utf8").trim(), left);
+  assert.equal(next.status, "completed", "cancel during the handler: the next wait is not stuck");
+  assert.equal(next.delivery_id, early.delivery_id);
+  assert.ok(doneAck(dir, sp2b.agent_id));
+
+  // 3. Send error.
+  const t3 = transport((cb) => setImmediate(() => cb(new Error("EPIPE (injected)"))));
+  const sp3 = await finished("r73-senderr");
+  const p3 = await parked(sp3);
+  await assert.rejects(t3.send({ jsonrpc: "2.0", id: p3.requestId, result: { structuredContent: p3.w, content: [] } }), /EPIPE/);
+  await reReport(sp3, p3.w, "send error");
+
+  // 4. Error response and isError result to the parked request.
+  const ok = transport((cb) => setImmediate(cb));
+  const sp4 = await finished("r73-errresp");
+  const p4 = await parked(sp4);
+  await ok.send({ jsonrpc: "2.0", id: p4.requestId, error: { code: -32603, message: "x" } });
+  await reReport(sp4, p4.w, "error response");
+  const sp5 = await finished("r73-iserror");
+  const p5 = await parked(sp5);
+  await ok.send({ jsonrpc: "2.0", id: p5.requestId, result: { isError: true, content: [] } });
+  await reReport(sp5, p5.w, "isError result");
+
+  // 5. Transport close.
+  const sp6 = await finished("r73-close");
+  const p6 = await parked(sp6);
+  await transport(() => {}).close();
+  await reReport(sp6, p6.w, "transport close");
+  assert.ok(writes.length >= 4);
+}
+
+// D-mcp-ack seq binding: E1 is still waited on while a send opens E2; each wait stays on
+// its episode, the ids differ; a late E1 wait after E2 exists gets E1; a late result and
+// malformed input or an IO error lose nothing.
+async function testEpisodesLateResultMalformedAndIoError() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-e1e2-"));
+  process.env.TMUX_AGENT_DIR = dir;
+  process.env.FAKE_AGENT_TMUX_ROOT = dir;
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "e1", name: "r73-e1e2" });
+  const e1 = waitTmuxAgent(sp.agent_id, 5, { seq: sp.seq });
+  process.env.FAKE_SEND_RESULT_JSON = "1";
+  const sent = await sendTmuxAgent(sp.agent_id, "now e2");
+  delete process.env.FAKE_SEND_RESULT_JSON;
+  assert.equal(sent.seq, 2);
+  writeResult(sp.result_path, { summary: "e1 late" });
+  const w1 = await e1;
+  const w2 = await waitTmuxAgent(sp.agent_id, 1, { seq: sent.seq });
+  assert.deepEqual([w1.status, w1.body.summary, w1.seq], ["completed", "e1 late", 1]);
+  assert.deepEqual([w2.status, w2.seq], ["completed", 2]);
+  assert.notEqual(w1.delivery_id, w2.delivery_id, "E1 and E2 ids differ");
+  assert.match(w2.delivery_id, new RegExp(`/${sp.agent_id}/2$`));
+  const late = await waitTmuxAgent(sp.agent_id, 0, { seq: 1 });
+  assert.deepEqual([late.status, late.delivery_id], ["already_acked", w1.delivery_id]);
+  assert.equal((await readTmuxAgent(sp.agent_id, 1)).summary, "e1 late", "read with seq reads that episode");
+
+  // Late result: a wait that timed out acks nothing; the result is delivered later.
+  const lr = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "late", name: "r73-late" });
+  assert.equal((await waitTmuxAgent(lr.agent_id, 0, { seq: 1 })).status, "timed_out");
+  assert.equal(doneAck(dir, lr.agent_id), false);
+  writeResult(lr.result_path, { summary: "late" });
+  assert.equal((await waitTmuxAgent(lr.agent_id, 1, { seq: 1 })).status, "completed");
+
+  // Malformed input: a bad or unknown seq is an error, never another episode.
+  for (const bad of [0, -1, 1.5, 99]) {
+    await assert.rejects(waitTmuxAgent(lr.agent_id, 0, { seq: bad }), (err) => err.code === "INVALID_SEQ");
+  }
+  await assert.rejects(readTmuxAgent(lr.agent_id, 99), (err) => err.code === "INVALID_SEQ");
+
+  // Malformed result, then an IO error: nothing acked; once readable, delivered.
+  const mr = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "bad", name: "r73-malformed" });
+  fs.writeFileSync(mr.result_path, "{ torn");
+  assert.equal((await waitTmuxAgent(mr.agent_id, 0, { seq: 1 })).reason, "invalid_result");
+  writeResult(mr.result_path, { summary: "fixed" });
+  fs.chmodSync(mr.result_path, 0o000);
+  try {
+    await assert.rejects(waitTmuxAgent(mr.agent_id, 0, { seq: 1 }), (err) => err.code === "IO_ERROR");
+  } finally {
+    fs.chmodSync(mr.result_path, 0o644);
+  }
+  assert.equal(doneAck(dir, mr.agent_id), false, "malformed / IO error: no ack");
+  const fixed = await waitTmuxAgent(mr.agent_id, 1, { seq: 1 });
+  assert.deepEqual([fixed.status, fixed.body.summary], ["completed", "fixed"]);
+}
+
+// S3, two processes on one session id: the mod (this process, channel mod) and an MCP
+// server (TMUX_AGENT_SESSION = the same id) both try; exactly one channel registers,
+// in either start order, and the refused one fences nothing.
+async function testChannelAuthorityModAndMcpBothTry() {
+  const { heartbeat, newGate } = require("../../skills/tmux-agent-tools/scripts/lib/workers.ts");
+  const { nodeHost } = require("../../skills/tmux-agent-tools/scripts/lib/host.node.ts");
+  for (const modFirst of [true, false]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `r73-channel-${modFirst ? "mod" : "mcp"}-first-`));
+    process.env.TMUX_AGENT_DIR = dir;
+    const session = "shared-S";
+    const modHost = nodeHost({ owner: session, cwd: REPO, log: () => {} });
+    const mod = newGate();
+    if (modFirst) assert.equal(await heartbeat(modHost, mod), true);
+    const s = await startServer(dir, { TMUX_AGENT_SESSION: session });
+    try {
+      if (!modFirst) {
+        assert.equal(await heartbeat(modHost, mod), false);
+        assert.match(mod.paused, /collected by its mcp channel/);
+      }
+      const sp = await call(s, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "S3", name: "r73-channel" });
+      writeResult(sp.result_path);
+      const w = await call(s, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
+      if (modFirst) {
+        assert.deepEqual([w.status, w.reason], ["failed", "not_live"]);
+        assert.match(w.detail, /collected by its mod channel/);
+        assert.equal(doneAck(dir, sp.agent_id), false);
+        assert.equal(await heartbeat(modHost, mod), true, "the mod is not fenced");
+      } else {
+        assert.equal(w.status, "completed");
+      }
+      assert.equal(channelOf(dir, session), modFirst ? "mod" : "mcp");
+      assert.deepEqual(actsOf(dir, session), ["1"], "exactly one channel registered");
+    } finally {
+      await s.close();
+    }
+  }
 }
 
 async function main() {
+  if (process.argv[2] === "--server") {
+    await serveWithCut(process.argv[3]);
+    return;
+  }
   if (process.argv[2] === "--child") {
     await runChild(process.argv[3], process.argv.slice(4));
     stopHeartbeat();
@@ -323,11 +663,10 @@ async function main() {
   if (process.argv[2] === "--findings") {
     const fixtures = path.join(__dirname, "fixtures/bin");
     process.env.PATH = `${fixtures}${path.delimiter}${process.env.PATH}`;
-    const which = process.argv[3] || "abcd";
+    const which = process.argv[3] || "abc";
     if (which.includes("a")) await testSharedSessionDeliversOnce();
     if (which.includes("b")) await testClosedEpisodeNotClaimedByOtherOwner();
-    if (which.includes("c")) await testPersistFailureIsToolError();
-    if (which.includes("d")) await testConcurrentSessionId();
+    if (which.includes("c")) await testNoProcessIdIsToolError();
     console.log(`findings ${which} ok`);
     return;
   }
@@ -419,7 +758,7 @@ async function main() {
   // 4. send_tmux_agent
   process.env.FAKE_SEND_RESULT_JSON = "1";
   const sent = await sendTmuxAgent(spawned.agent_id, "finish now");
-  assert.deepEqual(sent, { status: "submitted", completion_source: "result_json" });
+  assert.deepEqual(sent, { status: "submitted", completion_source: "result_json", seq: 2 });
   delete process.env.FAKE_SEND_RESULT_JSON;
 
   // 5. wait_tmux_agent
@@ -526,70 +865,21 @@ async function main() {
     }
   );
 
-  // 13. Server restart test: spawn with server 1, kill it, read with fresh server 2 from ledger
-  delete process.env.TMUX_AGENT_SESSION;
-  const restartClient1 = new Client({ name: "restart-client-1", version: "1.0.0" });
-  const restartTransport1 = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(repo, "src/server.js")],
-    cwd: repo,
-    env: process.env,
-    stderr: "pipe",
-  });
-  await restartClient1.connect(restartTransport1);
-  const restartSpawn = await restartClient1.callTool({
-    name: "spawn_tmux_agent",
-    arguments: { cli: "fake", repoPath: repo, task: "survive restart", name: "adapter-restart" },
-  });
-  const restartId = restartSpawn.structuredContent.agent_id;
-  const restartResultPath = restartSpawn.structuredContent.result_path;
-  fs.writeFileSync(restartResultPath, JSON.stringify({
-    schema_version: 1,
-    status: "done",
-    summary: "survived restart",
-    artifacts: [],
-    errors: [],
-  }));
-
-  // Verify stable session id was recorded on disk
-  const stableIdPath = path.join(tmp, ".v3", ".mcp-session-id");
-  assert.ok(fs.existsSync(stableIdPath), "stable session id must be persisted");
-  const session1Id = fs.readFileSync(stableIdPath, "utf8").trim();
-  assert.ok(session1Id.startsWith("mcp-session-"));
-
-  // Kill server process 1 by closing client transport
-  await restartClient1.close();
-
-  // Start fresh server process 2
-  const restartClient2 = new Client({ name: "restart-client-2", version: "1.0.0" });
-  const restartTransport2 = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(repo, "src/server.js")],
-    cwd: repo,
-    env: process.env,
-    stderr: "pipe",
-  });
-  await restartClient2.connect(restartTransport2);
-
-  // Verify server 2 reuses the same stable session id
-  const session2Id = fs.readFileSync(stableIdPath, "utf8").trim();
-  assert.equal(session2Id, session1Id, "server 2 must reuse the same stable session id across restart");
-
-  const restartRead = await restartClient2.callTool({
-    name: "read_tmux_agent",
-    arguments: { agent_id: restartId },
-  });
-  assert.equal(restartRead.structuredContent.status, "done");
-  assert.equal(restartRead.structuredContent.summary, "survived restart");
-  await restartClient2.close();
-
   delete process.env.TMUX_AGENT_SESSION;
   await testSharedSessionDeliversOnce();
   await testOverlappingWaitInSameProcessDeliversOnce();
   await testWaitTerminalAndEpisodeChecks();
   await testClosedEpisodeNotClaimedByOtherOwner();
-  await testPersistFailureIsToolError();
-  await testConcurrentSessionId();
+  await testNoProcessIdIsToolError();
+
+  // R7.3 (D-mcp-id, D-mcp-ack; plan §1c S1 (c), S3, S4)
+  await testTwoHostProcessesEachAssignAndWait();
+  await testRestartWaitsOnWorkerFromBeforeRestart();
+  await testSameHostReload();
+  await testCrashBeforeAndAfterAck();
+  await testAckBoundariesInProcess();
+  await testEpisodesLateResultMalformedAndIoError();
+  await testChannelAuthorityModAndMcpBothTry();
 
   stopHeartbeat();
   console.log("adapter smoke ok");

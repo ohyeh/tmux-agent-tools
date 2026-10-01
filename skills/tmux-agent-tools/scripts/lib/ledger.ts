@@ -317,6 +317,62 @@ export async function superseded(host: Host, sessionDir: string, n: number): Pro
   return acts ? (acts.at(-1) ?? 0) > n : undefined
 }
 
+// ── channel authority (plan §1c S3): one delivery channel per session ──────────
+
+/**
+ * Register an activation on the session's one delivery channel. `<sessionDir>/channel`
+ * is a symlink to `{channel, token}`, created once by `ln -sn`: the first registrant
+ * wins. The channel check and `registerActivation` run inside `<sessionDir>/channel.lock`
+ * (an action lock: only its holder releases it, it is never taken over), so a channel
+ * read outside the lock never counts. Another channel → `{ refused: <channel> }`, no
+ * registration. A busy lock or an unreadable channel → `undefined`: no registration
+ * this tick, and never read as "no channel yet".
+ */
+export async function registerOnChannel(
+  host: Host,
+  sessionDir: string,
+  channel: string,
+  me: Holder,
+  record: ActivationRecord,
+): Promise<{ n: number } | { refused: string } | undefined> {
+  const mk = await op(host, ['mkdir', '-p', sessionDir])
+  if (mk.exitCode !== 0) {
+    host.log(`tmux-agent: mkdir ${sessionDir}: ${mk.stderr.trim() || `exit ${mk.exitCode}`}`)
+    return undefined
+  }
+  const lockPath = `${sessionDir}/channel.lock`
+  const lock = await acquireLock(host, lockPath, me)
+  if (!lock.ok) {
+    const who = typeof lock.busy === 'string' ? lock.busy : `session ${lock.busy.session} (token ${lock.busy.token})`
+    host.log(`tmux-agent: ${lockPath} is held by ${who}; not registering this tick. A holder that crashed keeps it: rm '${lockPath}' once it is gone`)
+    return undefined
+  }
+  try {
+    const path = `${sessionDir}/channel`
+    let p = await probeHolder(host, path)
+    if ('absent' in p) {
+      const c = contest(host, `channel ${path}`, await op(host, ['ln', '-sn', JSON.stringify({ channel, token: me.token }), path]))
+      if (c === 'unknown') return undefined
+      if (c === 'won') return withN(await registerActivation(host, sessionDir, record))
+      p = await probeHolder(host, path)
+    }
+    if (!('holder' in p)) {
+      host.log(`tmux-agent: ${'unreadable' in p ? p.unreadable : `${path} vanished`}; not registering this tick`)
+      return undefined
+    }
+    const owner = (p.holder as unknown as { channel?: unknown }).channel
+    if (typeof owner !== 'string' || !owner) {
+      host.log(`tmux-agent: ${path} names no channel; not registering this tick`)
+      return undefined
+    }
+    if (owner !== channel) return { refused: owner }
+    return withN(await registerActivation(host, sessionDir, record))
+  } finally {
+    if (!(await releaseLock(host, lockPath, me.token))) host.log(`tmux-agent: could not release ${lockPath}; the next registration reports it busy`)
+  }
+}
+const withN = (n: number | undefined) => (n === undefined ? undefined : { n })
+
 // ── episodes (§2, §8): allocation, immutable descriptor, markers, recovery ──────
 
 /** `worker.json`: the worker's identity, published once at name reservation (assign and resume). */

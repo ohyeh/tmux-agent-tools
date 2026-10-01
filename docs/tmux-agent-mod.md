@@ -357,9 +357,12 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 - The lock holder pid is `$PPID` of a `/bin/sh` probe (`processId`, `skills/tmux-agent-tools/scripts/lib/workers.ts:2566`). In the collector that pid is the node process; in the engine it is UNCONFIRMED that it is the engine and not a short-lived intermediate. `unlock` also requires the holder's session to be non-live (`unlockWorker`, `workers.ts:2652`), and the waiter `binding` hold (`waiterOf` / `holderProvablyAlive`, `workers.ts:861` and `:838`) is released when that pid is provably gone — if the recorded pid is an intermediate, a binding can be released during the spawn window and E1 may be delivered by both the waiter and the collector (one extra re-report).
 - `holderProvablyAlive` treats a `ps` exit other than 0 with empty output as the pid gone (`workers.ts:849`).
 - The launcher steals a stale collector lock after 5 seconds (`LOCK_STALE_MS`, `skills/tmux-agent-tools/scripts/lib/launcher.node.ts:47`, used at `:122`).
-- Contract §2 `current` is not written. `allocateNext` takes one past the max listed seq (`skills/tmux-agent-tools/scripts/lib/ledger.ts:50`).
-- The wrapper half of “a late launch-lifecycle fold after tell E2 lands at the launch path only” is traced in `agent-tmux` (`reconcile_launch_envelope`, `skills/tmux-agent-tools/scripts/agent-tmux:3672`, which folds `$(agent_root_dir)/$name/result.json`). It is not a tested p2-matrix row. The core observation is `workers.contract.node.ts:687`.
-- Commander `collect` is started with `TMUX` unset (`skills/tmux-agent-tools/scripts/tmux-agent-commander:256` and `:376`) and then calls `tmux` with no `-S`, so the socket is the `TMUX_TMPDIR` default. `scripts/test-commander-smoke` isolates that with a private `TMUX_TMPDIR` (`:32`) plus a `-S` shim (`:37`, `:125`).
+- The ledger has no seq pointer file. The next activation or episode number is one past the max listed child (`allocateNext`, `skills/tmux-agent-tools/scripts/lib/ledger.ts:50`). Nothing writes or reads a pointer (plan R8.4).
+- A late launch-lifecycle fold after tell E2 lands on E1's path only. `stop` (`finalize_launch_envelope`) and a result read (`reconcile_launch_envelope`) fold only `$(agent_root_dir)/$name/result.json`. That is E1's path. E1 keeps its `status` and `episode`, and E2's `episodes/2/` stays byte-identical. A second stop does not fold again. `scripts/test-wrapper-limits-smoke` case c runs this with the real wrapper. The core side is `workers.contract.node.ts` (“a seq ≥ 2 result on the launch path”).
+- One tmux server for the whole chain. `TMUX_AGENT_TMUX_SOCKET` puts `-S` on every tmux call of `agent-tmux` (`TMUX_SOCKET_ARGS`) and of the node core (`host.node.ts`). `tmux-agent-commander` sets the variable from its own `$TMUX` socket when it is unset, exports it, and passes it to the `run-shell` collector. Without the variable and outside tmux, the chain uses tmux's default socket under `TMUX_TMPDIR`. `agent-tmux` never takes the server from `$TMUX`. `scripts/test-wrapper-limits-smoke` case b runs this with two private servers.
+- Name collision (plan R8.5, breaking): `start`, `resume`, and `start-ssh` never replace a live session. A live `<prefix>-<name>` makes them exit 1 before they touch any state of the name. tmux's own duplicate-session refusal in `new-session` covers a session that appears after the check. The launch writes the pane id that `new-session -P` printed to `<name>/pane-id`. `stop` refuses (exit 1) when the session of that name does not hold that pane. The core's `reserve` draws another name for a live session, so the refusal applies to a direct `--exact` launch.
+- An earlier launch's `result.json` and `stdout.log` are kept, not harvested. A new `start` or `resume` of the same name moves them (when they are not empty) into `<name>/legacy-<UTC time>-<pid>/` and prints that path on stderr. A result from a wrapper or collector from before an upgrade stays readable at that path. Nothing reads or delivers it from there on its own.
+- Polling cannot see some rewrites. The collector samples each result path at most once per tick (`POLL_MS` = 10 s, `workers.ts:124`). A pass reads at most `BATCH_MAX` = 20 workers within `COLLECT_BUDGET_MS` = 4 s, and the rest wait for the next tick. A read is stat, read, stat. A file whose mtime or size moved is read again next tick (`workers.ts:1281`). A snapshot's identity is the first 16 hex of sha256 of its bytes plus `floor(mtimeMs)` (`identity`, `workers.ts:1240`). So two rewrites are invisible: (1) a state that is overwritten before the next sample, which can be up to one tick plus the pass time, or longer when the batch defers the path; (2) a rewrite with the same bytes within the same mtime millisecond. On a filesystem with 1 s mtime resolution, that is the same second.
 - `.github/workflows/release.yml` has not run on GitHub yet. The Codex install with id `tmux-agent` was verified once before the last manifest change and has not been re-run.
 - `mock.clock` **確實**驅動 plugin 的 `$.clock.every`（本 mod 只用 `every`，
   沒有用到 `after`）：tick、面板的 2 秒
@@ -459,7 +462,7 @@ TUI 的按鍵（plan R4.6；畫出來的每個鍵都有 handler，contract 測�
 - 不帶 `--session` 的 viewer 是唯讀：`x c i n t + - U` 都只顯示
   「唯讀；帶 --session 才能操作」，不動 ledger、ack、pane。
 
-「收件」狀態（C-health）：每個收件通道（mod、node collector；MCP 在 R7）在
+「收件」狀態（C-health）：每個收件通道（mod、node collector、MCP adapter）在
 `heartbeat` 與投遞被拒三次而暫停時，以 temp＋rename 寫自己那個 activation 的
 `act/<n>.state`（`{token, channel, mode, status, reason?, updatedAt}`，只在內容變了
 才寫）。TUI 只讀最大的 n，配合 `sessionLiveness`：沒有 session 目錄或 activation →
@@ -469,7 +472,17 @@ on-request 寫成「MCP：host 呼叫 tool 時才收」；beat 超過 90 秒 →
 讀不到、JSON 不合法、token 對不上、或讀的時候最大 n 一直變 → `unknown（原因）`。
 `act/<n>.state` 只給 TUI 看，不參與 fencing、claim 與 `sessionLiveness`。
 
-TUI 結束時（`q`、Ctrl-C（任何模式，輸入列開著也一樣）、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw），並關掉 bracketed paste；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。還原的某一步失敗時，其他步驟照做，每個錯誤在離開 alt screen 後印到 stderr，TUI 以 exit 1 結束（按 `q` 結束也一樣）。啟動時任何一步（raw mode、resume、alt screen）失敗，TUI 不啟動：已做的步驟還原，錯誤印出，exit 1。TUI 開著時 terminal 是 bracketed paste（DECSET 2004）：貼上的 `q`、`x` 是文字，不是按鍵。
+一個 session 只有一個收件通道（plan §1c S3）：`<sessionDir>/channel` 是 `ln -sn`
+建立一次的 `{channel, token}`，先註冊的通道贏。查 channel 與 `registerActivation`
+在 `<sessionDir>/channel.lock`（action lock 規則：只有持有者釋放，不搶）裡一起做。
+別的通道用同一個 session id 註冊時被拒，不建 activation，所以不會 fence 現有的
+通道；它的 gate 停在 paused（`this session is collected by its <channel> channel …`）。
+channel 讀不到、或 `channel.lock` 被佔用 → 這一拍不註冊，下一拍再試；crash 留下的
+`channel.lock` 要手動 `rm`（log 印出路徑）。通知的每個 worker 區塊帶一行
+`delivery_id: <gen0 owner>/<name>/<seq>`：重報（at-least-once）時這一行不變，
+認領之後也不變。
+
+TUI 結束時（`q`、Ctrl-C（任何模式，輸入列開著也一樣）、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw），並關掉 bracketed paste；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。還原的某一步失敗時，其他步驟照做，每個錯誤在離開 alt screen 後印到 stderr，TUI 以 exit 1 結束（按 `q` 結束也一樣）。啟動時任何一步（raw mode、resume、alt screen）失敗，TUI 不啟動：已做的步驟還原，錯誤印出，exit 1。TUI 開著時 terminal 是 bracketed paste（DECSET 2004）：貼上的 `q`、`x` 是文字，不是按鍵。沒有結束標記（`ESC[201~`）的 paste 或沒結束的 escape sequence 不會卡住 TUI：1 秒沒有新輸入、CSI 參數超過 256 個字元、或 paste 超過 65536 個字元時，整段丟掉，狀態列顯示 `input — dropped an unfinished paste or escape sequence …`，丟掉的內容不會變成按鍵。paste 開著時按 Ctrl-C：丟掉這段 paste 並結束 TUI（按一次即可；所以內容含 0x03 的 paste 也會結束 TUI）。
 
 TUI 的位置跟著 mod 已經在用的 `agent-tmux` 走（`PATH`、marketplace checkout、
 `npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。找不到 `node`、
