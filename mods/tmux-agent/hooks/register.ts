@@ -92,7 +92,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.44.1'
+const MOD_VERSION = '0.44.2'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -783,7 +783,9 @@ export const register: Register = on => {
       displayCells('[ hide ]') +
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
-    const words = displayCells(full) + cellsOf(true) <= width
+    // A desktop draws native buttons, so cells do not bound it, and a bare glyph there
+    // read as greyed out on the accent bar (2026-10-02 screenshot): words always.
+    const words = e.surface === 'desktop' || displayCells(full) + cellsOf(true) <= width
     const addLabel = words ? '+ new' : '+'
     const refreshLabel = words ? '↻ refresh' : '↻'
     const tuiLabel = words ? '⧉ tui' : '⧉'

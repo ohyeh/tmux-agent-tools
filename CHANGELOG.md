@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.44.2 - 2026-10-02
+
+- Fix (mod panel, desktop): the header buttons always carry their words (`+ new`, `↻ refresh`, `⧉ tui`) on the desktop surface. A desktop draws native buttons, so the cell budget does not apply, and the bare glyphs read as greyed out on the accent bar. A narrow terminal still folds to glyphs.
+- Fix (tests): `test-core-contract-smoke` runs under a private `TMPDIR`, removed on exit; runs had left ~60k temp repos in the user's `$TMPDIR`.
+
 ## v0.44.1 - 2026-10-02
 
 - Fix (mod panel): the folded other-session line read `運行中 0：@883d8295 1` (lead count = running rows, per-holder counts = all rows). It now prints both: `運行中 0/共 1：@883d8295 1`.

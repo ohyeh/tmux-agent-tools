@@ -5365,7 +5365,9 @@ describe('resume', () => {
       const tree = await desk(maxRows, columns)
       expect(rows(tree, columns), `${maxRows} rows, ${columns} columns`).toBeLessThanOrEqual(maxRows)
       expect(keysOf(tree), 'the selected row survives a small band').toContain('w1#1')
+      expect(textOf(tree), 'desktop header buttons keep their words').toContain('↻ refresh')
     }
+    expect(textOf(await $.ui.render(bandRender(12, 11, 40))), 'a narrow terminal still folds to glyphs').not.toContain('↻ refresh')
   })
 
   /** Every exclusive `mkdir <v3>/<name>` answers EACCES: reserve() reports `unknown` (H7). */
