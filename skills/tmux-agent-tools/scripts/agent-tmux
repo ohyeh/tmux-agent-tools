@@ -8385,15 +8385,22 @@ FAKE_EOF
   saved_launch_flags="$LAUNCH_FLAGS"
   saved_result_prompt="${RESULT_PATH_VIA_PROMPT-}"
   saved_dir="${TMUX_AGENT_DIR-}"
+  # One base per run: cleanup kills every session it made, even when a start's
+  # output could not be parsed (that path leaked sessions before).
+  local st_base="st-rp-$$"
 
+  # The body runs in a subshell and its status is returned after `always`: under
+  # `set -e`, a `return`/`exit`/failing command inside a try block skips `always`.
+  local body_rc=0
   {
+    (
     CLI_BIN="$fake_cli"
     LAUNCH_FLAGS=''
     RESULT_PATH_VIA_PROMPT=true
     export TMUX_AGENT_DIR="$tmp_dir/agents"
 
-    out1="$(start_session "st-rp" "$tmp_dir" "first prompt")"
-    out2="$(start_session "st-rp" "$tmp_dir" "second prompt")"
+    out1="$(start_session "$st_base" "$tmp_dir" "first prompt")"
+    out2="$(start_session "$st_base" "$tmp_dir" "second prompt")"
     name1="$(printf '%s\n' "$out1" | while IFS= read -r line; do
       case "$line" in
         "agent: "*) printf '%s' "${line#agent: }"; break ;;
@@ -8409,18 +8416,18 @@ FAKE_EOF
 
     if [[ -z "$name1" || -z "$name2" || "$name1" == "$name2" || "$path1" == "$path2" ]]; then
       echo "self-test result-path-prompt: FAIL (expected two distinct non-exact result paths)" >&2
-      return 1
+      exit 1
     fi
 
     pane="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane -J -t "$(session_target "$(session_for_name "$name1")")" -p -S -200)"
     if [[ "$pane" != *"$path1"* ]]; then
       echo "self-test result-path-prompt: FAIL (initial prompt missing $path1)" >&2
-      return 1
+      exit 1
     fi
     pane="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane -J -t "$(session_target "$(session_for_name "$name2")")" -p -S -200)"
     if [[ "$pane" != *"$path2"* ]]; then
       echo "self-test result-path-prompt: FAIL (initial prompt missing $path2)" >&2
-      return 1
+      exit 1
     fi
 
     # Once-per-session (#283): start already injected path1 and marked the
@@ -8432,11 +8439,15 @@ FAKE_EOF
     after_count="$(count_literal_occurrences "$pane" "$path1")"
     if (( after_count != before_count )); then
       echo "self-test result-path-prompt: FAIL (follow-up send-wait re-injected $path1; expected once-per-session)" >&2
-      return 1
+      exit 1
     fi
+    ) || body_rc=$?
   } always {
-    [[ -n "$name1" ]] && "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$(session_for_name "$name1")")" 2>/dev/null || true
-    [[ -n "$name2" ]] && "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$(session_for_name "$name2")")" 2>/dev/null || true
+    local st_session
+    for st_session in ${(f)"$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null)"}; do
+      [[ "$st_session" == "$PREFIX-$st_base" || "$st_session" == "$PREFIX-$st_base"[.-]* ]] || continue
+      "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "=$st_session" 2>/dev/null || true
+    done
     CLI_BIN="$saved_cli_bin"
     LAUNCH_FLAGS="$saved_launch_flags"
     RESULT_PATH_VIA_PROMPT="$saved_result_prompt"
@@ -8447,6 +8458,7 @@ FAKE_EOF
     fi
     rm -rf "$tmp_dir"
   }
+  (( body_rc == 0 )) || return "$body_rc"
 
   echo "self-test result-path-prompt: ok"
 }
@@ -8502,7 +8514,11 @@ self_test_watch_count() {
   session2="$(session_for_name "$name2")"
   session3="$(session_for_name "$name3")"
 
+  # The body runs in a subshell and its status is returned after `always`: under
+  # `set -e`, a `return`/`exit`/failing command inside a try block skips `always`.
+  local body_rc=0
   {
+    (
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session2")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session3")" 2>/dev/null || true
@@ -8518,7 +8534,7 @@ self_test_watch_count() {
     fi
     if (( rc != 2 )); then
       echo "self-test watch-count: FAIL (mixed --any/--count expected rc=2, got $rc)" >&2
-      return 1
+      exit 1
     fi
 
     (
@@ -8534,12 +8550,13 @@ self_test_watch_count() {
     writer_pid=""
     if (( rc != 0 )); then
       echo "self-test watch-count: FAIL (--count 2 returned $rc)" >&2
-      return 1
+      exit 1
     fi
     if [[ "$("$JQ" -r '.mode' <<< "$out")" != count || "$("$JQ" -r '.required_count' <<< "$out")" != 2 || "$("$JQ" -r '.done_count' <<< "$out")" != 2 ]]; then
       echo "self-test watch-count: FAIL (unexpected JSON: $out)" >&2
-      return 1
+      exit 1
     fi
+    ) || body_rc=$?
   } always {
     [[ -n "$writer_pid" ]] && kill "$writer_pid" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
@@ -8552,6 +8569,7 @@ self_test_watch_count() {
     fi
     rm -rf "$tmp_dir"
   }
+  (( body_rc == 0 )) || return "$body_rc"
 
   echo "self-test watch-count: ok"
 }
@@ -8564,7 +8582,11 @@ self_test_team_quorum() {
   export TMUX_AGENT_DIR="$tmp_dir/agents"
   team="st-quorum-$$"
 
+  # The body runs in a subshell and its status is returned after `always`: under
+  # `set -e`, a `return`/`exit`/failing command inside a try block skips `always`.
+  local body_rc=0
   {
+    (
     mkdir -p "$(agent_root_dir)/$team-w1" "$(agent_root_dir)/$team-w2" "$(agent_root_dir)/$team-w3"
     _team_write_state "$team" "$CLI" "$("$JQ" -cn \
       --arg n1 "$team-w1" --arg n2 "$team-w2" --arg n3 "$team-w3" \
@@ -8581,11 +8603,11 @@ self_test_team_quorum() {
     rc=$?
     if (( rc != 0 )); then
       echo "self-test team-quorum: FAIL (--count 2 returned $rc)" >&2
-      return 1
+      exit 1
     fi
     if [[ "$("$JQ" -r '.met' <<< "$out")" != true || "$("$JQ" -r '.matched_count' <<< "$out")" != 2 ]]; then
       echo "self-test team-quorum: FAIL (unexpected JSON: $out)" >&2
-      return 1
+      exit 1
     fi
 
     if ( _team_quorum "$team" --count 2 --field .status --json >/dev/null 2>&1 ); then
@@ -8595,14 +8617,15 @@ self_test_team_quorum() {
     fi
     if (( rc != 2 )); then
       echo "self-test team-quorum: FAIL (missing --value expected rc=2, got $rc)" >&2
-      return 1
+      exit 1
     fi
 
     out="$(_team_quorum "$team" --count 3 --field .status --value success --json)" && rc=0 || rc=$?
     if (( rc == 0 )); then
       echo "self-test team-quorum: FAIL (--count 3 unexpectedly met: $out)" >&2
-      return 1
+      exit 1
     fi
+    ) || body_rc=$?
   } always {
     if [[ -n "$saved_dir" ]]; then
       export TMUX_AGENT_DIR="$saved_dir"
@@ -8611,6 +8634,7 @@ self_test_team_quorum() {
     fi
     rm -rf "$tmp_dir"
   }
+  (( body_rc == 0 )) || return "$body_rc"
 
   echo "self-test team-quorum: ok"
 }
