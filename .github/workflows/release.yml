@@ -86,7 +86,7 @@ jobs:
         run: |
           unset TMUX TMUX_PANE
           export TMUX_TMPDIR="$(mktemp -d /tmp/tas-rel.XXXXXX)"
-          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null || true; rm -rf "$TMUX_TMPDIR"' EXIT
           scripts/run-all-smokes
 
       - name: Validate release candidate
@@ -104,7 +104,7 @@ jobs:
           fi
           unset TMUX TMUX_PANE
           export TMUX_TMPDIR="$(mktemp -d /tmp/tas-diag.XXXXXX)"
-          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+          trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null || true; rm -rf "$TMUX_TMPDIR"' EXIT
           zsh -n skills/tmux-agent-tools/scripts/agent-tmux
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-dialogue
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
