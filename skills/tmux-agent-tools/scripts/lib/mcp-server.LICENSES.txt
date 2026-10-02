@@ -1,4 +1,4 @@
-Third-party software bundled in mcp-server.mjs (tmux-agent-mcp v0.42.0).
+Third-party software bundled in mcp-server.mjs (tmux-agent-mcp v0.43.0).
 
 ========================================================================
 @modelcontextprotocol/sdk@1.29.0 (MIT)
