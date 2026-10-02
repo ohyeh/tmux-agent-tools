@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.44.3 - 2026-10-02
+
+- Fix (mod panel, desktop): 0.44.2 let the desktop words also take the cell budget, so a desktop band under 100 columns lost the `workers v…` title. Only the labels keep their words now; the budget still decides the title and the hint.
+
 ## v0.44.2 - 2026-10-02
 
 - Fix (mod panel, desktop): the header buttons always carry their words (`+ new`, `↻ refresh`, `⧉ tui`) on the desktop surface. A desktop draws native buttons, so the cell budget does not apply, and the bare glyphs read as greyed out on the accent bar. A narrow terminal still folds to glyphs.

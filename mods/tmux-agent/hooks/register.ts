@@ -92,7 +92,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.44.2'
+const MOD_VERSION = '0.44.3'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -783,12 +783,14 @@ export const register: Register = on => {
       displayCells('[ hide ]') +
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
-    // A desktop draws native buttons, so cells do not bound it, and a bare glyph there
-    // read as greyed out on the accent bar (2026-10-02 screenshot): words always.
-    const words = e.surface === 'desktop' || displayCells(full) + cellsOf(true) <= width
-    const addLabel = words ? '+ new' : '+'
-    const refreshLabel = words ? '↻ refresh' : '↻'
-    const tuiLabel = words ? '⧉ tui' : '⧉'
+    const words = displayCells(full) + cellsOf(true) <= width
+    // A desktop draws native buttons, and a bare glyph there read as greyed out on the
+    // accent bar (2026-10-02 screenshot): its labels keep their words. Only the labels:
+    // the cell budget below still decides the title and the hint.
+    const named = words || e.surface === 'desktop'
+    const addLabel = named ? '+ new' : '+'
+    const refreshLabel = named ? '↻ refresh' : '↻'
+    const tuiLabel = named ? '⧉ tui' : '⧉'
     const buttonCells = cellsOf(words)
     const titleText = displayCells(full) + buttonCells <= width ? full : ` ${counts} `
     const titleCells = displayCells(titleText) + buttonCells

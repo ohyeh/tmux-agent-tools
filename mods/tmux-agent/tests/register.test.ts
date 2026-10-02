@@ -5368,6 +5368,7 @@ describe('resume', () => {
       expect(textOf(tree), 'desktop header buttons keep their words').toContain('↻ refresh')
     }
     expect(textOf(await $.ui.render(bandRender(12, 11, 40))), 'a narrow terminal still folds to glyphs').not.toContain('↻ refresh')
+    expect(textOf(await desk(12, 90)), 'the words do not cost the desktop its version title').toContain('workers v')
   })
 
   /** Every exclusive `mkdir <v3>/<name>` answers EACCES: reserve() reports `unknown` (H7). */
