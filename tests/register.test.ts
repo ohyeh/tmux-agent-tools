@@ -57,8 +57,8 @@ function mockFs(
   on('fs.stat', ($, e) => {
     seen.stats.push(e.path)
     const text = files[e.path]
-    if (text !== undefined) return { value: { kind: 'file' as const, size: text.length, mtimeMs: mtimes.get(e.path) ?? 0 } }
-    if (isDir(e.path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: mtimes.get(e.path) ?? 0 } }
+    if (text !== undefined) return { value: { kind: 'file' as const, size: text.length, mtimeMs: mtimes.get(e.path) ?? 0, isLink: false } }
+    if (isDir(e.path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: mtimes.get(e.path) ?? 0, isLink: false } }
     return { deny: `ENOENT: ${e.path}` }
   })
   on('fs.exists', ($, e) => {
@@ -80,8 +80,11 @@ function mockFs(
     return {
       value: [...names].map(name => ({
         name,
-        kind: files[`${prefix}${name}`] !== undefined || links.has(`${prefix}${name}`) ? ('file' as const) : ('dir' as const),
+        // 2.1.287: a symbolic link lists as `other`, whatever it leads to (FsEntry.kind).
+        kind: links.has(`${prefix}${name}`) ? ('other' as const) : files[`${prefix}${name}`] !== undefined ? ('file' as const) : ('dir' as const),
         size: 0,
+        mtimeMs: mtimes.get(`${prefix}${name}`) ?? 0,
+        isLink: links.has(`${prefix}${name}`),
       })),
     }
   })
@@ -116,7 +119,7 @@ function releaseSessionId(on: On): void {
   withheldSessionIds.delete(on)
 }
 
-type RunResult = { value: { exitCode: number; stdout: string; stderr: string } }
+type RunResult = { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }
 
 /**
  * One `process.run` hook per test (the engine refuses a second `on` of one event):
@@ -169,8 +172,8 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
   const [cmd, ...a] = argv
   const isDir = (p: string) => isDirIn(files, p)
   const present = (p: string) => p in files || links.has(p) || isDir(p)
-  const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
-  const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr } })
+  const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
   const mkdir = (p: string) => {
     files[`${p}/`] = ''
     mtimes.set(p, clockNow())
@@ -434,7 +437,7 @@ describe('ownership', () => {
   const collectorFloor = (on: On) => {
     mockSessionStart(on)
       on('ui.status', () => ({ value: undefined }))
-    onRun(on, () => ({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' } }))
+    onRun(on, () => ({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   }
 
   test("a live session's worker is left to it; an orphan and an unowned record are adopted", WITH_DRIVER, async ($, on) => {
@@ -613,7 +616,7 @@ describe('ownership', () => {
     const cwds: string[] = []
     onRun(on, ($, e) => {
       cwds.push(String((e as { cwd?: unknown }).cwd))
-      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":1}', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":1}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     const logs: string[] = []
     on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
@@ -666,8 +669,8 @@ describe('ownership', () => {
     on('ui.status', () => ({ value: undefined }))
     const held = { hang: false, release: [] as (() => void)[] }
     onRun(on, () => held.hang
-      ? new Promise(resolve => held.release.push(() => resolve({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' } })))
-      : ({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' } }))
+      ? new Promise(resolve => held.release.push(() => resolve({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })))
+      : ({ value: { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
 
     await $.session.start(session())
     // Every subprocess from here on hangs, so the next reconcile pass never ends.
@@ -898,10 +901,10 @@ describe('delivery', () => {
       const [, , , verb, a, b, c] = e.argv
       if (verb === 'cat-file' && a === '-t') {
         const kind = objects[b!]
-        return { value: kind ? { exitCode: 0, stdout: `${kind}\n`, stderr: '' } : { exitCode: 128, stdout: '', stderr: 'fatal: Not a valid object name' } }
+        return { value: kind ? { exitCode: 0, stdout: `${kind}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } : { exitCode: 128, stdout: '', stderr: 'fatal: Not a valid object name', isStdoutTruncated: false, isStderrTruncated: false } }
       }
-      if (verb === 'merge-base') return { value: { exitCode: descendants.includes(c!) ? 0 : 1, stdout: '', stderr: '' } }
-      return { value: { exitCode: 128, stdout: '', stderr: 'unexpected' } }
+      if (verb === 'merge-base') return { value: { exitCode: descendants.includes(c!) ? 0 : 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return { value: { exitCode: 128, stdout: '', stderr: 'unexpected', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     return calls
   }
@@ -1343,7 +1346,7 @@ describe('assign', () => {
     const argvs: string[][] = []
     onRun(on, ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     const out = await $.tool.call({
@@ -1367,7 +1370,7 @@ describe('assign', () => {
     const argvs: string[][] = []
     onRun(on, ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     const out = await $.tool.call({
@@ -1392,7 +1395,7 @@ describe('assign', () => {
     const argvs: string[][] = []
     onRun(on, ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     const out = await $.tool.call({
@@ -1418,7 +1421,7 @@ describe('assign', () => {
     const argvs: string[][] = []
     onRun(on, ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     const out = JSON.stringify(
@@ -1451,7 +1454,7 @@ describe('assign', () => {
     const head = 'f'.repeat(40)
     onRun(on, ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     const out = await $.tool.call({
@@ -1486,7 +1489,7 @@ describe('assign', () => {
     mockClock(on)
     const files: Files = {}
     mockFs(on, files)
-    onRun(on, () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    onRun(on, () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
 
     await $.tool.call({
       tool: 'mcp__tmux-agent__assign',
@@ -1571,7 +1574,7 @@ function mockStatus(
   const calls: (readonly string[])[] = []
   onRun(on, ($, e) => {
     calls.push(e.argv)
-    return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+    return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return { calls }
 }
@@ -1819,7 +1822,7 @@ function mockPanel(
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('ui.open', ($, e) => {
     open.push(e.id)
-    return { value: undefined }
+    return { value: { isPlaced: true as const } }
   })
   on('ui.close', ($, e) => {
     if (refuseClose === 'throw') throw new Error('another hook keeps the pane open')
@@ -1853,12 +1856,12 @@ function mockPanel(
   onRun(on, async ($, e) => {
     argv.push(e.argv)
     // grep over a session log (resume's cwd lookup): `probe.grep` is its stdout.
-    if (e.argv[0] === 'grep') return { value: { exitCode: typeof probe.grep === 'string' ? 0 : 1, stdout: typeof probe.grep === 'string' ? probe.grep : '', stderr: '' } }
+    if (e.argv[0] === 'grep') return { value: { exitCode: typeof probe.grep === 'string' ? 0 : 1, stdout: typeof probe.grep === 'string' ? probe.grep : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     // `[ ⧉ ]`: the node + tui.node.ts lookup is `probe.sh`; the split names a pane.
-    if (e.argv[0] === '/bin/sh' && typeof probe.sh === 'string') return { value: { exitCode: 0, stdout: probe.sh, stderr: '' } }
+    if (e.argv[0] === '/bin/sh' && typeof probe.sh === 'string') return { value: { exitCode: 0, stdout: probe.sh, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     // `probe.sh: false`: the lookup finds no node or no script (`[ -x ]` fails, no output).
-    if (e.argv[0] === '/bin/sh' && probe.sh === false) return { value: { exitCode: 1, stdout: '', stderr: '' } }
-    if (e.argv[0] === 'tmux' && e.argv[1] === 'split-window') return { value: { exitCode: 0, stdout: '%9\n', stderr: '' } }
+    if (e.argv[0] === '/bin/sh' && probe.sh === false) return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === 'tmux' && e.argv[1] === 'split-window') return { value: { exitCode: 0, stdout: '%9\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     const isList = e.argv[0] === 'tmux' && e.argv[1] === 'list-sessions'
     const isCapturePane = e.argv[0] === 'tmux' && e.argv[1] === 'capture-pane'
     const isCapture = e.argv.includes('capture') || isCapturePane
@@ -1886,8 +1889,7 @@ function mockPanel(
       value: {
         exitCode: (isLs || isList) && typeof probe.exitCode === 'number' ? probe.exitCode : 0,
         stdout: isCapture ? text : isList ? listed : isLs ? sessions : JSON.stringify(probe),
-        stderr: '',
-      },
+        stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     }
   })
   return { argv, open, closed, logs, statuses, toasts }
@@ -1954,8 +1956,8 @@ describe('panel', () => {
 })
 
 /** The band above the prompt as the engine would ask for it; `maxRows` is the room it has. */
-const bandRender = (maxRows = 40, bodyRows = maxRows - 1, columns = 80) => ({
-  surface: 'terminal' as const,
+const bandRender = (maxRows = 40, bodyRows = maxRows - 1, columns = 80, surface: 'terminal' | 'desktop' = 'terminal') => ({
+  surface,
   component: 'AbovePrompt' as const,
   requestId: 'above-prompt',
   viewport: { columns: Math.max(100, columns), rows: maxRows + 10 },
@@ -2448,8 +2450,7 @@ describe('regressions', () => {
         value: {
           exitCode: 0,
           stdout: JSON.stringify({ running: true, idle_seconds: 30 * 60 }),
-          stderr: '',
-        },
+          stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
       }
     })
 
@@ -3229,7 +3230,7 @@ describe('teammates', () => {
     mockPanel(on, { running: true })
     const ran: string[] = []
     on('tool.call', { tool: 'Bash' }, ($, e) => {
-      ran.push((e as { command: string }).command)
+      ran.push(String(e.command))
       return { result: 'ok' }
     })
     const bash = (command: string) => $.tool.call({ tool: 'Bash' as const, command })
@@ -3297,8 +3298,8 @@ describe('astra re-review of e8704d6', () => {
     }
     mockFs(on,files);const wake=mockWake(on);
     onRun(on, async ($,e)=>{
-      if(e.argv[0]==='git'){await clock.advance(2000);return {value:{exitCode:0,stdout:'commit\n',stderr:''}};}
-      return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:''}};
+      if(e.argv[0]==='git'){await clock.advance(2000);return {value:{exitCode:0,stdout:'commit\n',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};}
+      return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
     });
     await $.turn.complete(turn());
     expect(wake.join('\n')).not.toContain('look stopped by their CLI');
@@ -3308,7 +3309,7 @@ describe('astra re-review of e8704d6', () => {
     const files:Files={...worker('w1',0,{base:'a'.repeat(40)}),[`${V3}/w1/result.json`]:finished()};
     mockFs(on,files);mockWake(on);mockSessionStart(on);on('ui.status',()=>({value:undefined}));
     const calls:string[][]=[];
-    onRun(on, ($,e)=>{calls.push([...e.argv]);return {value:{exitCode:e.argv[0]==='git'?128:0,stdout:'',stderr:e.argv[0]==='git'?'not a repository':''}};});
+    onRun(on, ($,e)=>{calls.push([...e.argv]);return {value:{exitCode:e.argv[0]==='git'?128:0,stdout:'',stderr:e.argv[0]==='git'?'not a repository':'', isStdoutTruncated: false, isStderrTruncated: false }};});
     await $.session.start(session());
     const out=JSON.stringify(await $.tool.call({tool:'mcp__tmux-agent__tell' as const,name:'w1',text:'next'}));
     expect(out).toContain('sent to');
@@ -3331,7 +3332,7 @@ test('re-review: a commit whose ancestry did not fit stays outstanding',WITH_DRI
   onRun(on, async ($,e)=>{
     count++;
     await clock.advance(Math.min(1500,e.init?.timeoutMs??1500));
-    return {value:{exitCode:0,stdout:e.argv.includes('cat-file')?'commit\n':'',stderr:''}};
+    return {value:{exitCode:0,stdout:e.argv.includes('cat-file')?'commit\n':'',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
   });
   await $.turn.complete(turn());
   // 4d0af09 onward: a check that cannot fit what is left of the pass is not
@@ -3346,7 +3347,7 @@ test('re-review: tell records the refreshed base before sending',WITH_DRIVER,asy
   const files:Files={...worker('w1',0,{base:'b'.repeat(40)}),[`${V3}/w1/result.json`]:finished()};
   mockFs(on,files);mockWake(on);mockSessionStart(on);on('ui.status',()=>({value:undefined}));
   const calls:string[][]=[];
-  onRun(on, ($,e)=>{calls.push([...e.argv]);return {value:{exitCode:0,stdout:e.argv[0]==='git'?fresh+'\n':'',stderr:''}};});
+  onRun(on, ($,e)=>{calls.push([...e.argv]);return {value:{exitCode:0,stdout:e.argv[0]==='git'?fresh+'\n':'',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};});
   await $.session.start(session());
   await $.tool.call({tool:'mcp__tmux-agent__tell' as const,name:'w1',text:'next'});
   expect(JSON.parse(files[`${V3}/w1/episodes/2/dispatch.json`]!).base).toEqual(fresh);
@@ -3361,7 +3362,7 @@ test('bug 8: a tell whose send outlasts its time still answers and records the e
   let sendMs = 0
   onRun(on, ($, e) => {
     if (e.argv[2] === 'send') { sendMs = e.init?.timeoutMs ?? 0; throw new Error('process.run: timed out') }
-    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   await $.session.start(session())
   const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'next' }))
@@ -3401,7 +3402,7 @@ test('re-review: the deferred ancestry check finishes next tick and delivers onc
   onRun(on, async ($, e) => {
     if (e.argv[0] === 'git') windows.push(e.init?.timeoutMs ?? -1)
     await clock.advance(Math.min(1500, e.init?.timeoutMs ?? 1500))
-    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   await $.turn.complete(turn())
   await $.turn.complete(turn())
@@ -3440,7 +3441,7 @@ describe('astra re-review of 3b83a9e',()=>{
     onRun(on, async($,e)=>{
       if(e.argv.includes('cat-file')){
         await clock.advance(1900);
-        return {value:{exitCode:0,stdout:'commit\n',stderr:''}};
+        return {value:{exitCode:0,stdout:'commit\n',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
       }
       windows.push(e.init?.timeoutMs??0);
       await clock.advance(e.init?.timeoutMs??0);
@@ -3462,9 +3463,9 @@ describe('astra re-review of 3b83a9e',()=>{
     onRun(on, async($,e)=>{
       if(e.argv[0]==='git'){
         await clock.advance(2000);
-        return {value:{exitCode:0,stdout:'commit\n',stderr:''}};
+        return {value:{exitCode:0,stdout:'commit\n',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
       }
-      return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:''}};
+      return {value:{exitCode:0,stdout:JSON.stringify({running:true,idle_seconds:180,blocked_reason:'quota_exhausted',blocked_evidence:'usage limit reached'}),stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
     });
     await $.turn.complete(turn());
     expect((await $.command.run(run('stalled'))).text).toContain('w1:180');
@@ -3490,7 +3491,7 @@ test('re-review: a pass that ran out of budget resumes at the claim it deferred,
   mockWake(on)
   onRun(on, async ($, e) => {
     await clock.advance(e.init?.timeoutMs ?? 0)
-    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   await $.turn.complete(turn())
   // w0 is the pass's first worker, so its two git calls run whatever they cost
@@ -3533,7 +3534,7 @@ test('re-review: one pass stays inside its budget however long the tail, and eve
   const wake = mockWake(on)
   onRun(on, async ($, e) => {
     if (e.argv[0] === 'git') await clock.advance(e.init?.timeoutMs ?? 0)
-    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   const passes: number[] = []
   for (let t = 0; t < 30 && store.acked().length < 20; t++) {
@@ -3562,7 +3563,7 @@ test('re-review: the first worker of a pass is checked even when its own read sp
   mockWake(on)
   onRun(on, async ($, e) => {
     await clock.advance(10)
-    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   for (let t = 0; t < 3; t++) await $.turn.complete(turn())
   expect(store.acked()).toEqual(['w0#1'])
@@ -3605,7 +3606,7 @@ describe('cursor review of 4d0af09', () => {
         name === 'l7'
           ? { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' }
           : { running: true, idle_seconds: 5 }
-      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     // Four 1.2 s probes fit a 4 s sweep: a cursor that jumps the whole window
@@ -3665,7 +3666,7 @@ describe('cursor review of 4d0af09', () => {
       [`${V3}/small/result.json`]: finished('small done'),
     })
     const wake = mockWake(on)
-    onRun(on, () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: Not a valid object name' } }))
+    onRun(on, () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: Not a valid object name', isStdoutTruncated: false, isStderrTruncated: false } }))
 
     await $.turn.complete(turn())
     await $.turn.complete(turn())
@@ -3689,7 +3690,7 @@ describe('cursor review of 4d0af09', () => {
     const calls: (readonly string[])[] = []
     onRun(on, ($, e) => {
       calls.push(e.argv)
-      return { value: { exitCode: 0, stdout: 'commit\n', stderr: '' } }
+      return { value: { exitCode: 0, stdout: 'commit\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
 
     await $.turn.complete(turn())
@@ -3842,7 +3843,7 @@ describe('astra review of 34e2a1e', () => {
     onRun(on, async ($, e) => {
       probed.push(e.argv[e.argv.length - 1] ?? '')
       await clock.advance(2000)
-      return { value: { exitCode: 0, stdout: JSON.stringify({ running: true, idle_seconds: 5 }), stderr: '' } }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ running: true, idle_seconds: 5 }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     for (let i = 0; i < 8; i++) await $.turn.complete(turn())
     expect([...new Set(probed)].sort()).toEqual(['l0', 'l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7'])
@@ -3908,7 +3909,7 @@ describe('cursor review of 34e2a1e', () => {
         name === 'l6'
           ? { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' }
           : { running: true, idle_seconds: 5 }
-      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     for (let i = 0; i < 4; i += 1) await $.turn.complete(turn())
     expect(wake.join('\n')).toContain('"l6" on codex: stalled')
@@ -4092,7 +4093,7 @@ describe('cursor review of d20cdcc', () => {
         name === 'l3'
           ? { running: true, idle_seconds: 600, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' }
           : { running: true, idle_seconds: 5 }
-      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '' } }
+      return { value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     for (let i = 0; i < 8; i += 1) await $.turn.complete(turn())
     expect([...answered].sort()).toEqual(['l1', 'l2', 'l3'])
@@ -4183,13 +4184,13 @@ describe('live e2e of 0.7.6', () => {
     on('turn.complete', () => ({ text: '' }))
     onRun(on, ($, e) => {
       argv.push([...e.argv])
-      if (e.argv[0] === 'tmux') return { value: { exitCode: 0, stdout: [...sessions].join('\n'), stderr: '' } }
+      if (e.argv[0] === 'tmux') return { value: { exitCode: 0, stdout: [...sessions].join('\n'), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       if (e.argv[2] === 'stop') sessions.delete(`codex-cli-${e.argv[3]}`)
       if (e.argv[2] === 'status' && statusFor) {
         const ans = statusFor(String(e.argv[4]))
-        return { value: { exitCode: ans.exitCode, stdout: ans.stdout, stderr: ans.stderr ?? '' } }
+        return { value: { exitCode: ans.exitCode, stdout: ans.stdout, stderr: ans.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
-      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":5}', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":5}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     return { argv, logs, stopped: () => argv.filter(a => a[2] === 'stop').map(a => a[3]) }
   }
@@ -4689,7 +4690,7 @@ describe('native mirror', () => {
     const argvs: string[][] = []
     onRun(on, ($, e) => {
       argvs.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     on('agent.spawn', () => ({ model: 'haiku', agentId: 'should-not-start' }))
 
@@ -4711,7 +4712,7 @@ describe('native mirror', () => {
     mockSessionStart(on)
     on('ui.status', () => ({ value: undefined }))
     on('ui.log', () => ({ value: undefined }))
-    onRun(on, () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    onRun(on, () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
     // Another plugin's spawn hook below this one refuses the waiter.
     on('agent.spawn', () => ({ deny: 'policy not admitted' }))
 
@@ -4737,7 +4738,7 @@ describe('native mirror', () => {
     on('ui.log', () => ({ value: undefined }))
     const head = 'a'.repeat(40)
     onRun(on, ($, e) => ({
-      value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '' },
+      value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     }))
     let seen: { subagentType?: string; model?: string; background?: boolean; description?: string; prompt?: string } | undefined
     on('agent.spawn', ($, e) => {
@@ -5069,13 +5070,44 @@ describe('resume', () => {
     expect(keysOf(await $.ui.render(bandRender())), 'a resumed session closes the field').not.toContain('resume-input')
   })
 
+  test('desktop draws the band like the terminal: [ + ] and the selected row keep their Inputs, inside a narrow, short band', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, worker('w1', 0))
+    mockPanel(on, { running: true, idle_seconds: 5 })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await clock.advance(2_000)
+    const desk = (maxRows = 40, columns = 80) => $.ui.render(bandRender(maxRows, maxRows - 1, columns, 'desktop'))
+    await desk()
+    await $.ui.press({ plugin: 'tmux-agent', key: 'add', requestId: 'above-prompt' })
+    await desk()
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+
+    // As `rowsOf` in 'panel UX': one top-level child is a row; a wrapping Text takes what it needs.
+    const rows = (tree: unknown, columns: number) =>
+      ((tree as { children?: unknown[] }).children ?? []).slice(1).reduce<number>((n, c) => {
+        const wraps = (c as { props?: { wrap?: string } }).props?.wrap === 'wrap'
+        return n + (wraps ? Math.max(1, Math.ceil(textOf(c).length / columns)) : 1)
+      }, 0)
+    const wide = await desk()
+    expect(keysOf(wide)).toEqual(expect.arrayContaining(['resume-input', 'tell:w1#1', 'w1#1']))
+    for (const [maxRows, columns] of [[12, 40], [8, 40]] as const) {
+      const tree = await desk(maxRows, columns)
+      expect(rows(tree, columns), `${maxRows} rows, ${columns} columns`).toBeLessThanOrEqual(maxRows)
+      expect(keysOf(tree), 'the selected row survives a small band').toContain('w1#1')
+    }
+  })
+
   /** Every exclusive `mkdir <v3>/<name>` answers EACCES: reserve() reports `unknown` (H7). */
   const refuseReserve = (on: On) => {
     const st = runOf(on)
     const inner = st.ledger!
     st.ledger = argv =>
       argv[0] === 'mkdir' && argv[1] !== '-p' && argv[1]!.startsWith(`${V3}/`) && !argv[1]!.slice(V3.length + 1).includes('/')
-        ? { value: { exitCode: 1, stdout: '', stderr: `mkdir: ${argv[1]}: Permission denied` } }
+        ? { value: { exitCode: 1, stdout: '', stderr: `mkdir: ${argv[1]}: Permission denied`, isStdoutTruncated: false, isStderrTruncated: false } }
         : inner(argv)
   }
 
