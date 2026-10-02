@@ -56,10 +56,10 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| MCP | write + read (full lifecycle) | blocker: not counted | One run completed (`$R/r8-live/agy/life1-calls.txt`). The user stopped agy because each launch opens a keychain dialog. To close: run `life2` on a machine where the keychain dialog is accepted. |
+| MCP | write + read (full lifecycle) | blocker: not counted | One run completed (`$R/r8-live/agy/life1-calls.txt`). The keychain dialogs came from the harness, not agy: `agyrun.sh` set a private `HOME`, so agy found no login and asked the keychain. To close: run `life2` with the real `HOME` in a trusted folder. |
 | MCP | restart, concurrent waits | blocker | `$R/r8-live/agy/restart/` was aborted with no result. Same action. |
-| Paste | read (composer-state) | by design `unknown` | `collector.contract.node.ts`, the `agy` row of the composer-state test. agy has no verified pane pattern, so the collector never pastes into agy. To close: capture real agy panes, add a pattern set and fixtures. |
-| Paste | write | blocker: no paste is attempted | All five cells are BLOCKED (`$R/r74-paste/agy/*/BLOCKED.txt`). To close: same as the composer-state action, then run the five cells. |
+| Paste | read (composer-state) | PASS | Real captures of Antigravity CLI 1.2.14 (`fixtures/composer/agy-*.txt`: empty, draft, multiline, busy, trust menu); the `agy` rows of the composer-state test in `collector.contract.node.ts`. |
+| Paste | write | PASS (4 of 5; permission N/A) | `$R/r74-paste/agy/{1-empty,2-draft,3-busy,5-multiline}/VERDICT.txt`: each notice delivered once (`delivery_id` 1); a draft and a busy turn were waited out (`host composer is draft` / `busy; nothing pasted`); user config shasums unchanged. `4-permission`: N/A, `toolPermission=always-proceed` shows no prompt. |
 
 ## Claude Code, terminal
 

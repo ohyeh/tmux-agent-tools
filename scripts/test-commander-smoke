@@ -324,7 +324,13 @@ mkdir -p "$V3/.sessions/$OKEY/act/1"
 "$COMMANDER" collect codex "$CNAME" >"$WORK/collect.out" 2>"$WORK/collect.err" &
 COLLECT_PID=$!
 
-have_prompt() { private_tmux capture-pane -p -J -t "$PANE" | grep -q OWNEDOK; }
+# Submitted, not just pasted: the fake logged the Enter and its composer is empty again.
+# A paste still in the composer draws each line with a 4-column prefix (CI read 704, not 700).
+have_prompt() {
+  grep -q '^ENTER:idle:.*OWNEDOK' "$FAKE_HOST_STATE/log" 2>/dev/null || return 1
+  local pane; pane="$(private_tmux capture-pane -p -J -t "$PANE")"
+  [[ "$pane" == *OWNEDOK* && "$pane" == *"→ Plan, search, build anything"* ]]
+}
 poll 75 have_prompt || {
   echo "no paste within 15s" >&2
   echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true

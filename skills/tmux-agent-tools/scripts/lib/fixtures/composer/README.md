@@ -6,5 +6,7 @@ Pane captures for `agent-tmux <cli> composer-state` (collector.contract.node.ts)
   so an unrecognised dialog reads `unknown` (never pastes).
 - `*.synthetic.txt`: hand-written, UNCONFIRMED against the real CLI (claude has no live capture;
   the shell prompt is a plain zsh prompt).
-- agy: no capture exists (agy is never launched in tests), so its state is always `unknown`.
+- `agy-*.txt`: real `capture-pane -J -p` screens of Antigravity CLI 1.2.14, captured 2026-10-02 in a
+  trusted folder with the real HOME (account email and project path redacted). `agy-permission.txt` is
+  the trust-folder menu; agy runs tools with no prompt when `toolPermission` is `always-proceed`.
 - `fake-cursor.mjs`: a stand-in composer for the delivery tests.

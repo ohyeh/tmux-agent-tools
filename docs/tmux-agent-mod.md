@@ -716,7 +716,7 @@ collector 活著。同一個判斷也寫進 `assign` 工具的回傳最後一句
 node collector 貼進 host pane 之前先探測 composer（plan D-paste、§1c S5）：
 `agent-tmux <cli> composer-state <name>|--pane %N` 依 pane capture 的 pattern 回
 `empty | draft | busy | permission | shell | unknown`（第一行；有 composer 時其餘行是它的文字）。
-cli 為 codex、cursor（cursor-agent）、claude；agy 沒有實機 capture，一律 `unknown`。
+cli 為 codex、cursor（cursor-agent）、claude、agy；其他 CLI 一律 `unknown`。
 collector 的 `--cli` 沒給時，從 pane 底下的 process 找出是哪個 CLI。
 只有 `empty` 才貼；貼完、送 Enter 之前再探測一次，composer 必須等於剛貼的文字（忽略空白差異，
 或是 CLI 自己的 `[Pasted text #1 +9 lines]` 佔位），否則不送 Enter、文字留在 composer、回報 blocked。

@@ -561,7 +561,7 @@ test('R4-1 pasteInto: a real shell with PS1="› " under the codex parser gets n
 
 const AGENT_TMUX = new URL('../agent-tmux', import.meta.url).pathname
 
-test('composer-state: every captured pane gets its class (real codex and cursor-agent captures; synthetic ones marked)', async t => {
+test('composer-state: every captured pane gets its class (real codex, cursor-agent and agy captures; synthetic ones marked)', async t => {
   const want: [string, string, string, string?][] = [
     ['codex', 'codex-empty.txt', 'empty'],
     ['codex', 'codex-multiline.txt', 'empty'],
@@ -577,7 +577,12 @@ test('composer-state: every captured pane gets its class (real codex and cursor-
     ['claude', 'claude-empty.synthetic.txt', 'empty'],
     ['claude', 'claude-draft.synthetic.txt', 'draft', 'half typed text'],
     ['claude', 'claude-busy.synthetic.txt', 'busy'],
-    ['agy', 'codex-empty.txt', 'unknown'], // agy: no verified pattern set, never pastes
+    ['agy', 'agy-empty.txt', 'empty'],
+    ['agy', 'agy-draft.txt', 'draft', 'R74 draft text keep me'],
+    ['agy', 'agy-multiline.txt', 'draft', 'GOAL: line one of the brief\nline two\nline three'],
+    ['agy', 'agy-busy.txt', 'busy'], // agy keeps an empty `>` while it works; `esc to cancel` under the frame says busy
+    ['agy', 'agy-permission.txt', 'permission'], // the trust-folder menu
+    ['agy', 'codex-empty.txt', 'unknown'], // another CLI's screen is not recognised
     ['codex', 'cursor-agent-empty.txt', 'unknown'], // another CLI's screen is not recognised
   ]
   const srv = privateServer()

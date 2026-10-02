@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+
+- Feat: the collector now pastes into agy: `composer-state` reads agy's framed `>` composer (`esc to cancel` = busy) from real captures; live paste cells PASS.
+- Fix: commander smoke waited for the paste to show, not for its Enter; on a slow runner it read the composer's 4-column prefix (704 chars, not 700).
+- CI: manual dispatch only; the tail-send bound is 19 s, not 16 s.
 - Feat: the Codex and Cursor plugins declare the `tmux-agent-mcp` server (`.codex-plugin/mcp.json`, `mcpServers` in `.cursor-plugin/plugin.json`); the skill stays in both. README: an `npx skills` install registers the server from the skill folder; use one way, not both.
 - Fix (CI, red since 2026-07): `test-core-contract-smoke` puts this checkout's scripts first on `PATH`, so the core finds `agent-tmux` without an installed copy (77 tests failed on a runner); the C-lock test holds 3.5 s longer for a slow runner; the `result-path-prompt` self-test's fake CLI reads claude's file-ref send (since `0c08a5e`); the clipboard CI step gives claude and codex their own worker names (one agent dir per name, so the second start rebound the first's `pane-id` and its `stop` refused); `test-commander-smoke's host pane runs the core's fake composer, since the collector pastes only into a known CLI's empty composer (`64b48c1`).
 - Fix (Sol r7 R7-1, R7-2): `clearIncomplete` first owns its aside container with an exclusive `mkdir` (`<v3>/.clearing.<name>.<rand>`), then moves the dir into it as `<container>/<name>`, and removes only its own container. Two clears that draw the same suffix can no longer nest a record into one aside that the other then removes; the second clear refuses (`already exists (another clear)`). The restore command in the kept-dir text quotes its paths, so it runs under a root with spaces or quotes, and removes the then-empty container. Fixtures: `Sol R7-1`, `Sol R7-2` in `workers.contract.node.ts`.

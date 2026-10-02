@@ -684,8 +684,8 @@ agent-tmux <cli> composer-state --pane %N
 
 Classify the host composer from the visible pane. Line 1 is one of
 empty | draft | busy | permission | shell | unknown; when a composer was
-found the remaining lines are its text. <cli> is codex, cursor (cursor-agent)
-or claude; agy and any other CLI are always unknown. unknown whenever not sure.
+found the remaining lines are its text. <cli> is codex, cursor (cursor-agent),
+claude or agy; any other CLI is always unknown. unknown whenever not sure.
 Used by the node collector: it pastes only into `empty`.
 HELP_EOF
       ;;
@@ -2434,7 +2434,8 @@ _composer_holds_paste() {
 # pasted). Pattern-based on the visible pane; fixtures are real captures
 # (lib/fixtures/composer/). Order: permission/menu dialog, then busy, then the
 # composer; anything not recognised is unknown. The caller pastes only on `empty`.
-# agy has no verified pattern set (no capture), so it is always unknown.
+# agy: the composer is the last `>` line framed by `─────` rules; `esc to cancel` under
+# the lower rule is busy (agy keeps an empty `>` while it works).
 # ponytail: a CLI's placeholder text is matched literally; an unlisted one reads as
 # `draft` (no paste, shown as a reason), never as `empty`.
 _composer_classify() {
@@ -2446,7 +2447,7 @@ _composer_classify() {
       if (kind == "unknown" || n == 0) { print "unknown"; exit }
       lo = n - 16; if (lo < 1) lo = 1
       for (i = lo; i <= n; i++)
-        if (L[i] ~ /Press enter to confirm or esc to cancel|Do you want to (proceed|make this edit|create)|\[y\/N\]|\(y\/n\)/ || L[i] ~ /^ *(→|›|❯) [0-9]+\. /) { print "permission"; exit }
+        if (L[i] ~ /Press enter to confirm or esc to cancel|enter Confirm|Do you want to (proceed|make this edit|create)|\[y\/N\]|\(y\/n\)/ || L[i] ~ /^ *(→|›|❯) [0-9]+\. /) { print "permission"; exit }
       g = 0; f = n + 1; text = ""
       if (kind == "codex") {
         for (i = lo; i <= n; i++) if (L[i] ~ /^ *›( |$)/) g = i
@@ -2465,6 +2466,15 @@ _composer_classify() {
           seen = 0
           for (k = g - 1; k >= 1 && seen < 4; k--) { if (L[k] == "") continue; seen++; if (L[k] ~ /^ *\342[\240-\243]/) { print "busy"; exit } }
           first = strip_first(L[g + 1], "→"); ph = "(Plan, search, build anything|Add a follow-up)"; g++
+        }
+      } else if (kind == "agy") {
+        for (i = lo; i <= n; i++) if (L[i] ~ /^ *>( |$)/) g = i
+        # A transcript echo is `>` too; the composer is the last one with a rule above and below it.
+        if (g && !(g > 1 && L[g - 1] ~ /^ *─────/)) g = 0
+        if (g) { f = 0; for (j = g + 1; j <= n; j++) if (L[j] ~ /^ *─────/) { f = j; break }; if (!f) g = 0 }
+        if (g) {
+          for (k = f + 1; k <= n; k++) if (L[k] ~ /esc to cancel/) { print "busy"; exit }
+          first = strip_first(L[g], ">"); ph = ""
         }
       } else if (kind == "claude") {
         for (i = lo; i <= n; i++) if (L[i] ~ /^ *❯([ \302\240]|$)/) g = i
@@ -2498,7 +2508,7 @@ composer_state_session() {
       target="$(session_target "$(session_for_name "$1")")" ;;
   esac
   local kind=unknown cap
-  case "$CLI" in codex|claude) kind="$CLI" ;; cursor|cursor-agent) kind=cursor ;; esac
+  case "$CLI" in codex|claude|agy) kind="$CLI" ;; cursor|cursor-agent) kind=cursor ;; esac
   cap="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane -J -p -t "$target" 2>/dev/null)" \
     || { echo "composer-state: cannot capture $target" >&2; exit 1; }
   print -r -- "$cap" | _composer_classify "$kind"
