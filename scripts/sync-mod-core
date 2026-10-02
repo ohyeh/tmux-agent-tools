@@ -22,7 +22,7 @@ if [[ "${1:-}" == --check ]]; then
   for f in $FILES; do
     cmp -s "$SRC/$f" "$DST/$f" || { echo "$DST/$f differs from $SRC/$f" >&2; drift=1; }
   done
-  present=("$DST"/*(N:t))
+  present=("$DST"/*(ND:t))   # D: a hidden extra file counts too
   extra=(${present:|FILES})
   (( ${#extra} )) && { echo "$DST has files outside the core set: ${extra[*]}" >&2; drift=1; }
   exit $drift

@@ -1,5 +1,7 @@
 # workers-core P8 release checklist
 
+> Historical snapshot (0.42 single-plugin layout). Since 0.44.0 the mod is its own plugin in `mods/tmux-agent/` with a synced core copy in `hooks/lib/` (`scripts/sync-mod-core`); see README "Plugins" and `mods/tmux-agent/README.md`. Paths, imports and `MOD=.` below describe 0.42, not the current tree.
+
 Inventory for the release that ships one core (`skills/tmux-agent-tools/scripts/lib/workers.ts`) inside the root plugin. The base is `merge-base main HEAD` of the branch being released, not worktree `wc-p8` or `eec07ff`. Tag and publish stay with the operator. Do not bump versions in a lane that has not merged P3–P7.
 
 Contract: workers-core P0 contract v6 §9 (capability matrix) and §10 (P8 = immutable candidate / approved tag, install + upgrade matrix). Plan D1 is C: the mod binding lives in the root plugin and imports the core. Release policy for pinned consumers: agent-scripts `AGENTS.md` lines 35–37 (`npx --yes skills@<version>` against a gated release ref).

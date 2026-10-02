@@ -64,11 +64,23 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
   # (cursor-agent: --plugin-dir plus the installed Claude plugin) runs the gate
   # once per copy, with the same tool_use_id. mkdir is atomic, so concurrent
   # copies agree on which one records the call.
+  log="$STATE_DIR/review-dispatch.log"
   tool_use_id="$(printf '%s' "$IN" | jq -r '.tool_use_id // empty' 2>/dev/null)"
-  if [ -z "$tool_use_id" ] || { mkdir -p "$STATE_DIR/seen" && mkdir "$STATE_DIR/seen/$(printf '%s' "$tool_use_id" | tr -c 'A-Za-z0-9._-' '_')" 2>/dev/null; }; then
-    echo "$(date -u +%FT%TZ) $cmd" >> "$STATE_DIR/review-dispatch.log"
+  if [ -z "$tool_use_id" ]; then
+    echo "$(date -u +%FT%TZ) $cmd" >> "$log"
+  else
+    # Hex of the id's bytes: two ids never share a name, and none is . or ..
+    seen="$STATE_DIR/seen/id-$(printf '%s' "$tool_use_id" | od -An -v -tx1 | tr -d ' \n')"
+    mkdir -p "$STATE_DIR/seen"
+    if mkdir "$seen" 2>/dev/null; then
+      echo "$(date -u +%FT%TZ) $cmd" >> "$log"
+      : > "$seen/done"
+    else
+      # Another copy records this call: count after its line is written (max 2 s).
+      for _ in $(seq 40); do [ -e "$seen/done" ] && break; sleep 0.05; done
+    fi
   fi
-  n="$(wc -l < "$STATE_DIR/review-dispatch.log" | tr -d ' ')"
+  n="$(wc -l < "$log" 2>/dev/null | tr -d ' ')"; n="${n:-0}"
   if [ "$n" -ge 2 ] && ! valid_receipt "$STATE_DIR/gate-receipt-workflow"; then
     cat >&2 <<EOF
 BLOCKED by workflow gate: this is review-shaped worker dispatch #$n this
