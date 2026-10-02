@@ -1037,9 +1037,11 @@ refuse_live_name() {
     bound="$(cat "$(agent_root_dir)/$name/pane-id" 2>/dev/null || true)"
     [[ -n "$bound" ]] || return 0
     owner="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$bound" '#{session_name}' 2>/dev/null || true)"
-    # Only a session for this same name counts: after a tmux server restart a
-    # stale pane id can name an unrelated pane.
-    [[ -n "$owner" && "$owner" != "$session" && "$owner" == *"-$name" ]] || return 0
+    [[ -n "$owner" && "$owner" != "$session" ]] || return 0
+    # Only a worker of this same name counts (its session carries
+    # TMUX_AGENT_NAME=<name>): after a tmux server restart a stale pane id can
+    # name an unrelated pane, or another worker's.
+    [[ "$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" show-environment -t "=$owner" TMUX_AGENT_NAME 2>/dev/null || true)" == "TMUX_AGENT_NAME=$name" ]] || return 0
     echo "name $name is bound to live pane $bound of session $owner; agent-tmux never replaces a live worker, and every CLI shares $(agent_root_dir)/$name. Stop that worker first or use another name." >&2
     exit 1
   fi
@@ -8516,7 +8518,7 @@ self_test_sentinel_bias() {
 self_test_watch_count() {
   require_tmux
   require_jq
-  local tmp_dir saved_dir name1 name2 name3 session1 session2 session3 out rc writer_pid=""
+  local tmp_dir saved_dir name1 name2 name3 session1 session2 session3 out rc writer_pid
   tmp_dir="$(mktemp -d)"
   saved_dir="${TMUX_AGENT_DIR-}"
   export TMUX_AGENT_DIR="$tmp_dir/agents"
@@ -8557,10 +8559,8 @@ self_test_watch_count() {
     ) &
     writer_pid="$!"
 
-    out="$(watch_session --count 2 --timeout 5 --interval .1 --json "$name1" "$name2" "$name3")"
-    rc=$?
+    out="$(watch_session --count 2 --timeout 5 --interval .1 --json "$name1" "$name2" "$name3")" && rc=0 || rc=$?
     wait "$writer_pid" 2>/dev/null || true
-    writer_pid=""
     if (( rc != 0 )); then
       echo "self-test watch-count: FAIL (--count 2 returned $rc)" >&2
       exit 1
@@ -8571,7 +8571,6 @@ self_test_watch_count() {
     fi
     ) || body_rc=$?
   } always {
-    [[ -n "$writer_pid" ]] && kill "$writer_pid" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session2")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session3")" 2>/dev/null || true
