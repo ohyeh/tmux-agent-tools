@@ -92,7 +92,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.44.3'
+const MOD_VERSION = '0.44.4'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -784,13 +784,12 @@ export const register: Register = on => {
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
     const words = displayCells(full) + cellsOf(true) <= width
-    // A desktop draws native buttons, and a bare glyph there read as greyed out on the
-    // accent bar (2026-10-02 screenshot): its labels keep their words. Only the labels:
-    // the cell budget below still decides the title and the hint.
-    const named = words || e.surface === 'desktop'
-    const addLabel = named ? '+ new' : '+'
-    const refreshLabel = named ? '↻ refresh' : '↻'
-    const tuiLabel = named ? '⧉ tui' : '⧉'
+    const addLabel = words ? '+ new' : '+'
+    const refreshLabel = words ? '↻ refresh' : '↻'
+    const tuiLabel = words ? '⧉ tui' : '⧉'
+    // A desktop draws native buttons; on the accent background they read as greyed out
+    // (2026-10-02 screenshot). There only the title Text carries the accent.
+    const barBg = e.surface === 'desktop' ? undefined : PANEL_ACCENT
     const buttonCells = cellsOf(words)
     const titleText = displayCells(full) + buttonCells <= width ? full : ` ${counts} `
     const titleCells = displayCells(titleText) + buttonCells
@@ -808,7 +807,7 @@ export const register: Register = on => {
     children.push(
       Box({
         flexDirection: 'row',
-        backgroundColor: PANEL_ACCENT,
+        backgroundColor: barBg,
         children: [
           Text({ bold: true, color: 'black', backgroundColor: PANEL_ACCENT, children: titleText }),
           // Resume a CLI session by id as a teammate; the field is one row below.
@@ -860,7 +859,7 @@ export const register: Register = on => {
                 }),
               ]
             : []),
-          Text({ color: 'black', backgroundColor: PANEL_ACCENT, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
+          Text({ color: barBg ? 'black' : undefined, dimColor: !barBg, backgroundColor: barBg, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
           // Last and apart from refresh: hiding is undone by /workers, but it should
           // not sit one key away from the button people press most.
           Button({ key: 'close', label: 'hide', hotkey: 'q', dimColor: true, onPress: () => void panel.close?.() }),

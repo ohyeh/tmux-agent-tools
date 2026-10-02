@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent",
-  "version": "0.44.3",
+  "version": "0.44.4",
   "description": "Claude Code function-hook mod for tmux-agent-tools: dispatch an agent-tmux worker from an MCP tool, the /workers panel, and a collector that wakes this session when a worker finishes or fails to launch. Skills come from the tmux-agent-tools plugin or the global npx skills install.",
   "author": {
     "name": "PaulYeh",

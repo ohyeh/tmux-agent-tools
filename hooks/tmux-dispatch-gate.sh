@@ -69,15 +69,26 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
   if [ -z "$tool_use_id" ]; then
     echo "$(date -u +%FT%TZ) $cmd" >> "$log"
   else
-    # Hex of the id's bytes: two ids never share a name, and none is . or ..
-    seen="$STATE_DIR/seen/id-$(printf '%s' "$tool_use_id" | od -An -v -tx1 | tr -d ' \n')"
+    # sha256 of the id: a fixed-length name (a hex of a long id passed NAME_MAX, so
+    # mkdir failed and the call went uncounted), never . or ..
+    if command -v sha256sum >/dev/null 2>&1; then h="$(printf '%s' "$tool_use_id" | sha256sum)"
+    else h="$(printf '%s' "$tool_use_id" | shasum -a 256)"; fi
+    seen="$STATE_DIR/seen/id-${h%% *}"
     mkdir -p "$STATE_DIR/seen"
+    unrecorded() {
+      echo "BLOCKED by workflow gate: could not count this review-shaped dispatch ($1). Retry the call; if it repeats, check $STATE_DIR." >&2
+      exit 2
+    }
     if mkdir "$seen" 2>/dev/null; then
-      echo "$(date -u +%FT%TZ) $cmd" >> "$log"
+      echo "$(date -u +%FT%TZ) $cmd" >> "$log" || unrecorded "log write failed"
       : > "$seen/done"
-    else
+    elif [ -d "$seen" ]; then
       # Another copy records this call: count after its line is written (max 2 s).
       for _ in $(seq 40); do [ -e "$seen/done" ] && break; sleep 0.05; done
+      # No done: the recording copy died or stalled before its line; the log is not trusted.
+      [ -e "$seen/done" ] || unrecorded "another copy did not finish recording"
+    else
+      unrecorded "mkdir $seen failed"
     fi
   fi
   n="$(wc -l < "$log" 2>/dev/null | tr -d ' ')"; n="${n:-0}"

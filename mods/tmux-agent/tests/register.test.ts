@@ -5365,10 +5365,23 @@ describe('resume', () => {
       const tree = await desk(maxRows, columns)
       expect(rows(tree, columns), `${maxRows} rows, ${columns} columns`).toBeLessThanOrEqual(maxRows)
       expect(keysOf(tree), 'the selected row survives a small band').toContain('w1#1')
-      expect(textOf(tree), 'desktop header buttons keep their words').toContain('↻ refresh')
     }
-    expect(textOf(await $.ui.render(bandRender(12, 11, 40))), 'a narrow terminal still folds to glyphs').not.toContain('↻ refresh')
-    expect(textOf(await desk(12, 90)), 'the words do not cost the desktop its version title').toContain('workers v')
+    // The bar is the node whose own children hold the refresh Button; its background is the accent on the terminal only.
+    type N = { key?: unknown; props?: { key?: unknown; backgroundColor?: unknown }; children?: unknown[] }
+    const barBg = (tree: unknown): unknown => {
+      const n = tree as N
+      const kids = (n?.children ?? []) as N[]
+      if (kids.some(k => k?.props?.key === 'refresh' || k?.key === 'refresh')) return n.props?.backgroundColor ?? 'none'
+      for (const k of kids) {
+        const hit = barBg(k)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    expect(barBg(await desk(12, 90)), 'desktop buttons do not sit on the accent').toBe('none')
+    expect(barBg(await $.ui.render(bandRender(12, 11, 90))), 'the terminal bar keeps the accent').not.toBe('none')
+    expect(barBg(await $.ui.render(bandRender(12, 11, 90))), 'the bar was found').toBeDefined()
+    expect(textOf(await desk(12, 90)), 'the desktop keeps its version title').toContain('workers v')
   })
 
   /** Every exclusive `mkdir <v3>/<name>` answers EACCES: reserve() reports `unknown` (H7). */
