@@ -2480,7 +2480,9 @@ _composer_classify() {
         for (i = lo; i <= n; i++) if (L[i] ~ /^ *❯([ \302\240]|$)/) g = i
         if (g) {
           for (j = g + 1; j <= n; j++) if (L[j] ~ /^ *─────/) { f = j; break }
-          for (k = g - 1; k >= g - 6 && k >= 1; k--) if (L[k] ~ /esc to interrupt/) { print "busy"; exit }
+          # Claude Code 2.x draws no `esc to interrupt`: a turn in flight is a spinner line
+          # `● Calculating…` / `● Ideating… (11s · ↓ 464 tokens)`; a finished turn reads `✻ Worked for 18s · done`.
+          for (k = g - 1; k >= g - 6 && k >= 1; k--) if (L[k] ~ /esc to interrupt/ || L[k] ~ /^ *[^ a-zA-Z0-9]+ [A-Z][a-z]+…/) { print "busy"; exit }
           first = strip_first(L[g], "❯"); ph = "Try \".*\""
         }
       }

@@ -520,6 +520,10 @@ test('composerHolds: whitespace-insensitive equality, or the CLI placeholder cov
   assert.ok(composerHolds({ state: 'draft', text: 'a b\nc' }, 'a b c'))
   assert.ok(composerHolds({ state: 'draft', text: '[Pasted text #1 +9 lines]' }, Array(9).fill('x').join('\n')))
   assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +3 lines]' }, Array(9).fill('x').join('\n')))
+  // Claude Code counts newlines: a 9-line paste reads +8 there, +9 elsewhere.
+  assert.ok(composerHolds({ state: 'draft', text: '[Pasted text #1 +8 lines]' }, Array(9).fill('x').join('\n'), 'claude'))
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +9 lines]' }, Array(9).fill('x').join('\n'), 'claude'))
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +8 lines]' }, Array(9).fill('x').join('\n'), 'cursor-agent'))
   assert.ok(!composerHolds({ state: 'draft', text: 'old draft the notice' }, 'the notice'))
   const long = Array.from({ length: 30 }, (_, i) => `line ${i} of the notice`).join('\n')
   assert.ok(composerHolds({ state: 'draft', text: long.split('\n').slice(-6).join('\n    ') }, long), 'the visible tail of a long paste')
@@ -561,7 +565,7 @@ test('R4-1 pasteInto: a real shell with PS1="› " under the codex parser gets n
 
 const AGENT_TMUX = new URL('../agent-tmux', import.meta.url).pathname
 
-test('composer-state: every captured pane gets its class (real codex, cursor-agent and agy captures; synthetic ones marked)', async t => {
+test('composer-state: every captured pane gets its class (real codex, cursor-agent, agy and claude captures; synthetic ones marked)', async t => {
   const want: [string, string, string, string?][] = [
     ['codex', 'codex-empty.txt', 'empty'],
     ['codex', 'codex-multiline.txt', 'empty'],
@@ -574,9 +578,12 @@ test('composer-state: every captured pane gets its class (real codex, cursor-age
     ['cursor', 'cursor-agent-multiline.txt', 'empty'],
     ['cursor', 'cursor-agent-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],
     ['cursor', 'cursor-agent-busy.txt', 'busy'],
-    ['claude', 'claude-empty.synthetic.txt', 'empty'],
-    ['claude', 'claude-draft.synthetic.txt', 'draft', 'half typed text'],
-    ['claude', 'claude-busy.synthetic.txt', 'busy'],
+    ['claude', 'claude-empty.txt', 'empty'],
+    ['claude', 'claude-draft.txt', 'draft', 'R74 draft text keep me'],
+    ['claude', 'claude-multiline.txt', 'draft', 'GOAL: line one of the brief\nline two\nline three'],
+    ['claude', 'claude-busy.txt', 'busy'], // Claude Code 2.x: spinner `● Ideating… (11s · …)`, no `esc to interrupt`
+    ['claude', 'claude-busy-start.txt', 'busy'], // the first second of a turn: `● Calculating…` alone
+    ['claude', 'claude-done.txt', 'empty'], // `✻ Worked for 18s · done` is a finished turn
     ['agy', 'agy-empty.txt', 'empty'],
     ['agy', 'agy-draft.txt', 'draft', 'R74 draft text keep me'],
     ['agy', 'agy-multiline.txt', 'draft', 'GOAL: line one of the brief\nline two\nline three'],

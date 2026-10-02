@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix: the collector pasted into a busy Claude Code 2.x (its spinner has no `esc to interrupt`; busy is now the `● Verb…` spinner line) and never sent Enter after a folded paste (Claude's `[Pasted text #1 +M lines]` counts newlines, cursor-agent and agy count lines). Real Claude captures replace the synthetic fixtures; live paste cells PASS.
 - Feat: the collector now pastes into agy: `composer-state` reads agy's framed `>` composer (`esc to cancel` = busy) from real captures; live paste cells PASS.
 - Fix: commander smoke waited for the paste to show, not for its Enter; on a slow runner it read the composer's 4-column prefix (704 chars, not 700).
 - CI: manual dispatch only; the tail-send bound is 19 s, not 16 s.

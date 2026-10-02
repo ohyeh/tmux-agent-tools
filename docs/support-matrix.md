@@ -67,9 +67,9 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
 | Mod | write + read (assign, wait, deliver) | PASS in unit tests | `tests/register.test.ts`, `describe('delivery')`, `describe('assign')`, `describe('channel authority (S3)')` |
-| MCP | write + read | UNCONFIRMED | `mcp-adapter/README.md` names `claude mcp add`, but no run against Claude Code exists. To close: register `tmux-agent-mcp` with `claude mcp add` and run the full lifecycle. Record request, response, `agent_id`, `delivery_id`. |
-| Paste | read (composer-state) | UNCONFIRMED | Fixtures `skills/tmux-agent-tools/scripts/lib/fixtures/composer/claude-*.synthetic.txt` are hand-written (`fixtures/README.md`). To close: capture real Claude Code panes for empty, draft, busy, permission. |
-| Paste | write | UNCONFIRMED | Same fixtures. Logic is covered with a fake host (`collector.contract.node.ts`, `D-paste:` tests). To close: live run of the five states in `r74-paste` style. |
+| MCP | write + read, restart, concurrent waits | PASS | `$R/r8-live-agy/claude/VERDICT.md` on `1c021da` (`claude -p --strict-mcp-config --mcp-config`): full lifecycle; after a kill a new process's wait got `completed` with the old owner pid, later waits `already_acked`; two processes at once delivered once (`completed` + `already_acked`, one `done` ack). |
+| Paste | read (composer-state) | PASS | Real Claude Code captures (`fixtures/composer/claude-*.txt`: empty, draft, multiline, busy, busy-start, done); the `claude` rows of the composer-state test. Claude Code 2.x shows no `esc to interrupt`: busy is the spinner line (`● Calculating…`). |
+| Paste | write | PASS (4 of 5; permission not run) | `$R/r74-paste/claude/*/VERDICT.txt`: each notice delivered once; draft and busy waited out. Claude folds the notice to `[Pasted text #1 +7 lines]` for 8 lines (it counts newlines); the first run failed on that count, fixed in `composerHolds`. `4-permission`: auto mode shows no dialog. |
 
 ## Claude Code, desktop (Code tab)
 

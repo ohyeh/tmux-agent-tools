@@ -101,8 +101,9 @@ export async function hostCli(pane: string, env: NodeJS.ProcessEnv = process.env
  * The composer holds what was pasted: its text equals the paste with all whitespace
  * ignored (a TUI re-wraps), or is a provable suffix of a long paste (the composer scrolls), or it is the CLI's own
  * `[Pasted text #1 +9 lines]` / `[Pasted Content 1234 chars]` placeholder with exactly this paste's line / char count.
+ * Claude Code's `+M` counts newlines (an 8-line notice reads `+7 lines`, live 2026-10-02); cursor-agent and agy count lines.
  */
-export function composerHolds(c: Composer, pasted: string): boolean {
+export function composerHolds(c: Composer, pasted: string, kind?: string): boolean {
   if (c.state !== 'draft') return false
   const flat = (t: string) => t.replace(/\s+/g, '')
   const seen = flat(c.text)
@@ -114,7 +115,8 @@ export function composerHolds(c: Composer, pasted: string): boolean {
   // A CLI placeholder is exact: its line / char count must be this paste's. Unknown or mismatched -> not held.
   const lines = /^\[Pasted text #\d+ \+(\d+) lines?\]$/.exec(c.text.trim())
   if (lines) {
-    return Number(lines[1]) === pasted.split('\n').length // agent-tmux:2418: M is the number of lines (newlines + 1)
+    const newlines = pasted.split('\n').length - 1
+    return Number(lines[1]) === (kind === 'claude' ? newlines : newlines + 1)
   }
   const chars = /^\[Pasted Content (\d+) chars\]$/.exec(c.text.trim())
   return !!chars && Number(chars[1]) === pasted.length
@@ -136,7 +138,7 @@ export async function pasteInto(pane: string, text: string, env: NodeJS.ProcessE
   if (running !== (kind === 'cursor-agent' ? 'cursor' : kind)) return { deferred: `${kind} is not running in ${pane} (found ${running ?? 'no known CLI'}); nothing pasted, no Enter` }
   const before = await composerState(pane, kind, env)
   // The composer was empty before our paste, so a draft that holds this notice is our own earlier, unsent paste.
-  if (composerHolds(before, text)) return { deferred: `an earlier notice is still in the composer of ${pane}; Enter not sent — press Enter or clear it; nothing pasted, retrying` }
+  if (composerHolds(before, text, kind)) return { deferred: `an earlier notice is still in the composer of ${pane}; Enter not sent — press Enter or clear it; nothing pasted, retrying` }
   if (before.state !== 'empty') return { deferred: `host composer is ${before.state}${before.why ? ` (${before.why})` : ''}; nothing pasted, retrying` }
   const buffer = `tmux-agent-collector-${process.pid}`
   const steps: [string[], string?][] = [
@@ -148,11 +150,11 @@ export async function pasteInto(pane: string, text: string, env: NodeJS.ProcessE
     if (r.code !== 0) return { drop: `tmux ${args[0]} into ${pane} failed (exit ${r.code}): ${r.err.trim().slice(-200)}` }
   }
   let after = await composerState(pane, kind, env)
-  for (const end = Date.now() + SETTLE_MS; !composerHolds(after, text) && (after.state === 'empty' || after.state === 'draft') && Date.now() < end; ) {
+  for (const end = Date.now() + SETTLE_MS; !composerHolds(after, text, kind) && (after.state === 'empty' || after.state === 'draft') && Date.now() < end; ) {
     await new Promise(r => setTimeout(r, 100))
     after = await composerState(pane, kind, env)
   }
-  if (!composerHolds(after, text)) {
+  if (!composerHolds(after, text, kind)) {
     return { deferred: `blocked: after the paste the composer is ${after.state}, not the pasted text${after.why ? ` (${after.why})` : ''}; Enter not sent, the text is left in ${pane}` }
   }
   const enter = await tmux(['send-keys', '-t', pane, 'Enter'], undefined, env)
