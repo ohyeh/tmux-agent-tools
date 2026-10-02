@@ -583,7 +583,7 @@ CJK 終端機也只佔一格。`[ hide ]` 畫成 dim（次要動作）。
 - prompt 空白時直接按 `1`–`9` 選那一列（鏡像它的畫面尾巴；再按一次取消）。
 - `/workers N` 選第 N 列（第 10 列起、或被擠到 `+N more` 裡的列用這個）。
 - `/workers stop <名字>`、`/workers tell <名字> <訊息>`、`/workers hide`。打出名字本身就是確認。
-- `/workers probe on|off|show`：記錄這個 session 的 band 被哪些 surface 畫出來（desktop、手機實測用）。`on` 開一個新 epoch，寫 `loaded`、`attach`／`detach`、每個 surface 第一次的 `render`（面板關著也記）到 `<state root>/<session id>/surfaces.jsonl`；`show` 只印最新 epoch：整個 epoch 的計數（判定「沒有」要看這行）、遺失的觀測數，再加最後 20 行。預設關閉；新的 `on` 會把舊 epoch 移出檔案，單一 epoch 上限 1 MiB。讀不到的檔案、store 失敗、缺 session id 或 state root 都回 `probe: blocked — …`，不會當成空檔覆寫；寫入失敗計入遺失數，直到下一次 `on`，band 照常畫。
+- `/workers probe on|off|show`：記錄這個 session 的 band 被哪些 surface 畫出來（desktop、手機實測用）。`on` 開一個新 epoch，寫 `loaded`、`attach`／`detach`、每個 surface 第一次的 `render`（面板關著也記）到 `<state root>/<session id>/surfaces.jsonl`；`show` 只印最新 epoch：整個 epoch 的計數（判定「沒有」要看這行）、遺失的觀測數，再加最後 20 行。預設關閉；新的 `on` 會把舊 epoch 移出檔案，單一 epoch 上限 1 MiB。讀不到的檔案、store 失敗、缺 session id 或 state root 都回 `probe: blocked — …`，不會當成空檔覆寫；寫入失敗計入遺失數，直到下一次 `on`，band 照常畫。reload（或新 process）接手一個已經 on 的 epoch 時，`show` 會加一行 `restored after a reload…`：reload 前存不下來的遺失不留痕跡，這個 epoch 不能證明「沒有」，要重新 `on`。
   `stop`／`tell` 只收名字、不收列號：列號跟著每次 refresh 移動，打字到按 Enter 之間插進
   一列就會停錯人（0.7.6，cursor d20cdcc N-2）；打數字會回 `row N is "<名字>" right now`
   讓你照名字再打一次。訊息原樣送出，換行與縮排保留。`tell` 最壞要

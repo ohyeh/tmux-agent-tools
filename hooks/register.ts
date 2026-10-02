@@ -225,6 +225,12 @@ export const register: Register = on => {
     missed: 0,
     /** Set when a loss could not be saved with the epoch: the count shown may be low. */
     lossUnsaved: false,
+    /**
+     * Set when this activation bound an epoch that was already on (a hot reload or a new
+     * process): a loss the earlier activation could not save leaves no trace, so this epoch
+     * cannot prove an absence. A fresh `on` clears it.
+     */
+    restored: false,
     chain: Promise.resolve() as Promise<unknown>,
   }
   const probeKey = (sid: string) => `probe:${sid}`
@@ -282,6 +288,7 @@ export const register: Register = on => {
     )
     probe.errors = st?.lost ?? 0
     probe.lastError = st?.lastError ?? ''
+    probe.restored = st?.on === true
     if (probe.missed && st?.on) await probeLost(`probe load failed while observing (${probe.missed} dropped): ${probe.loadError}`, probe.missed)
     probe.missed = 0
     probe.loadError = ''
@@ -351,6 +358,9 @@ export const register: Register = on => {
         `${st ? ` since ${new Date(st.start).toISOString()}` : ''} · mod ${MOD_VERSION}`,
       `lost observations this epoch: ${probe.errors}${probe.lossUnsaved ? '+ (a loss could not be saved; the count may be low)' : ''}` +
         `${probe.errors || probe.lossUnsaved ? ` (last: ${probe.lastError}) — an absence below is not proof` : ''}`,
+      ...(st?.on && probe.restored
+        ? ['restored after a reload: a loss before it may be unsaved — an absence below is not proof; /workers probe on starts a clean epoch']
+        : []),
       ...(st ? [`this epoch, all lines: ${summary}`] : []),
       `file: ${probe.path || '(none)'}`,
       ...(st ? mine.slice(-20) : []),
@@ -1252,6 +1262,7 @@ export const register: Register = on => {
               probe.errors = 0
               probe.lastError = ''
               probe.lossUnsaved = false
+              probe.restored = false
             }
           }
           return ''

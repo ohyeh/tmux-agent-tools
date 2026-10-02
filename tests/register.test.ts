@@ -3910,6 +3910,20 @@ describe('surface probe (/workers probe)', () => {
     )
   })
 
+  test('Sol E3: an epoch this activation did not start cannot prove an absence; a fresh on clears that', WITH_DRIVER, async ($, on) => {
+    const files: Files = { [PROBE]: `${JSON.stringify({ epoch: 'e1', kind: 'loaded' })}\n` }
+    // The store holds a clean on epoch (lost unset), as after a reload whose loss could not be saved.
+    setup(on, files, { 'probe:sess-test': { on: true, epoch: 'e1', start: 0 } as unknown as string[] })
+    await $.session.start(session())
+    const restored = (await $.command.run(run('workers', 'probe show'))).text
+    expect(restored).toContain('lost observations this epoch: 0')
+    expect(restored).toContain('restored after a reload: a loss before it may be unsaved — an absence below is not proof')
+    const fresh = (await $.command.run(run('workers', 'probe on'))).text
+    expect(fresh).not.toContain('restored after a reload')
+    await $.command.run(run('workers', 'probe off'))
+    expect((await $.command.run(run('workers', 'probe show'))).text, 'off: no verdict to guard').not.toContain('restored after a reload')
+  })
+
   test('Sol N2: observations dropped while the load failed are charged to the epoch once it loads', WITH_DRIVER, async ($, on) => {
     // Counts refused reads, so the test knows the render's own load has failed.
     let refused = 0
