@@ -52,6 +52,9 @@ jobs:
           brew list jq >/dev/null 2>&1 || brew install jq
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
           brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          # The runner's own sqlite3 has no FTS5 (tmux-agent-history needs it); same as ci.yml.
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
       - name: Set up the core's Node floor
         uses: actions/setup-node@v5
