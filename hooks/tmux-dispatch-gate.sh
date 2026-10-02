@@ -65,18 +65,20 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
   # once per copy, with the same tool_use_id. mkdir is atomic, so concurrent
   # copies agree on which one records the call.
   log="$STATE_DIR/review-dispatch.log"
-  tool_use_id="$(printf '%s' "$IN" | jq -r '.tool_use_id // empty' 2>/dev/null)"
-  if [ -z "$tool_use_id" ]; then
-    echo "$(date -u +%FT%TZ) $cmd" >> "$log"
+  # Every step that counts the call fails closed: an uncounted call must not pass.
+  unrecorded() {
+    echo "BLOCKED by workflow gate: could not count this review-shaped dispatch ($1). Retry the call; if it repeats, check $STATE_DIR." >&2
+    exit 2
+  }
+  if ! printf '%s' "$IN" | jq -e '(.tool_use_id // "") | length > 0' >/dev/null 2>&1; then
+    echo "$(date -u +%FT%TZ) $cmd" >> "$log" || unrecorded "log write failed"
   else
-    # sha256 of the id: a fixed-length name (a hex of a long id passed NAME_MAX, so
-    # mkdir failed and the call went uncounted), never . or ..
-    unrecorded() {
-      echo "BLOCKED by workflow gate: could not count this review-shaped dispatch ($1). Retry the call; if it repeats, check $STATE_DIR." >&2
-      exit 2
-    }
-    if command -v sha256sum >/dev/null 2>&1; then h="$(printf '%s' "$tool_use_id" | sha256sum)"
-    else h="$(printf '%s' "$tool_use_id" | shasum -a 256 2>/dev/null)"; fi
+    # sha256 of the id's raw bytes (jq -j, never a shell variable: $(...) drops a
+    # trailing newline and bash drops a NUL, so two ids became one): a fixed-length
+    # name (a hex of a long id passed NAME_MAX), never . or ..
+    id_bytes() { printf '%s' "$IN" | jq -j '.tool_use_id'; }
+    if command -v sha256sum >/dev/null 2>&1; then h="$(id_bytes | sha256sum)"
+    else h="$(id_bytes | shasum -a 256 2>/dev/null)"; fi
     h="${h%% *}"
     # A failed or missing digest would leave every id on one marker `id-`.
     printf '%s' "$h" | grep -Eq '^[0-9a-f]{64}$' || unrecorded "no sha256 digest (sha256sum or shasum)"
@@ -94,7 +96,9 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
       unrecorded "mkdir $seen failed"
     fi
   fi
-  n="$(wc -l < "$log" 2>/dev/null | tr -d ' ')"; n="${n:-0}"
+  # An unreadable log is no count, not 0.
+  n="$(wc -l < "$log" 2>/dev/null)" || unrecorded "log unreadable"
+  n="$(printf '%s' "$n" | tr -d ' ')"
   if [ "$n" -ge 2 ] && ! valid_receipt "$STATE_DIR/gate-receipt-workflow"; then
     cat >&2 <<EOF
 BLOCKED by workflow gate: this is review-shaped worker dispatch #$n this

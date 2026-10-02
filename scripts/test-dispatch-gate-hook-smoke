@@ -114,5 +114,19 @@ rc=0; err="$(printf '{"session_id":"%s","tool_use_id":"x1","tool_name":"Shell","
 if [ "$rc" = 2 ] && printf '%s' "$err" | grep -q "no sha256 digest"; then echo "PASS [no-digest-deny]"; else echo "FAIL [no-digest-deny] rc=$rc $err"; FAILS=$((FAILS+1)); fi
 rm -rf "$ST6" "$FAKE"
 
+# 21–23. a count that cannot be trusted is no pass (Sol r11 ep3): unreadable log,
+# unwritable log on the no-id path, and ids that differ only in a trailing newline.
+SID7="smoke7-$$"; ST7="$HOME/.local/state/agent-hooks/$SID7"
+j7() { printf '{"session_id":"%s","tool_use_id":"%s","tool_name":"Shell","tool_input":{"command":"%s"}}' "$SID7" "$1" "$2"; }
+fresh7() { rm -rf "$ST7"; mkdir -p "$ST7"; printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST7/gate-receipt-parent-dispatch"; }
+fresh7; : > "$ST7/review-dispatch.log"; chmod 0200 "$ST7/review-dispatch.log"
+check "unreadable-log-deny" 2 "$(j7 r1 'agent-tmux codex start sol_review_a')" "log unreadable"
+fresh7; : > "$ST7/review-dispatch.log"; chmod 0400 "$ST7/review-dispatch.log"
+check "noid-unwritable-log-deny" 2 "$(j 'agent-tmux codex start sol_review_a' | sed "s/$SID/$SID7/")" "log write failed"
+fresh7
+check "newline-id-1st-pass" 0 "$(j7 'call-a' 'agent-tmux codex start sol_review_a')"
+check "newline-id-2nd-review-deny" 2 "$(j7 'call-a\n' 'agent-tmux codex start sol_review_b')" "dispatch #2"
+chmod -R u+rw "$ST7" 2>/dev/null; rm -rf "$ST7"
+
 if [ "$FAILS" -ne 0 ]; then echo "SMOKE FAIL ($FAILS)"; exit 1; fi
 echo "SMOKE OK — all checks passed"
