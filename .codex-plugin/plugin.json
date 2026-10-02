@@ -19,10 +19,11 @@
     "supervision"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "tmux-agent-tools",
     "shortDescription": "Supervise Claude Code / Codex CLI as controllable tmux sessions",
-    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill with no MCP server or hooks.",
+    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill plus the tmux-agent-mcp worker-lifecycle MCP server.",
     "developerName": "PaulYeh",
     "category": "Productivity",
     "capabilities": [

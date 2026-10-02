@@ -112,7 +112,9 @@ Its credential-free `fake` participants are covered by CI; real `codex`/`claude`
 - The skill is optional: add it only if you want the model to drive `agent-tmux` from
   the shell too. Install it one way — `npx skills` or the `tmux-agent` plugin, not
   both — or the same skill loads twice.
-- Codex, Cursor and other CLIs: the skill plus `install-bin`. They do not load
+- Codex, Cursor and other CLIs: the skill plus `install-bin` (and, for the MCP
+  server, register `tmux-agent-mcp` from the skill folder; see "MCP server"), or
+  the `tmux-agent` plugin, which carries the skill and the MCP server together. They do not load
   the Claude function-hook mod. They share its v5 ledger: one `.v3/` tree under
   the state root, written by the same core the mod imports
   (`skills/tmux-agent-tools/scripts/lib/workers.ts`). One collector per host
@@ -263,11 +265,23 @@ brief. When the host goes away (stdin closed, stdout broken) the server settles
 unsent responses as not-acked, retires its heartbeat so the next session claims
 at once, and exits; it neither crashes on `EPIPE` nor stays behind as an orphan.
 
-Register it with its absolute path, for example:
+The Codex and Cursor plugins declare it, so installing the plugin registers it:
+`.codex-plugin/mcp.json` (Codex runs `./skills/…/tmux-agent-mcp` with the plugin
+root as cwd) and `mcpServers` in `.cursor-plugin/plugin.json`
+(`${CURSOR_PLUGIN_ROOT}/skills/…/tmux-agent-mcp`). The server's cwd does not scope
+workers: `spawn_tmux_agent` takes `repoPath`, and the other tools find a worker by
+`agent_id`. With the skill installed by `npx skills` (the usual way) and no
+plugin, register the copy inside the installed skill folder by its absolute path,
+for example a global install:
 
 ```bash
-codex mcp add tmux-agent -- /abs/path/to/skills/tmux-agent-tools/scripts/tmux-agent-mcp
+codex mcp add tmux-agent -- ~/.agents/skills/tmux-agent-tools/scripts/tmux-agent-mcp
 ```
+
+For Cursor, put the same absolute path as `command` of a `tmux-agent` entry in
+`~/.cursor/mcp.json`. Use one way: the plugin also loads the skill, so a plugin
+next to an `npx skills` install loads the skill twice, and a plugin MCP entry next
+to a `codex mcp add` entry starts two servers.
 
 The bundle is generated: after a change in `mcp-adapter/src` or a version bump,
 run `npm --prefix mcp-adapter ci && node mcp-adapter/build.mjs` and commit the

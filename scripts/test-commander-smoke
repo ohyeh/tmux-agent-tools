@@ -285,8 +285,11 @@ OWNED="owned$$"
 OTHER="other$$"
 SINCE=1700000000001
 LONG="$(perl -e 'print "OWNEDOK" . ("x" x 693)')"
-# Echo would print the paste and cat would print it again. -echo keeps one copy.
-private_tmux new-session -d -s "$SESSION" -x 4000 -y 50 "stty -echo; cat"
+# The collector pastes only into a known CLI's empty composer (64b48c1), so the host pane
+# runs the core's fake composer; its state dir name lets hostCli see "cursor-agent".
+FAKE_HOST_STATE="$(mktemp -d "$WORK/cursor-agent-fake.XXXX")"
+private_tmux new-session -d -s "$SESSION" -x 4000 -y 50 \
+  "${(q)$(command -v node)} ${(q)REPO_ROOT}/skills/tmux-agent-tools/scripts/lib/fixtures/composer/fake-cursor.mjs ${(q)FAKE_HOST_STATE}"
 PANE="$(private_tmux display-message -p -t "$SESSION" '#{pane_id}')"
 PANE_CWD="$(private_tmux display-message -p -t "$PANE" '#{pane_current_path}')"
 V3="$TMUX_AGENT_DIR/.v3"

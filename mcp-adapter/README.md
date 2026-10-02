@@ -10,7 +10,7 @@ Small MCP server exposing a Codex-shaped lifecycle over `tmux-agent-tools` worke
 
 ## Installation
 
-The install layout is the bundle: `skills/tmux-agent-tools/scripts/tmux-agent-mcp` runs `scripts/lib/mcp-server.mjs`, which needs no `npm install`. Register it with its absolute path (MCP registration is stored in the host CLI config and must resolve from any working directory):
+The install layout is the bundle: `skills/tmux-agent-tools/scripts/tmux-agent-mcp` runs `scripts/lib/mcp-server.mjs`, which needs no `npm install`. The Codex plugin (`.codex-plugin/mcp.json`) and the Cursor plugin (`mcpServers` in `.cursor-plugin/plugin.json`) declare it, so a plugin install registers it. Without the plugin, register it by its absolute path (MCP registration is stored in the host CLI config and must resolve from any working directory):
 
 ```sh
 codex mcp add tmux-agent -- /abs/path/to/skills/tmux-agent-tools/scripts/tmux-agent-mcp

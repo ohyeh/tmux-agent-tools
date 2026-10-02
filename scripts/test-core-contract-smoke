@@ -9,6 +9,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 cd "$SCRIPT_DIR/../skills/tmux-agent-tools/scripts/lib"
+# Hermetic agent-tmux: the core resolves `agent-tmux` on PATH first (agentTmuxBin), and
+# the fake hosts answer that bare name. Put this checkout's scripts first, so a run never
+# depends on an installed copy (CI has none: 77 tests failed there and passed locally).
+export PATH="$PWD/..:$PATH"
 
 floor=22.18.0
 have="$(node -p 'process.versions.node')"

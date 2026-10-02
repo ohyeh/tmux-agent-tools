@@ -597,7 +597,9 @@ test('C-lock: crash right after the ln -sn publish → busy (no steal); unlock n
 test('C-lock: a holder alive for more than 10s is never stolen; a delayed release lets the waiter in after it', { timeout: 60_000 }, async () => {
   const w = lockDir()
   try {
-    const holder = contender(w.dir, { HOLD: '11000', RELEASE: '1' })
+    // HOLD leaves 3.5s after the 10.5s check for a slow runner to start the unlock while
+    // the holder still holds (CI: 0.5s was too little, the unlock ran after the release).
+    const holder = contender(w.dir, { HOLD: '14000', RELEASE: '1' })
     await until(() => linked(w.lock), 'the holder to take the lock')
     const token = holderOf(w.lock).token
     const waiter = contender(w.dir, { RELEASE: '1' })

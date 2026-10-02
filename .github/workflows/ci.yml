@@ -91,8 +91,8 @@ jobs:
           chmod +x "$fake_cli_dir/claude" "$fake_cli_dir/codex"
           claude_clipboard_conf="$(mktemp)"
           codex_clipboard_conf="$(mktemp)"
-          CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CONF="$claude_clipboard_conf" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/agent-tmux claude start --exact ci-clipboard . >/tmp/claude-clipboard.out
-          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CONF="$codex_clipboard_conf" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/agent-tmux codex start --exact ci-clipboard . >/tmp/codex-clipboard.out
+          CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CONF="$claude_clipboard_conf" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/agent-tmux claude start --exact ci-clipboard-claude . >/tmp/claude-clipboard.out
+          CODEX="$fake_cli_dir/codex" CODEX_TMUX_CONF="$codex_clipboard_conf" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/agent-tmux codex start --exact ci-clipboard-codex . >/tmp/codex-clipboard.out
           rg -n 'set -g mouse "on"' "$claude_clipboard_conf"
           rg -n 'copy-selection-and-cancel' "$claude_clipboard_conf"
           rg -n 'MouseDragEnd1Pane send -X copy-selection-and-cancel' "$claude_clipboard_conf"
@@ -100,8 +100,8 @@ jobs:
           rg -n 'MouseDragEnd1Pane send -X copy-pipe-and-cancel "sh -c \\"cat >/tmp/tmux-agent-tools-ci-copy\\""' "$codex_clipboard_conf"
           CLAUDE="$fake_cli_dir/claude" CLAUDE_TMUX_CLIPBOARD=internal skills/tmux-agent-tools/scripts/agent-tmux claude doctor | rg -n 'clipboard: internal'
           CODEX="$fake_cli_dir/codex" CODEX_TMUX_CLIPBOARD='sh -c "cat >/tmp/tmux-agent-tools-ci-copy"' skills/tmux-agent-tools/scripts/agent-tmux codex doctor | rg -n 'clipboard: sh -c "cat >/tmp/tmux-agent-tools-ci-copy"'
-          skills/tmux-agent-tools/scripts/agent-tmux claude stop ci-clipboard
-          skills/tmux-agent-tools/scripts/agent-tmux codex stop ci-clipboard
+          skills/tmux-agent-tools/scripts/agent-tmux claude stop ci-clipboard-claude
+          skills/tmux-agent-tools/scripts/agent-tmux codex stop ci-clipboard-codex
           tmux new-session -d -s claude-cli-ci-hygiene 'sleep 300'
           tmux new-session -d -s codex-cli-ci-hygiene 'sleep 300'
           tmux new-session -d -s tmux-agent-dialogue-ci-hygiene-a 'sleep 300'

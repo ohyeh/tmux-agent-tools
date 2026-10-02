@@ -8329,6 +8329,14 @@ while IFS= read -r line; do
     "End your reply with this exact nonce on its own line: "*)
       printf '%s\n' "${line##*: }"
       ;;
+    # claude gets a multi-line send as a file ref (file_ref_line); read the
+    # file as claude does and answer its nonce line. Both arms match wrapper
+    # prose: edit file_ref_line or the nonce sentence, edit these too.
+    "Your task is in the file "*)
+      ref="${line#Your task is in the file }"
+      ref="${ref%% — *}"
+      sed -n 's/^End your reply with this exact nonce on its own line: //p' "$ref"
+      ;;
   esac
 done
 FAKE_EOF
