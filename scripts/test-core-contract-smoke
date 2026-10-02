@@ -32,7 +32,9 @@ if [[ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | head -1)" != "$floor" ]]
 fi
 
 # A hung test used to sit until the job timeout. Each test FILE dies at this bound.
-timeout_ms=120000
+# launcher.contract takes ~70 s alone; beside the parallel smokes of a release run
+# it passed 120 s (v0.44.5, all its subtests ok). The run bound below still caps all.
+timeout_ms=240000
 for arg in "$@"; do
   if [[ "$arg" == --test-timeout=* ]]; then
     timeout_ms="${arg#*=}"
