@@ -855,10 +855,15 @@ export function fence(summary: string, path?: string): string {
   ].join('\n')
 }
 
-/** The CLI's own precedence (agent-tmux:1663): TMUX_AGENT_DIR, XDG_STATE_HOME, HOME. */
+/**
+ * The CLI's own precedence (agent-tmux:1663): TMUX_AGENT_DIR, XDG_STATE_HOME, HOME.
+ * The mod hands the wrapper `TMUX_AGENT_DIR=<root>/.v3` (the wrapper's agent dir); a tmux
+ * server started by that wrapper keeps it in its global env, so every pane inherits it.
+ * A value that is already the v5 dir means its parent, never `<root>/.v3/.v3`.
+ */
 export async function rootOf(host: Host): Promise<string | undefined> {
-  const override = await host.envTmuxAgentDir()
-  if (override?.startsWith('/')) return override
+  const override = (await host.envTmuxAgentDir())?.replace(/\/+$/, '')
+  if (override?.startsWith('/')) return override.endsWith(`/${V3}`) ? override.slice(0, -V3.length - 1) : override
   const xdg = await host.envXdgStateHome()
   if (xdg?.startsWith('/')) return `${xdg}/tmux-agent-tools`
   const home = await host.envHome()

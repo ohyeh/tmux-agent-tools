@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, rootOf, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
 
@@ -54,6 +54,14 @@ async function assigned(w: ReturnType<typeof world>, name = 'w') {
   if ('deny' in r) assert.fail(r.deny)
   return r
 }
+
+test('rootOf: TMUX_AGENT_DIR that is already the v5 dir (inherited from a wrapper-started tmux server) means its parent', async () => {
+  const at = (dir: string) => rootOf({ ...nodeHost({}), envTmuxAgentDir: async () => dir })
+  assert.equal(await at('/s/tmux-agent-tools/.v3'), '/s/tmux-agent-tools')
+  assert.equal(await at('/s/tmux-agent-tools/.v3/'), '/s/tmux-agent-tools')
+  assert.equal(await at('/s/tmux-agent-tools'), '/s/tmux-agent-tools')
+  assert.equal(await at('/s/x.v3'), '/s/x.v3')
+})
 
 test('assign: v5 name, worker.json, E1 descriptor + sent, launch on the producer route with TMUX_AGENT_DIR', async () => {
   const w = world()

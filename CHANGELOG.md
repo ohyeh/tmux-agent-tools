@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## v0.44.5 - 2026-10-02
+
+- Fix (core root, TUI): the mod launches the wrapper with `TMUX_AGENT_DIR=<root>/.v3` (the wrapper's agent dir). When that launch starts the tmux server, the server keeps the value in its global environment, and every pane inherits it; the core read it as the root and looked in `<root>/.v3/.v3`. So a `tmux-agent-tui` (or `workers.cli rows`, the launcher) opened in tmux showed no worker, only project-session rows. `rootOf` now reads a value that ends in `/.v3` as its parent. A contract case fails on 0.44.4. Leftover `<root>/.v3/.v3/` dirs from earlier runs are not touched.
 - Fix (Bash gate; Sol r11 ep2): a failed or missing sha256 tool left every `tool_use_id` on one `id-` marker, so a second review dispatch passed. A digest that is not 64 hex characters now denies (exit 2). Smoke case 20 fails on 0.44.4.
 - Fix (Bash gate; Sol r11 ep3): three paths counted a review dispatch it could not trust as a pass. An unreadable log was read as 0 lines; an append failure on the no-`tool_use_id` path was ignored; and the id was hashed from a shell variable, so `call-a` and `call-a\n` (or an id with a NUL) shared one marker. Each now denies (exit 2): the count fails closed, both append paths check the write, and the digest reads the id's raw bytes from `jq -j`. Smoke cases 21–23 fail on 24aa101 and pass now.
 
