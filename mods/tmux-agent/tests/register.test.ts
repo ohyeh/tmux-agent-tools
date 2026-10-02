@@ -519,7 +519,7 @@ describe('ownership', () => {
     const folded = textOf(await $.ui.render(bandRender()))
     expect(folded, 'the title names this session').toContain('@sess-A · tmux')
     expect(folded, 'ours is listed, untagged').toMatch(/mine(?!  @)/)
-    expect(folded, 'theirs by holder, one line; no heartbeat file = @unknown').toContain('展開 · 其他 session 運行中 0：@sess-B 1 · @unknown 1')
+    expect(folded, 'theirs by holder, one line; no heartbeat file = @unknown').toContain('展開 · 其他 session 運行中 0/共 2：@sess-B 1 · @unknown 1')
     expect(folded, 'their rows are folded away').not.toContain('live  @sess-B')
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'others', requestId: 'above-prompt' })
@@ -787,7 +787,7 @@ describe('ownership', () => {
     await $.session.start(session())
     await $.command.run(run('workers'))
     const folded = textOf(await $.ui.render(bandRender()))
-    expect(folded, "the other session's live teammate is counted as running").toContain('運行中 1：@sess-A 1')
+    expect(folded, "the other session's live teammate is counted as running").toContain('運行中 1/共 1：@sess-A 1')
     expect(folded, "another repo's worker is not").not.toContain('far')
     const told = await $.command.run(run('workers', 'tell w1 first, while folded'))
     expect(told.text, 'a folded row is still reached by name').not.toContain('no worker')

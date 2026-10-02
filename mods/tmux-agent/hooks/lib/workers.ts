@@ -2560,14 +2560,14 @@ export function setRows(panel: Panel, rows: PanelRow[]): void {
   if (panel.selected && !panel.rows.some(r => r.id === panel.selected)) panel.selected = undefined
 }
 
-/** `其他 session 運行中 1：@a 5 · @unknown 1`, or undefined when no other session holds a row here. */
+/** `其他 session 運行中 1/共 6：@a 5 · @unknown 1` (per-holder counts are all rows), or undefined when no other session holds a row here. */
 export function othersLine(all: readonly PanelRow[]): { text: string; running: number } | undefined {
   const theirs = all.filter(r => r.holder)
   if (!theirs.length) return undefined
   const by = new Map<string, number>()
   for (const r of theirs) by.set(r.holder!, (by.get(r.holder!) ?? 0) + 1)
   const running = theirs.filter(r => !r.terminal).length
-  return { text: `其他 session 運行中 ${running}：${[...by].map(([h, n]) => `@${h} ${n}`).join(' · ')}`, running }
+  return { text: `其他 session 運行中 ${running}/共 ${theirs.length}：${[...by].map(([h, n]) => `@${h} ${n}`).join(' · ')}`, running }
 }
 
 /** `text` cut to `max` display cells, `…` marking the cut. */

@@ -487,7 +487,7 @@ export const register: Register = on => {
           profile: { type: 'string', description: 'agent-tmux profile or cli name' },
           name: {
             type: 'string',
-            description: 'worker base name; a 4-character suffix is added (e.g. review → review-k3x9) — use the name the receipt returns for every later call',
+            description: 'worker base name; a 5-character suffix is added after a dot (e.g. review → review.k3x9a) — use the name the receipt returns for every later call',
           },
           dir: { type: 'string', description: 'absolute working directory for the worker' },
           brief: {
@@ -509,7 +509,7 @@ export const register: Register = on => {
       inputSchema: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'worker name as dispatched (e.g. review-k3x9)' },
+          name: { type: 'string', description: 'worker name as dispatched (e.g. review.k3x9a)' },
           text: { type: 'string', description: 'the message; multi-line is fine' },
         },
         required: ['name', 'text'],
