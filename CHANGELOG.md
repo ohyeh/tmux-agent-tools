@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix (Bash gate; Sol r11 ep2): a failed or missing sha256 tool left every `tool_use_id` on one `id-` marker, so a second review dispatch passed. A digest that is not 64 hex characters now denies (exit 2). Smoke case 20 fails on 0.44.4.
+
 ## v0.44.4 - 2026-10-02
 
 - Fix (mod panel, desktop; Sol r11 #3): 0.44.2/0.44.3 drew word labels on a glyph cell budget, so the desktop header ran past the band width. The labels follow the terminal budget again; on the desktop the bar has no accent background (only the title Text keeps it), so the native buttons no longer read as greyed out.

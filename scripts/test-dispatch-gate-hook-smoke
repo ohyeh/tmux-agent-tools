@@ -105,5 +105,14 @@ mkdir -p "$ST5/seen/id-${h%% *}"   # the recording copy made its marker, then di
 check "dead-copy-no-pass" 2 "$(j5 dead-copy 'agent-tmux codex start sol_review_c')" "did not finish recording"
 rm -rf "$ST5"
 
+# 20. no working sha256 tool: deny, never share one `id-` marker (Sol r11 ep2).
+SID6="smoke6-$$"; ST6="$HOME/.local/state/agent-hooks/$SID6"; FAKE="$(mktemp -d)"
+mkdir -p "$ST6"
+printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST6/gate-receipt-parent-dispatch"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE/sha256sum"; chmod +x "$FAKE/sha256sum"
+rc=0; err="$(printf '{"session_id":"%s","tool_use_id":"x1","tool_name":"Shell","tool_input":{"command":"agent-tmux codex start sol_review_a"}}' "$SID6" | PATH="$FAKE:$PATH" bash "$HOOK" 2>&1 >/dev/null)" || rc=$?
+if [ "$rc" = 2 ] && printf '%s' "$err" | grep -q "no sha256 digest"; then echo "PASS [no-digest-deny]"; else echo "FAIL [no-digest-deny] rc=$rc $err"; FAILS=$((FAILS+1)); fi
+rm -rf "$ST6" "$FAKE"
+
 if [ "$FAILS" -ne 0 ]; then echo "SMOKE FAIL ($FAILS)"; exit 1; fi
 echo "SMOKE OK — all checks passed"

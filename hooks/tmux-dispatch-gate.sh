@@ -71,14 +71,17 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
   else
     # sha256 of the id: a fixed-length name (a hex of a long id passed NAME_MAX, so
     # mkdir failed and the call went uncounted), never . or ..
-    if command -v sha256sum >/dev/null 2>&1; then h="$(printf '%s' "$tool_use_id" | sha256sum)"
-    else h="$(printf '%s' "$tool_use_id" | shasum -a 256)"; fi
-    seen="$STATE_DIR/seen/id-${h%% *}"
-    mkdir -p "$STATE_DIR/seen"
     unrecorded() {
       echo "BLOCKED by workflow gate: could not count this review-shaped dispatch ($1). Retry the call; if it repeats, check $STATE_DIR." >&2
       exit 2
     }
+    if command -v sha256sum >/dev/null 2>&1; then h="$(printf '%s' "$tool_use_id" | sha256sum)"
+    else h="$(printf '%s' "$tool_use_id" | shasum -a 256 2>/dev/null)"; fi
+    h="${h%% *}"
+    # A failed or missing digest would leave every id on one marker `id-`.
+    printf '%s' "$h" | grep -Eq '^[0-9a-f]{64}$' || unrecorded "no sha256 digest (sha256sum or shasum)"
+    seen="$STATE_DIR/seen/id-$h"
+    mkdir -p "$STATE_DIR/seen"
     if mkdir "$seen" 2>/dev/null; then
       echo "$(date -u +%FT%TZ) $cmd" >> "$log" || unrecorded "log write failed"
       : > "$seen/done"
