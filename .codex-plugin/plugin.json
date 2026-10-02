@@ -20,6 +20,7 @@
   ],
   "skills": "./skills/",
   "mcpServers": "./.codex-plugin/mcp.json",
+  "hooks": "./.codex-plugin/hooks.json",
   "interface": {
     "displayName": "tmux-agent-tools",
     "shortDescription": "Supervise Claude Code / Codex CLI as controllable tmux sessions",
@@ -35,7 +36,7 @@
       "Orchestrate multi-agent pair and team review workflows"
     ],
     "defaultPrompt": [
-      "Start a supervised agent session for this task with agent-tmux claude start or agent-tmux codex start, then report its structured result."
+      "Start a supervised codex or claude worker with agent-tmux and report its structured result."
     ]
   }
 }

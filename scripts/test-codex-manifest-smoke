@@ -1,0 +1,33 @@
+#!/usr/bin/env zsh
+# Codex plugin manifest shape (codex-cli 0.160.0, observed 2026-10-02):
+# - With no `hooks` in .codex-plugin/plugin.json, codex parses the plugin's
+#   hooks/hooks.json, which is Claude Code's file: its `modules` key failed with
+#   "unknown field `modules`, expected `description` or `hooks`". The manifest
+#   must name a codex hooks file whose top level is only those two keys.
+# - codex ignores an interface.defaultPrompt entry over 128 characters.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
+PASS=0
+FAIL=0
+ok()  { echo "  ok   $1"; PASS=$((PASS + 1)); }
+bad() { echo "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
+
+M=.codex-plugin/plugin.json
+hooks="$(jq -r '.hooks // empty' "$M")"
+if [[ -n "$hooks" && "$hooks" != ./hooks/hooks.json && "$hooks" != hooks/hooks.json ]]; then
+  ok "$M names its own hooks file ($hooks)"
+  extra="$(jq -r 'keys - ["description","hooks"] | join(",")' "$hooks" 2>/dev/null || echo PARSE_ERROR)"
+  [[ -z "$extra" ]] && ok "$hooks has only description/hooks" || bad "$hooks has keys codex rejects: $extra"
+else
+  bad "$M has no codex hooks file; codex would parse hooks/hooks.json (Claude's, with \`modules\`)"
+fi
+
+long="$(jq -r '[.interface.defaultPrompt[]? | select(length > 128)] | length' "$M")"
+[[ "$long" == 0 ]] && ok "every interface.defaultPrompt is at most 128 characters" || bad "$long interface.defaultPrompt entries are over 128 characters"
+
+echo "codex-manifest smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

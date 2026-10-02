@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Fix (Sol r9 F1–F6): the probe never takes an unreadable jsonl as empty (named blocker, file untouched); a failed store/file load binds nothing and stays retryable; lost observations stay counted until a fresh `on`; `show` names a missing session id or state root, and prints the whole epoch's counts before the last 20 lines; a fresh `on` drops older epochs and one epoch is capped at 1 MiB (capacity blocker).
+- Fix (codex plugin): `.codex-plugin/plugin.json` names its own hooks file (`.codex-plugin/hooks.json`, no hooks), so codex 0.160 no longer parses Claude's `hooks/hooks.json` and warns `unknown field \`modules\``; the codex `defaultPrompt` fits codex's 128-character limit (it was ignored). New `test-codex-manifest-smoke` (fails 2 of 3 on the old manifest).
 - Fix (Sol r9 ep3 E3-A/E3-B): an epoch this activation did not start (bound after a hot reload or in a new process, on or off) cannot prove an absence; `show` says so until a fresh `on` (`off` keeps it), since a loss the earlier activation could not save leaves no trace.
 - Fix (Sol r9 ep2 N1–N3, ep1 F2/F6): the lost-observation count survives a hot reload (kept in the store); observations dropped while a load is failing are counted; the 1 MiB epoch cap counts UTF-8 bytes.
 - Fix: a `tmux ls` / `process.run` stdout cut at the 4 MiB output limit (`isStdoutTruncated`) is not an answer; the band shows unknown instead of reading the cut listing as the whole fleet.
