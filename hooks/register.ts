@@ -94,6 +94,17 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  */
 const MOD_VERSION = '0.42.0'
 
+/**
+ * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
+ * the caller sees a rejection, as for a failed run, so a partial `tmux ls` never replaces the
+ * fleet (Sol r9). The mod's captures are one screen, so this only fires on a broken child.
+ */
+async function wholeRun(argv: readonly string[], ran: Promise<{ exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }>) {
+  const r = await ran
+  if (r.isStdoutTruncated) throw new Error(`${argv[0]}: stdout over the 4 MiB output limit was cut; not an answer`)
+  return r
+}
+
 // Tool names as literals here: the engine resolves a `tool.call` matcher only
 // from a constant in this file (imported ones validate as `tool=?`). The core
 // keeps its copy for the text it writes; this check fails typecheck on drift.
@@ -192,7 +203,8 @@ export const register: Register = on => {
    * `<state root>/<session id>/surfaces.jsonl`. `$.fs.write` replaces the whole file,
    * so every step runs on one chain, and a line is kept only once its write landed.
    */
-  type ProbeState = { on: boolean; epoch: string; start: number }
+  /** `lost`/`lastError` are kept with the epoch, so a hot reload cannot reset the loss count to 0. */
+  type ProbeState = { on: boolean; epoch: string; start: number; lost?: number; lastError?: string }
   // ponytail: one epoch is capped at 1 MiB (the fs limit is 4 MiB per read/write) and a fresh
   // `on` drops older epochs; raise the cap if a live run ever needs more lines.
   const PROBE_MAX_BYTES = 1 << 20
@@ -209,6 +221,10 @@ export const register: Register = on => {
     lastError: '',
     loadError: '',
     loadFailedAt: -Infinity,
+    /** Observations dropped while no load had succeeded; charged to the epoch once one does (if it is on). */
+    missed: 0,
+    /** Set when a loss could not be saved with the epoch: the count shown may be low. */
+    lossUnsaved: false,
     chain: Promise.resolve() as Promise<unknown>,
   }
   const probeKey = (sid: string) => `probe:${sid}`
@@ -264,22 +280,39 @@ export const register: Register = on => {
         return j?.epoch === st?.epoch && j?.kind === 'render' && typeof j?.surface === 'string' ? [j.surface] : []
       }),
     )
+    probe.errors = st?.lost ?? 0
+    probe.lastError = st?.lastError ?? ''
+    if (probe.missed && st?.on) await probeLost(`probe load failed while observing (${probe.missed} dropped): ${probe.loadError}`, probe.missed)
+    probe.missed = 0
     probe.loadError = ''
     return ''
   }
   /** Loads for a hook caller: a failed load is retried after PROBE_RETRY_MS, not on every render. */
   const probeLoadQuiet = async (): Promise<boolean> => {
     const w = world
-    if (probe.loadError && w && (await w.now()) - probe.loadFailedAt < PROBE_RETRY_MS) return false
+    if (probe.loadError && w && (await w.now()) - probe.loadFailedAt < PROBE_RETRY_MS) {
+      probe.missed += 1
+      return false
+    }
     const blocker = await probeLoad()
     if (!blocker) return true
+    probe.missed += 1
     probe.loadError = blocker
     probe.loadFailedAt = w ? await w.now() : 0
     return false
   }
-  const probeLost = (error: string) => {
-    probe.errors += 1
+  /** Counts `n` lost observations and saves the count with the epoch; a failed save is shown, never hidden. */
+  const probeLost = async (error: string, n = 1): Promise<void> => {
+    probe.errors += n
     probe.lastError = error
+    const w = world
+    if (!w || !probe.sid || !probe.state) return
+    probe.state = { ...probe.state, lost: probe.errors, lastError: error }
+    try {
+      await w.storeSet(probeKey(probe.sid), probe.state)
+    } catch {
+      probe.lossUnsaved = true
+    }
   }
   /** One event, when the probe is on; `once` de-dups within the epoch (a render per surface). */
   const probeNote = (fields: Record<string, unknown>, once?: string): Promise<void> =>
@@ -290,8 +323,8 @@ export const register: Register = on => {
       if (once && probe.rendered.has(once)) return
       const line = JSON.stringify({ epoch: probe.state.epoch, at: new Date(await w.now()).toISOString(), ...fields })
       const text = `${[...probe.lines, line].join('\n')}\n`
-      if (text.length > PROBE_MAX_BYTES) {
-        probeLost(`probe capacity: this epoch is over ${PROBE_MAX_BYTES} bytes; /workers probe on starts a fresh one`)
+      if (new TextEncoder().encode(text).length > PROBE_MAX_BYTES) {
+        await probeLost(`probe capacity: this epoch is over ${PROBE_MAX_BYTES} bytes; /workers probe on starts a fresh one`)
         return
       }
       try {
@@ -299,7 +332,7 @@ export const register: Register = on => {
         probe.lines.push(line)
         if (once) probe.rendered.add(once)
       } catch (error) {
-        probeLost(probeErr('probe write', error))
+        await probeLost(probeErr('probe write', error))
       }
     })
   /** What `show` prints: the latest epoch's summary (an absence verdict reads this), then its last 20 lines. */
@@ -316,7 +349,8 @@ export const register: Register = on => {
     return [
       `probe: session ${probe.sid ?? '(none)'} · ${st?.on ? 'on' : 'off'} · epoch ${st?.epoch ?? '(none)'}` +
         `${st ? ` since ${new Date(st.start).toISOString()}` : ''} · mod ${MOD_VERSION}`,
-      `lost observations this epoch: ${probe.errors}${probe.errors ? ` (last: ${probe.lastError}) — an absence below is not proof` : ''}`,
+      `lost observations this epoch: ${probe.errors}${probe.lossUnsaved ? '+ (a loss could not be saved; the count may be low)' : ''}` +
+        `${probe.errors || probe.lossUnsaved ? ` (last: ${probe.lastError}) — an absence below is not proof` : ''}`,
       ...(st ? [`this epoch, all lines: ${summary}`] : []),
       `file: ${probe.path || '(none)'}`,
       ...(st ? mine.slice(-20) : []),
@@ -347,7 +381,7 @@ export const register: Register = on => {
       log: text => beneath.ui.log(engineLine(text)),
       run: async (argv, cwd, timeoutMs) => {
         const call = await wrapperCall(host, argv)
-        return beneath.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) })
+        return wholeRun(call.argv, beneath.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) }))
       },
       agentList: () => listAgents(),
     }
@@ -418,7 +452,7 @@ export const register: Register = on => {
       log: text => $.ui.log(engineLine(text)),
       run: async (argv, cwd, timeoutMs) => {
         const call = await wrapperCall(host, argv)
-        return $.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) })
+        return wholeRun(call.argv, $.process.run(call.argv, { cwd: await runnableCwd(host, cwd), timeoutMs, ...(call.env ? { env: call.env } : {}) }))
       },
       agentList: () => listAgents(),
     }
@@ -1217,6 +1251,7 @@ export const register: Register = on => {
               probe.rendered = new Set()
               probe.errors = 0
               probe.lastError = ''
+              probe.lossUnsaved = false
             }
           }
           return ''

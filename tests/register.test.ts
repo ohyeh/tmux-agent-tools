@@ -554,6 +554,24 @@ describe('ownership', () => {
     expect(textOf(await $.ui.render(bandRender())), 'tmux ls did not answer').toContain('unknown — tmux did not say whether its pane is alive')
   })
 
+  test('a truncated tmux ls is not an answer: a row missing from the cut listing is unknown, never exited', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    setSessionId(on, 'sess-A')
+    mockFs(on, {
+      [`${V3}/rz/worker.json`]: JSON.stringify({ profile: 'codex', name: 'rz', dir: '/work', since: 0, owner: 'sess-A', ownerCwd: '/work', origin: 'resume' }),
+    })
+    const probe: Record<string, unknown> = { running: true, sessions: [], truncated: true }
+    mockPanel(on, probe)
+    await clock.advance(1_000)
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const band = textOf(await $.ui.render(bandRender()))
+    expect(band, 'cut listing').toContain('unknown — tmux did not say whether its pane is alive')
+    expect(band).not.toContain('exited — no result')
+  })
+
   test('R8.5: an episode whose delivery was reserved and never acknowledged shows unknown: 可能已送達 on the band; /workers cancel needs --force', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
@@ -1889,7 +1907,8 @@ function mockPanel(
       value: {
         exitCode: (isLs || isList) && typeof probe.exitCode === 'number' ? probe.exitCode : 0,
         stdout: isCapture ? text : isList ? listed : isLs ? sessions : JSON.stringify(probe),
-        stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+        // `probe.truncated`: the engine cut `tmux ls` stdout at its 4 MiB limit.
+        stderr: '', isStdoutTruncated: (isLs || isList) && probe.truncated === true, isStderrTruncated: false },
     }
   })
   return { argv, open, closed, logs, statuses, toasts }
@@ -3877,6 +3896,49 @@ describe('surface probe (/workers probe)', () => {
     // Over the cap: one attach with a client id near 1 MiB is refused, and named.
     await $.session.attach({ surface: 'desktop', clientId: 'x'.repeat(1 << 20) })
     expect((await $.command.run(run('workers', 'probe show'))).text).toContain('lost observations this epoch: 1 (last: probe capacity: this epoch is over 1048576 bytes')
+    expect(kinds(files).map(l => l.kind)).toEqual(['loaded'])
+  })
+
+  test('Sol N1: the loss count is saved with the epoch and survives a reload', WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    const saved = { on: true, epoch: 'e1', start: 0, lost: 2, lastError: 'probe write: Error: EIO' }
+    setup(on, files, { 'probe:sess-test': saved as unknown as string[] })
+    await $.session.start(session())
+    // A fresh activation (as after a hot reload) restores the epoch and its loss count.
+    expect((await $.command.run(run('workers', 'probe show'))).text).toContain(
+      'lost observations this epoch: 2 (last: probe write: Error: EIO) — an absence below is not proof',
+    )
+  })
+
+  test('Sol N2: observations dropped while the load failed are charged to the epoch once it loads', WITH_DRIVER, async ($, on) => {
+    // Counts refused reads, so the test knows the render's own load has failed.
+    let refused = 0
+    const unreadable = new (class extends Set<string> {
+      override has(p: string) {
+        const hit = super.has(p)
+        if (hit) refused += 1
+        return hit
+      }
+    })([PROBE])
+    const files: Files = { [PROBE]: `${JSON.stringify({ epoch: 'e1', kind: 'loaded' })}\n` }
+    setup(on, files, { 'probe:sess-test': { on: true, epoch: 'e1', start: 0 } as unknown as string[] }, { unreadable })
+    await $.session.start(session())
+    await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    for (let i = 0; i < 1000 && refused === 0; i++) await Promise.resolve()
+    expect(refused, "the render's load met the unreadable file").toBeGreaterThan(0)
+    unreadable.delete(PROBE)
+    const text = (await $.command.run(run('workers', 'probe show'))).text
+    expect(text).toMatch(/lost observations this epoch: [1-9]\d* \(last: probe load failed while observing \(\d+ dropped\): probe read .*\) — an absence below is not proof/)
+  })
+
+  test('Sol N3: the cap counts UTF-8 bytes, not string length', WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    setup(on, files)
+    await $.session.start(session())
+    await $.command.run(run('workers', 'probe on'))
+    // 400 000 CJK characters: under 1 MiB as a string length, 1.2 MB as UTF-8.
+    await $.session.attach({ surface: 'desktop', clientId: '字'.repeat(400_000) })
+    expect((await $.command.run(run('workers', 'probe show'))).text).toContain('lost observations this epoch: 1 (last: probe capacity:')
     expect(kinds(files).map(l => l.kind)).toEqual(['loaded'])
   })
 
