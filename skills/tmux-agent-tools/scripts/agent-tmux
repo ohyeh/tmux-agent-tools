@@ -1038,11 +1038,17 @@ refuse_live_name() {
     [[ -n "$bound" ]] || return 0
     owner="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$bound" '#{session_name}' 2>/dev/null || true)"
     [[ -n "$owner" && "$owner" != "$session" ]] || return 0
-    # Only a worker of this same name counts (its session carries
-    # TMUX_AGENT_NAME=<name>): after a tmux server restart a stale pane id can
-    # name an unrelated pane, or another worker's.
-    [[ "$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" show-environment -t "=$owner" TMUX_AGENT_NAME 2>/dev/null || true)" == "TMUX_AGENT_NAME=$name" ]] || return 0
-    echo "name $name is bound to live pane $bound of session $owner; agent-tmux never replaces a live worker, and every CLI shares $(agent_root_dir)/$name. Stop that worker first or use another name." >&2
+    # The owner's session names its worker (TMUX_AGENT_NAME=<name>). Another
+    # name means the pane id is stale (reused after a tmux server restart): go
+    # on. No name at all cannot be told apart from an older worker: refuse.
+    local owner_env
+    owner_env="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" show-environment -t "=$owner" TMUX_AGENT_NAME 2>/dev/null || true)"
+    [[ "$owner_env" == TMUX_AGENT_NAME=* && "$owner_env" != "TMUX_AGENT_NAME=$name" ]] && return 0
+    if [[ "$owner_env" == "TMUX_AGENT_NAME=$name" ]]; then
+      echo "name $name is bound to live pane $bound of session $owner; agent-tmux never replaces a live worker, and every CLI shares $(agent_root_dir)/$name. Stop that worker first or use another name." >&2
+    else
+      echo "name $name is bound to live pane $bound of session $owner, which names no worker (TMUX_AGENT_NAME unset), so its owner cannot be told; agent-tmux never replaces a possibly live worker. Stop that session if it is not yours, or use another name." >&2
+    fi
     exit 1
   fi
   pane="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$(session_target "$session")" '#{pane_id}' 2>/dev/null || true)"
@@ -8404,11 +8410,15 @@ FAKE_EOF
   # output could not be parsed (that path leaked sessions before).
   local st_base="st-rp-$$"
 
-  # The body runs in a subshell and its status is returned after `always`: under
-  # `set -e`, a `return`/`exit`/failing command inside a try block skips `always`.
+  # The body runs in a subshell with its own `set -e`, and its status is returned
+  # after `always`: under `set -e`, a `return`/`exit`/failing command inside a try
+  # block skips `always`. errexit is off around the subshell only (localoptions),
+  # never via `( … ) || rc=…`, which would turn errexit off inside the body too.
   local body_rc=0
   {
+    setopt localoptions noerrexit
     (
+    set -e
     CLI_BIN="$fake_cli"
     LAUNCH_FLAGS=''
     RESULT_PATH_VIA_PROMPT=true
@@ -8456,7 +8466,8 @@ FAKE_EOF
       echo "self-test result-path-prompt: FAIL (follow-up send-wait re-injected $path1; expected once-per-session)" >&2
       exit 1
     fi
-    ) || body_rc=$?
+    )
+    body_rc=$?
   } always {
     local st_session
     for st_session in ${(f)"$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null)"}; do
@@ -8529,11 +8540,15 @@ self_test_watch_count() {
   session2="$(session_for_name "$name2")"
   session3="$(session_for_name "$name3")"
 
-  # The body runs in a subshell and its status is returned after `always`: under
-  # `set -e`, a `return`/`exit`/failing command inside a try block skips `always`.
+  # The body runs in a subshell with its own `set -e`, and its status is returned
+  # after `always`: under `set -e`, a `return`/`exit`/failing command inside a try
+  # block skips `always`. errexit is off around the subshell only (localoptions),
+  # never via `( … ) || rc=…`, which would turn errexit off inside the body too.
   local body_rc=0
   {
+    setopt localoptions noerrexit
     (
+    set -e
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session2")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session3")" 2>/dev/null || true
@@ -8569,7 +8584,8 @@ self_test_watch_count() {
       echo "self-test watch-count: FAIL (unexpected JSON: $out)" >&2
       exit 1
     fi
-    ) || body_rc=$?
+    )
+    body_rc=$?
   } always {
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session1")" 2>/dev/null || true
     "$TMUX" "${TMUX_SOCKET_ARGS[@]}" kill-session -t "$(session_target "$session2")" 2>/dev/null || true
@@ -8594,11 +8610,15 @@ self_test_team_quorum() {
   export TMUX_AGENT_DIR="$tmp_dir/agents"
   team="st-quorum-$$"
 
-  # The body runs in a subshell and its status is returned after `always`: under
-  # `set -e`, a `return`/`exit`/failing command inside a try block skips `always`.
+  # The body runs in a subshell with its own `set -e`, and its status is returned
+  # after `always`: under `set -e`, a `return`/`exit`/failing command inside a try
+  # block skips `always`. errexit is off around the subshell only (localoptions),
+  # never via `( … ) || rc=…`, which would turn errexit off inside the body too.
   local body_rc=0
   {
+    setopt localoptions noerrexit
     (
+    set -e
     mkdir -p "$(agent_root_dir)/$team-w1" "$(agent_root_dir)/$team-w2" "$(agent_root_dir)/$team-w3"
     _team_write_state "$team" "$CLI" "$("$JQ" -cn \
       --arg n1 "$team-w1" --arg n2 "$team-w2" --arg n3 "$team-w3" \
@@ -8637,7 +8657,8 @@ self_test_team_quorum() {
       echo "self-test team-quorum: FAIL (--count 3 unexpectedly met: $out)" >&2
       exit 1
     fi
-    ) || body_rc=$?
+    )
+    body_rc=$?
   } always {
     if [[ -n "$saved_dir" ]]; then
       export TMUX_AGENT_DIR="$saved_dir"

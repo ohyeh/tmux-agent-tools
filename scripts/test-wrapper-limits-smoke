@@ -117,7 +117,7 @@ assert_contains "a2: the refusal names the owning session" "$out" "of session wl
 assert "a2: no second session was made" "$(tmux_b has-session -t '=wlim2-coll' 2>/dev/null && echo made || echo none)" none
 assert "a2: the first worker's state dir is byte-identical" "$(tree_hash "$TMUX_AGENT_DIR/coll")" "$before_tree"
 
-print -r -- "case a3: a stale pane-id naming an unrelated live pane (or another worker's) does not block a start"
+print -r -- "case a3: a stale pane-id naming another worker's live pane does not block a start"
 tmux_b new-session -d -s wlim-x-stale "sleep 300"
 tmux_b set-environment -t '=wlim-x-stale' TMUX_AGENT_NAME x-stale
 stale_pane="$(tmux_b display-message -p -t '=wlim-x-stale:' '#{pane_id}')"
@@ -131,6 +131,18 @@ assert "a3: pane-id now binds the new pane" "$(cat "$TMUX_AGENT_DIR/stale/pane-i
 assert "a3: the unrelated session is untouched" "$(tmux_b has-session -t '=wlim-x-stale' 2>/dev/null && echo kept || echo gone)" kept
 "$AGENT_TMUX" fakecli stop stale >/dev/null 2>&1 || true
 tmux_b kill-session -t '=wlim-x-stale' 2>/dev/null || true
+
+print -r -- "case a4: a live bound pane whose session names no worker (an older start) refuses; nothing is rebound"
+tmux_b new-session -d -s wlim-old-anon "sleep 300"
+anon_pane="$(tmux_b display-message -p -t '=wlim-old-anon:' '#{pane_id}')"
+mkdir -p "$TMUX_AGENT_DIR/anon"
+print -r -- "$anon_pane" > "$TMUX_AGENT_DIR/anon/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli start --exact anon "$WORK/repo" 2>&1)" || code=$?
+assert "a4: start exits non-zero" "$(( code != 0 ))" 1
+assert_contains "a4: the refusal says the owner cannot be told" "$out" "names no worker"
+assert "a4: pane-id still binds the old pane" "$(cat "$TMUX_AGENT_DIR/anon/pane-id")" "$anon_pane"
+tmux_b kill-session -t '=wlim-old-anon' 2>/dev/null || true
 
 print -r -- "case d: a result from an earlier launch of the name is preserved"
 mkdir -p "$TMUX_AGENT_DIR/old"
