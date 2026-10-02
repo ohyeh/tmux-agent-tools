@@ -309,7 +309,7 @@ assert_contains "h: unknown name says Already stopped" "$out" "Already stopped"
 assert "h: no <state>/<name> dir was created" "$([[ -e "$TMUX_AGENT_DIR/nosuchname" ]] && echo yes || echo no)" no
 
 print -r -- "case f: the protocol docs name no \`current\` seq pointer"
-hits="$(cd "$REPO_ROOT" && grep -n '`current`' docs/tmux-agent-mod.md README.md skills/tmux-agent-tools/SKILL.md skills/tmux-agent-tools/references/*.md || true)"
+hits="$(cd "$REPO_ROOT" && grep -n '`current`' mods/tmux-agent/README.md README.md skills/tmux-agent-tools/SKILL.md skills/tmux-agent-tools/references/*.md || true)"
 assert "f: no \`current\` in the protocol docs" "$hits" ""
 
 print -r -- "pass=$PASS fail=$FAIL"

@@ -1,10 +1,28 @@
 {
-  "extends": "./tsconfig.json",
   "compilerOptions": {
-    "lib": ["es2023"],
-    "types": ["node"],
-    "typeRoots": ["./mcp-adapter/node_modules/@types"]
+    "target": "es2023",
+    "lib": [
+      "es2023"
+    ],
+    "types": [
+      "node"
+    ],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "jsx": "react",
+    "jsxFactory": "h",
+    "jsxFragmentFactory": "Fragment",
+    "typeRoots": [
+      "./mcp-adapter/node_modules/@types"
+    ]
   },
-  "include": ["skills/tmux-agent-tools/scripts/lib/*.node.ts"],
+  "include": [
+    "skills/tmux-agent-tools/scripts/lib/*.node.ts"
+  ],
   "exclude": []
 }

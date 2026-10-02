@@ -66,7 +66,7 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| Mod | write + read (assign, wait, deliver) | PASS in unit tests | `tests/register.test.ts`, `describe('delivery')`, `describe('assign')`, `describe('channel authority (S3)')` |
+| Mod | write + read (assign, wait, deliver) | PASS in unit tests | `mods/tmux-agent/tests/register.test.ts`, `describe('delivery')`, `describe('assign')`, `describe('channel authority (S3)')` |
 | MCP | write + read, restart, concurrent waits | PASS | `$R/r8-live-agy/claude/VERDICT.md` on `1c021da` (`claude -p --strict-mcp-config --mcp-config`): full lifecycle; after a kill a new process's wait got `completed` with the old owner pid, later waits `already_acked`; two processes at once delivered once (`completed` + `already_acked`, one `done` ack). |
 | Paste | read (composer-state) | PASS | Real Claude Code captures (`fixtures/composer/claude-*.txt`: empty, draft, multiline, busy, busy-start, done); the `claude` rows of the composer-state test. Claude Code 2.x shows no `esc to interrupt`: busy is the spinner line (`● Calculating…`). |
 | Paste | write | PASS (4 of 5; permission not run) | `$R/r74-paste/claude/*/VERDICT.txt`: each notice delivered once; draft and busy waited out. Claude folds the notice to `[Pasted text #1 +7 lines]` for 8 lines (it counts newlines); the first run failed on that count, fixed in `composerHolds`. `4-permission`: auto mode shows no dialog. |
@@ -75,7 +75,7 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| Mod | write + read | UNCONFIRMED | GA 2.1.287, awaiting live run. `types/claude-code.d.ts` (2.1.287) lists a `desktop` surface whose table has `Input`, and says `AbovePrompt` is "Raised on the terminal and desktop surfaces only". `tests/register.test.ts` ("desktop draws the band like the terminal") draws the band on `desktop`. To close: Part B1 of `$R/runbook-B.md`. |
+| Mod | write + read | UNCONFIRMED | GA 2.1.287, awaiting live run. `mods/tmux-agent/types/claude-code.d.ts` (2.1.287) lists a `desktop` surface whose table has `Input`, and says `AbovePrompt` is "Raised on the terminal and desktop surfaces only". `mods/tmux-agent/tests/register.test.ts` ("desktop draws the band like the terminal") draws the band on `desktop`. To close: Part B1 of `$R/runbook-B.md`. |
 | MCP | write + read | UNCONFIRMED | No run exists. To close: same as the terminal MCP action, in the desktop host. |
 | Paste | read + write | not applicable | Paste needs a tmux pane that runs a known CLI. With no such pane the collector pastes nothing (`skills/tmux-agent-tools/scripts/lib/collector.node.ts:135`, `no known CLI ... nothing pasted`). Use the MCP path. |
 
@@ -83,7 +83,7 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| Mod | render + press | UNCONFIRMED | `types/claude-code.d.ts` (2.1.287): `RenderSurface` has `mobile`; its element table has no `Input` or `Select`; `AbovePrompt` is raised on terminal and desktop only. The 2.1.287 docs say Remote Control draws only in the local terminal. To close: Part B2 of `$R/runbook-B.md`. |
+| Mod | render + press | UNCONFIRMED | `mods/tmux-agent/types/claude-code.d.ts` (2.1.287): `RenderSurface` has `mobile`; its element table has no `Input` or `Select`; `AbovePrompt` is raised on terminal and desktop only. The 2.1.287 docs say Remote Control draws only in the local terminal. To close: Part B2 of `$R/runbook-B.md`. |
 
 ## Operating systems
 

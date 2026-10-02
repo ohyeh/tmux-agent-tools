@@ -1,7 +1,9 @@
 {
   "compilerOptions": {
     "target": "es2023",
-    "lib": ["es2023"],
+    "lib": [
+      "es2023"
+    ],
     "types": [],
     "module": "esnext",
     "moduleResolution": "bundler",
@@ -14,6 +16,9 @@
     "jsxFactory": "h",
     "jsxFragmentFactory": "Fragment"
   },
-  "include": ["types", "hooks", "tests", "skills/tmux-agent-tools/scripts/lib"],
-  "exclude": ["skills/tmux-agent-tools/scripts/lib/*.node.ts"]
+  "include": [
+    "types",
+    "hooks",
+    "tests"
+  ]
 }

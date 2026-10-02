@@ -114,14 +114,14 @@ Its credential-free `fake` participants are covered by CI; real `codex`/`claude`
   both — or the same skill loads twice.
 - Codex, Cursor and other CLIs: the skill plus `install-bin` (and, for the MCP
   server, register `tmux-agent-mcp` from the skill folder; see "MCP server"), or
-  the `tmux-agent` plugin, which carries the skill and the MCP server together. They do not load
+  the `tmux-agent-tools` plugin, which carries the skill and the MCP server together. They do not load
   the Claude function-hook mod. They share its v5 ledger: one `.v3/` tree under
   the state root, written by the same core the mod imports
   (`skills/tmux-agent-tools/scripts/lib/workers.ts`). One collector per host
   session is `node skills/tmux-agent-tools/scripts/lib/collector.node.ts`;
   `cancel` and `unlock` are `node skills/tmux-agent-tools/scripts/lib/workers.cli.node.ts`.
   Layout, ownership, and delivery are in
-  [`docs/tmux-agent-mod.md`](docs/tmux-agent-mod.md) (收集端). Bash guard
+  [`mods/tmux-agent/README.md`](mods/tmux-agent/README.md) (收集端). Bash guard
   (`tool.call`) stays on the Claude mod only.
 - Per-host evidence and open blockers: [`docs/support-matrix.md`](docs/support-matrix.md).
 
@@ -143,15 +143,27 @@ The repository doubles as a plugin for agent CLIs. Every manifest points at the 
 `./skills/` directory, so the skill content is identical across CLIs — only the wrapper
 manifest differs.
 
-Claude Code (the repository is its own marketplace, with one plugin, `tmux-agent`):
+The repository is its own marketplace, `tmux-agent-tools`, with two plugins:
+
+| Plugin | Source | Carries | For |
+|---|---|---|---|
+| `tmux-agent-tools` | `./` | skills (incl. the `tmux-agent-tui` TUI), wrappers, the Bash dispatch gate; the MCP server for Codex and Cursor | any CLI |
+| `tmux-agent` | `./mods/tmux-agent` | the Claude Code function-hook mod only | Claude Code |
+
+| Runtime | Install | Skills and TUI from |
+|---|---|---|
+| Claude Code | `tmux-agent` + global skill | `npx skills` (no Bash gate; the mod's own Bash guard still applies) |
+| Claude Code | `tmux-agent` + `tmux-agent-tools` | the plugin (gate on) |
+| Codex, Cursor | `tmux-agent-tools` | the plugin (MCP tools; Cursor also runs the Bash gate) |
+| Codex, Cursor | global skill only | `npx skills` (no MCP unless registered by hand) |
 
 ```bash
 /plugin marketplace add ohyeh/tmux-agent-tools
-/plugin install tmux-agent@tmux-agent-tools
+/plugin install tmux-agent@tmux-agent-tools         # the mod
+/plugin install tmux-agent-tools@tmux-agent-tools   # skills + gate (skip with the global skill)
 ```
 
-That one plugin carries the skills, the Bash dispatch gate and the `tmux-agent`
-function-hook mod. The mod turns any agent-tmux worker into a teammate of one Claude Code
+The mod turns any agent-tmux worker into a teammate of one Claude Code
 session: `assign` dispatches a brief, `tell` gives the same worker its next task or a
 correction, `stop` dismisses it, `peek` looks at a pane mid-flight, `keys` answers a dialog
 it is parked on, and `/workers` shows this project's teammates while their sessions live.
@@ -159,19 +171,24 @@ Every session that has it reconciles each worker's `result.json` and submits a p
 a worker finishes — so a detached worker never finishes into silence, even when nobody is
 watching the pane. The worker can be codex, agy, cursor, a second claude on a provider
 gateway, or a CLI that does not exist yet: `profile` is an agent-tmux profile name. See
-[`docs/tmux-agent-mod.md`](docs/tmux-agent-mod.md) for the permission surface, the
+[`mods/tmux-agent/README.md`](mods/tmux-agent/README.md) for the permission surface, the
 state-root rules and the known boundaries. It does not replace the shell path:
 `assign` + `result wait-required` stay the route for Codex, Cursor and anything else
 without function hooks.
 
-Upgrading from the two-plugin layout (until 0.41.0 the marketplace listed
-`tmux-agent-tools` and `tmux-agent`):
+Upgrading from 0.42.0/0.43.0 (one plugin, `tmux-agent`, carried skills, gate and mod):
 
-- had `tmux-agent@tmux-agent-tools`: `claude plugin update tmux-agent@tmux-agent-tools`.
-  Same plugin id, so tools, the waiter type and stored delivery marks carry over.
-- had only `tmux-agent-tools@tmux-agent-tools`: it now reports "failed to load … not found
-  in marketplace". Run `claude plugin uninstall tmux-agent-tools@tmux-agent-tools` and
-  `claude plugin install tmux-agent@tmux-agent-tools`.
+- Claude Code: `claude plugin marketplace update tmux-agent-tools`, then
+  `claude plugin update tmux-agent@tmux-agent-tools`. Same plugin id, so tools, the waiter
+  type and stored delivery marks carry over; it now holds the mod only. Without the global
+  skill, also `claude plugin install tmux-agent-tools@tmux-agent-tools`.
+- Codex: `codex plugin marketplace upgrade tmux-agent-tools`,
+  `codex plugin add tmux-agent-tools@tmux-agent-tools`, then
+  `codex plugin remove tmux-agent@tmux-agent-tools`.
+
+With the global skill (`npx skills`) and a plugin installed together, both copies load; keep
+them at the same version (`npx skills update -g tmux-agent-tools using-tmux-agent-tools`
+after a plugin update). An older copy brings back fixed bugs.
 
 Codex CLI and Cursor read `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json`
 respectively from a clone of this repository; both expose the same skill.

@@ -82,7 +82,7 @@ import {
   KEYS_ALLOWED,
   type TmuxDispatch as CoreDispatch,
   type TmuxStalled as CoreStalled,
-} from '../skills/tmux-agent-tools/scripts/lib/workers.ts'
+} from './lib/workers.ts'
 import type { TmuxDispatch, TmuxStalled } from '../types'
 
 /**
@@ -92,7 +92,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.43.0'
+const MOD_VERSION = '0.44.0'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:

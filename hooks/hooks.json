@@ -12,8 +12,5 @@
       }
     ]
   },
-  "description": "Bash gate (classic PreToolUse) and the tmux-agent function-hook module.",
-  "modules": [
-    "./register.ts"
-  ]
+  "description": "Bash dispatch gate (classic PreToolUse)."
 }

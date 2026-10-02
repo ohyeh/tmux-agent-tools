@@ -28,18 +28,15 @@ fi
 echo "latest CHANGELOG version: $changelog_version"
 
 MARKET=.claude-plugin/marketplace.json
-market_plugin_name="$(jq -r '.plugins[0].name' "$MARKET")"
-if [[ -z "$market_plugin_name" || "$market_plugin_name" == "null" ]]; then
-  echo "  FAIL could not parse plugin name from $MARKET" >&2
-  exit 1
-fi
-
+# Two plugins (restored split, 0.44.0): tmux-agent-tools (root: skills, gate, MCP for
+# Codex/Cursor) and tmux-agent (mods/tmux-agent: the Claude Code mod). One version line.
 for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json .cursor-plugin/plugin.json; do
-  v="$(jq -r '.version' "$manifest")"
-  assert "$manifest matches CHANGELOG" "$v" "$changelog_version"
-  m_name="$(jq -r '.name' "$manifest")"
-  assert "$manifest name matches marketplace entry" "$m_name" "$market_plugin_name"
+  assert "$manifest matches CHANGELOG" "$(jq -r '.version' "$manifest")" "$changelog_version"
+  assert "$manifest name is tmux-agent-tools" "$(jq -r '.name' "$manifest")" "tmux-agent-tools"
 done
+MOD_MANIFEST=mods/tmux-agent/.claude-plugin/plugin.json
+assert "$MOD_MANIFEST matches CHANGELOG" "$(jq -r '.version' "$MOD_MANIFEST")" "$changelog_version"
+assert "$MOD_MANIFEST name is tmux-agent" "$(jq -r '.name' "$MOD_MANIFEST")" "tmux-agent"
 
 # AGENT_TMUX_VERSION is what `--version` and `doctor` print — the offline signal
 # for multi-machine skill-copy drift. It lagged the CHANGELOG by a full release
@@ -53,17 +50,23 @@ assert "agent-tmux AGENT_TMUX_VERSION matches CHANGELOG" "$script_version" "$cha
 # marketplace listing shows, so a lag there is drift users can see.
 assert "$MARKET metadata.version matches CHANGELOG" \
   "$(jq -r '.metadata.version' "$MARKET")" "$changelog_version"
-assert "$MARKET tmux-agent entry matches CHANGELOG" \
-  "$(jq -r '.plugins[] | select(.name == "tmux-agent") | .version' "$MARKET")" \
-  "$changelog_version"
-assert "$MARKET lists exactly one plugin (the mod is part of the root plugin)" \
-  "$(jq -r '.plugins | length' "$MARKET")" "1"
+assert "$MARKET plugins (name=source)" \
+  "$(jq -r '[.plugins[] | .name + "=" + .source] | join(" ")' "$MARKET")" \
+  "tmux-agent-tools=./ tmux-agent=./mods/tmux-agent"
+for p in tmux-agent-tools tmux-agent; do
+  assert "$MARKET $p entry matches CHANGELOG" \
+    "$(jq -r --arg p "$p" '.plugins[] | select(.name == $p) | .version' "$MARKET")" "$changelog_version"
+done
 
 # The panel title prints MOD_VERSION so a running session shows which code it
 # loaded; a constant that lags the manifest would lie exactly when it matters.
-assert "hooks/register.ts MOD_VERSION matches the plugin manifest" \
-  "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" hooks/register.ts)" \
-  "$(jq -r '.version' .claude-plugin/plugin.json)"
+assert "mods/tmux-agent/hooks/register.ts MOD_VERSION matches the mod manifest" \
+  "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" mods/tmux-agent/hooks/register.ts)" \
+  "$(jq -r '.version' "$MOD_MANIFEST")"
+
+# The mod plugin's cache has no skills/, so it imports a copy of the core.
+if scripts/sync-mod-core --check; then core=same; else core=differs; fi
+assert "mods/tmux-agent/hooks/lib matches the core (scripts/sync-mod-core)" "$core" "same"
 
 # Finding M4/R4: release notes extraction pattern from release.yml must not swallow 0.10.x headings
 release_notes_test="$(CHANGELOG_VERSION="$changelog_version" ruby -e '

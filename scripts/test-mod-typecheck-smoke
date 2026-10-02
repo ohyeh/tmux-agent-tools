@@ -13,22 +13,25 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-if [[ ! -f tsconfig.json ]]; then
-  echo "  FAIL tsconfig.json not found — the mod tree moved" >&2
-  exit 1
-fi
+for cfg in mods/tmux-agent/tsconfig.json tsconfig.node.json; do
+  if [[ ! -f $cfg ]]; then
+    echo "  FAIL $cfg not found — the tree moved" >&2
+    exit 1
+  fi
+done
 
-echo "typechecking the mod (hooks, tests, types, scripts/lib) against tsconfig.json"
-if npx -p typescript tsc --noEmit -p tsconfig.json; then
+# The mod config covers hooks/lib, the mod's byte-identical copy of the non-node
+# core files (scripts/sync-mod-core --check), so the core is type-checked there.
+echo "typechecking the mod against mods/tmux-agent/tsconfig.json"
+if npx -p typescript tsc --noEmit -p mods/tmux-agent/tsconfig.json; then
   echo "  ok   mod typecheck clean"
 else
   echo "  FAIL mod typecheck reported errors (above)" >&2
   echo "0 passed, 1 failed" >&2
   exit 1
 fi
-
 # The node-run core files (`lib/*.node.ts`) are excluded above (no node typings
-# in the mod tree). They get their own config with @types/node from mcp-adapter.
+# in either tree). They get their own config with @types/node from mcp-adapter.
 if [[ ! -d mcp-adapter/node_modules/@types/node ]]; then
   echo "  FAIL @types/node missing: run npm --prefix mcp-adapter ci" >&2
   echo "1 passed, 1 failed" >&2

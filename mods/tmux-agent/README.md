@@ -4,7 +4,8 @@
 對帳一次 `result.json`，worker 收工時直接把結果送進你的 session —— 即使那個
 session 正閒著沒人看。
 
-這是整合在 `tmux-agent` 單一 plugin 中的 function-hook mod（包含 skills、Bash gate 與 mod）。
+這是獨立的 `tmux-agent` plugin（source `mods/tmux-agent`），只有 Claude Code 的 function-hook mod。
+skills、Bash gate 與獨立 TUI（`tmux-agent-tui`）在 `tmux-agent-tools` plugin 或全域 `npx skills` 安裝裡。
 shell 路徑（`agent-tmux ... assign` + `result wait-required`）繼續服務 codex／
 cursor 等沒有這個 mod 的 runtime。
 
@@ -20,12 +21,18 @@ cursor 等沒有這個 mod 的 runtime。
 ## 安裝
 
 ```sh
-# marketplace 只有一個 plugin：tmux-agent（skills + Bash gate + mod）
 claude plugin marketplace add ohyeh/tmux-agent-tools
-claude plugin install tmux-agent@tmux-agent-tools
+claude plugin install tmux-agent@tmux-agent-tools        # mod
+claude plugin install tmux-agent-tools@tmux-agent-tools  # skills + Bash gate（有全域 skill 可不裝）
 ```
 
-開發時直接掛 repo 根目錄：`claude --plugin-dir .`。
+只裝 mod 時沒有 Bash gate（GATE 1/2）；mod 自己的 Bash guard 仍擋手打的
+`agent-tmux … assign|send|send-wait|stop|status|…`。
+
+mod 匯入的 core 是 `hooks/lib/` 的複製（plugin cache 只有 `mods/tmux-agent`）：改
+`skills/tmux-agent-tools/scripts/lib/` 後跑 `scripts/sync-mod-core`，version-sync smoke 會比對。
+
+開發時掛 mod 目錄：`claude --plugin-dir mods/tmux-agent`（要 skills/gate 就再加 `--plugin-dir .`）。
 
 裝完就能用，不用再跑 install-bin：`agent-tmux` 不在 `PATH` 上時，mod 自己用同一個
 marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-tools/…`），
@@ -106,8 +113,8 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 **它不做的事**：沒有 `http.fetch`，不連網；不讀 credentials、shell history 或 state root 以外的檔案內容；不寫任何環境變數（pin 裡 `env writes: nothing`）；不改 `AskUserQuestion` 或其他工具的輸出。以上都能從下面那份 pin 對出來——pin 沒列的 API，mod 就沒有呼叫。
 
-`claude plugin validate .claude-plugin/plugin.json` 會把以上逐條印出來對帳（對 repo 根目錄跑 `validate .` 只會驗 marketplace）。那份輸出釘在
-[`permissions.txt`](../permissions.txt)，`scripts/test-mod-permissions-smoke` 在 CI
+`claude plugin validate mods/tmux-agent` 會把以上逐條印出來對帳。那份輸出釘在
+[`permissions.txt`](permissions.txt)，`scripts/test-mod-permissions-smoke` 在 CI
 比對：權限面任何變動都必須是一個看得見、被 review 過的 diff，不能是重構的副作用。
 
 ## 原生 sub-agent 列 (0.10.0)
@@ -445,7 +452,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v<MOD_VERSION> · @<本 session> · tmux N · 內部 M`（目前為 `workers v0.43.0`，列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+`/workers` 開關面板。標題是 `workers v<MOD_VERSION> · @<本 session> · tmux N · 內部 M`（目前為 `workers v0.44.0`，列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N：@<id> N ]`，按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17

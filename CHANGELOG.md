@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.44.0 - 2026-10-02
+
+- Breaking (packaging): the marketplace lists two plugins again, as before 0.42.0. `tmux-agent-tools` (source `./`) carries the skills, the standalone TUI, the wrappers, the Bash dispatch gate and, for Codex and Cursor, the MCP server; `tmux-agent` (source `./mods/tmux-agent`) carries the Claude Code function-hook mod only. The `tmux-agent` id is unchanged, so its tools, waiter type and delivery marks carry over on update. Codex and Cursor manifests are named `tmux-agent-tools` again. Claude Code with the global skill needs only `tmux-agent` (no duplicate skill). Migration in README.
+- The mod imports a byte-identical copy of the core (`mods/tmux-agent/hooks/lib/`: `workers.ts`, `width.ts`, `eaw-table.ts`, `ledger.ts`), since a plugin cache holds only its source dir. `scripts/sync-mod-core` writes it; `test-version-sync-smoke` fails on drift. The mod typecheck covers that copy; the root `tsconfig.json` is gone (`tsconfig.node.json` stands alone).
+- Fix (Bash gate, F6): one tool call counts once toward GATE 2. cursor-agent runs the gate once per loaded copy of the plugin (`--plugin-dir` plus the installed Claude plugin) with the same `tool_use_id`, so the first review-shaped dispatch was denied as `#2`/`#3`. The gate records a `tool_use_id` once (atomic `mkdir`). `test-dispatch-gate-hook-smoke` cases 14–16 fail 3 of 3 on the old gate.
+
 ## v0.43.0 - 2026-10-02
 
 - Fix (Sol r9 F1–F6): the probe never takes an unreadable jsonl as empty (named blocker, file untouched); a failed store/file load binds nothing and stays retryable; lost observations stay counted until a fresh `on`; `show` names a missing session id or state root, and prints the whole epoch's counts before the last 20 lines; a fresh `on` drops older epochs and one epoch is capped at 1 MiB (capacity blocker).

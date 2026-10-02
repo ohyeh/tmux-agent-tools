@@ -64,5 +64,18 @@ check "commit-msg-pass" 0 "$(j2 'git commit -m \"docs: agent-tmux codex flow —
 check "assign-pass" 0 "$(j2 'agent-tmux codex assign job /repo /abs/prompt.txt')"
 rm -rf "$HOME/.local/state/agent-hooks/$SID2"
 
+# 14–16. one tool call counts once for GATE 2 (F6): cursor-agent runs the gate
+# once per loaded copy of the plugin, with the same tool_use_id, concurrently.
+SID3="smoke3-$$"; ST3="$HOME/.local/state/agent-hooks/$SID3"
+mkdir -p "$ST3"
+printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST3/gate-receipt-parent-dispatch"
+j3() { printf '{"session_id":"%s","tool_use_id":"%s","tool_name":"Shell","tool_input":{"command":"%s"}}' "$SID3" "$1" "$2"; }
+for i in 1 2 3; do printf '%s' "$(j3 call-a 'agent-tmux codex start sol_review_a')" | bash "$HOOK" >/dev/null 2>&1 & done; wait
+lines="$(wc -l < "$ST3/review-dispatch.log" | tr -d ' ')"
+if [ "$lines" = 1 ]; then echo "PASS [same-id-concurrent-counts-once]"; else echo "FAIL [same-id-concurrent-counts-once] log lines=$lines want=1"; FAILS=$((FAILS+1)); fi
+check "same-id-repeat-pass" 0 "$(j3 call-a 'agent-tmux codex start sol_review_a')"
+check "new-id-2nd-review-deny" 2 "$(j3 call-b 'agent-tmux codex start sol_review_b')" "dispatch #2"
+rm -rf "$ST3"
+
 if [ "$FAILS" -ne 0 ]; then echo "SMOKE FAIL ($FAILS)"; exit 1; fi
 echo "SMOKE OK — all checks passed"

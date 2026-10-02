@@ -60,7 +60,14 @@ valid_receipt() {
 # --- GATE 2: second review-shaped dispatch -> workflow recipe -------------------
 if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
    && printf '%s' "$cmd" | grep -Eiq 'start([[:space:]]+--[A-Za-z-]+)*[[:space:]]+[A-Za-z0-9._-]*(review|verify|gate|freeze|audit)'; then
-  echo "$(date -u +%FT%TZ) $cmd" >> "$STATE_DIR/review-dispatch.log"
+  # One tool call counts once: a host that loads this plugin from two places
+  # (cursor-agent: --plugin-dir plus the installed Claude plugin) runs the gate
+  # once per copy, with the same tool_use_id. mkdir is atomic, so concurrent
+  # copies agree on which one records the call.
+  tool_use_id="$(printf '%s' "$IN" | jq -r '.tool_use_id // empty' 2>/dev/null)"
+  if [ -z "$tool_use_id" ] || { mkdir -p "$STATE_DIR/seen" && mkdir "$STATE_DIR/seen/$(printf '%s' "$tool_use_id" | tr -c 'A-Za-z0-9._-' '_')" 2>/dev/null; }; then
+    echo "$(date -u +%FT%TZ) $cmd" >> "$STATE_DIR/review-dispatch.log"
+  fi
   n="$(wc -l < "$STATE_DIR/review-dispatch.log" | tr -d ' ')"
   if [ "$n" -ge 2 ] && ! valid_receipt "$STATE_DIR/gate-receipt-workflow"; then
     cat >&2 <<EOF

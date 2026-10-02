@@ -23,4 +23,4 @@ skills/tmux-agent-tools/scripts/profiles/*.conf
 !skills/tmux-agent-tools/scripts/profiles/*.conf.example
 
 # plugin eval runs are local artifacts (reports, per-run transcripts)
-evals/results/
+mods/*/evals/results/

@@ -1,0 +1,4 @@
+{
+  "description": "The tmux-agent function-hook module: $.tmux, the assign/tell/stop/peek/keys tools, the /workers panel and the result.json collector.",
+  "modules": ["./register.ts"]
+}
