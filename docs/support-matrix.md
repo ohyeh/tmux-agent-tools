@@ -56,8 +56,9 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| MCP | write + read (full lifecycle) | blocker: not counted | One run completed (`$R/r8-live/agy/life1-calls.txt`). The keychain dialogs came from the harness, not agy: `agyrun.sh` set a private `HOME`, so agy found no login and asked the keychain. To close: run `life2` with the real `HOME` in a trusted folder. |
-| MCP | restart, concurrent waits | blocker | `$R/r8-live/agy/restart/` was aborted with no result. Same action. |
+| MCP | write + read (full lifecycle) | PASS | `$R/r8-live-agy/agy/life2-calls.txt` on `1c021da`: spawn, wait (completed), send, wait (completed), close. Real `HOME`, agy started in a trusted folder; the server was added with `agy mcp add` and removed after, user config shasums unchanged (`$R/r8-live-agy/cfgbak/`). The old keychain dialogs came from the first harness's private `HOME`. |
+| MCP | restart | PASS | `$R/r8-live-agy/agy/VERDICT.md`: A killed, no orphan server (`host gone (stdin ended)`); a new agy process's wait got `completed` with A's owner pid (`…-76886-…/rs.ef516/1`); earlier waits returned `wait_again` (the 40 s per-call bound). |
+| MCP | concurrent waits | PASS | `$R/r8-live-agy/agy/VERDICT.md`: two agy processes waited the same worker at once; one got `completed`, the other `not_owner` (`claim: lost`); `acks` holds `done` and one `unattributed-*`: delivered once. |
 | Paste | read (composer-state) | PASS | Real captures of Antigravity CLI 1.2.14 (`fixtures/composer/agy-*.txt`: empty, draft, multiline, busy, trust menu); the `agy` rows of the composer-state test in `collector.contract.node.ts`. |
 | Paste | write | PASS (4 of 5; permission N/A) | `$R/r74-paste/agy/{1-empty,2-draft,3-busy,5-multiline}/VERDICT.txt`: each notice delivered once (`delivery_id` 1); a draft and a busy turn were waited out (`host composer is draft` / `busy; nothing pasted`); user config shasums unchanged. `4-permission`: N/A, `toolPermission=always-proceed` shows no prompt. |
 
