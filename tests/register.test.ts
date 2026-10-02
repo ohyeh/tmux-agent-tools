@@ -3701,6 +3701,108 @@ describe('cursor review of 4d0af09', () => {
   })
 })
 
+describe('surface probe (/workers probe)', () => {
+  const PROBE = `${ROOT}/sess-test/surfaces.jsonl`
+  const kinds = (files: Files) =>
+    (files[PROBE] ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l) as { kind: string; epoch: string; surface?: string })
+  const setup = (on: On, files: Files, more: Record<string, string[]> = {}) => {
+    mock.env(on, { HOME })
+    mockStore(on, [], undefined, more)
+    mockClock(on)
+    mockFs(on, files)
+    mockPanel(on, { running: true, idle_seconds: 5 })
+    // Core's floor: both echo `{ clientId }`.
+    on('session.attach', ($, e) => ({ clientId: e.clientId }))
+    on('session.detach', ($, e) => ({ clientId: e.clientId }))
+  }
+
+  test('off by default: renders and attaches write nothing', WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    setup(on, files)
+    await $.session.start(session())
+    await $.ui.render(bandRender())
+    await $.session.attach({ surface: 'desktop', clientId: 'desk-1' })
+    expect((await $.command.run(run('workers', 'probe show'))).text).toContain('· off ·')
+    expect(files[PROBE]).toBeUndefined()
+  })
+
+  test('on: loaded once, render once per surface even with the panel closed, attach and detach kept in order', WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    setup(on, files)
+    await $.session.start(session())
+    const shown = (await $.command.run(run('workers', 'probe on'))).text
+    expect(shown).toContain('probe: session sess-test · on · epoch ')
+    expect(shown).toContain(`file: ${PROBE}`)
+    // The panel was never opened: the band is closed, the site is still raised.
+    await $.ui.render(bandRender())
+    await $.session.attach({ surface: 'desktop', clientId: 'desk-1' })
+    await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    await $.ui.render(bandRender())
+    await $.session.detach({ surface: 'desktop', clientId: 'desk-1', reason: 'detach' })
+    const text = (await $.command.run(run('workers', 'probe show'))).text
+    expect(kinds(files).map(k => `${k.kind}${k.surface ? `:${k.surface}` : ''}`)).toEqual([
+      'loaded',
+      'render:terminal',
+      'attach:desktop',
+      'render:desktop',
+      'detach:desktop',
+    ])
+    expect(text).toContain('"clientId":"desk-1"')
+    expect(text).toContain('last write error: none')
+  })
+
+  test('on, off, on: the second epoch is fresh and show prints only it', WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    setup(on, files)
+    await $.session.start(session())
+    await $.command.run(run('workers', 'probe on'))
+    await $.ui.render(bandRender())
+    await $.command.run(run('workers', 'probe off'))
+    await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    await $.command.run(run('workers', 'probe on'))
+    await $.ui.render(bandRender())
+    const text = (await $.command.run(run('workers', 'probe show'))).text
+    const lines = kinds(files)
+    const [first, second] = [...new Set(lines.map(l => l.epoch))]
+    expect(second, 'a new epoch').toBeDefined()
+    expect(lines.filter(l => l.epoch === first).map(l => l.kind)).toEqual(['loaded', 'render'])
+    expect(lines.filter(l => l.epoch === second).map(l => l.kind), 'render de-dup reset; nothing while off').toEqual(['loaded', 'render'])
+    expect(text).toContain(`epoch ${second}`)
+    expect(text).not.toContain(first!)
+  })
+
+  test('a refused write: the band draws as with the probe off, and show names a probe write blocker', WITH_DRIVER, async ($, on) => {
+    const files: Files = new Proxy({} as Files, {
+      set(t, k, v) {
+        if (k === PROBE) throw new Error(`EACCES: ${String(k)}`)
+        return Reflect.set(t, k, v)
+      },
+    })
+    setup(on, files)
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    // A press handle is minted per render; everything else must match.
+    const drawn = async () => JSON.stringify(await $.ui.render(bandRender())).replace(/"handle":\d+/g, '"handle":0')
+    const off = await drawn()
+    const text = (await $.command.run(run('workers', 'probe on'))).text
+    // The engine wraps a hook's throw; the line names the probe step and the error class.
+    expect(text).toMatch(/last write error: probe write: \w*Error: /)
+    expect(text).not.toContain('last write error: none')
+    expect(await drawn(), 'the draw path is untouched').toEqual(off)
+    expect(files[PROBE]).toBeUndefined()
+  })
+
+  test("another session's probe is its own: its on state neither shows nor writes here", WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    setup(on, files, { 'probe:sess-other': { on: true, epoch: 'e-other', start: 0 } as unknown as string[] })
+    await $.session.start(session())
+    await $.ui.render(bandRender())
+    expect((await $.command.run(run('workers', 'probe show'))).text).toContain('probe: session sess-test · off · epoch (none)')
+    expect(files[PROBE]).toBeUndefined()
+  })
+})
+
 describe('panel UX, 2026-09-25 live probe', () => {
   // One top-level child is one row, except a Text that wraps: it takes as many
   // rows as its text needs at the band's 80 columns.

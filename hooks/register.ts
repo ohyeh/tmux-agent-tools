@@ -185,6 +185,92 @@ export const register: Register = on => {
   let waiterReady = false
   let waiterRegisterLogged = false
   const gate: Gate = newGate()
+  /**
+   * `/workers probe on|off|show`: which surfaces this session's band reaches, for the
+   * desktop and mobile live runs (plan-app-surfaces A1). Off unless turned on; the
+   * on/off state and epoch live in `$.store` per session id, the events in
+   * `<state root>/<session id>/surfaces.jsonl`. `$.fs.write` replaces the whole file,
+   * so every step runs on one chain, and a line is kept only once its write landed.
+   */
+  type ProbeState = { on: boolean; epoch: string; start: number }
+  const probe = {
+    sid: undefined as string | undefined,
+    state: undefined as ProbeState | undefined,
+    path: '',
+    lines: [] as string[],
+    rendered: new Set<string>(),
+    lastError: '',
+    chain: Promise.resolve() as Promise<unknown>,
+  }
+  const probeKey = (sid: string) => `probe:${sid}`
+  /** Appends `step` to the chain; the chain itself never rejects. */
+  const probeRun = <T>(step: () => Promise<T>): Promise<T> => {
+    const done = probe.chain.then(step)
+    probe.chain = done.catch(() => undefined)
+    return done
+  }
+  const probeFail = (what: string, error: unknown) => {
+    probe.lastError = `${what}: ${error instanceof Error ? error.name : typeof error}: ${String(error)}`
+  }
+  /** Binds the probe to this session's id once (again after a hot reload); a failure is a storage blocker. */
+  const probeLoad = async (): Promise<void> => {
+    const w = world
+    if (!w || !sessionId || probe.sid === sessionId) return
+    const sid = sessionId
+    const root = await rootOf(w)
+    if (!root) {
+      probe.sid = sid
+      return
+    }
+    try {
+      const saved = await w.storeGet(probeKey(sid))
+      const st = saved && typeof saved === 'object' ? (saved as ProbeState) : undefined
+      const path = `${root}/${sid}/surfaces.jsonl`
+      const lines = (await readOrEmpty(w, path)).split('\n').filter(Boolean)
+      probe.sid = sid
+      probe.state = st
+      probe.path = path
+      probe.lines = lines
+      probe.rendered = new Set(
+        lines.flatMap(l => {
+          const j = parseJson(l) as { epoch?: unknown; kind?: unknown; surface?: unknown } | undefined
+          return j?.epoch === st?.epoch && j?.kind === 'render' && typeof j?.surface === 'string' ? [j.surface] : []
+        }),
+      )
+    } catch (error) {
+      probe.sid = sid
+      probeFail('probe load', error)
+    }
+  }
+  /** One event, when the probe is on; `once` de-dups within the epoch (a render per surface). */
+  const probeNote = (fields: Record<string, unknown>, once?: string): Promise<void> =>
+    probeRun(async () => {
+      await probeLoad()
+      const w = world
+      if (!w || !probe.state?.on || !probe.path) return
+      if (once && probe.rendered.has(once)) return
+      const line = JSON.stringify({ epoch: probe.state.epoch, at: new Date(await w.now()).toISOString(), ...fields })
+      try {
+        await w.write(probe.path, `${[...probe.lines, line].join('\n')}\n`)
+        probe.lines.push(line)
+        if (once) probe.rendered.add(once)
+        probe.lastError = ''
+      } catch (error) {
+        probeFail('probe write', error)
+      }
+    })
+  /** What `show` prints: the latest epoch only. */
+  const probeShow = (): string => {
+    const st = probe.state
+    const mine = probe.lines.filter(l => (parseJson(l) as { epoch?: unknown } | undefined)?.epoch === st?.epoch)
+    return [
+      `probe: session ${probe.sid ?? '(none)'} · ${st?.on ? 'on' : 'off'} · epoch ${st?.epoch ?? '(none)'}` +
+        `${st ? ` since ${new Date(st.start).toISOString()}` : ''} · mod ${MOD_VERSION}`,
+      `last write error: ${probe.lastError || 'none'}`,
+      `file: ${probe.path || '(none)'}`,
+      ...(st ? mine.slice(-20) : []),
+    ].join('\n')
+  }
 
   on('engine.create', async ($, e, next) => {
     const beneath = await next(e)
@@ -288,7 +374,7 @@ export const register: Register = on => {
 
     await $.command.register({
       name: 'workers',
-      description: 'Show or hide the workers panel; /workers N selects row N, /workers stop <name>, /workers tell <name> <text>, /workers cancel <name> <seq>, /workers unlock <name> [confirm], /workers hide',
+      description: 'Show or hide the workers panel; /workers N selects row N, /workers stop <name>, /workers tell <name> <text>, /workers cancel <name> <seq>, /workers unlock <name> [confirm], /workers probe on|off|show, /workers hide',
     })
 
     await $.tool.register({
@@ -478,7 +564,24 @@ export const register: Register = on => {
   // inline Pane could not be pressed at all. The band is always above the
   // prompt, in both layouts, and its Buttons press on a digit from an empty
   // composer or a letter while the band is focused (ctrl+x tab).
+  // Observe only (no redraw): the probe's proof that a desktop or phone client joined.
+  on('session.attach', async ($, e, next) => {
+    void probeNote({ kind: 'attach', surface: e.surface, clientId: e.clientId })
+    return next(e)
+  })
+  on('session.detach', async ($, e, next) => {
+    void probeNote({ kind: 'detach', surface: e.surface, clientId: e.clientId, reason: e.reason })
+    return next(e)
+  })
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Before the closed-panel return: a closed band still proves the site is raised.
+    // Queued, never awaited: the draw and its one `next(e)` do not wait on a write.
+    if (probe.state?.on || probe.sid !== sessionId) {
+      void probeNote(
+        { kind: 'render', surface: e.surface, bodyColumns: e.props.bodyColumns, maxRows: e.props.maxRows, panelOpen: panel.open },
+        e.surface,
+      )
+    }
     // Closed, or a survey holds the band: whatever the plugins below draw.
     if (!panel.open || e.props.hasSurvey) return next(e)
     const below = await next(e)
@@ -1040,6 +1143,30 @@ export const register: Register = on => {
     if (verb) {
       const bound = world
       if (!bound) return { text: 'unavailable — the mod did not bind.' }
+      if (verb === 'probe') {
+        const sid = await idNow(() => $.session.id())
+        if (target === 'show' || target === '') return { text: await probeRun(async () => (await probeLoad(), probeShow())) }
+        if (target !== 'on' && target !== 'off') return { text: '/workers probe on|off|show' }
+        if (!sid) return { text: 'probe: blocked — no session id yet (prerequisite); nothing written.' }
+        const root = await rootOf(bound)
+        if (!root) return { text: 'probe: blocked — no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME all unset); nothing written.' }
+        const refused = await probeRun(async () => {
+          await probeLoad()
+          const st: ProbeState = target === 'on' ? { on: true, epoch: crypto.randomUUID(), start: await bound.now() } : { ...(probe.state ?? { epoch: '', start: 0 }), on: false }
+          try {
+            await bound.storeSet(probeKey(sid), st)
+          } catch (error) {
+            probeFail('probe store', error)
+            return probe.lastError
+          }
+          probe.state = st
+          if (target === 'on') probe.rendered = new Set()
+          return ''
+        })
+        if (refused) return { text: `probe: blocked — ${refused}` }
+        if (target === 'on') await probeNote({ kind: 'loaded', version: MOD_VERSION, session: sid, probe: 'on' })
+        return { text: await probeRun(async () => probeShow()) }
+      }
       if (verb === 'hide') {
         if (panel.open) closePanel(redraw)
         return { text: 'workers panel hidden; /workers shows it again.' }
