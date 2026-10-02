@@ -3918,6 +3918,8 @@ describe('surface probe (/workers probe)', () => {
     const restored = (await $.command.run(run('workers', 'probe show'))).text
     expect(restored).toContain('lost observations this epoch: 0')
     expect(restored).toContain('restored after a reload: a loss before it may be unsaved — an absence below is not proof')
+    // `off` ends the epoch but not the doubt: the warning stays.
+    expect((await $.command.run(run('workers', 'probe off'))).text).toContain('restored after a reload')
     const fresh = (await $.command.run(run('workers', 'probe on'))).text
     expect(fresh).not.toContain('restored after a reload')
     await $.command.run(run('workers', 'probe off'))
