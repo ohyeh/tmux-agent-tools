@@ -19,6 +19,9 @@ export PATH="$PWD/..:$PATH"
 unset TMUX TMUX_PANE
 # /tmp, not $TMPDIR: macOS $TMPDIR makes the socket path longer than tmux allows.
 export TMUX_TMPDIR="$(mktemp -d /tmp/tas-core.XXXXXX)"
+# Every temp repo a test makes lands here too, so the trap removes it (one run left ~200
+# `tui-*-repo-*` dirs in the user's $TMPDIR).
+export TMPDIR="$TMUX_TMPDIR/tmp"; mkdir "$TMPDIR"
 trap 'tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null || true; rm -rf "$TMUX_TMPDIR"' EXIT
 
 floor=22.18.0
