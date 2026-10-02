@@ -307,7 +307,8 @@ t0=$SECONDS
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude send --from-file "$WORK/brief.txt" tail-send >"$WORK/tail.out" 2>"$WORK/tail.err" || true
 took=$(( SECONDS - t0 ))
 assert "tail: both instructions are still reported unconfirmed" "$(grep -c 'delivery UNCONFIRMED' "$WORK/tail.err")" "2"
-assert "tail: the send took under 16 s (took ${took}s; two windows is 20 s+)" "$(( took < 16 ))" "1"
+# 19, not 16: a slow macOS runner took 16 s for one window; two windows is still 20 s+.
+assert "tail: the send took under 19 s (took ${took}s; two windows is 20 s+)" "$(( took < 19 ))" "1"
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude stop tail-send >/dev/null 2>&1 || true
 
 # ---- case 2d: a turn that finished before two looks is processing --------------

@@ -1,10 +1,9 @@
 name: CI
 
+# Manual only (Actions tab or `gh workflow run ci.yml`): pushes and PRs never start
+# a run, so a busy day of commits costs no Actions minutes. Run it before a release.
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
