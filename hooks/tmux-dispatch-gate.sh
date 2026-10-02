@@ -60,8 +60,45 @@ valid_receipt() {
 # --- GATE 2: second review-shaped dispatch -> workflow recipe -------------------
 if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
    && printf '%s' "$cmd" | grep -Eiq 'start([[:space:]]+--[A-Za-z-]+)*[[:space:]]+[A-Za-z0-9._-]*(review|verify|gate|freeze|audit)'; then
-  echo "$(date -u +%FT%TZ) $cmd" >> "$STATE_DIR/review-dispatch.log"
-  n="$(wc -l < "$STATE_DIR/review-dispatch.log" | tr -d ' ')"
+  # One tool call counts once: a host that loads this plugin from two places
+  # (cursor-agent: --plugin-dir plus the installed Claude plugin) runs the gate
+  # once per copy, with the same tool_use_id. mkdir is atomic, so concurrent
+  # copies agree on which one records the call.
+  log="$STATE_DIR/review-dispatch.log"
+  # Every step that counts the call fails closed: an uncounted call must not pass.
+  unrecorded() {
+    echo "BLOCKED by workflow gate: could not count this review-shaped dispatch ($1). Retry the call; if it repeats, check $STATE_DIR." >&2
+    exit 2
+  }
+  if ! printf '%s' "$IN" | jq -e '(.tool_use_id // "") | length > 0' >/dev/null 2>&1; then
+    echo "$(date -u +%FT%TZ) $cmd" >> "$log" || unrecorded "log write failed"
+  else
+    # sha256 of the id's raw bytes (jq -j, never a shell variable: $(...) drops a
+    # trailing newline and bash drops a NUL, so two ids became one): a fixed-length
+    # name (a hex of a long id passed NAME_MAX), never . or ..
+    id_bytes() { printf '%s' "$IN" | jq -j '.tool_use_id'; }
+    if command -v sha256sum >/dev/null 2>&1; then h="$(id_bytes | sha256sum)"
+    else h="$(id_bytes | shasum -a 256 2>/dev/null)"; fi
+    h="${h%% *}"
+    # A failed or missing digest would leave every id on one marker `id-`.
+    printf '%s' "$h" | grep -Eq '^[0-9a-f]{64}$' || unrecorded "no sha256 digest (sha256sum or shasum)"
+    seen="$STATE_DIR/seen/id-$h"
+    mkdir -p "$STATE_DIR/seen"
+    if mkdir "$seen" 2>/dev/null; then
+      echo "$(date -u +%FT%TZ) $cmd" >> "$log" || unrecorded "log write failed"
+      : > "$seen/done"
+    elif [ -d "$seen" ]; then
+      # Another copy records this call: count after its line is written (max 2 s).
+      for _ in $(seq 40); do [ -e "$seen/done" ] && break; sleep 0.05; done
+      # No done: the recording copy died or stalled before its line; the log is not trusted.
+      [ -e "$seen/done" ] || unrecorded "another copy did not finish recording"
+    else
+      unrecorded "mkdir $seen failed"
+    fi
+  fi
+  # An unreadable log is no count, not 0.
+  n="$(wc -l < "$log" 2>/dev/null)" || unrecorded "log unreadable"
+  n="$(printf '%s' "$n" | tr -d ' ')"
   if [ "$n" -ge 2 ] && ! valid_receipt "$STATE_DIR/gate-receipt-workflow"; then
     cat >&2 <<EOF
 BLOCKED by workflow gate: this is review-shaped worker dispatch #$n this

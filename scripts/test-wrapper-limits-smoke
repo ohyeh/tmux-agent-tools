@@ -1,0 +1,316 @@
+#!/usr/bin/env zsh
+# Wrapper-side Known limits closed by plan R8.4/R8.5 (tui-retro plan §2):
+#   a. name collision: a second start/resume of a live name refuses (a2: also
+#      under another prefix, since every CLI shares <root>/<name>); the first
+#      session keeps its pane id, pid, and state dir bytes
+#   b. explicit socket: TMUX_AGENT_TMUX_SOCKET pins agent-tmux to one server,
+#      and the commander chain (start → panel → collector) stays on the server
+#      it runs in, never the default socket
+#   c. late fold: E1 blocked → tell E2 → stop folds the lifecycle into E1's
+#      path only; E1 keeps its status and episode; E2's result is unchanged
+#   d. a result left by an earlier launch of the name is preserved, not deleted
+#   g. two starters of one name: A paused right after its has-session while B
+#      starts. Exactly one wins; the loser writes none of the winner's state
+#      (result, launch state, pane-id); an empty or unreadable pane-id makes
+#      stop refuse
+#   f. the protocol docs name no `current` seq pointer (it has no writer/reader)
+# Two private servers: B is tmux's default socket under a private TMUX_TMPDIR,
+# A is an explicit -S socket. Never the user's server.
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+COMMANDER="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-commander"
+
+WORK="$(mktemp -d -t tas-limits.XXXXXX)"
+unset TMUX TMUX_PANE TMUX_AGENT_TMUX_SOCKET AGENT_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
+export TMUX_TMPDIR="/tmp/tlim-$$"
+export TMUX_AGENT_DIR="$WORK/state"
+export XDG_CONFIG_HOME="$WORK/xdg"
+export XDG_STATE_HOME="$WORK/xdg-state"
+export AGENT_TMUX_PROFILE_DIR="$WORK/noprofiles"
+export AGENT_TMUX_PREFIX=wlim
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
+export AGENT_TMUX_PREFLIGHT_TIMEOUT=5
+# ~/.zshenv may prepend ~/.local/bin (a stale agent-tmux) on every new zsh.
+export ZDOTDIR="$WORK/zdot"
+REAL_TMUX="$(command -v tmux)"
+SOCK_B="$TMUX_TMPDIR/tmux-$(id -u)/default"
+SOCK_A="$TMUX_TMPDIR/a.sock"
+tmux_a() { command env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$SOCK_A" "$@"; }
+tmux_b() { command env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$SOCK_B" "$@"; }
+mkdir -p "$TMUX_AGENT_DIR" "$XDG_CONFIG_HOME" "$AGENT_TMUX_PROFILE_DIR" "$ZDOTDIR" "$WORK/bin" "$WORK/repo" "${SOCK_B:h}"
+chmod 700 "$TMUX_TMPDIR" "${SOCK_B:h}"
+
+cleanup() {
+  local f p
+  for f in "$TMUX_AGENT_DIR"/.commander-*.pid(N); do
+    p="$(tr -d '[:space:]' < "$f" 2>/dev/null || true)"
+    [[ "$p" == <-> ]] || continue
+    pkill -P "$p" 2>/dev/null || true
+    kill "$p" 2>/dev/null || true
+  done
+  tmux_a kill-server 2>/dev/null || true
+  tmux_b kill-server 2>/dev/null || true
+  # The collector may still be writing its log while it exits.
+  local i
+  for (( i = 0; i < 20; i++ )); do
+    rm -rf "$WORK" "$TMUX_TMPDIR" 2>/dev/null && break
+    sleep 0.1
+  done
+}
+trap cleanup EXIT
+
+# Fake CLI: echoes each line it reads, so a send lands and returns.
+cat > "$WORK/bin/fakecli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "fakecli 1.0"; exit 0; }
+echo "> ready"
+while IFS= read -r line; do printf 'got:%s\n' "$line"; done
+EOF
+chmod +x "$WORK/bin/fakecli"
+# The commander resolves agent-tmux on PATH first: make it this checkout's.
+ln -s "$AGENT_TMUX" "$WORK/bin/agent-tmux"
+export PATH="$WORK/bin:$PATH"
+
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" got="$2" want="$3"
+  if [[ "$got" == "$want" ]]; then print -r -- "  ok   $label"; PASS=$((PASS + 1))
+  else print -r -- "  FAIL $label: got '$got' want '$want'"; FAIL=$((FAIL + 1)); fi
+}
+assert_contains() {
+  local label="$1" hay="$2" needle="$3"
+  if [[ "$hay" == *"$needle"* ]]; then print -r -- "  ok   $label"; PASS=$((PASS + 1))
+  else print -r -- "  FAIL $label: '$needle' not in '$hay'"; FAIL=$((FAIL + 1)); fi
+}
+# Paths and content hashes of every file under a dir.
+tree_hash() { (cd "$1" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do print -r -- "$f $(shasum "$f" | cut -d' ' -f1)"; done); }
+pane_of() { "$@" display-message -p -t "=wlim-$NAME:" '#{pane_id} #{pane_pid}' 2>/dev/null || true; }
+
+print -r -- "case a: a second start of a live name refuses and leaves the first untouched"
+NAME=coll
+"$AGENT_TMUX" fakecli start --exact coll "$WORK/repo" >"$WORK/a1.out" 2>&1 || { cat "$WORK/a1.out"; exit 1; }
+printf '{"status":"blocked","summary":"first worker","episode":1}\n' > "$TMUX_AGENT_DIR/coll/result.json"
+before_pane="$(pane_of tmux_b)"
+before_tree="$(tree_hash "$TMUX_AGENT_DIR/coll")"
+code=0
+out="$("$AGENT_TMUX" fakecli start --exact coll "$WORK/repo" 2>&1)" || code=$?
+assert "a: second start --exact exits non-zero" "$(( code != 0 ))" 1
+assert_contains "a: the refusal names the live session" "$out" "wlim-coll already exists"
+assert "a: same pane id and pid" "$(pane_of tmux_b)" "$before_pane"
+assert "a: the first worker's state dir is byte-identical" "$(tree_hash "$TMUX_AGENT_DIR/coll")" "$before_tree"
+code=0
+out="$("$AGENT_TMUX" fakecli resume --exact coll "$WORK/repo" 019e356f-f95d-7570-9784-ea7b58e404a5 2>&1)" || code=$?
+assert "a: resume --exact on the live name exits non-zero" "$(( code != 0 ))" 1
+assert "a: same pane id and pid after resume" "$(pane_of tmux_b)" "$before_pane"
+assert "a: state dir byte-identical after resume" "$(tree_hash "$TMUX_AGENT_DIR/coll")" "$before_tree"
+assert "a: pane-id binds the pane tmux created" "$(cat "$TMUX_AGENT_DIR/coll/pane-id" 2>/dev/null || true)" "${before_pane%% *}"
+
+print -r -- "case a2: another prefix (another CLI or profile) starting a live name refuses; the shared dir stays the first worker's"
+code=0
+out="$(AGENT_TMUX_PREFIX=wlim2 "$AGENT_TMUX" fakecli start --exact coll "$WORK/repo" 2>&1)" || code=$?
+assert "a2: start under another prefix exits non-zero" "$(( code != 0 ))" 1
+assert_contains "a2: the refusal names the owning session" "$out" "of session wlim-coll"
+assert "a2: no second session was made" "$(tmux_b has-session -t '=wlim2-coll' 2>/dev/null && echo made || echo none)" none
+assert "a2: the first worker's state dir is byte-identical" "$(tree_hash "$TMUX_AGENT_DIR/coll")" "$before_tree"
+
+print -r -- "case a3: a stale pane-id naming another worker's live pane does not block a start"
+tmux_b new-session -d -s wlim-x-stale "sleep 300"
+tmux_b set-environment -t '=wlim-x-stale' TMUX_AGENT_NAME x-stale
+stale_pane="$(tmux_b display-message -p -t '=wlim-x-stale:' '#{pane_id}')"
+mkdir -p "$TMUX_AGENT_DIR/stale"
+print -r -- "$stale_pane" > "$TMUX_AGENT_DIR/stale/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli start --exact stale "$WORK/repo" 2>&1)" || code=$?
+assert "a3: start over a stale pane-id exits 0" "$code" 0
+new_pane="$(tmux_b display-message -p -t '=wlim-stale:' '#{pane_id}' 2>/dev/null || true)"
+assert "a3: pane-id now binds the new pane" "$(cat "$TMUX_AGENT_DIR/stale/pane-id" 2>/dev/null || true)" "$new_pane"
+assert "a3: the unrelated session is untouched" "$(tmux_b has-session -t '=wlim-x-stale' 2>/dev/null && echo kept || echo gone)" kept
+"$AGENT_TMUX" fakecli stop stale >/dev/null 2>&1 || true
+tmux_b kill-session -t '=wlim-x-stale' 2>/dev/null || true
+
+print -r -- "case a4: a live bound pane whose session names no worker (an older start) refuses; nothing is rebound"
+tmux_b new-session -d -s wlim-old-anon "sleep 300"
+anon_pane="$(tmux_b display-message -p -t '=wlim-old-anon:' '#{pane_id}')"
+mkdir -p "$TMUX_AGENT_DIR/anon"
+print -r -- "$anon_pane" > "$TMUX_AGENT_DIR/anon/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli start --exact anon "$WORK/repo" 2>&1)" || code=$?
+assert "a4: start exits non-zero" "$(( code != 0 ))" 1
+assert_contains "a4: the refusal says the owner cannot be told" "$out" "names no worker"
+assert "a4: pane-id still binds the old pane" "$(cat "$TMUX_AGENT_DIR/anon/pane-id")" "$anon_pane"
+tmux_b kill-session -t '=wlim-old-anon' 2>/dev/null || true
+
+print -r -- "case d: a result from an earlier launch of the name is preserved"
+mkdir -p "$TMUX_AGENT_DIR/old"
+printf '{"status":"success","summary":"never harvested"}\n' > "$TMUX_AGENT_DIR/old/result.json"
+legacy_sum="$(shasum "$TMUX_AGENT_DIR/old/result.json" | cut -d' ' -f1)"
+out="$("$AGENT_TMUX" fakecli start --exact old "$WORK/repo" 2>&1)"
+kept=("$TMUX_AGENT_DIR"/old/legacy-*/result.json(N))
+assert "d: exactly one preserved copy" "${#kept}" 1
+if (( ${#kept} )); then
+  assert "d: the preserved bytes are the old result" "$(shasum "${kept[1]}" | cut -d' ' -f1)" "$legacy_sum"
+  assert_contains "d: start says where it went" "$out" "${kept[1]:h}"
+fi
+assert "d: the new launch starts without a result" "$([[ -e "$TMUX_AGENT_DIR/old/result.json" ]] && echo present || echo absent)" absent
+
+print -r -- "case c: a late lifecycle fold after tell E2 lands on E1's path only"
+NAME=fold
+"$AGENT_TMUX" fakecli start --exact fold "$WORK/repo" >/dev/null 2>&1
+E1="$TMUX_AGENT_DIR/fold/result.json"
+E2="$TMUX_AGENT_DIR/fold/episodes/2/result.json"
+printf '{"status":"blocked","summary":"needs a decision","episode":1}\n' > "$E1"
+printf 'decide: yes\n' > "$WORK/tell.txt"
+"$AGENT_TMUX" fakecli send --result-path "$E2" --episode 2 --prompt-file "$WORK/tell.txt" fold >/dev/null 2>&1
+mkdir -p "${E2:h}"
+printf '{"status":"success","summary":"decided","episode":2}\n' > "$E2"
+e2_before="$(tree_hash "${E2:h}")"
+"$AGENT_TMUX" fakecli stop fold >/dev/null 2>&1
+lid="$(jq -r .launch_id "$TMUX_AGENT_DIR/fold/launch-meta.json")"
+assert "c: E1 keeps status blocked" "$(jq -r .status "$E1")" blocked
+assert "c: E1 keeps episode 1" "$(jq -r .episode "$E1")" 1
+assert "c: E1 gains terminal_reason stopped" "$(jq -r .terminal_reason "$E1")" stopped
+assert "c: E1 carries this launch id" "$(jq -r .launch_id "$E1")" "$lid"
+assert "c: E2's dir is byte-identical" "$(tree_hash "${E2:h}")" "$e2_before"
+e1_after="$(shasum "$E1" | cut -d' ' -f1)"
+"$AGENT_TMUX" fakecli stop fold >/dev/null 2>&1
+"$AGENT_TMUX" fakecli result fold >/dev/null 2>&1 || true
+assert "c: a second stop and a read do not fold again" "$(shasum "$E1" | cut -d' ' -f1)" "$e1_after"
+
+print -r -- "case a: stop never kills a same-named session that lacks the bound pane"
+tmux_b new-session -d -s wlim-fold "sleep 300"
+code=0
+out="$("$AGENT_TMUX" fakecli stop fold 2>&1)" || code=$?
+assert "a: stop refuses" "$(( code != 0 ))" 1
+assert_contains "a: the refusal names the bound pane" "$out" "does not hold pane"
+assert "a: the foreign session is alive" "$(tmux_b has-session -t '=wlim-fold' 2>/dev/null && echo yes || echo no)" yes
+tmux_b kill-session -t '=wlim-fold'
+
+print -r -- "case b: TMUX_AGENT_TMUX_SOCKET pins agent-tmux to that server"
+tmux_a new-session -d -s keep "sleep 300"
+TMUX_AGENT_TMUX_SOCKET="$SOCK_A" "$AGENT_TMUX" fakecli start --exact sock "$WORK/repo" >/dev/null 2>&1 || true
+assert "b: the worker is on server A" "$(tmux_a has-session -t '=wlim-sock' 2>/dev/null && echo yes || echo no)" yes
+assert "b: the worker is not on the default server" "$(tmux_b has-session -t '=wlim-sock' 2>/dev/null && echo yes || echo no)" no
+TMUX_AGENT_TMUX_SOCKET="$SOCK_A" "$AGENT_TMUX" fakecli stop sock >/dev/null 2>&1 || true
+assert "b: stop with the socket stops it on A" "$(tmux_a has-session -t '=wlim-sock' 2>/dev/null && echo yes || echo no)" no
+
+print -r -- "case b: the commander chain stays on the server it runs in"
+code=0
+out="$(env TMUX="$SOCK_A,1,0" TMUX_PANE=%0 "$COMMANDER" start fakecli cmdr "$WORK/repo" --no-attach 2>&1)" || code=$?
+assert "b: commander start exits 0" "$code" 0
+assert "b: the host session is on server A" "$(tmux_a has-session -t '=wlim-cmdr' 2>/dev/null && echo yes || echo no)" yes
+assert "b: the host session is not on the default server" "$(tmux_b has-session -t '=wlim-cmdr' 2>/dev/null && echo yes || echo no)" no
+assert "b: the panel line is set on A" "$(tmux_a show-options -v -t '=wlim-cmdr:' 'status-format[1]' 2>/dev/null | grep -c ' panel ' || true)" 1
+assert_contains "b: the collector is up" "$out" "collector pid"
+
+print -r -- "case g: a start paused after its live-name check cannot disturb a concurrent start"
+# Shim tmux: the first has-session of the process with GCUT set reports at-cut,
+# then waits for release (the cut point between precheck and state init).
+cat > "$WORK/bin/tmux-cut" <<SHIM
+#!/bin/bash
+"$REAL_TMUX" "\$@"; rc=\$?
+if [ -n "\${GCUT:-}" ] && [ "\$1" = has-session ] && [ ! -e "$WORK/cut-done" ]; then
+  : > "$WORK/cut-done"; : > "$WORK/at-cut"
+  for _ in \$(seq 1 300); do [ -e "$WORK/release" ] && break; sleep 0.1; done
+fi
+exit \$rc
+SHIM
+chmod +x "$WORK/bin/tmux-cut"
+G="$TMUX_AGENT_DIR/gname"
+GCUT=1 TMUX="$WORK/bin/tmux-cut" "$AGENT_TMUX" fakecli start --exact gname "$WORK/repo" >"$WORK/ga.out" 2>&1 &
+pid_a=$!
+for (( i = 0; i < 100; i++ )); do [[ -e "$WORK/at-cut" ]] && break; sleep 0.1; done
+assert "g: A reached the cut point" "$([[ -e "$WORK/at-cut" ]] && echo yes || echo no)" yes
+"$AGENT_TMUX" fakecli start --exact gname "$WORK/repo" >"$WORK/gb.out" 2>&1 &
+pid_b=$!
+# Before the fix B finishes at once (A is only paused); after it B waits on A's lock.
+winner=""
+for (( i = 0; i < 25; i++ )); do kill -0 $pid_b 2>/dev/null || { winner=B; break; }; sleep 0.1; done
+code_a=0; code_b=0
+if [[ $winner == B ]]; then
+  wait $pid_b || code_b=$?
+else
+  : > "$WORK/release"; wait $pid_a || code_a=$?; winner=A
+fi
+gpane="$(tr -d '[:space:]' < "$G/pane-id" 2>/dev/null || true)"
+glaunch="$(jq -r .launch_id "$G/launch-meta.json" 2>/dev/null || true)"
+printf '{"status":"success","summary":"winner","episode":1}\n' > "$G/result.json"
+rsum="$(shasum "$G/result.json" | cut -d' ' -f1)"
+: > "$WORK/release"
+if [[ $winner == B ]]; then wait $pid_a || code_a=$?; else wait $pid_b || code_b=$?; fi
+if [[ $winner == A ]]; then won=$code_a lost=$code_b; else won=$code_b lost=$code_a; fi
+print -r -- "  g: winner=$winner A_exit=$code_a B_exit=$code_b"
+assert "g: the winner exits 0" "$won" 0
+assert "g: the loser exits non-zero" "$(( lost != 0 ))" 1
+live="$(tmux_b display-message -p -t '=wlim-gname:' '#{pane_id}' 2>/dev/null || true)"
+assert "g: pane-id is the live winner pane, not truncated" "$(tr -d '[:space:]' < "$G/pane-id")" "$live"
+assert "g: the loser kept the winner's launch state" "$(jq -r .launch_id "$G/launch-meta.json")" "$glaunch"
+assert "g: the winner's result.json is preserved in place" "$(shasum "$G/result.json" 2>/dev/null | cut -d' ' -f1)" "$rsum"
+legacy=("$G"/legacy-*(N))
+assert "g: nothing moved to legacy-*" "${#legacy}" 0
+assert "g: the winner session is alive" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" yes
+
+print -r -- "case g: stop refuses an empty or unreadable pane-id binding"
+: > "$G/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli stop gname 2>&1)" || code=$?
+assert "g: stop with an empty pane-id exits non-zero" "$(( code != 0 ))" 1
+assert_contains "g: the refusal names pane-id" "$out" "pane-id is missing, empty, or unreadable"
+assert "g: the session survives the empty binding" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" yes
+printf '%s\n' "$live" > "$G/pane-id"; chmod 000 "$G/pane-id"
+code=0
+out="$("$AGENT_TMUX" fakecli stop gname 2>&1)" || code=$?
+chmod 600 "$G/pane-id"
+assert "g: stop with an unreadable pane-id exits non-zero" "$(( code != 0 ))" 1
+assert "g: the session survives the unreadable binding" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" yes
+"$AGENT_TMUX" fakecli stop gname >/dev/null 2>&1 || true
+assert "g: stop with a valid binding still stops it" "$(tmux_b has-session -t '=wlim-gname' 2>/dev/null && echo yes || echo no)" no
+
+print -r -- "case h: a stop that verified the old pane cannot kill a replacement launched under the same name"
+# Shim tmux: the first kill-session of a process with SCUT set reports at-kill, then waits (the cut between identity check and kill).
+cat > "$WORK/bin/tmux-stopcut" <<SHIM
+#!/bin/bash
+if [ -n "\${SCUT:-}" ] && [ "\$1" = kill-session ] && [ ! -e "$WORK/stopcut-done" ]; then
+  : > "$WORK/stopcut-done"; : > "$WORK/at-kill"
+  for _ in \$(seq 1 300); do [ -e "$WORK/release-kill" ] && break; sleep 0.1; done
+fi
+exec "$REAL_TMUX" "\$@"
+SHIM
+chmod +x "$WORK/bin/tmux-stopcut"
+"$AGENT_TMUX" fakecli start --exact hname "$WORK/repo" >/dev/null 2>&1
+H="$TMUX_AGENT_DIR/hname"
+old="$(tr -d '[:space:]' < "$H/pane-id")"
+SCUT=1 TMUX="$WORK/bin/tmux-stopcut" "$AGENT_TMUX" fakecli stop hname >"$WORK/hs.out" 2>&1 &
+pid_s=$!
+for (( i = 0; i < 100; i++ )); do [[ -e "$WORK/at-kill" ]] && break; sleep 0.1; done
+assert "h: stop reached the cut point" "$([[ -e "$WORK/at-kill" ]] && echo yes || echo no)" yes
+tmux_b kill-session -t '=wlim-hname'
+"$AGENT_TMUX" fakecli start --exact hname "$WORK/repo" >"$WORK/hb.out" 2>&1 &
+pid_n=$!
+sleep 1.5
+: > "$WORK/release-kill"
+wait $pid_s || true
+code_n=0; wait $pid_n || code_n=$?
+new="$(tmux_b display-message -p -t '=wlim-hname:' '#{pane_id}' 2>/dev/null || true)"
+print -r -- "  h: old=$old replacement=$new start_exit=$code_n"
+assert "h: the replacement start exits 0" "$code_n" 0
+assert "h: the replacement session survives the stale stop" "$(tmux_b has-session -t '=wlim-hname' 2>/dev/null && echo yes || echo no)" yes
+assert "h: pane-id is the replacement pane" "$(tr -d '[:space:]' < "$H/pane-id")" "$new"
+"$AGENT_TMUX" fakecli stop hname >/dev/null 2>&1 || true
+
+print -r -- "case h: stop of an unknown name keeps the old refusal and creates nothing"
+code=0
+out="$("$AGENT_TMUX" fakecli stop nosuchname 2>&1)" || code=$?
+assert "h: unknown name exits as before (0)" "$code" 0
+assert_contains "h: unknown name says Already stopped" "$out" "Already stopped"
+assert "h: no <state>/<name> dir was created" "$([[ -e "$TMUX_AGENT_DIR/nosuchname" ]] && echo yes || echo no)" no
+
+print -r -- "case f: the protocol docs name no \`current\` seq pointer"
+hits="$(cd "$REPO_ROOT" && grep -n '`current`' mods/tmux-agent/README.md README.md skills/tmux-agent-tools/SKILL.md skills/tmux-agent-tools/references/*.md || true)"
+assert "f: no \`current\` in the protocol docs" "$hits" ""
+
+print -r -- "pass=$PASS fail=$FAIL"
+(( FAIL == 0 ))

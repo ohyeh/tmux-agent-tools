@@ -88,7 +88,7 @@ case "\$*" in
     ;;
 esac
 case "\$*" in
-  *" has-session "*) exit 1 ;;
+  has-session\ *|*" has-session "*) exit 1 ;;
   *) exit 0 ;;
 esac
 EOF

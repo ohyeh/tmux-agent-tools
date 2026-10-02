@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Smoke: `resume` launches each CLI with the flag that opens a SPECIFIC session.
+# cursor-agent: `resume` is "resume the latest chat" and takes no id; the id goes
+# to `--resume [chatId]`. agy has no resume subcommand; the id goes to
+# `--conversation`. A fake binary records its argv from a real tmux launch.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-resume-kw.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+# The bundled defaults are under test: a user profile in ~/.config/agent-tmux
+# (e.g. resume_keyword=resume) must not override them.
+export XDG_CONFIG_HOME="$WORK/config"
+unset AGENT_TMUX_PROFILE_DIR
+cleanup() {
+  "$AGENT_TMUX" cursor stop rkw-cursor >/dev/null 2>&1 || true
+  "$AGENT_TMUX" agy stop rkw-agy >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok   $label"; PASS=$((PASS+1))
+  else
+    echo "  FAIL $label expected=[$expected] got=[$actual]" >&2; FAIL=$((FAIL+1))
+  fi
+}
+
+# One fake per CLI: the tmux pane does not inherit this shell's env, so the
+# argv file name is baked into each fake.
+for cli in cursor agy; do
+  printf '#!/bin/sh\necho "$*" > "%s/argv.%s"\nsleep 30\n' "$WORK" "$cli" > "$WORK/fake-$cli.sh"
+  chmod +x "$WORK/fake-$cli.sh"
+done
+
+SID='5ea32e6e-0000-4000-8000-000000000001'
+argv_of() { # <cli> <name> <ENV_VAR>
+  local cli="$1" name="$2" var="$3" i
+  env "$var=$WORK/fake-$cli.sh" \
+    "$AGENT_TMUX" "$cli" resume --exact "$name" "$WORK" "$SID" >/dev/null 2>&1 || true
+  for i in $(seq 1 50); do
+    [[ -s "$WORK/argv.$cli" ]] && break
+    sleep 0.1
+  done
+  cat "$WORK/argv.$cli" 2>/dev/null || echo "<no launch>"
+}
+
+echo "--- resume keyword per CLI"
+assert "cursor resumes by id with --resume" "$(argv_of cursor rkw-cursor CURSOR)" "--resume $SID"
+assert "agy resumes by id with --conversation" "$(argv_of agy rkw-agy AGY)" \
+  "--dangerously-skip-permissions --conversation $SID"
+
+echo "PASS=$PASS FAIL=$FAIL"
+(( FAIL == 0 ))
+(( FAIL == 0 ))

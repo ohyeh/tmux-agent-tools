@@ -15,6 +15,11 @@ resolve_tmux_bin() {
 TMUX_BIN="$(resolve_tmux_bin)"
 unset TMUX
 TMUX="$TMUX_BIN"
+
+# Same rule as agent-tmux `session_target`: `a.b` is session `a`, pane `b`.
+session_target() {
+  printf '=%s:' "$1"
+}
 JQ="${JQ:-$(command -v jq 2>/dev/null || true)}"
 CLAUDE_PREFIX="${CLAUDE_TMUX_PREFIX:-claude-cli}"
 CODEX_PREFIX="${CODEX_TMUX_PREFIX:-codex-cli}"
@@ -28,6 +33,7 @@ FILTER_CREATED_AFTER_EPOCH=""
 SORT_FIELD=""
 typeset -a FILTER_TAGS
 FILTER_TAGS=()
+NO_WRITE=0
 TMUX_AGENT_DIR="${TMUX_AGENT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools}"
 
 tags_for_session() {
@@ -61,8 +67,8 @@ usage() {
 tmux-agent-sessions - inspect and clean up tmux-agent-tools sessions
 
 Usage:
-  tmux-agent-sessions list [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
-  tmux-agent-sessions list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions list [--no-write] [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
+  tmux-agent-sessions list --watch [--no-write] --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]
   tmux-agent-sessions resolve --name <partial-or-full-name> --json
   tmux-agent-sessions diff --since <timestamp> --json
   tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]
@@ -157,7 +163,7 @@ fallback_status_json() {
   local session="$3"
   local prefix="$4"
   local current lowered
-  current="$("$TMUX" capture-pane -J -t "$session" -p -S -80 2>/dev/null || true)"
+  current="$("$TMUX" capture-pane -J -t "$(session_target "$session")" -p -S -80 2>/dev/null || true)"
   lowered="${current:l}"
 
   local running=true
@@ -200,7 +206,13 @@ emit_wrapper_session_json() {
     codex) prefix="$CODEX_PREFIX" ;;
     agy) prefix="$AGY_PREFIX" ;;
   esac
-  if output="$("${wrapper[@]}" status --json "$name" 2>/dev/null)"; then
+  local -a status_cmd
+  status_cmd=("${wrapper[@]}" status)
+  if (( NO_WRITE )) || [[ -n "${TMUX_AGENT_NO_WRITE:-}" ]]; then
+    status_cmd+=(--no-write)
+  fi
+  status_cmd+=(--json "$name")
+  if output="$("${status_cmd[@]}" 2>/dev/null)"; then
     print -r -- "$output" | add_state_field
     return
   fi
@@ -327,7 +339,7 @@ cwd_for_session() {
       return
     fi
   fi
-  "$TMUX" display-message -p -t "$session" "#{pane_current_path}" 2>/dev/null || true
+  "$TMUX" display-message -p -t "$(session_target "$session")" "#{pane_current_path}" 2>/dev/null || true
 }
 
 wrapper_name_for_tool() {
@@ -453,6 +465,9 @@ list_sessions() {
       --json)
         output_json=1
         ;;
+      --no-write)
+        NO_WRITE=1
+        ;;
       --watch)
         watch=1
         ;;
@@ -496,7 +511,7 @@ list_sessions() {
         SORT_FIELD="$(parse_sort_arg "${1:-}")"
         ;;
       *)
-        die "Usage: tmux-agent-sessions list [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>] | list --watch --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]"
+        die "Usage: tmux-agent-sessions list [--no-write] [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>] | list --watch [--no-write] --json --count <n> [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] [--sort <tool|name|session|state>]"
         ;;
     esac
     shift
@@ -839,11 +854,11 @@ cleanup_sessions() {
 
     case "$tool" in
       claude|codex)
-        "$TMUX" kill-session -t "$session"
+        "$TMUX" kill-session -t "$(session_target "$session")"
         print -r -- "Stopped $session"
         ;;
       dialogue)
-        "$TMUX" kill-session -t "$session"
+        "$TMUX" kill-session -t "$(session_target "$session")"
         print -r -- "Stopped $session"
         ;;
     esac

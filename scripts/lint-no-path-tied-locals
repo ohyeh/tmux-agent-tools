@@ -34,7 +34,7 @@ SELF="$(cd "$(dirname "${(%):-%x}")" && pwd)/$(basename "${(%):-%x}")"
 # awk filter: for each line declaring `local`/`typeset`, walk tokens after
 # the keyword, skip flag tokens (start with `-` or `+`), strip `=value`,
 # and emit `file:line:content` if any remaining name is in BLOCKLIST.
-read -r -d '' AWK_PROG <<'AWK' || true
+AWK_PROG='
 BEGIN {
   n = split(blocklist, arr, ",")
   for (i = 1; i <= n; i++) banned[arr[i]] = 1
@@ -67,20 +67,21 @@ BEGIN {
     }
   }
 }
-AWK
+'
 
 blocklist_csv="${(j:,:)TIED_NAMES}"
 
 for dir in "${TARGETS[@]}"; do
   [[ -d "$dir" ]] || continue
-  # Collect candidate files (skip binaries; everything in scripts/ is text).
-  while IFS= read -r match; do
+  typeset matches
+  matches="$(find "$dir" -type f -print0 2>/dev/null \
+    | xargs -0 awk -v blocklist="$blocklist_csv" "$AWK_PROG" 2>/dev/null || true)"
+  for match in "${(f)matches}"; do
     [[ -z "$match" ]] && continue
     [[ "${match%%:*}" == "$SELF" ]] && continue
     printf '%s\n' "$match"
     violations=$((violations + 1))
-  done < <(find "$dir" -type f -print0 2>/dev/null \
-    | xargs -0 awk -v blocklist="$blocklist_csv" "$AWK_PROG" 2>/dev/null || true)
+  done
 done
 
 if (( violations > 0 )); then

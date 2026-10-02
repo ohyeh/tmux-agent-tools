@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.41.0",
+  "version": "0.44.5",
   "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent pair/team orchestration.",
   "author": {
     "name": "PaulYeh",
@@ -19,10 +19,12 @@
     "supervision"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "hooks": "./.codex-plugin/hooks.json",
   "interface": {
     "displayName": "tmux-agent-tools",
     "shortDescription": "Supervise Claude Code / Codex CLI as controllable tmux sessions",
-    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill with no MCP server or hooks.",
+    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill plus the tmux-agent-mcp worker-lifecycle MCP server.",
     "developerName": "PaulYeh",
     "category": "Productivity",
     "capabilities": [
@@ -34,7 +36,7 @@
       "Orchestrate multi-agent pair and team review workflows"
     ],
     "defaultPrompt": [
-      "Start a supervised agent session for this task with agent-tmux claude start or agent-tmux codex start, then report its structured result."
+      "Start a supervised codex or claude worker with agent-tmux and report its structured result."
     ]
   }
 }

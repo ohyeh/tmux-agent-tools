@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.287
+▝▜██████▀  Sonnet 5.5 · Claude Team
+ ▝▝   ▝▝   ~/github/tmux-agent-tools · /rc            
+
+⚠ Your login expires in 2 days · run /login to renew
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                            ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "write a test for register.test.ts"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep future transcripts   
+  [Sonnet 5.5 ◔ medium] │ github/tmux-agent-tools git:(main* [+1 -1]) │ Cost $0.0000                                                                            
+  Context ░░░░░░░░░░ 0% │ Usage plan ████░░░░░░ 42% (23d 10h) | auto ████░░░░░░ 41% (23d 10h) | api ██████████ 100% (23d 10h)
+  1 CLAUDE.md | 9 hooks                                                                                                                                         
+  ~support-matrix.md(+1 -1)  ?2                                                                                                                            
+  sid: 00000000-0000-0000-0000-000000000000
+  ⏵⏵ auto mode on (shift+tab to cycle)

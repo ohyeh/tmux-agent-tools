@@ -1,0 +1,653 @@
+// The §10 P2 gate at process level: real collector passes (workers.race.node.ts), each
+// its own OS process, against one shared state root. Deliveries are counted in a file
+// the contenders append to; the ledger is read straight off disk.
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { sessionKey } from './ledger.ts'
+import { composerHolds, paneAlive, pasteInto, readCollectorRecord } from './collector.node.ts'
+import { nodeHost } from './host.node.ts'
+import { deliveryIdOf, heartbeat, newGate, reconcileOnce } from './workers.ts'
+
+const RACE = new URL('./workers.race.node.ts', import.meta.url).pathname
+const COLLECTOR = new URL('./collector.node.ts', import.meta.url).pathname
+const OLD = 200 // seconds: past ORPHAN_MS (90 s)
+
+type World = { root: string; v3: string; cwd: string; out: string; ep: string; name: string }
+
+/** One worker whose E1 is sent and finished with an attributed result (`episode: 1`). */
+function world(gen0: string): World {
+  const root = mkdtempSync(join(tmpdir(), 'wrace-'))
+  const cwd = mkdtempSync(join(tmpdir(), 'wrepo-'))
+  const v3 = `${root}/.v3`
+  const name = 'w.abcde'
+  const w = `${v3}/${name}`
+  const ep = `${w}/episodes/1`
+  mkdirSync(`${ep}/sent`, { recursive: true })
+  const since = Date.now() - 60_000
+  writeFileSync(`${w}/worker.json`, JSON.stringify({ profile: 'codex', name, dir: cwd, since, owner: gen0, ownerCwd: cwd, origin: 'assign' }))
+  writeFileSync(`${ep}/dispatch.json`, JSON.stringify({ seq: 1, since, owner: gen0, resultPath: `${w}/result.json`, origin: 'launch' }))
+  writeFileSync(`${w}/result.json`, JSON.stringify({ schema_version: 1, status: 'success', summary: 'did it', artifacts: [], errors: [], episode: 1 }))
+  return { root, v3, cwd, out: `${root}/deliveries`, ep, name }
+}
+
+/** A session whose one activation beat `agoS` seconds ago. */
+function beatAt(w: World, session: string, agoS: number): void {
+  const act = `${w.v3}/.sessions/${sessionKey(session)}/act`
+  mkdirSync(`${act}/1`, { recursive: true })
+  writeFileSync(`${act}/1.beat`, '')
+  const t = Date.now() / 1000 - agoS
+  utimesSync(`${act}/1`, t, t)
+  utimesSync(`${act}/1.beat`, t, t)
+}
+
+/** Age every activation beat of `session` (the process stopped beating). */
+function ageBeats(w: World, session: string): void {
+  const act = `${w.v3}/.sessions/${sessionKey(session)}/act`
+  const t = Date.now() / 1000 - OLD
+  for (const f of readdirSync(act)) utimesSync(`${act}/${f}`, t, t)
+}
+
+type Run = { code: number; activation?: number; paused: string | null; logs: string[] }
+
+function pass(w: World, session: string, env: Record<string, string> = {}): Promise<Run> {
+  return new Promise(resolve => {
+    execFile(
+      process.execPath,
+      [RACE, session, w.cwd],
+      { env: { ...process.env, TMUX_AGENT_DIR: w.root, DELIVERIES: w.out, LIVE: `codex-cli-${w.name}`, ...env }, timeout: 30_000 },
+      (error, stdout) => {
+        const code = error ? (typeof error.code === 'number' ? error.code : -1) : 0
+        const line = stdout.trim().split('\n').at(-1)
+        const body = line ? (JSON.parse(line) as Omit<Run, 'code'>) : { paused: null, logs: [] }
+        resolve({ code, ...body })
+      },
+    )
+  })
+}
+
+const delivered = (w: World) => (existsSync(w.out) ? readFileSync(w.out, 'utf8').trim().split('\n').filter(Boolean) : [])
+const by = (w: World) => delivered(w).map(l => l.split('\t')[0])
+const gens = (w: World) => (existsSync(`${w.ep}/claims`) ? readdirSync(`${w.ep}/claims`).sort() : [])
+const acked = (w: World, kind = 'done') => existsSync(`${w.ep}/acks/${kind}`)
+
+async function until(p: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 500 && !p(); i++) await new Promise(r => setTimeout(r, 20))
+  assert.ok(p(), `timed out waiting for ${what}`)
+}
+
+test('slow-claim race (astra-review.md:94-99): 8 collectors see one dead owner; one claim gen, one delivery', async () => {
+  const w = world('X')
+  beatAt(w, 'X', OLD)
+  const claimTick = await Promise.all(Array.from({ length: 8 }, (_, i) => pass(w, `B${i}`)))
+  assert.deepEqual(claimTick.map(r => r.code), Array(8).fill(0))
+  assert.deepEqual(gens(w), ['1'], 'exactly one claim gen was won')
+  assert.deepEqual(delivered(w), [], 'the claim tick delivers nothing')
+  const owner = readFileSync(`${w.ep}/claims/1/owner`, 'utf8').trim()
+  await Promise.all(Array.from({ length: 8 }, (_, i) => pass(w, `B${i}`)))
+  assert.deepEqual(by(w), [owner], 'only the claimant delivers, once')
+  assert.ok(acked(w))
+})
+
+test('a slow pass that lost its claim delivers nothing (§4 re-check before submit)', async () => {
+  const w = world('A')
+  const a = pass(w, 'A', { HOLD_READ: '/result.json' })
+  await until(() => existsSync(`${w.root}/held.A`), 'A to reach its result read')
+  ageBeats(w, 'A') // A stopped beating while it hung
+  await pass(w, 'B') // claims gen 1
+  await pass(w, 'B') // delivers
+  assert.deepEqual(by(w), ['B'])
+  writeFileSync(`${w.root}/go.A`, '')
+  const r = await a
+  assert.equal(r.code, 0)
+  assert.deepEqual(by(w), ['B'], 'the old owner, woken, does not deliver a second time')
+  assert.ok(r.logs.some(l => l.includes('changed owner during this pass')), r.logs.join('\n'))
+})
+
+test('crash between claim mkdir and owner publish: nobody delivers inside the grace, then one claim of gen+1 delivers once', async () => {
+  const w = world('X')
+  beatAt(w, 'X', OLD)
+  assert.equal((await pass(w, 'B', { CRASH_AT: 'claim-owner' })).code, 9)
+  assert.deepEqual(gens(w), ['1'])
+  assert.ok(!existsSync(`${w.ep}/claims/1/owner`), 'the crash left gen 1 without an owner')
+  await pass(w, 'C')
+  await pass(w, 'C')
+  assert.deepEqual(delivered(w), [], 'an incomplete max gen: nobody owns, nobody delivers')
+  assert.deepEqual(gens(w), ['1'], 'no claim of gen 2 inside ORPHAN_MS')
+  const t = Date.now() / 1000 - OLD
+  utimesSync(`${w.ep}/claims/1`, t, t)
+  await pass(w, 'C') // claims gen 2
+  await pass(w, 'C') // delivers
+  assert.deepEqual(gens(w), ['1', '2'])
+  assert.deepEqual(by(w), ['C'])
+})
+
+test('crash after submit, before the ack: re-reported (never missed), then acked once', async () => {
+  const w = world('A')
+  assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
+  assert.equal(delivered(w).length, 1)
+  assert.ok(!acked(w))
+  await pass(w, 'A')
+  assert.equal(delivered(w).length, 2, 'the unacked delivery is reported again')
+  assert.ok(acked(w))
+  await pass(w, 'A')
+  assert.equal(delivered(w).length, 2, 'acked: nothing more')
+})
+
+test('crash before submit: nothing recorded, the next pass delivers once', async () => {
+  const w = world('A')
+  assert.equal((await pass(w, 'A', { CRASH_AT: 'before-submit' })).code, 9)
+  assert.deepEqual(delivered(w), [])
+  assert.ok(!acked(w))
+  await pass(w, 'A')
+  await pass(w, 'A')
+  assert.equal(delivered(w).length, 1)
+  assert.ok(acked(w))
+})
+
+test('two activations of one session: the older, woken after a newer registered, delivers nothing', async () => {
+  const w = world('A')
+  const old = pass(w, 'A', { HOLD_READ: '/result.json' })
+  await until(() => existsSync(`${w.root}/held.A`), 'the first activation to hang')
+  const fresh = await pass(w, 'A')
+  assert.equal(delivered(w).length, 1)
+  writeFileSync(`${w.root}/go.A`, '')
+  const r = await old
+  assert.equal(delivered(w).length, 1)
+  assert.ok(r.activation! < fresh.activation!)
+  assert.match(r.paused ?? '', /superseded/)
+})
+
+test('a submit already past its last check may land twice (allowed re-report); the ack is still one dir', async () => {
+  const w = world('A')
+  const old = pass(w, 'A', { HOLD_SUBMIT: '1' })
+  await until(() => existsSync(`${w.root}/held.A`), 'the first activation to hang inside submit')
+  await pass(w, 'A')
+  writeFileSync(`${w.root}/go.A`, '')
+  await old
+  assert.equal(delivered(w).length, 2)
+  assert.deepEqual(readdirSync(`${w.ep}/acks`).filter(k => k === 'done'), ['done'])
+})
+
+test('an ack that cannot be written is logged and re-reported, never read as delivered', async () => {
+  const w = world('A')
+  mkdirSync(`${w.ep}/acks`, { recursive: true }) // the marker (R4-2) needs the episode dir writable; only the ack is refused
+  chmodSync(`${w.ep}/acks`, 0o555)
+  try {
+    const r = await pass(w, 'A')
+    assert.equal(delivered(w).length, 1)
+    assert.ok(r.logs.some(l => l.includes('could not ack')), r.logs.join('\n'))
+    await pass(w, 'A')
+    assert.equal(delivered(w).length, 2)
+  } finally {
+    chmodSync(`${w.ep}/acks`, 0o755)
+  }
+  await pass(w, 'A')
+  await pass(w, 'A')
+  assert.equal(delivered(w).length, 3)
+  assert.ok(acked(w))
+})
+
+// §1c S1: at-least-once. One tuple (gen-0 owner, name, seq) is acked once; every
+// re-report of it is the same notice (same worker, same result path), whoever sends it.
+const notices = (w: World) => delivered(w).map(l => l.split('\t').slice(2).join('\t'))
+const doneDirs = (w: World) => (existsSync(`${w.ep}/acks`) ? readdirSync(`${w.ep}/acks`).filter(k => k === 'done') : [])
+
+function sameNotice(w: World, n: number): void {
+  const all = notices(w)
+  assert.equal(all.length, n, all.join('\n'))
+  assert.ok(all.every(t => t === all[0]), 'every report of the tuple is the same notice')
+  assert.match(all[0]!, new RegExp(`"${w.name}" on codex`))
+  assert.ok(all[0]!.includes(`result: ${w.v3}/${w.name}/result.json`))
+}
+
+test('S1 (b): three activations past the guard all submit; the tuple (A, name, 1) is acked once', async () => {
+  const w = world('A')
+  const held: Promise<Run>[] = []
+  for (let i = 0; i < 3; i++) {
+    rmSync(`${w.root}/held.A`, { force: true })
+    held.push(pass(w, 'A', { HOLD_SUBMIT: '1' }))
+    await until(() => existsSync(`${w.root}/held.A`), `activation ${i + 1} to hang inside submit`)
+  }
+  writeFileSync(`${w.root}/go.A`, '')
+  const runs = await Promise.all(held)
+  assert.deepEqual(runs.map(r => r.activation), [1, 2, 3])
+  sameNotice(w, 3)
+  assert.deepEqual(doneDirs(w), ['done'], 'one ack dir: one mkdir won, the others lost')
+  rmSync(`${w.root}/go.A`)
+  await pass(w, 'A')
+  assert.equal(notices(w).length, 3, 'acked: no further report')
+})
+
+test('S1 (c): a re-report after a mid-delivery crash, from a new activation, carries the same delivery_id <gen0>/<name>/<seq>', async () => {
+  const w = world('A')
+  assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
+  await pass(w, 'A')
+  sameNotice(w, 2)
+  const acts = delivered(w).map(l => l.split('\t')[1])
+  assert.notEqual(acts[0], acts[1], 'two activations, one tuple')
+  const ids = notices(w).map(t => /delivery_id: (\S+)/.exec(t)?.[1])
+  assert.deepEqual(ids, [`A/${w.name}/1`, `A/${w.name}/1`])
+  assert.deepEqual(doneDirs(w), ['done'])
+})
+
+test('S1 (c): a claim does not change the delivery_id (gen0 = the descriptor owner); another seq has another id', async () => {
+  const w = world('X')
+  beatAt(w, 'X', OLD)
+  await pass(w, 'B') // claims gen 1
+  await pass(w, 'B') // delivers
+  assert.deepEqual(by(w), ['B'])
+  assert.equal(/delivery_id: (\S+)/.exec(notices(w)[0]!)?.[1], `X/${w.name}/1`)
+  const d = { profile: 'codex', name: w.name, dir: w.cwd, since: 0, owner: 'B', adoptedFrom: 'X' }
+  assert.equal(deliveryIdOf({ ...d, seq: 1 }), `X/${w.name}/1`)
+  assert.equal(deliveryIdOf({ ...d, seq: 2 }), `X/${w.name}/2`)
+})
+
+test('AT_LEAST_ONCE_BOUND_PROBE: two ack failures, then the third attempt delivers the same notice and acks once', async () => {
+  const w = world('A')
+  mkdirSync(`${w.ep}/acks`, { recursive: true }) // the marker (R4-2) needs the episode dir writable; only the ack is refused
+  chmodSync(`${w.ep}/acks`, 0o555)
+  try {
+    await pass(w, 'A')
+    await pass(w, 'A')
+    assert.equal(notices(w).length, 2)
+    assert.deepEqual(doneDirs(w), [])
+  } finally {
+    chmodSync(`${w.ep}/acks`, 0o755)
+  }
+  await pass(w, 'A')
+  sameNotice(w, 3)
+  assert.deepEqual(doneDirs(w), ['done'])
+  await pass(w, 'A')
+  assert.equal(notices(w).length, 3)
+})
+
+test('AT_LEAST_ONCE_BOUND_PROBE: two submits that each crash before the ack, then the third delivers the same notice and acks once', async () => {
+  const w = world('A')
+  for (let i = 0; i < 2; i++) assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
+  assert.deepEqual(doneDirs(w), [])
+  await pass(w, 'A')
+  sameNotice(w, 3)
+  assert.deepEqual(doneDirs(w), ['done'])
+  await pass(w, 'A')
+  assert.equal(notices(w).length, 3)
+})
+
+test('an exited-but-open orphan (F1): a dead owner, acks/exited, a late result — one claim gen, one delivery, closed done', async () => {
+  const w = world('X')
+  beatAt(w, 'X', OLD)
+  mkdirSync(`${w.ep}/acks/exited`, { recursive: true })
+  const late = readFileSync(`${w.ep}/../../result.json`, 'utf8')
+  writeFileSync(`${w.ep}/../../result.json`, '{"schema_version":1,"status":"running"}')
+  await Promise.all(Array.from({ length: 4 }, (_, i) => pass(w, `B${i}`)))
+  assert.deepEqual(gens(w), ['1'], 'open (exited is not closed): contested, claimed once')
+  const owner = readFileSync(`${w.ep}/claims/1/owner`, 'utf8').trim()
+  writeFileSync(`${w.ep}/../../result.json`, late)
+  await Promise.all(Array.from({ length: 4 }, (_, i) => pass(w, `B${i}`)))
+  await Promise.all(Array.from({ length: 4 }, (_, i) => pass(w, `B${i}`)))
+  assert.deepEqual(by(w), [owner], 'the late result is delivered once, by the claimant')
+  assert.ok(acked(w))
+})
+
+test('uncrashed contention: a live owner and 7 peers in one pass each — exactly one delivery, no claim', async () => {
+  const w = world('A')
+  beatAt(w, 'A', 0)
+  await Promise.all([pass(w, 'A'), ...Array.from({ length: 7 }, (_, i) => pass(w, `P${i}`))])
+  assert.deepEqual(by(w), ['A'])
+  assert.deepEqual(gens(w), [])
+})
+
+test('collector entry: missing identity or a pane that is not %N is refused with exit 2', async () => {
+  const run = (args: string[]) =>
+    new Promise<number>(resolve => execFile(process.execPath, [COLLECTOR, ...args], error => resolve(error ? (typeof error.code === 'number' ? error.code : -1) : 0)))
+  assert.equal(await run(['--cwd', '/x', '--pane', '%1']), 2)
+  assert.equal(await run(['--session', 's', '--cwd', 'rel', '--pane', '%1']), 2)
+  assert.equal(await run(['--session', 's', '--cwd', '/x', '--pane', 'main']), 2)
+})
+
+/** A private tmux server. `$TMUX` is not copied onto the child, and every call carries `-S`. */
+function privateServer(): { dir: string; sock: string; env: NodeJS.ProcessEnv; tmux: (args: string[]) => Promise<{ code: number; out: string }> } {
+  const dir = mkdtempSync('/tmp/p3t-')
+  const sock = join(dir, 's')
+  const env: NodeJS.ProcessEnv = { ...process.env, TMUX_AGENT_TMUX_SOCKET: sock, TMUX_TMPDIR: dir }
+  delete env.TMUX
+  delete env.TMUX_PANE
+  const tmux = (args: string[]) =>
+    new Promise<{ code: number; out: string }>(resolve => {
+      const has = args.some((a, i) => a === '-S' || a === '-L' || args[i - 1] === '-S' || args[i - 1] === '-L')
+      execFile('tmux', has ? args : ['-S', sock, ...args], { env, encoding: 'utf8', timeout: 20_000 }, (error, stdout) =>
+        resolve({ code: error ? 1 : 0, out: stdout }),
+      )
+    })
+  return { dir, sock, env, tmux }
+}
+
+const FAKE = new URL('./fixtures/composer/fake-cursor.mjs', import.meta.url).pathname
+
+/** A private server whose one pane runs the fake cursor composer in `dir` (null when tmux cannot start). */
+async function fakeHost(draft = '', mode = 'idle') {
+  const srv = privateServer()
+  const state = mkdtempSync(join(tmpdir(), 'cursor-agent-fake-')) // the name lets `hostCli` find the CLI
+  writeFileSync(`${state}/mode`, mode)
+  if (draft) writeFileSync(`${state}/draft`, draft)
+  const name = `tac-fake-${process.pid}-${Math.random().toString(36).slice(2, 6)}`
+  const up = await srv.tmux(['new-session', '-d', '-s', name, '-x', '160', '-y', '30', `${process.execPath} ${FAKE} ${state}`])
+  const stop = async () => {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+  if (up.code !== 0) {
+    await stop()
+    return null
+  }
+  const pane = (await srv.tmux(['display-message', '-p', '-t', name, '#{pane_id}'])).out.trim()
+  const log = () => (existsSync(`${state}/log`) ? readFileSync(`${state}/log`, 'utf8').trim().split('\n').filter(Boolean) : [])
+  const setMode = (m: string) => writeFileSync(`${state}/mode`, m)
+  const clear = () => writeFileSync(`${state}/clear`, '')
+  await new Promise(r => setTimeout(r, 400)) // the fake draws its first screen
+  return { srv, pane, log, setMode, clear, stop }
+}
+
+test('collector wake: a bracketed paste into the exact pane, then Enter; a gone pane is a drop', async t => {
+  const h = await fakeHost()
+  if (!h) return t.skip('no private tmux server can start here')
+  try {
+    assert.ok(await paneAlive(h.pane, h.srv.env))
+    assert.deepEqual(await pasteInto(h.pane, 'line one\nline two', h.srv.env, 'cursor'), { text: 'line one\nline two' })
+    assert.deepEqual(h.log(), ['PASTE:"line one\\nline two"', 'ENTER:idle:"line one\\nline two"'], 'one paste, then one Enter')
+    assert.equal(await paneAlive('%999999', h.srv.env), false)
+    assert.match((await pasteInto('%999999', 'x', h.srv.env, 'cursor')).drop ?? '', /gone/)
+  } finally {
+    await h.stop()
+  }
+})
+
+test('CLI collector and another session on one root: a dead owner\'s finished episode is claimed and delivered once', async t => {
+  const w = world('dead')
+  beatAt(w, 'dead', OLD)
+  const h = await fakeHost()
+  if (!h) return t.skip('no private tmux server can start here')
+  const env = { ...h.srv.env, TMUX_AGENT_DIR: w.root }
+  try {
+    assert.match(h.pane, /^%\d+$/)
+    const once = (session: string) =>
+      new Promise<number>(resolve =>
+        execFile(
+          process.execPath,
+          [COLLECTOR, '--session', session, '--cwd', w.cwd, '--pane', h.pane, '--cli', 'cursor', '--once'],
+          { env, timeout: 30_000 },
+          error => resolve(error ? (typeof error.code === 'number' ? error.code : -1) : 0),
+        ),
+      )
+    const round = () => Promise.all([once('cli-host'), pass(w, 'other-host')])
+    const first = await round()
+    assert.deepEqual(first.map(c => (typeof c === 'number' ? c : c.code)), [0, 0])
+    assert.deepEqual(delivered(w), [], 'the claim tick delivers nothing')
+    assert.equal(gens(w).length, 1, 'one claim gen')
+    await round()
+    const pasted = h.log().filter(l => l.startsWith('ENTER:')).length
+    assert.equal(delivered(w).length + pasted, 1, 'the claimant delivers once, the other session does not')
+    assert.ok(acked(w))
+  } finally {
+    await h.stop()
+  }
+})
+
+/**
+ * D-paste at pass level: the real `reconcileOnce` with the collector's real `pasteInto` into a
+ * fake composer. The host log says what reached the host; the ledger says what was acked. A
+ * deferral is not a refusal: no failure count, no pause, no ack, and the next pass retries.
+ */
+async function scenario(mode: string, draft: string, body: (x: Awaited<ReturnType<typeof setup>> & { h: NonNullable<Awaited<ReturnType<typeof fakeHost>>> }) => Promise<void>, t: { skip: (m: string) => void }) {
+  const w = world('S')
+  const h = await fakeHost(draft, mode)
+  if (!h) return t.skip('no private tmux server can start here')
+  const x = setup(w, h)
+  try {
+    await body({ ...x, h })
+  } finally {
+    x.restore()
+    await h.stop()
+  }
+}
+
+function setup(w: World, h: NonNullable<Awaited<ReturnType<typeof fakeHost>>>) {
+  const saved = { dir: process.env.TMUX_AGENT_DIR, sock: process.env.TMUX_AGENT_TMUX_SOCKET }
+  process.env.TMUX_AGENT_DIR = w.root
+  process.env.TMUX_AGENT_TMUX_SOCKET = h.srv.sock
+  const gate = newGate()
+  const host = nodeHost({ owner: 'S', cwd: w.cwd, log: () => {}, submit: text => pasteInto(h.pane, text, process.env, 'cursor') })
+  return {
+    w,
+    gate,
+    beat: () => heartbeat(host, gate),
+    passes: async (n: number) => {
+      for (let i = 0; i < n; i++) await reconcileOnce(host, gate)
+    },
+    restore: () => {
+      for (const [k, v] of [['TMUX_AGENT_DIR', saved.dir], ['TMUX_AGENT_TMUX_SOCKET', saved.sock]] as const) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    },
+  }
+}
+
+const enters = (h: { log: () => string[] }) => h.log().filter(l => l.startsWith('ENTER:'))
+const DRAFT = 'R74-DRAFT-KEEPME unsent draft text'
+
+for (const c of [
+  { name: 'draft', mode: 'idle', draft: DRAFT, recover: (h: { clear: () => void }) => h.clear() },
+  { name: 'busy', mode: 'busy', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+  { name: 'permission', mode: 'permission', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+  { name: 'shell', mode: 'shell', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+  { name: 'unknown', mode: 'unknown', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
+]) {
+  test(`D-paste: host ${c.name} -> nothing pasted, no Enter, no ack, no pause, reason kept; delivered once when it recovers`, async t => {
+    await scenario(c.mode, c.draft, async ({ w, gate, beat, passes, h }) => {
+      await beat() // registers the activation, so act/<n>.state can be published
+      await passes(5) // FAIL_MAX is 3: five deferrals must not pause
+      assert.deepEqual(h.log(), [], 'neither a paste nor an Enter reached the host')
+      assert.ok(!acked(w), 'a deferred notice is not acked')
+      assert.equal(gate.failures, 0, 'a deferral is not a refusal')
+      assert.equal(gate.paused, undefined)
+      assert.match(gate.deferred ?? '', new RegExp(`composer is ${c.name}`), 'the reason stays set while the condition holds')
+      const stateFile = `${w.v3}/.sessions/${sessionKey('S')}/act/${gate.activation}.state`
+      const published = JSON.parse(readFileSync(stateFile, 'utf8')) as { status: string; reason?: string }
+      assert.equal(published.status, 'collecting', 'a deferral is not a pause')
+      assert.match(published.reason ?? '', new RegExp(`composer is ${c.name}`), 'act/<n>.state carries the reason for the TUI and panel')
+      c.recover(h)
+      await new Promise(r => setTimeout(r, 400))
+      await passes(2)
+      assert.equal(enters(h).length, 1, 'delivered once after it recovered')
+      assert.ok(acked(w))
+      assert.equal(gate.deferred, undefined)
+    }, t)
+  })
+}
+
+test('D-paste: empty composer -> one paste, one Enter, acked once', async t => {
+  await scenario('idle', '', async ({ w, gate, passes, h }) => {
+    await passes(3)
+    assert.equal(h.log().filter(l => l.startsWith('PASTE:')).length, 1)
+    assert.equal(enters(h).length, 1)
+    assert.ok(acked(w))
+    assert.equal(gate.deferred, undefined)
+  }, t)
+})
+
+test('D-paste: the composer after the paste is not the pasted text -> no Enter, text left, blocked, no ack, no second paste', async t => {
+  await scenario('mangle', '', async ({ w, gate, passes, h }) => {
+    await passes(3)
+    assert.equal(h.log().filter(l => l.startsWith('PASTE:')).length, 1, 'pasted once; the leftover reads as a draft afterwards')
+    assert.deepEqual(enters(h), [], 'no Enter')
+    assert.ok(!acked(w))
+    assert.equal(gate.failures, 0)
+    assert.match(gate.deferred ?? '', /composer is draft/)
+  }, t)
+})
+
+test('D-paste: pasteInto reports blocked for a post-paste mismatch and never sends Enter', async t => {
+  const h = await fakeHost('', 'mangle')
+  if (!h) return t.skip('no private tmux server can start here')
+  try {
+    const r = await pasteInto(h.pane, 'the notice', h.srv.env, 'cursor')
+    assert.match(r.deferred ?? '', /^blocked: .*Enter not sent/)
+    assert.deepEqual(enters(h), [])
+  } finally {
+    await h.stop()
+  }
+})
+
+test('D-paste: the composer already holds this notice (our blocked paste) -> a distinct reason, no keys, nothing pasted', async t => {
+  const h = await fakeHost('the notice')
+  if (!h) return t.skip('no private tmux server can start here')
+  try {
+    const r = await pasteInto(h.pane, 'the notice', h.srv.env, 'cursor')
+    assert.match(r.deferred ?? '', /earlier notice is still in the composer/)
+    assert.doesNotMatch(r.deferred ?? '', /composer is draft/)
+    assert.deepEqual(h.log(), [], 'no paste and no Enter reached the host')
+  } finally {
+    await h.stop()
+  }
+})
+
+test('composerHolds: whitespace-insensitive equality, or the CLI placeholder covering every pasted line', () => {
+  assert.ok(composerHolds({ state: 'draft', text: 'a b\nc' }, 'a b c'))
+  assert.ok(composerHolds({ state: 'draft', text: '[Pasted text #1 +9 lines]' }, Array(9).fill('x').join('\n')))
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +3 lines]' }, Array(9).fill('x').join('\n')))
+  // Claude Code counts newlines: a 9-line paste reads +8 there, +9 elsewhere.
+  assert.ok(composerHolds({ state: 'draft', text: '[Pasted text #1 +8 lines]' }, Array(9).fill('x').join('\n'), 'claude'))
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +9 lines]' }, Array(9).fill('x').join('\n'), 'claude'))
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +8 lines]' }, Array(9).fill('x').join('\n'), 'cursor-agent'))
+  assert.ok(!composerHolds({ state: 'draft', text: 'old draft the notice' }, 'the notice'))
+  const long = Array.from({ length: 30 }, (_, i) => `line ${i} of the notice`).join('\n')
+  assert.ok(composerHolds({ state: 'draft', text: long.split('\n').slice(-6).join('\n    ') }, long), 'the visible tail of a long paste')
+  assert.ok(!composerHolds({ state: 'draft', text: 'old draft ' + long.split('\n').slice(-6).join('\n') }, long), 'foreign text before the tail')
+  assert.ok(!composerHolds({ state: 'draft', text: 'line 29 of the notice' }, long), 'a sliver of a long paste is not enough')
+  assert.ok(!composerHolds({ state: 'empty', text: '' }, 'the notice'))
+})
+
+test('R4-5 composerHolds: a middle fragment, or a placeholder whose count is not this paste, is not held', () => {
+  const p300 = Array.from({ length: 100 }, (_, i) => String(i).padStart(3, '0')).join('')
+  assert.ok(!composerHolds({ state: 'draft', text: p300.slice(100, 200) }, p300), 'middle-only 100/300 chars')
+  assert.ok(composerHolds({ state: 'draft', text: p300.slice(-100) }, p300), 'a provable suffix')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted Content 1 chars]' }, p300), '1 char for 300')
+  assert.ok(composerHolds({ state: 'draft', text: '[Pasted Content 300 chars]' }, p300), 'exact char count')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted Content 301 chars]' }, p300), 'off by one')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted thing #1 +9 lines]' }, Array(9).fill('x').join('\n')), 'unknown placeholder')
+  assert.ok(!composerHolds({ state: 'draft', text: '[Pasted text #1 +30 lines]' }, Array(9).fill('x').join('\n')), 'more lines than pasted')
+})
+
+test('R4-1 pasteInto: a real shell with PS1="› " under the codex parser gets no paste and no Enter', async t => {
+  const srv = privateServer()
+  const mark = `${srv.dir}/R4_SHELL_EXECUTED`
+  try {
+    const up = await srv.tmux(['new-session', '-d', '-s', 'sh', '-x', '120', '-y', '30', "env PS1='› ' bash --norc --noprofile -i"])
+    if (up.code !== 0) return t.skip('no private tmux server can start here')
+    const pane = (await srv.tmux(['display-message', '-p', '-t', 'sh', '#{pane_id}'])).out.trim()
+    await new Promise(r => setTimeout(r, 600))
+    const r = await pasteInto(pane, `touch ${mark}`, srv.env, 'codex')
+    assert.match(r.deferred ?? '', /not running|nothing pasted/)
+    await new Promise(r => setTimeout(r, 300))
+    assert.equal(existsSync(mark), false, 'the shell never ran the notice')
+    const cap = (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
+    assert.doesNotMatch(cap, /touch /, 'nothing was pasted into the shell')
+  } finally {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+  }
+})
+
+const AGENT_TMUX = new URL('../agent-tmux', import.meta.url).pathname
+
+test('composer-state: every captured pane gets its class (real codex, cursor-agent, agy and claude captures; synthetic ones marked)', async t => {
+  const want: [string, string, string, string?][] = [
+    ['codex', 'codex-empty.txt', 'empty'],
+    ['codex', 'codex-multiline.txt', 'empty'],
+    ['codex', 'codex-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],
+    ['codex', 'codex-busy.txt', 'busy'],
+    ['codex', 'codex-permission.txt', 'permission'],
+    ['codex', 'codex-shell.synthetic.txt', 'shell'],
+    ['codex', 'codex-shell-glyph.synthetic.txt', 'unknown'], // R4-1: a shell drawing the codex prompt glyph has no footer
+    ['cursor', 'cursor-agent-empty.txt', 'empty'],
+    ['cursor', 'cursor-agent-multiline.txt', 'empty'],
+    ['cursor', 'cursor-agent-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],
+    ['cursor', 'cursor-agent-busy.txt', 'busy'],
+    ['claude', 'claude-empty.txt', 'empty'],
+    ['claude', 'claude-draft.txt', 'draft', 'R74 draft text keep me'],
+    ['claude', 'claude-multiline.txt', 'draft', 'GOAL: line one of the brief\nline two\nline three'],
+    ['claude', 'claude-busy.txt', 'busy'], // Claude Code 2.x: spinner `● Ideating… (11s · …)`, no `esc to interrupt`
+    ['claude', 'claude-busy-start.txt', 'busy'], // the first second of a turn: `● Calculating…` alone
+    ['claude', 'claude-done.txt', 'empty'], // `✻ Worked for 18s · done` is a finished turn
+    ['agy', 'agy-empty.txt', 'empty'],
+    ['agy', 'agy-draft.txt', 'draft', 'R74 draft text keep me'],
+    ['agy', 'agy-multiline.txt', 'draft', 'GOAL: line one of the brief\nline two\nline three'],
+    ['agy', 'agy-busy.txt', 'busy'], // agy keeps an empty `>` while it works; `esc to cancel` under the frame says busy
+    ['agy', 'agy-permission.txt', 'permission'], // the trust-folder menu
+    ['agy', 'codex-empty.txt', 'unknown'], // another CLI's screen is not recognised
+    ['codex', 'cursor-agent-empty.txt', 'unknown'], // another CLI's screen is not recognised
+  ]
+  const srv = privateServer()
+  try {
+    for (const [i, [cli, file, state, text]] of want.entries()) {
+      const path = new URL(`./fixtures/composer/${file}`, import.meta.url).pathname
+      const up = await srv.tmux(['new-session', '-d', '-s', `f${i}`, '-x', '200', '-y', '50', `cat ${path}; sleep 60`])
+      if (up.code !== 0) return t.skip('no private tmux server can start here')
+      const pane = (await srv.tmux(['display-message', '-p', '-t', `f${i}`, '#{pane_id}'])).out.trim()
+      await new Promise(r => setTimeout(r, 300))
+      const out = await new Promise<string>(resolve => execFile(AGENT_TMUX, [cli, 'composer-state', '--pane', pane], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))
+      assert.equal(out.split('\n')[0], state, `${cli} ${file}`)
+      if (text) assert.equal(out.split('\n').slice(1).join('\n').trim(), text, `${file} composer text`)
+    }
+  } finally {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+  }
+})
+
+test('Sol#2 readCollectorRecord: only ENOENT is absent; bad JSON, an incomplete record or a read error throws with the path', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'crec-'))
+  const path = `${dir}/collector.json`
+  assert.equal(await readCollectorRecord(path), undefined, 'ENOENT')
+  for (const text of ['{"pid": 4', '{"pid": 4}', 'null']) {
+    writeFileSync(path, text)
+    await assert.rejects(readCollectorRecord(path), new RegExp(`${path}`))
+  }
+  rmSync(path)
+  mkdirSync(path)
+  await assert.rejects(readCollectorRecord(path), /EISDIR/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('Sol r6 N5: from a valid record, dropping or corrupting any required field makes it not complete (throws); nonce is optional but typed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'crec-'))
+  const path = `${dir}/collector.json`
+  const valid = { pid: 4242, pidStart: 'Thu Jan  1 00:00:00 1970', host: 'h', session: 's', pane: '%1', socket: '/tmp/x', cwd: '/tmp', coreVersion: '0.43.0', token: 't' }
+  writeFileSync(path, JSON.stringify(valid))
+  assert.deepEqual(await readCollectorRecord(path), valid, 'the valid record is read')
+  writeFileSync(path, JSON.stringify({ ...valid, nonce: 'n' }))
+  assert.equal((await readCollectorRecord(path))?.nonce, 'n', 'a present nonce is kept')
+  const bad: [string, unknown][] = [['dropped', undefined], ['empty', ''], ['number', 7], ['null', null], ['object', {}]]
+  for (const key of Object.keys(valid)) {
+    for (const [what, v] of bad) {
+      if (key === 'pid' && (what === 'empty' || what === 'number')) continue
+      const r: Record<string, unknown> = { ...valid, [key]: v }
+      writeFileSync(path, JSON.stringify(r))
+      await assert.rejects(readCollectorRecord(path), new RegExp(path), `${key} ${what} was accepted`)
+    }
+  }
+  for (const pid of [0, -1, 1.5, '4242']) {
+    writeFileSync(path, JSON.stringify({ ...valid, pid }))
+    await assert.rejects(readCollectorRecord(path), new RegExp(path), `pid ${JSON.stringify(pid)} was accepted`)
+  }
+  for (const nonce of [7, null, '', {}]) {
+    writeFileSync(path, JSON.stringify({ ...valid, nonce }))
+    await assert.rejects(readCollectorRecord(path), new RegExp(path), `nonce ${JSON.stringify(nonce)} was accepted`)
+  }
+  rmSync(dir, { recursive: true, force: true })
+})

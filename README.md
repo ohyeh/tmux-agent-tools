@@ -110,9 +110,20 @@ Its credential-free `fake` participants are covered by CI; real `codex`/`claude`
   own marketplace checkout when `agent-tmux` is not on `PATH` (0.7.14), so no skill
   and no `install-bin` are needed.
 - The skill is optional: add it only if you want the model to drive `agent-tmux` from
-  the shell too. Install it one way — `npx skills` or the `tmux-agent-tools` plugin, not
+  the shell too. Install it one way — `npx skills` or the `tmux-agent` plugin, not
   both — or the same skill loads twice.
-- Codex, Cursor and other CLIs: the skill plus `install-bin`.
+- Codex, Cursor and other CLIs: the skill plus `install-bin` (and, for the MCP
+  server, register `tmux-agent-mcp` from the skill folder; see "MCP server"), or
+  the `tmux-agent-tools` plugin, which carries the skill and the MCP server together. They do not load
+  the Claude function-hook mod. They share its v5 ledger: one `.v3/` tree under
+  the state root, written by the same core the mod imports
+  (`skills/tmux-agent-tools/scripts/lib/workers.ts`). One collector per host
+  session is `node skills/tmux-agent-tools/scripts/lib/collector.node.ts`;
+  `cancel` and `unlock` are `node skills/tmux-agent-tools/scripts/lib/workers.cli.node.ts`.
+  Layout, ownership, and delivery are in
+  [`mods/tmux-agent/README.md`](mods/tmux-agent/README.md) (收集端). Bash guard
+  (`tool.call`) stays on the Claude mod only.
+- Per-host evidence and open blockers: [`docs/support-matrix.md`](docs/support-matrix.md).
 
 ## Install Skill With skills.sh
 
@@ -130,14 +141,54 @@ npx skills add ohyeh/tmux-agent-tools --skill tmux-agent-tools --global
 
 The repository doubles as a plugin for agent CLIs. Every manifest points at the same
 `./skills/` directory, so the skill content is identical across CLIs — only the wrapper
-manifest differs. No MCP server or hooks are involved; this is a skill plus shell wrappers.
+manifest differs.
 
-Claude Code (the repository is its own marketplace):
+The repository is its own marketplace, `tmux-agent-tools`, with two plugins:
+
+| Plugin | Source | Carries | For |
+|---|---|---|---|
+| `tmux-agent-tools` | `./` | skills (incl. the `tmux-agent-tui` TUI), wrappers, the Bash dispatch gate; the MCP server for Codex and Cursor | any CLI |
+| `tmux-agent` | `./mods/tmux-agent` | the Claude Code function-hook mod only | Claude Code |
+
+| Runtime | Install | Skills and TUI from |
+|---|---|---|
+| Claude Code | `tmux-agent` + global skill | `npx skills` (no Bash gate; the mod's own Bash guard still applies) |
+| Claude Code | `tmux-agent` + `tmux-agent-tools` | the plugin (gate on) |
+| Codex, Cursor | `tmux-agent-tools` | the plugin (MCP tools; Cursor also runs the Bash gate) |
+| Codex, Cursor | global skill only | `npx skills` (no MCP unless registered by hand) |
 
 ```bash
 /plugin marketplace add ohyeh/tmux-agent-tools
-/plugin install tmux-agent-tools@tmux-agent-tools
+/plugin install tmux-agent@tmux-agent-tools         # the mod
+/plugin install tmux-agent-tools@tmux-agent-tools   # skills + gate (skip with the global skill)
 ```
+
+The mod turns any agent-tmux worker into a teammate of one Claude Code
+session: `assign` dispatches a brief, `tell` gives the same worker its next task or a
+correction, `stop` dismisses it, `peek` looks at a pane mid-flight, `keys` answers a dialog
+it is parked on, and `/workers` shows this project's teammates while their sessions live.
+Every session that has it reconciles each worker's `result.json` and submits a prompt when
+a worker finishes — so a detached worker never finishes into silence, even when nobody is
+watching the pane. The worker can be codex, agy, cursor, a second claude on a provider
+gateway, or a CLI that does not exist yet: `profile` is an agent-tmux profile name. See
+[`mods/tmux-agent/README.md`](mods/tmux-agent/README.md) for the permission surface, the
+state-root rules and the known boundaries. It does not replace the shell path:
+`assign` + `result wait-required` stay the route for Codex, Cursor and anything else
+without function hooks.
+
+Upgrading from 0.42.0/0.43.0 (one plugin, `tmux-agent`, carried skills, gate and mod):
+
+- Claude Code: `claude plugin marketplace update tmux-agent-tools`, then
+  `claude plugin update tmux-agent@tmux-agent-tools`. Same plugin id, so tools, the waiter
+  type and stored delivery marks carry over; it now holds the mod only. Without the global
+  skill, also `claude plugin install tmux-agent-tools@tmux-agent-tools`.
+- Codex: `codex plugin marketplace upgrade tmux-agent-tools`,
+  `codex plugin add tmux-agent-tools@tmux-agent-tools`, then
+  `codex plugin remove tmux-agent@tmux-agent-tools`.
+
+With the global skill (`npx skills`) and a plugin installed together, both copies load; keep
+them at the same version (`npx skills update -g tmux-agent-tools using-tmux-agent-tools`
+after a plugin update). An older copy brings back fixed bugs.
 
 Codex CLI and Cursor read `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json`
 respectively from a clone of this repository; both expose the same skill.
@@ -145,27 +196,6 @@ respectively from a clone of this repository; both expose the same skill.
 The plugin installs the skill, not the `*-tmux` binaries. To get `agent-tmux`
 and the helpers on `PATH`, use `install-bin` below; the
 skill resolves the bundled scripts from its own directory when they are not on `PATH`.
-
-### Optional: the `tmux-agent` function-hook mod (Claude Code only)
-
-`mods/tmux-agent/` is a second, separate plugin in the same marketplace. It turns any
-agent-tmux worker into a teammate of one Claude Code session: `assign` dispatches a
-brief, `tell` gives the same worker its next task or a correction, `stop` dismisses
-it, `peek` looks at a pane mid-flight, `keys` answers a dialog it is parked on, and
-`/workers` shows this project's teammates while their sessions live. Every session that has it
-reconciles each worker's `result.json` and submits a prompt when a worker finishes —
-so a detached worker never finishes into silence, even when nobody is watching the pane.
-The worker can be codex, agy, cursor, a second claude on a provider gateway, or a CLI
-that does not exist yet: `profile` is an agent-tmux profile name.
-
-```bash
-/plugin install tmux-agent@tmux-agent-tools
-```
-
-It needs `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, and it does not replace the shell path:
-`assign` + `result wait-required` stay the route for Codex, Cursor and anything else
-without function hooks. See [`mods/tmux-agent/README.md`](mods/tmux-agent/README.md) for
-the permission surface, the state-root rules and the known boundaries.
 
 ## Install Commands
 
@@ -182,7 +212,102 @@ Then symlink the bundled scripts into `~/.local/bin`:
 skills/tmux-agent-tools/scripts/install-bin ~/.local/bin
 ```
 
+## Workers TUI
+
+`tmux-agent-tui` is the full-screen view of the tmux-agent workers. It is a zsh
+entry beside `agent-tmux` that runs `lib/tui.node.ts`; it resolves its own
+directory through symlinks, so an `install-bin` link, an `npx skills` folder and
+a marketplace checkout all work, from any cwd.
+
+```bash
+tmux-agent-tui --session <session-id> --cwd <dir>   # owner: act on that session's workers
+tmux-agent-tui                                      # viewer: every worker, labeled, read-only
+```
+
+- Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI acts for
+  that session. Without one it is a viewer that only lists.
+- Needs Node >= 22.18 (`NODE=/path/to/node` picks one) and a terminal. With no
+  TTY it exits 2; for a JSON snapshot use `tmux-agent-dashboard`.
+  `TMUX_AGENT_DIR` and `TMUX_AGENT_TMUX_SOCKET` pass through.
+- In Claude Code, the mod's `[ ⧉ ]` opens it in a tmux split. Outside tmux, the
+  toast gives the full command to run in another terminal (over 200 characters,
+  the whole command is in the log).
+
+Upgrade: `install-bin` links only the scripts that exist when it runs, so a new
+script (such as `tmux-agent-tui`) has no link until you run it again. After you
+update the skill (`npx skills update`, or `claude plugin update`), run
+`install-bin ~/.local/bin` again. `agent-tmux <cli> doctor` and `setup` list the
+bundle scripts that `~/.local/bin` is missing.
+
+## MCP server
+
+`tmux-agent-mcp` is the workers lifecycle as an MCP server over stdio
+(`spawn_tmux_agent`, `send_tmux_agent`, `wait_tmux_agent`, `read_tmux_agent`,
+`close_tmux_agent`). It runs `lib/mcp-server.mjs`, one self-contained file
+(the MCP SDK and zod bundled; licenses in `lib/mcp-server.LICENSES.txt`) that
+loads the core `.ts` files beside it. An install of the skill is enough: no repo
+checkout, no `npm install`, no `node_modules`. Needs Node >= 22.18. Its stdout
+is the MCP protocol only; diagnostics go to stderr.
+
+Delivery: each server process is its own session (`$TMUX_AGENT_SESSION`, else
+`mcp-<hostname>-<pid>-<start>`), so a restart is a new session; it can still
+`wait` on a worker from before the restart by `agent_id`, and claims it once the
+old process's heartbeat is past 90 s. `spawn_tmux_agent` and `send_tmux_agent`
+return the episode `seq`; `wait_tmux_agent`/`read_tmux_agent` with `seq` stay on
+that episode (without it, the latest episode at call time). A `completed` wait
+carries `delivery_id` = `<first owner>/<agent_id>/<seq>`. The episode is acked
+only after the response bytes are flushed to stdout (not when the client has
+processed them); a cancel, a send error or a crash before the ack leaves it
+unacked, and a later wait reports it again with the same `delivery_id`. This is
+at-least-once: dedup by `delivery_id`. A session has one delivery channel (the
+mod, the node collector, or MCP): the first one to register owns it, and
+another channel on the same session id is refused and does not collect. To move
+a session to another channel, stop the old channel's callers (a node collector, the
+MCP server, a Claude Code session with the plugin) and run
+`tmux-agent-tui --handover-channel <session> <mod|node|mcp>`; without `--yes` it
+only prints what it would do, with `--yes` it checks `ps` once and switches. A
+stale heartbeat does not count as "stopped". The launcher starts no node
+collector on a session that another channel owns and says so.
+
+Host failures: one `wait_tmux_agent` call lasts at most 40 s (cursor-agent drops a
+tool call at about 62 s). A longer `timeoutSec` ends with `{"status":"pending",
+"reason":"wait_again"}`: call it again with the same `agent_id` and `seq`; nothing
+was delivered or acked, and the delivery semantics are unchanged. Right after
+`spawn_tmux_agent`, while `agent-tmux assign` has not finished and the tmux
+session is not up yet, a wait answers `{"status":"pending","reason":"starting"}`,
+never `dead_session`; a launch that exited non-zero answers `failed` /
+`launch_failed`, and `dead_session` needs a finished launch. The launch runs in
+its own session, so a host that exits right after `spawn` does not cut off the
+brief. When the host goes away (stdin closed, stdout broken) the server settles
+unsent responses as not-acked, retires its heartbeat so the next session claims
+at once, and exits; it neither crashes on `EPIPE` nor stays behind as an orphan.
+
+The Codex and Cursor plugins declare it, so installing the plugin registers it:
+`.codex-plugin/mcp.json` (Codex runs `./skills/…/tmux-agent-mcp` with the plugin
+root as cwd) and `mcpServers` in `.cursor-plugin/plugin.json`
+(`${CURSOR_PLUGIN_ROOT}/skills/…/tmux-agent-mcp`). The server's cwd does not scope
+workers: `spawn_tmux_agent` takes `repoPath`, and the other tools find a worker by
+`agent_id`. With the skill installed by `npx skills` (the usual way) and no
+plugin, register the copy inside the installed skill folder by its absolute path,
+for example a global install:
+
+```bash
+codex mcp add tmux-agent -- ~/.agents/skills/tmux-agent-tools/scripts/tmux-agent-mcp
+```
+
+For Cursor, put the same absolute path as `command` of a `tmux-agent` entry in
+`~/.cursor/mcp.json`. Use one way: the plugin also loads the skill, so a plugin
+next to an `npx skills` install loads the skill twice, and a plugin MCP entry next
+to a `codex mcp add` entry starts two servers.
+
+The bundle is generated: after a change in `mcp-adapter/src` or a version bump,
+run `npm --prefix mcp-adapter ci && node mcp-adapter/build.mjs` and commit the
+result. `scripts/test-version-sync-smoke` fails when a rebuild does not
+reproduce the committed bytes.
+
 ## Usage
+
+`start`, `resume`, and `start-ssh` never replace a live session of the same name (breaking since the R8.5 change): they exit 1 and leave the first worker untouched. `stop` refuses a same-named session that does not hold the pane the worker was launched in (`<name>/pane-id`), or when that file is missing, empty, or unreadable. One per-name lock (`<name>/launch.lock`) covers the live-name check, the state init, and the `pane-id` write, so two starters of one name cannot interleave. A new launch of a name moves the earlier `result.json` and `stdout.log` into `<name>/legacy-<UTC time>-<pid>/`. `TMUX_AGENT_TMUX_SOCKET=<path>` puts `-S <path>` on every tmux call of `agent-tmux`, the node core, and `tmux-agent-commander`. The commander sets it from its own `$TMUX` when it is unset.
 
 ```bash
 agent-tmux codex start --exact worker ~/github/project 'Read the repo and report status.'
@@ -618,6 +743,27 @@ Size-based rotation triggers at `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default
 10MB), retaining `TMUX_AGENT_TOOLS_AUDIT_RETAIN` files (default 5). A
 `audit.rotation` HEAD-link record preserves the chain across rotations.
 Schema documented in `docs/design-issue-188-audit-surface.md`.
+
+## Privacy and Data Handling
+
+tmux-agent-tools runs entirely on your machine. It has no server and collects
+no telemetry; nothing is sent to the plugin author or to Anthropic.
+
+- **What it stores:** worker briefs, `result.json` files, launch metadata and
+  audit logs under the state root (default `~/.local/state/tmux-agent-tools`),
+  plus the tmux sessions it starts. You can delete that directory at any time.
+- **Credentials:** a worker CLI (`claude`, `codex`, `cursor-agent`, …) signs
+  in with its own configuration. The tools read a credential only when you
+  pass `--secret KEY=URI`: they resolve that one secret from the backend you
+  name (a file, an env file, 1Password `op read`, or the macOS Keychain), put
+  it in that worker's tmux environment, and redact it from captures and logs.
+  The value never leaves your machine.
+- **Outbound traffic:** only when you ask for it. `tmux-agent-notify` posts a
+  JSON summary (worker name, exit code, the context flags you pass) to a
+  webhook URL you supply, such as Slack; an `--on-exit`/`--on-start` hook runs
+  the command you give it. Without those, the tools make no network calls.
+- **Retention:** local files stay until you remove them; the audit log rotates
+  (see above).
 
 ## Requirements
 

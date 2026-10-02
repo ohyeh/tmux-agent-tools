@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CURSOR_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" cursor)"
 
 WORK="$(mktemp -d -t tmux-agent-runtime-blocker.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -182,6 +183,87 @@ fake mcp-warning <<'EOF'
   GPT-6-Astra low · tmux-agent-tools
 EOF
 
+# The cursor weekly limit block (2026-09-29): structured key and chatMessage
+fake cursor-quota <<'EOF'
+  chatMessage: *Weekly usage limit reached. It resets in 6 days.*
+  unifiedSkuWeeklyLimit: true
+  unifiedSkuWeeklyLimitResetDays: 6
+→
+EOF
+
+fake cursor-headless-quota <<'EOF'
+ActionRequiredError: Weekly usage limit reached. It resets in 6 days. Buy credits to keep going now, or upgrade your plan for more weekly usage.
+→
+EOF
+
+fake cursor-prose <<'EOF'
+• Checked the usage limit reached path
+→
+EOF
+
+fake cursor-recovered <<'EOF'
+  chatMessage: *Weekly usage limit reached. It resets in 6 days.*
+  unifiedSkuWeeklyLimit: true
+  unifiedSkuWeeklyLimitResetDays: 6
+• resumed after the reset
+• step 1
+• step 2
+• step 3
+• step 4
+• step 5
+• step 6
+• step 7
+• step 8
+• step 9
+• step 10
+→ Ask Cursor to do anything
+EOF
+
+fake cursor-limit-false <<'EOF'
+  chatMessage: *Working on task*
+  unifiedSkuWeeklyLimit: false
+  unifiedSkuWeeklyLimitResetDays: 0
+→
+EOF
+
+fake cursor-quoted <<'EOF'
+Added a test for "usage limit reached" handling.
+→
+EOF
+
+fake cursor-tool-output <<'EOF'
+• Reading the usage fixture
+└ cat usage.json
+    unifiedSkuWeeklyLimit: true
+    chatMessage: *Weekly usage limit reached.*
+→
+EOF
+
+fake cursor-false-then-true <<'EOF'
+  chatMessage: *Working on task*
+  unifiedSkuWeeklyLimit: false
+• Resuming task
+  chatMessage: *Weekly usage limit reached. It resets in 6 days.*
+  unifiedSkuWeeklyLimit: true
+  unifiedSkuWeeklyLimitResetDays: 6
+→
+EOF
+
+# agy draws a column-0 ⚠ for a model/API failure that is not a quota banner
+# (live: "⚠ … 404 NOT_FOUND"). The same text under └ is the tool's output.
+fake agy-model-404 <<'EOF'
+⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND
+? for shortcuts
+>
+EOF
+
+fake model-error-in-tool <<'EOF'
+• Reading the model fixture
+└ cat model-error.txt
+    ⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND
+>
+EOF
+
 PASS=0
 FAIL=0
 assert() {
@@ -193,24 +275,29 @@ assert() {
 status_of() {
   # Unique per run: two runs at once (run-all-smokes beside a mutation run) must
   # not share tmux sessions, or one reads the other's pane.
-  local fixture="$1" name="$1-$$"
-  CODEX="$WORK/$fixture.sh" "$CODEX_TMUX" start --exact "$name" "$WORK" >/dev/null
+  local fixture="$1" cli="${2:-codex}" name="$1-$$"
+  local launcher env_var
+  case "$cli" in
+    cursor) launcher="$CURSOR_TMUX"; env_var="CURSOR" ;;
+    *)      launcher="$CODEX_TMUX";  env_var="CODEX" ;;
+  esac
+  env "$env_var=$WORK/$fixture.sh" "$launcher" start --exact "$name" "$WORK" >/dev/null
   # Wait until the fixture is on screen: a `status` of a pane that has not drawn
   # yet answers null, and every "not blocked" case would then pass vacuously.
   local first i
   first="$(sed -n 3p "$WORK/$fixture.sh" | tr -d '[:space:]' | cut -c1-20)"
   for i in {1..40}; do
-    "$CODEX_TMUX" capture --strip-ansi --tail 60 "$name" 2>/dev/null | tr -d '[:space:]' | grep -qF -- "$first" && break
+    "$launcher" capture --strip-ansi --tail 60 "$name" 2>/dev/null | tr -d '[:space:]' | grep -qF -- "$first" && break
     sleep 0.25
   done
   if (( i >= 40 )); then
     # Not a pass by default: a case that saw no pane checked nothing.
     print -r -- '{"blocked_reason":"FIXTURE_NEVER_DREW"}'
-    "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+    "$launcher" stop "$name" >/dev/null 2>&1 || true
     return
   fi
-  "$CODEX_TMUX" status --json "$name"
-  "$CODEX_TMUX" stop "$name" >/dev/null 2>&1 || true
+  "$launcher" status --json "$name"
+  "$launcher" stop "$name" >/dev/null 2>&1 || true
 }
 
 echo "case: live codex usage-limit banner above the prompt"
@@ -314,6 +401,53 @@ assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<<
 echo "case: a ⚠ MCP auth warning is not a stop"
 st="$(status_of mcp-warning)"
 assert "warning not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: cursor weekly limit block with structured key (cursor profile)"
+st="$(status_of cursor-quota cursor)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the structured key line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "  unifiedSkuWeeklyLimit: true"
+
+echo "case: cursor headless weekly limit (ActionRequiredError)"
+st="$(status_of cursor-headless-quota cursor)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the ActionRequiredError line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "ActionRequiredError: Weekly usage limit reached. It resets in 6 days. Buy credits to keep going now, or upgrade your plan for more weekly usage."
+
+echo "case: cursor worker's own prose is not a blocker"
+st="$(status_of cursor-prose cursor)"
+assert "cursor prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "cursor prose has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
+
+echo "case: cursor error block scrolled above prompt boundary is history"
+st="$(status_of cursor-recovered cursor)"
+assert "cursor recovered not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: cursor unifiedSkuWeeklyLimit false is not a blocker"
+st="$(status_of cursor-limit-false cursor)"
+assert "cursor limit false not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: cursor prose quoting phrase is not a blocker"
+st="$(status_of cursor-quoted cursor)"
+assert "cursor quoted not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+
+echo "case: cursor tool output under └ is not a blocker"
+st="$(status_of cursor-tool-output cursor)"
+assert "cursor tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "cursor tool output has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
+
+echo "case: cursor false block followed by newer true block is quota_exhausted"
+st="$(status_of cursor-false-then-true cursor)"
+assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
+assert "evidence is the structured key line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "  unifiedSkuWeeklyLimit: true"
+
+echo "case: agy ⚠ model 404 is a model error, not a quota stop and not running"
+st="$(status_of agy-model-404)"
+assert "blocked_reason model_error" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "model_error"
+assert "evidence is the model error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND"
+
+echo "case: the same ⚠ model error under └ is tool output"
+st="$(status_of model-error-in-tool)"
+assert "tool model error not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "tool model error has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
 
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

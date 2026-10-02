@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="56" fill="#1b1f24"/>
+  <!-- tmux window: three panes, one per agent -->
+  <rect x="36" y="44" width="184" height="148" rx="14" fill="#0d1117" stroke="#3fb950" stroke-width="6"/>
+  <line x1="128" y1="44" x2="128" y2="192" stroke="#3fb950" stroke-width="6"/>
+  <line x1="128" y1="118" x2="220" y2="118" stroke="#3fb950" stroke-width="6"/>
+  <!-- prompt in the lead pane -->
+  <path d="M56 92 l18 14 -18 14" fill="none" stroke="#e6edf3" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="84" y1="122" x2="108" y2="122" stroke="#e6edf3" stroke-width="8" stroke-linecap="round"/>
+  <!-- worker panes: status dots -->
+  <circle cx="174" cy="81" r="14" fill="#d97757"/>
+  <circle cx="174" cy="155" r="14" fill="#58a6ff"/>
+  <!-- status bar -->
+  <rect x="36" y="204" width="184" height="16" rx="8" fill="#3fb950"/>
+</svg>

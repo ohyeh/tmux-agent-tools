@@ -27,10 +27,16 @@ if [[ -z "$changelog_version" ]]; then
 fi
 echo "latest CHANGELOG version: $changelog_version"
 
+MARKET=.claude-plugin/marketplace.json
+# Two plugins (restored split, 0.44.0): tmux-agent-tools (root: skills, gate, MCP for
+# Codex/Cursor) and tmux-agent (mods/tmux-agent: the Claude Code mod). One version line.
 for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json .cursor-plugin/plugin.json; do
-  v="$(jq -r '.version' "$manifest")"
-  assert "$manifest matches CHANGELOG" "$v" "$changelog_version"
+  assert "$manifest matches CHANGELOG" "$(jq -r '.version' "$manifest")" "$changelog_version"
+  assert "$manifest name is tmux-agent-tools" "$(jq -r '.name' "$manifest")" "tmux-agent-tools"
 done
+MOD_MANIFEST=mods/tmux-agent/.claude-plugin/plugin.json
+assert "$MOD_MANIFEST matches CHANGELOG" "$(jq -r '.version' "$MOD_MANIFEST")" "$changelog_version"
+assert "$MOD_MANIFEST name is tmux-agent" "$(jq -r '.name' "$MOD_MANIFEST")" "tmux-agent"
 
 # AGENT_TMUX_VERSION is what `--version` and `doctor` print — the offline signal
 # for multi-machine skill-copy drift. It lagged the CHANGELOG by a full release
@@ -42,24 +48,66 @@ assert "agent-tmux AGENT_TMUX_VERSION matches CHANGELOG" "$script_version" "$cha
 # marketplace.json was the hole this smoke used to have: it passed 4/4 while
 # metadata.version sat a whole release behind (0.38.0 vs 0.39.0). It is what the
 # marketplace listing shows, so a lag there is drift users can see.
-MARKET=.claude-plugin/marketplace.json
 assert "$MARKET metadata.version matches CHANGELOG" \
   "$(jq -r '.metadata.version' "$MARKET")" "$changelog_version"
-assert "$MARKET tmux-agent-tools entry matches CHANGELOG" \
-  "$(jq -r '.plugins[] | select(.name == "tmux-agent-tools") | .version' "$MARKET")" \
-  "$changelog_version"
-
-# The mod ships on its own version line (it is a separate plugin), so it is held
-# to its OWN manifest rather than to the CHANGELOG.
-assert "$MARKET tmux-agent entry matches the mod manifest" \
-  "$(jq -r '.plugins[] | select(.name == "tmux-agent") | .version' "$MARKET")" \
-  "$(jq -r '.version' mods/tmux-agent/.claude-plugin/plugin.json)"
+assert "$MARKET plugins (name=source)" \
+  "$(jq -r '[.plugins[] | .name + "=" + .source] | join(" ")' "$MARKET")" \
+  "tmux-agent-tools=./ tmux-agent=./mods/tmux-agent"
+for p in tmux-agent-tools tmux-agent; do
+  assert "$MARKET $p entry matches CHANGELOG" \
+    "$(jq -r --arg p "$p" '.plugins[] | select(.name == $p) | .version' "$MARKET")" "$changelog_version"
+done
 
 # The panel title prints MOD_VERSION so a running session shows which code it
 # loaded; a constant that lags the manifest would lie exactly when it matters.
-assert "mods/tmux-agent MOD_VERSION matches the mod manifest" \
+assert "mods/tmux-agent/hooks/register.ts MOD_VERSION matches the mod manifest" \
   "$(sed -n "s/^const MOD_VERSION = '\\(.*\\)'$/\\1/p" mods/tmux-agent/hooks/register.ts)" \
-  "$(jq -r '.version' mods/tmux-agent/.claude-plugin/plugin.json)"
+  "$(jq -r '.version' "$MOD_MANIFEST")"
+
+# The mod plugin's cache has no skills/, so it imports a copy of the core.
+if scripts/sync-mod-core --check; then core=same; else core=differs; fi
+assert "mods/tmux-agent/hooks/lib matches the core (scripts/sync-mod-core)" "$core" "same"
+
+# Finding M4/R4: release notes extraction pattern from release.yml must not swallow 0.10.x headings
+release_notes_test="$(CHANGELOG_VERSION="$changelog_version" ruby -e '
+  workflow = File.read(".github/workflows/release.yml")
+  patterns = workflow.scan(/^\s*pattern\s*=\s*(\/.+\/[a-z]*)$/).flatten
+  abort("pattern not found in release.yml") if patterns.empty?
+  version = "v" + ENV.fetch("CHANGELOG_VERSION")
+  changelog = File.read("CHANGELOG.md")
+  results = patterns.map do |pat_str|
+    pattern = eval(pat_str, binding)
+    match = changelog.match(pattern)
+    abort("missing section for pattern") unless match
+    body = match[:body].strip
+    body.include?("## 0.10.5") ? "contains_old" : "clean"
+  end
+  puts results.all? { |r| r == "clean" } ? "clean" : "contains_old"
+')"
+assert "release.yml release notes pattern does not leak old 0.10.x sections" "$release_notes_test" "clean"
+
+# The MCP bundle (plan R7.1, §1c S6) is generated and committed: a rebuild must
+# reproduce its bytes and its license notice, and its banner names the release.
+# The rebuild goes to a temp dir and is compared with cmp, so the check neither
+# edits the tree nor passes on an untracked file (git diff would).
+bundle_dir=skills/tmux-agent-tools/scripts/lib
+if [[ ! -d mcp-adapter/node_modules/esbuild ]]; then
+  echo "  FAIL esbuild missing: run npm --prefix mcp-adapter ci" >&2
+  FAIL=$((FAIL + 1))
+else
+  rebuild_dir="$(mktemp -d)"
+  node mcp-adapter/build.mjs --out "$rebuild_dir"
+  for f in mcp-server.mjs mcp-server.LICENSES.txt; do
+    if cmp -s "$rebuild_dir/$f" "$bundle_dir/$f"; then same=same; else same=differs; fi
+    assert "rebuild reproduces $bundle_dir/$f (node mcp-adapter/build.mjs)" "$same" "same"
+    if git check-ignore -q "$bundle_dir/$f"; then ignored=ignored; else ignored=committable; fi
+    assert "$bundle_dir/$f is not git-ignored" "$ignored" "committable"
+  done
+  rm -rf "$rebuild_dir"
+fi
+assert "$bundle_dir/mcp-server.mjs banner version matches CHANGELOG" \
+  "$(sed -n '1s|^// tmux-agent-mcp v\([0-9.]*\)\. .*|\1|p' "$bundle_dir/mcp-server.mjs")" \
+  "$changelog_version"
 
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

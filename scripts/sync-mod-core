@@ -1,0 +1,33 @@
+#!/usr/bin/env zsh
+# The tmux-agent mod is its own plugin (source ./mods/tmux-agent), and a plugin
+# cache holds only its source dir, so the mod cannot import the core from
+# skills/. It imports a byte-identical copy from mods/tmux-agent/hooks/lib/.
+# This script writes that copy; test-version-sync-smoke fails when it drifts.
+# Edit the core under skills/tmux-agent-tools/scripts/lib/, then run this.
+#
+# Usage: scripts/sync-mod-core [--check]   (--check: exit 1 on drift, write nothing)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
+SRC=skills/tmux-agent-tools/scripts/lib
+DST=mods/tmux-agent/hooks/lib
+# The mod's import closure: workers.ts -> width.ts, ledger.ts; width.ts -> eaw-table.ts.
+FILES=(workers.ts width.ts eaw-table.ts ledger.ts)
+
+if [[ "${1:-}" == --check ]]; then
+  drift=0
+  for f in $FILES; do
+    cmp -s "$SRC/$f" "$DST/$f" || { echo "$DST/$f differs from $SRC/$f" >&2; drift=1; }
+  done
+  present=("$DST"/*(ND:t))   # D: a hidden extra file counts too
+  extra=(${present:|FILES})
+  (( ${#extra} )) && { echo "$DST has files outside the core set: ${extra[*]}" >&2; drift=1; }
+  exit $drift
+fi
+
+mkdir -p "$DST"
+for f in $FILES; do cp "$SRC/$f" "$DST/$f"; done
+echo "synced ${#FILES} core files into $DST"

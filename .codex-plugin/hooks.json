@@ -1,0 +1,4 @@
+{
+  "description": "No codex hooks: the Bash dispatch gate and the function-hook module in hooks/hooks.json are Claude Code only.",
+  "hooks": {}
+}

@@ -1,0 +1,70 @@
+{
+  "single_entries": [
+    {
+      "name": "secw",
+      "profile": "codex",
+      "elapsed": "45s",
+      "mark": "▶",
+      "expected": "secw codex 45s ▶"
+    },
+    {
+      "name": "run1",
+      "profile": "codex",
+      "elapsed": "12m",
+      "mark": "▶",
+      "expected": "run1 codex 12m ▶"
+    },
+    {
+      "name": "ok1",
+      "profile": "codex",
+      "elapsed": "3h",
+      "mark": "✓ success",
+      "expected": "ok1 codex 3h ✓ success"
+    },
+    {
+      "name": "bad1",
+      "profile": "agy",
+      "elapsed": "5h",
+      "mark": "✗ failed",
+      "expected": "bad1 agy 5h ✗ failed"
+    },
+    {
+      "name": "newD",
+      "profile": "codex",
+      "elapsed": "4h",
+      "mark": "✓ delivered",
+      "expected": "newD codex 4h ✓ delivered"
+    }
+  ],
+  "full_panel": {
+    "description": "Active sorted newest-first, then up to 3 delivered newest-first, 4th delivered excluded",
+    "entries": [
+      "secw codex 45s ▶",
+      "run1 codex 12m ▶",
+      "ok1 codex 3h ✓ success",
+      "bad1 agy 5h ✗ failed",
+      "newD codex 4h ✓ delivered",
+      "midB codex 6h ✓ delivered",
+      "midA codex 8h ✓ delivered"
+    ],
+    "expected_line": "secw codex 45s ▶ run1 codex 12m ▶ ok1 codex 3h ✓ success bad1 agy 5h ✗ failed newD codex 4h ✓ delivered midB codex 6h ✓ delivered midA codex 8h ✓ delivered"
+  },
+  "width_truncation": [
+    {
+      "width": 29,
+      "entries": ["aaaa zz 9h ▶", "bbbb zz 9h ▶", "cccc zz 9h ▶", "dddd zz 9h ▶"],
+      "expected": "aaaa zz 9h ▶ bbbb zz 9h ▶ +2 more"
+    },
+    {
+      "width": 25,
+      "entries": ["aaaa zz 9h ▶", "bbbb zz 9h ▶", "cccc zz 9h ▶", "dddd zz 9h ▶"],
+      "expected": "aaaa zz 9h ▶ +3 more"
+    },
+    {
+      "width": 1,
+      "entries": ["aaaa zz 9h ▶", "bbbb zz 9h ▶", "cccc zz 9h ▶", "dddd zz 9h ▶"],
+      "expected": "+4 more"
+    }
+  ],
+  "empty": "tmux-agent: no workers"
+}

@@ -6,14 +6,13 @@ repo_root="${script_dir:h}"
 # Smokes still exercise the deprecated per-CLI shims until their v0.39 removal;
 # silence the shim deprecation warning so it doesn't pollute captured output.
 export AGENT_TMUX_SUPPRESS_DEPRECATION=1
-# The smokes run on a tmux server of their own. On the operator's server they
-# opened 100+ sessions (claude-cli-live-claude, claude-cli-a-claude-a, …) next
-# to real workers: a name that matched was killed, and leftovers showed up in
-# the /tmux panel (live 2026-09-25). $TMUX, set inside a tmux pane, would
-# outrank TMUX_TMPDIR, so it goes too.
-unset TMUX
-export TMUX_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/tas-tmux.XXXXXX")"
-trap 'tmux kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+"$script_dir/check-tmux-socket-isolation" || exit 1
+
+unset TMUX TMUX_PANE
+export TMUX_TMPDIR="$(mktemp -d /tmp/tas-main.XXXXXX)"
+scratch_dir="$(mktemp -d /tmp/tas-scratch.XXXXXX)"
+trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR" "$scratch_dir"' EXIT
+
 timeout_seconds=240
 kill_after_seconds=15
 
@@ -51,71 +50,119 @@ if (( ${#test_files[@]} == 0 )); then
   exit 2
 fi
 
-typeset -a result_names result_labels result_codes result_durations result_attempts
-typeset -i attempt_exit_code=0
-typeset -i attempt_duration=0
-
 is_timeout_code() {
   local exit_code="$1"
   [[ "$exit_code" == "124" || "$exit_code" == "137" ]]
 }
 
-run_attempt() {
-  local test_file="$1"
-  local started_at ended_at
-
-  started_at="$(date +%s)"
-  "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file"
-  attempt_exit_code=$?
-  ended_at="$(date +%s)"
-  attempt_duration=$(( ended_at - started_at ))
-}
+PARALLEL_JOBS="${PARALLEL_JOBS:-4}"
+if (( PARALLEL_JOBS < 1 )); then
+  PARALLEL_JOBS=1
+fi
 
 cd "$repo_root" || exit 1
 
-overall_failed=0
+run_job() {
+  local test_file="$1"
+  local test_name="${test_file:t}"
+  local out_file="$2"
+  local meta_file="$3"
+  local job_dir="$4"
+
+  local started_at ended_at duration code label
+  started_at="$(date +%s)"
+
+  (
+    unset TMUX TMUX_PANE
+    export TMUX_TMPDIR="$job_dir"
+    local socket="$job_dir/tmux-$(id -u)/default"
+    mkdir -p -m 0700 "${socket:h}"
+    trap 'env -u TMUX -u TMUX_PANE tmux -S "$socket" kill-server 2>/dev/null; rm -rf "$job_dir"' EXIT
+    "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file" < /dev/null
+  ) > "$out_file" 2>&1
+  code=$?
+  ended_at="$(date +%s)"
+  duration=$(( ended_at - started_at ))
+
+  if (( code == 0 )); then
+    label="PASS"
+  elif is_timeout_code "$code"; then
+    label="TIMEOUT"
+  else
+    label="FAIL"
+  fi
+
+  printf '%s\t%s\t%d\t%d\t1\n' "$test_name" "$label" "$code" "$duration" > "$meta_file"
+}
+
+typeset -a pids=() job_dirs=()
+typeset -i active_jobs=0
+
+wait_for_slot() {
+  while (( active_jobs >= PARALLEL_JOBS )); do
+    for p in "${pids[@]}"; do
+      if ! kill -0 "$p" 2>/dev/null; then
+        wait "$p" 2>/dev/null || true
+        pids=(${pids:#$p})
+        active_jobs=$(( active_jobs - 1 ))
+        return 0
+      fi
+    done
+    sleep 0.05
+  done
+}
 
 for test_file in "${test_files[@]}"; do
   test_name="${test_file:t}"
-  echo
-  echo "==> $test_name (attempt 1)"
-  run_attempt "$test_file"
-  first_code=$attempt_exit_code
-  total_duration=$attempt_duration
+  out_file="$scratch_dir/${test_name}.out"
+  meta_file="$scratch_dir/${test_name}.meta"
+  job_dir="$(mktemp -d /tmp/tas-job.XXXXXX)"
+  job_dirs+=("$job_dir")
 
-  if (( first_code == 0 )); then
-    result_label="PASS"
-    final_code=0
-    attempts=1
+  wait_for_slot
+
+  run_job "$test_file" "$out_file" "$meta_file" "$job_dir" &
+  pids+=($!)
+  active_jobs=$(( active_jobs + 1 ))
+done
+
+for p in "${pids[@]}"; do
+  wait "$p" 2>/dev/null || true
+done
+
+typeset -a result_names=() result_labels=() result_codes=() result_durations=() result_attempts=()
+typeset -i overall_failed=0
+
+for test_file in "${test_files[@]}"; do
+  test_name="${test_file:t}"
+  meta_file="$scratch_dir/${test_name}.meta"
+  out_file="$scratch_dir/${test_name}.out"
+
+  if [[ -f "$meta_file" ]]; then
+    IFS=$'\t' read -r m_name m_label m_code m_duration m_attempts < "$meta_file"
   else
-    if is_timeout_code "$first_code"; then
-      echo "retry: $test_name timed out with exit $first_code"
-    else
-      echo "retry: $test_name failed with exit $first_code"
-    fi
-    echo
-    echo "==> $test_name (attempt 2)"
-    run_attempt "$test_file"
-    final_code=$attempt_exit_code
-    total_duration=$(( total_duration + attempt_duration ))
-    attempts=2
-
-    if (( final_code == 0 )); then
-      result_label="FLAKY-PASS"
-    elif is_timeout_code "$final_code"; then
-      result_label="TIMEOUT"
-      overall_failed=1
-    else
-      result_label="FAIL"
-      overall_failed=1
-    fi
+    m_name="$test_name"
+    m_label="FAIL"
+    m_code=1
+    m_duration=0
+    m_attempts=1
   fi
 
-  result_names+=("$test_name")
-  result_labels+=("$result_label")
-  result_codes+=("$final_code")
-  result_durations+=("$total_duration")
-  result_attempts+=("$attempts")
+  echo
+  echo "==> $test_name (attempt 1)"
+  if [[ -f "$out_file" ]]; then
+    cat "$out_file"
+  fi
+
+  result_names+=("$m_name")
+  result_labels+=("$m_label")
+  result_codes+=("$m_code")
+  result_durations+=("$m_duration")
+  result_attempts+=("$m_attempts")
+
+  if (( m_code != 0 )); then
+    overall_failed=1
+  fi
 done
 
 echo

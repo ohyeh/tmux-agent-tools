@@ -1,4 +1,4 @@
 {
-  "description": "Adds $.tmux and an assign tool over agent-tmux; the collector session reconciles result.json on a clock and wakes the session when a worker finishes.",
+  "description": "The tmux-agent function-hook module: $.tmux, the assign/tell/stop/peek/keys tools, the /workers panel and the result.json collector.",
   "modules": ["./register.ts"]
 }

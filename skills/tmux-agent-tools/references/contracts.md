@@ -140,7 +140,7 @@ Exit codes from `wait-and-capture --pause-until-file`:
 
 ## Concurrency model
 
-- **Single caller per agent name.** Two `start --exact same-name` kills the first session.
+- **Single caller per agent name.** A second `start --exact same-name` while the first session is live exits 1 and leaves the first untouched. A start of a name whose session is gone moves the earlier `result.json` and `stdout.log` into `<name>/legacy-<UTC time>-<pid>/`, never deletes them.
 - Wrapper state under `$TMUX_AGENT_DIR/<name>/` (`started_at`, `marker_seen`, `transcript-path`, etc.) is NOT lock-protected today. Do not share one agent name across two orchestrators.
 - Do not run concurrent waits against the same agent. For many agents, use one `watch --any|--all --timeout <s> --json` call; for one agent, use one bounded `result --wait`, `send-wait`, or `wait-and-capture`.
 - The `marker_seen` FIFO is capped at 100 entries — oldest evicted first.

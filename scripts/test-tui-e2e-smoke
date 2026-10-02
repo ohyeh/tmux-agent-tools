@@ -1,0 +1,357 @@
+#!/usr/bin/env zsh
+# End-to-end smoke of the real TUI (plan R4): `tmux-agent-tui` in a pane of a
+# private tmux server, over a real ledger whose two workers are real tmux
+# sessions (a fake CLI, as the assign smokes use), driven with `send-keys` and
+# read back with `capture-pane`. Checks: header key hints; j/k selection; Enter
+# detail with the whole summary; a CJK summary never wraps (no line past the
+# width, `capture-pane -J`); r refresh; resize to 80x24 and 40x10; t tell reaches
+# the worker and its result shows; a real paste (`paste-buffer -p`) of x, q, qx
+# is text, not keys; x (twice) stops a worker; a viewer (no
+# --session) pressing x - U t c + n changes nothing on disk; R8.5: a resumed worker with a dead
+# pane reads exited, an unacknowledged delivery reads unknown: 可能已送達 and force-closes by - or CLI --force; q exits and the
+# pane's stty is unchanged; an unterminated paste (`send-keys -H` of ESC[200~abc)
+# then Ctrl-C exits and `stty -a` is unchanged (Sol-r2#N2). Bounded polls only;
+# the whole smoke has a deadline.
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
+SCRIPTS="$REPO_ROOT/skills/tmux-agent-tools/scripts"
+LIB="$SCRIPTS/lib"
+NODE_BIN="${NODE:-$(command -v node)}"
+REAL_TMUX="$(command -v tmux)"
+DEADLINE=$(( SECONDS + ${TUI_E2E_TIMEOUT:-200} ))
+
+# Short path: a macOS socket path tops out near 104 bytes.
+WORK="$(mktemp -d /tmp/tui-e2e.XXXXXX)"
+export TMUX_TMPDIR="$WORK/t"
+mkdir -p "$TMUX_TMPDIR" "$WORK/bin" "$WORK/repo" "$WORK/zdot"
+export TMUX_AGENT_DIR="$WORK/state"
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
+export AGENT_TMUX_SUPPRESS_DEPRECATION=1
+export ZDOTDIR="$WORK/zdot"   # ~/.zshenv would put another agent-tmux first on PATH
+unset TMUX TMUX_PANE TMUX_AGENT_SESSION TMUX_AGENT_TMUX_SOCKET
+# The private server is tmux's default socket under TMUX_TMPDIR: agent-tmux and
+# the TUI reach it without -S. `-L e2e` names it apart from any other default.
+T() { command "$REAL_TMUX" -L e2e "$@"; }
+cat > "$WORK/bin/tmux" <<EOF
+#!/bin/sh
+for a in "\$@"; do case "\$a" in -S|-L) exec ${(q)REAL_TMUX} "\$@" ;; esac; done
+exec ${(q)REAL_TMUX} -L e2e "\$@"
+EOF
+chmod +x "$WORK/bin/tmux"
+export PATH="$WORK/bin:$SCRIPTS:${NODE_BIN:h}:/usr/bin:/bin:/usr/sbin:/sbin"
+cleanup() {
+  T kill-server 2>/dev/null || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+PASS=0
+FAIL=0
+ok() { print -r -- "  ok   $1"; PASS=$((PASS + 1)); }
+bad() { print -r -- "  FAIL $1"; FAIL=$((FAIL + 1)); }
+check() { local label="$1"; shift; if "$@"; then ok "$label"; else bad "$label"; fi; }
+left() { (( SECONDS < DEADLINE )) || { bad "smoke deadline passed"; echo "$PASS passed, $FAIL failed"; exit 1; }; }
+
+# The pane, joined: a wrapped line comes back as one line, so overflow shows.
+screen() { T capture-pane -p -J -t "$1"; }
+# Poll the pane until it matches (grep -E), within a bound.
+wait_for() {
+  local pane="$1" pattern="$2" tries="${3:-100}"
+  for _ in {1..$tries}; do
+    left
+    screen "$pane" | grep -Eq -- "$pattern" && return 0
+    /bin/sleep 0.2
+  done
+  { print -r -- "--- $pane, waiting for: $pattern"; screen "$pane" | sed '/^ *$/d'; } >&2
+  return 1
+}
+keys() { T send-keys -t "$1" "${@:2}"; }
+# Display cells of the widest line (the TUI's own width function; tmux draws `·`
+# as 1 cell). A line over the limit is printed to stderr.
+widest() {
+  screen "$1" | TMUX_AGENT_AMBIGUOUS_WIDTH=1 "$NODE_BIN" --input-type=module -e "
+    const { cellWidth } = await import('$LIB/tui.node.ts')
+    const { readFileSync } = await import('node:fs')
+    const lines = readFileSync(0, 'utf8').split('\\n').map(l => l.replace(/ +\$/, ''))
+    for (const l of lines) if (cellWidth(l) > $2) console.error('over $2: ' + cellWidth(l) + ' [' + l + ']')
+    console.log(Math.max(0, ...lines.map(cellWidth)))" || echo 9999
+}
+# Paths, sizes, mtimes and content hashes under the state root.
+tree() {
+  "$NODE_BIN" -e "
+    const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto')
+    const out = []
+    const walk = p => { for (const e of fs.readdirSync(p, { withFileTypes: true })) {
+      const f = path.join(p, e.name), st = fs.statSync(f)
+      out.push(f + ' ' + st.mtimeMs + (e.isDirectory() ? '/' : ' ' + crypto.createHash('sha1').update(fs.readFileSync(f)).digest('hex')))
+      if (e.isDirectory()) walk(f) } }
+    walk(process.argv[1]); console.log(out.sort().join('\n'))" "$TMUX_AGENT_DIR"
+}
+
+# ---- fixtures: a fake CLI and two real workers ------------------------------
+# e2ecli shows a prompt, ticks (the pane keeps changing, so assign confirms it),
+# and writes the result the brief asks for: a long CJK summary for a brief, a
+# short one naming E2E-TELL-DONE for a tell.
+cat > "$WORK/bin/e2ecli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "e2ecli 1.0"; exit 0; }
+echo "› Write a prompt"
+( i=0; while :; do i=$((i+1)); echo "tick $i"; sleep 1; done ) &
+trap 'kill $! 2>/dev/null' EXIT
+path=""; ep=""
+write() {
+  printf '{"schema_version":1,"status":"success","episode":%s,"summary":"%s"}\n' "$ep" "$1" > "$path.tmp" && mv "$path.tmp" "$path"
+  path=""; ep=""
+}
+while IFS= read -r line; do
+  echo "got:${line:0:40}"
+  case "$line" in
+    *"Write final JSON to this exact path: "*) path="${line##*exact path: }" ;;
+    *"Also include episode: the number "*) ep="${line##*the number }"; ep="${ep%% *}" ;;
+  esac
+  [ -n "$path" ] && [ -n "$ep" ] || continue
+  case "$line" in
+    *E2E-TELL*) write "已收到追話 E2E-TELL-DONE" ;;
+    *REPORT:*)
+      long="開始"; for _ in $(seq 1 120); do long="${long}中文摘要寬度測試，"; done
+      write "${long}E2E-LONG-END" ;;
+  esac
+done
+EOF
+chmod +x "$WORK/bin/e2ecli"
+printf 'GOAL: e2e worker\nACCEPTANCE: write the result\nREPORT: one line\n' > "$WORK/brief.md"
+
+SESSION="e2e-owner"
+cli() { "$NODE_BIN" "$LIB/workers.cli.node.ts" "$@" --session "$SESSION" --cwd "$WORK/repo"; }
+T new-session -d -s base -x 120 -y 40 "sleep 600"
+
+echo "case: two real workers from the core assign"
+cli assign e2ecli wa "$WORK/repo" "$WORK/brief.md" > "$WORK/assign-a.out"
+cli assign e2ecli wb "$WORK/repo" "$WORK/brief.md" > "$WORK/assign-b.out"
+A="$(cd "$TMUX_AGENT_DIR/.v3" && print -r -- wa.*(N))"
+B="$(cd "$TMUX_AGENT_DIR/.v3" && print -r -- wb.*(N))"
+check "both workers are in the ledger ($A, $B)" test -n "$A" -a -n "$B"
+# `result init` leaves a `pending` placeholder first; wait for the worker's own.
+for w in "$A" "$B"; do
+  for _ in {1..150}; do left; grep -q '"success"' "$TMUX_AGENT_DIR/.v3/$w/result.json" 2>/dev/null && break; /bin/sleep 0.2; done
+done
+check "worker A wrote its result" grep -q '"success"' "$TMUX_AGENT_DIR/.v3/$A/result.json"
+check "worker B wrote its result" grep -q '"success"' "$TMUX_AGENT_DIR/.v3/$B/result.json"
+check "worker A is a live tmux session" sh -c "agent-tmux e2ecli status --json '$A' | grep -q '\"exists\": *true'"
+
+# ---- owner TUI ----------------------------------------------------------------
+RUN="$WORK/run-tui"
+cat > "$RUN" <<EOF
+#!/bin/zsh -f
+stty -g > ${(q)WORK}/stty.\$1.before
+stty -a > ${(q)WORK}/stty-a.\$1.before
+if [[ "\$1" == owner ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
+else tmux-agent-tui --cwd ${(q)WORK}/repo; fi
+echo "TUI_EXIT=\$?"
+stty -a > ${(q)WORK}/stty-a.\$1.after
+stty -g > ${(q)WORK}/stty.\$1.after
+exec sleep 600
+EOF
+chmod +x "$RUN"
+T new-session -d -s tui -x 120 -y 40 "$RUN owner"
+P="=tui:"
+
+echo "case: header hints, rows, health"
+check "the TUI drew both workers" wait_for "$P" "$B"
+check "header key hints" wait_for "$P" '\[ n resume \] \[ \+ assign \] \[ r refresh \] \[ c clear \] \[ q quit \]' 5
+check "health line: no collector for this session" wait_for "$P" '收件：無收件者' 5
+
+echo "case: j/k selection"
+keys "$P" j
+check "j selects the first row" wait_for "$P" '^1: .*› ' 25
+first="$(screen "$P" | grep -E '^1: ' | grep -oE 'w[ab]\.[a-z0-9]{5}' | head -1)"
+keys "$P" j
+check "j moves to the second row" wait_for "$P" '^2: .*› ' 25
+keys "$P" k
+check "k moves back to the first row" wait_for "$P" '^1: .*› ' 25
+check "the selected row shows its key hints" wait_for "$P" '\[ t tell \].*\[ x stop \].*\[ - cancel \].*\[ U unlock \]' 10
+# Put A under the cursor for the detail.
+[[ "$first" == "$A" ]] || keys "$P" j
+check "A is selected" wait_for "$P" "› $A" 25
+
+echo "case: Enter shows the whole summary"
+keys "$P" Enter
+check "the detail view opens" wait_for "$P" 'detail 1–[0-9]+ of [0-9]+' 25
+check "row and result state are apart" wait_for "$P" 'result: success' 5
+for _ in {1..40}; do
+  screen "$P" | grep -q 'E2E-LONG-END' && break
+  keys "$P" NPage
+  wait_for "$P" 'detail' 5 >/dev/null || true
+done
+check "PgDn reaches the end of the summary" wait_for "$P" 'E2E-LONG-END' 10
+check "no line past 120 cells with the CJK detail" test "$(widest "$P" 120)" -le 120
+keys "$P" Enter
+
+echo "case: r refresh"
+keys "$P" r
+check "r clears the selection" sh -c "for i in \$(seq 1 25); do tmux capture-pane -p -t '$P' | grep -q '›' || exit 0; sleep 0.2; done; exit 1"
+
+echo "case: resize re-lays out"
+for size in "80 24" "40 10"; do
+  w="${size% *}"; h="${size#* }"
+  T resize-window -t "$P" -x "$w" -y "$h"
+  keys "$P" j
+  check "${w}x${h}: a selected row is drawn" wait_for "$P" '› w[ab]\.' 25
+  # SIGWINCH reaches the TUI asynchronously: poll for the re-laid-out frame.
+  fits=no
+  for _ in {1..25}; do left; (( $(widest "$P" 9999) <= w )) && { fits=yes; break; }; /bin/sleep 0.2; done
+  [[ "$fits" == yes ]] || widest "$P" "$w" >/dev/null
+  check "${w}x${h}: no line past the width" test "$fits" = yes
+  check "${w}x${h}: at most $h lines" test "$(screen "$P" | wc -l | tr -d ' ')" -le "$h"
+  keys "$P" Escape
+done
+T resize-window -t "$P" -x 120 -y 40
+
+echo "case: t tell reaches the worker and its result shows"
+keys "$P" r
+for _ in {1..4}; do screen "$P" | grep -q "› $B" && break; keys "$P" j; /bin/sleep 0.2; done
+check "B is selected" wait_for "$P" "› $B" 25
+keys "$P" t
+check "the tell input opens" wait_for "$P" "t tell $B: " 25
+keys "$P" -l "E2E-TELL please"
+keys "$P" Enter
+check "the tell was sent" wait_for "$P" "tell $B — ok: sent to" 75
+check "the tell's result reaches the row" wait_for "$P" 'E2E-TELL-DONE' 150
+check "episode 2 result on disk" sh -c "grep -q E2E-TELL-DONE '$TMUX_AGENT_DIR'/.v3/'$B'/episodes/2/result.json"
+
+echo "case: a real paste is text, not keys (bracketed paste, Sol#7)"
+# paste-buffer -p brackets the paste only when the TUI turned on mode 2004.
+paste() { print -rn -- "$2" > "$WORK/paste.txt"; T load-buffer -b e2e "$WORK/paste.txt"; T paste-buffer -p -b e2e -t "$1"; }
+for _ in {1..4}; do screen "$P" | grep -q "› $A" && break; keys "$P" j; /bin/sleep 0.2; done
+check "A is selected for the paste" wait_for "$P" "› $A" 25
+paste "$P" x
+/bin/sleep 1
+check "a pasted x does not arm the stop" sh -c "! tmux capture-pane -p -t '$P' | grep -q 'press again'"
+paste "$P" q
+/bin/sleep 1
+check "a pasted q does not quit" sh -c "! tmux capture-pane -p -t '$P' | grep -q 'TUI_EXIT'"
+keys "$P" n
+check "the resume prompt opens" wait_for "$P" '<session-id>' 25
+paste "$P" qx
+check "a pasted qx is prompt text" wait_for "$P" ': qx█' 25
+keys "$P" Escape
+check "Escape closes the prompt" sh -c "for i in \$(seq 1 25); do tmux capture-pane -p -t '$P' | grep -q '<session-id>' || exit 0; sleep 0.2; done; exit 1"
+
+echo "case: x twice stops a worker (owner)"
+for _ in {1..4}; do screen "$P" | grep -q "› $A" && break; keys "$P" j; /bin/sleep 0.2; done
+check "A is selected again" wait_for "$P" "› $A" 25
+keys "$P" x
+check "x arms the stop" wait_for "$P" "stop $A\\? press again" 25
+/bin/sleep 0.5 # the confirm debounce (STOP_REPEAT_MS = 400) is a rule, not a race
+keys "$P" x
+check "the stop ran" wait_for "$P" "stop $A — ok" 100
+stopped=no
+for _ in {1..50}; do
+  left
+  agent-tmux e2ecli status --json "$A" 2>/dev/null | grep -q '"exists": *true' || { stopped=yes; break; }
+  /bin/sleep 0.2
+done
+check "A's tmux session is gone" test "$stopped" = yes
+
+echo "case: q exits and the pane's stty is unchanged"
+keys "$P" q
+check "the TUI exited 0" wait_for "$P" 'TUI_EXIT=0' 50
+for _ in {1..25}; do [[ -s "$WORK/stty.owner.after" ]] && break; /bin/sleep 0.2; done
+check "stty after == stty before" cmp -s "$WORK/stty.owner.before" "$WORK/stty.owner.after"
+
+echo "case: a viewer's mutating keys change nothing"
+T new-session -d -s view -x 120 -y 40 "$RUN viewer"
+V="=view:"
+check "the viewer drew B" wait_for "$V" "$B"
+check "the viewer says read-only" wait_for "$V" 'viewer — no session; 唯讀；帶 --session 才能操作' 5
+tree > "$WORK/tree.before"
+T list-sessions -F '#S' | sort > "$WORK/ls.before"
+keys "$V" j
+check "the viewer can select" wait_for "$V" '› w[ab]\.' 25
+for k in x x - - U U t + n c c; do
+  keys "$V" "$k"
+  /bin/sleep 0.45 # past the confirm debounce, so a second press would confirm
+done
+check "the viewer shows 唯讀 for those keys" wait_for "$V" 'tmux-agent: 唯讀；帶 --session 才能操作' 10
+check "no input line opened" sh -c "! tmux capture-pane -p -t '$V' | grep -Eq '(t tell|\\+ assign|n resume) .*: █'"
+tree > "$WORK/tree.after"
+T list-sessions -F '#S' | sort > "$WORK/ls.after"
+check "the state root is unchanged (paths, mtimes, contents)" cmp -s "$WORK/tree.before" "$WORK/tree.after"
+check "the tmux sessions are unchanged" cmp -s "$WORK/ls.before" "$WORK/ls.after"
+keys "$V" q
+check "the viewer exited 0" wait_for "$V" 'TUI_EXIT=0' 50
+for _ in {1..25}; do [[ -s "$WORK/stty.viewer.after" ]] && break; /bin/sleep 0.2; done
+check "viewer: stty after == stty before" cmp -s "$WORK/stty.viewer.before" "$WORK/stty.viewer.after"
+
+echo "case: an unterminated paste then Ctrl-C exits; stty -a is unchanged (Sol-r2#N2)"
+T new-session -d -s ctrlc -x 120 -y 40 "$RUN ctrlc"
+CC="=ctrlc:"
+check "the Ctrl-C TUI drew B" wait_for "$CC" "$B"
+T send-keys -t "$CC" -H 1b 5b 32 30 30 7e 61 62 63 # ESC[200~abc, no ESC[201~
+/bin/sleep 0.3
+T send-keys -t "$CC" -H 03
+check "Ctrl-C in an open paste exits the TUI" wait_for "$CC" 'TUI_EXIT=0' 50
+for _ in {1..25}; do [[ -s "$WORK/stty.ctrlc.after" ]] && break; /bin/sleep 0.2; done
+check "Ctrl-C: stty -a after == stty -a before" cmp -s "$WORK/stty-a.ctrlc.before" "$WORK/stty-a.ctrlc.after"
+
+echo "case: R8.5 a dead resumed pane and an incomplete reservation (TUI wording, force-close by TUI and CLI)"
+# Hand-made ledger rows: `rz` is a resumed worker with no pane (never a tmux session);
+# `rc` and `rd` have an open episode whose `delivering` marker belongs to activation 1 of
+# session `ghost`, which restarted as activation 2 (superseded): the delivery was never acknowledged.
+"$NODE_BIN" -e "
+  const fs = require('node:fs'), path = require('node:path')
+  const v3 = path.join(process.argv[1], '.v3'), repo = process.argv[2]
+  const worker = (name, origin, episode) => {
+    const w = path.join(v3, name); fs.mkdirSync(w, { recursive: true })
+    fs.writeFileSync(path.join(w, 'worker.json'), JSON.stringify({ profile: 'e2ecli', name, dir: repo, since: Date.now() - 60000, owner: '$SESSION', ownerCwd: repo, origin }))
+    if (!episode) return
+    const ep = path.join(w, 'episodes', '1'); fs.mkdirSync(path.join(ep, 'sent'), { recursive: true })
+    fs.writeFileSync(path.join(ep, 'dispatch.json'), JSON.stringify({ seq: 1, since: Date.now() - 60000, owner: '$SESSION', resultPath: path.join(w, 'result.json'), origin: 'tell' }))
+    fs.writeFileSync(path.join(ep, 'delivering'), JSON.stringify({ token: 'old', activation: 1, session: 'ghost', at: 1 }))
+  }
+  worker('rz.abcde', 'resume', false); worker('rc.abcde', 'assign', true); worker('rd.abcde', 'assign', true)
+  const hex = [...Buffer.from('ghost')].map(b => b.toString(16).padStart(2, '0')).join('')
+  fs.mkdirSync(path.join(v3, '.sessions', hex, 'act', '1'), { recursive: true })
+  fs.mkdirSync(path.join(v3, '.sessions', hex, 'act', '2'), { recursive: true })
+  for (const n of [1, 2]) fs.writeFileSync(path.join(v3, '.sessions', hex, 'act', n + '.json'), JSON.stringify({ pid: 1, pidStart: 'x', host: 'h', token: 't' }))
+" "$TMUX_AGENT_DIR" "$WORK/repo"
+RC="$TMUX_AGENT_DIR/.v3/rc.abcde/episodes/1"
+RD="$TMUX_AGENT_DIR/.v3/rd.abcde/episodes/1"
+T new-session -d -s res -x 140 -y 40 "$RUN owner"
+R="=res:"
+check "the TUI draws the resumed worker whose pane is gone as exited" wait_for "$R" 'rz\.abcde.*exited — no result' 50
+# Walk the selection to rc: the row's own line says unknown: 可能已送達.
+for _ in {1..8}; do screen "$R" | grep -q '› rc\.abcde' && break; keys "$R" j; /bin/sleep 0.3; done
+check "rc is selected" wait_for "$R" '› rc\.abcde' 25
+check "the incomplete reservation reads unknown: 可能已送達" wait_for "$R" 'rc\.abcde.*unknown: 可能已送達' 25
+check "the key hint offers force-close" wait_for "$R" '\[ - force-close \]' 25
+for _ in {1..8}; do screen "$R" | grep -q '› rz\.abcde' && break; keys "$R" j; /bin/sleep 0.3; done
+check "rz selected: its summary says the pane is gone" wait_for "$R" 'resumed worker: its pane is gone' 25
+for _ in {1..8}; do screen "$R" | grep -q '› rc\.abcde' && break; keys "$R" j; /bin/sleep 0.3; done
+check "rc is selected again" wait_for "$R" '› rc\.abcde' 25
+keys "$R" -
+check "- arms the force-close" wait_for "$R" 'force-close episode 1\? press again' 25
+/bin/sleep 0.5
+keys "$R" -
+check "force-close ran" wait_for "$R" 'cancel rc\.abcde — ok: force-closed episode 1' 50
+check "force-close text keeps 可能已送達" wait_for "$R" 'force-closed episode 1 of .*: unknown: 可能已送達' 10
+check "only acks/cancel was added to rc" test "$(ls $RC/acks)" = cancel
+# The same core call by CLI: refuses without --force, closes with it.
+cli cancel rd.abcde 1 > "$WORK/cancel-plain.out" || true
+check "CLI without --force: unknown: 可能已送達, nothing closed" sh -c "grep -q 'unknown: 可能已送達' '$WORK/cancel-plain.out' && test ! -e '$RD/acks/cancel'"
+"$NODE_BIN" "$LIB/workers.cli.node.ts" cancel rd.abcde 1 --force --cwd "$WORK/repo" > "$WORK/cancel-noses.out" 2>&1 || true
+check "CLI without --session cannot force-close" sh -c "test ! -e '$RD/acks/cancel'"
+cli cancel rd.abcde 1 --force > "$WORK/cancel-force.out"
+check "CLI --force closes it and says 可能已送達" sh -c "grep -q 'force-closed episode 1' '$WORK/cancel-force.out' && grep -q '可能已送達' '$WORK/cancel-force.out' && test \"\$(ls $RD/acks)\" = cancel"
+sleep 1
+"$NODE_BIN" "$LIB/workers.cli.node.ts" rows --session "$SESSION" --cwd "$WORK/repo" > "$WORK/rows.json"
+check "a later reconcile does not deliver it: no done ack, no marker rewrite" sh -c "test ! -e '$RC/acks/done' && test ! -e '$RD/acks/done'"
+keys "$R" q
+check "the R8.5 TUI exited 0" wait_for "$R" 'TUI_EXIT=0' 50
+
+(( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; echo "--- tree diff"; diff "$WORK/tree.before" "$WORK/tree.after" 2>/dev/null | head -20 || true; }
+echo
+echo "$PASS passed, $FAIL failed"
+(( FAIL == 0 ))

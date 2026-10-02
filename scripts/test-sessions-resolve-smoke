@@ -25,6 +25,15 @@ mkdir -p "$TMUX_AGENT_DIR"
 cat > "$TMUX" <<'EOF'
 #!/usr/bin/env zsh
 set -euo pipefail
+# session_target sends =name: ; real tmux treats that as the exact session name.
+target_session() {
+  local s="${1:-}"
+  if [[ "${s[1]}" == "=" && "${s[-1]}" == ":" ]]; then
+    s="${s#=}"
+    s="${s%:}"
+  fi
+  printf '%s' "$s"
+}
 cmd="${1:-}"
 case "$cmd" in
   ls)
@@ -33,7 +42,7 @@ case "$cmd" in
   has-session)
     shift
     [[ "${1:-}" == "-t" ]] && shift
-    session="${1:-}"
+    session="$(target_session "${1:-}")"
     cut -d: -f1 "$FAKE_TMUX_LS" | grep -Fxq "$session"
     ;;
   capture-pane)
@@ -42,7 +51,7 @@ case "$cmd" in
       case "$1" in
         -t)
           shift
-          session="${1:-}"
+          session="$(target_session "${1:-}")"
           ;;
       esac
       shift || true
@@ -56,7 +65,7 @@ case "$cmd" in
       case "$1" in
         -t)
           shift
-          session="${1:-}"
+          session="$(target_session "${1:-}")"
           ;;
       esac
       shift || true
@@ -66,7 +75,7 @@ case "$cmd" in
   kill-session)
     shift
     [[ "${1:-}" == "-t" ]] && shift
-    printf '%s\n' "${1:-}" >> "$FAKE_TMUX_KILLS"
+    printf '%s\n' "$(target_session "${1:-}")" >> "$FAKE_TMUX_KILLS"
     ;;
   *)
     echo "fake tmux unsupported: $*" >&2

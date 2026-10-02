@@ -109,6 +109,8 @@ assert "usage_init carries launch_id" \
   "$(jq -r .launch_id "$lm")"
 
 echo "case: same-name restart appends a second init with a distinct launch_id"
+# A live name is never replaced (plan R8.5): stop the first launch, then reuse it.
+"$AGENT" claude --profile "$prof_ok" stop linit >/dev/null 2>&1 || true
 "$AGENT" claude --profile "$prof_ok" start --exact linit "$WORK" 'task two' >/dev/null 2>&1 || true
 assert "two usage_init events" "$(grep -c usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl")" "2"
 assert "two distinct launch_ids" \

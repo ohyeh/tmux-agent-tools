@@ -1,7 +1,7 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.41.0",
-  "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent pair/team orchestration.",
+  "version": "0.44.5",
+  "description": "tmux wrappers, skills and a Bash dispatch gate for running Claude Code, Codex, Cursor, agy or grok CLI workers as supervised tmux sessions: delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, approval gates, pair/team orchestration. The Claude Code function-hook mod is the separate tmux-agent plugin.",
   "author": {
     "name": "PaulYeh",
     "url": "https://github.com/ohyeh"

@@ -32,6 +32,8 @@ cleanup() {
   AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude stop tail-send >/dev/null 2>&1 || true
   AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" doneclaude stop done-turn >/dev/null 2>&1 || true
   "$AGENT_TMUX" updcli stop upd-smoke >/dev/null 2>&1 || true
+  "$AGENT_TMUX" nodrawcli stop nodraw-smoke >/dev/null 2>&1 || true
+  "$AGENT_TMUX" exitcli stop exit-smoke >/dev/null 2>&1 || true
   local n; for n in work-codex work-claude work-cursor work-frozen; do "$AGENT_TMUX" workcli stop "$n" >/dev/null 2>&1 || true; done
   rm -rf "$WORK"
 }
@@ -305,7 +307,8 @@ t0=$SECONDS
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude send --from-file "$WORK/brief.txt" tail-send >"$WORK/tail.out" 2>"$WORK/tail.err" || true
 took=$(( SECONDS - t0 ))
 assert "tail: both instructions are still reported unconfirmed" "$(grep -c 'delivery UNCONFIRMED' "$WORK/tail.err")" "2"
-assert "tail: the send took under 16 s (took ${took}s; two windows is 20 s+)" "$(( took < 16 ))" "1"
+# 19, not 16: a slow macOS runner took 16 s for one window; two windows is still 20 s+.
+assert "tail: the send took under 19 s (took ${took}s; two windows is 20 s+)" "$(( took < 19 ))" "1"
 AGENT_TMUX_PROFILE_DIR="$WORK/profiles" "$AGENT_TMUX" tailclaude stop tail-send >/dev/null 2>&1 || true
 
 # ---- case 2d: a turn that finished before two looks is processing --------------
@@ -442,6 +445,74 @@ assert "frozen: the failed step is confirm-processing" "$(jq -r .failed_step "$W
 refute_contains "frozen: no resend" "$(cat "$WORK/work-frozen.err")" "resending once"
 assert "frozen: the brief arrived exactly once" "$(brief_count work-frozen)" "1"
 "$AGENT_TMUX" workcli stop work-frozen >/dev/null 2>&1 || true
+
+# ---- a CLI not up by the window is handed to the caller, not killed ----------
+# nodrawcli stays alive and draws nothing (a self-update, a slow sign-in). At
+# the ready window assign must not send, must leave the worker running, and
+# must name the exact command that sends the brief by hand (live 2026-09-30:
+# cursor-agent needed over 45s after a self-update).
+# nodrawcli draws nothing for 10s, then comes up and logs every line it reads.
+cat > "$WORK/nodrawcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "nodrawcli 1.0"; exit 0; }
+stty -echo 2>/dev/null
+LOG=/dev/null
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac; done
+sleep 10
+echo "> ready"
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$LOG"; done
+EOF
+chmod +x "$WORK/nodrawcli"
+
+echo
+echo "case: a CLI still not up at the ready window is left running and handed to the caller"
+LOG="$WORK/nodraw.log"; : > "$LOG"
+code=0
+AGENT_TMUX_START_READY_TIMEOUT=4 AGENT_TMUX_LAUNCH_FLAGS="--log $LOG" \
+  "$AGENT_TMUX" nodrawcli assign --timeout 60 --confirm-window 20 --detach \
+    --prompt-delivery paste --result-path "$WORK/nodraw-result.json" --episode 7 \
+    nodraw-smoke "$WORK" "$WORK/brief.txt" \
+    >"$WORK/nodraw.out" 2>"$WORK/nodraw.err" || code=$?
+nd_diag="$(jq -r .diagnostic "$WORK/nodraw.out" 2>/dev/null)"
+assert "nodraw: assign returned to the caller" "$code" "1"
+assert "nodraw: the failed step is send" "$(jq -r .failed_step "$WORK/nodraw.out" 2>/dev/null)" "send"
+assert_contains "nodraw: the brief was not sent" "$nd_diag" "the brief was NOT sent"
+assert_contains "nodraw: the worker is left running" "$nd_diag" "left running"
+assert "nodraw: nothing reached the CLI before the hand-off" "$(cat "$LOG")" ""
+assert "nodraw: the worker is still up" "$("$AGENT_TMUX" nodrawcli status --json nodraw-smoke 2>/dev/null | jq -r .running)" "true"
+# The hand-off must work as written: run the named command verbatim once the
+# CLI is up, and the brief arrives with this dispatch's result path.
+nd_cmd="${${nd_diag#*send the brief yourself \(}%%\), or stop it*}"
+assert_contains "nodraw: the named send keeps the dispatch route" "$nd_cmd" "--result-path $WORK/nodraw-result.json --episode 7"
+"$AGENT_TMUX" nodrawcli wait-text nodraw-smoke '> ready' 30 >/dev/null 2>&1 || true
+nd_argv=("${(z)nd_cmd}"); nd_argv[1]="$AGENT_TMUX"
+"${nd_argv[@]}" >/dev/null 2>&1 || true
+for _ in {1..20}; do grep -q 'input:GOAL: prove the brief survives' "$LOG" && break; sleep 0.5; done
+assert_contains "nodraw: the hand-sent brief arrived" "$(cat "$LOG")" "input:GOAL: prove the brief survives the dialog."
+assert_contains "nodraw: it carried the dispatch's result path" "$(cat "$LOG")" "$WORK/nodraw-result.json"
+"$AGENT_TMUX" nodrawcli stop nodraw-smoke >/dev/null 2>&1 || true
+
+# ---- a CLI that exits during boot fails at once ------------------------------
+# The exit is seen before any send, well inside the ready window, and the
+# diagnostic names it as an exit rather than a UI that is not up.
+cat > "$WORK/exitcli" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { echo "exitcli 1.0"; exit 0; }
+exit 3
+EOF
+chmod +x "$WORK/exitcli"
+
+echo
+echo "case: a CLI that exits during boot fails at once, with no send"
+code=0; t0=$SECONDS
+AGENT_TMUX_START_READY_TIMEOUT=40 \
+  "$AGENT_TMUX" exitcli assign --timeout 60 --confirm-window 20 --detach \
+    --prompt-delivery paste exit-smoke "$WORK" "$WORK/brief.txt" \
+    >"$WORK/exit.out" 2>"$WORK/exit.err" || code=$?
+assert "exit: assign failed" "$code" "1"
+assert_contains "exit: the diagnostic says the CLI exited" "$(jq -r .diagnostic "$WORK/exit.out" 2>/dev/null)" "CLI exited before it was up"
+assert "exit: it failed well inside the 40s window" "$(( SECONDS - t0 < 30 ))" "1"
+"$AGENT_TMUX" exitcli stop exit-smoke >/dev/null 2>&1 || true
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

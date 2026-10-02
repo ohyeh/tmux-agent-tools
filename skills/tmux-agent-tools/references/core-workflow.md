@@ -104,7 +104,7 @@ Use `start --dry-run` first when validating a new profile, `--result-schema`, or
 
 - Without `--exact`, `start` appends a random suffix to avoid collisions.
 - With `--exact`, the session uses the requested name exactly under the tool prefix.
-- **Single caller per agent name.** Two `start --exact same-name` kills the first. Wrapper state under `$TMUX_AGENT_DIR/<name>/` is NOT lock-protected (see `references/contracts.md` concurrency model).
+- **Single caller per agent name.** A second `start --exact same-name` while the first is live exits 1; the first is untouched. Wrapper state under `$TMUX_AGENT_DIR/<name>/` is NOT lock-protected (see `references/contracts.md` concurrency model).
 
 ### Remote sessions
 

@@ -3,13 +3,20 @@
 #
 # Validates that `send_lock_around` in agent-tmux claude and codex:
 #   - serializes concurrent acquirers on the same agent name
-#   - recovers from a stale PID written into the lock dir
+#   - refuses a second acquirer while a holder is alive (rc 75, no entry)
+#   - hands the lock to waiters one at a time after the holder is killed -9
 #   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
 #   - exits with the inner command's return code
 #
-# The helper is sourced from the actual wrapper file via
-# TMUX_AGENT_TOOLS_SOURCE_ONLY so we exercise the real implementation,
-# not a copy.
+# The helper is sourced from agent-tmux via TMUX_AGENT_TOOLS_SOURCE_ONLY
+# so we exercise the real implementation, not a copy. The cli launcher is
+# `exec agent-tmux <cli>`; sourcing that replaces the shell and the
+# source-only guard exits before the case body. The harness sources the
+# engine with that <cli> name instead.
+#
+# Cases wait on files, never on a sleep that has to win a race: a holder
+# blocks until the test creates its release file, and every wait loop has a
+# deadline that only bounds a failing run.
 #
 # Exits non-zero on the first failure.
 
@@ -34,18 +41,23 @@ fail() {
 # by the harness so $send_lock_around / $ensure_agent_dir are in scope.
 run_case() {
   local wrapper="$1" label="$2" body_file="$3"
-  echo "[$label] $(basename "$wrapper")"
+  local cli
+  cli="$(basename "$wrapper")"
+  echo "[$label] $cli"
   local state_dir="$WORK/$label"
   mkdir -p "$state_dir"
   TMUX_AGENT_DIR="$state_dir" \
     TMUX_AGENT_TOOLS_SOURCE_ONLY=1 \
-    WRAPPER="$wrapper" \
+    WORK="$WORK" \
+    ENGINE="$AGENT_TMUX" \
+    CLI_NAME="$cli" \
     BODY="$body_file" \
     zsh -c '
       set -euo pipefail
-      source "$WRAPPER"
+      set -- "$CLI_NAME"
+      source "$ENGINE"
       source "$BODY"
-    ' || fail "$label on $(basename "$wrapper")"
+    ' || fail "$label on $cli"
 }
 
 # Case bodies -------------------------------------------------------------
@@ -54,9 +66,6 @@ cat > "$WORK/case-basic.zsh" <<'BODY'
 sentinel="$TMUX_AGENT_DIR/basic-out"
 send_lock_around basic 5 sh -c "echo ok > '$sentinel'"
 [[ "$(cat "$sentinel")" == ok ]] || { echo "sentinel mismatch" >&2; exit 1; }
-if [[ -d "$TMUX_AGENT_DIR/basic/send.lock.d" ]]; then
-  echo "lock dir not cleaned up after success" >&2; exit 1
-fi
 BODY
 
 cat > "$WORK/case-concurrent.zsh" <<'BODY'
@@ -79,31 +88,6 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 BODY
 
-cat > "$WORK/case-stale-pid.zsh" <<'BODY'
-zmodload zsh/datetime 2>/dev/null || true
-name=stale
-mkdir -p "$TMUX_AGENT_DIR/$name"
-lock_dir="$TMUX_AGENT_DIR/$name/send.lock.d"
-mkdir "$lock_dir"
-# Pick a PID essentially guaranteed dead (above MAX_PID on Linux/macOS).
-dead_pid=2147483646
-echo "$dead_pid" > "$lock_dir/pid"
-# Force the mkdir fallback path by intercepting `command -v flock`.
-command() {
-  if [[ "$1" == "-v" && "$2" == "flock" ]]; then
-    return 1
-  fi
-  builtin command "$@"
-}
-start="${EPOCHSECONDS:-$(date +%s)}"
-send_lock_around "$name" 5 true
-now="${EPOCHSECONDS:-$(date +%s)}"
-elapsed=$(( now - start ))
-if (( elapsed >= 3 )); then
-  echo "stale lock recovery too slow: ${elapsed}s" >&2; exit 1
-fi
-BODY
-
 cat > "$WORK/case-missing-dir.zsh" <<'BODY'
 name=brand-new
 [[ ! -e "$TMUX_AGENT_DIR/$name" ]] || { echo "precondition: dir should not exist" >&2; exit 1; }
@@ -119,13 +103,119 @@ set -e
 [[ "$rc" -eq 7 ]] || { echo "expected rc=7 got $rc" >&2; exit 1; }
 BODY
 
+# Shared helper sourced by the cases below. wait_for_file only bounds a run
+# that is already failing; a passing run leaves the loop as soon as the file
+# exists.
+cat > "$WORK/helpers.zsh" <<'BODY'
+wait_for_file() {
+  local file="$1" i
+  for (( i = 0; i < 1000; i++ )); do
+    [[ -e "$file" ]] && return 0
+    command sleep 0.01
+  done
+  echo "timeout waiting for $file" >&2
+  return 1
+}
+# Start a holder that owns the lock until $1/release exists. Records the pid
+# of the lock-holding subshell (the critical section's parent) in $1/holder.pid.
+# Callers install their own EXIT trap to touch release (a trap set inside a zsh
+# function ends with the function), so a failing case cannot leave it spinning.
+start_holder() {
+  local dir="$1" name="$2"
+  ( send_lock_around "$name" 10 zsh -c '
+      echo $PPID > "$1/holder.pid"
+      touch "$1/held"
+      while [[ ! -e "$1/release" ]]; do command sleep 0.01; done
+    ' _ "$dir" ) &
+  holder_job=$!
+  wait_for_file "$dir/held"
+}
+BODY
+
+cat > "$WORK/case-contended.zsh" <<'BODY'
+# A live holder keeps the lock until the test releases it. A second acquirer
+# must give up with rc 75 and never run its command; once the holder is
+# released a new acquirer gets the lock.
+source "$WORK/helpers.zsh"
+name=contended
+dir="$TMUX_AGENT_DIR/$name-case"
+mkdir -p "$dir"
+start_holder "$dir" "$name"
+trap 'touch "$dir/release"' EXIT
+
+entered="$dir/contender-entered"
+set +e
+send_lock_around "$name" 1 touch "$entered" 2>"$dir/contender.err"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] || { echo "expected rc=75 while held, got $rc" >&2; exit 1; }
+[[ ! -e "$entered" ]] || { echo "contender entered the critical section while the holder held the lock" >&2; exit 1; }
+grep -q "lock contended on $name" "$dir/contender.err" || { echo "missing contention message" >&2; cat "$dir/contender.err" >&2; exit 1; }
+
+touch "$dir/release"
+wait "$holder_job"
+send_lock_around "$name" 5 touch "$entered"
+[[ -e "$entered" ]] || { echo "lock not released after holder finished" >&2; exit 1; }
+BODY
+
+cat > "$WORK/case-killed-holder.zsh" <<'BODY'
+# The holder is killed with SIGKILL while two waiters are queued. The OS must
+# release the lock, and the waiters must then enter one at a time: each waiter
+# claims a mutex directory, marks itself, and waits for the peer's mark. Under
+# a correct lock the peer never enters, so the wait ends at its deadline with
+# no mark and the mutex claim holds.
+source "$WORK/helpers.zsh"
+name=killed
+dir="$TMUX_AGENT_DIR/$name-case"
+mkdir -p "$dir"
+start_holder "$dir" "$name"
+trap 'touch "$dir/release"' EXIT
+
+waiter() {
+  local me="$1" peer="$2"
+  send_lock_around "$name" 10 zsh -c '
+    dir="$1"; me="$2"; peer="$3"
+    mkdir "$dir/in-critical" 2>/dev/null || { echo "VIOLATION: $me entered while another waiter was inside" >> "$dir/violations"; exit 0; }
+    touch "$dir/$me-in"
+    for (( i = 0; i < 100; i++ )); do
+      if [[ -e "$dir/$peer-in" ]]; then
+        echo "VIOLATION: $me and $peer overlapped" >> "$dir/violations"
+        break
+      fi
+      command sleep 0.01
+    done
+    touch "$dir/$me-done"
+    rm "$dir/$me-in"
+    rmdir "$dir/in-critical"
+  ' _ "$dir" "$me" "$peer"
+}
+( waiter b c ) &
+job_b=$!
+( waiter c b ) &
+job_c=$!
+
+# The killed holder's critical-section child is orphaned and keeps running
+# until release: the lock must be free without waiting for it to exit.
+kill -9 "$(cat "$dir/holder.pid")"
+wait "$holder_job" 2>/dev/null || true
+wait "$job_b"
+wait "$job_c"
+
+[[ -e "$dir/b-done" && -e "$dir/c-done" ]] || { echo "a waiter never ran after the holder was killed" >&2; exit 1; }
+if [[ -s "$dir/violations" ]]; then
+  cat "$dir/violations" >&2
+  exit 1
+fi
+BODY
+
 for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   tool="$(basename "$wrapper")"
-  run_case "$wrapper" "$tool-basic"        "$WORK/case-basic.zsh"
-  run_case "$wrapper" "$tool-concurrent"   "$WORK/case-concurrent.zsh"
-  run_case "$wrapper" "$tool-stale-pid"    "$WORK/case-stale-pid.zsh"
-  run_case "$wrapper" "$tool-missing-dir"  "$WORK/case-missing-dir.zsh"
-  run_case "$wrapper" "$tool-rc"           "$WORK/case-rc.zsh"
+  run_case "$wrapper" "$tool-basic"          "$WORK/case-basic.zsh"
+  run_case "$wrapper" "$tool-concurrent"     "$WORK/case-concurrent.zsh"
+  run_case "$wrapper" "$tool-contended"      "$WORK/case-contended.zsh"
+  run_case "$wrapper" "$tool-killed-holder"  "$WORK/case-killed-holder.zsh"
+  run_case "$wrapper" "$tool-missing-dir"    "$WORK/case-missing-dir.zsh"
+  run_case "$wrapper" "$tool-rc"             "$WORK/case-rc.zsh"
 done
 
 echo "OK: send-lock smoke passed for agent-tmux claude and codex."

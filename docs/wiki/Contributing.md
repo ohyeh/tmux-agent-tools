@@ -46,12 +46,12 @@ tmux-agent-tools/
 5. **Run locally**:
    ```bash
    scripts/test-<name>-smoke
-   scripts/test-l5-batch-smoke         # if you touched L5
+   scripts/test-fanout-run-smoke       # if you touched L5 fanout/dag
    scripts/test-l6-batch-smoke         # if you touched L6
    scripts/ci-shellcheck
    scripts/lint-no-path-tied-locals
    ```
-6. **Open a PR** with `Closes #<issue>` and an acceptance-checklist body. CI runs the same smokes plus shellcheck.
+6. **Open a PR** with `Closes #<issue>` and an acceptance-checklist body. CI is manual only (`gh workflow run ci.yml`); it runs the same smokes plus shellcheck, so run them locally first.
 7. **Review loop** — see [the partner review pattern](#partner-review-pattern) below.
 8. **Merge** via squash. Conventional commit message in the squash subject.
 9. **CHANGELOG.md** — add an entry under `## Unreleased`. The release PR consolidates these into a versioned section.

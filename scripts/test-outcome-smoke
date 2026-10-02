@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Smoke for `agent-tmux <cli> outcome`: the commander's label joins the exact
+# result.json it judged, and a reset result does not inherit the old label.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+
+WORK="$(mktemp -d -t tmux-agent-outcome.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+export TMUX_AGENT_DIR="$WORK/state"
+
+pass=0
+ok() { pass=$((pass + 1)); echo "ok $pass - $1"; }
+fail() { echo "FAIL - $1" >&2; exit 1; }
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+
+dir="$TMUX_AGENT_DIR/w1"
+mkdir -p "$dir"
+
+# 1. No result.json yet: refuse, write nothing.
+if "$AGENT_TMUX" claude outcome w1 met >/dev/null 2>&1; then fail "labelled a worker with no result.json"; fi
+[[ ! -e "$dir/outcome.json" ]] || fail "outcome.json written without a result"
+if "$AGENT_TMUX" claude outcome nosuch met >/dev/null 2>&1; then fail "labelled an unknown worker"; fi
+[[ ! -d "$TMUX_AGENT_DIR/nosuch" ]] || fail "refusal created a worker dir"
+set +e; "$AGENT_TMUX" claude outcome ../escape met >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -eq 2 && ! -e "$WORK/escape" ]] || fail "path-escaping name accepted (exit $rc)"
+ok "no result.json / unknown / path-escaping name -> refused, nothing created"
+
+# 2. Bad label: usage error.
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"done"}' > "$dir/result.json"
+set +e; "$AGENT_TMUX" claude outcome w1 maybe >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -eq 2 ]] || fail "bad label exit $rc, want 2"
+ok "label outside met|not-met|unknown -> exit 2"
+
+# 3. Label written and bound to this result.
+out="$("$AGENT_TMUX" claude outcome w1 not-met --note "acceptance item 2 missing")"
+[[ "$out" == "$dir/outcome.json" ]] || fail "printed path $out"
+[[ "$(jq -r .outcome "$out")" == "not-met" ]] || fail "outcome field"
+[[ "$(jq -r .status_reported "$out")" == "success" ]] || fail "status_reported field"
+[[ "$(jq -r .profile "$out")" == "claude" ]] || fail "profile field"
+[[ "$(jq -r .result_sha256 "$out")" == "$(sha "$dir/result.json")" ]] || fail "join on result_sha256"
+ok "not-met label joins result.json by sha256 (success reported, not met)"
+
+# 4. A reset result (next episode) no longer matches the old label.
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"second episode"}' > "$dir/result.json"
+[[ "$(jq -r .result_sha256 "$out")" != "$(sha "$dir/result.json")" ]] || fail "old label still matches a new result"
+ok "reset result does not inherit the old label"
+
+# 5. unknown is a stored value, not absence.
+"$AGENT_TMUX" claude outcome w1 unknown >/dev/null
+[[ "$(jq -r .outcome "$dir/outcome.json")" == "unknown" ]] || fail "unknown not stored"
+ok "unknown stored explicitly"
+
+# 6. Concurrent labels: the visible file is always one complete JSON, no temp files left.
+pids=()
+for l in met not-met unknown met not-met unknown; do "$AGENT_TMUX" claude outcome w1 "$l" >/dev/null & pids+=($!); done
+for p in "${pids[@]}"; do wait "$p" || fail "a concurrent writer failed"; done
+jq -e '.outcome | test("^(met|not-met|unknown)$")' "$dir/outcome.json" >/dev/null || fail "outcome.json not complete JSON after concurrent writes"
+leftover="$(find "$dir" -name 'outcome.json.tmp.*' -o -name '.result-snapshot.*' | wc -l | tr -d ' ')"
+[[ "$leftover" == "0" ]] || fail "$leftover temp file(s) left behind"
+ok "6 concurrent labels -> one complete outcome.json, no temp files"
+
+# 7. Invalid result.json: refuse and leave no snapshot behind.
+printf '%s\n' 'not json' > "$dir/result.json"
+if "$AGENT_TMUX" claude outcome w1 met >/dev/null 2>&1; then fail "labelled an invalid result.json"; fi
+[[ -z "$(find "$dir" -name '.result-snapshot.*')" ]] || fail "snapshot left after invalid JSON"
+ok "invalid result.json -> refused, no snapshot left"
+
+echo "outcome smoke: $pass/7 passed"

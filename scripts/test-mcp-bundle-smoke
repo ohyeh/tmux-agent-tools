@@ -1,0 +1,130 @@
+#!/usr/bin/env zsh
+# Clean-install smoke for the MCP bundle (plan R7.1/R7.2): copy ONLY the skill
+# dir to a temp path with a space, outside the repo, with no node_modules on any
+# resolution path and NODE_PATH unset. Start tmux-agent-mcp through a symlink and
+# drive raw JSON-RPC: initialize, tools/list, then spawn → wait (delivery_id, ack)
+# → wait again (already_acked, same id) → read → close against
+# the fake agent-tmux (mcp-adapter/test/fixtures/bin). stdout must be JSON-RPC only.
+
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/tmux agent mcp.XXXXXX")"
+tmp="${tmp:A}"
+trap 'rm -rf "$tmp"' EXIT
+[[ "$tmp" != "$REPO_ROOT"/* ]] || { echo "  FAIL temp dir is inside the repo: $tmp" >&2; exit 1; }
+
+cp -R "$REPO_ROOT/skills/tmux-agent-tools" "$tmp/tmux-agent-tools"
+mkdir -p "$tmp/bin" "$tmp/state" "$tmp/work"
+ln -s "$tmp/tmux-agent-tools/scripts/tmux-agent-mcp" "$tmp/bin/tmux-agent-mcp"
+
+# No node_modules in the copy, nor in any parent of it.
+if [[ -n "$(find "$tmp" -name node_modules -print -quit)" ]]; then
+  echo "  FAIL node_modules inside the copy" >&2; exit 1
+fi
+dir="$tmp"
+while [[ "$dir" != / ]]; do
+  dir="${dir:h}"
+  [[ ! -e "$dir/node_modules" ]] || { echo "  FAIL node_modules on the resolution path: $dir/node_modules" >&2; exit 1; }
+done
+
+expected_version="$(jq -r '.version' "$REPO_ROOT/.claude-plugin/plugin.json")"
+
+cd "$tmp/work"
+env -u NODE_PATH -u TMUX -u TMUX_PANE -u TMUX_AGENT_SESSION \
+  PATH="$REPO_ROOT/mcp-adapter/test/fixtures/bin:$PATH" \
+  TMUX_AGENT_DIR="$tmp/state" FAKE_AGENT_TMUX_ROOT="$tmp/state" \
+  MCP_BIN="$tmp/bin/tmux-agent-mcp" WORK="$tmp/work" EXPECTED_VERSION="$expected_version" \
+  node --input-type=module - <<'EOF'
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import assert from "node:assert/strict";
+
+const child = spawn(process.env.MCP_BIN, [], { stdio: ["pipe", "pipe", "pipe"] });
+let out = "", err = "", buf = "";
+const waiting = new Map();
+child.stderr.on("data", (c) => { err += c; });
+child.stdout.on("data", (c) => {
+  out += c; buf += c;
+  let nl;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; } // reported by the final stdout check
+    waiting.get(msg.id)?.(msg);
+  }
+});
+child.on("exit", (code) => { for (const r of waiting.values()) r({ error: { message: `server exited ${code}` } }); });
+
+let nextId = 1;
+function rpc(method, params) {
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timeout on ${method}\nstderr:\n${err}`)), 15000);
+    waiting.set(id, (msg) => { clearTimeout(t); waiting.delete(id); resolve(msg); });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  });
+}
+async function call(name, args) {
+  const msg = await rpc("tools/call", { name, arguments: args });
+  assert.ok(msg.result && !msg.result.isError, `${name} failed: ${JSON.stringify(msg)}\nstderr:\n${err}`);
+  return msg.result.structuredContent;
+}
+
+try {
+  const init = await rpc("initialize", {
+    protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bundle-smoke", version: "0" },
+  });
+  assert.ok(init.result, `initialize failed: ${JSON.stringify(init)}\nstderr:\n${err}`);
+  assert.equal(init.result.serverInfo.version, process.env.EXPECTED_VERSION);
+  console.log(`  ok   initialize (serverInfo.version ${init.result.serverInfo.version})`);
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+
+  const listed = await rpc("tools/list", {});
+  assert.deepEqual(listed.result.tools.map((t) => t.name).sort(), [
+    "close_tmux_agent", "read_tmux_agent", "send_tmux_agent", "spawn_tmux_agent", "wait_tmux_agent",
+  ]);
+  console.log("  ok   tools/list (5 tools)");
+
+  const spawned = await call("spawn_tmux_agent", { cli: "fake", repoPath: process.env.WORK, task: "bundle smoke", name: "bundle-rpc" });
+  assert.match(spawned.agent_id, /^bundle-rpc\.[0-9a-z]{5}$/);
+  assert.equal(spawned.seq, 1);
+  writeFileSync(spawned.result_path, JSON.stringify({ schema_version: 1, status: "success", summary: "bundle ok", artifacts: [], errors: [], episode: 1 }));
+  const owner = JSON.parse(readFileSync(`${process.env.TMUX_AGENT_DIR}/.v3/${spawned.agent_id}/worker.json`, "utf8")).owner;
+  assert.match(owner, /^mcp-[^/]+-\d+-\d+$/, "D-mcp-id: one session per server process");
+  const waited = await call("wait_tmux_agent", { agent_id: spawned.agent_id, seq: spawned.seq, timeoutSec: 2 });
+  assert.equal(waited.status, "completed");
+  assert.equal(waited.body.summary, "bundle ok");
+  assert.equal(waited.delivery_id, `${owner}/${spawned.agent_id}/1`);
+  // The ack lands after the response's write callback: the next wait sees it closed.
+  const ack = `${process.env.TMUX_AGENT_DIR}/.v3/${spawned.agent_id}/episodes/1/acks/done`;
+  for (let i = 0; i < 100 && !existsSync(ack); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(existsSync(ack), "acked after the response was flushed");
+  // timeoutSec 2: already_acked lands as soon as the earlier delivery released its marker
+  // (within the call's deadline), so the close below does not meet that lock.
+  const again = await call("wait_tmux_agent", { agent_id: spawned.agent_id, seq: 1, timeoutSec: 2 });
+  assert.equal(again.status, "already_acked");
+  assert.equal(again.delivery_id, waited.delivery_id);
+  console.log(`  ok   wait → completed + ack, re-wait → already_acked (delivery_id ${waited.delivery_id})`);
+  assert.equal((await call("read_tmux_agent", { agent_id: spawned.agent_id, seq: 1 })).status, "success");
+  assert.equal((await call("close_tmux_agent", { agent_id: spawned.agent_id })).closed, true);
+  console.log(`  ok   lifecycle spawn → wait → read → close (${spawned.agent_id})`);
+} finally {
+  // Heartbeat timers may keep the server up past stdin EOF: stop it here.
+  child.kill();
+}
+// Drain stdout to the end: a late write after the last response must be seen too.
+if (child.exitCode === null && child.signalCode === null) await new Promise((r) => child.on("close", r));
+
+const lines = out.split("\n").filter((l) => l !== "");
+for (const line of lines) {
+  let msg;
+  try { msg = JSON.parse(line); } catch { assert.fail(`stdout line is not JSON: ${line}`); }
+  assert.equal(msg.jsonrpc, "2.0", `stdout line is not JSON-RPC: ${line}`);
+}
+assert.ok(out.endsWith("\n"), "stdout ends inside a frame");
+console.log(`  ok   stdout is JSON-RPC only (${lines.length} frames)`);
+EOF
+echo "mcp-bundle smoke: passed"

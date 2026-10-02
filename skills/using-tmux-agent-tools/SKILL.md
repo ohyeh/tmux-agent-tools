@@ -48,7 +48,7 @@ No exception fired → inline, receipt `no-delegate-trigger`.
 ## COLLECTOR — when the `tmux-agent` mod owns the wait
 
 Applies ONLY when the tool `mcp__tmux-agent__assign` is present in this session
-(the `mods/tmux-agent` function-hook mod is loaded). Every other runtime
+(the `tmux-agent` plugin's function-hook mod is loaded). Every other runtime
 (Codex, agy, Cursor, a Claude session without the mod) skips this section
 and uses "commander is not Claude Code" below.
 
@@ -102,7 +102,7 @@ and uses "commander is not Claude Code" below.
 
 ## commander is not Claude Code
 
-Codex, agy, and Cursor have no `mods/tmux-agent` collector, so a finished
+Codex, agy, and Cursor have no `tmux-agent` mod collector, so a finished
 worker never wakes them. Start a commander session, dispatch from inside
 its pane, then end the turn. `assign` starts the collector for that session
 from the tmux server when none is live. Do not background `collect`
