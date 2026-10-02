@@ -1029,7 +1029,20 @@ refuse_live_name() {
   local name="$1" session pane
   acquire_launch_lock "$name"
   session="$(session_for_name "$name")"
-  "$TMUX" "${TMUX_SOCKET_ARGS[@]}" has-session -t "$(session_target "$session")" 2>/dev/null || return 0
+  if ! "$TMUX" "${TMUX_SOCKET_ARGS[@]}" has-session -t "$(session_target "$session")" 2>/dev/null; then
+    # <root>/<name> is shared by every CLI: a live pane bound there by another
+    # session (another CLI or profile prefix) would have its pane-id and
+    # result.json taken over.
+    local bound owner
+    bound="$(cat "$(agent_root_dir)/$name/pane-id" 2>/dev/null || true)"
+    [[ -n "$bound" ]] || return 0
+    owner="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$bound" '#{session_name}' 2>/dev/null || true)"
+    # Only a session for this same name counts: after a tmux server restart a
+    # stale pane id can name an unrelated pane.
+    [[ -n "$owner" && "$owner" != "$session" && "$owner" == *"-$name" ]] || return 0
+    echo "name $name is bound to live pane $bound of session $owner; agent-tmux never replaces a live worker, and every CLI shares $(agent_root_dir)/$name. Stop that worker first or use another name." >&2
+    exit 1
+  fi
   pane="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" display-message -p -t "$(session_target "$session")" '#{pane_id}' 2>/dev/null || true)"
   echo "session $session already exists (pane ${pane:-?}); agent-tmux never replaces a live worker. Stop it first ($SELF $CLI stop $name) or use another name." >&2
   exit 1

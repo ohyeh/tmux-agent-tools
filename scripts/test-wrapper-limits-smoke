@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 # Wrapper-side Known limits closed by plan R8.4/R8.5 (tui-retro plan §2):
-#   a. name collision: a second start/resume of a live name refuses; the first
+#   a. name collision: a second start/resume of a live name refuses (a2: also
+#      under another prefix, since every CLI shares <root>/<name>); the first
 #      session keeps its pane id, pid, and state dir bytes
 #   b. explicit socket: TMUX_AGENT_TMUX_SOCKET pins agent-tmux to one server,
 #      and the commander chain (start → panel → collector) stays on the server
@@ -107,6 +108,14 @@ assert "a: resume --exact on the live name exits non-zero" "$(( code != 0 ))" 1
 assert "a: same pane id and pid after resume" "$(pane_of tmux_b)" "$before_pane"
 assert "a: state dir byte-identical after resume" "$(tree_hash "$TMUX_AGENT_DIR/coll")" "$before_tree"
 assert "a: pane-id binds the pane tmux created" "$(cat "$TMUX_AGENT_DIR/coll/pane-id" 2>/dev/null || true)" "${before_pane%% *}"
+
+print -r -- "case a2: another prefix (another CLI or profile) starting a live name refuses; the shared dir stays the first worker's"
+code=0
+out="$(AGENT_TMUX_PREFIX=wlim2 "$AGENT_TMUX" fakecli start --exact coll "$WORK/repo" 2>&1)" || code=$?
+assert "a2: start under another prefix exits non-zero" "$(( code != 0 ))" 1
+assert_contains "a2: the refusal names the owning session" "$out" "of session wlim-coll"
+assert "a2: no second session was made" "$(tmux_b has-session -t '=wlim2-coll' 2>/dev/null && echo made || echo none)" none
+assert "a2: the first worker's state dir is byte-identical" "$(tree_hash "$TMUX_AGENT_DIR/coll")" "$before_tree"
 
 print -r -- "case d: a result from an earlier launch of the name is preserved"
 mkdir -p "$TMUX_AGENT_DIR/old"
