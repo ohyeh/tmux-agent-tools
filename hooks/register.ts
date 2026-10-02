@@ -193,13 +193,22 @@ export const register: Register = on => {
    * so every step runs on one chain, and a line is kept only once its write landed.
    */
   type ProbeState = { on: boolean; epoch: string; start: number }
+  // ponytail: one epoch is capped at 1 MiB (the fs limit is 4 MiB per read/write) and a fresh
+  // `on` drops older epochs; raise the cap if a live run ever needs more lines.
+  const PROBE_MAX_BYTES = 1 << 20
+  /** After a failed load, render and attach retry no sooner than this; a command always retries. */
+  const PROBE_RETRY_MS = 10_000
   const probe = {
     sid: undefined as string | undefined,
     state: undefined as ProbeState | undefined,
     path: '',
     lines: [] as string[],
     rendered: new Set<string>(),
+    /** Every lost observation of this epoch stays counted until a fresh `on`: absence is not proof while it is not 0. */
+    errors: 0,
     lastError: '',
+    loadError: '',
+    loadFailedAt: -Infinity,
     chain: Promise.resolve() as Promise<unknown>,
   }
   const probeKey = (sid: string) => `probe:${sid}`
@@ -209,64 +218,106 @@ export const register: Register = on => {
     probe.chain = done.catch(() => undefined)
     return done
   }
-  const probeFail = (what: string, error: unknown) => {
-    probe.lastError = `${what}: ${error instanceof Error ? error.name : typeof error}: ${String(error)}`
-  }
-  /** Binds the probe to this session's id once (again after a hot reload); a failure is a storage blocker. */
-  const probeLoad = async (): Promise<void> => {
+  const probeErr = (what: string, error: unknown) => `${what}: ${error instanceof Error ? error.name : typeof error}: ${String(error)}`
+  /** The prerequisites, as a blocker sentence; nothing is guessed. */
+  const probePrereq = async (): Promise<{ sid: string; root: string } | string> => {
     const w = world
-    if (!w || !sessionId || probe.sid === sessionId) return
-    const sid = sessionId
+    if (!w) return 'the mod did not bind (prerequisite)'
+    if (!sessionId) return 'no session id yet (prerequisite)'
     const root = await rootOf(w)
-    if (!root) {
-      probe.sid = sid
-      return
+    if (!root) return 'no state root: TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset (prerequisite)'
+    return { sid: sessionId, root }
+  }
+  /**
+   * Binds the probe to this session (again after a hot reload). Only a complete load binds;
+   * a failure is a named storage blocker and stays retryable. A file that is there but cannot
+   * be read is never taken as empty: rewriting it would erase its evidence.
+   */
+  const probeLoad = async (): Promise<string> => {
+    const pre = await probePrereq()
+    if (typeof pre === 'string') return pre
+    if (probe.sid === pre.sid) return ''
+    const w = world!
+    const path = `${pre.root}/${pre.sid}/surfaces.jsonl`
+    let saved: unknown
+    let text: string
+    try {
+      saved = await w.storeGet(probeKey(pre.sid))
+    } catch (error) {
+      return probeErr('probe store read', error)
     }
     try {
-      const saved = await w.storeGet(probeKey(sid))
-      const st = saved && typeof saved === 'object' ? (saved as ProbeState) : undefined
-      const path = `${root}/${sid}/surfaces.jsonl`
-      const lines = (await readOrEmpty(w, path)).split('\n').filter(Boolean)
-      probe.sid = sid
-      probe.state = st
-      probe.path = path
-      probe.lines = lines
-      probe.rendered = new Set(
-        lines.flatMap(l => {
-          const j = parseJson(l) as { epoch?: unknown; kind?: unknown; surface?: unknown } | undefined
-          return j?.epoch === st?.epoch && j?.kind === 'render' && typeof j?.surface === 'string' ? [j.surface] : []
-        }),
-      )
+      text = await w.read(path)
     } catch (error) {
-      probe.sid = sid
-      probeFail('probe load', error)
+      if (await w.exists(path).catch(() => true)) return probeErr(`probe read ${path}`, error)
+      text = ''
     }
+    const st = saved && typeof saved === 'object' ? (saved as ProbeState) : undefined
+    const lines = text.split('\n').filter(Boolean)
+    probe.sid = pre.sid
+    probe.state = st
+    probe.path = path
+    probe.lines = lines
+    probe.rendered = new Set(
+      lines.flatMap(l => {
+        const j = parseJson(l) as { epoch?: unknown; kind?: unknown; surface?: unknown } | undefined
+        return j?.epoch === st?.epoch && j?.kind === 'render' && typeof j?.surface === 'string' ? [j.surface] : []
+      }),
+    )
+    probe.loadError = ''
+    return ''
+  }
+  /** Loads for a hook caller: a failed load is retried after PROBE_RETRY_MS, not on every render. */
+  const probeLoadQuiet = async (): Promise<boolean> => {
+    const w = world
+    if (probe.loadError && w && (await w.now()) - probe.loadFailedAt < PROBE_RETRY_MS) return false
+    const blocker = await probeLoad()
+    if (!blocker) return true
+    probe.loadError = blocker
+    probe.loadFailedAt = w ? await w.now() : 0
+    return false
+  }
+  const probeLost = (error: string) => {
+    probe.errors += 1
+    probe.lastError = error
   }
   /** One event, when the probe is on; `once` de-dups within the epoch (a render per surface). */
   const probeNote = (fields: Record<string, unknown>, once?: string): Promise<void> =>
     probeRun(async () => {
-      await probeLoad()
+      if (!(await probeLoadQuiet())) return
       const w = world
       if (!w || !probe.state?.on || !probe.path) return
       if (once && probe.rendered.has(once)) return
       const line = JSON.stringify({ epoch: probe.state.epoch, at: new Date(await w.now()).toISOString(), ...fields })
+      const text = `${[...probe.lines, line].join('\n')}\n`
+      if (text.length > PROBE_MAX_BYTES) {
+        probeLost(`probe capacity: this epoch is over ${PROBE_MAX_BYTES} bytes; /workers probe on starts a fresh one`)
+        return
+      }
       try {
-        await w.write(probe.path, `${[...probe.lines, line].join('\n')}\n`)
+        await w.write(probe.path, text)
         probe.lines.push(line)
         if (once) probe.rendered.add(once)
-        probe.lastError = ''
       } catch (error) {
-        probeFail('probe write', error)
+        probeLost(probeErr('probe write', error))
       }
     })
-  /** What `show` prints: the latest epoch only. */
+  /** What `show` prints: the latest epoch's summary (an absence verdict reads this), then its last 20 lines. */
   const probeShow = (): string => {
     const st = probe.state
     const mine = probe.lines.filter(l => (parseJson(l) as { epoch?: unknown } | undefined)?.epoch === st?.epoch)
+    const count = new Map<string, number>()
+    for (const l of mine) {
+      const j = parseJson(l) as { kind?: unknown; surface?: unknown } | undefined
+      const k = `${String(j?.kind)}${typeof j?.surface === 'string' ? `:${j.surface}` : ''}`
+      count.set(k, (count.get(k) ?? 0) + 1)
+    }
+    const summary = st ? [...count].map(([k, n]) => `${k}×${n}`).join(' · ') || 'nothing yet' : ''
     return [
       `probe: session ${probe.sid ?? '(none)'} · ${st?.on ? 'on' : 'off'} · epoch ${st?.epoch ?? '(none)'}` +
         `${st ? ` since ${new Date(st.start).toISOString()}` : ''} · mod ${MOD_VERSION}`,
-      `last write error: ${probe.lastError || 'none'}`,
+      `lost observations this epoch: ${probe.errors}${probe.errors ? ` (last: ${probe.lastError}) — an absence below is not proof` : ''}`,
+      ...(st ? [`this epoch, all lines: ${summary}`] : []),
       `file: ${probe.path || '(none)'}`,
       ...(st ? mine.slice(-20) : []),
     ].join('\n')
@@ -1144,27 +1195,34 @@ export const register: Register = on => {
       const bound = world
       if (!bound) return { text: 'unavailable — the mod did not bind.' }
       if (verb === 'probe') {
-        const sid = await idNow(() => $.session.id())
-        if (target === 'show' || target === '') return { text: await probeRun(async () => (await probeLoad(), probeShow())) }
-        if (target !== 'on' && target !== 'off') return { text: '/workers probe on|off|show' }
-        if (!sid) return { text: 'probe: blocked — no session id yet (prerequisite); nothing written.' }
-        const root = await rootOf(bound)
-        if (!root) return { text: 'probe: blocked — no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME all unset); nothing written.' }
-        const refused = await probeRun(async () => {
-          await probeLoad()
-          const st: ProbeState = target === 'on' ? { on: true, epoch: crypto.randomUUID(), start: await bound.now() } : { ...(probe.state ?? { epoch: '', start: 0 }), on: false }
-          try {
-            await bound.storeSet(probeKey(sid), st)
-          } catch (error) {
-            probeFail('probe store', error)
-            return probe.lastError
+        await idNow(() => $.session.id())
+        if (target !== '' && target !== 'show' && target !== 'on' && target !== 'off') return { text: '/workers probe on|off|show' }
+        const text = await probeRun(async () => {
+          const blocker = await probeLoad()
+          if (blocker) return `probe: blocked — ${blocker}; nothing written.`
+          if (target === 'on' || target === 'off') {
+            const st: ProbeState =
+              target === 'on'
+                ? { on: true, epoch: crypto.randomUUID(), start: await bound.now() }
+                : { ...(probe.state ?? { epoch: '', start: 0 }), on: false }
+            try {
+              await bound.storeSet(probeKey(probe.sid!), st)
+            } catch (error) {
+              return `probe: blocked — ${probeErr('probe store write', error)}; still ${probe.state?.on ? 'on' : 'off'}.`
+            }
+            probe.state = st
+            if (target === 'on') {
+              // A fresh epoch: older epochs leave the file (bounded), de-dup and the loss count reset.
+              probe.lines = []
+              probe.rendered = new Set()
+              probe.errors = 0
+              probe.lastError = ''
+            }
           }
-          probe.state = st
-          if (target === 'on') probe.rendered = new Set()
           return ''
         })
-        if (refused) return { text: `probe: blocked — ${refused}` }
-        if (target === 'on') await probeNote({ kind: 'loaded', version: MOD_VERSION, session: sid, probe: 'on' })
+        if (text) return { text }
+        if (target === 'on') await probeNote({ kind: 'loaded', version: MOD_VERSION, session: sessionId, probe: 'on' })
         return { text: await probeRun(async () => probeShow()) }
       }
       if (verb === 'hide') {

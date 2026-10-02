@@ -3705,15 +3705,27 @@ describe('surface probe (/workers probe)', () => {
   const PROBE = `${ROOT}/sess-test/surfaces.jsonl`
   const kinds = (files: Files) =>
     (files[PROBE] ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l) as { kind: string; epoch: string; surface?: string })
-  const setup = (on: On, files: Files, more: Record<string, string[]> = {}) => {
-    mock.env(on, { HOME })
-    mockStore(on, [], undefined, more)
-    mockClock(on)
-    mockFs(on, files)
+  const setup = (
+    on: On,
+    files: Files,
+    more: Record<string, string[]> = {},
+    opts: { env?: Record<string, string>; unreadable?: Set<string>; storeGet?: () => unknown } = {},
+  ) => {
+    mock.env(on, opts.env ?? { HOME })
+    if (opts.storeGet) {
+      const kv = new Map<string, unknown>()
+      on('store.get', ($, e) => ({ value: kv.has(e.key) ? kv.get(e.key) : opts.storeGet!() }))
+      on('store.set', ($, e) => (kv.set(e.key, e.value), { value: undefined }))
+      on('store.keys', () => ({ value: [...kv.keys()] }))
+      on('store.delete', ($, e) => (kv.delete(e.key), { value: undefined }))
+    } else mockStore(on, [], undefined, more)
+    const clock = mockClock(on)
+    mockFs(on, files, undefined, opts.unreadable)
     mockPanel(on, { running: true, idle_seconds: 5 })
     // Core's floor: both echo `{ clientId }`.
     on('session.attach', ($, e) => ({ clientId: e.clientId }))
     on('session.detach', ($, e) => ({ clientId: e.clientId }))
+    return clock
   }
 
   test('off by default: renders and attaches write nothing', WITH_DRIVER, async ($, on) => {
@@ -3749,26 +3761,32 @@ describe('surface probe (/workers probe)', () => {
       'detach:desktop',
     ])
     expect(text).toContain('"clientId":"desk-1"')
-    expect(text).toContain('last write error: none')
+    expect(text).toContain('lost observations this epoch: 0')
+    expect(text).toContain('this epoch, all lines: loaded×1 · render:terminal×1 · attach:desktop×1 · render:desktop×1 · detach:desktop×1')
   })
 
   test('on, off, on: the second epoch is fresh and show prints only it', WITH_DRIVER, async ($, on) => {
     const files: Files = {}
     setup(on, files)
     await $.session.start(session())
-    await $.command.run(run('workers', 'probe on'))
+    const epochOf = (text?: string) => /· epoch (\S+)/.exec(text ?? '')?.[1]
+    // Render does not wait for the probe; a show runs after the queued writes.
+    const flush = () => $.command.run(run('workers', 'probe show'))
+    const first = epochOf((await $.command.run(run('workers', 'probe on'))).text)
     await $.ui.render(bandRender())
+    await flush()
+    expect(kinds(files).map(l => l.kind)).toEqual(['loaded', 'render'])
     await $.command.run(run('workers', 'probe off'))
     await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    await flush()
+    expect(kinds(files).map(l => l.kind), 'nothing while off').toEqual(['loaded', 'render'])
     await $.command.run(run('workers', 'probe on'))
     await $.ui.render(bandRender())
     const text = (await $.command.run(run('workers', 'probe show'))).text
-    const lines = kinds(files)
-    const [first, second] = [...new Set(lines.map(l => l.epoch))]
-    expect(second, 'a new epoch').toBeDefined()
-    expect(lines.filter(l => l.epoch === first).map(l => l.kind)).toEqual(['loaded', 'render'])
-    expect(lines.filter(l => l.epoch === second).map(l => l.kind), 'render de-dup reset; nothing while off').toEqual(['loaded', 'render'])
-    expect(text).toContain(`epoch ${second}`)
+    const second = epochOf(text)
+    expect(second).toBeDefined()
+    expect(second).not.toEqual(first)
+    expect(kinds(files).map(l => `${l.epoch === second ? 'new' : 'old'}:${l.kind}`), 'render de-dup reset; old epoch gone').toEqual(['new:loaded', 'new:render'])
     expect(text).not.toContain(first!)
   })
 
@@ -3787,10 +3805,79 @@ describe('surface probe (/workers probe)', () => {
     const off = await drawn()
     const text = (await $.command.run(run('workers', 'probe on'))).text
     // The engine wraps a hook's throw; the line names the probe step and the error class.
-    expect(text).toMatch(/last write error: probe write: \w*Error: /)
-    expect(text).not.toContain('last write error: none')
+    expect(text).toMatch(/lost observations this epoch: 1 \(last: probe write: \w*Error: .*\) — an absence below is not proof/)
     expect(await drawn(), 'the draw path is untouched').toEqual(off)
     expect(files[PROBE]).toBeUndefined()
+  })
+
+  test('Sol F1: a jsonl that is there but unreadable is a named blocker, and is never rewritten', WITH_DRIVER, async ($, on) => {
+    const old = `${JSON.stringify({ epoch: 'e1', kind: 'render', surface: 'desktop' })}\n`
+    const files: Files = { [PROBE]: old }
+    setup(on, files, { 'probe:sess-test': { on: true, epoch: 'e1', start: 0 } as unknown as string[] }, { unreadable: new Set([PROBE]) })
+    await $.session.start(session())
+    await $.session.attach({ surface: 'desktop', clientId: 'desk-1' })
+    expect((await $.command.run(run('workers', 'probe show'))).text).toMatch(/^probe: blocked — probe read \/h\/.*surfaces\.jsonl: \w*Error: /)
+    expect((await $.command.run(run('workers', 'probe on'))).text).toContain('probe: blocked — probe read')
+    expect(files[PROBE], 'the old evidence is untouched').toEqual(old)
+  })
+
+  test('Sol F2: a lost render stays counted after a later write lands', WITH_DRIVER, async ($, on) => {
+    let writes = 0
+    const files: Files = new Proxy({} as Files, {
+      set(t, k, v) {
+        if (k === PROBE && ++writes === 2) throw new Error('EIO: once')
+        return Reflect.set(t, k, v)
+      },
+    })
+    setup(on, files)
+    await $.session.start(session())
+    await $.command.run(run('workers', 'probe on'))
+    await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    await $.session.attach({ surface: 'desktop', clientId: 'desk-1' })
+    const text = (await $.command.run(run('workers', 'probe show'))).text
+    expect(text).toContain('this epoch, all lines: loaded×1 · attach:desktop×1')
+    expect(text).toMatch(/lost observations this epoch: 1 \(last: probe write: \w*Error: .*\) — an absence below is not proof/)
+    // A fresh epoch clears the count, and the surface is recorded again.
+    await $.command.run(run('workers', 'probe on'))
+    await $.ui.render(bandRender(40, 39, 80, 'desktop'))
+    expect((await $.command.run(run('workers', 'probe show'))).text).toContain('lost observations this epoch: 0')
+  })
+
+  test('Sol F3: show names a missing prerequisite instead of reading off', WITH_DRIVER, async ($, on) => {
+    setup(on, {}, {}, { env: {} })
+    await $.session.start(session())
+    expect((await $.command.run(run('workers', 'probe show'))).text).toBe(
+      'probe: blocked — no state root: TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset (prerequisite); nothing written.',
+    )
+  })
+
+  test('Sol F4: a failed store read binds nothing; once storage answers, on records', WITH_DRIVER, async ($, on) => {
+    let broken = true
+    const files: Files = {}
+    setup(on, files, {}, { storeGet: () => { if (broken) throw new Error('EIO: store'); return undefined } })
+    await $.session.start(session())
+    await $.ui.render(bandRender())
+    expect((await $.command.run(run('workers', 'probe on'))).text).toMatch(/^probe: blocked — probe store read: \w*Error: /)
+    broken = false
+    const text = (await $.command.run(run('workers', 'probe on'))).text
+    expect(text).toContain(`file: ${PROBE}`)
+    expect(kinds(files).map(k => k.kind)).toEqual(['loaded'])
+  })
+
+  test('Sol F6: a fresh on keeps only its own epoch in the file; an epoch over the cap stops with a capacity blocker', WITH_DRIVER, async ($, on) => {
+    const files: Files = {}
+    setup(on, files)
+    await $.session.start(session())
+    await $.command.run(run('workers', 'probe on'))
+    for (let i = 0; i < 3; i++) await $.session.attach({ surface: 'desktop', clientId: `d${i}` })
+    await $.command.run(run('workers', 'probe on'))
+    const lines = kinds(files)
+    expect(new Set(lines.map(l => l.epoch)).size, 'older epochs leave the file').toBe(1)
+    expect(lines.map(l => l.kind)).toEqual(['loaded'])
+    // Over the cap: one attach with a client id near 1 MiB is refused, and named.
+    await $.session.attach({ surface: 'desktop', clientId: 'x'.repeat(1 << 20) })
+    expect((await $.command.run(run('workers', 'probe show'))).text).toContain('lost observations this epoch: 1 (last: probe capacity: this epoch is over 1048576 bytes')
+    expect(kinds(files).map(l => l.kind)).toEqual(['loaded'])
   })
 
   test("another session's probe is its own: its on state neither shows nor writes here", WITH_DRIVER, async ($, on) => {
