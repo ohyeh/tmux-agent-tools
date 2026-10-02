@@ -10,8 +10,11 @@ cursor 等沒有這個 mod 的 runtime。
 
 ## 前置條件
 
-- **function hooks 要開**：`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`。沒開的話這個
-  plugin 不會載入，`assign` 工具不會出現。
+- **Claude Code 2.1.287 以上**：mod 預設開啟，不用設 env（claude.dev getting-started，
+  2026-10-01：「Claude Code 2.1.287 or later. Mods are on by default」；本機 settings 已設
+  env，預設值未在本機驗證）。
+- **更舊的版本**：要設 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`。沒設的話這個 plugin 不會
+  載入，`assign` 工具不會出現。
 - state root 必須是絕對路徑（見下）。
 
 ## 安裝

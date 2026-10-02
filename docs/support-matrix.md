@@ -75,9 +75,15 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| Mod | write + read | UNCONFIRMED | No run exists. `CHANGELOG.md` (0.5.0 entry) says the panel band is terminal-only. To close: load the mod in the desktop Code tab, run assign and deliver, record the transcript. |
+| Mod | write + read | UNCONFIRMED | GA 2.1.287, awaiting live run. `types/claude-code.d.ts` (2.1.287) lists a `desktop` surface whose table has `Input`, and says `AbovePrompt` is "Raised on the terminal and desktop surfaces only". `tests/register.test.ts` ("desktop draws the band like the terminal") draws the band on `desktop`. To close: Part B1 of `$R/runbook-B.md`. |
 | MCP | write + read | UNCONFIRMED | No run exists. To close: same as the terminal MCP action, in the desktop host. |
 | Paste | read + write | not applicable | Paste needs a tmux pane that runs a known CLI. With no such pane the collector pastes nothing (`skills/tmux-agent-tools/scripts/lib/collector.node.ts:135`, `no known CLI ... nothing pasted`). Use the MCP path. |
+
+## Claude Code, mobile app (Remote Control)
+
+| Path | Op | Status | Evidence, or blocker and action |
+|---|---|---|---|
+| Mod | render + press | UNCONFIRMED | `types/claude-code.d.ts` (2.1.287): `RenderSurface` has `mobile`; its element table has no `Input` or `Select`; `AbovePrompt` is raised on terminal and desktop only. The 2.1.287 docs say Remote Control draws only in the local terminal. To close: Part B2 of `$R/runbook-B.md`. |
 
 ## Operating systems
 

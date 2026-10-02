@@ -484,8 +484,9 @@ export const register: Register = on => {
     const below = await next(e)
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
-    // The band is terminal-only, so Input is always here; the guard keeps the
-    // union type honest without a cast.
+    // AbovePrompt is raised on the terminal and desktop only (claude-code.d.ts,
+    // 2.1.287); both tables carry Input. The guard keeps the union type honest
+    // without a cast.
     const Input = 'Input' in elements ? elements.Input : undefined
     const width = e.props.bodyColumns
     // Rows the band may take, less the list: the mirror is the tail that fits.
