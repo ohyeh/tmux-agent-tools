@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.44.1 - 2026-10-02
+
+- Fix (mod panel): the folded other-session line read `運行中 0：@883d8295 1` (lead count = running rows, per-holder counts = all rows). It now prints both: `運行中 0/共 1：@883d8295 1`.
+- Fix (mod `assign` tool): the description said a 4-character `-` suffix (`review-k3x9`); the name gets `.` plus 5 base36 characters (`review.k3x9a`).
+
 ## v0.44.0 - 2026-10-02
 
 - Breaking (packaging): the marketplace lists two plugins again, as before 0.42.0. `tmux-agent-tools` (source `./`) carries the skills, the standalone TUI, the wrappers, the Bash dispatch gate and, for Codex and Cursor, the MCP server; `tmux-agent` (source `./mods/tmux-agent`) carries the Claude Code function-hook mod only. The `tmux-agent` id is unchanged, so its tools, waiter type and delivery marks carry over on update. Codex and Cursor manifests are named `tmux-agent-tools` again. Claude Code with the global skill needs only `tmux-agent` (no duplicate skill). Migration in README.
