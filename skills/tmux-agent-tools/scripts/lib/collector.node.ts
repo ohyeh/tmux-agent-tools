@@ -52,6 +52,7 @@ export async function paneAlive(pane: string, env: NodeJS.ProcessEnv = process.e
 
 const COMPOSER_STATES = ['empty', 'draft', 'busy', 'permission', 'shell', 'unknown'] as const
 export type Composer = { state: (typeof COMPOSER_STATES)[number]; text: string; why?: string }
+// Run as `zsh <path>`, never a #! exec: see wrapperCall in workers.ts (kernel leak).
 const AGENT_TMUX = fileURLToPath(new URL('../agent-tmux', import.meta.url))
 const SETTLE_MS = 3_000
 
@@ -64,7 +65,7 @@ export async function composerState(pane: string, cli: string, env: NodeJS.Proce
   const sock = env.TMUX_AGENT_TMUX_SOCKET ?? (await serverSocket(pane, env))
   if (sock) env = { ...env, TMUX_AGENT_TMUX_SOCKET: sock }
   const r = await new Promise<{ code: number; out: string; err: string }>(resolve =>
-    execFile(AGENT_TMUX, [cli, 'composer-state', '--pane', pane], { env, timeout: 2 * TMUX_MS, encoding: 'utf8' }, (error, stdout, stderr) =>
+    execFile('zsh', [AGENT_TMUX, cli, 'composer-state', '--pane', pane], { env, timeout: 2 * TMUX_MS, encoding: 'utf8' }, (error, stdout, stderr) =>
       resolve({ code: error ? (typeof error.code === 'number' ? error.code : -1) : 0, out: stdout, err: stderr || (error ? String(error) : '') }),
     ),
   )

@@ -126,6 +126,12 @@ type RunResult = { value: { exitCode: number; stdout: string; stderr: string; is
  * the ledger's own steps are answered by `mockFs`'s map first, then the test's hook,
  * registered with `onRun`, answers everything else.
  */
+/**
+ * With no PATH (this harness), the core runs a bare `agent-tmux` as
+ * `zsh -f -c <resolve> agent-tmux …` (zshRun); the fake answers the command it stands for.
+ */
+const unwrapZsh = (argv: readonly string[]): readonly string[] =>
+  argv[0] === 'zsh' && argv[1] === '-f' && argv[2] === '-c' && argv[4] === 'agent-tmux' ? argv.slice(4) : argv
 const runState = new WeakMap<On, { ledger?: (argv: readonly string[]) => RunResult | undefined; hook?: Hook<'process.run'> }>()
 function runOf(on: On) {
   let st = runState.get(on)
@@ -133,7 +139,10 @@ function runOf(on: On) {
     const state: { ledger?: (argv: readonly string[]) => RunResult | undefined; hook?: Hook<'process.run'> } = {}
     st = state
     runState.set(on, state)
-    on('process.run', ($, e, next) => state.ledger?.(e.argv) ?? (state.hook ? state.hook($, e, next) : next(e)))
+    on('process.run', ($, e, next) => {
+      const run = { ...e, argv: unwrapZsh(e.argv) }
+      return state.ledger?.(run.argv) ?? (state.hook ? state.hook($, run, next) : next(e))
+    })
   }
   return st
 }
@@ -1426,8 +1435,9 @@ describe('assign', () => {
 
     expect(JSON.stringify(out)).toContain('launch requested')
     const launch = argvs.find(a => a[0] === 'sh')?.join(' ') ?? ''
-    // Nothing else in the launch names this path: it is argv[0].
+    // The interpreter precedes the quoted script path, also in detached launches.
     expect(launch).toContain(bin)
+    expect(launch).toContain(`'zsh' '${bin}'`)
   })
 
   test('agent-tmux nowhere: assign is denied with where it looked, before anything is written', WITH_DRIVER, async ($, on) => {

@@ -78,10 +78,10 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
     # name (a hex of a long id passed NAME_MAX), never . or ..
     id_bytes() { printf '%s' "$IN" | jq -j '.tool_use_id'; }
     if command -v sha256sum >/dev/null 2>&1; then h="$(id_bytes | sha256sum)"
-    else h="$(id_bytes | shasum -a 256 2>/dev/null)"; fi
+    else h="$(id_bytes | openssl dgst -sha256 -r 2>/dev/null)"; fi
     h="${h%% *}"
     # A failed or missing digest would leave every id on one marker `id-`.
-    printf '%s' "$h" | grep -Eq '^[0-9a-f]{64}$' || unrecorded "no sha256 digest (sha256sum or shasum)"
+    printf '%s' "$h" | grep -Eq '^[0-9a-f]{64}$' || unrecorded "no sha256 digest (sha256sum or openssl)"
     seen="$STATE_DIR/seen/id-$h"
     mkdir -p "$STATE_DIR/seen"
     if mkdir "$seen" 2>/dev/null; then

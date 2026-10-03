@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for the start-time readiness poll: transient startup screens
 # (blocked_reason=startup_pending, e.g. agy "Verifying your account
 # eligibility") must delay the initial prompt injection until they clear,

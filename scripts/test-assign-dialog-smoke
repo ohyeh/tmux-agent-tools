@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for two assign defects seen live on 2026-09-25 (tmux-agent mod 0.7.6 e2e):
 #
 #  1. A workspace-trust dialog drawn AFTER assign sent the brief ate it (agy,

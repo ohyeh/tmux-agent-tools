@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke for tmux-agent-commander (SPEC.md §Tests).
 # Five cases, each with an explicit assertion:
 #   1. assign publishes the v5 descriptor (owner = session) before the launch
@@ -29,7 +30,6 @@ unset CURSOR_TMUX_PREFIX GROK_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 # macOS socket paths top out near 104 bytes. This is tmux's own default socket
 # under TMUX_TMPDIR, so a client that only has the dir still hits this server.
 # $TMUX outranks the dir, so every call also passes -S and the child env drops it.
-export TMUX_TMPDIR="/tmp/tcmd-$$"
 REAL_TMUX="$(command -v tmux)"
 export TMUX_AGENT_TMUX_SOCKET="$TMUX_TMPDIR/tmux-$(id -u)/default"
 # Direct smoke calls. Commander and the fake agent-tmux still exec plain tmux;
@@ -62,8 +62,7 @@ cleanup() {
   if [[ -n "${TIMER_PID:-}" ]]; then
     kill "$TIMER_PID" 2>/dev/null || true
   fi
-  private_tmux kill-server 2>/dev/null || true
-  rm -rf "$WORK" "$TMUX_TMPDIR"
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -406,6 +405,7 @@ assert "start sets per-session status 2" "$ST_STATUS" "2"
 ST_INT="$(private_tmux show-options -t "$SSESSION" -v status-interval)"
 assert "start sets per-session status-interval 2" "$ST_INT" "2"
 ST_FMT="$(private_tmux show-options -t "$SSESSION" -v 'status-format[1]')"
+assert_contains "start status line uses explicit zsh" "$ST_FMT" "#(zsh "
 assert_contains "start status line runs panel" "$ST_FMT" " panel "
 assert_contains "start status line quotes the session" "$ST_FMT" "'$SSESSION'"
 assert_contains "start status line names this script" "$ST_FMT" "tmux-agent-commander"

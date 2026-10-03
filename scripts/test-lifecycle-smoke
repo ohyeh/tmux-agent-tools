@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for the wrapper-owned terminal envelope + append-only launch
 # ledger (agent-tmux-lifecycle spec). Covers the happy path AND the failure
 # paths the spec calls out: stop with no result, ledger-less state dirs, and

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.44.6 - 2026-10-03
+
+- Fix (dashboard, detached workers): run the sessions inventory and detached `assign` through explicit zsh, including the mod's core copy, so these paths do not execute a shell shebang below a tainted parent.
+- Fix (hashing, macOS): use binary `sha256sum` or `openssl dgst -sha256 -r` for worker, audit, monitor, and dispatch hashes. The Perl `shasum` launcher no longer runs in these production paths.
+- Fix (commander, sessions, fanout, dialogue, teams, plugins): run repeated owned shell helpers with their interpreter, including the commander's two-second status line and plugin hook/MCP entry points.
+- Fix (smoke teardown): keep smoke and contract sockets below their run directory, handle EXIT/INT/TERM/HUP, and sweep every job socket before runner cleanup. Standalone smokes also use private servers; the socket guard rejects directory escapes.
+
+- Fix (core, mod, TUI, MCP; macOS kernel memory): the core ran `agent-tmux` as a `#!` exec on every tick (status, composer-state, result). On macOS, once any ancestor ran as a `#!` script (a tmux server that `agent-tmux` started, `cursor-agent`), each `#!` exec below it leaks ~1 KB of kernel memory (zone `data.kalloc.1024`) until reboot; orphaned TUI e2e runs polling `agent-tmux` grew it to ~8 GB on one host. `wrapperCall` and `composerState` now run it as `zsh <path>` (the PATH entry is resolved to its file; the panel still shows `agent-tmux`). Live `zprint`, 600 calls under a `#!`-launched node: +702K before, -31K after.
+
 ## v0.44.5 - 2026-10-02
 
 - Fix (core root, TUI): the mod launches the wrapper with `TMUX_AGENT_DIR=<root>/.v3` (the wrapper's agent dir). When that launch starts the tmux server, the server keeps the value in its global environment, and every pane inherits it; the core read it as the root and looked in `<root>/.v3/.v3`. So a `tmux-agent-tui` (or `workers.cli rows`, the launcher) opened in tmux showed no worker, only project-session rows. `rootOf` now reads a value that ends in `/.v3` as its parent. A contract case fails on 0.44.4. Leftover `<root>/.v3/.v3/` dirs from earlier runs are not touched.
@@ -194,6 +203,8 @@
 - An orphan whose current episode is already acknowledged (by any session) is not claimed: it has nothing left to deliver, and claiming it only moved `owner` away from the session that dispatched it (the five above were all delivered). A `tell` starts a new episode, which is claimable again. Mod tests 153 pass; the new test fails without the guard.
 
 ## Unreleased
+
+## v0.44.6 - 2026-10-03
 
 - `agent-tmux status --json`: `last_change_at` / `idle_seconds` no longer count what a CLI redraws below its composer line — claude's statusline, cursor's usage countdown and `git:(main ↑1)`, codex's context meter. Live 2026-09-26 cursor's footer reset the idle clock every hour and on every commit in the worker's repo, so a delivered worker never sat idle 30 min and the mod's auto-stop (Q-1, 2026-09-25) never fired: finished workers piled up in `tmux ls` since 12:48. The hash now covers the pane down to and including the composer line (output above it and typing into it still count), found with the same rules as the prompt area (`PROMPT_BOUNDARY_AWK`, one copy), and only when that line is among the last 12 non-empty lines; otherwise the whole pane, as before. `test-liveness-smoke` gains three cases (a footer-only redraw stays idle; a change above the composer is activity; a `> ` quote high in the output is not a composer), 39 pass; the footer case fails with the whole-pane hash put back. Expect every worker's idle clock to restart once after the update (new hash).
 

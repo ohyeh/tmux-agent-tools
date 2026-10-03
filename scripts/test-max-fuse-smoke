@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for issue #105 safety fuses (--max-runtime / --max-idle).
 #
 # Exercises the actual agent-tmux claude / codex engines with fake CLIs so

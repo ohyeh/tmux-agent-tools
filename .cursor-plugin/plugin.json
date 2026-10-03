@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.44.5",
+  "version": "0.44.6",
   "description": "Cursor plugin exposing the tmux-agent-tools skill: run Claude Code or Codex CLI as controllable, supervised tmux sessions with an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, approval gates, and multi-agent pair/team orchestration.",
   "author": {
     "name": "PaulYeh",
@@ -21,7 +21,8 @@
   "skills": "./skills/",
   "mcpServers": {
     "tmux-agent": {
-      "command": "${CURSOR_PLUGIN_ROOT}/skills/tmux-agent-tools/scripts/tmux-agent-mcp"
+      "command": "zsh",
+      "args": ["${CURSOR_PLUGIN_ROOT}/skills/tmux-agent-tools/scripts/tmux-agent-mcp"]
     }
   }
 }

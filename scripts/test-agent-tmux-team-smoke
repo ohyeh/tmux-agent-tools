@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for `agent-tmux team` (PR B): list, workers/lead, rm-refusal
 # while live, stop then rm, team-stop self-guard, mixed-CLI member dispatch.
 

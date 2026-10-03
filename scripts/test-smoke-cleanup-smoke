@@ -1,0 +1,63 @@
+#!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+set -euo pipefail
+SCRIPT_DIR="${0:A:h}"
+WORK="$(mktemp -d "$TMPDIR/cleanup.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+PASS=0
+FAIL=0
+
+cat > "$WORK/fixture" <<'EOF'
+#!/usr/bin/env zsh
+source "$SMOKE_HELPER"
+smoke_socket child
+tmux -S "$REPLY" new-session -d -s child 'sleep 60'
+print -r -- "$REPLY" > "$SOCKET_RECORD"
+if [[ "$MODE" == kill ]]; then kill -KILL $$; fi
+if [[ "$MODE" == exit ]]; then exit 0; fi
+while :; do sleep 0.1; done
+EOF
+chmod +x "$WORK/fixture"
+export SMOKE_HELPER="$SCRIPT_DIR/lib/smoke-tmux.sh"
+export SOCKET_RECORD="$WORK/socket"
+
+check_gone() {
+  local label="$1" socket="$2" i
+  for i in {1..50}; do
+    if ! "$SMOKE_TMUX_BIN" -S "$socket" has-session 2>/dev/null; then
+      print -r -- "  ok   $label"
+      PASS=$((PASS + 1))
+      return
+    fi
+    sleep 0.1
+  done
+  print -r -- "  FAIL $label"
+  FAIL=$((FAIL + 1))
+}
+
+for mode in exit TERM INT HUP; do
+  rm -f "$SOCKET_RECORD"
+  child_dir="$(mktemp -d "$TMPDIR/child.XXXXXX")"
+  MODE="$mode" TAS_JOB_DIR="$child_dir" zsh "$WORK/fixture" &
+  pid=$!
+  for i in {1..100}; do [[ -s "$SOCKET_RECORD" ]] && break; sleep 0.05; done
+  [[ -s "$SOCKET_RECORD" ]] || { kill "$pid" 2>/dev/null || true; echo 'fixture did not start'; exit 1; }
+  socket="$(cat "$SOCKET_RECORD")"
+  if [[ "$mode" != exit ]]; then kill -"$mode" "$pid"; fi
+  wait "$pid" 2>/dev/null || true
+  check_gone "$mode removes the registered server" "$socket"
+done
+
+# SIGKILL cannot run a trap. The runner must find the socket before deleting it.
+MODE=kill zsh "$SCRIPT_DIR/run-all-smokes" "$WORK/fixture" > "$WORK/runner.out" 2>&1 && code=0 || code=$?
+if [[ "$code" == 1 ]]; then
+  print -r -- '  ok   runner reports the killed smoke as failed'
+  PASS=$((PASS + 1))
+else
+  cat "$WORK/runner.out"
+  print -r -- "  FAIL runner exit $code"
+  FAIL=$((FAIL + 1))
+fi
+check_gone 'runner removes the SIGKILL orphan' "$(cat "$SOCKET_RECORD")"
+print -r -- "smoke-cleanup: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

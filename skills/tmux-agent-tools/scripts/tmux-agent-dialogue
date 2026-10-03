@@ -340,8 +340,9 @@ start_fake_agent() {
 # which supports any
 # CLI — claude, codex, agy, and any future coding-agent CLI — with zero
 # per-CLI code, matching how the rest of the suite generalized. Returns the
-# command as two array elements (engine path + cli) for safe quoting.
+# command as array elements (interpreter, engine path, cli) for safe quoting.
 engine_cmd_for_agent() {
+  print -r -- zsh
   print -r -- "$SCRIPT_DIR/agent-tmux"
   print -r -- "$1"
 }
@@ -425,7 +426,7 @@ send_to_agent() {
   if [[ "$agent" == "fake" ]]; then
     "$TMUX" send-keys -t "$(session_target "$(session_name "$label")")" -- "$message" C-m
   else
-    "$SCRIPT_DIR/agent-tmux" "$agent" send "$(session_name "$label")" "$message"
+    zsh "$SCRIPT_DIR/agent-tmux" "$agent" send "$(session_name "$label")" "$message"
   fi
 }
 
@@ -441,7 +442,7 @@ send_and_wait_for_marker() {
     return
   fi
 
-  "$SCRIPT_DIR/agent-tmux" "$agent" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$(participant_timeout "$label")"
+  zsh "$SCRIPT_DIR/agent-tmux" "$agent" send-wait-literal "$(session_name "$label")" "$message" "$marker" "$(participant_timeout "$label")"
 }
 
 wait_for_marker() {
@@ -463,7 +464,7 @@ wait_for_marker() {
     return 1
   fi
 
-  "$SCRIPT_DIR/agent-tmux" "$agent" wait-literal "$(session_name "$label")" "$marker" "$(participant_timeout "$label")"
+  zsh "$SCRIPT_DIR/agent-tmux" "$agent" wait-literal "$(session_name "$label")" "$marker" "$(participant_timeout "$label")"
 }
 
 capture_agent() {
@@ -473,7 +474,7 @@ capture_agent() {
   if [[ "$agent" == "fake" ]]; then
     "$TMUX" capture-pane -J -t "$(session_target "$(session_name "$label")")" -p -S -1000
   else
-    "$SCRIPT_DIR/agent-tmux" "$agent" capture "$(session_name "$label")" 1000
+    zsh "$SCRIPT_DIR/agent-tmux" "$agent" capture "$(session_name "$label")" 1000
   fi
 }
 
@@ -494,7 +495,7 @@ agent_session_exists() {
     return
   fi
 
-  "$SCRIPT_DIR/agent-tmux" "$agent" status "$(session_name "$label")" >/dev/null 2>&1
+  zsh "$SCRIPT_DIR/agent-tmux" "$agent" status "$(session_name "$label")" >/dev/null 2>&1
 }
 
 classify_failure_type() {
@@ -952,7 +953,7 @@ cleanup() {
     for item in "${OWNED_WRAPPERS[@]}"; do
       local agent="${item%%:*}"
       local session="${item#*:}"
-      "$SCRIPT_DIR/agent-tmux" "$agent" stop "$session" >/dev/null 2>&1 || true
+      zsh "$SCRIPT_DIR/agent-tmux" "$agent" stop "$session" >/dev/null 2>&1 || true
     done
   fi
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for `stats` aggregation, canonical status reads, and the
 # launch-meta.json written at start (usage-survey rec 1+7).
 

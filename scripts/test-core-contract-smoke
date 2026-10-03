@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # The shared core (skills/tmux-agent-tools/scripts/lib/workers.ts) is run by plain
 # node for every non-Claude host, so its contract is tested by plain node against
 # an in-memory Host. The files are `*.contract.node.ts`, not `*.test.ts`: `claude plugin
@@ -17,12 +18,7 @@ export PATH="$PWD/..:$PATH"
 # 8 `claude-cli-orphan-w.*` sessions on the user's server) reaches only this one.
 # $TMUX outranks TMUX_TMPDIR, so unset it too.
 unset TMUX TMUX_PANE
-# /tmp, not $TMPDIR: macOS $TMPDIR makes the socket path longer than tmux allows.
-export TMUX_TMPDIR="$(mktemp -d /tmp/tas-core.XXXXXX)"
-# Every temp repo a test makes lands here too, so the trap removes it (one run left ~200
-# `tui-*-repo-*` dirs in the user's $TMPDIR).
-export TMPDIR="$TMUX_TMPDIR/tmp"; mkdir "$TMPDIR"
-trap 'tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null || true; rm -rf "$TMUX_TMPDIR"' EXIT
+# The sourced helper puts contract temp files and every socket below the job dir.
 
 floor=22.18.0
 have="$(node -p 'process.versions.node')"

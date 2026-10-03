@@ -384,14 +384,15 @@ export const AGENT_TMUX_HOMES = [
  * so the fallback is logged once. A miss is looked up again, so an install
  * mid-session is picked up.
  */
-export const agentTmuxFound = new Map<string, string>()
+export const agentTmuxFound = new Map<string, { bin: string; shown: string }>()
 /** The last one found, for text shown to the person (the panel renders synchronously). */
 export let agentTmuxShown = 'agent-tmux'
 
 /**
- * `agent-tmux` as argv[0]: the bare name when PATH has it (a developer's own
- * checkout wins), else the first install that exists. `missing` lists where it
- * looked, so the tool that fails can say so to the model.
+ * The `agent-tmux` file to run: the one on PATH (a developer's own checkout
+ * wins; shown as the bare name), else the first install that exists. A path,
+ * so wrapperCall can run it as `zsh <path>`. `missing` lists where it looked,
+ * so the tool that fails can say so to the model.
  */
 export async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?: string }> {
   const pathVar = await host.envPath()
@@ -400,18 +401,22 @@ export async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?:
   const home = await host.envHome()
   const key = `${home}\0${pathVar}`
   const found = agentTmuxFound.get(key)
-  if (found) return { bin: (agentTmuxShown = found) }
+  if (found) {
+    agentTmuxShown = found.shown
+    return { bin: found.bin }
+  }
   const has = (path: string) => host.exists(path).catch(() => false)
   for (const dir of pathVar.split(':').filter(Boolean)) {
     if (await has(`${dir}/agent-tmux`)) {
-      agentTmuxFound.set(key, 'agent-tmux')
-      return { bin: (agentTmuxShown = 'agent-tmux') }
+      agentTmuxFound.set(key, { bin: `${dir}/agent-tmux`, shown: 'agent-tmux' })
+      agentTmuxShown = 'agent-tmux'
+      return { bin: `${dir}/agent-tmux` }
     }
   }
   const paths = home ? AGENT_TMUX_HOMES.map(rel => `${home}/${rel}`) : []
   for (const path of paths) {
     if (await has(path)) {
-      agentTmuxFound.set(key, path)
+      agentTmuxFound.set(key, { bin: path, shown: path })
       host.log(`tmux-agent: agent-tmux is not on PATH; using ${path}`)
       return { bin: (agentTmuxShown = path) }
     }
@@ -436,6 +441,18 @@ export async function runnableCwd(host: Host, cwd: string): Promise<string> {
 }
 
 /**
+ * argv that runs one of this repo's zsh scripts with zsh, never as a #! exec: on
+ * macOS, once any ancestor ran as a #! script (a tmux server agent-tmux started,
+ * cursor-agent), each #! exec below it leaks ~1 KB of kernel memory
+ * (data.kalloc.1024) until reboot. A bare name is found by the child's own PATH
+ * at run time, so no install location is assumed; the lookup shell reads no
+ * startup files (-f), so the script's zsh reads zshenv once, as a #! exec did.
+ */
+export function zshRun(bin: string): string[] {
+  return bin.includes('/') ? ['zsh', bin] : ['zsh', '-f', '-c', 'p=$(whence -p -- "$0") || exit 127; exec zsh "$p" "$@"', bin]
+}
+
+/**
  * Every `agent-tmux` call the core makes, as a binding runs it: the resolved binary,
  * and TMUX_AGENT_DIR = the v5 root, so the wrapper's per-worker dir IS the ledger's
  * worker dir (contract §2). One seam; the mod and the node host both bind through it.
@@ -443,7 +460,8 @@ export async function runnableCwd(host: Host, cwd: string): Promise<string> {
 export async function wrapperCall(host: Host, argv: readonly string[]): Promise<{ argv: readonly string[]; env?: Record<string, string> }> {
   if (argv[0] !== 'agent-tmux') return { argv }
   const root = await rootOf(host)
-  return { argv: [(await agentTmuxBin(host)).bin, ...argv.slice(1)], ...(root ? { env: { TMUX_AGENT_DIR: v3Of(root) } } : {}) }
+  const { bin } = await agentTmuxBin(host)
+  return { argv: [...zshRun(bin), ...argv.slice(1)], ...(root ? { env: { TMUX_AGENT_DIR: v3Of(root) } } : {}) }
 }
 
 /**
@@ -3465,7 +3483,7 @@ export async function assignWorker(
     // The launch must outlive the host (a host killed with its process group would
     // take a backgrounded child with it, before the brief is sent or launch.exit is
     // written): a node `spawn` puts it in its own session; macOS has no `setsid`.
-    const argv = [tool.bin, input.profile, 'assign', '--detach', '--result-path', ep.resultPath, '--episode', '1', name, input.dir, briefPath]
+    const argv = [...zshRun(tool.bin), input.profile, 'assign', '--detach', '--result-path', ep.resultPath, '--episode', '1', name, input.dir, briefPath]
     const child = `TMUX_AGENT_DIR=${shq(v3)} ${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
     const run = await host.run(['sh', '-c', DETACH_LAUNCH, 'sh', child, logPath, exitPath], input.dir, 5_000)
     if (run.exitCode !== 0) {
@@ -3684,4 +3702,3 @@ export async function resumeWorker(host: Host, text: string): Promise<Outcome> {
     text: `resumed ${hit.profile} session ${input.id.slice(0, 8)} as "${name}" in ${where}. It has no task, so nothing wakes you until you give it one: in the TUI select "${name}" and press t (tell).`,
   }
 }
-

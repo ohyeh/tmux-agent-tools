@@ -60,9 +60,9 @@ sanitize_owner() {
 
 agent_tmux() {
   if command -v agent-tmux >/dev/null 2>&1; then
-    command agent-tmux "$@"
+    zsh "$(command -v agent-tmux)" "$@"
   else
-    "$SCRIPT_DIR/agent-tmux" "$@"
+    zsh "$SCRIPT_DIR/agent-tmux" "$@"
   fi
 }
 
@@ -215,7 +215,7 @@ require_tmux_session() {
 # the user focuses would swallow the delivery. A status line is not a pane.
 install_worker_panel() {
   local session="$1" fmt
-  fmt="#(${(qq)SELF} panel ${(qq)session})"
+  fmt="#(zsh ${(qq)SELF} panel ${(qq)session})"
   tmux_cmd set-option -t "$(session_target "$session")" status 2
   tmux_cmd set-option -t "$(session_target "$session")" 'status-format[1]' "$fmt"
   tmux_cmd set-option -t "$(session_target "$session")" status-interval 2
@@ -264,7 +264,7 @@ cmd_start() {
   # agent-tmux drops $TMUX before new-session, so the collector must too.
   # The exported TMUX_AGENT_TMUX_SOCKET keeps it on this server. collect writes the pid file.
   local bgpid i claimed="" detail
-  env -u TMUX nohup "$SELF" collect "$cli" "$name" >>"$log" 2>&1 &
+  env -u TMUX nohup zsh "$SELF" collect "$cli" "$name" >>"$log" 2>&1 &
   bgpid="$!"
   disown "$bgpid" 2>/dev/null || true
   for (( i = 0; i < 200; i++ )); do
@@ -384,7 +384,7 @@ start_collector_from_server() {
   name="${mapped#*$'\n'}"
   log="$root/.commander-$(sanitize_owner "$session").log"
   # tmux expands % and # as formats before /bin/sh sees the command.
-  cmd="env -u TMUX${TMUX_AGENT_TMUX_SOCKET:+ TMUX_AGENT_TMUX_SOCKET=${(qq)TMUX_AGENT_TMUX_SOCKET}} ${(qq)SELF} collect ${(qq)cli} ${(qq)name} >> ${(qq)log} 2>&1"
+  cmd="env -u TMUX${TMUX_AGENT_TMUX_SOCKET:+ TMUX_AGENT_TMUX_SOCKET=${(qq)TMUX_AGENT_TMUX_SOCKET}} zsh ${(qq)SELF} collect ${(qq)cli} ${(qq)name} >> ${(qq)log} 2>&1"
   cmd="${cmd//\%/%%}"
   cmd="${cmd//\#/##}"
   tmux_cmd run-shell -b -t "$(session_target "$session")" "$cmd"

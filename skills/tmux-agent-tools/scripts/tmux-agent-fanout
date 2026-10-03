@@ -211,7 +211,7 @@ SCRIPT_DIR="${0:A:h}"
 # Wrapper command is an array: the unified engine plus the CLI preset
 # (the per-CLI shims are deprecated; removal planned for v0.39).
 wrapper_for() {
-  reply=("$SCRIPT_DIR/agent-tmux" "$1")
+  reply=(zsh "$SCRIPT_DIR/agent-tmux" "$1")
 }
 
 # Test-mode override: when TMUX_AGENT_FANOUT_FAKE_WRAPPER is set, use it

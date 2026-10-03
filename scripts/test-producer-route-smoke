@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for the producer route (workers-core P0 contract v5 §8):
 # `start`/`send --result-path <abs> --episode <n>` tells the worker THIS prompt's
 # result file and episode on every prompt, never touches the once-per-session

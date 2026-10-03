@@ -6,12 +6,37 @@ repo_root="${script_dir:h}"
 # Smokes still exercise the deprecated per-CLI shims until their v0.39 removal;
 # silence the shim deprecation warning so it doesn't pollute captured output.
 export AGENT_TMUX_SUPPRESS_DEPRECATION=1
-"$script_dir/check-tmux-socket-isolation" || exit 1
+node "$script_dir/check-tmux-socket-isolation" || exit 1
 
 unset TMUX TMUX_PANE
 export TMUX_TMPDIR="$(mktemp -d /tmp/tas-main.XXXXXX)"
 scratch_dir="$(mktemp -d /tmp/tas-scratch.XXXXXX)"
-trap '[[ -n "${TMUX_TMPDIR:-}" ]] && env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR" "$scratch_dir"' EXIT
+typeset -a pids=() job_dirs=()
+runner_tmux="$(command -v tmux)"
+kill_job_sockets() {
+  local dir="$1" s
+  [[ -d "$dir" ]] || return 0
+  while IFS= read -r s; do
+    env -u TMUX -u TMUX_PANE "$runner_tmux" -S "$s" kill-server 2>/dev/null || true
+  done < <(find "$dir" -type s)
+}
+runner_cleanup() {
+  local p dir
+  for p in "${pids[@]}"; do
+    pkill -TERM -P "$p" 2>/dev/null || true
+    kill -TERM "$p" 2>/dev/null || true
+    wait "$p" 2>/dev/null || true
+  done
+  for dir in "${job_dirs[@]}" "$TMUX_TMPDIR"; do
+    kill_job_sockets "$dir"
+    rm -rf "$dir"
+  done
+  rm -rf "$scratch_dir"
+}
+trap runner_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 timeout_seconds=240
 kill_after_seconds=15
@@ -75,9 +100,13 @@ run_job() {
   (
     unset TMUX TMUX_PANE
     export TMUX_TMPDIR="$job_dir"
+    export TAS_JOB_DIR="$job_dir"
     local socket="$job_dir/tmux-$(id -u)/default"
     mkdir -p -m 0700 "${socket:h}"
-    trap 'env -u TMUX -u TMUX_PANE tmux -S "$socket" kill-server 2>/dev/null; rm -rf "$job_dir"' EXIT
+    trap 'kill_job_sockets "$job_dir"; rm -rf "$job_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     "$timeout_bin" --kill-after="${kill_after_seconds}s" "${timeout_seconds}s" "$test_file" < /dev/null
   ) > "$out_file" 2>&1
   code=$?
@@ -95,7 +124,6 @@ run_job() {
   printf '%s\t%s\t%d\t%d\t1\n' "$test_name" "$label" "$code" "$duration" > "$meta_file"
 }
 
-typeset -a pids=() job_dirs=()
 typeset -i active_jobs=0
 
 wait_for_slot() {
@@ -129,6 +157,7 @@ done
 for p in "${pids[@]}"; do
   wait "$p" 2>/dev/null || true
 done
+pids=()
 
 typeset -a result_names=() result_labels=() result_codes=() result_durations=() result_attempts=()
 typeset -i overall_failed=0

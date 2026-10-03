@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Wrapper-side Known limits closed by plan R8.4/R8.5 (tui-retro plan §2):
 #   a. name collision: a second start/resume of a live name refuses (a2: also
 #      under another prefix, since every CLI shares <root>/<name>); the first
@@ -25,7 +26,6 @@ COMMANDER="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-commander"
 
 WORK="$(mktemp -d -t tas-limits.XXXXXX)"
 unset TMUX TMUX_PANE TMUX_AGENT_TMUX_SOCKET AGENT_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
-export TMUX_TMPDIR="/tmp/tlim-$$"
 export TMUX_AGENT_DIR="$WORK/state"
 export XDG_CONFIG_HOME="$WORK/xdg"
 export XDG_STATE_HOME="$WORK/xdg-state"
@@ -37,7 +37,8 @@ export AGENT_TMUX_PREFLIGHT_TIMEOUT=5
 export ZDOTDIR="$WORK/zdot"
 REAL_TMUX="$(command -v tmux)"
 SOCK_B="$TMUX_TMPDIR/tmux-$(id -u)/default"
-SOCK_A="$TMUX_TMPDIR/a.sock"
+smoke_socket a
+SOCK_A="$REPLY"
 tmux_a() { command env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$SOCK_A" "$@"; }
 tmux_b() { command env -u TMUX -u TMUX_PANE "$REAL_TMUX" -S "$SOCK_B" "$@"; }
 mkdir -p "$TMUX_AGENT_DIR" "$XDG_CONFIG_HOME" "$AGENT_TMUX_PROFILE_DIR" "$ZDOTDIR" "$WORK/bin" "$WORK/repo" "${SOCK_B:h}"
@@ -51,12 +52,10 @@ cleanup() {
     pkill -P "$p" 2>/dev/null || true
     kill "$p" 2>/dev/null || true
   done
-  tmux_a kill-server 2>/dev/null || true
-  tmux_b kill-server 2>/dev/null || true
   # The collector may still be writing its log while it exits.
   local i
   for (( i = 0; i < 20; i++ )); do
-    rm -rf "$WORK" "$TMUX_TMPDIR" 2>/dev/null && break
+    rm -rf "$WORK" 2>/dev/null && break
     sleep 0.1
   done
 }
