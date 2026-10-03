@@ -197,6 +197,62 @@ export const register: Register = on => {
   let waiterRegisterLogged = false
   const gate: Gate = newGate()
   /**
+   * Worker notices reach the running turn. `$.prompt.submit` is a turn of its own,
+   * once the session is idle, so a worker that finished mid-turn waited for that
+   * turn to end (live 2026-10-03: 20 min). While the main loop's turn runs,
+   * `submit` parks the notice: the next main-loop tool result carries it as
+   * context, or the turn's end submits it. Core acks only on the answer `submit`
+   * resolves, so exactly-once stays in core.
+   */
+  let mainTurn = false
+  type Parked = {
+    text: string
+    at: number
+    prompt: Host['submit']
+    resolve: (answer: Awaited<ReturnType<Host['submit']>>) => void
+    reject: (error: unknown) => void
+  }
+  const parked: Parked[] = []
+  const submitVia = (prompt: Host['submit'], now: () => Promise<number>): Host['submit'] => async text => {
+    if (!mainTurn) return prompt(text)
+    const at = await now()
+    return new Promise((resolve, reject) => parked.push({ text, at, prompt, resolve, reject }))
+  }
+  const hhmm = (ms: number) => new Date(ms).toTimeString().slice(0, 5)
+  /** The notice as delivered: when it was ready and when it reached the session. */
+  const stamped = (p: Parked, now: number) => {
+    const min = Math.floor((now - p.at) / 60_000)
+    return min >= 1 ? `${p.text}\n(ready ${hhmm(p.at)}, delivered ${hhmm(now)}: ${min} min later)` : p.text
+  }
+  // turn.step carries agentId (absent on the main loop) on every model request.
+  on('turn.step', async function* ($, e, next) {
+    if (!e.agentId) mainTurn = true
+    return yield* next(e)
+  })
+  // Every end of a turn (answer, aborted, error, refusal) fires this, so a parked
+  // notice never outlives its turn. It is released before the hooks beneath run:
+  // one of them may await reconcile, whose pass waits on this very submit. The
+  // submit is not awaited here: it resolves once the session is idle, which
+  // waits for this hook.
+  on('turn.complete', async ($, e, next) => {
+    if (!(e as { agentId?: string }).agentId) {
+      mainTurn = false
+      const now = await $.clock.now()
+      for (const p of parked.splice(0)) void p.prompt(stamped(p, now)).then(p.resolve, p.reject)
+    }
+    return next(e)
+  })
+  // Registered before every other tool.call hook, so it wraps their results too.
+  on('tool.call', async ($, e, next) => {
+    const r = await next(e)
+    if ((e as { agentId?: string }).agentId || !parked.length || !r || (r as { deny?: string }).deny !== undefined) return r
+    const now = await $.clock.now()
+    const items = parked.splice(0)
+    for (const p of items) p.resolve({})
+    const done = r as { context?: readonly string[] }
+    return { ...r, context: [...(done.context ?? []), items.map(p => stamped(p, now)).join('\n\n')] } as typeof r
+  })
+  /**
    * `/workers probe on|off|show`: which surfaces this session's band reaches, for the
    * desktop and mobile live runs (plan-app-surfaces A1). Off unless turned on; the
    * on/off state and epoch live in `$.store` per session id, the events in
@@ -386,7 +442,7 @@ export const register: Register = on => {
       storeSet: (key, value) => beneath.store.set(key, value),
       storeKeys: () => beneath.store.keys(),
       storeDelete: key => beneath.store.delete(key),
-      submit: text => beneath.prompt.submit({ text }),
+      submit: submitVia(text => beneath.prompt.submit({ text }), () => beneath.clock.now()),
       toast: text => beneath.ui.toast(text),
       log: text => beneath.ui.log(engineLine(text)),
       run: async (argv, cwd, timeoutMs) => {
@@ -457,7 +513,7 @@ export const register: Register = on => {
       storeSet: (key, value) => $.store.set(key, value),
       storeKeys: () => $.store.keys(),
       storeDelete: key => $.store.delete(key),
-      submit: text => $.prompt.submit({ text }),
+      submit: submitVia(text => $.prompt.submit({ text }), () => $.clock.now()),
       toast: text => $.ui.toast(text),
       log: text => $.ui.log(engineLine(text)),
       run: async (argv, cwd, timeoutMs) => {

@@ -1,5 +1,5 @@
 import type { Hook, On } from 'claude-code'
-import { describe, expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { driver, run, turn } from './fixtures/driver'
 
@@ -5440,5 +5440,122 @@ describe('resume', () => {
     const out = JSON.stringify(await $.tool.call(assignInput()))
     expect(out).toMatch(/"tmux-agent: could not reserve /)
     expect(out.split('tmux-agent:').length - 1, 'prefix exactly once').toEqual(1)
+  })
+})
+
+/**
+ * Worker notices reach the running turn (notice-midturn-design.md): `prompt.submit`
+ * waits for the session to go idle, so while a main-loop turn runs the notice rides
+ * the next main-loop tool result as context; the turn's end submits what is left.
+ */
+describe('mid-turn delivery', () => {
+  const POLL = 10_000
+  /** Nothing beneath the plugins answers a model request or Read in a test: the floor. */
+  const floor = (on: On) => {
+    on('turn.step', async function* () {
+      return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'end_turn' } as never
+    })
+    on('tool.call', { tool: 'Read' }, () => ({ result: 'file text' }) as never)
+  }
+  /** One model request of the turn; `agentId` makes it a subagent's. */
+  const step = async ($: Engine, agentId?: string) => {
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1, ...(agentId ? { agentId } : {}) } as never)) void _
+  }
+  const read = (agentId?: string) => ({ tool: 'Read', file_path: '/x', ...(agentId ? { agentId } : {}) }) as never
+  const contextOf = (r: unknown) => ((r as { context?: readonly string[] }).context ?? []).join('\n')
+
+  test('a result that lands mid-turn rides the next main-loop tool result, not a new turn', async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    const files = { ...worker('w1', 0) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    floor(on)
+    mockSessionStart(on)
+    await $.session.start(session())
+    await step($)
+    files[`${V3}/w1/result.json`] = finished()
+    await clock.advance(POLL)
+    expect(woken, 'no turn of its own while the turn runs').toEqual([])
+
+    expect(contextOf(await $.tool.call(read('sub-1'))), 'a subagent never carries it').toEqual('')
+    const r = await $.tool.call(read())
+    expect(contextOf(r)).toContain('"w1" on codex: success')
+    expect(contextOf(r)).toContain('<worker-output')
+    await clock.settle()
+    expect(store.acked()).toEqual(['w1#1'])
+
+    expect(contextOf(await $.tool.call(read())), 'carried once').toEqual('')
+    await $.turn.complete(turn())
+    await clock.settle()
+    expect(woken, 'and never submitted afterwards').toEqual([])
+  })
+
+  test('a mid-turn result with no later tool call is submitted when the turn ends, stamped with its wait', async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    const files = { ...worker('w1', 0) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    floor(on)
+    mockSessionStart(on)
+    await $.session.start(session())
+    await step($)
+    files[`${V3}/w1/result.json`] = finished()
+    await clock.advance(POLL)
+    expect(woken).toEqual([])
+    // The parked submit holds this poll pass, and clock.every asks no new period
+    // until a pass returns; the heartbeat's clock still moves time on.
+    await clock.advance(120_000)
+
+    await $.turn.complete(turn())
+    await clock.settle()
+    expect(woken.length).toEqual(1)
+    expect(woken[0]).toContain('"w1" on codex: success')
+    expect(woken[0]).toMatch(/\(ready \d\d:\d\d, delivered \d\d:\d\d: 2 min later\)/)
+    expect(store.acked()).toEqual(['w1#1'])
+  })
+
+  test('a subagent turn does not hold the notice: with the main loop idle it is submitted at once', async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    const files = { ...worker('w1', 0) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    floor(on)
+    mockSessionStart(on)
+    await $.session.start(session())
+    await step($, 'sub-1')
+    files[`${V3}/w1/result.json`] = finished()
+    await clock.advance(POLL)
+    await clock.settle()
+    expect(woken.length).toEqual(1)
+    expect(store.acked()).toEqual(['w1#1'])
+  })
+
+  test('a refused submit at the turn end acks nothing, so the next tick retries', async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    const files = { ...worker('w1', 0) }
+    mockFs(on, files)
+    const woken = mockWake(on, [{ drop: 'busy' }])
+    floor(on)
+    mockSessionStart(on)
+    await $.session.start(session())
+    await step($)
+    files[`${V3}/w1/result.json`] = finished()
+    await clock.advance(POLL)
+    await $.turn.complete(turn())
+    await clock.settle()
+    expect(woken.length).toEqual(1)
+    expect(store.acked()).toEqual([])
+    await clock.advance(60_000)
+    await clock.settle()
+    expect(woken.length).toEqual(2)
+    expect(store.acked()).toEqual(['w1#1'])
   })
 })

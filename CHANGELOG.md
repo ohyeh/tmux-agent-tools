@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix (mod, worker notices): a worker that finished while the main loop's turn ran waited for that turn to end, because `$.prompt.submit` starts a turn of its own once the session is idle (live: 20 min late, which read as a duplicate). The notice now rides the next main-loop tool result as `context`; with no later tool call it is submitted when the turn ends, stamped `(ready HH:MM, delivered HH:MM: N min later)` when it waited a minute or more. Subagent turns never hold or carry it; a refused submit still acks nothing, so the next tick retries.
+
 ## v0.44.6 - 2026-10-03
 
 - Fix (dashboard, detached workers): run the sessions inventory and detached `assign` through explicit zsh, including the mod's core copy, so these paths do not execute a shell shebang below a tainted parent.
