@@ -32,9 +32,6 @@ jobs:
         with:
           node-version: 22.18.0
 
-      - name: Core contract tests (node, fake Host)
-        run: scripts/test-core-contract-smoke
-
       - name: Validate shell scripts
         run: |
           scripts/lint-no-path-tied-locals
@@ -64,15 +61,13 @@ jobs:
       - name: Install mcp-adapter dev dependencies
         run: npm --prefix mcp-adapter ci
 
+      - name: mcp-adapter tests
+        run: npm --prefix mcp-adapter test
+
       - name: Run wrapper self-tests
         run: |
           skills/tmux-agent-tools/scripts/agent-tmux codex self-test
           skills/tmux-agent-tools/scripts/agent-tmux claude self-test
-          scripts/test-version-sync-smoke
-          scripts/test-color-env-smoke
-          scripts/test-outcome-smoke
-          scripts/test-resume-keyword-smoke
-          scripts/test-producer-route-smoke
           skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -s 'length == 0'
           watch_zero_output="$(skills/tmux-agent-tools/scripts/tmux-agent-sessions list --watch --json --count 0)"
           test -z "$watch_zero_output"
@@ -547,8 +542,3 @@ jobs:
 
       - name: Run full smoke suite
         run: scripts/run-all-smokes
-
-      - name: Run session-id + oneshot smokes
-        run: |
-          scripts/test-session-meta-smoke
-          scripts/test-oneshot-smoke

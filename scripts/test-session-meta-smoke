@@ -4,13 +4,13 @@
 #
 # Covers (source-only-safe — no real tmux sessions):
 #   - sidecar seeded null by result init
-#   - sidecar missing / null / valid-UUID / malformed-UUID
-#   - session_meta_validate() called directly via a thin zsh wrapper
 #   - profile parser accepts session_id_pattern (no unknown-key warning)
 #   - profile parser warns on unknown key
 #   - capture no-op when pattern unset (explicit blank-pattern profile)
-#   - POSITIVE capture: fake pane output with UUID → sidecar updated (B2)
 #   - result --field .cli_session_id fallback reads sidecar (B1)
+#   - real session_meta_validate: missing / null / valid / malformed UUID
+#   - real spawn_session_id_capture over a fake tmux pane: label-anchored
+#     UUID written, decoy UUID ignored, non-UUID pane leaves the sidecar null
 
 set -euo pipefail
 
@@ -62,37 +62,6 @@ assert_not_contains() {
   fi
 }
 
-# Call session_meta_validate() directly — mirrors the exact implementation in
-# agent-tmux. Written to a temp script to avoid nested-quote fragility in zsh -c.
-_VALIDATE_SCRIPT="$WORK/validate-helper.zsh"
-cat > "$_VALIDATE_SCRIPT" << 'VALIDATEEOF'
-#!/usr/bin/env zsh
-# Minimal harness: define only the deps session_meta_validate needs, then call it.
-JQ=jq
-require_jq() { :; }
-
-session_meta_validate() {
-  local meta_path="$1"
-  if [[ ! -f "$meta_path" ]]; then printf 'missing\n'; return 0; fi
-  local raw
-  raw="$(jq -r '.cli_session_id // "null"' "$meta_path" 2>/dev/null)" || {
-    printf 'malformed:parse_error\n'; return 1
-  }
-  if [[ "$raw" == "null" ]]; then printf 'null\n'; return 0; fi
-  if [[ "$raw" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-    printf 'ok\n'; return 0
-  fi
-  printf 'malformed:%s\n' "$raw"; return 1
-}
-
-session_meta_validate "$1"
-VALIDATEEOF
-chmod +x "$_VALIDATE_SCRIPT"
-
-call_session_meta_validate() {
-  zsh "$_VALIDATE_SCRIPT" "$1" 2>/dev/null || true
-}
-
 # ---------------------------------------------------------------------------
 # Part 1: result init seeds sidecar with null
 # ---------------------------------------------------------------------------
@@ -105,32 +74,6 @@ META="$TMUX_AGENT_DIR/init-test/session-meta.json"
 assert "sidecar created by result init" "$(test -f "$META" && echo yes || echo no)" "yes"
 assert "sidecar schema_version=1" "$(jq -r .schema_version "$META")" "1"
 assert "sidecar cli_session_id null on init" "$(jq -r '.cli_session_id // "null"' "$META")" "null"
-
-# ---------------------------------------------------------------------------
-# Part 2: session_meta_validate() — called directly via wrapper
-# ---------------------------------------------------------------------------
-echo "--- Part 2: session_meta_validate() direct calls"
-
-assert "missing sidecar -> missing" \
-  "$(call_session_meta_validate "$WORK/no-such-file.json")" "missing"
-
-NULL_META="$WORK/meta-null.json"
-jq -n '{schema_version:1, cli_session_id: null}' > "$NULL_META"
-assert "null sidecar -> null" "$(call_session_meta_validate "$NULL_META")" "null"
-
-UUID_META="$WORK/meta-uuid.json"
-jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716-446655440000"}' > "$UUID_META"
-assert "valid UUID sidecar -> ok" "$(call_session_meta_validate "$UUID_META")" "ok"
-
-BAD_META="$WORK/meta-bad.json"
-jq -n '{schema_version:1, cli_session_id: "not-a-uuid"}' > "$BAD_META"
-assert_contains "malformed UUID sidecar -> malformed: prefix" \
-  "$(call_session_meta_validate "$BAD_META" || true)" "malformed:"
-
-BADLEN_META="$WORK/meta-badlen.json"
-jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716"}' > "$BADLEN_META"
-assert_contains "truncated UUID sidecar -> malformed: prefix" \
-  "$(call_session_meta_validate "$BADLEN_META" || true)" "malformed:"
 
 # ---------------------------------------------------------------------------
 # Part 3: profile parser accepts session_id_pattern; warns on unknown key
@@ -197,50 +140,6 @@ assert "capture no-op: sidecar stays null with blank pattern" \
   "$(jq -r '.cli_session_id // "null"' "$NOOP_META")" "null"
 
 # ---------------------------------------------------------------------------
-# Part 5: POSITIVE capture — fake pane output with UUID → sidecar updated (B2)
-# We simulate spawn_session_id_capture by running the inner loop logic directly
-# against a temp file that acts as "pane output". No real tmux session needed.
-# ---------------------------------------------------------------------------
-echo "--- Part 5: positive capture (fake pane → sidecar written)"
-
-CAPTURE_META="$WORK/capture-meta.json"
-jq -n '{schema_version:1, cli_session_id: null}' > "$CAPTURE_META"
-
-FAKE_UUID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-FAKE_PANE="$WORK/fake-pane.txt"
-printf 'Starting claude...\nSession ID: %s\nReady.\n' "$FAKE_UUID" > "$FAKE_PANE"
-
-# Run the capture loop logic inline (mirrors two-stage spawn_session_id_capture):
-#   Stage 1: find first line matching label anchor ($label_pattern).
-#   Stage 2: extract + validate RFC-4122 UUID from THAT line only.
-# A 3rd arg $label_pattern defaults to matching any line (for non-label tests).
-_UUID_RE='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-_run_capture_inline() {
-  local pane_file="$1" meta_path="$2" label_pattern="${3:-.}"
-  local pane_text labeled_line uuid
-  pane_text="$(cat "$pane_file")"
-  # Stage 1: find first line matching the label anchor.
-  labeled_line="$(printf '%s\n' "$pane_text" | grep -m1 -E "$label_pattern")" || true
-  [[ -n "$labeled_line" ]] || return 0
-  # Stage 2: extract UUID from that line + validate shape.
-  uuid="$(printf '%s\n' "$labeled_line" | grep -oE "$_UUID_RE" | head -1)" || true
-  if [[ -n "$uuid" ]] && [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-    local tmp
-    tmp="$(mktemp "${meta_path}.tmp.XXXXXX")"
-    jq -n --arg id "$uuid" '{schema_version:1, cli_session_id: $id}' > "$tmp" && mv "$tmp" "$meta_path" || rm -f "$tmp"
-  fi
-}
-
-# Use a label-anchored pattern: "Session ID:" line contains the UUID.
-FAKE_LABEL='Session ID:'
-_run_capture_inline "$FAKE_PANE" "$CAPTURE_META" "$FAKE_LABEL"
-
-assert "positive capture: sidecar updated with UUID" \
-  "$(jq -r '.cli_session_id // "null"' "$CAPTURE_META")" "$FAKE_UUID"
-assert "positive capture: sidecar validate -> ok" \
-  "$(call_session_meta_validate "$CAPTURE_META")" "ok"
-
-# ---------------------------------------------------------------------------
 # Part 6: result --field .cli_session_id sidecar read
 # ---------------------------------------------------------------------------
 echo "--- Part 6: result --field .cli_session_id sidecar read"
@@ -291,31 +190,10 @@ assert "timing: result.json still absent after field read" \
   "$(test -f "$TMUX_AGENT_DIR/timing-test/result.json" && echo yes || echo no)" "no"
 
 # ---------------------------------------------------------------------------
-# Part 7: B1 security — capture rejects non-UUID match; read rejects non-UUID sidecar
+# Part 7: B1 security — read rejects non-UUID sidecar
 # ---------------------------------------------------------------------------
 echo "--- Part 7: B1 validation guards"
-
-# 7a: capture rejects non-UUID pane match → sidecar stays null
-NONUUID_META="$WORK/nonuuid-capture-meta.json"
-jq -n '{schema_version:1, cli_session_id: null}' > "$NONUUID_META"
-NONUUID_PANE="$WORK/nonuuid-pane.txt"
-# Pane contains a string that looks UUID-ish but isn't (too short), plus a
-# plain non-UUID token that grep -oE with a broad pattern would still not match.
-# To test the guard, we write a value that matches the regex but then inject
-# a hand-crafted non-UUID directly (bypasses grep, tests the guard path).
-printf 'Session: not-a-uuid\nReady.\n' > "$NONUUID_PANE"
-# Simulate what spawn_session_id_capture does: grep finds nothing → sidecar untouched.
-# Also test the guard directly: feed a non-UUID match through _run_capture_inline.
-GUARD_META="$WORK/guard-meta.json"
-jq -n '{schema_version:1, cli_session_id: null}' > "$GUARD_META"
-GUARD_PANE="$WORK/guard-pane.txt"
-# Write a pane with no valid RFC-4122 UUID — grep -oE won't match.
-printf 'Session: short-not-uuid\nid: 12345\n' > "$GUARD_PANE"
-_run_capture_inline "$GUARD_PANE" "$GUARD_META"
-assert "capture: non-UUID pane → sidecar stays null" \
-  "$(jq -r '.cli_session_id // "null"' "$GUARD_META")" "null"
-
-# 7b: read fallback rejects hand-written non-UUID sidecar → exit 1
+# read fallback rejects hand-written non-UUID sidecar → exit 1
 mkdir -p "$TMUX_AGENT_DIR/invalid-sid-test"
 "$CLAUDE_TMUX" result init invalid-sid-test >/dev/null
 INVALID_META="$TMUX_AGENT_DIR/invalid-sid-test/session-meta.json"
@@ -332,40 +210,6 @@ else
   echo "  ok   read: non-UUID value not printed to stdout"
   PASS=$((PASS + 1))
 fi
-
-# ---------------------------------------------------------------------------
-# Part 8: DECOY case — label-anchored capture ignores decoy UUID on earlier line
-# Pane layout: unlabeled decoy UUID first, then labeled session line with real UUID.
-# With a label-anchored pattern, only the labeled UUID must be written.
-# ---------------------------------------------------------------------------
-echo "--- Part 8: decoy UUID ignored by label-anchored capture"
-
-DECOY_UUID="ddddeeee-ffff-1111-2222-333344445555"
-REAL_UUID="aaaabbbb-cccc-4444-8888-999900001111"
-DECOY_PANE="$WORK/decoy-pane.txt"
-# Decoy UUID on an earlier unlabeled line; real UUID on the labeled "Session ID:" line.
-printf 'Tool call result: %s\nSession ID: %s\nReady.\n' "$DECOY_UUID" "$REAL_UUID" > "$DECOY_PANE"
-
-DECOY_META="$WORK/decoy-meta.json"
-jq -n '{schema_version:1, cli_session_id: null}' > "$DECOY_META"
-
-# Use a label-anchored pattern that only matches the "Session ID:" line.
-_run_capture_inline "$DECOY_PANE" "$DECOY_META" "Session ID:"
-
-assert "decoy: sidecar written with labeled UUID (not decoy)" \
-  "$(jq -r '.cli_session_id // "null"' "$DECOY_META")" "$REAL_UUID"
-assert "decoy: labeled UUID validates ok" \
-  "$(call_session_meta_validate "$DECOY_META")" "ok"
-
-# Also confirm: WITHOUT a label pattern (match-any), first UUID found is the decoy.
-# This demonstrates WHY label-anchored is needed.
-DECOY_META_NOLABEL="$WORK/decoy-meta-nolabel.json"
-jq -n '{schema_version:1, cli_session_id: null}' > "$DECOY_META_NOLABEL"
-_run_capture_inline "$DECOY_PANE" "$DECOY_META_NOLABEL"  # default label_pattern='.'
-NOLABEL_VAL="$(jq -r '.cli_session_id // "null"' "$DECOY_META_NOLABEL")"
-# Without label anchor, decoy UUID wins (documents the problem that label-anchoring solves).
-assert "decoy-nolabel: first UUID captured is the decoy (demonstrates the problem)" \
-  "$NOLABEL_VAL" "$DECOY_UUID"
 
 # ---------------------------------------------------------------------------
 # Part 9: structured transcript/store correlation helpers (P3)
@@ -515,6 +359,63 @@ assert "transcript bail: sidecar stays null" "$(jq -r '.cli_session_id // "null"
 
 START_BODY="${functions[start_session]}"
 assert_contains "wiring: transcript branch uses structured capturer" "$START_BODY" 'spawn_transcript_session_id_capture "$CLI"'
+
+# ---------------------------------------------------------------------------
+# Part 10: real session_meta_validate and spawn_session_id_capture
+# ---------------------------------------------------------------------------
+echo "--- Part 10: sidecar validation and pane capture (agent-tmux functions)"
+
+validate() { session_meta_validate "$1" 2>/dev/null || true; }
+assert "missing sidecar -> missing" "$(validate "$WORK/no-such-file.json")" "missing"
+jq -n '{schema_version:1, cli_session_id: null}' > "$WORK/meta-null.json"
+assert "null sidecar -> null" "$(validate "$WORK/meta-null.json")" "null"
+jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716-446655440000"}' > "$WORK/meta-uuid.json"
+assert "valid UUID sidecar -> ok" "$(validate "$WORK/meta-uuid.json")" "ok"
+jq -n '{schema_version:1, cli_session_id: "not-a-uuid"}' > "$WORK/meta-bad.json"
+assert "malformed UUID sidecar -> malformed:not-a-uuid" "$(validate "$WORK/meta-bad.json")" "malformed:not-a-uuid"
+jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716"}' > "$WORK/meta-badlen.json"
+assert_contains "truncated UUID sidecar -> malformed: prefix" "$(validate "$WORK/meta-badlen.json")" "malformed:"
+
+# The capturer reads `$TMUX capture-pane -t =<session>: -p`. This fake prints
+# $FAKE_PANES/<session>; a missing file fails, which ends the capture loop.
+FAKE_PANES="$WORK/panes"
+mkdir -p "$FAKE_PANES"
+cat > "$WORK/fake-tmux" <<FAKE
+#!/bin/sh
+while [ \$# -gt 0 ]; do [ "\$1" = -t ] && t="\$2"; shift; done
+t="\${t#=}"; t="\${t%:}"
+cat "$FAKE_PANES/\$t"
+FAKE
+chmod +x "$WORK/fake-tmux"
+TMUX="$WORK/fake-tmux"
+TMUX_SOCKET_ARGS=()
+
+LABEL_UUID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+DECOY_UUID="ddddeeee-ffff-1111-2222-333344445555"
+printf 'Starting claude...\nSession ID: %s\nReady.\n' "$LABEL_UUID" > "$FAKE_PANES/label"
+printf 'Tool call result: %s\nSession ID: %s\nReady.\n' "$DECOY_UUID" "$LABEL_UUID" > "$FAKE_PANES/decoy"
+printf 'Session: short-not-uuid\nid: 12345\n' > "$FAKE_PANES/nouuid"
+for c in label decoy nouuid; do jq -n '{schema_version:1, cli_session_id: null}' > "$WORK/cap-$c.json"; done
+SESSION_ID_PATTERN='Session ID:'
+# The loop runs behind start; whatever it prints lands on start's stdout.
+spawn_session_id_capture label label "$WORK/cap-label.json" >>"$WORK/cap.out"
+spawn_session_id_capture decoy decoy "$WORK/cap-decoy.json" >>"$WORK/cap.out"
+SESSION_ID_PATTERN='.'
+spawn_session_id_capture nouuid nouuid "$WORK/cap-nouuid.json" >>"$WORK/cap.out"
+captured() { jq -r '.cli_session_id // "null"' "$WORK/cap-$1.json"; }
+# The loop sleeps 2 s before its first read; all three start together.
+for _ in {1..40}; do
+  [[ "$(captured label)" != null && "$(captured decoy)" != null ]] && break
+  sleep 0.25
+done
+sleep 0.5
+assert "capture: labeled UUID written" "$(captured label)" "$LABEL_UUID"
+assert "capture: decoy UUID on an unlabeled line ignored" "$(captured decoy)" "$LABEL_UUID"
+assert "capture: non-UUID pane leaves the sidecar null" "$(captured nouuid)" "null"
+assert "capture: written sidecar validates ok" "$(validate "$WORK/cap-label.json")" "ok"
+sleep 2.5  # the nouuid loop's second pass (a repeated zsh `local` printed the pane)
+assert "capture: prints nothing to start's stdout" "$(cat "$WORK/cap.out")" ""
+rm -f "$FAKE_PANES/nouuid"  # its loop polls until the pane read fails
 
 # ---------------------------------------------------------------------------
 echo

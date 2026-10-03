@@ -22,7 +22,8 @@ export TMUX_AGENT_DIR="$WORK/state"
 export AGENT_TMUX_PREFLIGHT_TIMEOUT=5
 # Keep this run's audit events out of the machine's real trail.
 export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
-trap '"$AGENT_TMUX" echocli stop deliver-smoke >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+# smoke-tmux.sh kills this run's tmux server, and with it every worker.
+trap 'rm -rf "$WORK"' EXIT
 
 PASS=0; FAIL=0
 assert() {

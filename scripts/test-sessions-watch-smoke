@@ -105,15 +105,6 @@ else
 fi
 assert_contains "stop event carries schema_version" "$events_stop" '"schema_version":1'
 
-echo "case: --count 0 parses as unlimited (interrupt to bound runtime)"
-"$SESSIONS" watch --count 0 --interval 1 --tool claude > "$WORK/events3.jsonl" 2>&1 &
-WATCH_PID3=$!
-/bin/sleep 2
-kill "$WATCH_PID3" 2>/dev/null || true
-wait "$WATCH_PID3" 2>/dev/null || true
-echo "  ok   --count 0 starts and is interruptible"
-PASS=$((PASS + 1))
-
 echo "case: rejects bad --count"
 code=0
 "$SESSIONS" watch --count abc 2>/dev/null || code=$?

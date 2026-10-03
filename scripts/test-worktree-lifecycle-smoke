@@ -67,6 +67,12 @@ assert "meta.branch prefix" \
 assert "worktree.json schema in agent dir" \
   "$(jq -r '.schema_version' "$TMUX_AGENT_DIR/wt-a/worktree.json")" "1"
 
+echo "case: --workdir-fresh rejects a non-git workdir"
+code=0
+CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact --workdir-fresh \
+  "wt-nogit" "$WORK" >/dev/null 2>&1 || code=$?
+assert "non-git workdir exit=1" "$code" "1"
+
 # --- Case 2: list finds it ---------------------------------------------------
 echo "case: list finds worktree"
 out_json="$("$WT_CLI" list --json)"

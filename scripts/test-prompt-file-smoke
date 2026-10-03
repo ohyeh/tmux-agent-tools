@@ -327,15 +327,15 @@ FAKEOF
 
 # ── run all cases ─────────────────────────────────────────────────────────────
 
-for wrapper_pair in "$CODEX_TMUX|CODEX|cd" "$CLAUDE_TMUX|CLAUDE|cl"; do
-  IFS='|' read -r wrapper env_var prefix <<< "$wrapper_pair"
-  run_start_from_file           "$wrapper" "$env_var" "$prefix"
-  run_start_trailing_flag       "$wrapper" "$env_var" "$prefix"
-  run_help_from_file            "$wrapper" "$prefix"
-  run_send_wait_error_paths     "$wrapper" "$prefix"
-  run_send_prompt_file_alias    "$wrapper" "$prefix"
-  run_positional_ordering_real  "$wrapper" "$env_var" "$prefix"
-done
+# Argv parsing is shared: one CLI is enough.
+run_start_from_file           "$CODEX_TMUX" CODEX cd
+run_start_trailing_flag       "$CODEX_TMUX" CODEX cd
+run_help_from_file            "$CODEX_TMUX" cd
+run_send_wait_error_paths     "$CODEX_TMUX" cd
+run_send_prompt_file_alias    "$CODEX_TMUX" cd
+# Delivery differs per CLI (claude: file-ref, codex: paste).
+run_positional_ordering_real  "$CODEX_TMUX"  CODEX  cd
+run_positional_ordering_real  "$CLAUDE_TMUX" CLAUDE cl
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

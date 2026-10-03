@@ -133,7 +133,7 @@ env HOME="$scratch/home" CLAUDE_CONFIG_DIR="$scratch/claude" \
   claude --plugin-dir "$REPO" -p 'Reply with the single word ok'
 
 env HOME="$scratch/home" codex plugin marketplace add "$REPO" --json
-env HOME="$scratch/home" codex plugin add tmux-agent@tmux-agent-tools --json
+env HOME="$scratch/home" codex plugin add tmux-agent-tools@tmux-agent-tools --json
 
 env HOME="$scratch/home" agent plugin marketplace add "$REPO"
 env HOME="$scratch/home" agent --plugin-dir "$REPO" -p 'Reply with the single word ok'

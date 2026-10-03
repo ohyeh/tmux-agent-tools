@@ -5,9 +5,12 @@
 set -euo pipefail
 
 HOOK="$(cd "$(dirname "$0")/.." && pwd)/hooks/tmux-dispatch-gate.sh"
+# The hook writes under $HOME/.local/state; keep it off the real home.
+HOME="$(mktemp -d)"
+export HOME
 SID="smoke-$$"
 STATE_DIR="$HOME/.local/state/agent-hooks/$SID"
-cleanup() { rm -rf "$STATE_DIR"; }
+cleanup() { chmod -R u+rwx "$HOME" 2>/dev/null; rm -rf "$HOME"; }
 trap cleanup EXIT
 
 FAILS=0

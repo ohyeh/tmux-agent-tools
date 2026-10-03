@@ -110,9 +110,6 @@ jobs:
           zsh -n skills/tmux-agent-tools/scripts/tmux-agent-sessions
           skills/tmux-agent-tools/scripts/agent-tmux codex self-test
           skills/tmux-agent-tools/scripts/agent-tmux claude self-test
-          scripts/test-version-sync-smoke
-          scripts/test-session-meta-smoke
-          scripts/test-oneshot-smoke
           skills/tmux-agent-tools/scripts/tmux-agent-sessions list --json | jq -se 'length == 0'
           prompt_file="$(mktemp)"
           transcript_file="$(mktemp)"

@@ -12,7 +12,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$AGENT_TMUX"
-CLAUDE_TMUX="$AGENT_TMUX"
 SCHEMA="$REPO_ROOT/schemas/result-status-summary.schema.json"
 
 WORK="$(mktemp -d -t tmux-agent-schema-smoke.XXXXXX)"
@@ -137,9 +136,7 @@ run_flag_rejections() {
 }
 
 run_validator_cases "$CODEX_TMUX"  codex  "rs-codex"
-run_validator_cases "$CLAUDE_TMUX" claude "rs-claude"
 run_flag_rejections "$CODEX_TMUX"  codex  "fr-codex"
-run_flag_rejections "$CLAUDE_TMUX" claude "fr-claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

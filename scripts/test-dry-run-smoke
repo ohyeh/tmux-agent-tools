@@ -288,16 +288,14 @@ run_project_config_guard() {
 for wrapper_pair in "$CODEX_TMUX|CODEX|cd|--yolo" "$CLAUDE_TMUX|CLAUDE|cl|--dangerously-skip-permissions"; do
   IFS='|' read -r wrapper env_var prefix default_flags <<< "$wrapper_pair"
   run_ok_case "$wrapper" "$env_var" "$prefix"
-  run_model_passthrough "$wrapper" "$env_var" "$prefix"
   run_extra_launch_flags "$wrapper" "$env_var" "$prefix" "$default_flags"
-  run_misplaced_flag_rejections "$wrapper" "$env_var" "$prefix"
-  run_project_config_guard "$wrapper" "$env_var" "$prefix"
-  run_bad_workdir "$wrapper" "$env_var" "$prefix"
-  run_preexisting_sentinel "$wrapper" "$env_var" "$prefix"
-  run_on_exit_without_sentinel "$wrapper" "$env_var" "$prefix"
-  run_relative_transcript "$wrapper" "$env_var" "$prefix"
-  run_transcript_no_side_effect "$wrapper" "$env_var" "$prefix"
-  run_no_side_effects "$wrapper" "$env_var" "$prefix"
+done
+
+# Shared start validation: no per-CLI branch, so one CLI is enough.
+for fn in run_model_passthrough run_misplaced_flag_rejections run_project_config_guard \
+          run_bad_workdir run_preexisting_sentinel run_on_exit_without_sentinel \
+          run_relative_transcript run_transcript_no_side_effect run_no_side_effects; do
+  "$fn" "$CODEX_TMUX" CODEX cd
 done
 
 run_effort_passthrough

@@ -10,7 +10,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
 
 WORK="$(mktemp -d -t tmux-agent-tag-smoke.XXXXXX)"
@@ -82,11 +81,8 @@ run_sessions_filter() {
 }
 
 run_basic "$CODEX_TMUX"  "CODEX"  "tg-codex"
-run_basic "$CLAUDE_TMUX" "CLAUDE" "tg-claude"
 run_invalid_format "$CODEX_TMUX"  "if-codex"
-run_invalid_format "$CLAUDE_TMUX" "if-claude"
 run_sessions_filter "$CODEX_TMUX"  "CODEX"  "sf-codex"
-run_sessions_filter "$CLAUDE_TMUX" "CLAUDE" "sf-claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

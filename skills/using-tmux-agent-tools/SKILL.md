@@ -199,7 +199,7 @@ yourself.
   authorization for count, tool, model, and effort — never assume it.
 - Inspect / housekeep existing sessions → `tmux-agent-sessions` (resolve,
   inventory, cleanup) · live overview → `tmux-agent-dashboard`.
-- Background & scheduled → `tmux-agent-cron` · dependencies → `tmux-agent-dag`
+- Dependencies → `tmux-agent-dag`
   · evidence polling → `tmux-agent-monitor` · alerts → `tmux-agent-notify`.
 - Records → `tmux-agent-audit` / `tmux-agent-history` / `tmux-agent-replay`
   · worktrees → `tmux-agent-worktrees`.

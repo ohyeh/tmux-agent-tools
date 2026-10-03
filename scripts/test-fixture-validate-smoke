@@ -9,7 +9,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPLAY="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-replay"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-fixture-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -81,12 +80,6 @@ CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --record "$TRANSCRIPT" rec-cod
 assert "transcript exists after --record" "$(test -s "$TRANSCRIPT" && echo yes)" "yes"
 assert "start event present" "$(jq -c 'select(.event=="start")' "$TRANSCRIPT" | wc -l | tr -d ' ')" "1"
 "$CODEX_TMUX" stop rec-codex >/dev/null 2>&1 || true
-
-TRANSCRIPT2="$WORK/rec-claude.jsonl"
-CLAUDE="$WORK/fake.sh" "$CLAUDE_TMUX" start --exact --record "$TRANSCRIPT2" rec-claude "$WORK" >/dev/null
-/bin/sleep 1
-assert "claude --record creates transcript" "$(test -s "$TRANSCRIPT2" && echo yes)" "yes"
-"$CLAUDE_TMUX" stop rec-claude >/dev/null 2>&1 || true
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

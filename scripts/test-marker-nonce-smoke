@@ -140,6 +140,27 @@ ind_code=0
 assert "nonce-indented send-wait matched" "$ind_code" "0"
 "$CLAUDE_TMUX" stop nonce-indent >/dev/null 2>&1 || true
 
+# A marker already in the pane must not satisfy a later wait: wait-text on a
+# string that never comes times out with rc 1, and send-wait ignores a stale
+# `[DONE]` because it waits for its own fresh nonce.
+echo "case: stale marker (no nonce reply) times out"
+cat > "$WORK/fake-stale.sh" <<'EOF'
+printf '[DONE]\n'
+while IFS= read -r line; do :; done
+EOF
+chmod +x "$WORK/fake-stale.sh"
+env CODEX="$WORK/fake-stale.sh" "$CODEX_TMUX" start --exact nonce-stale "$WORK" >/dev/null
+stale_code=0
+"$CODEX_TMUX" wait-text --literal nonce-stale "[DONE]" 5 >/dev/null 2>&1 || stale_code=$?
+assert "stale [DONE] is in the pane" "$stale_code" "0"
+stale_code=0
+"$CODEX_TMUX" wait-text --literal nonce-stale MARK 2 >/dev/null 2>&1 || stale_code=$?
+assert "wait-text never-seen marker exit=1" "$stale_code" "1"
+stale_code=0
+"$CODEX_TMUX" send-wait nonce-stale "do real work" 2 >/dev/null 2>&1 || stale_code=$?
+assert "send-wait ignores stale [DONE] exit=1" "$stale_code" "1"
+"$CODEX_TMUX" stop nonce-stale >/dev/null 2>&1 || true
+
 echo
 echo "summary: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

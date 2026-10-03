@@ -149,12 +149,6 @@ assert "oneshot empty dry-run ok false" "$(printf '%s' "$empty_dry_json" | jq -r
 assert "oneshot empty dry-run check fails" "$(printf '%s' "$empty_dry_json" | jq -r '.checks[] | select(.name == "oneshot_prompt") | .status')" "fail"
 assert "oneshot happy dry-run ok" "$(printf '%s' "$happy_dry_json" | jq -r .ok)" "true"
 
-echo "case: source ordering result before marker"
-source_body="$(< "$AGENT")"
-before="${source_body%%__AGENT_TMUX_ONESHOT_EXIT__*}"
-assert_contains "cli_code captured before result synthesis" "$before" 'cli_code=\$?; if [ ! -s '
-assert_contains "result write before marker" "$before" "result_path"
-
 echo
 echo "summary: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

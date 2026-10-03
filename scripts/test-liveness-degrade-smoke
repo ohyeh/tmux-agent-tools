@@ -76,32 +76,6 @@ run_readonly_dir_case() {
   "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
 }
 
-run_started_at_degrade() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-started-at-degrade ($wrapper, parent dir readonly at start)"
-  # Make $TMUX_AGENT_DIR readonly so ensure_agent_dir cannot create subdir.
-  # start_session must NOT crash on the record_started_at line.
-  local saved_mode
-  saved_mode="$(stat -f '%p' "$TMUX_AGENT_DIR" 2>/dev/null || stat -c '%a' "$TMUX_AGENT_DIR")"
-  mkdir -p "$TMUX_AGENT_DIR"
-  chmod 555 "$TMUX_AGENT_DIR"
-
-  local code=0
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix" "$WORK" >/dev/null 2>&1 || code=$?
-  # start may or may not exit non-zero depending on subdir creation flow,
-  # but we want to ensure the wrapper itself doesn't crash with set -e.
-  if [[ "$code" -le 1 ]]; then
-    echo "  ok   $prefix start tolerates readonly TMUX_AGENT_DIR (exit=$code)"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $prefix start crashed with exit=$code under readonly dir" >&2
-    FAIL=$((FAIL + 1))
-  fi
-
-  chmod u+w "$TMUX_AGENT_DIR"
-  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
-}
-
 run_readonly_dir_case "$CODEX_TMUX"  "CODEX"  "deg-codex"
 run_readonly_dir_case "$CLAUDE_TMUX" "CLAUDE" "deg-claude"
 

@@ -122,22 +122,6 @@ Exit codes from `wait-and-capture --pause-until-file`:
 - `7` — operator wrote `reject`
 - `8` — `--pause-timeout` expired
 
-## CI-mode exit codes
-
-`agent-tmux claude start --ci` / `agent-tmux codex start --ci` (or `CLAUDE_TMUX_CI=1` / `CODEX_TMUX_CI=1`) exit with a stable contract — branch on the code, don't parse output:
-
-| Code | Meaning |
-|------|---------|
-| 0 | success — agent ran and exited cleanly |
-| 1 | generic wrapper failure |
-| 2 | invalid argument / usage error |
-| 3 | prompt / permission wall detected (first-run auth, confirmation) |
-| 4 | secret-missing (reserved placeholder; never emitted in v1) |
-| 5 | schema validation failed (reserved placeholder; not yet emitted) |
-| 7 | approval gate decision = reject |
-| 8 | approval gate pause-timeout |
-| 124 | `--max-runtime` / `--max-idle` fuse fired |
-
 ## Concurrency model
 
 - **Single caller per agent name.** A second `start --exact same-name` while the first session is live exits 1 and leaves the first untouched. A start of a name whose session is gone moves the earlier `result.json` and `stdout.log` into `<name>/legacy-<UTC time>-<pid>/`, never deletes them.

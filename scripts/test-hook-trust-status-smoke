@@ -300,5 +300,30 @@ st="$("$CODEX_TMUX" status --json "$B")"
 assert "browser sign-in is login_prompt" "$(printf '%s' "$st" | jq -r .blocked_reason)" "login_prompt"
 "$CODEX_TMUX" stop "$B" >/dev/null 2>&1 || true
 
+# Issue #320: idle CLI chrome and the worker's own launch flags containing
+# "approve" must not read as approval_prompt (the dialog case is above).
+cat > "$WORK/fake-agy-idle.sh" <<'EOF'
+#!/bin/sh
+echo "Antigravity CLI 1.1.22"
+echo "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)"
+while IFS= read -r line; do : ; done
+EOF
+cat > "$WORK/fake-cursor-launch.sh" <<'EOF'
+#!/bin/sh
+echo "cursor-agent --trust --approve-mcps"
+while IFS= read -r line; do : ; done
+EOF
+chmod +x "$WORK/fake-agy-idle.sh" "$WORK/fake-cursor-launch.sh"
+
+for pair in "agy-idle:fake-agy-idle.sh" "cursor-launch:fake-cursor-launch.sh"; do
+  n="${pair%%:*}"
+  echo "case: $n chrome containing 'approve' is not an approval prompt"
+  CODEX="$WORK/${pair#*:}" "$CODEX_TMUX" start --exact "$n" "$WORK" >/dev/null
+  sleep 1
+  st="$("$CODEX_TMUX" status --json "$n")"
+  assert "$n not approval_prompt" "$(printf '%s' "$st" | jq -r '.blocked_reason // "null"')" "null"
+  "$CODEX_TMUX" stop "$n" >/dev/null 2>&1 || true
+done
+
 echo "hook-trust-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

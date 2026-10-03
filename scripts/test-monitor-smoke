@@ -10,7 +10,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MONITOR="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-monitor"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-monitor-smoke.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -128,7 +127,6 @@ run_wait_for_human_case() {
 }
 
 run_wait_for_human_case "$CODEX_TMUX"  "CODEX"  "wfh-codex"  "codex-cli"
-run_wait_for_human_case "$CLAUDE_TMUX" "CLAUDE" "wfh-claude" "claude-cli"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

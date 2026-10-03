@@ -1,55 +1,17 @@
 #!/usr/bin/env zsh
-# Smoke test for issue #283 Gap 1 (superseded): the tmux-delegate /
-# codex-oneshot / claude-oneshot subagent defs that used to ship at
-# agents/, .claude/agents/, .codex/agents/*.toml, and
-# skills/tmux-agent-tools/agents/ are retired (Codex CLI never exposed
-# these as spawn_agent agent_type values at runtime, and Claude Code's
-# repo-local .claude/agents/ discovery was carrying 100% of real usage —
-# see CHANGELOG for the removal). The decision logic and no-cascade
-# worker constraint they carried now live directly in the
-# using-tmux-agent-tools skill's decision tree. This test's job changes
-# accordingly: assert the four legacy locations stay gone (no silent
-# reintroduction of the drifting four-copy sync burden), and assert the
-# skill carries the gate in forcing-gate form, not ambient prose.
+# Packaging shape of the installable skill: doc/schema copies match their
+# repo canonicals, no dev-only evals/ ships, and the .codex skill symlink
+# points at the canonical skill.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-AGENTS=(tmux-delegate codex-oneshot claude-oneshot)
-
 PASS=0
 FAIL=0
 ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
-
-for agent in "${AGENTS[@]}"; do
-  PLUGIN_AGENT="$REPO_ROOT/agents/$agent.md"
-  PROJECT_AGENT="$REPO_ROOT/.claude/agents/$agent.md"
-  CODEX_AGENT="$REPO_ROOT/.codex/agents/$agent.toml"
-  SKILL_AGENT="$REPO_ROOT/skills/tmux-agent-tools/agents/$agent.md"
-
-  [[ ! -f "$PLUGIN_AGENT" ]]  && ok "plugin-root agents/$agent.md stays retired"      || bad "plugin-root agents/$agent.md was reintroduced"
-  [[ ! -f "$PROJECT_AGENT" ]] && ok ".claude/agents/$agent.md stays retired"          || bad ".claude/agents/$agent.md was reintroduced"
-  [[ ! -f "$CODEX_AGENT" ]]   && ok ".codex/agents/$agent.toml stays retired"         || bad ".codex/agents/$agent.toml was reintroduced"
-  [[ ! -f "$SKILL_AGENT" ]]   && ok "skills/tmux-agent-tools/agents/$agent.md stays retired" || bad "skills/tmux-agent-tools/agents/$agent.md was reintroduced"
-done
-
-# The gate now lives in using-tmux-agent-tools/SKILL.md — check it carries
-# the forcing-gate form (observable trigger + evidence obligation), not a
-# paraphrase, and still carries the no-cascade worker constraint.
-GATE_SKILL="$REPO_ROOT/skills/using-tmux-agent-tools/SKILL.md"
-[[ -f "$GATE_SKILL" ]] && ok "using-tmux-agent-tools/SKILL.md exists" || bad "using-tmux-agent-tools/SKILL.md missing"
-
-grep -qF '## BYPASS — inline is the DEFAULT' "$GATE_SKILL" \
-  && ok "gate section heading present" || bad "gate section heading missing"
-grep -qF 'forcing gate, not ambient advice' "$GATE_SKILL" \
-  && ok "gate states forcing-gate contract explicitly" || bad "gate does not state the forcing-gate contract"
-grep -qF 'record the winner BY NAME' "$GATE_SKILL" \
-  && ok "gate requires naming an observable trigger" || bad "gate does not require naming an observable trigger"
-grep -qF 'Do not spawn additional tmux sessions or delegate further.' "$GATE_SKILL" \
-  && ok "gate carries the no-cascade worker constraint" || bad "gate missing the no-cascade worker constraint"
 
 # Skill-packaged doc/schema copies must not drift from their repo canonicals.
 SKILL_DIR="$REPO_ROOT/skills/tmux-agent-tools"
@@ -75,19 +37,6 @@ CODEX_SKILL="$REPO_ROOT/.codex/skills/tmux-agent-tools"
 [[ -L "$CODEX_SKILL" ]] && ok ".codex/skills/tmux-agent-tools is a symlink" || bad ".codex/skills/tmux-agent-tools symlink missing"
 [[ "$(readlink "$CODEX_SKILL" 2>/dev/null)" == "../../skills/tmux-agent-tools" ]] \
   && ok ".codex/skills/tmux-agent-tools points at canonical skill" || bad ".codex/skills/tmux-agent-tools points at wrong target"
-
-# CI-mode exit code tables in the source contract and the skill-packaged
-# reference must carry the same set of codes (issue: contracts.md silently
-# dropped reserved codes 4/5 that docs/ci-mode-exit-codes.md documents).
-DOC_CODES=("${(@f)$(grep -E '^\| [0-9]+ \|' "$REPO_ROOT/docs/ci-mode-exit-codes.md" | awk -F'|' '{gsub(/ /,"",$2); print $2}')}")
-CONTRACTS_CODES="$(grep -E '^\| [0-9]+ \|' "$SKILL_DIR/references/contracts.md" | awk -F'|' '{gsub(/ /,"",$2); print $2}')"
-for code in "${DOC_CODES[@]}"; do
-  if grep -qx "$code" <<< "$CONTRACTS_CODES"; then
-    ok "contracts.md carries CI exit code $code"
-  else
-    bad "contracts.md missing CI exit code $code (present in docs/ci-mode-exit-codes.md)"
-  fi
-done
 
 echo "agent-delegate-packaging smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

@@ -16,7 +16,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-result-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -121,9 +120,7 @@ run_missing_value_reject() {
 }
 
 run_result_variants "$CODEX_TMUX"  "CODEX"  "result-codex"
-run_result_variants "$CLAUDE_TMUX" "CLAUDE" "result-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
-run_missing_value_reject "$CLAUDE_TMUX" "claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

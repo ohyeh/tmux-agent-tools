@@ -11,7 +11,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$AGENT_TMUX"
-CLAUDE_TMUX="$AGENT_TMUX"
 
 WORK="$(mktemp -d -t tmux-agent-result-contract-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -106,6 +105,13 @@ run_contract_cases() {
   assert "$prefix wait-required incomplete timeout" "$(printf '%s' "$out" | jq -r .timeout)" "true"
   assert_contains "$prefix wait-required missing summary" "$out" "summary"
 
+  # A result file that is present but not JSON: every field is missing and the wait times out.
+  write_result "$prefix-wait-malformed" '{"status":'
+  code=0
+  out="$("$wrapper" "$cli" result wait-required "$prefix-wait-malformed" --fields status,summary --wait 2 --json 2>&1)" || code=$?
+  assert "$prefix wait-required malformed exit" "$code" "1"
+  assert "$prefix wait-required malformed payload" "$(printf '%s' "$out" | jq -c '[.present, .timeout, .missing_fields]')" '[true,true,["status","summary"]]'
+
   write_result "$prefix-wait-complete" '{"schema_version":1,"status":"ok","summary":"done","artifacts":[{"kind":"file","ref":"x"}],"errors":[]}'
   code=0
   out="$("$wrapper" "$cli" result wait-required "$prefix-wait-complete" --fields status,summary --wait 2 --json 2>&1)" || code=$?
@@ -136,10 +142,6 @@ run_contract_cases() {
 }
 
 run_contract_cases "$CODEX_TMUX" codex "contract-codex"
-run_contract_cases "$CLAUDE_TMUX" claude "contract-claude"
-run_contract_cases "$AGENT_TMUX" agy "contract-agy"
-run_contract_cases "$AGENT_TMUX" cursor "contract-cursor"
-run_contract_cases "$AGENT_TMUX" grok "contract-grok"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

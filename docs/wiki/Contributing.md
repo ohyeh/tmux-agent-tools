@@ -47,7 +47,7 @@ tmux-agent-tools/
    ```bash
    scripts/test-<name>-smoke
    scripts/test-fanout-run-smoke       # if you touched L5 fanout/dag
-   scripts/test-l6-batch-smoke         # if you touched L6
+   scripts/run-all-smokes test-sentinel-smoke test-secret-uri-smoke test-worktree-lifecycle-smoke  # if you touched L6
    scripts/ci-shellcheck
    scripts/lint-no-path-tied-locals
    ```

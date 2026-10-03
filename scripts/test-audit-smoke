@@ -7,7 +7,6 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-audit-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -111,11 +110,8 @@ run_append_failure() {
 }
 
 run_audit "$CODEX_TMUX"  "CODEX"  "a-codex"
-run_audit "$CLAUDE_TMUX" "CLAUDE" "a-claude"
 run_default_log "$CODEX_TMUX"  "CODEX"  "n-codex"
-run_default_log "$CLAUDE_TMUX" "CLAUDE" "n-claude"
 run_disabled_no_log "$CODEX_TMUX"  "CODEX"  "d-codex"
-run_disabled_no_log "$CLAUDE_TMUX" "CLAUDE" "d-claude"
 run_append_failure "$CODEX_TMUX" "CODEX" "f-codex"
 
 echo

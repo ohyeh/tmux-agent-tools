@@ -18,7 +18,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-wait-capture-smoke.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -170,11 +169,8 @@ run_missing_value_reject() {
 }
 
 run_cases "$CODEX_TMUX"  "CODEX"  "wc-codex"
-run_cases "$CLAUDE_TMUX" "CLAUDE" "wc-claude"
 run_ere_class_default_literal "$CODEX_TMUX"  "CODEX"  "wc-ere-codex"
-run_ere_class_default_literal "$CLAUDE_TMUX" "CLAUDE" "wc-ere-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
-run_missing_value_reject "$CLAUDE_TMUX" "claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

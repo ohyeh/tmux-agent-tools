@@ -50,6 +50,22 @@ cd "$WORK/elsewhere"
 echo "case: install-bin links the entry"
 check "link exists" test -L "$ENTRY"
 
+echo "case: install-bin drops the link of a wrapper a release removed"
+ln -s "${ODD:A}/scripts/removed-wrapper" "$WORK/bin dir/removed-wrapper"
+ln -s /usr/bin/true "$WORK/bin dir/foreign"
+# Another install's removed wrapper, reached through `..`: not this installer's link.
+ln -s "${ODD:A}/scripts/../other-install/scripts/gone" "$WORK/bin dir/gone"
+# A relative link named like its target, run from the install dir: read from the
+# cwd it would look like this installer's `<script_dir>/zz`; it points into bin.
+ln -s zz "$WORK/bin dir/zz"
+(cd "$ODD/scripts" && ./install-bin "$WORK/bin dir" >/dev/null)
+check "relative link read from its own directory, kept" test -L "$WORK/bin dir/zz"
+"$ODD/scripts/install-bin" "$WORK/bin dir" >/dev/null
+check "stale link removed" test ! -L "$WORK/bin dir/removed-wrapper"
+check "foreign link kept" test -L "$WORK/bin dir/foreign"
+check "link into another install kept" test -L "$WORK/bin dir/gone"
+check "entry link kept" test -L "$ENTRY"
+
 echo "case: --help needs no TTY and no node"
 rc=0; out="$(NODE=/nonexistent/node "$ENTRY" --help </dev/null 2>&1)" || rc=$?
 check "--help exit 0" test "$rc" -eq 0

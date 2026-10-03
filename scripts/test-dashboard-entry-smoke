@@ -1,0 +1,32 @@
+#!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+# The tmux-agent-dashboard shell entry: it reaches lib/snapshot.node.ts and
+# `--watch --count` ends. The snapshot's content is snapshot.contract.node.ts's.
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+DASH="${SCRIPT_DIR:h}/skills/tmux-agent-tools/scripts/tmux-agent-dashboard"
+WORK="$(mktemp -d -t tmux-agent-dash-entry.XXXXXX)"
+export TMUX_AGENT_DIR="$WORK/state"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+check() {
+  local label="$1"; shift
+  if "$@"; then echo "  ok   $label"; PASS=$((PASS + 1)); else echo "  FAIL $label" >&2; FAIL=$((FAIL + 1)); fi
+}
+
+echo "case: --watch --count 2 prints two snapshots and exits"
+rc=0
+out="$(perl -e 'alarm 30; exec @ARGV' zsh "$DASH" --watch --count 2 --interval 0 2>&1)" || rc=$?
+check "exit 0 within 30 s (rc=$rc)" test "$rc" -eq 0
+check "two snapshots, each schema_version 1 with a sessions array" \
+  test "$(printf '%s' "$out" | jq -s '[.[] | select(.schema_version == 1 and (.sessions | type) == "array")] | length' 2>/dev/null)" = 2
+
+echo "case: an unknown flag is refused"
+rc=0; zsh "$DASH" --bogus >/dev/null 2>&1 || rc=$?
+check "exit 2" test "$rc" -eq 2
+
+echo "dashboard-entry smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))
