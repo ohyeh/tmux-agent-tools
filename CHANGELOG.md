@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.45.0 - 2026-10-03
+
 - Fix (session id capture): with a profile `session_id_pattern`, the capture loop behind `start` declared its `local`s inside the loop; zsh prints a set name it re-declares, so every pass after the first wrote the pane text to `start`'s stdout. `test-session-meta-smoke` now asserts the loop prints nothing.
 - Fix (mod, worker notices, review): a notice is parked before any await (a turn that ended while the submit read the clock left it parked for good and held the poll pass), and only the model's own tool call carries it (a plugin's `$.tool.call` took it as context the model never reads, and acked it).
 - Tests: smoke suite pruned. `test-dashboard-smoke` became `test-dashboard-entry-smoke` (the shell entry and `--watch --count`; snapshot.contract asserts the content); merged approval-chrome → hook-trust-status, claude-env-inherit → color-env, usage → lifecycle, supervision-stress → marker-nonce, l6-batch → sentinel / secret-uri / worktree-lifecycle. Coverage given up on purpose: the packaging guards on retired agent files and SKILL prose, the `status --usage` aggregate (a skeleton no code feeds) and `usage_init.schema_version`, the `result validate --json` entry on a malformed file (the shared parser stays covered by result-schema), and supervision-stress's stopped-worker `.running=false` check. session-meta tests the real `session_meta_validate` and `spawn_session_id_capture` instead of copies written inside the test. 22 smokes that ran every case for codex and claude run the second CLI only where the assertion depends on it (profile flags, delivery, env). Dead code and dead traps removed; dispatch-gate-hook no longer writes the real `~/.local/state/agent-hooks`; tui-e2e keeps its work dir under the job dir; mod-permissions shows the validate output when it prints no surface (pipefail ended the script silently).
@@ -212,6 +214,8 @@
 - An orphan whose current episode is already acknowledged (by any session) is not claimed: it has nothing left to deliver, and claiming it only moved `owner` away from the session that dispatched it (the five above were all delivered). A `tell` starts a new episode, which is claimable again. Mod tests 153 pass; the new test fails without the guard.
 
 ## Unreleased
+
+## v0.45.0 - 2026-10-03
 
 ## v0.44.6 - 2026-10-03
 
