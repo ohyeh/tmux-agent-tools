@@ -128,10 +128,10 @@ type RunResult = { value: { exitCode: number; stdout: string; stderr: string; is
  */
 /**
  * With no PATH (this harness), the core runs a bare `agent-tmux` as
- * `zsh -c <resolve> agent-tmux …` (zshRun); the fake answers the command it stands for.
+ * `zsh -f -c <resolve> agent-tmux …` (zshRun); the fake answers the command it stands for.
  */
 const unwrapZsh = (argv: readonly string[]): readonly string[] =>
-  argv[0] === 'zsh' && argv[1] === '-c' && argv[3] === 'agent-tmux' ? argv.slice(3) : argv
+  argv[0] === 'zsh' && argv[1] === '-f' && argv[2] === '-c' && argv[4] === 'agent-tmux' ? argv.slice(4) : argv
 const runState = new WeakMap<On, { ledger?: (argv: readonly string[]) => RunResult | undefined; hook?: Hook<'process.run'> }>()
 function runOf(on: On) {
   let st = runState.get(on)

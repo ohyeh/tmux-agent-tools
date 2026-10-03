@@ -445,10 +445,11 @@ export async function runnableCwd(host: Host, cwd: string): Promise<string> {
  * macOS, once any ancestor ran as a #! script (a tmux server agent-tmux started,
  * cursor-agent), each #! exec below it leaks ~1 KB of kernel memory
  * (data.kalloc.1024) until reboot. A bare name is found by the child's own PATH
- * at run time, so no install location is assumed.
+ * at run time, so no install location is assumed; the lookup shell reads no
+ * startup files (-f), so the script's zsh reads zshenv once, as a #! exec did.
  */
 export function zshRun(bin: string): string[] {
-  return bin.includes('/') ? ['zsh', bin] : ['zsh', '-c', 'p=$(whence -p -- "$0") || exit 127; exec zsh "$p" "$@"', bin]
+  return bin.includes('/') ? ['zsh', bin] : ['zsh', '-f', '-c', 'p=$(whence -p -- "$0") || exit 127; exec zsh "$p" "$@"', bin]
 }
 
 /**

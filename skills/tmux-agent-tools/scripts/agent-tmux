@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.44.5'
+AGENT_TMUX_VERSION='0.44.6'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -8326,7 +8326,7 @@ self_test_dry_run() {
   default_profile="$tmp_dir/default.conf"
   supplied_profile="$tmp_dir/supplied.conf"
   printf 'bin=/bin/echo\n' > "$default_profile"
-  out="$(TMUX_AGENT_DIR="$tmp_dir/default-state" "$SELF" claude --profile "$default_profile" start --dry-run --exact st-default "$tmp_dir" 2>/dev/null)" || true
+  out="$(TMUX_AGENT_DIR="$tmp_dir/default-state" zsh "$SELF" claude --profile "$default_profile" start --dry-run --exact st-default "$tmp_dir" 2>/dev/null)" || true
   invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$out" 2>/dev/null)"
   if [[ "$invocation_flags" == *"--session-id"* ]]; then
     rm -rf "$tmp_dir"
@@ -8335,7 +8335,7 @@ self_test_dry_run() {
   fi
 
   printf 'bin=/bin/echo\nsession_id_capture=supplied\n' > "$supplied_profile"
-  supplied_out="$(TMUX_AGENT_DIR="$tmp_dir/supplied-state" "$SELF" claude --profile "$supplied_profile" start --dry-run --exact st-supplied "$tmp_dir" 2>/dev/null)" || true
+  supplied_out="$(TMUX_AGENT_DIR="$tmp_dir/supplied-state" zsh "$SELF" claude --profile "$supplied_profile" start --dry-run --exact st-supplied "$tmp_dir" 2>/dev/null)" || true
   invocation_flags="$("$JQ" -r '.invocation.launch_flags // ""' <<< "$supplied_out" 2>/dev/null)"
   supplied_id="$("$JQ" -r '.invocation.cli_session_id // ""' <<< "$supplied_out" 2>/dev/null)"
   supplied_meta="$("$JQ" -r '.invocation.session_meta_path // ""' <<< "$supplied_out" 2>/dev/null)"

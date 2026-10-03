@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.44.6 - 2026-10-03
+
 - Fix (dashboard, detached workers): run the sessions inventory and detached `assign` through explicit zsh, including the mod's core copy, so these paths do not execute a shell shebang below a tainted parent.
 - Fix (hashing, macOS): use binary `sha256sum` or `openssl dgst -sha256 -r` for worker, audit, monitor, and dispatch hashes. The Perl `shasum` launcher no longer runs in these production paths.
 - Fix (commander, sessions, fanout, dialogue, teams, plugins): run repeated owned shell helpers with their interpreter, including the commander's two-second status line and plugin hook/MCP entry points.
@@ -201,6 +203,8 @@
 - An orphan whose current episode is already acknowledged (by any session) is not claimed: it has nothing left to deliver, and claiming it only moved `owner` away from the session that dispatched it (the five above were all delivered). A `tell` starts a new episode, which is claimable again. Mod tests 153 pass; the new test fails without the guard.
 
 ## Unreleased
+
+## v0.44.6 - 2026-10-03
 
 - `agent-tmux status --json`: `last_change_at` / `idle_seconds` no longer count what a CLI redraws below its composer line — claude's statusline, cursor's usage countdown and `git:(main ↑1)`, codex's context meter. Live 2026-09-26 cursor's footer reset the idle clock every hour and on every commit in the worker's repo, so a delivered worker never sat idle 30 min and the mod's auto-stop (Q-1, 2026-09-25) never fired: finished workers piled up in `tmux ls` since 12:48. The hash now covers the pane down to and including the composer line (output above it and typing into it still count), found with the same rules as the prompt area (`PROMPT_BOUNDARY_AWK`, one copy), and only when that line is among the last 12 non-empty lines; otherwise the whole pane, as before. `test-liveness-smoke` gains three cases (a footer-only redraw stays idle; a change above the composer is activity; a `> ` quote high in the output is not a composer), 39 pass; the footer case fails with the whole-pane hash put back. Expect every worker's idle clock to restart once after the update (new hash).
 
