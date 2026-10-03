@@ -56,42 +56,7 @@ Node entry points (not Claude plugin paths):
 
 ## CI and release gates
 
-### Already on CI (` .github/workflows/ci.yml`)
-
-| gate | file:line | runs the new tests? |
-|---|---|---|
-| Node floor `22.18.0` | `ci.yml:31–34` `actions/setup-node@v5` | yes, for the steps below |
-| Core contract | `ci.yml:36–37` `scripts/test-core-contract-smoke` | yes. The smoke is `scripts/test-core-contract-smoke:13–20`: floor `22.18.0`, then `node --test ./*.contract.node.ts` |
-| Collector tests | same glob | yes: `collector.contract.node.ts` matches `*.contract.node.ts`. `ledger.race.node.ts` and `workers.race.node.ts` are contender processes, not `node:test` files |
-| Launcher tests | same glob | yes: `launcher.contract.node.ts` matches `*.contract.node.ts` (P7) |
-| TUI tests | same glob | yes: `tui.contract.node.ts` matches `*.contract.node.ts` (P6, renamed from `tui.test.node.ts` in 4463641) |
-| `claude plugin test .` | `ci.yml:522–544` installs Claude, then `scripts/run-all-smokes` | yes, indirectly. `scripts/run-all-smokes:46` globs `test-*-smoke`, which includes `scripts/test-mod-permissions-smoke:70` (`claude plugin test .`). Per-smoke timeout is `scripts/run-all-smokes:17` (240s) |
-| Typecheck | same glob | yes: `scripts/test-mod-typecheck-smoke:22` (`npx -p typescript tsc --noEmit -p tsconfig.json`). `tsconfig.json:17–18` includes `scripts/lib` and excludes `*.node.ts` |
-
-`ci.yml` did not need a new job.
-
-### Release workflow (landed here)
-
-Before this prep, `.github/workflows/release.yml` `validate` did not set up Node 22.18.0 and did not run the contract smoke, typecheck, or plugin test. P6 TUI tests (`tui.contract.node.ts`) and P7 launcher tests (`launcher.contract.node.ts`) are now in the tree and executed by `test-core-contract-smoke` (`*.contract.node.ts`). Release workflow now also runs `cd mcp-adapter && npm ci && npm test` on Node 22.18.0, the full smoke suite (`scripts/run-all-smokes`) with private tmux isolation, and ties publish to the tested candidate SHA.
-
-| gate | file:line |
-|---|---|
-| job timeout | `release.yml:31` `timeout-minutes: 30` |
-| Candidate SHA recording | `release.yml:42–46` `record_sha` output |
-| Node `22.18.0` | `release.yml:56–59` |
-| mcp-adapter `npm ci` + `npm test` | `release.yml:61–62` `cd mcp-adapter && npm ci && npm test` |
-| Socket isolation guard | `release.yml:64–65` |
-| Core contract (includes collector, launcher, and TUI contracts) | `release.yml:67–68` |
-| Typecheck | `release.yml:70–71` |
-| Claude install | `release.yml:73–77` |
-| Permission surface + `claude plugin test .` | `release.yml:79–80` `scripts/test-mod-permissions-smoke` |
-| Smoke CLI stubs + full smoke suite (private tmux isolation) | `release.yml:82–96` `scripts/run-all-smokes` |
-| Existing candidate checks (version regex, tag absent, wrapper self-test, version-sync, session-meta, oneshot, dialogue with isolated tmux) | `release.yml:98–129` |
-| CHANGELOG section for the tag | `release.yml:131–145` |
-| Checkout tested candidate SHA & refuse if main moved | `release.yml:164–179` |
-| Publish (tag + GitHub release on tested SHA) only when `dry_run` is false | `release.yml:196–211` |
-
-`publish` does not re-run tests. `needs: validate` is the gate, and publish checks out the tested SHA and tags it explicitly. Formula syntax is not a gate: the Homebrew formula was removed (`CHANGELOG.md:112`). `docs/wiki/Contributing.md:85` still mentions it. `docs/release-process.md` is not in the tree; `docs/wiki/Contributing.md:81` still points at it.
+None on GitHub: the repo has no Actions workflows (owner ruling 2026-10-02). The gates are the local checks in `docs/wiki/Contributing.md` § Release process.
 
 ## Capability matrix
 
@@ -242,7 +207,7 @@ running the mod's test suite
 2 passed, 0 failed
 ```
 
-`npm install -g @anthropic-ai/claude-code` was not run; `claude` was already on PATH. The smoke is the step `release.yml:64` runs after that install.
+`npm install -g @anthropic-ai/claude-code` was not run; `claude` was already on PATH.
 
 ## Left for the final P8 (after P3–P7 merge)
 

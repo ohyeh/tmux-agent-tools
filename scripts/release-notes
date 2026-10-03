@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# Prints the CHANGELOG.md section of one release, for `gh release create --notes-file`.
+#   scripts/release-notes v0.45.0 > /tmp/notes.md
+version = ARGV.fetch(0) { abort("usage: release-notes vX.Y.Z") }
+changelog = File.read(File.expand_path("../CHANGELOG.md", __dir__))
+pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## |\z)/m
+match = changelog.match(pattern) or abort("CHANGELOG.md is missing a #{version} section")
+body = match[:body].strip
+abort("CHANGELOG.md #{version} section is empty") if body.empty?
+puts body
