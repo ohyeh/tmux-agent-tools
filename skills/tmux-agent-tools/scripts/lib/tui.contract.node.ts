@@ -1563,7 +1563,8 @@ test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', {
         const call = await wrapperCall(host, argv)
         const cmd = [...call.argv]
         // zsh scripts read /etc/zshenv, which rebuilds PATH and hides the shim.
-        if (argv[0] === 'agent-tmux') cmd.splice(0, 1, '/bin/zsh', '-f', agentTmux)
+        // Replace the wrapper's run prefix (`zsh <path>`) with this checkout's agent-tmux.
+        if (argv[0] === 'agent-tmux') cmd.splice(0, cmd.length - (argv.length - 1), '/bin/zsh', '-f', agentTmux)
         if ((cmd[0] === 'tmux' || cmd[0] === real) && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', socket)
         const env: NodeJS.ProcessEnv = { ...process.env, ...call.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ''}` }
         delete env.TMUX

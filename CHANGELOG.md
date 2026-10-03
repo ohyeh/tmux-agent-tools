@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix (core, mod, TUI, MCP; macOS kernel memory): the core ran `agent-tmux` as a `#!` exec on every tick (status, composer-state, result). On macOS, once any ancestor ran as a `#!` script (a tmux server that `agent-tmux` started, `cursor-agent`), each `#!` exec below it leaks ~1 KB of kernel memory (zone `data.kalloc.1024`) until reboot; orphaned TUI e2e runs polling `agent-tmux` grew it to ~8 GB on one host. `wrapperCall` and `composerState` now run it as `zsh <path>` (the PATH entry is resolved to its file; the panel still shows `agent-tmux`). Live `zprint`, 600 calls under a `#!`-launched node: +702K before, -31K after.
+
 ## v0.44.5 - 2026-10-02
 
 - Fix (core root, TUI): the mod launches the wrapper with `TMUX_AGENT_DIR=<root>/.v3` (the wrapper's agent dir). When that launch starts the tmux server, the server keeps the value in its global environment, and every pane inherits it; the core read it as the root and looked in `<root>/.v3/.v3`. So a `tmux-agent-tui` (or `workers.cli rows`, the launcher) opened in tmux showed no worker, only project-session rows. `rootOf` now reads a value that ends in `/.v3` as its parent. A contract case fails on 0.44.4. Leftover `<root>/.v3/.v3/` dirs from earlier runs are not touched.

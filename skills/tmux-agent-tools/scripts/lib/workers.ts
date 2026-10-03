@@ -384,14 +384,15 @@ export const AGENT_TMUX_HOMES = [
  * so the fallback is logged once. A miss is looked up again, so an install
  * mid-session is picked up.
  */
-export const agentTmuxFound = new Map<string, string>()
+export const agentTmuxFound = new Map<string, { bin: string; shown: string }>()
 /** The last one found, for text shown to the person (the panel renders synchronously). */
 export let agentTmuxShown = 'agent-tmux'
 
 /**
- * `agent-tmux` as argv[0]: the bare name when PATH has it (a developer's own
- * checkout wins), else the first install that exists. `missing` lists where it
- * looked, so the tool that fails can say so to the model.
+ * The `agent-tmux` file to run: the one on PATH (a developer's own checkout
+ * wins; shown as the bare name), else the first install that exists. A path,
+ * so wrapperCall can run it as `zsh <path>`. `missing` lists where it looked,
+ * so the tool that fails can say so to the model.
  */
 export async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?: string }> {
   const pathVar = await host.envPath()
@@ -400,18 +401,22 @@ export async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?:
   const home = await host.envHome()
   const key = `${home}\0${pathVar}`
   const found = agentTmuxFound.get(key)
-  if (found) return { bin: (agentTmuxShown = found) }
+  if (found) {
+    agentTmuxShown = found.shown
+    return { bin: found.bin }
+  }
   const has = (path: string) => host.exists(path).catch(() => false)
   for (const dir of pathVar.split(':').filter(Boolean)) {
     if (await has(`${dir}/agent-tmux`)) {
-      agentTmuxFound.set(key, 'agent-tmux')
-      return { bin: (agentTmuxShown = 'agent-tmux') }
+      agentTmuxFound.set(key, { bin: `${dir}/agent-tmux`, shown: 'agent-tmux' })
+      agentTmuxShown = 'agent-tmux'
+      return { bin: `${dir}/agent-tmux` }
     }
   }
   const paths = home ? AGENT_TMUX_HOMES.map(rel => `${home}/${rel}`) : []
   for (const path of paths) {
     if (await has(path)) {
-      agentTmuxFound.set(key, path)
+      agentTmuxFound.set(key, { bin: path, shown: path })
       host.log(`tmux-agent: agent-tmux is not on PATH; using ${path}`)
       return { bin: (agentTmuxShown = path) }
     }
@@ -443,7 +448,12 @@ export async function runnableCwd(host: Host, cwd: string): Promise<string> {
 export async function wrapperCall(host: Host, argv: readonly string[]): Promise<{ argv: readonly string[]; env?: Record<string, string> }> {
   if (argv[0] !== 'agent-tmux') return { argv }
   const root = await rootOf(host)
-  return { argv: [(await agentTmuxBin(host)).bin, ...argv.slice(1)], ...(root ? { env: { TMUX_AGENT_DIR: v3Of(root) } } : {}) }
+  const { bin } = await agentTmuxBin(host)
+  // zsh <path>, never a #! exec: on macOS, once any ancestor ran as a #! script (a
+  // tmux server agent-tmux started, cursor-agent), each #! exec below it leaks
+  // ~1 KB of kernel memory (data.kalloc.1024) until reboot; this runs every tick.
+  const run = bin.includes('/') ? ['zsh', bin] : [bin]
+  return { argv: [...run, ...argv.slice(1)], ...(root ? { env: { TMUX_AGENT_DIR: v3Of(root) } } : {}) }
 }
 
 /**
