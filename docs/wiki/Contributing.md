@@ -25,8 +25,7 @@ tmux-agent-tools/
 │   └── lint-no-path-tied-locals.test  # lint smoke
 ├── schemas/                           # JSON schemas for stable surfaces
 ├── docs/                              # design docs (one per issue / batch)
-├── CHANGELOG.md                       # release-by-release narrative
-└── .github/workflows/                 # CI + release workflows
+└── CHANGELOG.md                       # release-by-release narrative
 ```
 
 ## Style ground rules
@@ -47,11 +46,11 @@ tmux-agent-tools/
    ```bash
    scripts/test-<name>-smoke
    scripts/test-fanout-run-smoke       # if you touched L5 fanout/dag
-   scripts/test-l6-batch-smoke         # if you touched L6
+   scripts/run-all-smokes test-sentinel-smoke test-secret-uri-smoke test-worktree-lifecycle-smoke  # if you touched L6
    scripts/ci-shellcheck
    scripts/lint-no-path-tied-locals
    ```
-6. **Open a PR** with `Closes #<issue>` and an acceptance-checklist body. CI is manual only (`gh workflow run ci.yml`); it runs the same smokes plus shellcheck, so run them locally first.
+6. **Open a PR** with `Closes #<issue>` and an acceptance-checklist body, quoting the local check output. There is no CI: this repo has no GitHub Actions workflows, and agents never add or trigger one (owner ruling 2026-10-02).
 7. **Review loop** — see [the partner review pattern](#partner-review-pattern) below.
 8. **Merge** via squash. Conventional commit message in the squash subject.
 9. **CHANGELOG.md** — add an entry under `## Unreleased`. The release PR consolidates these into a versioned section.
@@ -78,14 +77,16 @@ Many PRs land via a two-agent loop: an implementer writes the code, a partner ru
 
 ## Release process
 
-Releases go through `docs/release-process.md`. Summary:
+No GitHub Actions: the release is local, after the local checks pass.
 
-1. **Open a release PR** that updates `CHANGELOG.md` with a `## v0.X.Y - YYYY-MM-DD` section. No tag yet.
-2. **Merge** to `main` after CI passes.
-3. **Run the `Release` workflow** from GitHub Actions with `version: v0.X.Y` and `dry_run: true`. Inspect the dry-run output (CHANGELOG section match, smokes, shellcheck, Formula syntax).
-4. **Re-run with `dry_run: false`** only if the dry run is clean. This is the only step that creates a public annotated tag and GitHub Release.
-
-Do not run `git tag` and `git push --tags` from your shell. The workflow is the supported path because it validates the release content before publishing.
+1. Move `## Unreleased` entries under `## v0.X.Y - YYYY-MM-DD`, bump every version line (`scripts/test-version-sync-smoke` lists them), rebuild the MCP bundle (`npm --prefix mcp-adapter run build`), commit `chore(release): 0.X.Y`.
+2. Run the local checks: `scripts/test-mod-typecheck-smoke`, `scripts/ci-shellcheck`, `scripts/test-core-contract-smoke`, `(cd mods/tmux-agent && claude plugin test .)`, `zsh scripts/run-all-smokes`. All must pass; quote their output.
+3. Push `main`, then tag and publish from the same commit:
+   ```sh
+   git tag -a v0.X.Y -m v0.X.Y && git push origin v0.X.Y
+   ruby scripts/release-notes v0.X.Y > "$TMPDIR/notes.md"
+   gh release create v0.X.Y --title v0.X.Y --notes-file "$TMPDIR/notes.md"
+   ```
 
 ## Asking for help
 

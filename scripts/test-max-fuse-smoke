@@ -16,9 +16,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
-for wrapper in "$CODEX_TMUX" "$CLAUDE_TMUX"; do
+for wrapper in "$CODEX_TMUX"; do
   if [[ ! -x "$wrapper" ]]; then
     echo "wrapper not executable: $wrapper" >&2
     exit 1
@@ -211,18 +210,10 @@ case_bad_value() {
   assert "$prefix-bad-value rejected" "$rc" "2"
 }
 
-# Exercise both wrappers.
-for spec in "$CLAUDE_TMUX|CLAUDE|claude" "$CODEX_TMUX|CODEX|codex"; do
-  wrapper="${spec%%|*}"
-  rest="${spec#*|}"
-  cli_env="${rest%%|*}"
-  prefix="${rest#*|}"
-  case_max_runtime        "$wrapper" "$cli_env" "$prefix"
-  case_max_idle           "$wrapper" "$cli_env" "$prefix"
-  case_max_idle_reset     "$wrapper" "$cli_env" "$prefix"
-  case_stop_kills_watcher "$wrapper" "$cli_env" "$prefix"
-  case_both_runtime_wins  "$wrapper" "$cli_env" "$prefix"
-  case_bad_value          "$wrapper" "$cli_env" "$prefix"
+# One CLI is enough: the fuse watcher has no per-CLI branch.
+for fn in case_max_runtime case_max_idle case_max_idle_reset case_stop_kills_watcher \
+          case_both_runtime_wins case_bad_value; do
+  "$fn" "$CODEX_TMUX" CODEX codex
 done
 
 echo

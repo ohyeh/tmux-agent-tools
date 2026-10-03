@@ -8,7 +8,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 PASS=0
 FAIL=0
@@ -72,7 +71,6 @@ run_wrapper() {
 }
 
 run_wrapper "$CODEX_TMUX"  "codex"
-run_wrapper "$CLAUDE_TMUX" "claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

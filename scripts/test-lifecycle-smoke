@@ -256,6 +256,16 @@ assert "dry-run no launch-meta" \
 assert "dry-run no usage.jsonl" \
   "$([[ -f "$TMUX_AGENT_DIR/ldry/usage.jsonl" ]] && echo yes || echo no)" "no"
 
+echo "case: --usage writes the ledger to a custom absolute path"
+"$AGENT" claude --profile "$prof_ok" start --exact --usage "$WORK/custom.jsonl" lusage "$WORK" 'x' >/dev/null 2>&1 || true
+assert "custom usage has usage_init" "$(grep -c usage_init "$WORK/custom.jsonl" 2>/dev/null || true)" "1"
+"$AGENT" claude --profile "$prof_ok" stop lusage >/dev/null 2>&1 || true
+
+echo "case: --usage rejects a relative path"
+code=0
+"$AGENT" claude --profile "$prof_ok" start --exact --usage rel.jsonl lusagerel "$WORK" 'x' >/dev/null 2>&1 || code=$?
+assert "relative --usage exit=2" "$code" "2"
+
 echo
 echo "summary: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

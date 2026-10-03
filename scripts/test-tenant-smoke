@@ -7,7 +7,6 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 PASS=0
 FAIL=0
@@ -23,11 +22,9 @@ assert() {
 
 echo "case: default prefix (no tenant)"
 assert "codex default" "$("$CODEX_TMUX" tenant)" "codex-cli"
-assert "claude default" "$("$CLAUDE_TMUX" tenant)" "claude-cli"
 
 echo "case: tenant suffix"
 assert "codex alice" "$(TMUX_AGENT_TOOLS_TENANT=alice "$CODEX_TMUX" tenant)" "codex-cli-alice"
-assert "claude bob" "$(TMUX_AGENT_TOOLS_TENANT=bob "$CLAUDE_TMUX" tenant)" "claude-cli-bob"
 
 echo "case: empty tenant treated as unset"
 assert "codex empty=default" "$(TMUX_AGENT_TOOLS_TENANT= "$CODEX_TMUX" tenant)" "codex-cli"

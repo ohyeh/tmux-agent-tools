@@ -16,7 +16,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-ping-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -156,7 +155,6 @@ run_one() {
 }
 
 run_one "$CODEX_TMUX"  "CODEX"  "ping-codex"
-run_one "$CLAUDE_TMUX" "CLAUDE" "ping-claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

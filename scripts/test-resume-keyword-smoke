@@ -59,4 +59,3 @@ assert "agy resumes by id with --conversation" "$(argv_of agy rkw-agy AGY)" \
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
-(( FAIL == 0 ))

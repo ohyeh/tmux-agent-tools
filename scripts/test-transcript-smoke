@@ -14,7 +14,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
-unset CLAUDE
 
 WORK="$(mktemp -d -t tmux-agent-transcript-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -215,19 +214,14 @@ run_wait_events() {
 }
 
 run_transcript        "$CODEX_TMUX"  "CODEX"  "tr-codex"  "codex"
+# claude delivers by file-ref, a separate send path: the transcript still records the text sent.
 run_transcript        "$CLAUDE_TMUX" "CLAUDE" "tr-claude" "claude"
 run_stale_reject      "$CODEX_TMUX"  "CODEX"  "codex"
-run_stale_reject      "$CLAUDE_TMUX" "CLAUDE" "claude"
 run_unwritable_reject "$CODEX_TMUX"  "CODEX"  "codex"
-run_unwritable_reject "$CLAUDE_TMUX" "CLAUDE" "claude"
 run_truncate          "$CODEX_TMUX"  "CODEX"  "trc-codex"
-run_truncate          "$CLAUDE_TMUX" "CLAUDE" "trc-claude"
 run_truncate_invalid  "$CODEX_TMUX"  "tic-codex"
-run_truncate_invalid  "$CLAUDE_TMUX" "tic-claude"
 run_wait_events       "$CODEX_TMUX"  "CODEX"  "we-codex"
-run_wait_events       "$CLAUDE_TMUX" "CLAUDE" "we-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
-run_missing_value_reject "$CLAUDE_TMUX" "claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

@@ -90,7 +90,7 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 | Item | Status | Evidence, or blocker and action |
 |---|---|---|
 | macOS: detached worker launch (perl `setpgrp`) | PASS | `skills/tmux-agent-tools/scripts/lib/workers.contract.node.ts` (launch detach test); `sh`, `bash`, `dash` children survive a group kill (commit `7ab54a2` record in `$R/state.md`) |
-| Linux: detached launch with `setsid` | UNCONFIRMED | `$R/state.md` row `7ab54a2` says Linux `setsid` did not run. CI runs on `macos-latest` only (`.github/workflows/ci.yml`). To close: run the core contract and `scripts/run-all-smokes` on a Linux host or add a Linux CI job. |
+| Linux: detached launch with `setsid` | UNCONFIRMED | `$R/state.md` row `7ab54a2` says Linux `setsid` did not run. There is no CI (no GitHub Actions). To close: run the core contract and `scripts/run-all-smokes` on a Linux host. |
 | Linux: all other cells | UNCONFIRMED | No Linux run of any live or smoke test is recorded. Same action. |
 | Unit and smoke suites (macOS) | PASS | `scripts/test-mcp-bundle-smoke`, `mcp-adapter/test/adapter-smoke.js`, `skills/tmux-agent-tools/scripts/lib/*.contract.node.ts`; green run for `ff31398` in `$R/state.md` ("gate-b17") |
 

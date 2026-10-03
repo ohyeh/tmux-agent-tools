@@ -23,12 +23,12 @@ NODE_BIN="${NODE:-$(command -v node)}"
 REAL_TMUX="$(command -v tmux)"
 DEADLINE=$(( SECONDS + ${TUI_E2E_TIMEOUT:-200} ))
 
-# Short path: a macOS socket path tops out near 104 bytes.
-WORK="$(mktemp -d /tmp/tui-e2e.XXXXXX)"
+# Under smoke-tmux.sh's TMPDIR, inside the runner's job dir: a runner that
+# SIGKILLs this smoke still removes it with the job dir.
+WORK="$(mktemp -d "$TMPDIR/tui-e2e.XXXXXX")"
 mkdir -p "$TMUX_TMPDIR" "$WORK/bin" "$WORK/repo" "$WORK/zdot"
 export TMUX_AGENT_DIR="$WORK/state"
 export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
-export AGENT_TMUX_SUPPRESS_DEPRECATION=1
 export ZDOTDIR="$WORK/zdot"   # ~/.zshenv would put another agent-tmux first on PATH
 unset TMUX TMUX_PANE TMUX_AGENT_SESSION TMUX_AGENT_TMUX_SOCKET
 smoke_socket e2e

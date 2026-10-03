@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Smoke test for issue #102 advisory send lock.
 #
-# Validates that `send_lock_around` in agent-tmux claude and codex:
+# Validates that `send_lock_around` in agent-tmux (one CLI: the lock has no per-CLI branch):
 #   - serializes concurrent acquirers on the same agent name
 #   - refuses a second acquirer while a holder is alive (rc 75, no entry)
 #   - hands the lock to waiters one at a time after the holder is killed -9
@@ -25,7 +25,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
@@ -208,7 +207,7 @@ if [[ -s "$dir/violations" ]]; then
 fi
 BODY
 
-for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
+for wrapper in "$CODEX_TMUX"; do
   tool="$(basename "$wrapper")"
   run_case "$wrapper" "$tool-basic"          "$WORK/case-basic.zsh"
   run_case "$wrapper" "$tool-concurrent"     "$WORK/case-concurrent.zsh"
@@ -218,4 +217,4 @@ for wrapper in "$CLAUDE_TMUX" "$CODEX_TMUX"; do
   run_case "$wrapper" "$tool-rc"             "$WORK/case-rc.zsh"
 done
 
-echo "OK: send-lock smoke passed for agent-tmux claude and codex."
+echo "OK: send-lock smoke passed for agent-tmux codex."

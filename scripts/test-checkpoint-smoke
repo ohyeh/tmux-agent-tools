@@ -7,7 +7,6 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-ckpt-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -71,9 +70,7 @@ run_rejects() {
 }
 
 run_cycle   "$CODEX_TMUX"  "CODEX"  "cp-codex"
-run_cycle   "$CLAUDE_TMUX" "CLAUDE" "cp-claude"
 run_rejects "$CODEX_TMUX"  "rj-codex"
-run_rejects "$CLAUDE_TMUX" "rj-claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

@@ -116,5 +116,45 @@ run_local_color_case "$CODEX_TMUX" "CODEX" "codex"
 run_remote_color_toggle_case "$CLAUDE_TMUX" "CLAUDE" "CLAUDE_TMUX_COLOR_ENV" "claude"
 run_remote_color_toggle_case "$CODEX_TMUX" "CODEX" "CODEX_TMUX_COLOR_ENV" "codex"
 
+# claude start clears caller ANTHROPIC_* env unless an opt-in says otherwise.
+cat > "$WORK/fake-claude-env.sh" <<'EOF'
+#!/bin/sh
+echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}"
+echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}"
+echo "ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}"
+echo "API_TIMEOUT_MS=${API_TIMEOUT_MS:-}"
+sleep 30
+EOF
+chmod +x "$WORK/fake-claude-env.sh"
+
+# run_claude_env_case <name> <expected base,token,model,timeout> <env assignments...>
+run_claude_env_case() {
+  local name="$1" expected="$2" key want
+  shift 2
+  echo "case: claude env $name"
+  env CLAUDE="$WORK/fake-claude-env.sh" "$@" "$CLAUDE_TMUX" start --exact "$name" "$WORK" >/dev/null
+  sleep 1
+  for key in ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL API_TIMEOUT_MS; do
+    want="${expected%%,*}"; expected="${expected#*,}"
+    [[ "$want" == "-" ]] && continue
+    assert "$name $key" "$(pane_env_value "claude-cli-$name" "$key")" "$want"
+  done
+  "$CLAUDE_TMUX" stop "$name" >/dev/null 2>&1 || true
+}
+
+CALLER_ENV=(ANTHROPIC_BASE_URL=http://localhost:8317 ANTHROPIC_AUTH_TOKEN=tok-inherited
+  ANTHROPIC_MODEL=claude-opus-4-7 API_TIMEOUT_MS=3000000)
+run_claude_env_case env-default ",,," "${CALLER_ENV[@]}"
+run_claude_env_case env-optin "http://localhost:8317,tok-inherited,claude-opus-4-7,3000000" \
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=1 "${CALLER_ENV[@]}"
+run_claude_env_case env-explicit "http://explicit.example,-,explicit-model,-" \
+  ANTHROPIC_BASE_URL=http://caller.example \
+  TMUX_AGENT_TOOLS_SESSION_ENV=$'ANTHROPIC_BASE_URL=http://explicit.example\nANTHROPIC_MODEL=explicit-model'
+run_claude_env_case env-explicit-bare "http://bare-key.example,-,-,-" \
+  ANTHROPIC_BASE_URL=http://bare-key.example TMUX_AGENT_TOOLS_SESSION_ENV=ANTHROPIC_BASE_URL
+run_claude_env_case env-optout "http://should-not-inherit.example,-,-,-" \
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=0 CLAUDE_TMUX_CLEAR_CLAUDE_ENV=0 \
+  ANTHROPIC_BASE_URL=http://should-not-inherit.example
+
 echo "color-env smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

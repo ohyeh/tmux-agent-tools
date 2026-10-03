@@ -9,7 +9,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-on-start-smoke.XXXXXX)"
 export TMUX_AGENT_DIR="$WORK/state"
@@ -163,15 +162,10 @@ run_with_sentinel_log_path() {
 }
 
 run_basic_hook "$CODEX_TMUX"  "CODEX"  "os-codex"
-run_basic_hook "$CLAUDE_TMUX" "CLAUDE" "os-claude"
 run_no_hook_default "$CODEX_TMUX"  "CODEX"  "nh-codex"
-run_no_hook_default "$CLAUDE_TMUX" "CLAUDE" "nh-claude"
 run_non_zero_hook_logged "$CODEX_TMUX"  "CODEX"  "fail-codex"
-run_non_zero_hook_logged "$CLAUDE_TMUX" "CLAUDE" "fail-claude"
 run_missing_value "$CODEX_TMUX"  "mv-codex"
-run_missing_value "$CLAUDE_TMUX" "mv-claude"
 run_with_sentinel_log_path "$CODEX_TMUX"  "CODEX"  "sl-codex"
-run_with_sentinel_log_path "$CLAUDE_TMUX" "CLAUDE" "sl-claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

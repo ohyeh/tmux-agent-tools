@@ -17,7 +17,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
 WORK="$(mktemp -d -t tmux-agent-approval-smoke.XXXXXX)"
 TMUX_AGENT_DIR="$WORK/state"
@@ -26,7 +25,6 @@ trap '
   "$CODEX_TMUX"  stop ag-approve >/dev/null 2>&1 || true
   "$CODEX_TMUX"  stop ag-reject  >/dev/null 2>&1 || true
   "$CODEX_TMUX"  stop ag-timeout >/dev/null 2>&1 || true
-  "$CLAUDE_TMUX" stop ag-cl-approve >/dev/null 2>&1 || true
   rm -rf "$WORK"
 ' EXIT
 
@@ -204,8 +202,6 @@ run_timeout_case() {
 run_approve_case  "$CODEX_TMUX"  "CODEX"  "ag-approve"
 run_reject_case   "$CODEX_TMUX"  "CODEX"  "ag-reject"
 run_timeout_case  "$CODEX_TMUX"  "CODEX"  "ag-timeout"
-# Cross-wrapper sanity: agent-tmux claude approve path.
-run_approve_case  "$CLAUDE_TMUX" "CLAUDE" "ag-cl-approve"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

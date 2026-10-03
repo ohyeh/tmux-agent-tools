@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.44.6'
+AGENT_TMUX_VERSION='0.45.0'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -2748,9 +2748,11 @@ spawn_session_id_capture() {
   # Run in a subshell so it doesn't block start_session.
   (
     local deadline=$(( $(date +%s) + 30 ))
+    # Declared once: a zsh `local` of a set name prints it, so a second pass
+    # wrote the pane text to start's stdout.
+    local pane_text labeled_line uuid tmp
     while (( $(date +%s) < deadline )); do
       sleep 2
-      local pane_text labeled_line uuid
       pane_text="$("$tmux_bin" "${TMUX_SOCKET_ARGS[@]}" capture-pane -t "$(session_target "$session")" -p 2>/dev/null)" || break
       # Stage 1: find the first line that matches the label anchor.
       labeled_line="$(printf '%s\n' "$pane_text" | grep -m1 -E "$pattern")" || true
@@ -2758,7 +2760,6 @@ spawn_session_id_capture() {
       # Stage 2: extract + validate UUID from that line only.
       uuid="$(printf '%s\n' "$labeled_line" | grep -oE "$_uuid_re" | head -1)" || true
       if [[ -n "$uuid" ]] && _is_rfc4122_uuid "$uuid"; then
-        local tmp
         tmp="$(mktemp "${meta_path}.tmp.XXXXXX")" || break
         "$jq_bin" -n --arg id "$uuid" \
           '{schema_version: 1, cli_session_id: $id}' > "$tmp" && mv "$tmp" "$meta_path" || rm -f "$tmp"
@@ -4923,7 +4924,6 @@ start_session() {
   local transcript_truncate=""
   local result_schema_path=""
   local usage_path=""
-  local ci_mode=0
   local on_exit_allow=""
   local workdir_fresh=0
   local -a pending_secrets
@@ -4933,7 +4933,7 @@ start_session() {
   local model_flag=""
   local effort_flag=""
   local task_shape=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" || "${1:-}" == "--model" || "${1:-}" == "--effort" || "${1:-}" == "--task-shape" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" || "${1:-}" == "--model" || "${1:-}" == "--effort" || "${1:-}" == "--task-shape" ]]; do
     case "$1" in
       --task-shape)
         if (( $# < 2 )); then
@@ -5047,10 +5047,6 @@ start_session() {
         fi
         usage_path="$2"
         shift 2
-        ;;
-      --ci)
-        ci_mode=1
-        shift
         ;;
       --on-exit-allow)
         if (( $# < 2 )); then
@@ -5189,9 +5185,6 @@ start_session() {
   record_started_at "$name"
   audit_log_append "$("$JQ" -c -n --arg event start --arg tool "$CLI" --arg name "$name" \
     --arg session "$session" --arg cwd "$directory" '{event:$event, tool:$tool, name:$name, session:$session, cwd:$cwd}')"
-  if (( ci_mode )); then
-    ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
-  fi
   if [[ -n "$usage_path" ]]; then
     usage_record_path "$name" "$usage_path"
   fi
@@ -5438,14 +5431,13 @@ resume_session() {
   local transcript_truncate=""
   local result_schema_path=""
   local usage_path=""
-  local ci_mode=0
   local on_exit_allow=""
   local workdir_fresh=0
   local -a pending_secrets
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--ci" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
     case "$1" in
       --secret-redact|--secret-redact=true)
         SECRET_REDACT_DISABLE=0
@@ -5523,10 +5515,6 @@ resume_session() {
         fi
         usage_path="$2"
         shift 2
-        ;;
-      --ci)
-        ci_mode=1
-        shift
         ;;
       --on-exit-allow)
         if (( $# < 2 )); then
@@ -5645,9 +5633,6 @@ resume_session() {
   record_started_at "$name"
   audit_log_append "$("$JQ" -c -n --arg event start --arg tool "$CLI" --arg name "$name" \
     --arg session "$session" --arg cwd "$directory" '{event:$event, tool:$tool, name:$name, session:$session, cwd:$cwd}')"
-  if (( ci_mode )); then
-    ( printf '1\n' > "$(agent_root_dir)/$name/ci-mode" ) 2>/dev/null || true
-  fi
   if [[ -n "$usage_path" ]]; then
     usage_record_path "$name" "$usage_path"
   fi

@@ -12,9 +12,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
-for wrapper in "$CODEX_TMUX" "$CLAUDE_TMUX"; do
+for wrapper in "$CODEX_TMUX"; do
   if [[ ! -x "$wrapper" ]]; then
     echo "wrapper not executable: $wrapper" >&2
     exit 1
@@ -199,9 +198,7 @@ run_missing_value_reject() {
 }
 
 run_capture_variants "$CODEX_TMUX"  "CODEX"  "capture-codex"
-run_capture_variants "$CLAUDE_TMUX" "CLAUDE" "capture-claude"
 run_missing_value_reject "$CODEX_TMUX"  "codex"
-run_missing_value_reject "$CLAUDE_TMUX" "claude"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

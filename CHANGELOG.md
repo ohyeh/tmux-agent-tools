@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.45.0 - 2026-10-03
+
+- Fix (session id capture): with a profile `session_id_pattern`, the capture loop behind `start` declared its `local`s inside the loop; zsh prints a set name it re-declares, so every pass after the first wrote the pane text to `start`'s stdout. `test-session-meta-smoke` now asserts the loop prints nothing.
+- Fix (mod, worker notices, review): a notice is parked before any await (a turn that ended while the submit read the clock left it parked for good and held the poll pass), and only the model's own tool call carries it (a plugin's `$.tool.call` took it as context the model never reads, and acked it).
+- Tests: smoke suite pruned. `test-dashboard-smoke` became `test-dashboard-entry-smoke` (the shell entry and `--watch --count`; snapshot.contract asserts the content); merged approval-chrome → hook-trust-status, claude-env-inherit → color-env, usage → lifecycle, supervision-stress → marker-nonce, l6-batch → sentinel / secret-uri / worktree-lifecycle. Coverage given up on purpose: the packaging guards on retired agent files and SKILL prose, the `status --usage` aggregate (a skeleton no code feeds) and `usage_init.schema_version`, the `result validate --json` entry on a malformed file (the shared parser stays covered by result-schema), and supervision-stress's stopped-worker `.running=false` check. session-meta tests the real `session_meta_validate` and `spawn_session_id_capture` instead of copies written inside the test. 22 smokes that ran every case for codex and claude run the second CLI only where the assertion depends on it (profile flags, delivery, env). Dead code and dead traps removed; dispatch-gate-hook no longer writes the real `~/.local/state/agent-hooks`; tui-e2e keeps its work dir under the job dir; mod-permissions shows the validate output when it prints no surface (pipefail ended the script silently).
+- Removed: `tmux-agent-cron`. It only kept a catalog (`schedules.jsonl`) and never ran anything: `history` read a `runs.jsonl` that no code wrote, and the cheatsheet's "run scheduled jobs" was not true. `test-cron-smoke` goes with it. `install-bin` now removes its links to wrappers that a release removed.
+- Removed: `start --ci` / `resume --ci`. The flag only wrote `<name>/ci-mode`, which nothing read, and `CLAUDE_TMUX_CI` / `CODEX_TMUX_CI` were never read. The "CI-mode exit codes" table (`docs/ci-mode-exit-codes.md`, contracts.md) described codes the wrapper does not emit that way (3 is a contract mismatch or an `--on-exit-allow` refusal, 4 a preflight or `--secret` failure, 5 never); contracts.md keeps the per-command exit codes that are real. `test-ci-mode-smoke` and the table-sync check go with it.
+- Removed: the GitHub Actions workflows (`ci.yml`, `release.yml`). Agent-triggered runs spent the owner's Actions quota re-running a suite that had just passed locally. Checks run locally; a release is a local tag plus `gh release create` with `scripts/release-notes` (docs/wiki/Contributing.md § Release process).
+- Docs: the release checklist installed the mod into Codex (`codex plugin add tmux-agent@…`); Codex gets `tmux-agent-tools@tmux-agent-tools` only. The mod is Claude Code only: a Codex that has it parses its `hooks/hooks.json` and warns `unknown field modules` — `codex plugin remove tmux-agent@tmux-agent-tools`.
+- Fix (mod, worker notices): a worker that finished while the main loop's turn ran waited for that turn to end, because `$.prompt.submit` starts a turn of its own once the session is idle (live: 20 min late, which read as a duplicate). The notice now rides the next main-loop tool result as `context`; with no later tool call it is submitted when the turn ends, stamped `(ready HH:MM, delivered HH:MM: N min later)` when it waited a minute or more. Subagent turns never hold or carry it; a refused submit still acks nothing, so the next tick retries.
+
 ## v0.44.6 - 2026-10-03
 
 - Fix (dashboard, detached workers): run the sessions inventory and detached `assign` through explicit zsh, including the mod's core copy, so these paths do not execute a shell shebang below a tainted parent.
@@ -203,6 +214,8 @@
 - An orphan whose current episode is already acknowledged (by any session) is not claimed: it has nothing left to deliver, and claiming it only moved `owner` away from the session that dispatched it (the five above were all delivered). A `tell` starts a new episode, which is claimable again. Mod tests 153 pass; the new test fails without the guard.
 
 ## Unreleased
+
+## v0.45.0 - 2026-10-03
 
 ## v0.44.6 - 2026-10-03
 

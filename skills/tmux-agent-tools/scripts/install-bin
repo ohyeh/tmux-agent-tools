@@ -17,6 +17,16 @@ for name in "${wrappers[@]}"; do
   ln -sf "$script_dir/$name" "$target_dir/$name"
   echo "  $target_dir/$name -> $script_dir/$name"
 done
+# A wrapper a release removed leaves its link behind. Drop only a link this
+# installer would make (same name, straight into this directory) whose file is
+# gone; `:a` folds any `..`, so a link into another install never matches.
+for link in "$target_dir"/*(N@); do
+  dest="$(readlink "$link")"
+  [[ "$dest" == /* ]] || dest="${link:h}/$dest"  # a relative link is relative to its own directory
+  [[ "${dest:a}" == "$script_dir/${link:t}" && ! -e "$dest" ]] || continue
+  rm -f "$link"
+  echo "Removed stale link: $link -> $dest"
+done
 echo
 echo "Make sure this is on PATH:"
 echo "  $target_dir"
