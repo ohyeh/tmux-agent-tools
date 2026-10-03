@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test: `status --json` names a worker the CLI stopped on a usage limit or
 # lost credentials for (blocked_reason quota_exhausted / login_required, with
 # the matching line in blocked_evidence), and does NOT fire on a worker's own

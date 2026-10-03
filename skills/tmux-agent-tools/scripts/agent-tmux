@@ -1512,7 +1512,7 @@ max_fuse_watcher_loop() {
       if command -v sha256sum >/dev/null 2>&1; then
         new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
       else
-        new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+        new_hash="$(printf '%s' "$pane_text" | openssl dgst -sha256 -r | awk '{print $1}')"
       fi
       if [[ "$new_hash" != "$last_hash" ]]; then
         last_hash="$new_hash"
@@ -1561,7 +1561,7 @@ spawn_max_fuse_watcher() {
   local subdir
   subdir="$(ensure_agent_dir "$agent_name")"
   local pid_file="$subdir/fuse.pid"
-  nohup "$SELF" "$CLI" __fuse_watcher \
+  nohup zsh "$SELF" "$CLI" __fuse_watcher \
     "$agent_name" "$tmux_session" "$sentinel" "$on_exit_cmd" \
     "$max_runtime" "$max_idle" "$TMUX" \
     >/dev/null 2>&1 </dev/null &
@@ -2067,7 +2067,7 @@ transcript_truncate_text() {
     if command -v sha256sum >/dev/null 2>&1; then
       sha="$(printf '%s' "$text" | sha256sum | awk '{print $1}')"
     else
-      sha="$(printf '%s' "$text" | shasum -a 256 | awk '{print $1}')"
+      sha="$(printf '%s' "$text" | openssl dgst -sha256 -r | awk '{print $1}')"
     fi
     "$JQ" -c -n --arg text "[truncated, original $bytes bytes]" \
       --arg sha "$sha" --argjson bytes "$bytes" \
@@ -2082,7 +2082,7 @@ sha256_text() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print $1}'
   else
-    shasum -a 256 | awk '{print $1}'
+    openssl dgst -sha256 -r | awk '{print $1}'
   fi
 }
 
@@ -3575,7 +3575,7 @@ _audit_log_append_locked() {
       # Already inside the lock — invoke the rotate routine in-process
       # via TMUX_AGENT_AUDIT_NO_LOCK so it does not re-acquire.
       if [[ -x "$_audit_bin" ]]; then
-        TMUX_AGENT_AUDIT_NO_LOCK=1 "$_audit_bin" rotate --log "$audit_target" --force >/dev/null 2>&1 || true
+        TMUX_AGENT_AUDIT_NO_LOCK=1 bash "$_audit_bin" rotate --log "$audit_target" --force >/dev/null 2>&1 || true
       fi
     fi
   fi
@@ -3597,7 +3597,7 @@ _audit_log_append_locked() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha_cmd="sha256sum"
   else
-    sha_cmd="shasum -a 256"
+    sha_cmd="openssl dgst -sha256 -r"
   fi
   local new_hash
   new_hash="$(printf '%s%s%s' "$chain_key" "$prev_hash" "$with_meta" | eval "$sha_cmd" | awk '{print $1}')"
@@ -3632,7 +3632,7 @@ audit_log_verify() {
   require_jq
   local chain_key sha_cmd
   chain_key="$(audit_log_chain_key)"
-  if command -v sha256sum >/dev/null 2>&1; then sha_cmd="sha256sum"; else sha_cmd="shasum -a 256"; fi
+  if command -v sha256sum >/dev/null 2>&1; then sha_cmd="sha256sum"; else sha_cmd="openssl dgst -sha256 -r"; fi
   local expected_prev="0000000000000000000000000000000000000000000000000000000000000000"
   local lineno=0 bad=0
   while IFS= read -r line; do
@@ -3950,13 +3950,13 @@ update_pane_hash() {
   subdir="$(ensure_agent_dir "$name")"
   local hash_file="$subdir/pane-hash"
   # Prefer sha256sum (GNU coreutils — ubiquitous on Linux); fall back to
-  # shasum (Perl-based, default on macOS). gemini-code-assist on PR #142
+  # openssl (a binary on macOS). gemini-code-assist on PR #142
   # caught that minimal Linux distros may ship without Perl.
   local new_hash
   if command -v sha256sum >/dev/null 2>&1; then
     new_hash="$(printf '%s' "$pane_text" | sha256sum | awk '{print $1}')"
   else
-    new_hash="$(printf '%s' "$pane_text" | shasum -a 256 | awk '{print $1}')"
+    new_hash="$(printf '%s' "$pane_text" | openssl dgst -sha256 -r | awk '{print $1}')"
   fi
   local now_iso
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -6539,7 +6539,7 @@ outcome_session() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha="$(sha256sum "$snap" | awk '{print $1}')"
   else
-    sha="$(shasum -a 256 "$snap" | awk '{print $1}')"
+    sha="$(openssl dgst -sha256 -r "$snap" | awk '{print $1}')"
   fi
   if ! reported="$(jq -r '.status // ""' "$snap")"; then
     rm -f "$snap"
@@ -9342,7 +9342,7 @@ stop_session() {
 
 _team_state_dir()  { printf '%s/teams' "$(agent_root_dir)"; }
 _team_state_file() { printf '%s/%s.json' "$(_team_state_dir)" "$1"; }
-_agt()             { "$SELF" "$@"; }   # re-invoke engine: _agt <cli> <subcmd...>
+_agt()             { zsh "$SELF" "$@"; }   # re-invoke engine: _agt <cli> <subcmd...>
 _file_mtime()      { _file_mtime_epoch "$1"; }
 
 # ---- per-team lock: mkdir (atomic) + pid owner + stale detect + timeout ----

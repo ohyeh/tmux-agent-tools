@@ -105,7 +105,7 @@ require_jq() {
 wrapper_for_tool() {
   local tool="$1"
   case "$tool" in
-    claude|codex|agy) reply=("$SCRIPT_DIR/agent-tmux" "$tool") ;;
+    claude|codex|agy) reply=(zsh "$SCRIPT_DIR/agent-tmux" "$tool") ;;
     *) die "unsupported wrapper tool: $tool" ;;
   esac
 }

@@ -23,6 +23,7 @@ import {
   v3Of,
   type Host,
   type TmuxDispatch,
+  zshRun,
 } from './workers.ts'
 
 export type PanelOptions = {
@@ -218,7 +219,7 @@ export class FleetProbeError extends Error {
 /** Fetch fleet sessions via tmux-agent-sessions list --json --no-write. */
 export async function fetchFleetSessions(host: Host): Promise<DashboardSession[]> {
   const sessionsBin = await findSessionsBin(host)
-  const run = await host.run([sessionsBin, 'list', '--json', '--no-write'], (await host.cwd()) ?? process.cwd(), 10000)
+  const run = await host.run([...zshRun(sessionsBin), 'list', '--json', '--no-write'], (await host.cwd()) ?? process.cwd(), 10000)
   if (run.exitCode !== 0) {
     const errText = run.stderr?.trim() || `exit code ${run.exitCode}`
     throw new FleetProbeError(`fleet probe failed with exit ${run.exitCode}: ${errText}`, run.stderr?.trim(), run.exitCode)

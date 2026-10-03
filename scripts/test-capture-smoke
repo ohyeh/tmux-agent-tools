@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for issue #96 token-efficient capture variants.
 #
 # Exercises --strip-ansi / --since-marker / --json against synthetic

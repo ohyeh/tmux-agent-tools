@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke for issue #144 graceful degrade on liveness-state write failures.
 # Locks the partner R8 followup: status --json must remain readable when
 # the per-agent metadata dir is read-only.

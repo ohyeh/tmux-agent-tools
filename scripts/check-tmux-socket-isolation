@@ -252,8 +252,22 @@ function scan(file) {
   const lines = strip(readFileSync(file, 'utf8'), shell)
   const hits = []
   for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    // Replacing this directory hides sockets from the runner's SIGKILL cleanup.
+    if (shell && rel !== 'scripts/run-all-smokes' && /^\s*(?:export\s+)?TMUX_TMPDIR\s*=/.test(line)) {
+      hits.push(`${rel}:${i + 1}: smoke replaces the run's TMUX_TMPDIR`)
+    }
+    if (/['"`]-S['"`]\s*,\s*['"`]\/|(?:^|\s)-S\s+['"]?\//.test(line)) {
+      hits.push(`${rel}:${i + 1}: literal socket path is outside the run directory`)
+    }
+    if (/\b(?:socket\w*|sock\w*|SOCK\w*)\s*=.*['"`]\/(?:tmp|private)(?:\/|['"`])/.test(line)) {
+      hits.push(`${rel}:${i + 1}: socket is assigned an out-of-dir path`)
+    }
     const problems = shell ? shProblems(lines, i) : tsProblems(lines, i)
     for (const problem of problems) hits.push(`${rel}:${i + 1}: ${problem}`)
+  }
+  if (shell && rel !== 'scripts/run-all-smokes' && SERVER.test(lines.join('\n')) && !/source .*smoke-tmux\.sh/.test(lines.join('\n'))) {
+    hits.push(`${rel}: smoke server calls need the sourced smoke-tmux helper`)
   }
   return hits
 }

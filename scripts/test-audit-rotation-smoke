@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke for #188 audit rotation + chain preservation.
 set -euo pipefail
 
@@ -7,7 +8,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUDIT_BIN="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-audit"
 
 WORK="$(mktemp -d -t tmux-agent-audit-rot.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; smoke_cleanup' EXIT
 
 PASS=0; FAIL=0
 assert() {

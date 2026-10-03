@@ -21,7 +21,8 @@
   "skills": "./skills/",
   "mcpServers": {
     "tmux-agent": {
-      "command": "${CURSOR_PLUGIN_ROOT}/skills/tmux-agent-tools/scripts/tmux-agent-mcp"
+      "command": "zsh",
+      "args": ["${CURSOR_PLUGIN_ROOT}/skills/tmux-agent-tools/scripts/tmux-agent-mcp"]
     }
   }
 }

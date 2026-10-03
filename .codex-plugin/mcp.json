@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "tmux-agent": {
-      "command": "./skills/tmux-agent-tools/scripts/tmux-agent-mcp",
+      "command": "zsh",
+      "args": ["./skills/tmux-agent-tools/scripts/tmux-agent-mcp"],
       "cwd": "."
     }
   }

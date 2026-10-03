@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
-import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, rootOf, v3Of, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
+import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, rootOf, v3Of, zshRun, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
 
@@ -85,6 +85,7 @@ test('assign: v5 name, worker.json, E1 descriptor + sent, launch on the producer
   assert.equal(detach[1], '-c')
   assert.match(detach[2]!, /setsid nohup .*setpgrp\(0, 0\)/, 'the launch runs in a process group of its own')
   const launch = detach[4]!
+  assert.match(launch, /'zsh' '[^']*agent-tmux'/, 'detached assign must not execute the shell shebang')
   // The child is one `sh -c` line: check the words, not the quoting.
   assert.ok(launch.includes('TMUX_AGENT_DIR=') && launch.includes(w.v3), launch)
   assert.match(launch, /assign.*--detach.*--result-path.*result\.json.*--episode.*1.*brief\.md/)
@@ -2089,5 +2090,24 @@ test('R4-11 follow-up: a launch slower than host.run\'s timeout does not hold as
   } finally {
     process.env.PATH = was.path
     process.env.TMUX_AGENT_DIR = was.dir
+  }
+})
+
+test('zshRun: a path runs as zsh <path>; a bare name is found by the child\'s PATH, else 127', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zshrun-'))
+  try {
+    const script = join(dir, 'agent-tmux')
+    writeFileSync(script, '#!/usr/bin/env zsh\nprint -r -- "ran $0 $*"\n')
+    chmodSync(script, 0o755)
+    assert.deepEqual(zshRun(script), ['zsh', script])
+    const [cmd, ...args] = zshRun('agent-tmux')
+    const env = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` }
+    const found = spawnSync(cmd!, [...args, 'codex', 'status'], { env, encoding: 'utf8' })
+    assert.equal(found.status, 0, found.stderr)
+    assert.equal(found.stdout.trim(), `ran ${script} codex status`)
+    const missing = spawnSync(cmd!, [...args, 'codex'], { env: { ...process.env, PATH: '/usr/bin:/bin' }, encoding: 'utf8' })
+    assert.equal(missing.status, 127)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })

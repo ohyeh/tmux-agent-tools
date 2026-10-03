@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke for L6 batch: #115 --on-exit-allow, #116 --secret, #117 --workdir-fresh.
 
 set -euo pipefail

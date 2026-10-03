@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # End-to-end smoke of the real TUI (plan R4): `tmux-agent-tui` in a pane of a
 # private tmux server, over a real ledger whose two workers are real tmux
 # sessions (a fake CLI, as the assign smokes use), driven with `send-keys` and
@@ -24,25 +25,23 @@ DEADLINE=$(( SECONDS + ${TUI_E2E_TIMEOUT:-200} ))
 
 # Short path: a macOS socket path tops out near 104 bytes.
 WORK="$(mktemp -d /tmp/tui-e2e.XXXXXX)"
-export TMUX_TMPDIR="$WORK/t"
 mkdir -p "$TMUX_TMPDIR" "$WORK/bin" "$WORK/repo" "$WORK/zdot"
 export TMUX_AGENT_DIR="$WORK/state"
 export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
 export AGENT_TMUX_SUPPRESS_DEPRECATION=1
 export ZDOTDIR="$WORK/zdot"   # ~/.zshenv would put another agent-tmux first on PATH
 unset TMUX TMUX_PANE TMUX_AGENT_SESSION TMUX_AGENT_TMUX_SOCKET
-# The private server is tmux's default socket under TMUX_TMPDIR: agent-tmux and
-# the TUI reach it without -S. `-L e2e` names it apart from any other default.
-T() { command "$REAL_TMUX" -L e2e "$@"; }
+smoke_socket e2e
+export TMUX_AGENT_TMUX_SOCKET="$REPLY"
+T() { command "$REAL_TMUX" -S "$TMUX_AGENT_TMUX_SOCKET" "$@"; }
 cat > "$WORK/bin/tmux" <<EOF
 #!/bin/sh
 for a in "\$@"; do case "\$a" in -S|-L) exec ${(q)REAL_TMUX} "\$@" ;; esac; done
-exec ${(q)REAL_TMUX} -L e2e "\$@"
+exec ${(q)REAL_TMUX} -S ${(q)TMUX_AGENT_TMUX_SOCKET} "\$@"
 EOF
 chmod +x "$WORK/bin/tmux"
 export PATH="$WORK/bin:$SCRIPTS:${NODE_BIN:h}:/usr/bin:/bin:/usr/sbin:/sbin"
 cleanup() {
-  T kill-server 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT

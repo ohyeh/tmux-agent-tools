@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for Claude/Anthropic env inheritance into agent-tmux claude sessions.
 
 set -euo pipefail

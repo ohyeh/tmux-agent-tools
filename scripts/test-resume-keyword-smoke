@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke: `resume` launches each CLI with the flag that opens a SPECIFIC session.
 # cursor-agent: `resume` is "resume the latest chat" and takes no id; the id goes
 # to `--resume [chatId]`. agy has no resume subcommand; the id goes to
@@ -20,7 +21,7 @@ cleanup() {
   "$AGENT_TMUX" agy stop rkw-agy >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+trap 'cleanup; smoke_cleanup' EXIT
 
 PASS=0; FAIL=0
 assert() {

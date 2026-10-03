@@ -36,7 +36,7 @@ sha_cmd() {
   if command -v sha256sum >/dev/null 2>&1; then
     echo "sha256sum"
   else
-    echo "shasum -a 256"
+    echo "openssl dgst -sha256 -r"
   fi
 }
 

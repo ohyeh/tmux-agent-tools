@@ -1,0 +1,209 @@
+const fs = require("node:fs");
+const path = require("node:path");
+
+const [, , cli, command, ...args] = process.argv;
+const root = process.env.TMUX_AGENT_DIR || process.env.FAKE_AGENT_TMUX_ROOT || path.join(process.cwd(), "test/tmp/fake-state");
+fs.mkdirSync(root, { recursive: true });
+
+function statePath(name, file) {
+  return path.join(root, name, file);
+}
+
+function ensure(name) {
+  fs.mkdirSync(path.join(root, name), { recursive: true });
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+if (cli === "fake" && command === "doctor" && args[0] === "--json") {
+  console.log(JSON.stringify({ ok: true, checks: [] }));
+  process.exit(0);
+}
+
+if (command === "start" && args[0] === "--dry-run") {
+  console.log(JSON.stringify({ ok: true, dry_run: true, cli }));
+  process.exit(0);
+}
+
+if (command === "result" && args[0] === "--path") {
+  const name = args[1];
+  console.log(statePath(name, "result.json"));
+  process.exit(0);
+}
+
+if (command === "assign") {
+  let detach = false;
+  let resultPath = "";
+  let episode = "1";
+  let i = 0;
+  while (i < args.length && args[i].startsWith("--")) {
+    if (args[i] === "--detach") {
+      detach = true;
+      i += 1;
+    } else if (args[i] === "--result-path") {
+      resultPath = args[i + 1];
+      i += 2;
+    } else if (args[i] === "--episode") {
+      episode = args[i + 1];
+      i += 2;
+    } else {
+      i += 1;
+    }
+  }
+  const name = args[i];
+  const repoPath = args[i + 1];
+  const briefPath = args[i + 2];
+  ensure(name);
+  // Knobs for the host-failure fixtures: a slow launch, and a launch that fails.
+  if (process.env.FAKE_ASSIGN_DELAY_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_ASSIGN_DELAY_MS));
+  if (briefPath && fs.existsSync(briefPath)) {
+    fs.copyFileSync(briefPath, statePath(name, "brief.md"));
+    fs.copyFileSync(briefPath, statePath(name, "prompt.txt"));
+  }
+  fs.writeFileSync(statePath(name, "repo.txt"), repoPath || "");
+  fs.writeFileSync(statePath(name, "assigned"), "1");
+  console.log(`agent: ${name}`);
+  process.exit(Number(process.env.FAKE_ASSIGN_EXIT || 0));
+}
+
+if (command === "start") {
+  const exact = args[0];
+  const name = args[1];
+  const repoPath = args[2];
+  const prompt = args[3] || "";
+  if (exact !== "--exact") process.exit(2);
+  ensure(name);
+  fs.writeFileSync(statePath(name, "prompt.txt"), prompt);
+  fs.writeFileSync(statePath(name, "repo.txt"), repoPath);
+  console.log(`agent: ${name}`);
+  process.exit(0);
+}
+
+if (command === "send" || command === "send-wait") {
+  let resultPath = "";
+  let episode = "1";
+  let promptFile = "";
+  let i = 0;
+  while (i < args.length && args[i].startsWith("--")) {
+    if (args[i] === "--result-path") {
+      resultPath = args[i + 1];
+      i += 2;
+    } else if (args[i] === "--episode") {
+      episode = args[i + 1];
+      i += 2;
+    } else if (args[i] === "--prompt-file") {
+      promptFile = args[i + 1];
+      i += 2;
+    } else {
+      i += 1;
+    }
+  }
+  const name = args[i];
+  const message = promptFile && fs.existsSync(promptFile) ? fs.readFileSync(promptFile, "utf8") : (args[i + 1] || "");
+  ensure(name);
+  fs.writeFileSync(statePath(name, "message.txt"), message || "");
+  if (process.env.FAKE_SEND_BLOCKED === "1") {
+    console.log(JSON.stringify({ schema_version: 1, submitted: false, blocked: true, blocked_reason: "login_prompt" }));
+    process.exit(1);
+  }
+  if (process.env.FAKE_SEND_RESULT_JSON === "1") {
+    const body = { schema_version: 1, status: "success", summary: "ok", artifacts: [], errors: [], episode: Number(episode) || 1 };
+    const targetPath = resultPath || statePath(name, "result.json");
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, JSON.stringify(body));
+    console.log(JSON.stringify({ schema_version: 1, submitted: true, nonce_seen: false, completion_source: "result_json", result: { body } }));
+    process.exit(0);
+  }
+  console.log("matched nonce: MARK-fake");
+  process.exit(0);
+}
+
+if (command === "capture") {
+  console.log("fake pane line 1\nfake prompt >");
+  process.exit(0);
+}
+
+if (command === "result" && args[0] === "wait-required") {
+  const name = args[1];
+  let fields = [];
+  let waitSec = 0;
+  let customPath = "";
+  for (let i = 2; i < args.length; i += 1) {
+    if (args[i] === "--fields") {
+      fields = args[i + 1].split(",");
+      i += 1;
+    } else if (args[i] === "--wait") {
+      waitSec = Number(args[i + 1]);
+      i += 1;
+    } else if (args[i] === "--path") {
+      customPath = args[i + 1];
+      i += 1;
+    }
+  }
+  const resultPath = customPath || statePath(name, "result.json");
+  if (process.env.FAKE_INVALID_RESULT === "1") {
+    console.log(JSON.stringify({ schema_version: 1, path: resultPath, present: true, valid: false, timeout: true, errors: [{ message: "invalid" }] }));
+    process.exit(1);
+  }
+  if (fs.existsSync(resultPath)) {
+    const body = readJson(resultPath);
+    const missing = fields.filter((f) => !Object.prototype.hasOwnProperty.call(body, f));
+    if (missing.length > 0) {
+      console.log(JSON.stringify({ schema_version: 1, path: resultPath, present: true, valid: false, body, missing_fields: missing }));
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ schema_version: 1, present: true, valid: true, body }));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({ schema_version: 1, path: resultPath, present: false, valid: false, timeout: true, missing_fields: ["status"] }));
+  process.exit(1);
+}
+
+if (command === "result" && args[0] === "--json") {
+  const name = args[1];
+  const resultPath = statePath(name, "result.json");
+  console.log(JSON.stringify({ schema_version: 1, present: fs.existsSync(resultPath), valid: fs.existsSync(resultPath), body: fs.existsSync(resultPath) ? readJson(resultPath) : null }));
+  process.exit(fs.existsSync(resultPath) ? 0 : 1);
+}
+
+if (command === "status" && args[0] === "--json") {
+  const name = args[1];
+  // The tmux session is not up until `assign` has finished (F1).
+  if (process.env.FAKE_STATUS_ABSENT_BEFORE_ASSIGN === "1" && !fs.existsSync(statePath(name, "assigned"))) {
+    console.log(JSON.stringify({ schema_version: 1, name, exists: false }));
+    process.exit(1);
+  }
+  if (process.env.FAKE_DEAD_SESSION === "1") {
+    console.log(JSON.stringify({ schema_version: 1, name, running: false }));
+    process.exit(1);
+  }
+  if (process.env.FAKE_STATUS_DEADLINE === "1") {
+    console.log(JSON.stringify({ schema_version: 1, name, running: true, note: "deadline tomorrow" }));
+    process.exit(0);
+  }
+  if (process.env.FAKE_STATUS_BLOCKED === "1") {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      name,
+      running: true,
+      confirmation_detected: true,
+      blocked_reason: process.env.FAKE_STATUS_BLOCKED_REASON || "permission_prompt",
+      diagnostic: "session may be waiting for interactive confirmation",
+    }));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({ schema_version: 1, name, running: true }));
+  process.exit(0);
+}
+
+if (command === "stop") {
+  const name = args[0];
+  fs.writeFileSync(statePath(name, "stopped"), "1");
+  console.log(`Stopped ${name}`);
+  process.exit(0);
+}
+
+console.error(`unexpected fake agent-tmux call: ${process.argv.slice(2).join(" ")}`);
+process.exit(2);

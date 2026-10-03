@@ -58,7 +58,7 @@ tmp_t1="$(mktemp "${TMPDIR:-/tmp}/t1_long.XXXXXX.contract.node.ts")"
   for i in {1..35}; do
     echo "  const dummy$i = $i"
   done
-  echo '  return execFile("tmux", ["-S", "/tmp/sock", ...args])'
+  echo '  return execFile("tmux", ["-S", process.env.TMUX_TMPDIR + "/sock", ...args])'
   echo '}'
   echo 'async function main() {'
   echo "  longWrapper([\"$(b_srv)\"])"
@@ -92,7 +92,7 @@ tmp_f4="$(mktemp "${TMPDIR:-/tmp}/f4_brace.XXXXXX.contract.node.ts")"
 cat <<EOF > "$tmp_f4"
 function safe(args) {
   const label = "}"
-  return execFile("tmux", ["-S", "/private", ...args])
+  return execFile("tmux", ["-S", process.env.TMUX_TMPDIR + "/sock", ...args])
 }
 safe(["$(b_srv)"])
 EOF
@@ -106,7 +106,7 @@ assert "brace inside a string does not end the wrapper body (F4)" "$code" 0
 tmp_f5="$(mktemp "${TMPDIR:-/tmp}/f5_asi.XXXXXX.contract.node.ts")"
 cat <<EOF > "$tmp_f5"
 function safe(args) {
-  const argv = ["-S", "/private", ...args]
+  const argv = ["-S", process.env.TMUX_TMPDIR + "/sock", ...args]
   return execFile("tmux", argv)
 }
 safe(["$(b_srv)"])
@@ -120,7 +120,7 @@ assert "argv declared without a semicolon passes (F5)" "$code" 0
 tmp_f5d="$(mktemp "${TMPDIR:-/tmp}/f5_asi_decoy.XXXXXX.contract.node.ts")"
 cat <<EOF > "$tmp_f5d"
 function unsafe(args) {
-  const decoy = ["-S", "/private"]
+  const decoy = ["-S", process.env.TMUX_TMPDIR + "/sock"]
   const argv = [...args]
   return execFile("tmux", argv)
 }
@@ -131,6 +131,20 @@ code=0
 out="$("$GUARD" "$tmp_f5d" 2>&1)" || code=$?
 rm -f "$tmp_f5d"
 assert "unused decoy without a semicolon is rejected (F5)" "$code" 1
+
+tmp_escape="$(mktemp "${TMPDIR:-/tmp}/socket-escape.XXXXXX.contract.node.ts")"
+printf 'execFile("tmux", ["-S", "%s", "%s"])\n' /tmp/escape.sock "$(b_srv)" > "$tmp_escape"
+code=0
+out="$("$GUARD" "$tmp_escape" 2>&1)" || code=$?
+rm -f "$tmp_escape"
+assert "literal out-of-dir socket is rejected" "$code" 1
+
+tmp_dir="$(mktemp "${TMPDIR:-/tmp}/socket-dir.XXXXXX.sh")"
+printf 'export %s="/tmp/escape"\n' TMUX_TMPDIR > "$tmp_dir"
+code=0
+out="$("$GUARD" "$tmp_dir" 2>&1)" || code=$?
+rm -f "$tmp_dir"
+assert "smoke cannot replace the run directory" "$code" 1
 
 echo "socket-isolation smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

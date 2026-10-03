@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for issue #320: idle CLI chrome and the worker's own launch
 # flags containing "approve" must NOT read as approval_prompt; a
 # dialog-shaped approval prompt still must.

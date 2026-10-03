@@ -441,6 +441,17 @@ export async function runnableCwd(host: Host, cwd: string): Promise<string> {
 }
 
 /**
+ * argv that runs one of this repo's zsh scripts with zsh, never as a #! exec: on
+ * macOS, once any ancestor ran as a #! script (a tmux server agent-tmux started,
+ * cursor-agent), each #! exec below it leaks ~1 KB of kernel memory
+ * (data.kalloc.1024) until reboot. A bare name is found by the child's own PATH
+ * at run time, so no install location is assumed.
+ */
+export function zshRun(bin: string): string[] {
+  return bin.includes('/') ? ['zsh', bin] : ['zsh', '-c', 'p=$(whence -p -- "$0") || exit 127; exec zsh "$p" "$@"', bin]
+}
+
+/**
  * Every `agent-tmux` call the core makes, as a binding runs it: the resolved binary,
  * and TMUX_AGENT_DIR = the v5 root, so the wrapper's per-worker dir IS the ledger's
  * worker dir (contract §2). One seam; the mod and the node host both bind through it.
@@ -449,11 +460,7 @@ export async function wrapperCall(host: Host, argv: readonly string[]): Promise<
   if (argv[0] !== 'agent-tmux') return { argv }
   const root = await rootOf(host)
   const { bin } = await agentTmuxBin(host)
-  // zsh <path>, never a #! exec: on macOS, once any ancestor ran as a #! script (a
-  // tmux server agent-tmux started, cursor-agent), each #! exec below it leaks
-  // ~1 KB of kernel memory (data.kalloc.1024) until reboot; this runs every tick.
-  const run = bin.includes('/') ? ['zsh', bin] : [bin]
-  return { argv: [...run, ...argv.slice(1)], ...(root ? { env: { TMUX_AGENT_DIR: v3Of(root) } } : {}) }
+  return { argv: [...zshRun(bin), ...argv.slice(1)], ...(root ? { env: { TMUX_AGENT_DIR: v3Of(root) } } : {}) }
 }
 
 /**
@@ -3475,7 +3482,7 @@ export async function assignWorker(
     // The launch must outlive the host (a host killed with its process group would
     // take a backgrounded child with it, before the brief is sent or launch.exit is
     // written): a node `spawn` puts it in its own session; macOS has no `setsid`.
-    const argv = [tool.bin, input.profile, 'assign', '--detach', '--result-path', ep.resultPath, '--episode', '1', name, input.dir, briefPath]
+    const argv = [...zshRun(tool.bin), input.profile, 'assign', '--detach', '--result-path', ep.resultPath, '--episode', '1', name, input.dir, briefPath]
     const child = `TMUX_AGENT_DIR=${shq(v3)} ${argv.map(shq).join(' ')} >${shq(logPath)} 2>&1 </dev/null; echo $? >${shq(exitPath)}`
     const run = await host.run(['sh', '-c', DETACH_LAUNCH, 'sh', child, logPath, exitPath], input.dir, 5_000)
     if (run.exitCode !== 0) {
@@ -3694,4 +3701,3 @@ export async function resumeWorker(host: Host, text: string): Promise<Outcome> {
     text: `resumed ${hit.profile} session ${input.id.slice(0, 8)} as "${name}" in ${where}. It has no task, so nothing wakes you until you give it one: in the TUI select "${name}" and press t (tell).`,
   }
 }
-

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix (dashboard, detached workers): run the sessions inventory and detached `assign` through explicit zsh, including the mod's core copy, so these paths do not execute a shell shebang below a tainted parent.
+- Fix (hashing, macOS): use binary `sha256sum` or `openssl dgst -sha256 -r` for worker, audit, monitor, and dispatch hashes. The Perl `shasum` launcher no longer runs in these production paths.
+- Fix (commander, sessions, fanout, dialogue, teams, plugins): run repeated owned shell helpers with their interpreter, including the commander's two-second status line and plugin hook/MCP entry points.
+- Fix (smoke teardown): keep smoke and contract sockets below their run directory, handle EXIT/INT/TERM/HUP, and sweep every job socket before runner cleanup. Standalone smokes also use private servers; the socket guard rejects directory escapes.
+
 - Fix (core, mod, TUI, MCP; macOS kernel memory): the core ran `agent-tmux` as a `#!` exec on every tick (status, composer-state, result). On macOS, once any ancestor ran as a `#!` script (a tmux server that `agent-tmux` started, `cursor-agent`), each `#!` exec below it leaks ~1 KB of kernel memory (zone `data.kalloc.1024`) until reboot; orphaned TUI e2e runs polling `agent-tmux` grew it to ~8 GB on one host. `wrapperCall` and `composerState` now run it as `zsh <path>` (the PATH entry is resolved to its file; the panel still shows `agent-tmux`). Live `zprint`, 600 calls under a `#!`-launched node: +702K before, -31K after.
 
 ## v0.44.5 - 2026-10-02

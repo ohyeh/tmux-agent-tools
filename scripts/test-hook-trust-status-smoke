@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for issue #283: `status --json` surfaces a plugin hook-trust prompt
 # as confirmation_detected=true / blocked_reason=hook_trust_prompt, and does NOT
 # false-trigger on ordinary "needs review" prose.

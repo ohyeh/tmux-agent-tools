@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke for #188 tmux-agent-audit query subcommand.
 set -euo pipefail
 
@@ -15,7 +16,7 @@ cleanup() {
   TMUX_AGENT_TOOLS_TENANT=beta  "$CODEX_TMUX"  stop q-codex-b  >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+trap 'cleanup; smoke_cleanup' EXIT
 export TMUX_AGENT_DIR="$WORK/state"
 
 cat > "$WORK/fake.sh" <<'EOF'
