@@ -1,5 +1,5 @@
 import type { Hook, On } from 'claude-code'
-import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
+import { describe, expect, mock, test, type Engine, type Plugin } from 'claude-code/testing'
 
 import { driver, run, turn } from './fixtures/driver'
 
@@ -5533,6 +5533,97 @@ describe('mid-turn delivery', () => {
     await clock.advance(POLL)
     await clock.settle()
     expect(woken.length).toEqual(1)
+    expect(store.acked()).toEqual(['w1#1'])
+  })
+
+  /**
+   * A plugin beside the mod (its own module scope: it reaches the test only
+   * through the nouns): on turn.start it runs its own Read and writes the
+   * context that call returned to /side-read.
+   */
+  const reader: Plugin = {
+    name: 'reader',
+    register: on => {
+      on('turn.start', async ($, e) => {
+        const r = await $.tool.call({ tool: 'Read', file_path: '/x' } as never)
+        await $.fs.write('/side-read', ((r as { context?: readonly string[] }).context ?? []).join('\n'))
+        return { turnId: e.turnId }
+      })
+    },
+  }
+
+  test("a plugin's own tool call does not carry the notice: the model's next call does", { plugins: [reader] }, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    const files: Files = { ...worker('w1', 0) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    floor(on)
+    mockSessionStart(on)
+    await $.session.start(session())
+    await step($)
+    files[`${V3}/w1/result.json`] = finished()
+    await clock.advance(POLL)
+
+    await $.turn.start({ turnId: 't1' } as never)
+    expect(files['/side-read'], 'not in a plugin-side result').toEqual('')
+    await clock.settle()
+    expect(store.acked(), 'and not acked by it').toEqual([])
+
+    expect(contextOf(await $.tool.call(read()))).toContain('"w1" on codex: success')
+    await clock.settle()
+    expect(store.acked()).toEqual(['w1#1'])
+    expect(woken).toEqual([])
+  })
+
+  /**
+   * Holds the first clock.now after the "finished" toast (the submit's own,
+   * as it parks) until turn.start releases it, and records the hold in /held.
+   */
+  const slowClock: Plugin = {
+    name: 'slow-clock',
+    register: on => {
+      let armed = false
+      let release = () => {}
+      on('ui.toast', ($, e, next) => {
+        if (JSON.stringify(e).includes('finished')) armed = true
+        return next(e)
+      })
+      on('clock.now', async ($, e, next) => {
+        if (armed) {
+          armed = false
+          await $.fs.write('/held', 'yes')
+          await new Promise<void>(r => (release = r))
+        }
+        return next(e)
+      })
+      on('turn.start', async ($, e) => {
+        release()
+        return { turnId: e.turnId }
+      })
+    },
+  }
+
+  test('a turn that ends while the submit reads the clock still delivers the notice', { plugins: [slowClock] }, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    const files: Files = { ...worker('w1', 0) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    floor(on)
+    mockSessionStart(on)
+    await $.session.start(session())
+    await step($)
+    files[`${V3}/w1/result.json`] = finished()
+    await clock.advance(POLL)
+
+    expect(files['/held'], 'the submit is reading the clock').toEqual('yes')
+    await $.turn.complete(turn())
+    await $.turn.start({ turnId: 't2' } as never)
+    await clock.settle()
+    expect(woken.length, 'submitted at the turn end, not stranded').toEqual(1)
     expect(store.acked()).toEqual(['w1#1'])
   })
 

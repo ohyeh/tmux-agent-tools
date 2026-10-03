@@ -207,7 +207,7 @@ export const register: Register = on => {
   let mainTurn = false
   type Parked = {
     text: string
-    at: number
+    at?: number
     prompt: Host['submit']
     resolve: (answer: Awaited<ReturnType<Host['submit']>>) => void
     reject: (error: unknown) => void
@@ -215,12 +215,22 @@ export const register: Register = on => {
   const parked: Parked[] = []
   const submitVia = (prompt: Host['submit'], now: () => Promise<number>): Host['submit'] => async text => {
     if (!mainTurn) return prompt(text)
-    const at = await now()
-    return new Promise((resolve, reject) => parked.push({ text, at, prompt, resolve, reject }))
+    // Parked before any await, so a turn that ends meanwhile still flushes it;
+    // the time it was ready lands after, for the stamp.
+    let item!: Parked
+    const answer = new Promise<Awaited<ReturnType<Host['submit']>>>((resolve, reject) => {
+      item = { text, prompt, resolve, reject }
+      parked.push(item)
+    })
+    // A clock that fails costs only the stamp; a throw here would read as a
+    // refusal while the notice stays parked and is delivered anyway.
+    item.at = await now().catch(() => undefined)
+    return answer
   }
   const hhmm = (ms: number) => new Date(ms).toTimeString().slice(0, 5)
   /** The notice as delivered: when it was ready and when it reached the session. */
   const stamped = (p: Parked, now: number) => {
+    if (p.at === undefined) return p.text
     const min = Math.floor((now - p.at) / 60_000)
     return min >= 1 ? `${p.text}\n(ready ${hhmm(p.at)}, delivered ${hhmm(now)}: ${min} min later)` : p.text
   }
@@ -243,9 +253,11 @@ export const register: Register = on => {
     return next(e)
   })
   // Registered before every other tool.call hook, so it wraps their results too.
+  // Only the model's own call (origin engine): a plugin's `$.tool.call` result
+  // carries no context to the model.
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
-    if ((e as { agentId?: string }).agentId || !parked.length || !r || (r as { deny?: string }).deny !== undefined) return r
+    if (next.origin.plugin !== 'engine' || (e as { agentId?: string }).agentId || !parked.length || !r || (r as { deny?: string }).deny !== undefined) return r
     const now = await $.clock.now()
     const items = parked.splice(0)
     for (const p of items) p.resolve({})
