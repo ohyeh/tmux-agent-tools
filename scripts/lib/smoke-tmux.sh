@@ -36,6 +36,19 @@ smoke_cleanup() {
 if [ -n "${ZSH_VERSION:-}" ]; then
   autoload -Uz add-zsh-hook
   add-zsh-hook zshexit smoke_cleanup
+  # zsh 5.9.2 (measured): when errexit fires on a failing function call, the shell exits
+  # without its EXIT trap or zshexit hooks, so an aborted smoke leaked its tmux server
+  # (and a relay on 7717). ZERR still runs there: leave through a real exit, which runs
+  # both. Only the main shell: a subshell's errexit stays its own.
+  zmodload zsh/system
+  SMOKE_MAIN_PID=$sysparams[pid]
+  _smoke_errexit() {
+    local rc=$?
+    [[ -o errexit && $sysparams[pid] == "$SMOKE_MAIN_PID" ]] || return 0
+    unsetopt errexit
+    exit $rc
+  }
+  trap _smoke_errexit ZERR
 else
   trap smoke_cleanup EXIT
 fi

@@ -13,6 +13,7 @@ The shared automation contract for both `agent-tmux claude status --json` and `a
 - `exists` — tmux session present
 - `running` — false when the pane shows the wrapper's local or remote exit-code marker even if the tmux session still exists for capture
 - `exit_detected` — wrapper observed CLI exit
+- `exit_source` — present only as `"relay"`: a `start-ssh --notify` worker pushed its exit to this host's relay (`<name>/remote-exit.json` names the current launch and `<name>/remote.exit` holds the same code); `exit_detected` is true, `running` false and `exit_code` that code even when the pane cannot show it
 - `local_or_remote` — best-effort
 - `diagnostic` — best-effort (e.g. `confirmation_detected`)
 - `idle_seconds` / `last_change_at` — liveness hints when available

@@ -1,10 +1,23 @@
 #!/usr/bin/env ruby
 # Prints the CHANGELOG.md section of one release, for `gh release create --notes-file`.
 #   scripts/release-notes v0.45.0 > /tmp/notes.md
+# It is the last step before publishing, so it also refuses a release that is not ready:
+#   - the section must state what was not verified (a `Not verified:` line; W40-8);
+#   - the tag must exist and point at the `chore(release): X.Y.Z` commit (v0.45.0 sat
+#     on a later commit; W40-11).
+# RELEASE_NOTES_ROOT overrides the repo root (tests only).
 version = ARGV.fetch(0) { abort("usage: release-notes vX.Y.Z") }
-changelog = File.read(File.expand_path("../CHANGELOG.md", __dir__))
+root = ENV.fetch("RELEASE_NOTES_ROOT", File.expand_path("..", __dir__))
+changelog = File.read(File.join(root, "CHANGELOG.md"))
 pattern = /^## #{Regexp.escape(version)}(?:\s+-[^\n]*)?\n(?<body>.*?)(?=^## |\z)/m
 match = changelog.match(pattern) or abort("CHANGELOG.md is missing a #{version} section")
 body = match[:body].strip
 abort("CHANGELOG.md #{version} section is empty") if body.empty?
+body.match?(/^(?:- )?Not verified:/) or
+  abort("CHANGELOG.md #{version} section has no `Not verified:` line; state what the release did not check")
+
+subject = IO.popen(["git", "-C", root, "log", "-1", "--format=%s", "#{version}^{commit}", "--"], err: File::NULL, &:read).strip
+abort("tag #{version} does not exist; tag the release commit first") unless $?.success? && !subject.empty?
+expected = "chore(release): #{version.delete_prefix('v')}"
+subject == expected or abort("tag #{version} points at \"#{subject}\", not \"#{expected}\"")
 puts body

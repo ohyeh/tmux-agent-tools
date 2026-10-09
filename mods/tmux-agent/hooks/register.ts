@@ -1,5 +1,6 @@
 import type {
   EngineInterface,
+  HookFailure,
   Register,
   RenderElement,
 } from 'claude-code'
@@ -92,7 +93,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.45.0'
+const MOD_VERSION = '0.46.0'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -197,6 +198,25 @@ export const register: Register = on => {
   let waiterRegisterLogged = false
   const gate: Gate = newGate()
   /**
+   * A hook that throws or overruns is absent: the engine runs `next(e)` for it, so a
+   * refused call would pass. Each gating hook takes a `.catch` that logs why, then answers.
+   * shortcut: logs through the bound host, so a failure before the session binds is not
+   * logged (the answer still says why); log through `$` if that case ever matters.
+   */
+  const hookFailed = (where: string, error: HookFailure): string => {
+    const why = error.message ? `${error.kind}: ${error.message}` : error.kind
+    try {
+      world?.log(`${where} hook failed (${why})`)
+    } catch {
+      // A surface with no log keeps the answer the handler gives.
+    }
+    return why
+  }
+  /** The answer of a tool this mod serves, when its hook failed: why, never a bare error. */
+  const toolFailed = (tool: string, error: HookFailure) => ({
+    deny: `tmux-agent: ${tool} failed (${hookFailed(tool, error)}); it may have partly run — check /workers or ${PEEK_TOOL} before repeating it`,
+  })
+  /**
    * Worker notices reach the running turn. `$.prompt.submit` is a turn of its own,
    * once the session is idle, so a worker that finished mid-turn waited for that
    * turn to end (live 2026-10-03: 20 min). While the main loop's turn runs,
@@ -263,6 +283,10 @@ export const register: Register = on => {
     for (const p of items) p.resolve({})
     const done = r as { context?: readonly string[] }
     return { ...r, context: [...(done.context ?? []), items.map(p => stamped(p, now)).join('\n\n')] } as typeof r
+  }).catch(($, e, next) => {
+    // Only notices ride on this hook: the call itself goes on (a replay when it already ran).
+    hookFailed('tool.call notice', next.error)
+    return next(e)
   })
   /**
    * `/workers probe on|off|show`: which surfaces this session's band reaches, for the
@@ -493,7 +517,7 @@ export const register: Register = on => {
         description: 'tmux-agent internal: waits for one tmux worker result. The mod dispatches it for a `runtime: tmux/<profile>` brief; never call it directly',
         prompt: WAITER_SYSTEM,
         tools: ['Bash'],
-        model: 'haiku',
+        model: 'sonnet',
         omitClaudeMd: true,
       })
       waiterReady = true
@@ -1146,6 +1170,8 @@ export const register: Register = on => {
     if (shown) {
       const row = panel.rows.find(r => r.id === shown.id)
       children.push(Text({ dimColor: true, children: '─'.repeat(Math.max(3, Math.min(width, 60))) }))
+      // A failed capture says so; it is not an empty pane (T1 C2b).
+      if (shown.error) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `capture failed: ${shown.error}` }))
       // The capture was sized by an earlier render; this one may have less room.
       for (const line of shown.lines.slice(Math.max(0, shown.lines.length - (panel.rows_available ?? 0)))) {
         children.push(Text({ wrap: 'truncate-end', children: line.slice(0, Math.max(10, width)) || ' ' }))
@@ -1278,12 +1304,12 @@ export const register: Register = on => {
       if (row && (panel.rows_available ?? MIRROR_ROWS) > 0) {
         panel.capturing = true
         try {
-          const lines = row.project
+          const cap = row.project
             ? await mirrorProject(bound, row.d.name, panel.rows_available ?? MIRROR_ROWS)
             : await mirrorOf(bound, row.d, panel.rows_available ?? MIRROR_ROWS)
           // The selection may have moved, or the panel closed, while this ran.
           if (panel.generation === mine && panel.open && panel.selected === row.id) {
-            panel.mirror = { id: row.id, lines }
+            panel.mirror = { id: row.id, ...cap }
           }
         } finally {
           panel.capturing = false
@@ -1438,7 +1464,7 @@ export const register: Register = on => {
     })
     if ('deny' in out) return { deny: out.deny }
     return { result: out.receipt }
-  })
+  }).catch(($, e, next) => toolFailed(TOOL, next.error))
 
   /**
    * The worker a `tell`/`stop` names, from the record `assign` wrote. Reported or
@@ -1474,7 +1500,7 @@ export const register: Register = on => {
           : 'collector: active — end the turn; a prompt arrives when it answers') +
         '.',
     }
-  })
+  }).catch(($, e, next) => toolFailed(TELL_TOOL, next.error))
 
   on('tool.call', { tool: STOP_TOOL }, async ($, e) => {
     const input = e as unknown as StopInput
@@ -1486,7 +1512,7 @@ export const register: Register = on => {
     if (!d && projectNamed(input.name!)) return READONLY_PROJECT
     if (!d) return { deny: `tmux-agent: no worker "${input.name}" was dispatched by this mod` }
     return { result: `${(await stopWorker(host, gate, d)).text}.` }
-  })
+  }).catch(($, e, next) => toolFailed(STOP_TOOL, next.error))
 
   on('tool.call', { tool: PEEK_TOOL }, async ($, e) => {
     const input = e as unknown as PeekInput
@@ -1505,7 +1531,7 @@ export const register: Register = on => {
     const status = typeof raw?.status === 'string' && TERMINAL.has(raw.status) ? raw.status : undefined
     const out = await peekWorker(host, d, typeof input.lines === 'number' ? input.lines : PEEK_DEFAULT, status)
     return out.ok ? { result: out.text } : { deny: `tmux-agent: ${out.text}` }
-  })
+  }).catch(($, e, next) => toolFailed(PEEK_TOOL, next.error))
 
   on('tool.call', { tool: KEYS_TOOL }, async ($, e) => {
     const input = e as unknown as KeysInput
@@ -1518,7 +1544,7 @@ export const register: Register = on => {
     const keys = Array.isArray(input.keys) ? input.keys.filter((k): k is string => typeof k === 'string') : []
     const out = await pressKeys(host, d, keys)
     return out.ok ? { result: `${out.text}.` } : { deny: `tmux-agent: ${out.text}` }
-  })
+  }).catch(($, e, next) => toolFailed(KEYS_TOOL, next.error))
 
   // The panel from the model's side: the same openPanel /workers runs, so it is
   // recorded for reopen after a reload exactly like a typed /workers.
@@ -1533,7 +1559,7 @@ export const register: Register = on => {
     if (panel.open) return { result: 'workers panel is already open.' }
     const failed = await openPanel(redraw, (ms, fn) => $.clock.every(ms, fn))
     return { result: failed ?? `workers panel opened above the prompt (${panel.rows.length} worker row(s)).` }
-  })
+  }).catch(($, e, next) => toolFailed(PANEL_TOOL, next.error))
 
   // /reload-plugins cannot run inside the tool call (the turn waits on it and
   // $.command.run rejects there); a timer queues it for when the session is idle.
@@ -1546,14 +1572,18 @@ export const register: Register = on => {
       ),
     )
     return { result: `/reload-plugins is queued for when this turn ends (mod ${MOD_VERSION} now).` }
-  })
+  }).catch(($, e, next) => toolFailed(RELOAD_TOOL, next.error))
 
   // While this mod is loaded the wrapper verbs have tools, and the collector owns
   // the wait: a hand-typed `agent-tmux <cli> assign|status|...` from Bash would be
   // a second supervisor (or a dispatch the collector never hears about, because
   // only the tool writes dispatch.json). `--help` is inspection and passes.
+  // A subagent's call (agentId set) passes: a tool result reaches the main loop
+  // only, so a workflow conduit agent (consensus-gate, plan-pipeline `cli`) must
+  // drive and wait on its worker from Bash itself (W42-16, live 2026-10-09).
   on('tool.call', { tool: 'Bash' }, ($, e, next) => {
     const command = (e as unknown as { command?: unknown }).command
+    if ((e as { agentId?: string }).agentId) return next(e)
     if (typeof command !== 'string' || !BASH_GATE_RE.test(command) || HELP_RE.test(command)) return next(e)
     const verb = BASH_GATE_RE.exec(command)?.[2] ?? 'assign'
     const route =
@@ -1571,6 +1601,10 @@ export const register: Register = on => {
         `tmux-agent: do not run \`agent-tmux … ${verb}\` from Bash while the tmux-agent mod is loaded — ` +
         (route ? `use ${route}.` : 'the collector wakes this session when the worker finishes; /workers shows its state now.'),
     }
+  }).catch(($, e, next) => {
+    // Open on failure: a broken gate must not block every Bash call; the log names it.
+    hookFailed('Bash gate', next.error)
+    return next(e)
   })
 
   // The waiter stays offered: `isOffered: false` hides a type at dispatch as
@@ -1612,7 +1646,7 @@ export const register: Register = on => {
             spawned = await next({
               ...e,
               subagentType: WAITER_TYPE,
-              model: 'haiku',
+              model: 'sonnet',
               background: true,
               description: name,
               prompt: waiterPrompt(stateDir, name),
@@ -1638,5 +1672,13 @@ export const register: Register = on => {
       return { deny: `${spawned.deny} — tmux worker "${assigned.name}" was dispatched anyway; the collector will deliver its result. Do not dispatch it again.` }
     }
     return spawned
+  }).catch(($, e, next) => {
+    const why = hookFailed('agent.spawn', next.error)
+    // Called: the waiter spawn settled, and a replay hands that back without a second spawn.
+    if (next.called || !RUNTIME_LINE.test(e.prompt)) return next(e)
+    // Closed on failure: next(e) would run a runtime brief as an in-process agent.
+    return {
+      deny: `tmux-agent: runtime tmux/${RUNTIME_LINE.exec(e.prompt)?.[1] ?? ''} dispatch failed (${why}); a worker may already be running — check /workers before dispatching again`,
+    }
   })
 }

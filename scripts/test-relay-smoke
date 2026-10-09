@@ -1,0 +1,241 @@
+#!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+# Smoke for tmux-agent-relay as a program: `ensure` starts `serve` in its own tmux
+# session, `send` reaches a real local worker pane through agent-tmux, `roster`
+# lists this host and marks an unreachable peer, a second `serve` is refused, the
+# endpoint file goes away on stop. A fake `tailscale` (TMUX_AGENT_RELAY_TAILSCALE)
+# answers `ip -4`, `whois --json` and `status --json`; the relay binds 127.0.0.1.
+# `start-ssh --notify` runs end to end through a fake `ssh` (the "remote" is a
+# local /bin/sh): the remote exit is pushed with the real curl to the relay, and
+# `status --json` reports it (exit_source relay). The HTTP contract itself is
+# lib/relay.contract.node.ts.
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
+SCRIPTS="$REPO_ROOT/skills/tmux-agent-tools/scripts"
+RELAY="$SCRIPTS/tmux-agent-relay"
+
+WORK="$(mktemp -d "$TMPDIR/relay-smoke.XXXXXX")"
+W="${WORK:A}"
+mkdir -p "$W/bin" "$W/zdot" "$W/state" "$W/cwd" "$W/rbin" "$W/ncbin" "$W/rhome"
+export TMUX_AGENT_DIR="$W/state"
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$W/audit.jsonl"
+export ZDOTDIR="$W/zdot"
+unset TMUX TMUX_PANE TMUX_AGENT_SESSION TMUX_AGENT_TMUX_SOCKET
+_extra=""
+for _t in tmux jq node; do
+  _p="$(command -v "$_t")" || { echo "missing $_t" >&2; exit 1; }
+  _extra="$_extra:${_p:h}"
+done
+export PATH="$W/bin${_extra}:/usr/bin:/bin:/usr/sbin:/sbin"
+export NODE="$(command -v node)"
+cleanup() {
+  tmux kill-session -t '=tmux-agent-relay' 2>/dev/null || true
+  for _n in nok nw relw; do "$CODEX_TMUX" stop "$_n" >/dev/null 2>&1 || true; done
+  rm -rf "$W"
+}
+trap cleanup EXIT
+
+PORT=7717
+if nc -z 127.0.0.1 $PORT 2>/dev/null; then
+  # Not a skip: a silent pass would hide that nothing ran (often a leaked relay from an aborted run).
+  echo "FAIL 127.0.0.1:$PORT is in use (ensure binds the default port): $(lsof -nP -iTCP:$PORT -sTCP:LISTEN 2>/dev/null | tail -n +2)" >&2; exit 1
+fi
+
+cat > "$W/bin/tailscale" <<EOF
+#!/bin/sh
+case "\$1" in
+  ip) echo 127.0.0.1 ;;
+  whois) printf '%s' '{"Node":{"StableID":"nSELF","Name":"self.tail.ts.net.","Tags":null},"UserProfile":{"LoginName":"me@example.com"}}' ;;
+  status) printf '%s' '{"Self":{"HostName":"self","DNSName":"self.tail.ts.net.","Online":true,"UserID":1,"TailscaleIPs":["127.0.0.1"]},"Peer":{"k1":{"HostName":"dead","DNSName":"dead.tail.ts.net.","Online":true,"UserID":1,"TailscaleIPs":["127.0.0.2"]},"k2":{"HostName":"other","DNSName":"other.tail.ts.net.","Online":true,"UserID":2,"TailscaleIPs":["127.0.0.3"]},"k3":{"HostName":"ci","DNSName":"ci.tail.ts.net.","Online":true,"UserID":1,"Tags":["tag:ci"],"TailscaleIPs":["127.0.0.4"]}}}' ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod +x "$W/bin/tailscale"
+export TMUX_AGENT_RELAY_TAILSCALE="$W/bin/tailscale"
+
+# Fake ssh: -G answers the config (target "proxy.*" has a ProxyJump); a probe or a
+# launch runs the command under /bin/sh here. Target "nocurl.*" runs without curl.
+cat > "$W/bin/ssh" <<EOF
+#!/bin/sh
+W=${(q)W}
+target=""; skip=0; mode=probe
+for a in "\$@"; do
+  if [ \$skip = 1 ]; then skip=0; continue; fi
+  case "\$a" in
+    -G) mode=config ;;
+    -tt) mode=launch ;;
+    -o) skip=1 ;;
+    *) if [ -z "\$target" ]; then target="\$a"; fi ;;
+  esac
+  cmd="\$a"
+done
+echo "\$mode \$target" >> "\$W/ssh.log"
+if [ \$mode = config ]; then
+  echo "hostname \$target"; echo "port 22"
+  case "\$target" in proxy.*) echo "proxyjump jump.host" ;; esac
+  exit 0
+fi
+rpath="\$W/rbin:/usr/bin:/bin"
+case "\$target" in nocurl.*) rpath="\$W/ncbin:/bin" ;; esac
+# A remote proxy setting (dead port) must not catch the tailnet push.
+cd "\$W/rhome" && http_proxy=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 AGENT_SHIM_TARGET="\$target" PATH="\$rpath" /bin/sh -c "\$cmd"
+EOF
+chmod +x "$W/bin/ssh"
+ln -s /usr/bin/base64 "$W/ncbin/base64"
+# The "remote" CLI: records its relay env, then exits 7 ("wait.*": exits 3 once go-<target> exists).
+cat > "$W/rbin/codex" <<EOF
+#!/bin/sh
+W=${(q)W}
+printf '%s|%s|%s|%s\n' "\$TMUX_AGENT_RELAY_URL" "\$TMUX_AGENT_RELAY_FROM" "\${TMUX_AGENT_TOOLS_NOTIFY_LAUNCH_ID-unset}" "\${TMUX_AGENT_TOOLS_NOTIFY_URL-unset}" > "\$W/renv.\$AGENT_SHIM_TARGET"
+case "\$AGENT_SHIM_TARGET" in
+  wait.*) while [ ! -e "\$W/go-\$AGENT_SHIM_TARGET" ]; do sleep 0.1; done; exit 3 ;;
+esac
+exit 7
+EOF
+chmod +x "$W/rbin/codex"
+
+# A fake CLI that records every line it reads.
+cat > "$W/fake-cli.sh" <<EOF
+#!/bin/sh
+while IFS= read -r line; do printf '%s\n' "\$line" >> ${(q)W}/got; done
+EOF
+chmod +x "$W/fake-cli.sh"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+
+PASS=0
+FAIL=0
+ok() { print -r -- "  ok   $1"; PASS=$((PASS + 1)); }
+bad() { print -r -- "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
+assert() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got='$2' expected='$3')"; fi; }
+wait_grep() {
+  local f="$1" text="$2" i
+  for (( i = 0; i < 100; i++ )); do
+    [[ -f "$f" ]] && grep -qF -- "$text" "$f" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+echo "case: --notify refusals before any launch"
+sshcount() { cat "$W/ssh.log" 2>/dev/null | grep -c -- "$1" || true; }
+# Called as `nstart … || …`, so a refused start is a FAIL line, not an abort.
+nstart() { "$CODEX_TMUX" start-ssh --exact "$@" "$W/rhome" >/dev/null 2>"$W/err"; }
+rc=0; nstart --sentinel "$W/rhome/n1.exit" --notify n1 direct.host || rc=$?
+assert "--notify without a live relay exits 2" "$rc" "2"
+grep -qF "tmux-agent-relay ensure" "$W/err" && ok "no-relay message names ensure" || bad "no-relay message ($(<"$W/err"))"
+assert "no relay: ssh not asked" "$(sshcount '^config')" "0"
+assert "nothing launched yet" "$(sshcount '^launch')" "0"
+
+echo "case: ensure never kills a relay whose process is alive"
+mkdir -p "$W/state/relay"
+sleep 60 &
+alive=$!
+print -r -- "{\"url\":\"http://127.0.0.1:1\",\"pid\":$alive,\"node\":\"nSELF\",\"login\":\"me@example.com\",\"host\":\"x\",\"token\":\"t\"}" > "$W/state/relay/endpoint.json"
+rc=0; "$RELAY" ensure >/dev/null 2>"$W/err" || rc=$?
+assert "alive but silent relay: ensure exits 1" "$rc" "1"
+grep -qF "is alive but does not answer" "$W/err" && ok "ensure names the silent relay" || bad "ensure message ($(<"$W/err"))"
+kill -0 $alive 2>/dev/null && ok "its process was not killed" || bad "its process was killed"
+kill $alive 2>/dev/null; wait $alive 2>/dev/null || true
+rm -f "$W/state/relay/endpoint.json"
+
+echo "case: ensure starts the relay once"
+url="$("$RELAY" ensure)"
+assert "ensure prints the URL" "$url" "http://127.0.0.1:$PORT"
+assert "endpoint.json url" "$(jq -r .url "$W/state/relay/endpoint.json")" "$url"
+url2="$("$RELAY" ensure)"
+assert "second ensure reuses it" "$url2" "$url"
+assert "one relay session" "$(tmux list-sessions -F '#S' | grep -c '^tmux-agent-relay$')" "1"
+rc=0; "$RELAY" serve --bind 127.0.0.1 --port $PORT >/dev/null 2>"$W/err" || rc=$?
+assert "second serve refused" "$rc" "1"
+grep -qF "already serves" "$W/err" && ok "second serve message" || bad "second serve message ($(<"$W/err"))"
+
+echo "case: send reaches a local worker"
+env CODEX="$W/fake-cli.sh" "$CODEX_TMUX" start --exact relw "$W/cwd" >/dev/null
+rc=0; TMUX_AGENT_RELAY_FROM=far "$RELAY" send "$url" relw 'hello over the relay' >"$W/out" 2>"$W/err" || rc=$?
+assert "send exit" "$rc" "0"
+if wait_grep "$W/got" "hello over the relay"; then ok "worker got the text"; else bad "worker never got the text ($(<"$W/err"))"; fi
+assert "provenance prefix" "$(grep -F 'hello over the relay' "$W/got" | head -1)" "[relay self.tail.ts.net/far] hello over the relay"
+rc=0; "$RELAY" send "$url" nobody 'x' >/dev/null 2>"$W/err" || rc=$?
+assert "send to an unknown worker exits 3" "$rc" "3"
+rc=0; "$RELAY" send "http://127.0.0.1:1" relw 'x' >/dev/null 2>"$W/err" || rc=$?
+assert "send to a closed port exits 4" "$rc" "4"
+
+echo "case: start-ssh --notify"
+rc=0; nstart --notify n0 direct.host || rc=$?
+assert "--notify without --sentinel exits 2" "$rc" "2"
+grep -qF "needs --sentinel" "$W/err" && ok "no-sentinel message" || bad "no-sentinel message ($(<"$W/err"))"
+rc=0; nstart --sentinel "$W/rhome/p.exit" --notify np proxy.host || rc=$?
+assert "proxied target exits 2" "$rc" "2"
+rc=0; nstart --sentinel "$W/rhome/c.exit" --notify nc nocurl.host || rc=$?
+assert "remote without curl exits 2" "$rc" "2"
+grep -qF "needs curl on nocurl.host" "$W/err" && ok "no-curl message" || bad "no-curl message ($(<"$W/err"))"
+rc=0; nstart --sentinel "$W/rhome/bad.exit" --notify '..' direct.host || rc=$?
+assert "name .. exits 2" "$rc" "2"
+mkdir -p "$W/state/nr/launch-meta.json"  # a directory: the metadata write fails
+rc=0; nstart --sentinel "$W/rhome/rb.exit" --notify nr rb.host || rc=$?
+assert "unwritable launch metadata exits 4" "$rc" "4"
+grep -qF "could not record the launch" "$W/err" && ok "metadata failure message" || bad "metadata failure message ($(<"$W/err"))"
+assert "refusals launched nothing" "$(sshcount '^launch')" "0"
+# Only the launch lock may exist: no launch metadata for a refused start.
+[[ -e "$W/state/np/launch-meta.json" || -e "$W/state/nc/launch-meta.json" ]] && bad "a refusal wrote launch metadata" || ok "refusals wrote no launch metadata"
+
+nstart --sentinel "$W/rhome/ok.exit" --on-exit 'echo hook $ON_EXIT_CODE' --notify nok direct.host || bad "start-ssh --notify failed ($(<"$W/err"))"
+for (( i = 0; i < 100; i++ )); do [[ -e "$W/state/nok/remote.exit" ]] && break; sleep 0.1; done
+assert "relay wrote remote.exit" "$(cat "$W/state/nok/remote.exit" 2>/dev/null)" "7"
+lid="$(jq -r .launch_id "$W/state/nok/launch-meta.json")"
+assert "launch-meta notify fields" "$(jq -r '[.notify_node, .notify_addr, .remote_target] | join(",")' "$W/state/nok/launch-meta.json")" "nSELF,127.0.0.1,direct.host"
+assert "record names the launch" "$(jq -r .launch_id "$W/state/nok/remote-exit.json")" "$lid"
+# The CLI gets the talk-back pair only; the exit binding is set after it exits.
+assert "remote env for talking back" "$(cat "$W/renv.direct.host")" "$url|nok|unset|unset"
+wait_grep "$W/rhome/ok.exit.hook.log" "hook 7" && ok "hook ran after the push" || bad "hook log ($(cat "$W/rhome/ok.exit.hook.log" 2>/dev/null))"
+st="$("$CODEX_TMUX" status --json nok)"
+assert "status exit via relay" "$(print -r -- "$st" | jq -r '[.exit_detected, .running, .exit_code, .exit_source] | join(",")')" "true,false,7,relay"
+printf '9\n' > "$W/state/nok/remote.exit"
+assert "a remote.exit that differs from the record is ignored" "$("$CODEX_TMUX" status --json nok | jq -r '.exit_source // "none"')" "none"
+printf '7\n' > "$W/state/nok/remote.exit"
+jq --arg l "other" '.launch_id = $l' "$W/state/nok/launch-meta.json" > "$W/m" && mv "$W/m" "$W/state/nok/launch-meta.json"
+assert "a record of another launch is ignored" "$("$CODEX_TMUX" status --json nok | jq -r '.exit_source // "none"')" "none"
+"$CODEX_TMUX" stop nok >/dev/null 2>&1 || true
+
+echo "case: a relaunch clears the old record; a failed push keeps the code and the hook"
+nstart --sentinel "$W/rhome/w1.exit" --notify nw wait.host || bad "start-ssh --notify failed ($(<"$W/err"))"
+assert "old exit files gone (none yet)" "$(ls "$W/state/nw" | grep -c 'remote.exit\|remote-exit.json' || true)" "0"
+touch "$W/go-wait.host"
+for (( i = 0; i < 100; i++ )); do [[ -e "$W/state/nw/remote.exit" ]] && break; sleep 0.1; done
+assert "first launch pushed 3" "$(cat "$W/state/nw/remote.exit" 2>/dev/null)" "3"
+"$CODEX_TMUX" stop nw >/dev/null 2>&1 || true
+rm -f "$W/go-wait.host"
+nstart --sentinel "$W/rhome/w2.exit" --on-exit 'echo hook2 $ON_EXIT_CODE' --notify nw wait.host || bad "start-ssh --notify failed ($(<"$W/err"))"
+assert "relaunch removed remote.exit" "$([[ -e "$W/state/nw/remote.exit" ]] && echo present || echo gone)" "gone"
+assert "relaunch removed remote-exit.json" "$([[ -e "$W/state/nw/remote-exit.json" ]] && echo present || echo gone)" "gone"
+
+echo "case: roster"
+"$RELAY" roster --json > "$W/roster.json"
+assert "roster hosts (self + same-user untagged peer)" "$(jq -r '[.hosts[].host] | join(",")' "$W/roster.json")" "self,dead"
+assert "self reachable" "$(jq -r '.hosts[0].reachable' "$W/roster.json")" "true"
+assert "self lists the worker" "$(jq -r '[.hosts[0].workers[] | select(.name=="relw") | .running] | first' "$W/roster.json")" "true"
+assert "dead peer listed as unreachable" "$(jq -r '.hosts[1].reachable' "$W/roster.json")" "false"
+"$RELAY" roster > "$W/roster.txt"
+grep -qE '^  relw  codex  running$' "$W/roster.txt" && ok "roster table row" || bad "roster table row ($(<"$W/roster.txt"))"
+
+echo "case: stop removes the endpoint"
+"$CODEX_TMUX" stop relw >/dev/null 2>&1 || true
+tmux kill-session -t '=tmux-agent-relay'
+for (( i = 0; i < 50; i++ )); do [[ -e "$W/state/relay/endpoint.json" ]] || break; sleep 0.1; done
+assert "endpoint removed" "$([[ -e "$W/state/relay/endpoint.json" ]] && echo present || echo gone)" "gone"
+# nw (second launch) exits now, with no relay to take the push.
+touch "$W/go-wait.host"
+wait_grep "$W/rhome/w2.exit.hook.log" "hook2 3" && ok "hook still ran without the relay" || bad "hook2 log ($(cat "$W/rhome/w2.exit.hook.log" 2>/dev/null))"
+assert "sentinel kept the code" "$(cat "$W/rhome/w2.exit" 2>/dev/null)" "3"
+"$CODEX_TMUX" capture nw 40 > "$W/cap" 2>/dev/null || true
+grep -qF "[agent-tmux] relay notify failed (curl rc 7)" "$W/cap" && ok "pane shows the failed push" || bad "pane line ($(tail -5 "$W/cap"))"
+grep -qF "remote command exited with code 3" "$W/cap" && ok "pane keeps the CLI code" || bad "pane code ($(tail -5 "$W/cap"))"
+assert "no relay record for the failed push" "$([[ -e "$W/state/nw/remote.exit" ]] && echo present || echo gone)" "gone"
+"$CODEX_TMUX" stop nw >/dev/null 2>&1 || true
+assert "log has the delivery" "$(jq -r 'select(.route=="POST /v1/message") | .status' "$W/state/relay/relay.log.jsonl" | head -1)" "202"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

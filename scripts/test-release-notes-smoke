@@ -1,0 +1,40 @@
+#!/usr/bin/env zsh
+# scripts/release-notes refuses a section without `Not verified:` and a tag that is not on
+# the `chore(release): X.Y.Z` commit (W40-8, W40-11); a ready release prints its notes.
+set -euo pipefail
+
+NOTES="$(cd "$(dirname "${(%):-%x}")" && pwd)/release-notes"
+WORK="$(mktemp -d -t release-notes-smoke.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+export RELEASE_NOTES_ROOT="$WORK" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+git -C "$WORK" init -q
+g() { git -C "$WORK" -c user.name=t -c user.email=t@t "$@"; }
+
+PASS=0 FAIL=0
+check() { # $1 label, $2 expected exit (0 or nonzero), $3 stderr pattern
+  local code=0
+  ruby "$NOTES" v1.0.0 >"$WORK/out" 2>"$WORK/err" || code=$?
+  if [[ "$2" == 0 && $code == 0 ]] || [[ "$2" != 0 && $code != 0 ]] && grep -q -- "$3" "$WORK/err" "$WORK/out"; then
+    echo "  ok   $1"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $1 (exit $code): $(cat "$WORK/err")" >&2; FAIL=$((FAIL + 1))
+  fi
+}
+
+printf '# Changelog\n\n## v1.0.0 - 2026-10-09\n\n- Fix: a thing.\n' > "$WORK/CHANGELOG.md"
+g add -A && g commit -qm 'chore(release): 1.0.0' && g tag v1.0.0
+check "section without Not verified: fails" 1 'Not verified:'
+
+printf '# Changelog\n\n## v1.0.0 - 2026-10-09\n\n- Fix: a thing.\n- Not verified: Linux hosts.\n\n## 0.10.1\n\n- Older.\n' > "$WORK/CHANGELOG.md"
+g tag -d v1.0.0 >/dev/null
+check "missing tag fails" 1 'does not exist'
+
+g commit -qam 'chore: later work' && g tag v1.0.0
+check "tag on a non-release commit fails" 1 'not "chore(release): 1.0.0"'
+
+g tag -d v1.0.0 >/dev/null && g tag v1.0.0 HEAD~1
+check "ready release prints its notes" 0 'Not verified: Linux hosts.'
+if grep -q -e '^## ' -e 'Older' "$WORK/out"; then echo "  FAIL notes leak the next section (M4/R4)" >&2; FAIL=$((FAIL + 1)); else echo "  ok   notes stop at the next section"; PASS=$((PASS + 1)); fi
+
+echo "release-notes smoke: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

@@ -511,7 +511,7 @@ export type Panel = {
   internal: number | '?'
   /** Set once a list() failure is logged, so the 2s clock does not log every tick. */
   internalMissLogged: boolean
-  mirror?: { id: string; lines: string[] }
+  mirror?: { id: string } & MirrorCapture
   timer?: { cancel: () => void }
   /** The `[ + ]` field is open: one row, `[profile] <session-id> [name]`. */
   adding?: boolean
@@ -2060,16 +2060,35 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
  * escapes onto it would be guesswork shipped as a feature. Plain text is the
  * honest v1; `tmux attach` is still the way to see the real thing.
  */
-export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number): Promise<string[]> {
+export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number): Promise<MirrorCapture> {
   const probe = await host
     .run(
       ['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', String(rows), d.name],
       d.dir,
       MIRROR_PROBE_MS,
     )
-    .catch(() => undefined)
-  if (!probe || probe.exitCode !== 0) return []
-  return probe.stdout.split('\n').slice(-rows).map(l => l.replace(CTRL_ALL_RE, ' '))
+    .catch((err: unknown) => err)
+  const error = captureError(probe)
+  if (error) return { lines: [], error }
+  return { lines: (probe as RunResult).stdout.split('\n').slice(-rows).map(l => l.replace(CTRL_ALL_RE, ' ')) }
+}
+
+/** One pane capture: its lines, or why there are none. A failure is not an empty pane. */
+export interface MirrorCapture {
+  lines: string[]
+  error?: string
+}
+
+type RunResult = Awaited<ReturnType<Host['run']>>
+
+/** Why a capture run failed, one line; undefined when it succeeded. */
+function captureError(probe: unknown): string | undefined {
+  if (probe instanceof Error) return probe.message.split('\n')[0]!
+  const r = probe as RunResult | undefined
+  if (!r) return 'no result'
+  if (r.exitCode === 0) return undefined
+  const why = r.stderr.split('\n').find(l => l.trim())?.trim().replace(CTRL_ALL_RE, ' ')
+  return `exit ${r.exitCode}${why ? `: ${why}` : ''}`
 }
 
 /**
@@ -2091,14 +2110,15 @@ export function exactSessionTarget(session: string): string {
 }
 
 /** The selected project row's pane. Same cap as the worker mirror; one row at a time. */
-export async function mirrorProject(host: Host, name: string, rows: number): Promise<string[]> {
+export async function mirrorProject(host: Host, name: string, rows: number): Promise<MirrorCapture> {
   const cwd = host.cwd()
-  if (!cwd) return []
+  if (!cwd) return { lines: [], error: 'no session cwd' }
   const probe = await host
     .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
-    .catch(() => undefined)
-  if (!probe || probe.exitCode !== 0) return []
-  return paneTail(probe.stdout, rows)
+    .catch((err: unknown) => err)
+  const error = captureError(probe)
+  if (error) return { lines: [], error }
+  return { lines: paneTail((probe as RunResult).stdout, rows) }
 }
 
 /**
@@ -2716,7 +2736,8 @@ export async function openTuiBeside(host: Host, pane: string | undefined): Promi
   const root = await rootOf(host)
   const split = await host.run(
     [
-      'tmux', 'split-window', '-t', pane, '-h', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
+      // `-f`: the TUI takes the full window height even when `pane` is the top half of a vertical split (T1 C4).
+      'tmux', 'split-window', '-t', pane, '-h', '-f', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
       '-e', `TMUX_AGENT_SESSION=${session}`,
       ...(root ? ['-e', `TMUX_AGENT_DIR=${root}`] : []),
       node, tui, '--session', session, '--cwd', cwd,

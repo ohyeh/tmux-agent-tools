@@ -35,6 +35,8 @@ function mockFs(
   unreadable: ReadonlySet<string> = new Set(),
   /** Runs before each read answers: a read that costs time on the mocked clock. */
   beforeRead?: (path: string) => Promise<void>,
+  /** Writes the engine refuses (EIO), as a real failed write rejects. */
+  unwritable: (path: string, text: string) => boolean = () => false,
 ): Seen {
   const mtimes = new Map<string, number>()
   /** The action lock is a symlink whose target is the holder: path → target. */
@@ -50,6 +52,7 @@ function mockFs(
     return { value: text }
   })
   on('fs.write', ($, e) => {
+    if (unwritable(e.path, e.text)) return { deny: `EIO: ${e.path}` }
     files[e.path] = e.text
     mtimes.set(e.path, clockNow())
     return { value: undefined }
@@ -3271,7 +3274,9 @@ describe('teammates', () => {
     await bash(`${WRAPPER} codex assign --help`)
     await bash(`${WRAPPER} codex list`)
     await bash('git status')
-    expect(ran).toEqual([`${WRAPPER} codex assign --help`, `${WRAPPER} codex list`, 'git status'])
+    // A subagent (workflow conduit) drives its own worker: the gate passes it.
+    await $.tool.call({ tool: 'Bash' as const, command: `${WRAPPER} codex status w1`, agentId: 'sub-1' } as never)
+    expect(ran).toEqual([`${WRAPPER} codex assign --help`, `${WRAPPER} codex list`, 'git status', `${WRAPPER} codex status w1`])
   })
 })
 
@@ -4280,7 +4285,7 @@ describe('cursor review of 34e2a1e', () => {
     expect(split, 'one split-window, no launcher (the mod is the collector)').toBeDefined()
     expect(p.argv.some(a => a.some(x => x.includes('launcher.node.ts')))).toBe(false)
     const s = split ?? []
-    expect(s.slice(2, 5)).toEqual(['-t', '%5', '-h'])
+    expect(s.slice(2, 6), '-f: full window height beside a half-height pane').toEqual(['-t', '%5', '-h', '-f'])
     expect(s).toContain(`TMUX_AGENT_SESSION=${s[s.indexOf('--session') + 1]}`)
     expect(s.slice(s.indexOf('/opt/node/bin/node'), s.indexOf('/opt/node/bin/node') + 2)).toEqual([
       '/opt/node/bin/node',
@@ -4917,7 +4922,7 @@ describe('native mirror', () => {
       name: 'tmux-waiter',
       description: 'tmux-agent internal: waits for one tmux worker result. The mod dispatches it for a `runtime: tmux/<profile>` brief; never call it directly',
       tools: ['Bash'],
-      model: 'haiku',
+      model: 'sonnet',
       omitClaudeMd: true,
     })
     expect(JSON.stringify(specs[0])).toContain('one Bash poll at a time')
@@ -5004,6 +5009,65 @@ describe('native mirror', () => {
     expect(JSON.parse(files[record!]!).waiter, 'no waiter to wait for').toBeUndefined()
   })
 
+  test('a runtime spawn whose hook throws before the waiter is denied, never run as a local agent', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mockClock(on)
+    mockFs(on, {})
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    const logs: string[] = []
+    on('ui.log', ($, e) => {
+      logs.push(e.text)
+      return { value: undefined }
+    })
+    onRun(on, () => {
+      throw new Error('spawn exploded')
+    })
+    let started = 0
+    on('agent.spawn', () => {
+      started++
+      return { model: 'haiku', agentId: 'local-agent' }
+    })
+
+    await $.session.start(session())
+    const out = await $.agent.spawn(spawnOf({ cwd: '/work', description: 'job' }))
+
+    expect(started, 'the brief does not fall through to an in-process agent').toBe(0)
+    // The harness answers a throwing process.run mock as absent, so the reason is its own.
+    expect(out.deny).toMatch(/^tmux-agent: runtime tmux\/cursor dispatch failed \(throw: .*process\.run\)/)
+    expect(out.deny).toContain('/workers')
+    expect(logs.some(l => /^agent\.spawn hook failed \(throw: /.test(l))).toBe(true)
+  })
+
+  test('a runtime spawn whose hook throws after the waiter started returns that waiter', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mock.store(on)
+    mockClock(on)
+    // The write that records the started waiter fails.
+    mockFs(on, {}, undefined, undefined, undefined, (path, text) => path.endsWith('/episodes/1/waiter') && text.includes('agentId'))
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    const logs: string[] = []
+    on('ui.log', ($, e) => {
+      logs.push(e.text)
+      return { value: undefined }
+    })
+    onRun(on, () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+    let started = 0
+    on('agent.spawn', () => {
+      started++
+      return { model: 'sonnet', agentId: 'waiter-1' }
+    })
+
+    await $.session.start(session())
+    const out = await $.agent.spawn(spawnOf({ cwd: '/work', description: 'job' }))
+
+    expect(started, 'the waiter is not spawned twice').toBe(1)
+    expect(out.agentId).toBe('waiter-1')
+    expect(logs.some(l => l.startsWith('agent.spawn hook failed (throw: ')), 'the hook did fail').toBe(true)
+  })
+
   test('a runtime spawn dispatches the brief without the runtime line and starts the waiter', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mock.store(on)
@@ -5020,13 +5084,13 @@ describe('native mirror', () => {
     let seen: { subagentType?: string; model?: string; background?: boolean; description?: string; prompt?: string } | undefined
     on('agent.spawn', ($, e) => {
       seen = e
-      return { model: 'haiku', agentId: 'waiter-9' }
+      return { model: 'sonnet', agentId: 'waiter-9' }
     })
 
     await $.session.start(session())
     const out = await $.agent.spawn(spawnOf({ cwd: '/work', description: 'Fix the bug!' }))
 
-    expect(out).toMatchObject({ model: 'haiku', agentId: 'waiter-9' })
+    expect(out).toMatchObject({ model: 'sonnet', agentId: 'waiter-9' })
     const fresh = Object.keys(files).filter(p => /\/worker\.json$/.test(p))
     expect(fresh).toHaveLength(1)
     const record = JSON.parse(files[fresh[0] ?? ''] ?? '{}') as { name: string; profile?: string; dir?: string }
@@ -5040,7 +5104,7 @@ describe('native mirror', () => {
     expect(record.name).toMatch(/^Fixthebug\.[0-9a-z]{5}$/)
     expect(seen).toMatchObject({
       subagentType: 'tmux-agent:tmux-waiter',
-      model: 'haiku',
+      model: 'sonnet',
       background: true,
       description: record.name,
     })

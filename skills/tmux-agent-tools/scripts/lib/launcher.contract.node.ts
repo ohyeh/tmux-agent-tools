@@ -260,6 +260,24 @@ test('(c) killing the TUI pane leaves the collector alive', { timeout: 20_000 },
   }),
 )
 
+test('(c2) beside the top half of a vertical split, the TUI pane still gets the full window height (T1 C4)', { timeout: 20_000 }, () =>
+  exclusive(async () => {
+    let w: Live | undefined
+    try {
+      w = await live('c2')
+      const pane = await hostPane(w.session)
+      assert.equal((await tmux(['split-window', '-v', '-d', '-t', pane, 'cat'])).code, 0)
+      const height = (t: string, f: string) => tmux(['display-message', '-p', '-t', t, f]).then(r => Number(r.out.trim()))
+      const windowHeight = await height(pane, '#{window_height}')
+      assert.ok((await height(pane, '#{pane_height}')) < windowHeight, 'the host pane is the top half')
+      const status = await ready(spawnLauncher(w, pane))
+      assert.equal(await height(status.tui, '#{pane_height}'), windowHeight)
+    } finally {
+      await cleanup(w)
+    }
+  }),
+)
+
 test('(d) killing the host pane exits the collector and the launcher names the pane', { timeout: 30_000 }, () =>
   exclusive(async () => {
     let w: Live | undefined

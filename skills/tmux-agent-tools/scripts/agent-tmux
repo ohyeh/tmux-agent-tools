@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.45.0'
+AGENT_TMUX_VERSION='0.46.0'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -352,7 +352,7 @@ Usage:
   agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
   agent-tmux <cli> start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux <cli> resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
-  agent-tmux <cli> start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
+  agent-tmux <cli> start-ssh [--attach] [--exact] [--allow-project-config] [--sentinel <remote-abs-path> [--on-exit <cmd> [--on-exit-allow <regex>]] [--notify]] <name> <ssh-target> <remote-directory> [initial text]
   agent-tmux <cli> preflight [--json]
   agent-tmux <cli> composer-state <name> | --pane %N
   agent-tmux <cli> attach <name>
@@ -536,7 +536,7 @@ Flags (place BEFORE <name>):
   --sentinel <abs-path>          Write CLI exit code to file when CLI exits (#95).
   --on-start <shell-cmd>         Run hook after `tmux new-session` returns (#101a).
   --on-exit  <shell-cmd>         Run hook after CLI exit; needs --sentinel.
-  --sentinel-keep                Keep sentinel file across `stop` cleanup.
+  --sentinel-keep                Accepted; no effect yet (`stop` never removes the sentinel).
   --transcript <abs-path>        Append JSONL events to this path (#100).
   --allow-project-config         Do not prepend the task-scope isolation guard.
 
@@ -805,8 +805,8 @@ HELP_EOF
       cat <<'HELP_EOF'
 agent-tmux stop <name>
 
-Kill the tmux session. Removes the sentinel file by default; pass
---sentinel-keep at start to retain it.
+Kill the tmux session. A --sentinel file is never removed: it stays as the
+exit-code record (--sentinel-keep is accepted and has no effect yet).
 HELP_EOF
       ;;
     doctor|self-test|setup)
@@ -826,10 +826,36 @@ HELP_EOF
       ;;
     start-ssh)
       cat <<'HELP_EOF'
-agent-tmux start-ssh [--attach] [--exact] [--allow-project-config] <name> <ssh-target> <remote-directory> [initial text]
+agent-tmux start-ssh [--attach] [--exact] [--allow-project-config] [--sentinel <remote-abs-path> [--on-exit <cmd> [--on-exit-allow <regex>]] [--notify]] <name> <ssh-target> <remote-directory> [initial text]
 
 Keep tmux local but run claude over ssh on <ssh-target>. The remote shell
-must resolve `claude` on PATH.
+must resolve `claude` on PATH. The remote host needs sh, printf, mv and a
+`base64` that accepts -d. tmux takes at most 16364 bytes per command, and
+base64 adds a third: keep --on-exit and the paths under about 11 KiB (exit 2).
+
+  --sentinel <remote-abs-path>   The remote sh writes the CLI exit code there
+                                 (atomic .tmp + mv). Read it with
+                                 `ssh <target> cat <path>`. Before launch a
+                                 BatchMode probe (15 s + 2 s grace) refuses a path
+                                 that already exists, or a host it cannot reach.
+  --on-exit <shell-cmd>          Runs on the REMOTE host after the sentinel is
+                                 written; ON_EXIT_CODE / ON_EXIT_NAME exported;
+                                 output to <sentinel>.hook.log. Needs --sentinel.
+  --notify                       After the sentinel is written and before the
+                                 hook, the remote host pushes the code to this
+                                 host's tailnet relay (`tmux-agent-relay ensure`
+                                 first; one curl, 10 s max). `status --json`
+                                 then reports it with exit_source "relay". Needs
+                                 --sentinel, a direct ssh route (no ProxyJump),
+                                 curl on the remote host, and a name of
+                                 [A-Za-z0-9._-]; else exit 2 (an unknown or
+                                 foreign tailnet device: exit 4). A failed push
+                                 prints one pane line; the code and hook stay.
+                                 The remote CLI gets TMUX_AGENT_RELAY_URL and
+                                 TMUX_AGENT_RELAY_FROM to message back.
+  --on-start is refused (exit 2): it would run here, not where the CLI runs.
+
+No sentinel + local pane gone = ssh ended; the remote outcome is unknown.
 
 By default, initial prompts include the same task-scope project-config guard as
 local start/send. Pass --allow-project-config to opt out.
@@ -1112,6 +1138,89 @@ shell_quote() {
   printf "%q" "$1"
 }
 
+# POSIX single-quote encoder for a value that a remote `sh` reads (start-ssh
+# payload). shell_quote is zsh %q, which can emit $'\n'; dash does not parse it.
+sh_quote() {
+  local q="'\\''"
+  printf "'%s'" "${1//\'/$q}"
+}
+
+# start-ssh hands the remote login shell ONE word built only from base64 text and
+# a fixed frame: no backslash, no inner single quote, so sh, bash, zsh, dash and
+# fish all pass the same bytes to `sh`. The decoder status is checked before eval:
+# a host without a working `base64 -d` fails loudly (125) and runs nothing.
+remote_sh_command() {
+  local payload="$1" b64 cmd
+  if ! b64="$(printf '%s' "$payload" | base64 | tr -d '\n')" || [[ -z "$b64" ]]; then
+    echo "start-ssh: could not base64-encode the remote command" >&2
+    return 2
+  fi
+  cmd="sh -c 'p=\$(printf %s $b64 | base64 -d) || { echo \"agent-tmux: cannot decode the remote command (base64 -d)\" >&2; exit 125; }; eval \"\$p\"'"
+  printf '%s' "$cmd"
+}
+
+# tmux sends a command's argv to the server in one imsg: MAX_IMSGSIZE 16384 minus
+# the 16-byte header and the 4-byte argc leaves 16364 bytes for the NUL-ended args
+# (measured on tmux 3.7c). A larger new-session fails with "command too long".
+TMUX_ARGV_MAX_BYTES=16364
+# Returns 0 when the args fit; else prints the size and returns 1.
+tmux_argv_fits() {
+  setopt localoptions nomultibyte  # ${#a} counts bytes
+  local a; local -i n=0
+  for a in "$@"; do (( n += ${#a} + 1 )); done
+  (( n <= TMUX_ARGV_MAX_BYTES )) && return 0
+  echo "$n"
+  return 1
+}
+
+# Whether <path> exists on <ssh-target>, before anything is launched. Prints
+# exists or absent (or nocurl, when [need_curl] is 1 and curl is missing) and returns 0; any other outcome (deadline, auth, transport,
+# a malformed answer) prints why to stderr and returns 4. Non-interactive
+# (BatchMode) and bounded: ConnectTimeout covers only the handshake, so a
+# zsh-side deadline bounds the whole call (no GNU timeout on stock macOS).
+SSH_PROBE_CONNECT_SECONDS=10
+SSH_PROBE_DEADLINE_SECONDS=15
+remote_sentinel_probe() {
+  local target="$1" spath="$2" need_curl="${3:-0}" cmd tmp pid rc=0 timed_out=0 answer  # not `path`: zsh ties it to PATH
+  local -i ticks=0 limit=$(( SSH_PROBE_DEADLINE_SECONDS * 10 ))
+  local p="$(sh_quote "$spath")" curl_check=""
+  # --notify: the exit push runs curl on the remote host; a host without it is refused before launch.
+  (( need_curl )) && curl_check="if ! command -v curl >/dev/null 2>&1; then echo AGENT_TMUX_PROBE=nocurl; el"
+  cmd="$(remote_sh_command "${curl_check}if test -e $p; then echo AGENT_TMUX_PROBE=exists; elif test ! -e $p; then echo AGENT_TMUX_PROBE=absent; else exit 3; fi")" || return 2
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/agent-tmux-probe.XXXXXX")" || { echo "start-ssh: mktemp failed" >&2; return 4; }
+  ssh -o BatchMode=yes -o ConnectTimeout="$SSH_PROBE_CONNECT_SECONDS" "$target" "$cmd" </dev/null >"$tmp/out" 2>"$tmp/err" &
+  pid=$!
+  trap "kill -KILL $pid 2>/dev/null; rm -rf ${(q)tmp}; exit 130" INT TERM
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( ticks >= limit )); then timed_out=1; break; fi
+    sleep 0.1
+    (( ticks += 1 ))
+  done
+  if (( timed_out )); then
+    kill -TERM "$pid" 2>/dev/null || true
+    for ticks in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || rc=$?
+  trap - INT TERM
+  answer="$(cat "$tmp/out"; printf x)"  # the x keeps trailing newlines: the answer must be exactly one line
+  answer="${answer%x}"
+  local why="$(tail -n 3 "$tmp/err" | LC_ALL=C tr -cd '[:print:]\n')"
+  rm -rf "$tmp"
+  if (( timed_out )); then
+    echo "start-ssh: checking the sentinel on $target timed out after ${SSH_PROBE_DEADLINE_SECONDS}s; nothing was started" >&2
+    return 4
+  fi
+  if (( rc == 0 )) && [[ "$answer" == $'AGENT_TMUX_PROBE=exists\n' || "$answer" == $'AGENT_TMUX_PROBE=absent\n' || ( need_curl -ne 0 && "$answer" == $'AGENT_TMUX_PROBE=nocurl\n' ) ]]; then
+    answer="${answer#AGENT_TMUX_PROBE=}"
+    printf '%s' "$answer"
+    return 0
+  fi
+  echo "start-ssh: could not check the sentinel on $target (ssh exit $rc; connection, auth or remote shell failure); nothing was started" >&2
+  [[ -n "$why" ]] && printf '  %s\n' "${(@f)why}" >&2
+  return 4
+}
+
 oneshot_invocation_command() {
   local prompt="$1" launch_flags="$2"
   local command="$(shell_quote "$CLI_BIN")"
@@ -1219,12 +1328,14 @@ apply_color_env_args() {
 }
 
 color_env_shell_prefix() {
+  # $1: the quoting function for the values (default shell_quote; start-ssh passes sh_quote).
+  local q="${1:-shell_quote}"
   [[ "$COLOR_ENV" == "1" ]] || return 0
 
   local prefix="" value
   if session_env_has_key "NO_COLOR"; then
     value="$(session_env_value_for_key "NO_COLOR")"
-    prefix+="export NO_COLOR=$(shell_quote "$value"); "
+    prefix+="export NO_COLOR=$($q "$value"); "
   else
     prefix+="unset NO_COLOR; "
   fi
@@ -1234,21 +1345,21 @@ color_env_shell_prefix() {
   else
     value="truecolor"
   fi
-  prefix+="export COLORTERM=$(shell_quote "$value"); "
+  prefix+="export COLORTERM=$($q "$value"); "
 
   if session_env_has_key "FORCE_COLOR"; then
     value="$(session_env_value_for_key "FORCE_COLOR")"
   else
     value="3"
   fi
-  prefix+="export FORCE_COLOR=$(shell_quote "$value"); "
+  prefix+="export FORCE_COLOR=$($q "$value"); "
 
   if session_env_has_key "CLICOLOR_FORCE"; then
     value="$(session_env_value_for_key "CLICOLOR_FORCE")"
   else
     value="1"
   fi
-  prefix+="export CLICOLOR_FORCE=$(shell_quote "$value"); "
+  prefix+="export CLICOLOR_FORCE=$($q "$value"); "
 
   printf "%s" "$prefix"
 }
@@ -1417,21 +1528,21 @@ sentinel_inline_block() {
   # Emits the shell snippet that goes between `code=$?` and the exit-message
   # printfs inside the tmux new-session command. The snippet:
   #   1. atomically writes the exit code to $TMUX_AGENT_TOOLS_SENTINEL
-  #   2. runs the --on-exit hook with ON_EXIT_CODE / ON_EXIT_NAME exported,
-  #      only when BOTH the sentinel path and the hook command are set.
-  #
-  # Escape gymnastics (DO NOT touch without re-running scripts/test-sentinel-smoke):
-  #   - Outer printf is SINGLE-QUOTED so the wrapper shell does NOT expand
-  #     $TMUX_AGENT_TOOLS_SENTINEL / $code etc. — those are for the pane shell.
-  #   - '\''...'\'' = end-quote + literal `'` + start-quote, used to embed the
-  #     inner `printf '%s\n'`.
-  #   - %%s\\n = printf format that emits literal `%s\n` (two chars: percent-s
-  #     and backslash-n). NOT a real newline; the tmux pane shell re-processes
-  #     the `\n` when running the inner printf.
-  #   - The last `%s` is the only real format spec, filled with the
-  #     shell_quoted agent name so dangerous names cannot break out.
-  local agent_name="$1"
-  printf 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then printf '\''%%s\\n'\'' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" "$TMUX_AGENT_TOOLS_SENTINEL"; fi; if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ] && [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME=%s; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi' "$(shell_quote "$agent_name")"
+  #   2. only when that write AND the mv succeeded, runs the --on-exit hook with
+  #      ON_EXIT_CODE / ON_EXIT_NAME exported (a non-zero CLI code still runs it);
+  #   3. on a failed write: removes the .tmp, prints a visible diagnostic, skips
+  #      the hook. It never exits, so the caller's `read _; exit "$code"` runs.
+  # The text is emitted verbatim (single-quoted here); $code and the
+  # TMUX_AGENT_TOOLS_* variables expand in the pane shell (or the remote sh).
+  # $2 quotes the agent name for the shell that runs the snippet: shell_quote
+  # (default) for the local pane, sh_quote for the start-ssh remote sh.
+  # start-ssh --notify sets TMUX_AGENT_TOOLS_NOTIFY_URL / _LAUNCH_ID: after the
+  # publication and before the hook, one bounded curl tells the controller's relay
+  # (POST /v1/exit). A failed push prints one pane line; the hook and the code are kept.
+  local agent_name="$1" quote="${2:-shell_quote}"
+  local S='"$TMUX_AGENT_TOOLS_SENTINEL"' N="$($quote "$agent_name")"
+  local notify='if [ -n "$TMUX_AGENT_TOOLS_NOTIFY_URL" ]; then printf '"'"'{"name":"%s","launch_id":"%s","code":%s}'"'"' '"$N"' "$TMUX_AGENT_TOOLS_NOTIFY_LAUNCH_ID" "$code" | curl -sSf --noproxy '"'"'*'"'"' --connect-timeout 5 --max-time 10 -H '"'"'Content-Type: application/json'"'"' --data-binary @- "$TMUX_AGENT_TOOLS_NOTIFY_URL/v1/exit" >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1; nrc=$?; if [ "$nrc" -ne 0 ]; then printf '"'"'[agent-tmux] relay notify failed (curl rc %s)\n'"'"' "$nrc" >&2; fi; fi; '
+  printf '%s' 'if [ -n "$TMUX_AGENT_TOOLS_SENTINEL" ]; then if printf '"'%s\\n'"' "$code" > "$TMUX_AGENT_TOOLS_SENTINEL.tmp" && mv -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" '"$S"'; then '"$notify"'if [ -n "$TMUX_AGENT_TOOLS_ON_EXIT" ]; then ( export ON_EXIT_CODE="$code" ON_EXIT_NAME='"$N"'; eval "$TMUX_AGENT_TOOLS_ON_EXIT" ) >> "$TMUX_AGENT_TOOLS_SENTINEL.hook.log" 2>&1 || true; fi; else rm -f "$TMUX_AGENT_TOOLS_SENTINEL.tmp" 2>/dev/null; printf '"'[agent-tmux] sentinel write failed: %s\\n'"' '"$S"' >&2; fi; fi'
 }
 
 # --- Safety fuses: --max-runtime / --max-idle (issue #105) ----------------
@@ -3690,7 +3801,7 @@ new_launch_id() {
   printf '%s-%s-%s' "$name" "$ts" "${hex:l}"
 }
 
-# write_launch_meta <name> <exec_mode> [launch_id] [task_shape]
+# write_launch_meta <name> <exec_mode> [launch_id] [task_shape] [extra-json-object]
 # Persist the single-run launch facts (usage-survey rec 1+7): which CLI and
 # exec mode this worker was started under, so `stats` can attribute adoption
 # (headless/oneshot/tui) and CLI mix. Overwritten every start — one run, one
@@ -3698,7 +3809,8 @@ new_launch_id() {
 # (additive, schema stays 1) are omitted when empty; task_shape absence is
 # itself the coverage signal `stats` reports.
 write_launch_meta() {
-  local name="$1" exec_mode="$2" launch_id="${3:-}" task_shape="${4:-}"
+  local name="$1" exec_mode="$2" launch_id="${3:-}" task_shape="${4:-}" extra="${5:-}"
+  [[ -n "$extra" ]] || extra='{}'
   local subdir
   subdir="$(ensure_agent_dir "$name")"
   require_jq
@@ -3708,12 +3820,13 @@ write_launch_meta() {
   # a re-assigned worker's model could not be attributed to profile vs default).
   "$JQ" -n --arg cli "$CLI" --arg exec_mode "$exec_mode" --arg launch_id "$launch_id" \
     --arg task_shape "$task_shape" \
-    --arg launch_flags "${LAUNCH_FLAGS:-}" --arg cli_bin "${CLI_BIN:-}" \
+    --arg launch_flags "${LAUNCH_FLAGS:-}" --arg cli_bin "${CLI_BIN:-}" --argjson extra "$extra" \
     '{schema_version: 1, cli: $cli, exec_mode: $exec_mode}
      + (if $launch_id == "" then {} else {launch_id: $launch_id} end)
      + (if $task_shape == "" then {} else {task_shape: $task_shape} end)
      + (if $launch_flags == "" then {} else {launch_flags: $launch_flags} end)
-     + (if $cli_bin == "" then {} else {cli_bin: $cli_bin} end)' > "$subdir/launch-meta.json" 2>/dev/null || true
+     + (if $cli_bin == "" then {} else {cli_bin: $cli_bin} end)
+     + $extra' > "$subdir/launch-meta.json" 2>/dev/null || true
 }
 
 # finalize_launch_envelope <name> <terminal_reason> [exit_code]
@@ -5704,18 +5817,61 @@ start_ssh_session() {
   local should_attach=0
   local exact_name=0
   local allow_project_config=0
+  local notify=0
+  local on_exit_allow=""
   local start_from_file=""
   _extract_prompt_file_prepass "$@" || exit 2
   start_from_file="$_PPFF_VALUE"
   set -- "${_PPFF_REMAINING[@]}"
 
-  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" || "${1:-}" == "--allow-project-config" ]]; do
+  # The sentinel lives on the REMOTE host: the remote sh writes it, the operator
+  # reads it with `ssh <target> cat <path>`. --on-exit runs there too.
+  local sentinel=""
+  local on_exit_cmd=""
+  local on_start_cmd=""
+  local sentinel_keep=0
+  parse_sentinel_flags "$@"
+  set -- "${SENTINEL_PARSE_REMAINING[@]}"
+
+  while [[ "${1:-}" == "--attach" || "${1:-}" == "--exact" || "${1:-}" == "--allow-project-config" || "${1:-}" == "--notify" || "${1:-}" == "--on-exit-allow" ]]; do
     case "$1" in
       --attach) should_attach=1; shift ;;
       --exact) exact_name=1; shift ;;
       --allow-project-config) allow_project_config=1; shift ;;
+      --notify) notify=1; shift ;;
+      --on-exit-allow)
+        if (( $# < 2 )); then
+          echo "--on-exit-allow requires a regex value" >&2
+          exit 2
+        fi
+        on_exit_allow="$2"
+        shift 2
+        ;;
     esac
   done
+
+  if (( notify )) && [[ -z "$sentinel" ]]; then
+    echo "start-ssh: --notify needs --sentinel (the push is sent after the sentinel is published)" >&2
+    exit 2
+  fi
+  if [[ -n "$on_start_cmd" ]]; then
+    echo "start-ssh: --on-start is not supported (it would run on this host, not where the CLI runs)" >&2
+    exit 2
+  fi
+  if [[ -n "$sentinel" && "${sentinel:0:1}" != "/" ]]; then
+    echo "--sentinel must be an absolute path on the remote host: $sentinel" >&2
+    exit 2
+  fi
+  if [[ -n "$on_exit_cmd" && -z "$sentinel" ]]; then
+    echo "[agent-tmux] warning: --on-exit ignored without --sentinel" >&2
+    on_exit_cmd=""
+  fi
+  # Same policy as start/resume, checked before the probe: the hook runs on the remote host.
+  if [[ -n "$on_exit_allow" && -n "$on_exit_cmd" ]] && ! [[ "$on_exit_cmd" =~ $on_exit_allow ]]; then
+    echo "--on-exit hook does not match --on-exit-allow regex: $on_exit_cmd" >&2
+    echo "  allow regex: $on_exit_allow" >&2
+    exit 3
+  fi
 
   local requested_name="${1:-}"
   local ssh_target="${2:-}"
@@ -5725,7 +5881,7 @@ start_ssh_session() {
   reject_misplaced_positional_flag "$remote_directory"
 
   if [[ -z "$requested_name" || -z "$ssh_target" || -z "$remote_directory" ]]; then
-    echo "Usage: agent-tmux start-ssh [--attach] [--exact] [--from-file <abs>|--prompt-file <abs>|-] <name> <ssh-target> <remote-directory> [initial text]" >&2
+    echo "Usage: agent-tmux start-ssh [--attach] [--exact] [--allow-project-config] [--from-file <abs>|--prompt-file <abs>|-] [--sentinel <remote-abs-path> [--on-exit <cmd> [--on-exit-allow <regex>]] [--notify]] <name> <ssh-target> <remote-directory> [initial text]" >&2
     exit 2
   fi
 
@@ -5746,6 +5902,38 @@ start_ssh_session() {
   fi
   refuse_live_name "$name"
   local session="$(session_for_name "$name")"
+
+  # --notify: the remote host pushes its exit to this host's tailnet relay. The
+  # push must come from the device ssh reaches, so a proxied route is refused; the
+  # relay accepts it only from that device (notify_node) for this launch_id.
+  local notify_url="" notify_node="" notify_addr=""
+  if (( notify )); then
+    if [[ ! "$name" =~ '^[A-Za-z0-9._-]{1,64}$' || "$name" == . || "$name" == .. ]]; then
+      echo "start-ssh: --notify needs a name of 1-64 [A-Za-z0-9._-] (the relay's charset): $name" >&2
+      exit 2
+    fi
+    local ssh_conf eff_host target_info
+    # The local precondition first: no live relay is exit 2 before ssh is asked anything.
+    "${SELF:h}/tmux-agent-relay" notify-target >/dev/null || exit $?
+    if ! ssh_conf="$(ssh -G "$ssh_target" 2>/dev/null </dev/null)"; then
+      echo "start-ssh: ssh -G $ssh_target failed; nothing was started" >&2
+      exit 4
+    fi
+    if print -r -- "$ssh_conf" | awk '($1 == "proxyjump" || $1 == "proxycommand") && $2 != "none" { f = 1 } END { exit !f }'; then
+      echo "start-ssh: --notify needs a direct ssh route; $ssh_target uses ProxyJump/ProxyCommand, so the push would come from another device" >&2
+      exit 2
+    fi
+    eff_host="$(print -r -- "$ssh_conf" | awk '$1 == "hostname" { print $2; exit }')"
+    target_info="$("${SELF:h}/tmux-agent-relay" notify-target "$eff_host")" || exit $?
+    require_jq
+    notify_url="$(print -r -- "$target_info" | "$JQ" -r '.url')"
+    notify_node="$(print -r -- "$target_info" | "$JQ" -r '.node')"
+    notify_addr="$(print -r -- "$target_info" | "$JQ" -r '.addr')"
+  fi
+  # The launch id is in the remote payload (--notify), so it exists before the payload.
+  local launch_id
+  launch_id="$(new_launch_id "$name")"
+
   local -a session_env_args
   local session_env_entry
   session_env_args=()
@@ -5754,23 +5942,72 @@ start_ssh_session() {
     append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_color_env_args
+
+  # The remote payload runs under `sh` (remote_sh_command), so every value in it
+  # is sh_quote'd. The whole tmux command is built and sized before the probe and
+  # any metadata: a command tmux would reject is refused clean (exit 2).
+  local remote_payload remote_command color_prefix sentinel_part="" notify_part=""
+  color_prefix="$(color_env_shell_prefix sh_quote)"
+  local notify_exit_part=""
+  if (( notify )); then
+    # TMUX_AGENT_RELAY_URL / _FROM let the remote agent talk back (tmux-agent-relay send, or curl).
+    notify_part="export TMUX_AGENT_RELAY_URL=$(sh_quote "$notify_url") TMUX_AGENT_RELAY_FROM=$(sh_quote "$name"); "
+    # The exit push binding is set after the CLI exits, so the CLI and its children never
+    # inherit it (an agent that POSTs /v1/exit with it would end its own launch early).
+    notify_exit_part="TMUX_AGENT_TOOLS_NOTIFY_URL=$(sh_quote "$notify_url") TMUX_AGENT_TOOLS_NOTIFY_LAUNCH_ID=$(sh_quote "$launch_id") "
+  fi
+  if [[ -n "$sentinel" ]]; then
+    sentinel_part="export ${notify_exit_part}TMUX_AGENT_TOOLS_SENTINEL=$(sh_quote "$sentinel") TMUX_AGENT_TOOLS_ON_EXIT=$(sh_quote "$on_exit_cmd"); $(sentinel_inline_block "$name" sh_quote); "
+  fi
+  remote_payload="export TERM=xterm-256color; ${notify_part}${color_prefix}cd $(sh_quote "$remote_directory") && printf '%s\n' $(sh_quote 'agent-tmux remote agent:') $(sh_quote "$name") $(sh_quote 'ssh target:') $(sh_quote "$ssh_target") $(sh_quote 'remote cwd:') $(sh_quote "$remote_directory") '' && ${CLI} ${LAUNCH_FLAGS}; code=\$?; ${sentinel_part}printf '\n[agent-tmux] remote command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
+  remote_command="$(remote_sh_command "$remote_payload")" || exit 2
+  local -a new_session_args
+  new_session_args=(new-session -P -F '#{pane_id}' "${session_env_args[@]}" -d -s "$session" \
+    "printf '%s\n' $(shell_quote "agent-tmux agent: $name") $(shell_quote "requested name: $requested_name") $(shell_quote "tmux session: $session") 'local mode: ssh' $(shell_quote "ssh target: $ssh_target") $(shell_quote "remote cwd: $remote_directory") $(shell_quote "send: $SELF $CLI send $name <text>") $(shell_quote "capture: $SELF $CLI capture $name 120") ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")")
+  local argv_bytes
+  if ! argv_bytes="$(tmux_argv_fits "${new_session_args[@]}")"; then
+    echo "start-ssh: the tmux command is $argv_bytes bytes; tmux accepts at most $TMUX_ARGV_MAX_BYTES. Shorten --on-exit, the paths, or the session env; nothing was started" >&2
+    exit 2
+  fi
+
+  # A sentinel that already exists on the remote host would read as a finished
+  # run: refuse before anything is written or launched (local start does the same).
+  if [[ -n "$sentinel" ]]; then
+    local probe
+    probe="$(remote_sentinel_probe "$ssh_target" "$sentinel" "$notify")" || exit $?
+    if [[ "$probe" == nocurl ]]; then
+      echo "start-ssh: --notify needs curl on $ssh_target; nothing was started" >&2
+      exit 2
+    fi
+    if [[ "$probe" == exists ]]; then
+      echo "Sentinel path already exists on $ssh_target: $sentinel" >&2
+      echo "Remove it or pass a fresh --sentinel path to avoid stale-completion false positives." >&2
+      exit 1
+    fi
+  fi
+
   # Launch metadata parity with local start (agent-tmux-stats spec): tui by
   # construction — the remote CLI is driven interactively over ssh. Order
   # matters: write_launch_meta's ensure_agent_dir creates the state subdir
   # that record_started_at and usage_init_event then write into.
-  local launch_id
-  launch_id="$(new_launch_id "$name")"
-  write_launch_meta "$name" 'tui' "$launch_id"
+  require_jq
+  local meta_extra
+  meta_extra="$("$JQ" -cn --arg t "$ssh_target" --arg n "$notify_node" --arg a "$notify_addr" '{remote_target: $t} + (if $n == "" then {} else {notify_node: $n, notify_addr: $a} end)')"
+  write_launch_meta "$name" 'tui' "$launch_id" '' "$meta_extra"
+  if (( notify )); then
+    # The relay binds a push to this file: it must hold this launch, or nothing starts.
+    if [[ "$("$JQ" -r '"\(.launch_id)|\(.notify_node)"' "$(agent_root_dir)/$name/launch-meta.json" 2>/dev/null)" != "$launch_id|$notify_node" ]]; then
+      echo "start-ssh: could not record the launch in $(agent_root_dir)/$name/launch-meta.json; nothing was started" >&2
+      exit 4
+    fi
+    # After the new launch_id is on disk: a push of an older launch now gets 409,
+    # and its leftover record cannot block this launch's push.
+    rm -f "$(agent_root_dir)/$name/remote.exit" "$(agent_root_dir)/$name/remote-exit.json"
+  fi
   record_started_at "$name"
   usage_init_event "$name" "$launch_id"
 
-  local remote_command
-  local color_prefix
-  color_prefix="$(color_env_shell_prefix)"
-  remote_command="export TERM=xterm-256color; ${color_prefix}cd $(shell_quote "$remote_directory") && printf '%s\n' $(shell_quote 'agent-tmux remote agent:') $(shell_quote "$name") $(shell_quote 'ssh target:') $(shell_quote "$ssh_target") $(shell_quote 'remote cwd:') $(shell_quote "$remote_directory") '' && ${CLI} ${LAUNCH_FLAGS}; code=\$?; printf '\n[agent-tmux] remote command exited with code %s\n' \"\$code\"; printf '[agent-tmux] press Enter to close this pane\n'; read _; exit \"\$code\""
-
-  "$TMUX" "${TMUX_SOCKET_ARGS[@]}" -f "$TMUX_CONF" new-session -P -F '#{pane_id}' "${session_env_args[@]}" -d -s "$session" \
-    "printf '%s\n' 'agent-tmux agent: $name' 'requested name: $requested_name' 'tmux session: $session' 'local mode: ssh' 'ssh target: $ssh_target' 'remote cwd: $remote_directory' 'send: $SELF $CLI send $name <text>' 'capture: $SELF $CLI capture $name 120' ''; exec ssh -tt $(shell_quote "$ssh_target") $(shell_quote "$remote_command")" > "$(agent_root_dir)/$name/pane-id.new"
+  "$TMUX" "${TMUX_SOCKET_ARGS[@]}" -f "$TMUX_CONF" "${new_session_args[@]}" > "$(agent_root_dir)/$name/pane-id.new"
   publish_pane_id "$name"
 
   echo "agent: $name"
@@ -8757,6 +8994,19 @@ status_session() {
     fi
     bytes_in_pane=$(printf '%s' "$current" | wc -c | tr -d ' ')
   fi
+  # A relay record (start-ssh --notify) is the remote exit itself: trusted only when
+  # remote-exit.json names the current launch and remote.exit holds the same code.
+  local exit_source="" _sd="$(agent_root_dir)/$name" _rx=""
+  if [[ -f "$_sd/remote-exit.json" && -f "$_sd/launch-meta.json" && -f "$_sd/remote.exit" ]]; then
+    require_jq
+    _rx="$("$JQ" -r --slurpfile m "$_sd/launch-meta.json" 'if (.launch_id | type) == "string" and .launch_id == ($m[0].launch_id // null) and (.code | type) == "number" then .code else empty end' "$_sd/remote-exit.json" 2>/dev/null)" || _rx=""
+    if [[ -n "$_rx" && "$(cat "$_sd/remote.exit"; printf x)" == "$_rx"$'\nx' ]]; then
+      exit_detected=true
+      running=false
+      exit_code="$_rx"
+      exit_source=relay
+    fi
+  fi
   local started_at
   started_at="$(read_started_at "$name")"
   local idle_seconds=""
@@ -8787,6 +9037,7 @@ status_session() {
     require_jq
     "$JQ" -cn \
       --arg wrong_engine_hint "$wrong_engine_hint" \
+      --arg exit_source "$exit_source" \
       --arg tool "$CLI" \
       --arg name "$name" \
       --arg session "$session" \
@@ -8806,7 +9057,7 @@ status_session() {
       --argjson running "$running" \
       --argjson exit_detected "$exit_detected" \
       --argjson confirmation_detected "$confirmation_detected" \
-      '{schema_version:1,tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end),blocked_evidence:(if $blocked_evidence == "" then null else $blocked_evidence end),started_at:(if $started_at == "" then null else $started_at end),last_change_at:(if $last_change_at == "" then null else $last_change_at end),idle_seconds:(if $idle_seconds == "" then null else ($idle_seconds | tonumber) end),bytes_in_pane:(if $bytes_in_pane == "" then null else ($bytes_in_pane | tonumber) end),marker_seen:$marker_seen} + (if $wrong_engine_hint == "" then {} else {wrong_engine_hint:$wrong_engine_hint} end)'
+      '{schema_version:1,tool:$tool,name:$name,session:$session,prefix:$prefix,exists:$exists,running:$running,exit_detected:$exit_detected,exit_code:(if $exit_code == "" then null else ($exit_code | tonumber) end),local_or_remote:(if $local_or_remote == "" then null else $local_or_remote end),diagnostic:(if $diagnostic == "" then null else $diagnostic end),last_capture_lines:$last_capture_lines,confirmation_detected:$confirmation_detected,blocked_reason:(if $blocked_reason == "" then null else $blocked_reason end),blocked_evidence:(if $blocked_evidence == "" then null else $blocked_evidence end),started_at:(if $started_at == "" then null else $started_at end),last_change_at:(if $last_change_at == "" then null else $last_change_at end),idle_seconds:(if $idle_seconds == "" then null else ($idle_seconds | tonumber) end),bytes_in_pane:(if $bytes_in_pane == "" then null else ($bytes_in_pane | tonumber) end),marker_seen:$marker_seen} + (if $wrong_engine_hint == "" then {} else {wrong_engine_hint:$wrong_engine_hint} end) + (if $exit_source == "" then {} else {exit_source:$exit_source} end)'
   elif [[ "$running" == true ]]; then
     echo "running: $session"
     if [[ -n "$diagnostic" ]]; then

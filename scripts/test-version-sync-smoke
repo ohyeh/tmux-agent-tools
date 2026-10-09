@@ -68,10 +68,8 @@ assert "mods/tmux-agent/hooks/register.ts MOD_VERSION matches the mod manifest" 
 if scripts/sync-mod-core --check; then core=same; else core=differs; fi
 assert "mods/tmux-agent/hooks/lib matches the core (scripts/sync-mod-core)" "$core" "same"
 
-# Finding M4/R4: the release notes of this version must not swallow older sections (0.10.x headings).
-notes="$(ruby scripts/release-notes "v$changelog_version" 2>&1)" && notes_rc=0 || notes_rc=$?
-assert "release-notes extracts the v$changelog_version section" "$notes_rc" "0"
-assert "release-notes stops at the next section" "$([[ "$notes" == *"## "* ]] && echo leaks || echo clean)" "clean"
+# Finding M4/R4 (notes stop at the next section) lives in test-release-notes-smoke: release-notes
+# now also gates the tag and `Not verified:`, which a past release need not meet.
 
 # The MCP bundle (plan R7.1, §1c S6) is generated and committed: a rebuild must
 # reproduce its bytes and its license notice, and its banner names the release.

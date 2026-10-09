@@ -1,0 +1,545 @@
+#!/usr/bin/env zsh
+# Held-out checks use plan r1 contracts, not relay implementation details.
+# Python provides raw HTTP framing, process deadlines, and concurrent requests.
+setopt NO_NOMATCH
+ROOT="${0:A:h:h}"
+LOG="${TMUX_AGENT_RELAY_HELDOUT_LOG:-${TMPDIR:-/tmp}/relay-heldout.log}"
+exec 3>&1
+exec 2>/dev/null
+if ! exec >>"$LOG" 2>&1; then
+  print -r -- 'FAIL log-open'
+  print -r -- 'heldout: 0 passed, 1 failed'
+  exit 1
+fi
+source "$ROOT/scripts/lib/smoke-tmux.sh"
+export RELAY_HELDOUT_ROOT="$ROOT"
+export RELAY_HELDOUT_WORK="$TMPDIR/heldout"
+mkdir -p "$RELAY_HELDOUT_WORK"/{bin,state,zdot,cwd}
+export TMUX_AGENT_DIR="$RELAY_HELDOUT_WORK/state"
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$RELAY_HELDOUT_WORK/audit.jsonl"
+export ZDOTDIR="$RELAY_HELDOUT_WORK/zdot"
+unset TMUX TMUX_PANE TMUX_AGENT_SESSION TMUX_AGENT_TMUX_SOCKET
+unset TMUX_AGENT_TOOLS_SENTINEL TMUX_AGENT_TOOLS_ON_EXIT
+unset TMUX_AGENT_TOOLS_NOTIFY_URL TMUX_AGENT_TOOLS_NOTIFY_LAUNCH_ID
+unset TMUX_AGENT_RELAY_URL TMUX_AGENT_RELAY_FROM
+python3 - <<'PY'
+import concurrent.futures
+import contextlib
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
+import traceback
+
+root = Path(os.environ['RELAY_HELDOUT_ROOT'])
+work = Path(os.environ['RELAY_HELDOUT_WORK'])
+state = Path(os.environ['TMUX_AGENT_DIR'])
+relay = root / 'skills/tmux-agent-tools/scripts/tmux-agent-relay'
+agent = root / 'skills/tmux-agent-tools/scripts/agent-tmux'
+output = os.fdopen(os.dup(3), 'w', buffering=1)
+passed = failed = 0
+children = []
+env = dict(os.environ)
+env['PATH'] = str(work / 'bin') + os.pathsep + env['PATH']
+env['TMUX_AGENT_RELAY_WHOIS'] = str(work / 'bin/whois')
+env['CODEX'] = str(work / 'bin/codex')
+
+
+def executable(name, text):
+    p = work / 'bin' / name
+    p.write_text(text)
+    p.chmod(0o700)
+    return p
+
+
+# All network identity is synthetic. No tailscale daemon or real ssh is used.
+identity = '''import json, os, sys, time
+from pathlib import Path
+w=Path(os.environ['RELAY_HELDOUT_WORK'])
+args=sys.argv[1:]
+def node(ip, stable, name):
+ return {'StableID':stable,'ID':1,'Name':name,'DNSName':name+'.test.',
+         'Tags':[], 'UserID':1, 'Online':True, 'TailscaleIPs':[ip]}
+selfnode=node('100.64.0.1','nSelf','self')
+peer=node('127.0.0.1','nPeer','peer')
+mode=(w/'whois-mode').read_text()
+if args and args[0]=='ip':
+ if len(args)>2 and mode=='unresolved': sys.exit(1)
+ if len(args)<=2:
+  addr=(w/'bind-address').read_text() if (w/'bind-address').exists() else '100.64.0.1'
+  print(addr)
+ else: print('100.64.0.2')
+ sys.exit()
+if args[:2]==['status','--json']:
+ peers={}
+ if (w/'roster-hang').exists():
+  peers={'nodekey:hang':node('127.0.0.1','nHang','localhost')}
+  peers['nodekey:hang']['DNSName']='localhost.'
+ print(json.dumps({'Self':selfnode,'Peer':peers,'User':{'1':{'ID':1,'LoginName':'owner@test'}}})); sys.exit()
+if args and args[0]=='whois': args=args[1:]
+if len(args)!=2 or args[0]!='--json': sys.exit(2)
+ip=args[1]
+with (w/'whois-args').open('a') as f: f.write(json.dumps(args)+'\\n')
+own=ip=='100.64.0.1'
+if not own and mode=='timeout': time.sleep(20)
+if not own and mode=='error': sys.exit(1)
+n=selfnode if own else peer
+u={'ID':1,'LoginName':'owner@test'}
+if not own and mode=='other': u['LoginName']='other@test'
+if not own and mode=='tagged': n['Tags']=['tag:worker']
+if not own and mode=='wrong-node': n['StableID']='nWrong'
+reply={'Node':n,'UserProfile':u}
+if not own and mode=='missing-user': reply.pop('UserProfile')
+print(json.dumps(reply))
+'''
+executable('tailscale', '#!/usr/bin/env python3\n' + identity)
+executable('whois', '#!/usr/bin/env python3\n' + identity)
+executable('codex', '''#!/bin/sh
+echo HELDOUT_READY
+while IFS= read -r line; do
+  printf '%s\\n' "$line" >> "$RELAY_HELDOUT_WORK/delivered"
+done
+''')
+executable('ssh', '''#!/usr/bin/env python3
+import os, subprocess, sys
+from pathlib import Path
+w=Path(os.environ['RELAY_HELDOUT_WORK'])
+with (w/'ssh-log').open('a') as f: f.write(repr(sys.argv[1:])+'\\n')
+if '-G' in sys.argv[1:]:
+ print('hostname '+sys.argv[sys.argv.index('-G')+1].rsplit('@',1)[-1]); sys.exit(0)
+e=dict(os.environ)
+e.pop('TMUX_AGENT_TOOLS_SENTINEL',None)
+e.pop('TMUX_AGENT_TOOLS_ON_EXIT',None)
+# Only the generated remote shell command runs; ssh never reaches a host.
+sys.exit(subprocess.call(['/bin/sh','-c',sys.argv[-1]],env=e,cwd=w/'cwd'))
+''')
+# Remote codex exits 7; the local receiver above stays alive.
+(work / 'remote').mkdir(exist_ok=True)
+(work / 'remote/codex').write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+w=Path(os.environ['RELAY_HELDOUT_WORK'])
+(w/'remote-env.json').write_text(json.dumps({k:v for k,v in os.environ.items() if k.startswith('TMUX_AGENT_')}))
+sys.exit(7)
+''')
+(work / 'remote/codex').chmod(0o700)
+executable('curl', '''#!/usr/bin/env python3
+import os, subprocess, sys
+from pathlib import Path
+w=Path(os.environ['RELAY_HELDOUT_WORK'])
+with (w/'curl-log').open('a') as f: f.write(repr(sys.argv[1:])+'\\n')
+if (w/'curl-fail').exists(): sys.exit(28)
+sys.exit(subprocess.call(['/usr/bin/curl']+sys.argv[1:]))
+''')
+(work / 'whois-mode').write_text('good')
+
+
+def stop(p):
+    if p.poll() is None:
+        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait(timeout=2)
+
+
+def command(argv, timeout=12, extra=None):
+    e = dict(env)
+    if extra:
+        e.update(extra)
+    p = subprocess.Popen([str(a) for a in argv], env=e, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    children.append(p)
+    try:
+        data = p.communicate(timeout=timeout)[0].decode('utf-8', 'replace')
+    except subprocess.TimeoutExpired:
+        stop(p)
+        raise AssertionError('command deadline: ' + repr(argv))
+    print('command', argv, 'rc', p.returncode, data, flush=True)
+    return p.returncode, data
+
+
+def until(predicate, seconds=5):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError('wait deadline')
+
+
+def request(port, route='/v1/health', obj=None, headers=None, raw=None, timeout=5, host='127.0.0.1'):
+    if raw is None:
+        body = json.dumps(obj, ensure_ascii=False).encode() if obj is not None else b''
+        method = 'POST' if obj is not None else 'GET'
+        h = {'Host': 'localhost', 'Connection': 'close'}
+        if obj is not None:
+            h.update({'Content-Type': 'application/json', 'Content-Length': str(len(body))})
+        h.update(headers or {})
+        raw = (f'{method} {route} HTTP/1.1\r\n' + ''.join(f'{k}: {v}\r\n' for k, v in h.items()) + '\r\n').encode() + body
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(raw)
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+    response = b''.join(chunks)
+    print('HTTP', route, repr(response[:2000]), flush=True)
+    return int(response.split(b' ', 2)[1]), response
+
+
+@contextlib.contextmanager
+def server(mode='good', bind='127.0.0.1'):
+    assert relay.is_file() and os.access(relay, os.X_OK), 'relay executable missing: ' + str(relay)
+    # Establish the owner's identity before selecting the request peer's answer.
+    # A loopback bind otherwise makes fake own and peer lookups indistinguishable.
+    (work / 'whois-mode').write_text('good')
+    (work / 'bind-address').write_text(bind)
+    (work / 'whois-args').write_text('')
+    family = socket.AF_INET6 if ':' in bind else socket.AF_INET
+    with socket.socket(family) as s:
+        s.bind((bind, 0))
+        port = s.getsockname()[1]
+    p = subprocess.Popen([str(relay), 'serve', '--bind', bind, '--port', str(port)],
+                         env=env, start_new_session=True)
+    children.append(p)
+    try:
+        def listening():
+            assert p.poll() is None, 'serve exited before listening'
+            try:
+                with socket.create_connection((bind, port), timeout=0.1):
+                    return True
+            except OSError:
+                return False
+        until(listening)
+        (work / 'whois-mode').write_text(mode)
+        yield port
+    finally:
+        stop(p)
+
+
+def fixture(name='exit-worker', launch='N2'):
+    d = state / name
+    d.mkdir(exist_ok=True)
+    for f in ('remote.exit', 'remote-exit.json'):
+        (d / f).unlink(missing_ok=True)
+    (d / 'launch-meta.json').write_text(json.dumps({
+        'schema_version': 1, 'cli': 'codex', 'exec_mode': 'tui',
+        'launch_id': launch, 'notify_node': 'nPeer', 'remote_target': 'peer'}))
+    return d
+
+
+def exit_body(**fields):
+    return dict({'name': 'exit-worker', 'launch_id': 'N2', 'code': 7}, **fields)
+
+
+def rejection(code):
+    assert 400 <= code < 500, f'expected refusal, got {code}'
+
+
+def auth(mode, headers=None):
+    with server(mode) as port:
+        assert request(port, headers=headers)[0] == 403
+
+
+def invalid_exit(value):
+    d = fixture()
+    with server() as port:
+        rejection(request(port, '/v1/exit', exit_body(code=value))[0])
+        assert not (d / 'remote.exit').exists(), 'invalid request published'
+        assert request(port)[0] == 200, 'relay stopped after invalid input'
+
+
+def good_exit():
+    d = fixture()
+    with server() as port:
+        assert request(port, '/v1/exit', exit_body())[0] == 204
+        assert (d / 'remote.exit').read_bytes() == b'7\n'
+        record = json.loads((d / 'remote-exit.json').read_text())
+        assert record['launch_id'] == 'N2' and record['code'] == 7 and record['node'] == 'nPeer'
+        assert record['received_at']
+
+
+def stale():
+    d = fixture(launch='N1')
+    fixture(launch='N2')
+    with server() as port:
+        assert request(port, '/v1/exit', exit_body(launch_id='N1'))[0] == 409
+        assert not (d / 'remote.exit').exists()
+        assert request(port, '/v1/exit', exit_body())[0] == 204
+
+
+def wrong_node():
+    d = fixture()
+    with server('wrong-node') as port:
+        rejection(request(port, '/v1/exit', exit_body())[0])
+        assert not (d / 'remote.exit').exists()
+
+
+def dot_name():
+    d = fixture(name='..')
+    with server() as port:
+        rejection(request(port, '/v1/exit', exit_body(name='..'))[0])
+        assert not (d / 'remote.exit').exists(), 'name escaped the worker directory'
+
+
+def concurrent_exit():
+    d = fixture()
+    with server() as port, concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda c: (c, request(port, '/v1/exit', exit_body(code=c))[0]), range(8)))
+        winners = [c for c, rc in results if rc == 204]
+        assert len(winners) == 1 and all(rc in (204, 409) for _, rc in results), results
+        assert (d / 'remote.exit').read_bytes() == f'{winners[0]}\n'.encode()
+        assert json.loads((d / 'remote-exit.json').read_text())['code'] == winners[0]
+
+
+def framed(kind):
+    d = fixture()
+    body = json.dumps(exit_body()).encode()
+    if kind in ('chunked', 'chunked-overflow'):
+        if kind == 'chunked-overflow':
+            body = json.dumps(exit_body(padding='x' * 17000)).encode()
+        chunks = [body[i:i+17] for i in range(0, len(body), 17)]
+        payload = b''.join(f'{len(c):x}\r\n'.encode() + c + b'\r\n' for c in chunks) + b'0\r\n\r\n'
+        raw = b'POST /v1/exit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n' + payload
+    elif kind == 'oversized':
+        body = json.dumps(exit_body(padding='x' * 17000)).encode()
+        raw = f'POST /v1/exit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n'.encode() + body
+    else:
+        raw = b'POST /v1/exit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n['
+    with server() as port:
+        rc = request(port, '/v1/exit', raw=raw)[0]
+        if kind == 'chunked':
+            assert rc == 204 and (d / 'remote.exit').read_bytes() == b'7\n'
+        else:
+            rejection(rc)
+            assert not (d / 'remote.exit').exists()
+        assert request(port)[0] == 200
+
+
+def slow_body():
+    fixture()
+    with server() as port, socket.create_connection(('127.0.0.1', port), timeout=2) as s:
+        s.sendall(b'POST /v1/exit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{')
+        # r1 gives no body deadline: assert only that another request can proceed.
+        assert request(port, timeout=4)[0] == 200
+        assert not (state / 'exit-worker/remote.exit').exists()
+
+
+def peer_form():
+    for bind in ('::1', '::ffff:127.0.0.1'):
+        with server(bind=bind) as port:
+            assert request(port, host=bind)[0] == 200
+            args = [json.loads(l)[1] for l in (work / 'whois-args').read_text().splitlines()]
+            allowed = ('::1',) if bind == '::1' else ('127.0.0.1', '::ffff:127.0.0.1')
+            assert any(ip in allowed for ip in args), args
+
+
+def worker():
+    rc, text = command([agent, 'codex', 'start', '--exact', 'receiver', work / 'cwd'])
+    assert rc == 0, text
+    until(lambda: 'HELDOUT_READY' in command([agent, 'codex', 'capture', 'receiver', '30'])[1])
+
+
+@contextlib.contextmanager
+def receiver():
+    worker()
+    (work / 'delivered').write_text('')
+    try:
+        yield
+    finally:
+        command([agent, 'codex', 'stop', 'receiver'])
+
+
+def message(kind):
+    with server() as port, receiver():
+        text = '中文🙂 e\u0301 ; $(touch ' + str(work / 'executed') + ')'
+        if kind == 'controls':
+            text = 'unicode 中文\tcontrol\u202e\nnext line'
+        obj = {'to': 'receiver', 'from': 'remote', 'text': text, 'id': 'heldout-' + kind}
+        if kind == 'oversized-id':
+            obj['id'] = 'x' * 17000
+            rejection(request(port, '/v1/message', obj)[0])
+            assert not (work / 'delivered').read_text()
+            return
+        assert request(port, '/v1/message', obj, timeout=12)[0] == 202
+        expected = '[relay peer/remote] ' + text
+        try:
+            until(lambda: expected in (work / 'delivered').read_text(), seconds=5)
+        except AssertionError:
+            print('delivered bytes', repr((work / 'delivered').read_bytes()), 'expected', repr(expected))
+            raise
+        if kind == 'duplicate':
+            rc = request(port, '/v1/message', obj, timeout=12)[0]
+            assert 200 <= rc < 500
+            time.sleep(0.5)
+            assert (work / 'delivered').read_text().count(expected) == 1
+        assert not (work / 'executed').exists(), 'text executed as shell'
+        log = state / 'relay/relay.log.jsonl'
+        records = [json.loads(l) for l in log.read_text().splitlines()]
+        assert records and not any(text in json.dumps(r, ensure_ascii=False) for r in records), 'body leaked to audit'
+
+
+def dead_message():
+    with server() as port:
+        rejection(request(port, '/v1/message', {'to':'absent','from':'remote','text':'hi','id':'dead'})[0])
+
+
+def roster_hang():
+    # A peer accepts but never answers. Port 7717 is fixed by the send/roster CLI.
+    with socket.socket() as hang:
+        hang.bind(('127.0.0.1', 7717))
+        hang.listen(8)
+        (work / 'roster-hang').touch()
+        try:
+            with server():
+                start = time.monotonic()
+                rc, text = command([relay, 'roster', '--json'], timeout=8)
+                assert time.monotonic() - start < 8
+                # JSON layout and exit code are unspecified; do not freeze either.
+                parsed = json.loads(text)
+                rendered = json.dumps(parsed).lower()
+                assert ('localhost' in rendered or '127.0.0.1' in rendered) and any(
+                    v in rendered for v in ('unreachable', 'timeout', 'timed out')), text
+        finally:
+            (work / 'roster-hang').unlink(missing_ok=True)
+
+
+def notify(kind):
+    # Require relay even for negative cases: missing binaries cannot pass by accident.
+    assert relay.is_file() and os.access(relay, os.X_OK), 'relay executable missing'
+    name = 'notify-' + kind
+    sentinel = work / (name + '.exit')
+    sentinel.unlink(missing_ok=True)
+    (work / 'ssh-log').write_text('')
+    args = [agent, 'codex', 'start-ssh', '--exact', '--notify']
+    if kind != 'no-sentinel':
+        args += ['--sentinel', sentinel]
+    args += [name, 'user@peer', work / 'cwd']
+    if kind in ('no-sentinel', 'no-relay'):
+        rc, text = command(args)
+        assert rc == 2 and not (state / name / 'launch-meta.json').exists()
+        assert '-tt' not in (work / 'ssh-log').read_text()
+        if kind == 'no-sentinel':
+            assert 'sentinel' in text.lower(), text
+        if kind == 'no-relay':
+            assert 'run tmux-agent-relay ensure' in text
+        return
+    with server('unresolved' if kind == 'unresolved' else 'good') as port:
+        if kind == 'unresolved':
+            rc, text = command(args)
+            assert rc == 4 and not (state / name / 'launch-meta.json').exists()
+            assert '-tt' not in (work / 'ssh-log').read_text()
+            return
+        # Replace just the fake remote command's PATH; inherit no local notify vars.
+        ssh = work / 'bin/ssh'
+        original = ssh.read_text()
+        ssh.write_text(original.replace("# Only the generated", "e['PATH']=str(w/'remote')+os.pathsep+e['PATH']\n# Only the generated"))
+        if kind == 'curl-failure':
+            (work / 'curl-fail').touch()
+        (work / 'curl-log').write_text('')
+        hook = 'test -s "$RELAY_HELDOUT_WORK/curl-log" && printf "hook:%s:%s\\n" "$ON_EXIT_CODE" "$(cat "$TMUX_AGENT_TOOLS_SENTINEL")"'
+        args[5:5] = ['--on-exit', hook]
+        try:
+            rc, text = command(args)
+            assert rc == 0, text
+            until(lambda: sentinel.exists(), seconds=8)
+            until(lambda: (Path(str(sentinel)+'.hook.log').exists() and 'hook:7:7' in Path(str(sentinel)+'.hook.log').read_text()), seconds=15)
+            assert sentinel.read_bytes() == b'7\n'
+            meta = json.loads((state / name / 'launch-meta.json').read_text())
+            assert meta['notify_node'] == 'nPeer' and meta['launch_id'] and meta['remote_target'] == 'user@peer'
+            remote_env = json.loads((work / 'remote-env.json').read_text())
+            url = f'http://127.0.0.1:{port}'
+            assert 'TMUX_AGENT_TOOLS_NOTIFY_URL' not in remote_env
+            assert 'TMUX_AGENT_TOOLS_NOTIFY_LAUNCH_ID' not in remote_env
+            assert remote_env['TMUX_AGENT_RELAY_URL'].rstrip('/') == url
+            assert remote_env['TMUX_AGENT_RELAY_FROM'] == name
+            capture = command([agent, 'codex', 'capture', name, '100'])[1]
+            assert 'remote command exited with code 7' in capture
+            if kind == 'curl-failure':
+                assert 'relay notify failed (curl rc 28)' in capture
+                assert not (state / name / 'remote.exit').exists()
+            else:
+                until(lambda: (state / name / 'remote.exit').exists())
+                assert (state / name / 'remote.exit').read_bytes() == b'7\n'
+                pushed = json.loads((state / name / 'remote-exit.json').read_text())
+                assert pushed['launch_id'] == meta['launch_id']
+                assert pushed['node'] == meta['notify_node']
+                rc, status = command([agent, 'codex', 'status', '--json', name])
+                status = json.loads(status)
+                assert status['exit_source'] == 'relay' and status['exit_detected'] and status['exit_code'] == 7
+        finally:
+            ssh.write_text(original)
+            (work / 'curl-fail').unlink(missing_ok=True)
+            command([agent, 'codex', 'stop', name])
+
+
+cases = [
+    ('spoofed-forwarded-identity', lambda: auth('other', {'X-Forwarded-For':'100.64.0.1','X-Real-IP':'100.64.0.1','Forwarded':'for=100.64.0.1'})),
+    ('dot-name-cannot-escape-state', dot_name),
+    ('missing-user-fails-closed', lambda: auth('missing-user')),
+    ('whois-error-fails-closed', lambda: auth('error')),
+    ('whois-timeout-fails-closed', lambda: auth('timeout')),
+    ('IPv6-and-mapped-socket-peers', peer_form),
+    ('exit-valid-publishes-both-files', good_exit),
+    ('exit-negative-code', lambda: invalid_exit(-1)),
+    ('exit-fractional-code', lambda: invalid_exit(1.5)),
+    ('exit-boolean-code', lambda: invalid_exit(True)),
+    ('exit-huge-code', lambda: invalid_exit(2**80)),
+    ('exit-string-code', lambda: invalid_exit('7')),
+    ('N1-push-after-N2', stale),
+    ('exit-wrong-device', wrong_node),
+    ('concurrent-first-write-wins', concurrent_exit),
+    ('chunked-valid-json', lambda: framed('chunked')),
+    ('chunked-size-cap', lambda: framed('chunked-overflow')),
+    ('content-length-size-cap', lambda: framed('oversized')),
+    ('malformed-json-keeps-server-alive', lambda: framed('malformed')),
+    ('slow-body-does-not-block-health', slow_body),
+    ('message-unicode-shell-literal', lambda: message('unicode')),
+    ('message-control-text-literal', lambda: message('controls')),
+    ('message-duplicate-once', lambda: message('duplicate')),
+    ('message-oversized-id-body-cap', lambda: message('oversized-id')),
+    ('message-dead-worker-refused', dead_message),
+    ('roster-retains-hanging-peer', roster_hang),
+    ('notify-needs-sentinel', lambda: notify('no-sentinel')),
+    ('notify-needs-live-relay', lambda: notify('no-relay')),
+    ('notify-unresolved-node-no-launch', lambda: notify('unresolved')),
+    ('notify-curl-failure-keeps-code-and-hook', lambda: notify('curl-failure')),
+]
+# 30 cases: keep the positive notify push in the last case as a second phase.
+cases[-1] = (cases[-1][0] + '-then-good-push', lambda: (notify('curl-failure'), notify('good')))
+try:
+    for label, test in cases:
+        print('\nCASE', label, flush=True)
+        try:
+            test()
+        except Exception:
+            traceback.print_exc()
+            failed += 1
+            output.write('FAIL ' + label + '\n')
+        else:
+            passed += 1
+            output.write('ok ' + label + '\n')
+finally:
+    for p in reversed(children):
+        try:
+            stop(p)
+        except Exception:
+            traceback.print_exc()
+output.write(f'heldout: {passed} passed, {failed} failed\n')
+sys.exit(1 if failed else 0)
+PY
+rc=$?
+if (( rc > 1 )); then
+  print -r -- 'FAIL runner-runtime' >&3
+  print -r -- 'heldout: 0 passed, 1 failed' >&3
+fi
+exit "$rc"

@@ -23,6 +23,8 @@ import {
   heartbeat,
   episodeDetail,
   resumeWorker,
+  mirrorOf,
+  mirrorProject,
   type Health,
 } from './workers.ts'
 import {
@@ -1907,6 +1909,141 @@ test('mirror: capture asks for the layout body; a resize drops the capture start
   }
 })
 
+test('preview fills the frame in every state: height rows, footer last, rule and tail in place (T1 C1)', () => {
+  const NOW = 1_000_000
+  const rows = [mockRow('a'), mockRow('b'), mockRow('c')]
+  const base: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a', statusMessage: 'note', statusUntil: NOW + 5_000 }
+  const states: [string, Partial<TuiState>, RegExp][] = [
+    ['absent (pending)', {}, /capturing the pane…/],
+    ['successful empty capture', { mirror: { id: 'a', lines: [] } }, /\(the pane is empty\)/],
+    ['failed capture', { mirror: { id: 'a', lines: [], error: 'exit 1: no session' } }, /capture failed: exit 1: no session/],
+    ['short mirror', { mirror: { id: 'a', lines: ['one', 'two'] } }, /^two$/],
+    ['long mirror', { mirror: { id: 'a', lines: Array.from({ length: 300 }, (_, i) => `m${i}`) } }, /^m299$/],
+    ['another row\'s mirror', { mirror: { id: 'b', lines: ['B-ONLY'] } }, /capturing the pane…/],
+    ['detail loading', { expanded: true }, /loading…/],
+    ['short detail', { expanded: true, detail: { id: 'a', lines: ['d1'] } }, /^d1$/],
+  ]
+  for (const height of [12, 24, 40, 60]) {
+    for (const [name, extra, marker] of states) {
+      const s = { ...base, ...extra }
+      const lay = tuiLayout(s, 70, height, NOW)
+      const frame = renderTuiLines(s, 70, height, NOW).map(stripAnsi)
+      const at = `${name} h=${height}`
+      assert.equal(frame.length, height, `${at}: frame is the full height`)
+      assert.equal(frame.at(-1), 'tmux-agent: note', `${at}: footer on the last line`)
+      assert.ok(frame.every(l => cellWidth(l) <= 70), `${at}: no line wider than the screen`)
+      const rule = frame.findIndex(l => l.startsWith('─'))
+      assert.ok(rule > 0 && lay.body > 0, `${at}: the rule is drawn`)
+      assert.ok(frame.slice(rule + 1, rule + 1 + lay.body).some(l => marker.test(l)), `${at}: ${marker} in the body`)
+      assert.match(frame[rule + 1 + lay.body]!, s.expanded ? /^detail / : /^See it whole: /, `${at}: tail right after the body`)
+      for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
+      assert.ok(!frame.some(l => l.includes('B-ONLY')), `${at}: never another row's content`)
+    }
+  }
+  // No preview (no selection; or a window too short for one): still full height, footer last (T1 C5).
+  for (const [name, s, height] of [
+    ['no selection', { ...base, selected: undefined }, 24],
+    ['h=9, the status line squeezes the body to 0', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 9],
+    ['h=8', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 8],
+  ] as [string, TuiState, number][]) {
+    const frame = renderTuiLines(s, 70, height, NOW).map(stripAnsi)
+    assert.equal(tuiLayout(s, 70, height, NOW).body, 0, `${name}: no preview`)
+    assert.equal(frame.length, height, `${name}: frame is the full height`)
+    assert.equal(frame.at(-1), 'tmux-agent: note', `${name}: footer on the last line`)
+  }
+})
+
+test('mirror: capture failure reaches the preview as an error, not an empty pane (T1 C2b)', async () => {
+  const host = quietHost('S', '/tmp', '/tmp')
+  host.run = async () => ({ exitCode: 1, stdout: '', stderr: "\ncan't find session: x\n" })
+  const d = { profile: 'codex', name: 'x.abcde', dir: '/tmp', since: 1 }
+  assert.deepEqual(await mirrorOf(host, d, 10), { lines: [], error: "exit 1: can't find session: x" })
+  assert.deepEqual(await mirrorProject(host, 'x', 10), { lines: [], error: "exit 1: can't find session: x" })
+  host.run = async () => {
+    throw new Error('spawn agent-tmux ENOENT')
+  }
+  assert.deepEqual(await mirrorOf(host, d, 10), { lines: [], error: 'spawn agent-tmux ENOENT' })
+  host.run = async () => ({ exitCode: 0, stdout: 'a\nb\n', stderr: '' })
+  assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b', ''] })
+  assert.deepEqual(await mirrorProject(host, 'x', 10), { lines: ['a', 'b'] })
+})
+
+test('mirror: select, A→B and resize capture at once, not at the next tick; never draw another row (T1 C2)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-c2-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-c2-repo-'))
+  writeWorker(root, repo, 'S', 'aaa.abcde')
+  writeWorker(root, repo, 'S', 'bbb.abcde')
+  const host = quietHost('S', repo, root)
+  const calls: string[] = []
+  const holds: (() => void)[] = []
+  let holdNext = false
+  host.run = async argv => {
+    if (argv[0] === 'agent-tmux' && argv.includes('capture')) {
+      const name = argv.at(-1)!
+      const tail = argv[argv.indexOf('--tail') + 1]!
+      calls.push(`${name}/${tail}`)
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(r => holds.push(r))
+      }
+      return { exitCode: 0, stdout: `${name.toUpperCase()}-${tail}\n`, stderr: '' }
+    }
+    if (argv[0] === 'agent-tmux' && argv.includes('status')) return { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' }
+    return { exitCode: 0, stdout: '', stderr: '' }
+  }
+  const { stdin, stdout } = mockTty()
+  // 60 s tick: every capture below comes from the key or the resize, not the clock.
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000 })
+  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+  try {
+    await until(() => stdout.written.includes('bbb.abcde'), 5_000, 'the rows')
+    stdin.emit('data', 'j')
+    await until(() => last().includes('capturing the pane…') || /AAA\.ABCDE-\d+/.test(last()), 5_000, 'the pending preview')
+    await until(() => /AAA\.ABCDE-\d+/.test(last()), 5_000, 'A captured without a tick')
+    assert.equal(last().split('\r\n').length, 24, 'full frame')
+
+    // A→B while B's capture is held: B pending, A's content gone.
+    holdNext = true
+    stdin.emit('data', 'j')
+    await until(() => holds.length === 1, 5_000, 'B capture in flight')
+    await until(() => last().includes('capturing the pane…'), 5_000, 'B pending')
+    assert.ok(!last().includes('AAA.ABCDE'), 'A is never drawn as B')
+
+    // Resize while B's capture (sized 80x24) is in flight: it is dropped; a new one runs at the new size.
+    stdout.columns = 120
+    stdout.rows = 60
+    stdout.emit('resize')
+    // Release the old-size capture while the new-size one is held, then force a frame:
+    // what is drawn is the mirror as it stands between the two.
+    holdNext = true
+    holds.shift()!()
+    await until(() => holds.length === 1, 5_000, 'the new-size capture in flight')
+    const before = stdout.written.length
+    stdin.emit('data', 'z') // unbound: a frame, selection kept
+    await until(() => stdout.written.length > before, 5_000, 'a forced frame')
+    assert.ok(!/BBB\.ABCDE-\d+/.test(last()), 'the capture sized before the resize is never drawn')
+    holds.shift()!()
+    await until(() => /BBB\.ABCDE-5\d/.test(last()), 5_000, 'B at the new size')
+    assert.equal(last().split('\r\n').length, 60)
+
+    // Same row, resize again: the kept capture stays on screen until the new one lands.
+    holdNext = true
+    stdout.rows = 40
+    stdout.emit('resize')
+    await until(() => holds.length === 1, 5_000, 'the resize capture in flight')
+    assert.match(last(), /BBB\.ABCDE-5\d/, 'the same row keeps its last capture through a resize')
+    holds.shift()!()
+    await until(() => /BBB\.ABCDE-3\d/.test(last()), 5_000, 'B at 40 rows')
+  } finally {
+    for (const h of holds) h()
+    stdin.emit('data', 'q')
+    await run
+  }
+  const after = stdout.written.length
+  await new Promise(r => setTimeout(r, 50))
+  assert.equal(stdout.written.length, after, 'nothing is drawn after quit')
+})
+
 test('detail: the whole result, past SUMMARY_MAX, with row and result state apart; PgDn reaches the end (R4.3)', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-detail-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-detail-repo-'))
@@ -1958,8 +2095,10 @@ test('detail: the whole result, past SUMMARY_MAX, with row and result state apar
     await until(() => stdout.written.includes('det.abcde'), 5_000, 'the row')
     stdin.emit('data', 'j')
     stdin.emit('data', '\r')
-    await until(() => stdout.written.includes('detail 1–'), 5_000, 'the detail view')
-    const total = Number(/detail 1–\d+ of (\d+)/.exec(stripAnsi(stdout.written))![1])
+    // The last frame: a capture started by `j` may draw the `loading…` detail (1 of 1) first.
+    const lastFrame = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+    await until(() => Number(/detail 1–\d+ of (\d+)/.exec(lastFrame())?.[1] ?? 0) > 1, 5_000, 'the loaded detail view')
+    const total = Number(/detail 1–\d+ of (\d+)/.exec(lastFrame())![1])
     assert.ok(total > 300, `a long summary wraps to many lines: ${total}`)
     for (let i = 0; i < Math.ceil(total / 10) && !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'); i++) {
       stdin.emit('data', PAGE_DOWN)

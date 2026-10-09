@@ -79,12 +79,13 @@ Many PRs land via a two-agent loop: an implementer writes the code, a partner ru
 
 No GitHub Actions: the release is local, after the local checks pass.
 
-1. Move `## Unreleased` entries under `## v0.X.Y - YYYY-MM-DD`, bump every version line (`scripts/test-version-sync-smoke` lists them), rebuild the MCP bundle (`npm --prefix mcp-adapter run build`), commit `chore(release): 0.X.Y`.
+1. Move `## Unreleased` entries under `## v0.X.Y - YYYY-MM-DD` and add a `- Not verified: …` line (what this release did not check; `release-notes` refuses a section without it), bump every version line (`scripts/test-version-sync-smoke` lists them), rebuild the MCP bundle (`npm --prefix mcp-adapter run build`), commit `chore(release): 0.X.Y`.
 2. Run the local checks: `scripts/test-mod-typecheck-smoke`, `scripts/ci-shellcheck`, `scripts/test-core-contract-smoke`, `(cd mods/tmux-agent && claude plugin test .)`, `zsh scripts/run-all-smokes`. All must pass; quote their output.
 3. Push `main`, then tag and publish from the same commit:
    ```sh
-   git tag -a v0.X.Y -m v0.X.Y && git push origin v0.X.Y
-   ruby scripts/release-notes v0.X.Y > "$TMPDIR/notes.md"
+   git tag -a v0.X.Y -m v0.X.Y
+   ruby scripts/release-notes v0.X.Y > "$TMPDIR/notes.md"   # fails unless the tag is on the chore(release) commit; fix before pushing the tag
+   git push origin v0.X.Y
    gh release create v0.X.Y --title v0.X.Y --notes-file "$TMPDIR/notes.md"
    ```
 

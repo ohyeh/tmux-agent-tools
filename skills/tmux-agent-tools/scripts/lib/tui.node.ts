@@ -47,6 +47,7 @@ import {
   UNLOCK_WORD,
   type EpisodeDetail,
   type Health,
+  type MirrorCapture,
   rootOf,
   stopWorker,
   stopAll,
@@ -250,7 +251,7 @@ export interface TuiState {
   inputKind?: InputKind
   /** The row a `tell` input is for. */
   inputFor?: string
-  mirror?: { id: string; lines: string[] }
+  mirror?: { id: string } & MirrorCapture
   /** Enter on the selected row: its detail replaces the mirror. */
   expanded?: boolean
   detail?: { id: string; lines: string[] }
@@ -889,26 +890,39 @@ export function renderTuiLines(
     if (!isSelected) continue
     lines.push(...s.selExtra.slice(s.selExtra.length - lay.selExtra).map(fit))
     if (lay.body === 0) continue
+    // The preview owns its rule, `lay.body` rows and a tail line in every state, so
+    // the frame is `height` rows and the footer stays at the bottom (T1 C1).
     const rule = `\x1b[2m${'─'.repeat(Math.max(0, Math.min(width, 60) - 1))}\x1b[0m`
+    const body: string[] = []
+    let tail: string
     if (state.expanded) {
       const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), width) : ['loading…']
       const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - lay.body))
-      lines.push(fit(rule))
-      for (const l of all.slice(top, top + lay.body)) lines.push(l || ' ')
+      for (const l of all.slice(top, top + lay.body)) body.push(l || ' ')
       const end = Math.min(all.length, top + lay.body)
-      lines.push(fit(`\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · PgUp/PgDn scroll · Enter mirror\x1b[0m`))
-    } else if (state.mirror && state.mirror.id === r.id) {
-      lines.push(fit(rule))
-      for (const ml of state.mirror.lines.slice(-lay.body)) lines.push(fit(sanitizeAnsi(ml) || ' '))
-      const seeWhole = r.project
-        ? `See it whole: tmux attach -t ${exactSessionTarget(r.d.name)}`
-        : `See it whole: agent-tmux ${r.d.profile} attach ${r.d.name}`
-      lines.push(fit(`\x1b[2m${seeWhole}\x1b[0m`))
+      tail = `\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · PgUp/PgDn scroll · Enter mirror\x1b[0m`
+    } else {
+      const m = state.mirror?.id === r.id ? state.mirror : undefined
+      if (!m) body.push('\x1b[2mcapturing the pane…\x1b[0m')
+      else if (m.error) body.push(`\x1b[33mcapture failed: ${sanitizeAnsi(m.error)}\x1b[0m`)
+      else if (!m.lines.length) body.push('\x1b[2m(the pane is empty)\x1b[0m')
+      else for (const ml of m.lines.slice(-lay.body)) body.push(sanitizeAnsi(ml) || ' ')
+      tail = r.project
+        ? `\x1b[2mSee it whole: tmux attach -t ${exactSessionTarget(r.d.name)}\x1b[0m`
+        : `\x1b[2mSee it whole: agent-tmux ${r.d.profile} attach ${r.d.name}\x1b[0m`
     }
+    lines.push(fit(rule))
+    for (const l of body) lines.push(fit(l))
+    for (let k = body.length; k < lay.body; k++) lines.push(' ')
+    lines.push(fit(tail))
   }
 
   if (lay.more) lines.push(fit(`\x1b[2m  +${lay.hidden} more — j/k moves the selection\x1b[0m`))
-  lines.push(...s.footer.slice(s.footer.length - lay.footer).map(fit))
+  const footer = s.footer.slice(s.footer.length - lay.footer).map(fit)
+  // Every frame is `height` rows with the footer on the last ones, also when there is
+  // no preview (no selection, or a window too short for one) (T1 C1/C5).
+  while (lines.length + footer.length < height) lines.push(' ')
+  lines.push(...footer)
   return lines.slice(0, height)
 }
 
@@ -1052,22 +1066,52 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     }
   }
 
-  const captureSelected = async () => {
-    if (!state.selected || capturing) return
+  // A capture asked for while one runs is not dropped: it runs when that one ends,
+  // for whatever row is selected then (T1 C2).
+  let captureAgain = false
+  // Set by a resize: the kept mirror was sized for the old layout.
+  let resized = false
+  /** True when a capture landed in `state.mirror`. */
+  const captureSelected = async (): Promise<boolean> => {
+    if (stopped) return false
+    if (capturing) {
+      captureAgain = true
+      return false
+    }
+    if (!state.selected || state.expanded) return false
     const row = state.rows.find(r => r.id === state.selected)
-    if (!row) return
+    if (!row) return false
     const rows = layout().body
-    if (rows < 1) return
+    if (rows < 1) return false
     const gen = generation
     capturing = true
+    let landed = false
     try {
-      const lines = row.project ? await mirrorProject(host, row.d.name, rows) : await mirrorOf(host, row.d, rows)
-      if (gen === generation && state.selected === row.id) {
-        state.mirror = { id: row.id, lines }
+      const cap = row.project ? await mirrorProject(host, row.d.name, rows) : await mirrorOf(host, row.d, rows)
+      if (gen === generation && state.selected === row.id && !stopped) {
+        state.mirror = { id: row.id, ...cap }
+        landed = true
       }
     } finally {
       capturing = false
     }
+    if (captureAgain) {
+      captureAgain = false
+      if (!stopped) return (await captureSelected()) || landed
+    }
+    return landed
+  }
+
+  // A selection or size change shows the pending preview at once and captures now,
+  // not at the next tick (MIRROR_MS) (T1 C2).
+  const captureNow = () => {
+    if (stopped || !state.selected || state.expanded || (state.mirror?.id === state.selected && !resized)) return
+    resized = false
+    captureSelected()
+      .then(landed => {
+        if (landed) render()
+      })
+      .catch(fail)
   }
 
   // Read-only, whole (R4.3). A read error is shown in the detail, not thrown.
@@ -1106,10 +1150,13 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   const onResize = () => {
     width = stdout.columns || 80
     height = stdout.rows || 24
+    // The same row's last capture stays, cut to the new body, until the one sized
+    // for the new layout lands; a capture already in flight is dropped (R4.1).
     generation += 1
-    state.mirror = undefined
+    resized = true
     try {
       render()
+      captureNow()
     } catch (err) {
       fail(err)
     }
@@ -1162,6 +1209,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
           if (state.quit) return stop()
         }
         render()
+        captureNow()
       } catch (err) {
         fail(err)
       }
@@ -1302,10 +1350,12 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (!stopped) {
       const tick = async () => {
         const fresh = await refreshRows()
+        let landed = false
         if (state.selected && !stopped) {
-          await (state.expanded ? loadDetail() : captureSelected())
+          if (state.expanded) await loadDetail()
+          else landed = await captureSelected()
         }
-        if (fresh) render()
+        if (fresh || landed) render()
       }
       timer = setInterval(() => {
         if (!stopped) tick().catch(fail)

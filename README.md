@@ -229,9 +229,16 @@ tmux-agent-tui                                      # viewer: every worker, labe
 - Needs Node >= 22.18 (`NODE=/path/to/node` picks one) and a terminal. With no
   TTY it exits 2; for a JSON snapshot use `tmux-agent-dashboard`.
   `TMUX_AGENT_DIR` and `TMUX_AGENT_TMUX_SOCKET` pass through.
-- In Claude Code, the mod's `[ ⧉ ]` opens it in a tmux split. Outside tmux, the
-  toast gives the full command to run in another terminal (over 200 characters,
-  the whole command is in the log).
+- In Claude Code, the mod's `[ ⧉ ]` opens it in a tmux split. The split is
+  full window height (`split-window -h -f`), also beside a pane that is the top
+  half of a window. Outside tmux, the toast gives the full command to run in
+  another terminal (over 200 characters, the whole command is in the log).
+- The TUI fills its pane. If the window itself is smaller than your terminal,
+  another tmux client on the same session is the cause: with tmux's default
+  `window-size latest`, the window takes the size of the client used last.
+  Detach the other client, or set `window-size largest` (or
+  `aggressive-resize on`) in your own `~/.tmux.conf`; the TUI does not change
+  your tmux config.
 
 Upgrade: `install-bin` links only the scripts that exist when it runs, so a new
 script (such as `tmux-agent-tui`) has no link until you run it again. After you
@@ -540,11 +547,70 @@ Flags (place before `<name>` and `<directory>`):
 | `--sentinel <abs-path>` | Absolute path; wrapper writes the CLI exit code (decimal + newline) atomically after the CLI returns. Pre-existing file aborts start to prevent stale-completion false positives. |
 | `--on-exit <shell-cmd>` | Hook command run after the sentinel is written. The hook reads `$ON_EXIT_CODE` (decimal exit code) and `$ON_EXIT_NAME` (agent name) from its environment. The wrapper does NOT append positional args, so composite shell strings such as `'curl -X POST "$URL?code=$ON_EXIT_CODE"'` work correctly. Stdout/stderr go to `<sentinel>.hook.log`. Ignored with a warning if `--sentinel` is omitted. |
 | `--on-start <shell-cmd>` | Hook command run after `tmux new-session` returns (issue #101a). The hook reads `$TMUX_AGENT_NAME` and `$TMUX_AGENT_SESSION` from its environment and runs detached so wrapper return is not blocked. Stdout/stderr captured to `<sentinel>.hook.log` (when `--sentinel` is set) or `$TMUX_AGENT_DIR/<name>/hook.log`. Non-zero hook exit is logged but never fails the agent. Best-effort timing: the pane is created but the CLI may not yet have rendered its first prompt when the hook fires. |
-| `--sentinel-keep` | Keep the sentinel file on `stop`. Default removes it during cleanup. |
+| `--sentinel-keep` | Accepted; no effect yet. `stop` never removes the sentinel file. |
 
 The sentinel format is intentionally minimal — a single decimal integer plus newline — so shell consumers can rely on `cat`/`[[ ]]` without parsing. Structured telemetry belongs to a separate JSON artifact (see roadmap L3 issues #100/#103); the sentinel will not grow into a JSON payload.
 
-Currently the sentinel is wired into local `start` and `resume` paths for both wrappers. `start-ssh` and the SSH variant are pending a design decision on where remote sentinels should live (remote host by default, with operator-pulled retrieval).
+The sentinel is wired into local `start` (interactive and `--headless`), `resume`, and `start-ssh`. A failed write (unwritable directory, failed `mv`) prints `[agent-tmux] sentinel write failed: <path>` in the pane, skips the hook, and keeps the CLI exit code.
+
+#### Remote sentinel (`start-ssh`)
+
+```bash
+agent-tmux claude start-ssh --sentinel /home/me/.cache/w1.exit --on-exit 'touch "$HOME/w1.done"' w1 build-host ~/src/app
+ssh build-host cat /home/me/.cache/w1.exit   # → the remote CLI exit code
+```
+
+- The path is on the **remote** host. The remote `sh` writes it; `--on-exit` runs there too, output to `<sentinel>.hook.log` on that host. `--on-start` is refused (exit 2): it would run on this host. `--on-exit-allow <regex>` works as on `start`: a hook that does not match exits 3 before the probe, and nothing is launched.
+- Before launch, a `BatchMode` ssh probe (15 s deadline, then a 2 s TERM grace) checks the path. An existing path exits 1; a timeout, auth failure, or unclear answer exits 4. Both cases start nothing and write no launch metadata. The interactive `-tt` launch keeps your normal ssh auth.
+- The probe is not a lock (`test -e`, then launch). Use a fresh, private, writable path per run.
+- Remote prerequisites: `sh`, `printf`, `mv`, and a `base64` that accepts `-d` (GNU coreutils, macOS). Verified login shells: sh, bash, zsh, dash; fish by grammar only; others unverified. A missing decoder exits 125 with `cannot decode the remote command`. This applies to every `start-ssh`, with or without `--sentinel`: without one there is no probe, so the pane closes with the ssh session and the message goes with it. tmux accepts at most 16364 bytes per command and base64 adds a third, so `--on-exit` plus the paths must stay under about 11 KiB; a larger command exits 2 before the probe and before any launch.
+- How to read it:
+
+| What you see | Meaning |
+|---|---|
+| Sentinel holds a code | The remote command returned that code: the CLI's own code, or the `cd` / command-not-found code (1, 2, 127) when the CLI never started. |
+| No sentinel, local pane gone | ssh ended; the remote outcome is unknown. |
+| No sentinel, pane alive | No completion evidence yet. |
+
+This gives a remote exit-code file only. It does not complete a mod episode or map to `result.json`.
+
+### Relay (tailnet)
+
+`tmux-agent-relay` is one small HTTP relay per host, reachable only over your tailnet. It carries three things: workers on other hosts telling a worker here something (`send`), the worker list of every host of yours (`roster`), and the exit push of a `start-ssh --notify` worker.
+
+```bash
+tmux-agent-relay ensure                       # start the relay in tmux session tmux-agent-relay (if none is live); prints its URL
+tmux-agent-relay send mini lead 'tests pass'  # tell worker "lead" on host mini (MagicDNS name, tailnet IP, or URL)
+tmux-agent-relay roster                       # workers on this host and on every online device of yours
+```
+
+- **Bind:** this host's tailnet IPv4 (`tailscale ip -4`), port 7717. A wildcard (`0.0.0.0`, `::`) or a host name is refused. Who can reach the port is your tailnet ACL.
+- **Who may call:** checked on the socket peer, never a header: `tailscale whois` must name an untagged device of the same Tailscale user as this host; anything else, and a whois failure, is 403. This is user-level authorization: any process of any local account on any of your untagged devices (this host included, through its own 100.x address) can tell any worker here, the same power as `ssh host agent-tmux … send`. A tagged device (CI, shared servers) cannot.
+- **What it does with a message:** strips control characters, then runs `agent-tmux <cli> send <worker> "[relay <device>/<from>] <text>"` (argv, no shell). The worker must be running (409 otherwise, and the id may be reused). Each message id is delivered at most once per day, also across a relay restart: once `send` has started, a failure answers 502 and spends the id (the text may already be in the pane), so retry with a new id after checking the pane. Text ≤ 8 KiB, body ≤ 16 KiB.
+- **Exit codes of `send`:** 0 delivered (or a repeated id), 3 refused (4xx/5xx, the reason on stderr), 4 unreachable.
+- **Record:** every decision is one line in `$TMUX_AGENT_DIR/relay/relay.log.jsonl` (route, peer, device, status; never the text). The live URL is `$TMUX_AGENT_DIR/relay/endpoint.json`, removed when the relay stops.
+- **Needs:** Node ≥ 22.18 and `tailscale` on each host that runs a relay; plain `curl` is enough to send.
+- **Roster:** each host's worker status calls run 16 at a time (3 s each); `roster` waits 5 s per host, so a host with more than 16 workers can read as `timeout`.
+- **`from` is the caller's claim:** the relay proves the device (whois), not the worker name in `from`. A message id is unique per sending device and target launch; the same id with another body is 409, and an id whose delivery was cut by a relay stop is 409 "outcome unknown" (never sent twice).
+- **Revocation delay:** a whois answer is reused for 60 s per IP; a device removed from the tailnet loses access within that time.
+
+#### `start-ssh --notify`: the remote exit, pushed
+
+```bash
+tmux-agent-relay ensure
+agent-tmux codex start-ssh --sentinel /home/me/.cache/w1.exit --notify w1 mini ~/src/app
+agent-tmux codex status --json w1   # after the remote CLI exits: exit_detected true, exit_code N, exit_source "relay"
+```
+
+After the remote sentinel is written and before the `--on-exit` hook, the remote `sh` runs one `curl` (connect 5 s, total 10 s) to `POST /v1/exit` on this host's relay. The relay accepts it only from the tailnet device that `ssh -G <target>` resolves to (recorded at launch as `notify_node`) and only for the current `launch_id`; the first push wins, a late push of an older launch is 409. It writes `<name>/remote-exit.json` (the record) and `<name>/remote.exit` (the code). A failed push prints `[agent-tmux] relay notify failed (curl rc N)` in the pane; the CLI code, the sentinel and the hook are unchanged.
+
+Refused before anything is launched: no `--sentinel` or no live relay (exit 2), a ProxyJump/ProxyCommand route (exit 2: the push would come from another device), no `curl` on the remote host (exit 2), a name outside `[A-Za-z0-9._-]{1,64}` (exit 2), a target that is not one untagged device of your Tailscale user (exit 4). The push uses `--noproxy '*'` (a remote proxy setting would make the relay see the proxy as the peer). Its launch binding (`TMUX_AGENT_TOOLS_NOTIFY_URL` / `_LAUNCH_ID`) is set only after the CLI exits, so the CLI and its children never inherit it. The remote CLI gets `TMUX_AGENT_RELAY_URL` and `TMUX_AGENT_RELAY_FROM=<name>` to message back:
+
+```bash
+curl -sS -H 'Content-Type: application/json' \
+  --data "{\"to\":\"lead\",\"from\":\"$TMUX_AGENT_RELAY_FROM\",\"id\":\"$(date +%s)-$$\",\"text\":\"tests pass\"}" \
+  "$TMUX_AGENT_RELAY_URL/v1/message"
+```
 
 Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, and mouse drag release use the first available system clipboard command (`pbcopy`, `wl-copy`, `xclip`, or `xsel`); when none exists, they fall back to tmux's internal selection so keyboard copy does not fail just because a platform clipboard helper is missing. Set `CLAUDE_TMUX_CLIPBOARD=internal` or `CODEX_TMUX_CLIPBOARD=internal` to force tmux internal selection, or set either variable to a custom copy command when a terminal needs a specific clipboard bridge.
 

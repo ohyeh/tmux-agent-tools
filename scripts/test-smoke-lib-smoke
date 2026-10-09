@@ -1,0 +1,69 @@
+#!/usr/bin/env zsh
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+# Smoke for scripts/lib/smoke-tmux.sh itself: a child smoke that aborts through
+# errexit on a failing function call still runs its EXIT trap and smoke_cleanup
+# (zsh 5.9.2 skips both on that path; the lib's ZERR handler exits for real), and
+# keeps its exit code. errexit-exempt failures (`||`, `if`, a subshell) do not
+# end or clean up the child early.
+set -euo pipefail
+
+W="$TMPDIR/smoke-lib"
+mkdir -p "$W"
+LIB="${0:A:h}/lib/smoke-tmux.sh"
+PASS=0
+FAIL=0
+ok() { print -r -- "  ok   $1"; PASS=$((PASS + 1)); }
+bad() { print -r -- "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
+assert() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got='$2' expected='$3')"; fi; }
+
+# child <name> <body>: a direct-run smoke (owns its TMUX_TMPDIR) that starts a
+# tmux server, records the socket dir, then runs <body>.
+child() {
+  local name="$1" body="$2"
+  cat > "$W/$name.zsh" <<EOF
+#!/usr/bin/env zsh
+source ${(q)LIB}
+set -euo pipefail
+print -r -- "\$TMUX_TMPDIR" > ${(q)W}/$name.dir
+tmux -S "\$TMUX_TMPDIR/tmux-\$(id -u)/default" new-session -d -s held 'sleep 300'
+trap 'print -r -- exit-trap >> ${(q)W}/$name.log' EXIT
+$body
+print -r -- end >> ${(q)W}/$name.log
+EOF
+  local rc=0
+  env -u TAS_JOB_DIR -u TMUX_TMPDIR -u TMPDIR zsh "$W/$name.zsh" >/dev/null 2>&1 || rc=$?
+  print -r -- "$rc"
+}
+gone() { [[ -e "$(cat "$W/$1.dir")" ]] && echo present || echo gone; }
+
+echo "case: errexit inside a function"
+rc="$(child fn 'f() { false; }; f')"
+assert "exit code kept" "$rc" "1"
+assert "own EXIT trap ran" "$(cat "$W/fn.log" 2>/dev/null)" "exit-trap"
+assert "smoke_cleanup ran (socket dir removed)" "$(gone fn)" "gone"
+
+echo "case: a function's own nonzero return, and a nested call"
+rc="$(child nested 'a() { b; }; b() { return 7; }; a')"
+assert "nested exit code kept" "$rc" "7"
+assert "nested cleanup ran" "$(gone nested)" "gone"
+
+echo "case: a pipefail-failed pipeline inside a function"
+rc="$(child pipe 'f() { false | true; }; f')"
+assert "pipefail exit code kept" "$rc" "1"
+assert "pipefail EXIT trap ran, end not reached" "$(cat "$W/pipe.log" 2>/dev/null)" "exit-trap"
+assert "pipefail cleanup ran" "$(gone pipe)" "gone"
+
+echo "case: errexit-exempt failures do not end the child early"
+rc="$(child exempt 'f() { false; }; f || true; if f; then :; fi; ( false ) || true; x=$(false) || true; tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" has-session -t held')"
+assert "exempt exit code" "$rc" "0"
+assert "exempt reached the end, then exited" "$(tr '\n' ' ' < "$W/exempt.log")" "end exit-trap "
+assert "exempt cleanup at the end" "$(gone exempt)" "gone"
+
+echo "case: a subshell's errexit stays in the subshell"
+rc="$(child sub '( set -e; g() { false; }; g ) || true; tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" has-session -t held')"
+assert "subshell: parent continued with its server" "$rc" "0"
+assert "subshell: parent reached the end" "$(tr '\n' ' ' < "$W/sub.log")" "end exit-trap "
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

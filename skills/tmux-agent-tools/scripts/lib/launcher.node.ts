@@ -535,8 +535,9 @@ export async function handoverChannel(
 async function splitTui(hostPane: string, cwd: string, command: string[], session: string, root: string, socket?: string): Promise<string> {
   // The pane's environment is the tmux session's, not this process's. The collector
   // was started with this root; the TUI has to see the same ledger.
+  // `-f`: full window height even when the host pane is the top half of a vertical split (T1 C4).
   const args = [
-    'split-window', '-t', hostPane, '-h', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
+    'split-window', '-t', hostPane, '-h', '-f', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
     '-e', `TMUX_AGENT_SESSION=${session}`,
     '-e', `TMUX_AGENT_DIR=${root}`,
   ]

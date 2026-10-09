@@ -1,0 +1,27 @@
+#!/usr/bin/env zsh
+# tmux-agent-relay: the tailnet relay (lib/relay.node.ts). One per host: exit pushes
+# from start-ssh --notify workers, messages to local workers, and the worker roster.
+# README "Relay (tailnet)" has the trust model.
+
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+NODE="${NODE:-$(command -v node 2>/dev/null || true)}"
+# The same floor as tmux-agent-tui: .node.ts needs type stripping.
+FLOOR_MAJOR=22
+FLOOR_MINOR=18
+
+[[ -n "$NODE" && -x "$NODE" ]] || {
+  echo "tmux-agent-relay: node not found; install Node >= $FLOOR_MAJOR.$FLOOR_MINOR or set NODE=/path/to/node" >&2
+  exit 1
+}
+version="$("$NODE" --version 2>/dev/null || true)"
+version="${version#v}"
+major="${version%%.*}"
+minor="${${version#*.}%%.*}"
+if [[ "$major" != <-> || "$minor" != <-> ]] || (( major < FLOOR_MAJOR || (major == FLOOR_MAJOR && minor < FLOOR_MINOR) )); then
+  echo "tmux-agent-relay: node ${version:-<no version>} ($NODE) is below the floor $FLOOR_MAJOR.$FLOOR_MINOR; install a newer Node or set NODE=/path/to/node" >&2
+  exit 1
+fi
+
+exec "$NODE" --no-warnings "$SCRIPT_DIR/lib/relay.node.ts" "$@"

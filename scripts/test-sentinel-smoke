@@ -1,161 +1,389 @@
 #!/usr/bin/env zsh
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test for issue #95 event-driven completion signaling.
+# Smoke test for the exit-code sentinel + --on-exit hook (#95), local and remote.
 #
-# Exercises the actual agent-tmux claude / codex engines with fake CLIs so the
-# sentinel + on-exit hook contract can be validated without real Claude or
-# Codex installs and without credentials.
+# Fake CLIs and a fake `ssh` (a shim first in PATH that runs the "remote" side
+# locally under a separate PATH) stand in for real CLIs and hosts: no
+# credentials, no network. A real ssh never runs; the shim log is the evidence.
 #
-# Exits non-zero on the first failure. Run from any cwd; the script resolves
-# the in-tree wrapper paths automatically.
+# Groups:
+#   RT     the start-ssh frame (remote_sh_command) round-trips hostile bytes under
+#          each login shell present (sh bash zsh dash fish; a missing one prints
+#          SKIP), inner sh is /bin/sh and dash.
+#   L      local callers of the shared sentinel snippet: interactive start,
+#          oneshot start --headless, resume; publication failure (unwritable dir,
+#          mv failure) skips the hook and keeps the CLI code.
+#   R-neg  start-ssh must NOT launch: sentinel exists, probe deadline (plain and
+#          TERM-ignoring), auth failure, marker + rc 255, marker then hang,
+#          conflicting markers, decoder failure (plain and partial output), a
+#          command over the tmux size limit, --on-start, relative --sentinel.
+#   R-pos  start-ssh launches: absent, absent while the same path exists locally,
+#          special-character path, CLI non-zero, publication failure.
+# Every wait has a deadline and fails loudly.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h}"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+DEADLINE=$(( SECONDS + ${SENTINEL_SMOKE_TIMEOUT:-240} ))
+
+# Isolation before the first tmux server: private state, audit log, zsh dotfiles,
+# and the shims first in PATH (pattern: test-tui-e2e-smoke).
+WORK="$(mktemp -d "$TMPDIR/sentinel-smoke.XXXXXX")"
+W="${WORK:A}"  # resolved: /tmp is a symlink on macOS and $PWD reports the real path
+mkdir -p "$W/bin" "$W/rbin" "$W/zdot" "$W/state" "$W/cwd" "$W/rcwd" "$W/rhome" "$W/ro"
+export TMUX_AGENT_DIR="$W/state"
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$W/audit.jsonl"
+export ZDOTDIR="$W/zdot"
+unset TMUX TMUX_PANE TMUX_AGENT_SESSION TMUX_AGENT_TMUX_SOCKET
+_extra=""
+for _t in tmux jq; do
+  _p="$(command -v "$_t")" || { echo "missing $_t" >&2; exit 1; }
+  _extra="$_extra:${_p:h}"
+done
+export PATH="$W/bin${_extra}:/usr/bin:/bin:/usr/sbin:/sbin"
+chmod 555 "$W/ro"
+: > "$W/ssh.log"
+cleanup() { chmod 755 "$W/ro" 2>/dev/null; rm -rf "$W"; }
+trap cleanup EXIT
+
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
-for wrapper in "$CODEX_TMUX"; do
-  if [[ ! -x "$wrapper" ]]; then
-    echo "wrapper not executable: $wrapper" >&2
-    exit 1
-  fi
-done
-
-WORK="$(mktemp -d -t tmux-agent-sentinel-smoke.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
-
-cat > "$WORK/fake-exit-7.sh" <<'EOF'
+# --- fakes ------------------------------------------------------------------
+cat > "$W/fake-exit-7.sh" <<'EOF'
 #!/bin/sh
 sleep 1
 exit 7
 EOF
-cat > "$WORK/hook.sh" <<'EOF'
-#!/bin/sh
-printf 'hook: code=%s name=%s\n' "${ON_EXIT_CODE:-MISSING}" "${ON_EXIT_NAME:-MISSING}"
-EOF
-chmod +x "$WORK"/fake-exit-*.sh "$WORK/hook.sh"
+chmod +x "$W/fake-exit-7.sh"
 
+# mv shim (local pane and fake remote): fails (73) only for a destination that
+# ends in .mvfail.exit; everything else is the real mv.
+for d in bin rbin; do
+  cat > "$W/$d/mv" <<'EOF'
+#!/bin/sh
+for a in "$@"; do last="$a"; done
+case "$last" in *.mvfail.exit) exit 73 ;; esac
+exec /bin/mv "$@"
+EOF
+  chmod +x "$W/$d/mv"
+done
+
+# Fake remote CLI: records each run, exits 3 on a target named code3.*, else 0.
+cat > "$W/rbin/codex" <<EOF
+#!/bin/sh
+printf 'ran cwd=%s\n' "\$PWD" >> ${(q)W}/cli.\$AGENT_SHIM_TARGET
+sleep 1
+case "\$AGENT_SHIM_TARGET" in code3.*) exit 3 ;; esac
+exit 0
+EOF
+# Fake remote base64: a broken decoder on targets b64fail.* / b64partial.*.
+cat > "$W/rbin/base64" <<EOF
+#!/bin/sh
+case "\$AGENT_SHIM_TARGET" in
+  b64fail.*) exit 1 ;;
+  b64partial.*) printf 'touch %s; ' ${(q)W}/evaluated; exit 1 ;;
+esac
+exec /usr/bin/base64 "\$@"
+EOF
+chmod +x "$W/rbin/codex" "$W/rbin/base64"
+
+# Fake ssh. The target picks the probe behavior (prefix before the first dot).
+# The launch (-tt) always runs. "Remote" = $W/rhome cwd + PATH $W/rbin:/usr/bin:/bin,
+# login shell /bin/sh (the frame is tested under other login shells in RT).
+cat > "$W/bin/ssh" <<EOF
+#!/bin/sh
+W=${(q)W}
+mode=probe; target=""; skip=0
+for a in "\$@"; do
+  if [ \$skip = 1 ]; then skip=0; continue; fi
+  case "\$a" in
+    -tt) mode=launch ;;
+    -o) skip=1 ;;
+    *) if [ -z "\$target" ]; then target="\$a"; fi ;;
+  esac
+  cmd="\$a"
+done
+{ printf '%s' "\$mode"; for a in "\$@"; do printf ' <%s>' "\$a"; done; printf '\n'; } >> "\$W/ssh.log"
+echo \$\$ > "\$W/pid.\$mode.\$target"
+behave=run
+[ \$mode = probe ] && behave="\${target%%.*}"
+remote() {
+  cd "\$W/rhome" && AGENT_SHIM_TARGET="\$target" PATH="\$W/rbin:/usr/bin:/bin" /bin/sh -c "\$cmd"
+}
+case "\$behave" in
+  hang) exec sleep 600 ;;
+  noterm) trap '' TERM; while :; do sleep 1; done ;;
+  auth) echo 'Permission denied (publickey).' >&2; exit 255 ;;
+  marker255) echo AGENT_TMUX_PROBE=absent; exit 255 ;;
+  markerhang) echo AGENT_TMUX_PROBE=absent; exec sleep 600 ;;
+  conflict) echo AGENT_TMUX_PROBE=absent; echo AGENT_TMUX_PROBE=exists; exit 0 ;;
+  hide)
+    # The local file is not on the "remote": move it aside for the probe only.
+    hp="\$(cat "\$W/hide-path")"; /bin/mv "\$hp" "\$hp.aside"
+    rc=0; remote || rc=\$?
+    /bin/mv "\$hp.aside" "\$hp"; exit \$rc ;;
+esac
+remote
+EOF
+chmod +x "$W/bin/ssh"
+
+# The hook proves: it ran once, after the sentinel was readable, with the right
+# code, name and cwd. It sleeps first so a stop before it ends would show.
+# It also appends its name to $W/hook-runs, a writable file: a publication-failure
+# case whose sentinel dir is read-only can still prove the hook did not run.
+HOOK="printf '%s\\n' \"\$ON_EXIT_NAME\" >> '$W/hook-runs'; "'sleep 1; printf "hook code=%s name=%s cwd=%s seen=%s\n" "$ON_EXIT_CODE" "$ON_EXIT_NAME" "$PWD" "$(cat "$TMUX_AGENT_TOOLS_SENTINEL")"; echo HOOK_DONE'
+
+# --- assertions -------------------------------------------------------------
 PASS=0
 FAIL=0
-
-assert() {
-  local label="$1" actual="$2" expected="$3"
-  if [[ "$actual" == "$expected" ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
+ok() { print -r -- "  ok   $1"; PASS=$((PASS + 1)); }
+bad() { print -r -- "  FAIL $1" >&2; FAIL=$((FAIL + 1)); }
+assert() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got='$2' expected='$3')"; fi; }
+left() { (( SECONDS < DEADLINE )) || { bad "smoke deadline passed"; echo "summary: $PASS passed, $FAIL failed"; exit 1; }; }
+# wait_grep <file> <fixed text> [tenths]: poll a file for a line, with a bound.
+wait_grep() {
+  local f="$1" text="$2" n="${3:-150}" i
+  for (( i = 0; i < n; i++ )); do
+    [[ -f "$f" ]] && grep -qF -- "$text" "$f" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+# wait_pane <name> <fixed text>: poll the agent's pane.
+wait_pane() {
+  local name="$1" text="$2" i
+  for (( i = 0; i < 150; i++ )); do
+    "$CODEX_TMUX" capture "$name" 200 2>/dev/null | grep -qF -- "$text" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+bytes() { [[ -f "$1" ]] && od -An -c "$1" | tr -s ' ' | sed 's/^ //;s/ $//' || echo MISSING; }
+# check_success <label> <sentinel> <code> <name> <cwd>: hook-complete wait first.
+check_success() {
+  local label="$1" s="$2" code="$3" name="$4" cwd="$5"
+  if wait_grep "$s.hook.log" HOOK_DONE; then ok "$label hook completed"; else bad "$label hook did not complete"; fi
+  assert "$label sentinel bytes" "$(bytes "$s")" "$code \\n"
+  assert "$label no .tmp" "$([[ -e "$s.tmp" ]] && echo present || echo none)" "none"
+  assert "$label hook ran once" "$(grep -c HOOK_DONE "$s.hook.log" 2>/dev/null || true)" "1"
+  assert "$label hook-runs once" "$(grep -cxF -- "$name" "$W/hook-runs" 2>/dev/null || true)" "1"
+  assert "$label hook line" "$(head -n1 "$s.hook.log" 2>/dev/null)" "hook code=$code name=$name cwd=$cwd seen=$code"
+}
+# check_pubfail <label> <name> <sentinel> <code>: a failed write shows, no hook, code kept.
+check_pubfail() {
+  local label="$1" name="$2" s="$3" code="$4"
+  if wait_pane "$name" "exited with code $code"; then ok "$label CLI code $code kept"; else bad "$label pane never showed code $code"; fi
+  if "$CODEX_TMUX" capture "$name" 200 2>/dev/null | grep -qF "[agent-tmux] sentinel write failed: $s"; then
+    ok "$label diagnostic shown"
   else
-    echo "  FAIL $label (got='$actual' expected='$expected')" >&2
-    FAIL=$((FAIL + 1))
+    bad "$label no 'sentinel write failed' line"
   fi
+  assert "$label no sentinel" "$([[ -e "$s" ]] && echo present || echo none)" "none"
+  assert "$label no .tmp" "$([[ -e "$s.tmp" ]] && echo present || echo none)" "none"
+  sleep 1.5  # the hook sleeps 1 s first: give a wrongly-run hook the time to record itself
+  assert "$label no hook" "$(grep -cxF -- "$name" "$W/hook-runs" 2>/dev/null || true)" "0"
 }
+no_meta() { [[ ! -e "$TMUX_AGENT_DIR/$1/launch-meta.json" ]] && echo none || echo present; }
+launches() { grep -c "^launch .*<$1>" "$W/ssh.log" 2>/dev/null || true; }
+probes() { grep -c "^probe .*<$1>" "$W/ssh.log" 2>/dev/null || true; }
+stop() { "$CODEX_TMUX" stop "$1" >/dev/null 2>&1 || true; }
 
-run_happy_path() {
-  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4" expected="$5"
-  echo "case: $prefix ($wrapper, expected exit=$expected)"
-  local sentinel="$WORK/$prefix.exit"
-  rm -f "$sentinel" "$sentinel.hook.log" "$sentinel.tmp"
-  env "$cli_env=$fake" "$wrapper" start --exact \
-    --sentinel "$sentinel" --on-exit "$WORK/hook.sh" \
-    "$prefix" "$WORK" >/dev/null
-  local i got=""
-  for i in 1 2 3 4 5 6 7 8; do
-    [[ -f "$sentinel" ]] && { got="$(cat "$sentinel")"; break; }
-    sleep 1
-  done
-  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
-  assert "$prefix sentinel content" "$got" "$expected"
-  local hook_present="missing"
-  [[ -f "$sentinel.hook.log" ]] && hook_present="present"
-  assert "$prefix hook log present" "$hook_present" "present"
-  if [[ -f "$sentinel.hook.log" ]]; then
-    local hook_line
-    hook_line="$(head -n1 "$sentinel.hook.log")"
-    assert "$prefix hook log exit code" "$hook_line" "hook: code=$expected name=$prefix"
-  fi
-}
-
-run_stale_reject() {
-  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4"
-  echo "case: $prefix-stale ($wrapper, pre-existing sentinel should be rejected)"
-  local sentinel="$WORK/$prefix-stale.exit"
-  echo "stale" > "$sentinel"
-  local rc=0
-  env "$cli_env=$fake" "$wrapper" start --exact \
-    --sentinel "$sentinel" "$prefix-stale" "$WORK" >/dev/null 2>&1 || rc=$?
-  rm -f "$sentinel"
-  assert "$prefix-stale rejected" "$rc" "1"
-}
-
-run_relative_reject() {
-  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4"
-  echo "case: $prefix-relative ($wrapper, relative path should be rejected)"
-  local rc=0
-  env "$cli_env=$fake" "$wrapper" start --exact \
-    --sentinel "relative.exit" "$prefix-rel" "$WORK" >/dev/null 2>&1 || rc=$?
-  assert "$prefix-rel rejected" "$rc" "2"
-}
-
-run_missing_value_reject() {
-  # Regression test for #133 review: --sentinel as the last argv used to
-  # crash the wrapper with "shift count must be <= $#" under zsh + set -e.
-  # Must now exit 2 with a clear "requires a value" diagnostic.
-  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4"
-  echo "case: $prefix-missing-value ($wrapper, --sentinel without value should be rejected)"
-  local rc=0
-  env "$cli_env=$fake" "$wrapper" start --exact --sentinel 2>/dev/null || rc=$?
-  assert "$prefix-missing-value rejected" "$rc" "2"
-}
-
-run_composite_hook() {
-  # Regression test for the partner-reported bug in PR #130 review:
-  # composite shell commands as --on-exit must work without the wrapper
-  # injecting trailing positional args. Env injection (ON_EXIT_CODE /
-  # ON_EXIT_NAME) lets the hook author compose pipelines / && / etc.
-  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4" expected="$5"
-  echo "case: $prefix ($wrapper, composite --on-exit command)"
-  local sentinel="$WORK/$prefix.exit"
-  local hook_out="$WORK/$prefix.hook.captured"
-  rm -f "$sentinel" "$sentinel.hook.log" "$sentinel.tmp" "$hook_out"
-  # Composite: an && chain that uses env vars and writes elsewhere.
-  local composite="printf 'composite: code=%s name=%s' \"\$ON_EXIT_CODE\" \"\$ON_EXIT_NAME\" > $hook_out && printf '\n' >> $hook_out"
-  env "$cli_env=$fake" "$wrapper" start --exact \
-    --sentinel "$sentinel" --on-exit "$composite" \
-    "$prefix" "$WORK" >/dev/null
-  local i got=""
-  for i in 1 2 3 4 5 6 7 8; do
-    [[ -f "$sentinel" ]] && { got="$(cat "$sentinel")"; break; }
-    sleep 1
-  done
-  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
-  local captured=""
-  [[ -f "$hook_out" ]] && captured="$(head -n1 "$hook_out")"
-  assert "$prefix composite sentinel" "$got" "$expected"
-  assert "$prefix composite hook captured" "$captured" "composite: code=$expected name=$prefix"
-}
-
-run_on_exit_allow() {
-  local wrapper="$1" cli_env="$2" prefix="$3" fake="$4" rc
-  echo "case: $prefix-allow ($wrapper, --on-exit-allow gates the hook command)"
+# --- RT: the frame round-trips hostile bytes --------------------------------
+echo "group RT: start-ssh frame round trip"
+(
+  # A subshell exit must not run the parent's cleanup (it would delete $W and the sockets).
+  trap - EXIT; add-zsh-hook -d zshexit smoke_cleanup
+  eval "$(awk '/^sh_quote\(\)/,/^}/' "$AGENT_TMUX")"
+  eval "$(awk '/^remote_sh_command\(\)/,/^}/' "$AGENT_TMUX")"
+  v=$'it\'s a \\ \\\\ $HOME ; `x` "q"\ttab\nline2 *?[]{}&>|'
+  want="$(printf '%s' "$v" | od -An -c)"
+  frame="$(remote_sh_command "printf %s $(sh_quote "$v")")"
+  [[ "$frame" != *\\* && "$frame" != *"'"*"'"*"'"* ]] && echo "  ok   frame has no backslash and only the two outer quotes" \
+    || { echo "  FAIL frame alphabet" >&2; exit 1; }
   rc=0
-  env "$cli_env=$fake" "$wrapper" start --exact --sentinel "$WORK/$prefix-deny.exit" \
-    --on-exit "echo denied" --on-exit-allow '^/' "$prefix-deny" "$WORK" >/dev/null 2>&1 || rc=$?
-  assert "$prefix-allow non-match rejected" "$rc" "3"
-  rc=0
-  env "$cli_env=$fake" "$wrapper" start --exact --sentinel "$WORK/$prefix-allow.exit" \
-    --on-exit "$WORK/hook.sh" --on-exit-allow "^$WORK/hook" "$prefix-allow" "$WORK" >/dev/null 2>&1 || rc=$?
-  assert "$prefix-allow match accepted" "$rc" "0"
-  "$wrapper" stop "$prefix-allow" >/dev/null 2>&1 || true
-}
+  for login in sh bash zsh dash fish; do
+    lp="$(command -v "$login" 2>/dev/null)" || { echo "  SKIP $login (not installed)"; continue; }
+    for inner in /bin/sh dash; do
+      ip="$(command -v "$inner" 2>/dev/null)" || { echo "  SKIP inner $inner"; continue; }
+      mkdir -p "$W/rt" && ln -sf "$ip" "$W/rt/sh"
+      lflags=(); [[ $login == fish ]] && lflags=(--no-config)  # config.fish could put another sh first
+      got="$(cd "$W" && PATH="$W/rt:/usr/bin:/bin" "$lp" "${lflags[@]}" -c "$frame" | od -An -c)" || { echo "  FAIL $login/$inner rc" >&2; rc=1; continue; }
+      if [[ "$got" == "$want" ]]; then echo "  ok   $login -> ${inner:t}: bytes match"; else echo "  FAIL $login -> ${inner:t}: bytes differ" >&2; rc=1; fi
+    done
+  done
+  exit $rc
+) && ok "RT round trip" || bad "RT round trip"
 
-run_happy_path "$CODEX_TMUX"  "CODEX"  "codex-smoke"  "$WORK/fake-exit-7.sh" "7"
-run_stale_reject    "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
-run_relative_reject "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
-run_missing_value_reject "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
-run_composite_hook  "$CODEX_TMUX"  "CODEX"  "codex-composite"  "$WORK/fake-exit-7.sh" "7"
-run_on_exit_allow "$CODEX_TMUX"  "CODEX"  "codex"  "$WORK/fake-exit-7.sh"
+# --- L: local callers --------------------------------------------------------
+echo "group L: local callers"
+left
+s="$W/l-int.exit"
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$s" --on-exit "$HOOK" l-int "$W/cwd" >/dev/null
+check_success "L interactive" "$s" 7 l-int "$W/cwd"
+stop l-int
+
+left
+s="$W/l-headless.exit"
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --headless --sentinel "$s" --on-exit "$HOOK" l-headless "$W/cwd" 'bounded task' >/dev/null
+check_success "L headless" "$s" 7 l-headless "$W/cwd"
+stop l-headless
+
+left
+s="$W/l-resume.exit"
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" resume --exact --sentinel "$s" --on-exit "$HOOK" l-resume "$W/cwd" 0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee >/dev/null
+check_success "L resume" "$s" 7 l-resume "$W/cwd"
+stop l-resume
+
+left
+s="$W/l-comp.exit"
+composite="printf 'composite: code=%s name=%s' \"\$ON_EXIT_CODE\" \"\$ON_EXIT_NAME\" > $W/l-comp.captured && printf '\n' >> $W/l-comp.captured"
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$s" --on-exit "$composite" l-comp "$W/cwd" >/dev/null
+wait_grep "$W/l-comp.captured" "composite:" && ok "L composite hook ran" || bad "L composite hook did not run"
+assert "L composite captured" "$(head -n1 "$W/l-comp.captured" 2>/dev/null)" "composite: code=7 name=l-comp"
+stop l-comp
+
+left
+# In a read-only dir the hook cannot run at all (its >> <sentinel>.hook.log fails), so
+# this case proves the diagnostic and the code; the mv-failure case proves "no hook".
+s="$W/ro/l-ro.exit"
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$s" --on-exit "$HOOK" l-ro "$W/cwd" >/dev/null
+check_pubfail "L unwritable dir" l-ro "$s" 7
+stop l-ro
+
+left
+s="$W/l.mvfail.exit"
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$s" --on-exit "$HOOK" l-mvf "$W/cwd" >/dev/null
+check_pubfail "L mv failure" l-mvf "$s" 7
+stop l-mvf
+
+left
+s="$W/l-stale.exit"; echo stale > "$s"; rc=0
+env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$s" l-stale "$W/cwd" >/dev/null 2>&1 || rc=$?
+assert "L stale rejected" "$rc" "1"
+rc=0; env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel relative.exit l-rel "$W/cwd" >/dev/null 2>&1 || rc=$?
+assert "L relative rejected" "$rc" "2"
+rc=0; env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel 2>/dev/null || rc=$?
+assert "L missing value rejected" "$rc" "2"
+rc=0; env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$W/l-deny.exit" \
+  --on-exit "echo denied" --on-exit-allow '^/' l-deny "$W/cwd" >/dev/null 2>&1 || rc=$?
+assert "L --on-exit-allow non-match rejected" "$rc" "3"
+rc=0; env CODEX="$W/fake-exit-7.sh" "$CODEX_TMUX" start --exact --sentinel "$W/l-allow.exit" \
+  --on-exit "/bin/echo ok" --on-exit-allow '^/bin/echo' l-allow "$W/cwd" >/dev/null 2>&1 || rc=$?
+assert "L --on-exit-allow match accepted" "$rc" "0"
+stop l-allow
+
+# --- R-neg: start-ssh refuses, launches nothing ------------------------------
+echo "group R-neg: start-ssh must not launch"
+# rneg <label> <name> <target> <sentinel> <want-rc> <want-stderr-text> [extra args...]
+rneg() {
+  local label="$1" name="$2" target="$3" s="$4" want_rc="$5" want_text="$6" rc=0 err
+  shift 6
+  err="$("$CODEX_TMUX" start-ssh --exact --sentinel "$s" "$@" "$name" "$target" "$W/rcwd" 2>&1 >/dev/null)" || rc=$?
+  assert "$label exit" "$rc" "$want_rc"
+  if [[ "$err" == *"$want_text"* ]]; then ok "$label message"; else bad "$label message (got: $err)"; fi
+  assert "$label no launch-meta" "$(no_meta "$name")" "none"
+  assert "$label no -tt launch" "$(launches "$target")" "0"
+  local pf pid
+  for pf in "$W"/pid.probe."$target"(N); do
+    pid="$(<"$pf")"
+    if kill -0 "$pid" 2>/dev/null; then bad "$label shim pid $pid still running"; else ok "$label no leftover shim"; fi
+  done
+}
+left
+s="$W/rneg-exists.exit"; echo old > "$s"
+rneg "R-neg exists" rn-exists exists.host "$s" 1 "Sentinel path already exists on exists.host"
+rneg "R-neg auth" rn-auth auth.host "$W/rn-auth.exit" 4 "Permission denied (publickey)."
+rneg "R-neg marker+255" rn-m255 marker255.host "$W/rn-m255.exit" 4 "ssh exit 255"
+rneg "R-neg conflicting markers" rn-conf conflict.host "$W/rn-conf.exit" 4 "could not check the sentinel"
+rneg "R-neg decoder failure" rn-b64 b64fail.host "$W/rn-b64.exit" 4 "cannot decode the remote command"
+rneg "R-neg decoder partial output" rn-b64p b64partial.host "$W/rn-b64p.exit" 4 "cannot decode the remote command"
+assert "R-neg partial decode never evaluated" "$([[ -e "$W/evaluated" ]] && echo yes || echo no)" "no"
+rneg "R-neg relative sentinel" rn-rel rel.host relative.exit 2 "absolute path on the remote host"
+rneg "R-neg --on-start" rn-ons ons.host "$W/rn-ons.exit" 2 "--on-start is not supported" --on-start 'date'
+rneg "R-neg --on-exit-allow mismatch" rn-allow allow.host "$W/rn-allow.exit" 3 "does not match --on-exit-allow regex" --on-exit 'echo not-on-the-list' --on-exit-allow '^notify-send '
+assert "R-neg --on-exit-allow: no probe" "$(probes allow.host)" "0"
+big="$(head -c 12000 /dev/zero | tr '\0' x)"
+rneg "R-neg over tmux size" rn-big big.host "$W/rn-big.exit" 2 "tmux accepts at most 16364" --on-exit "echo $big"
+assert "R-neg over size: no probe" "$(probes big.host)" "0"
+# The three deadline cases take 15 s each: run them side by side.
+echo "  (deadline cases run in parallel, ~15 s)"
+t0=$SECONDS
+for t in hang noterm markerhang; do
+  ( rc=0; "$CODEX_TMUX" start-ssh --exact --sentinel "$W/rn-$t.exit" "rn-$t" "$t.host" "$W/rcwd" >/dev/null 2>"$W/err.$t" || rc=$?; echo $rc > "$W/rc.$t" ) &
+done
+wait
+for t in hang noterm markerhang; do
+  assert "R-neg $t exit" "$(<"$W/rc.$t")" "4"
+  if grep -qF "timed out after 15s" "$W/err.$t"; then ok "R-neg $t message"; else bad "R-neg $t message ($(<"$W/err.$t"))"; fi
+  assert "R-neg $t no launch-meta" "$(no_meta "rn-$t")" "none"
+  assert "R-neg $t no -tt launch" "$(launches "$t.host")" "0"
+  pid="$(<"$W/pid.probe.$t.host")"
+  if kill -0 "$pid" 2>/dev/null; then bad "R-neg $t shim pid $pid still running"; kill -KILL "$pid" 2>/dev/null; else ok "R-neg $t no leftover shim"; fi
+done
+(( SECONDS - t0 < 30 )) && ok "deadline bounded ($(( SECONDS - t0 ))s)" || bad "deadline took $(( SECONDS - t0 ))s"
+
+# --- R-pos: start-ssh launches ----------------------------------------------
+echo "group R-pos: start-ssh launches"
+# rpos <label> <name> <target> <sentinel> [extra args...]: start, then the probe and launch are logged.
+rpos() {
+  local label="$1" name="$2" target="$3" s="$4"
+  shift 4
+  "$CODEX_TMUX" start-ssh --exact --sentinel "$s" --on-exit "$HOOK" "$@" "$name" "$target" "$W/rcwd" >/dev/null
+  assert "$label launch-meta" "$([[ -f "$TMUX_AGENT_DIR/$name/launch-meta.json" ]] && echo present || echo none)" "present"
+  assert "$label probed once" "$(probes "$target")" "1"
+  wait_grep "$W/ssh.log" "launch <-tt> <$target>" || true  # the pane execs ssh after start-ssh returns
+  assert "$label launched once" "$(launches "$target")" "1"
+}
+left
+s="$W/rp-absent.exit"
+# An allowed hook launches and runs as before.
+rpos "R-pos absent" rp-absent run.host "$s" --on-exit-allow '^printf '
+check_success "R-pos absent" "$s" 0 rp-absent "$W/rcwd"
+assert "R-pos absent CLI cwd" "$(head -n1 "$W/cli.run.host" 2>/dev/null)" "ran cwd=$W/rcwd"
+stop rp-absent
+
+left
+s="$W/rp-hide.exit"; echo local-only > "$s"; print -r -- "$s" > "$W/hide-path"
+rpos "R-pos local-only file" rp-hide hide.host "$s"
+check_success "R-pos local-only file" "$s" 0 rp-hide "$W/rcwd"
+stop rp-hide
+
+left
+sd="$W/odd dir it's \$HOME;\\x"; mkdir -p "$sd"
+s="$sd/w.exit"
+rpos "R-pos special path" rp-odd run2.host "$s"
+check_success "R-pos special path" "$s" 0 rp-odd "$W/rcwd"
+stop rp-odd
+
+left
+s="$W/rp-code3.exit"
+rpos "R-pos CLI non-zero" rp-code3 code3.host "$s"
+check_success "R-pos CLI non-zero" "$s" 3 rp-code3 "$W/rcwd"
+stop rp-code3
+
+left
+s="$W/ro/rp-ro.exit"
+rpos "R-pos unwritable dir" rp-ro run3.host "$s"
+check_pubfail "R-pos unwritable dir" rp-ro "$s" 0
+stop rp-ro
+
+left
+s="$W/rp.mvfail.exit"
+rpos "R-pos mv failure" rp-mvf mvf.host "$s"
+check_pubfail "R-pos mv failure" rp-mvf "$s" 0
+stop rp-mvf
+
+# The other side of the size limit: a hook near the limit still launches.
+left
+s="$W/rp-near.exit"
+near="$(head -c 9000 /dev/zero | tr '\0' x)"
+"$CODEX_TMUX" start-ssh --exact --sentinel "$s" --on-exit "$HOOK; : $near" rp-near near.host "$W/rcwd" >/dev/null
+wait_grep "$W/ssh.log" "launch <-tt> <near.host>" || true
+assert "R-pos near limit launched" "$(launches near.host)" "1"
+check_success "R-pos near limit" "$s" 0 rp-near "$W/rcwd"
+stop rp-near
 
 echo
 echo "summary: $PASS passed, $FAIL failed"
