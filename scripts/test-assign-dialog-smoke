@@ -241,6 +241,34 @@ assert "fold: scope-guard instruction recorded as landed" \
   "$([[ -e "$TMUX_AGENT_DIR/fold-whole/scope-guard-injected" ]] && echo yes || echo no)" "yes"
 "$AGENT_TMUX" foldcli stop fold-whole >/dev/null 2>&1 || true
 
+# The mod always assigns with --result-path. The sentinel records only the
+# DEFAULT path, so the warning fired on every mod dispatch, named the default
+# path, and its "re-prompt" advice became a `tell` that opened a new episode
+# and delivered the same result again (agent-scripts W42-9, F10).
+fold_assign_rp() {  # <name> [extra launch flags]
+  mkdir -p "$TMUX_AGENT_DIR/$1"
+  code=0
+  AGENT_TMUX_LAUNCH_FLAGS="--result $TMUX_AGENT_DIR/$1/result.json ${2:-}" \
+    "$AGENT_TMUX" foldcli assign --timeout 60 --confirm-window 30 --detach \
+      --prompt-delivery paste --result-path "$WORK/$1-ep1.json" "$1" "$WORK" "$WORK/brief.txt" \
+      >"$WORK/$1.out" 2>"$WORK/$1.err" || code=$?
+}
+
+echo
+echo "case: --result-path delivered and proven: no warning"
+fold_assign_rp rp-whole
+assert "rp: assign confirmed the worker" "$code" "0"
+refute_contains "rp: no result-path warning" "$(cat "$WORK/rp-whole.err")" "result-path delivery UNCONFIRMED"
+"$AGENT_TMUX" foldcli stop rp-whole >/dev/null 2>&1 || true
+
+echo
+echo "case: --result-path not proven: the warning names that path and a plain send"
+fold_assign_rp rp-short "--short 1"
+assert "rp-short: assign confirmed the worker" "$code" "0"
+assert_contains "rp-short: the warning names the episode path" "$(cat "$WORK/rp-short.err")" "told $WORK/rp-short-ep1.json"
+assert_contains "rp-short: the warning says send, not tell" "$(cat "$WORK/rp-short.err")" "in a plain \`agent-tmux foldcli send\`"
+"$AGENT_TMUX" foldcli stop rp-short >/dev/null 2>&1 || true
+
 echo
 echo "case: a placeholder shorter than the payload is no proof, and the warning stays"
 fold_assign fold-short "--show 2"

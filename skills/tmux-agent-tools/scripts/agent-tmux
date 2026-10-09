@@ -2507,6 +2507,7 @@ RESULT_PATH_MARKER="Write final JSON to this exact path:"
 # pinned in the wording rather than normalized in code, because no reader
 # compares the value yet and a normalizer would be built for no consumer.
 RESULT_PATH_OVERRIDE=""
+RESULT_PATH_CONFIRMED=""
 RESULT_EPISODE=""
 RESULT_SCHEMA_LINE="Result JSON must include schema_version, status, summary, artifacts, and errors; schema_version must be the number 1 (not a string), and status must be exactly one of success, failed, blocked, needs-input. If you committed, add commit: the full 40-hex sha of your final commit."
 
@@ -2946,8 +2947,6 @@ result_path_prepend() {
 # silently never learned its result path (#283).
 result_path_mark_injected() {
   local name="$1" session="${2:-}"
-  # The sentinel records that the DEFAULT path was taught; an override taught another one.
-  [[ -n "$RESULT_PATH_OVERRIDE" ]] && return 0
   # Cheapest disqualifier first: for an untrustworthy family the pane poll's
   # outcome is discarded anyway, so do not pay its up-to-10s wait.
   _sentinel_trustworthy || { _sentinel_unconfirmed "result-path" "$name"; return 1; }
@@ -2955,6 +2954,10 @@ result_path_mark_injected() {
     _sentinel_unconfirmed "result-path" "$name"
     return 1
   fi
+  # This send's path is proven: assign's warning reads this for an override (W42-9).
+  RESULT_PATH_CONFIRMED=true
+  # The sentinel records that the DEFAULT path was taught; an override taught another one.
+  [[ -n "$RESULT_PATH_OVERRIDE" ]] && return 0
   : > "$(result_path_sentinel "$name")" 2>/dev/null || true
 }
 
@@ -4942,8 +4945,11 @@ assign_session() {
   # dropped both injected prefixes during a 95s boot and nothing said so).
   # Report it as its own step outcome — non-fatal, because some TUIs redraw the
   # prefix out of view after submitting it, but never silent again.
-  if [[ "$RESULT_PATH_VIA_PROMPT" == true && ! -e "$(result_path_sentinel "$name")" ]]; then
-    echo "assign[4/5] WARNING: result-path delivery UNCONFIRMED for '$name' — the worker may never have been told $(result_session path "$name" 2>/dev/null || echo '<result path>'). Treat a 'pending' result as possibly permanent: re-prompt with that literal path before waiting on it again, and never take a pane scrape as a confirmed answer." >&2
+  # An override (--result-path, every mod dispatch) never writes the default sentinel,
+  # so it is judged by this send's own proof; the default path by the sentinel.
+  if [[ -n "$RESULT_PATH_OVERRIDE" && "$RESULT_PATH_CONFIRMED" != true ]] ||
+     [[ -z "$RESULT_PATH_OVERRIDE" && "$RESULT_PATH_VIA_PROMPT" == true && ! -e "$(result_path_sentinel "$name")" ]]; then
+    echo "assign[4/5] WARNING: result-path delivery UNCONFIRMED for '$name' — the worker may never have been told ${RESULT_PATH_OVERRIDE:-$(result_session path "$name" 2>/dev/null || echo '<result path>')}. Treat a 'pending' result as possibly permanent: re-prompt with that literal path in a plain \`agent-tmux $CLI send\` before waiting on it again (a tmux-agent \`tell\` opens a new episode, and the same result is delivered once per episode), and never take a pane scrape as a confirmed answer." >&2
   fi
 
   if (( detach )); then
