@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Fix (smokes, safety): a smoke never runs with the real HOME. On 2026-10-09 a mutation run removed the `start-ssh --on-exit-allow` refusal; the test's fake `ssh` ran the "remote" hook on this Mac with the real HOME, and the hook (destructive test data) deleted much of the home directory. Now `run-all-smokes` gives each job its own HOME (`<job>/home`; XDG_* and ZDOTDIR unset), every smoke sources `scripts/lib/smoke-home-guard.sh` on line 2, which exits 3 before any work when HOME is the real home (passwd entry) or empty, and the fake `ssh` in `test-sentinel-smoke` and `test-relay-smoke` runs the "remote" command with `$W/rhome` as HOME. Run one smoke with `scripts/run-all-smokes <test>`; a direct run now exits 3. `test-home-guard-smoke` checks the job HOME, the guard line in every smoke, and the exit 3 for a real or empty HOME (it fails with the guard disabled).
+- Test (tmux-agent mod): one test runs the whole stall chain (agent-scripts W42-22): a worker's owner session stops heartbeating, a new collector adopts the same episode, a 30-minute quiet run is neither failed nor woken, a quota stop wakes the new owner once, and the late result is delivered once with `adopted from session <old>`. It fails when a quiet run counts as a stall and when the adoption line is dropped.
 
 ## v0.46.0 - 2026-10-09
 

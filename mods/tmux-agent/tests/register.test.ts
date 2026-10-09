@@ -1641,6 +1641,51 @@ describe('stall detection', () => {
     expect(logs.length, 'an idle notice is given once, not every tick').toEqual(1)
   })
 
+  // W42-22: the whole chain in one run — dispatch, the owner's heartbeat lost, a new
+  // collector, a long quiet run, a real stall, then a late end event.
+  test('an owner that died mid-run: the new collector adopts, keeps a quiet run alive, flags the stall once, delivers the late result once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    setSessionId(on, 'sess-B')
+    // sess-A dispatched "long" and then stopped heartbeating (no beat file).
+    const files: Files = { ...worker('long', 0, { owner: 'sess-A', ownerCwd: '/work' }) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    const status: Record<string, unknown> = {
+      running: true,
+      idle_seconds: 30 * 60,
+      last_capture_lines: ['Running cargo build', '  Compiling foo v0.1'],
+    }
+    mockStatus(on, status)
+
+    await $.session.start(session())
+    expect(ownerIn(files, 'long'), 'the restarted collector takes over the same episode').toEqual({ owner: 'sess-B', gen: 1 })
+
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(woken, 'a long quiet run is not a failure and wakes nobody').toEqual([])
+    expect(closedIn(files), 'nothing is closed while it runs').toEqual([])
+
+    Object.assign(status, { idle_seconds: 3 * 60, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' })
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(woken.length, 'a real stall wakes the new owner once').toEqual(1)
+    expect(woken[0]).toContain('"long" on codex: stalled')
+    expect((await $.command.run(run('stalled'))).text).toEqual('long:180')
+
+    files[`${V3}/long/result.json`] = finished('late but done')
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(woken.length, 'the late end event is delivered once').toEqual(2)
+    expect(woken[1]).toContain('late but done')
+    expect(woken[1], 'identity survives the restart').toContain('adopted from session sess-A')
+    expect(closedIn(files)).toEqual(['long#1'])
+    expect((await $.command.run(run('stalled'))).text).toEqual('')
+  })
+
   test('a worker the CLI stopped on a usage limit is stalled and wakes the session once', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
