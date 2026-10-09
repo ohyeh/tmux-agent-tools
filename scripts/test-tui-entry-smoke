@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Smoke for the tmux-agent-tui entry (plan R2.1): it runs from an install-bin
 # link in a path with a space, `%`, `#` and a non-ASCII char, from a cwd outside
 # the repo, checks the Node floor in the shell, refuses a non-TTY, and passes

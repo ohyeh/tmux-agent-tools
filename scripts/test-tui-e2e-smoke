@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # End-to-end smoke of the real TUI (plan R4): `tmux-agent-tui` in a pane of a
 # private tmux server, over a real ledger whose two workers are real tmux

@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Smoke test for the runtime-agnostic dispatch gate: when
 # AGENT_TMUX_REQUIRE_GATE_RECEIPT is set, dispatch-shaped commands
 # (start/send*) must be refused with blocked_reason=gate_receipt_missing

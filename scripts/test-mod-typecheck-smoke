@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # `claude plugin validate` and `claude plugin test` do NOT type-check the mods:
 # v0.3.0 shipped four tsc errors past both of them (an omitted required argument,
 # an unassignable render child, two malformed ConfigRow mocks) and only an

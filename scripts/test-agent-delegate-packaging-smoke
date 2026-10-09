@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Packaging shape of the installable skill: doc/schema copies match their
 # repo canonicals, no dev-only evals/ ships, and the .codex skill symlink
 # points at the canonical skill.

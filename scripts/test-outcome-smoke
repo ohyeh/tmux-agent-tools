@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Smoke for `agent-tmux <cli> outcome`: the commander's label joins the exact
 # result.json it judged, and a reset result does not inherit the old label.
 set -euo pipefail

@@ -1,0 +1,29 @@
+#!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
+# A smoke never runs with the real HOME: run-all-smokes gives each job its own, and every smoke
+# sources lib/smoke-home-guard.sh, which exits 3 before any work when HOME is the real home.
+set -euo pipefail
+SCRIPT_DIR="${0:A:h}"
+real_home="$(eval "printf '%s' ~$(id -un)")"
+PASS=0 FAIL=0
+check() { if eval "$2"; then echo "  ok   $1"; PASS=$((PASS + 1)); else echo "  FAIL $1" >&2; FAIL=$((FAIL + 1)); fi; }
+
+check "this job's HOME is not the real home" '[[ "${HOME:A}" != "${real_home:A}" ]]'
+check "this job's HOME is inside its job dir" '[[ -n "${TAS_JOB_DIR:-}" && "${HOME:A}" == "${TAS_JOB_DIR:A}"/* ]]'
+
+# Every smoke starts with the guard, so none can run before it.
+missing=()
+for f in "$SCRIPT_DIR"/test-*-smoke; do
+  [[ "$(sed -n 2p "$f")" == *'lib/smoke-home-guard.sh'* ]] || missing+=("${f:t}")
+done
+check "every smoke sources the guard on line 2 (missing: ${missing[*]:-none})" '(( ${#missing[@]} == 0 ))'
+
+# With the real HOME, a smoke exits 3 and its body never runs (the guard exits before anything).
+out="$(HOME="$real_home" "$SCRIPT_DIR/test-help-smoke" 2>&1)" && rc=0 || rc=$?
+check "real HOME: a smoke exits 3 (got $rc)" '(( rc == 3 ))'
+check "real HOME: the smoke body did not run" '[[ "$out" == *"refusing to run with the real HOME"* && "$out" != *" ok "* ]]'
+out="$(HOME= "$SCRIPT_DIR/test-help-smoke" 2>&1)" && rc=0 || rc=$?
+check "empty HOME: a smoke exits 3 (got $rc)" '(( rc == 3 ))'
+
+echo "summary: $PASS passed, $FAIL failed"
+(( FAIL == 0 ))

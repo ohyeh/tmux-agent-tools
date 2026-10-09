@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test: `status --json` names a worker the CLI stopped on a usage limit or
 # lost credentials for (blocked_reason quota_exhausted / login_required, with

@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Codex plugin manifest shape (codex-cli 0.160.0, observed 2026-10-02):
 # - With no `hooks` in .codex-plugin/plugin.json, codex parses the plugin's
 #   hooks/hooks.json, which is Claude Code's file: its `modules` key failed with

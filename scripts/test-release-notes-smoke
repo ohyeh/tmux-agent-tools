@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # scripts/release-notes refuses a section without `Not verified:` and a tag that is not on
 # the `chore(release): X.Y.Z` commit (W40-8, W40-11); a ready release prints its notes.
 set -euo pipefail

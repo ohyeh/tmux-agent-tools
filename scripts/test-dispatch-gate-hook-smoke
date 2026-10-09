@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Smoke test for hooks/tmux-dispatch-gate.sh — feeds PreToolUse-shaped
 # stdin JSON straight into the hook and asserts exit codes + deny messages.
 # No tmux, no Claude runtime needed.
