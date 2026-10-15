@@ -25,6 +25,10 @@ import {
   resumeWorker,
   mirrorOf,
   mirrorProject,
+  fitWorker,
+  exactSessionTarget,
+  projectSessionsOf,
+  sameProject,
   type Health,
 } from './workers.ts'
 import {
@@ -38,6 +42,7 @@ import {
   type TuiState,
   ANSI_LEAVE_ALT,
   KeyParser,
+  X10_MOUSE,
   ESC_WAIT_MS,
   SEQ_IDLE_MS,
   SEQ_MAX,
@@ -58,6 +63,7 @@ import {
   rowHints,
   PAGE_DOWN,
   PAGE_UP,
+  MIRROR_HISTORY,
   ANSI_CLEAR_HOME,
   padCells,
 } from './tui.node.ts'
@@ -645,6 +651,8 @@ test('input: rq in one chunk is refresh, then quit (COALESCED_QUIT)', async () =
   await run
   assert.equal(ended, 'quit', 'rq in one chunk must quit')
   assert.ok(refreshes > 0, 'the r ran a refresh before the q')
+  // 80 columns with a session id: the hint words give way, the name and version stay.
+  assert.match(stdout.written, /workers v\d+\.\d+\.\d+ · @rq · /, 'the title names the version that drew it')
 })
 
 test('input: jk in one chunk moves down, then up', () => {
@@ -1870,7 +1878,7 @@ test('layout: one function sizes every section; hard-coded fixtures (R4.1, R4.2)
   }
 })
 
-test('mirror: capture asks for the layout body; a resize drops the capture started before it (R4.1, R4.2)', async () => {
+test('mirror: capture asks for the whole scrollback; a resize drops the capture started before it (R4.1, R4.2)', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-mirror-'))
   const repo = mkdtempSync(join(tmpdir(), 'tui-mirror-repo-'))
   writeWorker(root, repo, 'S', 'mir.abcde')
@@ -1895,13 +1903,13 @@ test('mirror: capture asks for the layout body; a resize drops the capture start
     await until(() => stdout.written.includes('mir.abcde'), 5_000, 'the row')
     stdin.emit('data', 'j')
     await until(() => tails.length === 1 && !!hold, 5_000, 'the first capture')
-    assert.equal(tails[0], '18', '80x24, one selected row: 18 mirror rows')
+    assert.equal(tails[0], String(MIRROR_HISTORY), 'the capture asks for the whole scrollback, not one screen')
     stdout.columns = 120
     stdout.rows = 60
     stdout.emit('resize')
     hold!()
     await until(() => stdout.written.includes('FRESH-120x60'), 5_000, 'the capture at the new size')
-    assert.equal(tails.at(-1), '54', '120x60: 54 mirror rows')
+    assert.equal(tails.at(-1), String(MIRROR_HISTORY), 'a resize does not shrink the capture')
     assert.ok(!stdout.written.includes('STALE-80x24'), 'a capture sized before the resize is never drawn')
   } finally {
     stdin.emit('data', 'q')
@@ -1966,6 +1974,34 @@ test('mirror: capture failure reaches the preview as an error, not an empty pane
   host.run = async () => ({ exitCode: 0, stdout: 'a\nb\n', stderr: '' })
   assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b', ''] })
   assert.deepEqual(await mirrorProject(host, 'x', 10), { lines: ['a', 'b'] })
+  // Colour: SGR is kept (sanitizeAnsi drops the rest when it prints); a row of only SGR is a blank tail.
+  const calls: string[][] = []
+  host.run = async (argv: readonly string[]) => (calls.push([...argv]), { exitCode: 0, stdout: '\x1b[31mred\x1b[0m\tx\n\x1b[0m\n', stderr: '' })
+  assert.deepEqual(await mirrorProject(host, 'x', 10, true), { lines: ['\x1b[31mred\x1b[0m x'] })
+  assert.ok(calls[0]!.includes('-e'))
+  assert.deepEqual((await mirrorOf(host, d, 10, true)).lines[0], '\x1b[31mred\x1b[0m x')
+  assert.ok(calls[1]!.includes('--color') && !calls[1]!.includes('--strip-ansi'))
+  // Default (the mod panel, which prints lines as they are): no escape reaches a line.
+  const plain = [...(await mirrorProject(host, 'x', 10)).lines, ...(await mirrorOf(host, d, 10)).lines]
+  assert.ok(plain.every(l => !l.includes('\x1b')))
+  assert.ok(!calls[2]!.includes('-e') && calls[3]!.includes('--strip-ansi'))
+})
+
+test('fitWorker: resizes a detached worker only when its live size differs; an attached one is left alone', async () => {
+  const host = quietHost('S', '/tmp', '/tmp')
+  const t = exactSessionTarget('codex-sol-x.abcde')
+  const d = { profile: 'codex', name: 'x.abcde', dir: '/tmp', since: 1 }
+  for (const [live, resized] of [['80 24 0', true], ['120 45 0', false], ['80 24 1', false]] as const) {
+    const calls: string[][] = []
+    host.run = async argv => {
+      calls.push([...argv])
+      return { exitCode: 0, stdout: argv[1] === 'ls' ? 'codex-sol-x.abcde\n' : argv[1] === 'display-message' ? `${live}\n` : '', stderr: '' }
+    }
+    assert.equal((await fitWorker(host, d, 120, 45)).ok, true, live)
+    const resize = calls.find(c => c[1] === 'resize-window')
+    assert.deepEqual(resize, resized ? ['tmux', 'resize-window', '-t', t, '-x', '120', '-y', '45'] : undefined, live)
+  }
+  assert.equal((await fitWorker(host, { ...d, name: 'gone.zzzzz' }, 120, 45)).ok, false)
 })
 
 test('mirror: select, A→B and resize capture at once, not at the next tick; never draw another row (T1 C2)', async () => {
@@ -1986,7 +2022,8 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
         holdNext = false
         await new Promise<void>(r => holds.push(r))
       }
-      return { exitCode: 0, stdout: `${name.toUpperCase()}-${tail}\n`, stderr: '' }
+      // The capture depth no longer follows the window: the call number tells the captures apart.
+      return { exitCode: 0, stdout: `${name.toUpperCase()}#${calls.length}\n`, stderr: '' }
     }
     if (argv[0] === 'agent-tmux' && argv.includes('status')) return { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' }
     return { exitCode: 0, stdout: '', stderr: '' }
@@ -1998,8 +2035,8 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
   try {
     await until(() => stdout.written.includes('bbb.abcde'), 5_000, 'the rows')
     stdin.emit('data', 'j')
-    await until(() => last().includes('capturing the pane…') || /AAA\.ABCDE-\d+/.test(last()), 5_000, 'the pending preview')
-    await until(() => /AAA\.ABCDE-\d+/.test(last()), 5_000, 'A captured without a tick')
+    await until(() => last().includes('capturing the pane…') || /AAA\.ABCDE#\d+/.test(last()), 5_000, 'the pending preview')
+    await until(() => /AAA\.ABCDE#\d+/.test(last()), 5_000, 'A captured without a tick')
     assert.equal(last().split('\r\n').length, 24, 'full frame')
 
     // A→B while B's capture is held: B pending, A's content gone.
@@ -2021,9 +2058,12 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
     const before = stdout.written.length
     stdin.emit('data', 'z') // unbound: a frame, selection kept
     await until(() => stdout.written.length > before, 5_000, 'a forced frame')
-    assert.ok(!/BBB\.ABCDE-\d+/.test(last()), 'the capture sized before the resize is never drawn')
+    assert.ok(!/BBB\.ABCDE#\d+/.test(last()), 'the capture sized before the resize is never drawn')
     holds.shift()!()
-    await until(() => /BBB\.ABCDE-5\d/.test(last()), 5_000, 'B at the new size')
+    await until(() => /BBB\.ABCDE#\d+/.test(last()), 5_000, 'B at the new size')
+    const seen = () => Number(/BBB\.ABCDE#(\d+)/.exec(last())?.[1] ?? 0)
+    const atNewSize = seen()
+    assert.ok(atNewSize >= 3, `a capture started after the resize: #${atNewSize}`)
     assert.equal(last().split('\r\n').length, 60)
 
     // Same row, resize again: the kept capture stays on screen until the new one lands.
@@ -2031,9 +2071,9 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
     stdout.rows = 40
     stdout.emit('resize')
     await until(() => holds.length === 1, 5_000, 'the resize capture in flight')
-    assert.match(last(), /BBB\.ABCDE-5\d/, 'the same row keeps its last capture through a resize')
+    assert.equal(seen(), atNewSize, 'the same row keeps its last capture through a resize')
     holds.shift()!()
-    await until(() => /BBB\.ABCDE-3\d/.test(last()), 5_000, 'B at 40 rows')
+    await until(() => seen() > atNewSize, 5_000, 'B at 40 rows')
   } finally {
     for (const h of holds) h()
     stdin.emit('data', 'q')
@@ -2042,6 +2082,41 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
   const after = stdout.written.length
   await new Promise(r => setTimeout(r, 50))
   assert.equal(stdout.written.length, after, 'nothing is drawn after quit')
+})
+
+test('fit: a select or a resize fits the worker window once; the tick only captures', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-fit-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-fit-repo-'))
+  writeWorker(root, repo, 'S', 'aaa.abcde')
+  const host = quietHost('S', repo, root)
+  const fits: string[] = []
+  let captures = 0
+  host.run = async argv => {
+    if (argv[0] === 'agent-tmux' && argv.includes('capture')) return { exitCode: 0, stdout: `cap#${++captures}\n`, stderr: '' }
+    if (argv[0] === 'agent-tmux' && argv.includes('status')) return { exitCode: 0, stdout: '{"exists":true,"running":true}', stderr: '' }
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: 'codex-aaa.abcde\n', stderr: '' }
+    if (argv[1] === 'display-message') return { exitCode: 0, stdout: '80 24 0\n', stderr: '' }
+    if (argv[1] === 'resize-window') fits.push(`${argv.at(-3)}x${argv.at(-1)}`)
+    return { exitCode: 0, stdout: '', stderr: '' }
+  }
+  const { stdin, stdout } = mockTty()
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 20 })
+  try {
+    await until(() => stdout.written.includes('aaa.abcde'), 5_000, 'the row')
+    stdin.emit('data', 'j')
+    await until(() => fits.length === 1, 5_000, 'the select fits')
+    const after = captures
+    await until(() => captures >= after + 3, 5_000, 'three tick captures')
+    assert.equal(fits.length, 1, 'ticks do not fit')
+    assert.match(fits[0]!, /^80x\d+$/)
+    stdout.columns = 120
+    stdout.emit('resize')
+    await until(() => fits.length === 2, 5_000, 'the resize fits')
+    assert.match(fits[1]!, /^120x\d+$/)
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
 })
 
 test('detail: the whole result, past SUMMARY_MAX, with row and result state apart; PgDn reaches the end (R4.3)', async () => {
@@ -2086,7 +2161,10 @@ test('detail: the whole result, past SUMMARY_MAX, with row and result state apar
     'summary:',
     's',
   ])
-  assert.deepEqual(detailText(mockRow('p', { project: true }), { kind: 'project' }), ['project session p: not a ledger worker; no episode, no result'])
+  const proj = mockRow('p', { project: true })
+  const onProj = nextKeyState({ rows: [proj], all: [proj], showAll: false, adding: false, resumeInput: '', quit: false, selected: 'p' }, '\r', 0)
+  assert.equal(onProj.state.expanded, undefined, 'a project session has no detail: Enter keeps the mirror')
+  assert.equal(onProj.action, undefined)
 
   // Through runTui: Enter expands, PgDn pages to the end, Enter collapses.
   const { stdin, stdout } = mockTty()
@@ -2114,6 +2192,62 @@ test('detail: the whole result, past SUMMARY_MAX, with row and result state apar
     stdin.emit('data', 'q')
     await run
   }
+})
+
+test('mirror: PgUp scrolls back through the scrollback, PgDn to the end follows live again', () => {
+  const NOW = 1_000_000
+  const rows = [mockRow('a')]
+  const lines = Array.from({ length: 300 }, (_, i) => `m${i}`)
+  let s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a', mirror: { id: 'a', lines } }
+  const body = tuiLayout(s, 70, 24, NOW).body
+  s = { ...s, page: body }
+  const frame = (st: TuiState) => renderTuiLines(st, 70, 24, NOW).map(stripAnsi)
+  assert.ok(frame(s).includes('m299'), 'live: the newest line')
+  s = nextKeyState(s, PAGE_UP, NOW).state
+  assert.equal(s.back, body)
+  assert.ok(frame(s).includes(`m${299 - body}`) && !frame(s).includes('m299'), 'one page back')
+  assert.ok(frame(s).some(l => l.startsWith(`scrollback ${300 - 2 * body + 1}–${300 - body} of 300`)), 'the tail says where')
+  for (let i = 0; i < 100; i++) s = nextKeyState(s, PAGE_UP, NOW).state
+  assert.ok(frame(s).includes('m0'), 'clamped at the oldest line')
+  for (let i = 0; i < 100; i++) s = nextKeyState(s, PAGE_DOWN, NOW).state
+  assert.equal(s.back, 0, 'back at the end: live again')
+  // b/f do the same, for terminals that keep PgUp/PgDn for their own window.
+  s = nextKeyState(s, 'b', NOW).state
+  assert.equal(s.back, body)
+  s = nextKeyState(s, 'f', NOW).state
+  assert.equal(s.back, 0)
+  // The mouse wheel: 3 lines a notch; a click changes nothing.
+  s = nextKeyState(s, '\x1b[<64;10;5M', NOW).state
+  assert.equal(s.back, 3)
+  assert.equal(nextKeyState(s, '\x1b[<0;10;5M', NOW).state, s)
+  s = nextKeyState(s, '\x1b[<65;10;5M', NOW).state
+  assert.equal(s.back, 0)
+  // At the oldest line one notch down moves the frame at once (the viewport bounds back, not the step).
+  for (let i = 0; i < 200; i++) s = nextKeyState(s, '\x1b[<64;10;5M', NOW).state
+  assert.equal(s.back, 300 - body)
+  s = nextKeyState(s, '\x1b[<65;10;5M', NOW).state
+  assert.equal(s.back, 300 - body - 3)
+  // X10 (a terminal that ignored SGR 1006) is detected, not parsed: mouse goes off, the status says why.
+  let kp = new KeyParser()
+  assert.deepEqual([...kp.feed('\x1b[M'), ...kp.feed('`Q(q')], [X10_MOUSE, 'q'], 'whole report across chunks, then q')
+  const x10 = nextKeyState(s, X10_MOUSE, NOW)
+  assert.deepEqual(x10.action, { type: 'mouseOff' })
+  assert.ok(!x10.state.quit && /X10/.test(x10.state.statusMessage ?? ''))
+  kp = new KeyParser()
+  assert.deepEqual(kp.feed('\x1b[M`\x03'), [X10_MOUSE, '\x03'], 'Ctrl-C cuts a partial report and stays Ctrl-C')
+  kp = new KeyParser()
+  assert.deepEqual([...kp.feed('\x1b[M`'), ...kp.expire(), ...kp.feed('q')], [X10_MOUSE, 'q'], 'an idle partial report is dropped, no CSI skip')
+  for (let i = 0; i < 100; i++) s = nextKeyState(s, PAGE_DOWN, NOW).state
+  assert.ok(frame(s).some(l => l.startsWith('See it whole: ')))
+})
+
+test('viewer scope: a cwd of / lists every project session and every worker record (D-viewer)', () => {
+  const ls = 'hg-android\t/Users/u/git/healthgo/app\t1\nother\t/Users/u/git/agent-scripts\t2\n'
+  assert.deepEqual(projectSessionsOf(ls, '/', []).map(p => p.name), ['hg-android', 'other'], '/ sees the whole machine')
+  assert.deepEqual(projectSessionsOf(ls, '/Users/u/git/agent-scripts', []).map(p => p.name), ['other'], 'a repo cwd still narrows')
+  const at = (cwd: string) => ({ cwd: () => cwd }) as unknown as Parameters<typeof sameProject>[0]
+  assert.equal(sameProject(at('/'), { ownerCwd: '/Users/u/git/healthgo/app' }), true)
+  assert.equal(sameProject(at('/Users/u/git/agent-scripts'), { ownerCwd: '/Users/u/git/healthgo/app' }), false)
 })
 
 test('wrap: CJK and emoji wrap by cells and never split a grapheme', () => {
@@ -2851,4 +2985,17 @@ test('R4-10 key-state: an incomplete reservation row clears with - (press twice)
   }
   const v = nextKeyState({ ...t, viewer: true }, '-', 1_000)
   assert.equal(v.state.statusMessage, READ_ONLY)
+})
+
+test('layout: the row list stays at the top; the preview follows the last row', () => {
+  const rows = ['a', 'b', 'c', 'd'].map(id => mockRow(id))
+  const lines = Array.from({ length: 50 }, (_, i) => `m${i}`)
+  const frame = (sel: string) => {
+    const s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: sel, mirror: { id: sel, lines } }
+    return renderTuiLines(s, 80, 30, 0).map(stripAnsi)
+  }
+  const at = (f: string[]) => ['1: ', '2: ', '3: ', '4: '].map(p => f.findIndex(l => l.startsWith(p)))
+  const first = frame('a')
+  assert.deepEqual(at(first), at(frame('c')), 'rows do not move when the selection does')
+  assert.ok(first.findIndex(l => l.includes('m49')) > at(first)[3]!, 'the preview is below row 4')
 })

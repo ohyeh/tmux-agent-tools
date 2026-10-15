@@ -9,9 +9,9 @@
 
 **Use**
 
-- [Recipes](Recipes)
+- [Recipes](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md)
 - [Observability and Secrets](Observability-and-Secrets)
-- [Troubleshooting](Troubleshooting)
+- [Troubleshooting](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/troubleshooting.md)
 
 **Contribute**
 

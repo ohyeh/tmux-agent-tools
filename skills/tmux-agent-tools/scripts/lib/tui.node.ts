@@ -3,7 +3,7 @@
 // the core (p0-contract.md §9).
 //
 // Usage: node tui.node.ts [--session <id>] [--cwd <dir>]
-// Without a session it is a viewer: every row, read-only (D-viewer).
+// Without a session it is a viewer: every row on the machine, read-only (D-viewer).
 // Keys (header):
 //   n       resume a CLI session by id (input line)
 //   +       assign a new worker: <profile> <name> <brief-file> (input line)
@@ -18,7 +18,8 @@
 //   x       stop the worker (press twice)
 //   -       cancel its episode (press twice; the pane is untouched)
 //   U       unlock its action lock, maintenance (press twice; only a provably gone holder)
-//   Enter   detail view; PgUp / PgDn scroll it
+//   b / f   scroll the mirror's scrollback (f to the bottom follows live again); PgUp / PgDn and the mouse wheel too
+//   Enter   detail view of a worker; b / f scroll it
 //   Esc     cancel a confirmation, close the detail, or deselect
 
 import { parseArgs } from 'node:util'
@@ -61,18 +62,25 @@ import {
   episodeDetail,
   mirrorOf,
   mirrorProject,
+  fitWorker,
   exactSessionTarget,
   observeView,
 } from './workers.ts'
 import { nodeHost } from './host.node.ts'
+import { coreVersion } from './collector.node.ts'
 import { graphemes, graphemeWidth as widthOf } from './width.ts'
 
 export const NODE_FLOOR = [22, 18, 0]
 
 // `?2004h` turns on bracketed paste: the terminal wraps a paste in ESC[200~ … ESC[201~,
 // so a pasted `q` or `x` is text, not a key (KeyParser). `?2004l` turns it off again.
-export const ANSI_ENTER_ALT = '\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H'
-export const ANSI_LEAVE_ALT = '\x1b[?2004l\x1b[?25h\x1b[?1049l'
+// Mouse reporting (1000 + SGR 1006): the wheel scrolls the preview; without it a terminal
+// turns the wheel into ↑/↓, which only move the selection. Shift-drag still selects text.
+export const ANSI_ENTER_ALT = '\x1b[?1049h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[2J\x1b[H'
+export const ANSI_MOUSE_OFF = '\x1b[?1006l\x1b[?1000l'
+export const ANSI_LEAVE_ALT = `${ANSI_MOUSE_OFF}\x1b[?2004l\x1b[?25h\x1b[?1049l`
+/** Lines one wheel notch scrolls. */
+const WHEEL_LINES = 3
 export const ANSI_HIDE_CURSOR = '\x1b[?25l'
 export const ANSI_SHOW_CURSOR = '\x1b[?25h'
 export const ANSI_CLEAR_HOME = '\x1b[2J\x1b[H'
@@ -257,12 +265,16 @@ export interface TuiState {
   detail?: { id: string; lines: string[] }
   /** First detail line shown (PgUp/PgDn). */
   scroll?: number
+  /** Mirror lines scrolled back from the bottom (PgUp/PgDn); 0 follows live. */
+  back?: number
   /** Body rows of the last layout and the last scroll offset; runTui sets both. */
   page?: number
   scrollMax?: number
   statusMessage?: string
   statusUntil?: number
   owner?: string
+  /** `AGENT_TMUX_VERSION` beside lib/: the title names the code that drew it, as the band's MOD_VERSION does. */
+  version?: string
   /** No --session and no TMUX_AGENT_SESSION: every row, read-only (D-viewer). */
   viewer?: boolean
   /** Why the ledger could not be read (the third empty state). */
@@ -283,9 +295,12 @@ export type TuiAction =
   | { type: 'unlock'; row: PanelRow }
   | { type: 'clear'; row: PanelRow }
   | { type: 'detail' }
+  | { type: 'mouseOff' }
 
 const PASTE_START = '\x1b[200~'
 const PASTE_END = '\x1b[201~'
+/** Mirror capture depth: tmux's default history-limit. */
+export const MIRROR_HISTORY = 2000
 export const PAGE_UP = '\x1b[5~'
 export const PAGE_DOWN = '\x1b[6~'
 export const READ_ONLY = '唯讀；帶 --session 才能操作'
@@ -315,6 +330,8 @@ export const SEQ_MAX = 256
 export const PASTE_MAX = 65_536
 /** Emitted by KeyParser (never read from input): an unfinished sequence was dropped. */
 export const INPUT_DROPPED = '\x00dropped'
+/** KeyParser saw an X10 mouse report: the terminal ignored SGR 1006. */
+export const X10_MOUSE = '\x00x10mouse'
 
 /**
  * Decoded stdin text → keys, across chunk boundaries. A key is one grapheme, one
@@ -375,6 +392,10 @@ export class KeyParser {
       return first ? [INPUT_DROPPED] : []
     }
     if (this.skipCsi || this.buf === '') return []
+    if (this.buf.startsWith('\x1b[M')) {
+      this.buf = ''
+      return [X10_MOUSE]
+    }
     this.buf = ''
     this.skipCsi = true
     return [INPUT_DROPPED]
@@ -431,6 +452,20 @@ export class KeyParser {
         const final = (k: number) => rest.charCodeAt(k) >= 0x40 && rest.charCodeAt(k) <= 0x7e
         let len = 0 // 0 = incomplete, -1 = ESC alone (then a plain key), -k = drop k bytes
         if (rest.length === 1) len = force ? -1 : 0
+        // X10 mouse report (a terminal that ignores SGR 1006): not parsed, only detected, and
+        // the TUI then turns mouse reporting off. Its 3 payload bytes are always >= 0x20, so
+        // a control byte (Ctrl-C) ends it and is read as its own key.
+        // shortcut: a payload byte >= 0x80 (column/row > 95) is merged by the UTF-8 decoder, so
+        // up to 2 chars can leak as keys once before mouse is off; parse bytes before the
+        // decoder only if a terminal in use ever answers in X10.
+        else if (rest.startsWith('\x1b[M')) {
+          let k = 3
+          while (k < 6 && k < rest.length && rest.charCodeAt(k) >= 0x20) k++
+          if (k < 6 && k === rest.length) break
+          out.push(X10_MOUSE)
+          i += k
+          continue
+        }
         else if (rest[1] === '[') {
           let j = 2
           while (j < rest.length && rest.charCodeAt(j) >= 0x20 && rest.charCodeAt(j) <= 0x3f) j++
@@ -503,12 +538,14 @@ const reselect = (state: TuiState, selected: string | undefined): TuiState => ({
   expanded: false,
   detail: undefined,
   scroll: 0,
+  back: 0,
 })
 
 export function nextKeyState(state: TuiState, key: string, now: number): { state: TuiState; action?: TuiAction } {
   // Raw mode turns Ctrl-C into a key (no SIGINT): it quits from every mode, prompt included.
   if (key === '\x03') return { state: { ...state, quit: true }, action: { type: 'quit' } }
   if (key === INPUT_DROPPED) return say(state, 'input — dropped an unfinished paste or escape sequence (no end in time or too long)', now)
+  if (key === X10_MOUSE) return { ...say(state, 'mouse — this terminal answers in X10, not SGR: mouse off; b/f scroll', now), action: { type: 'mouseOff' } }
   if (state.adding) {
     const closed: TuiState = { ...state, adding: false, resumeInput: '', inputKind: undefined, inputFor: undefined }
     if (key === '\x1b') return { state: closed }
@@ -603,7 +640,8 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
   }
 
   if (key === '\r' || key === '\n') {
-    if (!row) return { state }
+    // A project session has no episode to show: Enter keeps the mirror.
+    if (!row || row.project) return { state }
     const expanded = !state.expanded
     return {
       state: { ...state, expanded, scroll: 0, armedStop: undefined, ...(expanded ? {} : { detail: undefined }) },
@@ -611,12 +649,27 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
     }
   }
 
+  // b/f too: a Mac laptop has no PgUp/PgDn key, and some terminals keep them for their own window.
+  if (key === 'b' || key === 'f') key = key === 'b' ? PAGE_UP : PAGE_DOWN
+  // SGR mouse report (ESC [ < b ; x ; y M): button 64/65 is the wheel up/down; clicks are ignored.
+  const sgr = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(key)
+  if (sgr && sgr[1] !== '64' && sgr[1] !== '65') return { state }
+  const mouse = !!sgr
+  if (sgr) key = sgr[1] === '64' ? PAGE_UP : PAGE_DOWN
   if (key === PAGE_UP || key === PAGE_DOWN) {
-    if (!state.expanded) return { state }
+    // The viewport bounds the scroll; the wheel steps WHEEL_LINES, a key a viewport.
     const page = Math.max(1, state.page ?? 1)
+    const step = mouse ? WHEEL_LINES : page
+    if (!state.expanded) {
+      const m = state.mirror?.id === state.selected ? state.mirror : undefined
+      if (!m) return { state }
+      const max = Math.max(0, m.lines.length - page)
+      const cur = Math.min(state.back ?? 0, max)
+      return { state: { ...state, back: key === PAGE_UP ? Math.min(max, cur + step) : Math.max(0, cur - step) } }
+    }
     const max = state.scrollMax ?? Number.MAX_SAFE_INTEGER
     const cur = Math.min(state.scroll ?? 0, max)
-    const scroll = key === PAGE_UP ? Math.max(0, cur - page) : Math.min(max, cur + page)
+    const scroll = key === PAGE_UP ? Math.max(0, cur - step) : Math.min(max, cur + step)
     return { state: { ...state, scroll } }
   }
 
@@ -692,7 +745,7 @@ export function headerHints(state: TuiState, now: number): string[] {
 
 /** The selected row's key hints, longest first. */
 export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
-  if (r.project) return ['project session · read-only  Enter detail', 'read-only']
+  if (r.project) return ['project session · read-only  b/f scroll', 'read-only']
   if (state.viewer) return [`${READ_ONLY}  Enter detail`, '唯讀']
   const armed = (id: string) => state.armedStop?.id === id && now < state.armedStop.until
   const keys: [string, string][] = [['t', 'tell']]
@@ -724,8 +777,7 @@ export function emptyText(state: TuiState): string {
 }
 
 /** Lines of the detail view (R4.3): row state and result state are separate lines. */
-export function detailText(r: PanelRow, det: EpisodeDetail | { kind: 'project' }): string[] {
-  if (det.kind === 'project') return [`project session ${r.d.name}: not a ledger worker; no episode, no result`]
+export function detailText(r: PanelRow, det: EpisodeDetail): string[] {
   const out = [`row: ${r.state} · ${r.d.profile} ${r.d.name} · episode ${r.d.seq ?? 0}`]
   if (det.kind === 'no-episode') out.push('result: none — no episode yet (a resumed worker gets one at its first tell)')
   else if (det.kind === 'no-result') out.push(`result: not written yet · ${det.resultPath}`)
@@ -803,15 +855,18 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): S
   const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning}`
   const hints = headerHints(state, now)
   let title = ''
-  outer: for (const h of hints) {
-    for (const t of [` workers · ${counts} `, ` ${counts} `]) {
+  // As the band: the hint words go first, then the session id, then the counts; the name and version never
+  // (mods/README.md rule 11 in agent-scripts).
+  const name = ` workers${state.version ? ` v${state.version}` : ''}`
+  outer: for (const t of [`${name} · ${counts} `, `${name} · tmux ${tmuxRunning} `, `${name} `]) {
+    for (const h of hints) {
       if (cellWidth(t) + cellWidth(h) <= width) {
         title = `${t}${h}`
         break outer
       }
     }
   }
-  if (!title) title = ` ${counts} ${hints.at(-1)}`
+  if (!title) title = `${name} ${hints.at(-1)}`
   const titleLine = `${ANSI_FG_BLACK}${ANSI_BG_CYAN}${ANSI_BOLD}${padCells(truncateAnsi(title, width), width)}${ANSI_RESET}`
 
   const status: string[] = []
@@ -887,9 +942,13 @@ export function renderTuiLines(
     const color = r.project ? ANSI_COLOR_MAP['blue'] : (ANSI_COLOR_MAP[STATE_COLOR[r.state]] ?? '')
     const glyphStr = `${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}`
     lines.push(fit(`${digitPrefix}${glyphStr}${sanitizeAnsi(rowLabel(r, isSelected))}`))
-    if (!isSelected) continue
-    lines.push(...s.selExtra.slice(s.selExtra.length - lay.selExtra).map(fit))
-    if (lay.body === 0) continue
+  }
+  if (lay.more) lines.push(fit(`\x1b[2m  +${lay.hidden} more — j/k moves the selection\x1b[0m`))
+
+  // The row list stays put above; the selected row's hints and preview come after it.
+  const r = s.sel >= 0 ? state.rows[s.sel] : undefined
+  if (r) lines.push(...s.selExtra.slice(s.selExtra.length - lay.selExtra).map(fit))
+  if (r && lay.body > 0) {
     // The preview owns its rule, `lay.body` rows and a tail line in every state, so
     // the frame is `height` rows and the footer stays at the bottom (T1 C1).
     const rule = `\x1b[2m${'─'.repeat(Math.max(0, Math.min(width, 60) - 1))}\x1b[0m`
@@ -900,24 +959,27 @@ export function renderTuiLines(
       const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - lay.body))
       for (const l of all.slice(top, top + lay.body)) body.push(l || ' ')
       const end = Math.min(all.length, top + lay.body)
-      tail = `\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · PgUp/PgDn scroll · Enter mirror\x1b[0m`
+      tail = `\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · b/f scroll · Enter mirror\x1b[0m`
     } else {
       const m = state.mirror?.id === r.id ? state.mirror : undefined
       if (!m) body.push('\x1b[2mcapturing the pane…\x1b[0m')
       else if (m.error) body.push(`\x1b[33mcapture failed: ${sanitizeAnsi(m.error)}\x1b[0m`)
       else if (!m.lines.length) body.push('\x1b[2m(the pane is empty)\x1b[0m')
-      else for (const ml of m.lines.slice(-lay.body)) body.push(sanitizeAnsi(ml) || ' ')
-      tail = r.project
-        ? `\x1b[2mSee it whole: tmux attach -t ${exactSessionTarget(r.d.name)}\x1b[0m`
-        : `\x1b[2mSee it whole: agent-tmux ${r.d.profile} attach ${r.d.name}\x1b[0m`
+      const total = m?.lines.length ?? 0
+      const end = total - Math.min(state.back ?? 0, Math.max(0, total - lay.body))
+      if (m && !m.error && total) for (const ml of m.lines.slice(Math.max(0, end - lay.body), end)) body.push(sanitizeAnsi(ml) || ' ')
+      tail =
+        end < total
+          ? `\x1b[2mscrollback ${Math.max(1, end - lay.body + 1)}–${end} of ${total} · b/f scroll · f to the end follows live\x1b[0m`
+          : r.project
+            ? `\x1b[2mSee it whole: tmux attach -t ${exactSessionTarget(r.d.name)} · b scrollback\x1b[0m`
+            : `\x1b[2mSee it whole: agent-tmux ${r.d.profile} attach ${r.d.name} · b scrollback\x1b[0m`
     }
     lines.push(fit(rule))
     for (const l of body) lines.push(fit(l))
     for (let k = body.length; k < lay.body; k++) lines.push(' ')
     lines.push(fit(tail))
   }
-
-  if (lay.more) lines.push(fit(`\x1b[2m  +${lay.hidden} more — j/k moves the selection\x1b[0m`))
   const footer = s.footer.slice(s.footer.length - lay.footer).map(fit)
   // Every frame is `height` rows with the footer on the last ones, also when there is
   // no preview (no selection, or a window too short for one) (T1 C1/C5).
@@ -1005,7 +1067,8 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   const stdout = options.stdout ?? process.stdout
   // No invented owner. A missing id is a viewer (every row, labeled), never `tui-<pid>`.
   const session = options.session ?? process.env.TMUX_AGENT_SESSION
-  const cwd = options.cwd ?? process.cwd()
+  // A viewer is the whole machine (D-viewer): `/` lists every project's rows; --cwd narrows it.
+  const cwd = options.cwd ?? (session ? process.cwd() : '/')
   const base = options.host ?? nodeHost({ owner: session, cwd })
   const host: Host = options.root ? { ...base, envTmuxAgentDir: async () => options.root as string } : base
   const root = options.root ?? (await rootOf(host))
@@ -1022,6 +1085,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     resumeInput: '',
     quit: false,
     owner: host.owner(),
+    version: coreVersion(),
     viewer: !session,
   }
 
@@ -1071,6 +1135,11 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   let captureAgain = false
   // Set by a resize: the kept mirror was sized for the old layout.
   let resized = false
+  // Set by a user action (select, resize): the next capture fits the worker's window.
+  // The tick never fits, so two TUIs on one worker do not trade sizes each tick: the
+  // window follows the last TUI action, as tmux's window-size latest follows the last client.
+  // shortcut: a worker resized by another TUI or resumed under the same row keeps that size until reselected (j/k); refit on resume if it bites.
+  let fitPending = false
   /** True when a capture landed in `state.mirror`. */
   const captureSelected = async (): Promise<boolean> => {
     if (stopped) return false
@@ -1081,14 +1150,28 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (!state.selected || state.expanded) return false
     const row = state.rows.find(r => r.id === state.selected)
     if (!row) return false
-    const rows = layout().body
-    if (rows < 1) return false
+    const body = layout().body
+    if (body < 1) return false
     const gen = generation
     capturing = true
     let landed = false
     try {
-      const cap = row.project ? await mirrorProject(host, row.d.name, rows) : await mirrorOf(host, row.d, rows)
+      // The worker's screen is the view: size its window to the preview, as attach would.
+      // A viewer too (owner ruling 2026-10-15): read-only covers the ledger and the
+      // worker's input, not the size of a window nobody is attached to.
+      const fit = fitPending && !row.project
+      fitPending = false
+      const fitOut = fit ? await fitWorker(host, row.d, width, body) : undefined
+      // The whole scrollback, like `tmux attach`; the view shows a window of it (PgUp/PgDn).
+      // Colour on: every mirror line goes through sanitizeAnsi before it is printed.
+      const cap = row.project ? await mirrorProject(host, row.d.name, MIRROR_HISTORY, true) : await mirrorOf(host, row.d, MIRROR_HISTORY, true)
+      // A gone session is the capture's error to show; a live one that would not resize is said here.
+      if (fitOut && !fitOut.ok && !cap.error) say(fitOut.text)
       if (gen === generation && state.selected === row.id && !stopped) {
+        // Scrolled back: keep the same lines in view while new output lands below.
+        // shortcut: once the pane passes MIRROR_HISTORY lines the window drifts; pin by content if that bites.
+        const prev = state.mirror?.id === row.id ? state.mirror.lines.length : cap.lines.length
+        if (state.back) state.back += Math.max(0, cap.lines.length - prev)
         state.mirror = { id: row.id, ...cap }
         landed = true
       }
@@ -1107,6 +1190,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   const captureNow = () => {
     if (stopped || !state.selected || state.expanded || (state.mirror?.id === state.selected && !resized)) return
     resized = false
+    fitPending = true
     captureSelected()
       .then(landed => {
         if (landed) render()
@@ -1117,8 +1201,8 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   // Read-only, whole (R4.3). A read error is shown in the detail, not thrown.
   const loadDetail = async () => {
     const row = state.rows.find(r => r.id === state.selected)
-    if (!row || !state.expanded) return
-    const det: EpisodeDetail | { kind: 'project' } = row.project ? { kind: 'project' } : await episodeDetail(host, row.d)
+    if (!row || row.project || !state.expanded) return
+    const det = await episodeDetail(host, row.d)
     if (state.selected === row.id && state.expanded) state.detail = { id: row.id, lines: detailText(row, det) }
   }
 
@@ -1320,6 +1404,11 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (action.type === 'unlock') {
       const out = await unlockWorker(host, action.row.d.name, UNLOCK_WORD)
       say(`unlock ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
+      render()
+      return
+    }
+    if (action.type === 'mouseOff') {
+      stdout.write(ANSI_MOUSE_OFF)
       render()
       return
     }

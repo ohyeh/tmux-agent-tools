@@ -192,8 +192,6 @@ Output JSON shape:
 }
 ```
 
-For team state, `team quorum <team> --count N [--field <jq> --value <literal>] --json` counts present, valid worker results using each worker row's stored `result_path`. Use `--field .status --value success` to require a specific result value.
-
 If `watch` times out, run one structured liveness pass per worker: `status --json`, then `ping --json --timeout 5` for workers with `running:true` and high `idle_seconds`, then `result --json --wait 30`. If `diagnostic` shows an approval/permission prompt, attach and answer only with authorization. If ping fails and no result appears, report the worker as stalled with status JSON and one `capture --strip-ansi <name> 80` diagnostic tail.
 
 `wait-text` is literal-by-default. Add `--regex` only when you intentionally want regex matching. Literal markers may contain regex metacharacters like `[`, `]`, `(`, `)`, `.`, `*`, or `?` without escaping.

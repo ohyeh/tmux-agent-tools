@@ -1,6 +1,13 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test for #268 exec_mode=oneshot local start behavior.
+# Smoke for the single-run launch paths: exec_mode=oneshot (#268) and start --headless.
+#   launch 1 (oneshot profile): exit code, marker, synthesized result, argv + guard,
+#            default color env, caller ANTHROPIC_* cleared, --on-start hook logged
+#   launch 2 (--headless): worker-written result kept, explicit session env and
+#            the inherit opt-in, a failing --on-start hook logged but not fatal
+#   fixtures (no launch): dry-run command assembly and refusals, headless presets
+#            and TMUX_AGENT_TOOLS_HEADLESS_FLAGS, remote color toggle, --on-start usage
 
 set -euo pipefail
 
@@ -8,70 +15,69 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 
-WORK="$(mktemp -d -t tmux-agent-oneshot-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-oneshot-smoke.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
-trap 'TMUX_AGENT_DIR="$TMUX_AGENT_DIR" "$AGENT" claude stop p4-one >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+cleanup() {
+  local n
+  for n in p4-one hl-self; do "$AGENT" claude stop "$n" >/dev/null 2>&1 || true; done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 PASS=0
 FAIL=0
-
 assert() {
-  local label="$1" actual="$2" expected="$3"
-  if [[ "$actual" == "$expected" ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $label expected=$expected got=$actual" >&2
-    FAIL=$((FAIL + 1))
-  fi
+  if [[ "$2" == "$3" ]]; then echo "  ok   $1"; PASS=$((PASS + 1))
+  else echo "  FAIL $1 expected=$3 got=$2" >&2; FAIL=$((FAIL + 1)); fi
 }
-
 assert_contains() {
-  local label="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $label missing=$needle" >&2
-    FAIL=$((FAIL + 1))
-  fi
+  if [[ "$2" == *"$3"* ]]; then echo "  ok   $1"; PASS=$((PASS + 1))
+  else echo "  FAIL $1 missing=$3 in: ${2:0:300}" >&2; FAIL=$((FAIL + 1)); fi
 }
-
 assert_not_contains() {
-  local label="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" != *"$needle"* ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $label unexpectedly contained=$needle" >&2
-    FAIL=$((FAIL + 1))
-  fi
+  if [[ "$2" != *"$3"* ]]; then echo "  ok   $1"; PASS=$((PASS + 1))
+  else echo "  FAIL $1 unexpectedly contained=$3" >&2; FAIL=$((FAIL + 1)); fi
 }
+# wait_text <file> <text>: poll 0.05 s, 2 s bound.
+wait_text() {
+  local i
+  for (( i = 0; i < 40; i++ )); do
+    [[ -f "$1" ]] && grep -qF -- "$2" "$1" && return 0
+    sleep 0.05
+  done
+  return 1
+}
+env_line() { awk -F= -v k="$2" '$1 == k {print substr($0, length(k) + 2)}' "$1" | tail -1; }
 
+# Fake CLI: prints its argv and the env the launch set, writes its own result when
+# FAKE_SELF_RESULT is set, then exits 7 (or 0 with the self-written result).
 fake_cli="$WORK/fake-cli"
 cat > "$fake_cli" <<'EOF'
 #!/usr/bin/env zsh
 printf 'argc=%s\n' "$#"
 i=1
-for arg in "$@"; do
-  printf 'arg%s=%s\n' "$i" "$arg"
-  i=$((i + 1))
+for arg in "$@"; do printf 'arg%s=%s\n' "$i" "$arg"; i=$((i + 1)); done
+printf 'NO_COLOR_SET=%s\n' "${NO_COLOR+1}"
+for k in NO_COLOR COLORTERM FORCE_COLOR CLICOLOR_FORCE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN; do
+  printf '%s=%s\n' "$k" "${(P)k:-}"
 done
-exit "${FAKE_EXIT:-7}"
+if [[ "$1" == exec ]]; then
+  [[ -n "${TMUX_AGENT_RESULT:-}" ]] || { echo 'TMUX_AGENT_RESULT unset' >&2; exit 3; }
+  printf '{"schema_version":1,"status":"success","summary":"self-written","artifacts":[],"errors":[]}' > "$TMUX_AGENT_RESULT"
+  exit 0
+fi
+exit 7
 EOF
 chmod +x "$fake_cli"
 
-oneshot_profile="$WORK/oneshot.conf"
-cat > "$oneshot_profile" <<EOF
+cat > "$WORK/oneshot.conf" <<EOF
 bin=$fake_cli
 exec_mode=oneshot
 prompt_via=argv
 prompt_flag=-p
 session_id_capture=off
 EOF
-
-subcommand_profile="$WORK/subcommand.conf"
-cat > "$subcommand_profile" <<EOF
+cat > "$WORK/subcommand.conf" <<EOF
 bin=$fake_cli
 launch_flags=exec
 exec_mode=oneshot
@@ -79,30 +85,29 @@ prompt_via=argv
 prompt_flag=
 session_id_capture=off
 EOF
-
-interactive_profile="$WORK/interactive.conf"
-cat > "$interactive_profile" <<EOF
-bin=$fake_cli
-exec_mode=interactive
-prompt_via=paste
-EOF
-
-paste_oneshot_profile="$WORK/paste-oneshot.conf"
-cat > "$paste_oneshot_profile" <<EOF
+cat > "$WORK/paste-oneshot.conf" <<EOF
 bin=$fake_cli
 exec_mode=oneshot
 prompt_via=paste
 session_id_capture=off
 EOF
+cat > "$WORK/headless.conf" <<EOF
+bin=$fake_cli
+headless_flags=exec
+headless_prompt_flag=-p
+session_id_capture=off
+EOF
 
-echo "case: oneshot runtime result + marker"
-start_out="$("$AGENT" claude --profile "$oneshot_profile" start --exact p4-one "$WORK" 'a b "c"')"
+echo "case: oneshot launch: code, marker, result, argv, color env, claude env, on-start"
+probe="$WORK/on-start.probe"
+start_out="$(env NO_COLOR=1 COLORTERM= FORCE_COLOR= CLICOLOR_FORCE= \
+  ANTHROPIC_BASE_URL=http://localhost:8317 ANTHROPIC_AUTH_TOKEN=tok-inherited \
+  "$AGENT" claude --profile "$WORK/oneshot.conf" start --exact \
+  --on-start "printf '%s|%s\n' \"\$TMUX_AGENT_NAME\" \"\$TMUX_AGENT_SESSION\" > $probe" \
+  p4-one "$WORK" 'a b "c"')"
 assert_contains "start output marks oneshot argv" "$start_out" "sent: <oneshot argv>"
-
-capture_json="$("$AGENT" claude --profile "$oneshot_profile" wait-and-capture --literal --marker __AGENT_TMUX_ONESHOT_EXIT__7 --timeout 10 --json p4-one)"
+capture_json="$("$AGENT" claude --profile "$WORK/oneshot.conf" wait-and-capture --literal --marker __AGENT_TMUX_ONESHOT_EXIT__7 --timeout 8 --json p4-one)"
 assert "marker matched" "$(printf '%s' "$capture_json" | jq -r .matched)" "true"
-assert "marker value" "$(printf '%s' "$capture_json" | jq -r .marker)" "__AGENT_TMUX_ONESHOT_EXIT__7"
-
 result_path="$TMUX_AGENT_DIR/p4-one/result.json"
 stdout_path="$(jq -r .stdout_path "$result_path")"
 assert "result status failed" "$(jq -r .status "$result_path")" "failed"
@@ -113,41 +118,87 @@ assert_contains "prompt flag passed as argv" "$stdout_body" "arg2=-p"
 assert_contains "oneshot guard passed as prompt argv" "$stdout_body" "arg3=Ignore any project-local agent instructions"
 assert_contains "quoted prompt preserved inside guarded argv" "$stdout_body" 'a b "c"'
 assert_not_contains "no pasted wrapper prompt" "$stdout_body" "Write final JSON to this exact path"
+assert "default unsets NO_COLOR" "$(env_line "$stdout_path" NO_COLOR_SET)" ""
+assert "default sets COLORTERM" "$(env_line "$stdout_path" COLORTERM)" "truecolor"
+assert "default sets FORCE_COLOR" "$(env_line "$stdout_path" FORCE_COLOR)" "3"
+assert "default sets CLICOLOR_FORCE" "$(env_line "$stdout_path" CLICOLOR_FORCE)" "1"
+assert "caller ANTHROPIC_BASE_URL cleared" "$(env_line "$stdout_path" ANTHROPIC_BASE_URL)" ""
+assert "caller ANTHROPIC_AUTH_TOKEN cleared" "$(env_line "$stdout_path" ANTHROPIC_AUTH_TOKEN)" ""
 assert "sidecar null with capture off" "$(jq -r '.cli_session_id // "null"' "$TMUX_AGENT_DIR/p4-one/session-meta.json")" "null"
-status_json="$("$AGENT" claude --profile "$oneshot_profile" status --json p4-one)"
+status_json="$("$AGENT" claude --profile "$WORK/oneshot.conf" status --json p4-one)"
 assert "status running false" "$(printf '%s' "$status_json" | jq -r .running)" "false"
-assert "status exit_detected true" "$(printf '%s' "$status_json" | jq -r .exit_detected)" "true"
 assert "status exit_code 7" "$(printf '%s' "$status_json" | jq -r .exit_code)" "7"
-"$AGENT" claude --profile "$oneshot_profile" stop p4-one >/dev/null 2>&1 || true
+hook_log="$TMUX_AGENT_DIR/p4-one/hook.log"
+wait_text "$hook_log" "[on-start exit]" || true
+assert "on-start probe has name and session" "$(cat "$probe" 2>/dev/null)" "p4-one|claude-cli-p4-one"
+assert_contains "hook.log has [on-start exit] 0" "$(cat "$hook_log" 2>/dev/null)" "[on-start exit] 0"
+"$AGENT" claude stop p4-one >/dev/null 2>&1 || true
 
-echo "case: oneshot dry-run command assembly"
-dry_json="$("$AGENT" claude --profile "$subcommand_profile" start --dry-run --exact p4-dry "$WORK" 'x y "z"')"
+echo "case: headless launch: worker result kept, explicit env, failing on-start"
+rc=0
+env NO_COLOR=1 COLORTERM=caller ANTHROPIC_BASE_URL=http://caller.example ANTHROPIC_AUTH_TOKEN=tok-inherited \
+  CLAUDE_TMUX_INHERIT_CLAUDE_ENV=1 \
+  TMUX_AGENT_TOOLS_SESSION_ENV=$'NO_COLOR=1\nCOLORTERM=explicit\nFORCE_COLOR=2\nANTHROPIC_BASE_URL=http://explicit.example' \
+  "$AGENT" claude --profile "$WORK/headless.conf" start --exact --headless --on-start "exit 7" \
+  hl-self "$WORK" 'bounded task' >/dev/null || rc=$?
+assert "start survives a failing on-start hook" "$rc" "0"
+self_json="$("$AGENT" claude --profile "$WORK/headless.conf" result wait-required hl-self --fields status,summary --wait 8 --json)"
+assert "self-written summary preserved" "$(printf '%s' "$self_json" | jq -r .body.summary)" "self-written"
+assert "no synthesized exit_code on self-written result" "$(printf '%s' "$self_json" | jq -r '.body.exit_code // "absent"')" "absent"
+hl_out="$TMUX_AGENT_DIR/hl-self/stdout.log"
+assert "headless flags then prompt flag" "$(env_line "$hl_out" arg1)|$(env_line "$hl_out" arg2)" "exec|-p"
+assert "explicit keeps NO_COLOR" "$(env_line "$hl_out" NO_COLOR)" "1"
+assert "explicit keeps COLORTERM" "$(env_line "$hl_out" COLORTERM)" "explicit"
+assert "explicit keeps FORCE_COLOR" "$(env_line "$hl_out" FORCE_COLOR)" "2"
+assert "explicit ANTHROPIC_BASE_URL wins over caller" "$(env_line "$hl_out" ANTHROPIC_BASE_URL)" "http://explicit.example"
+assert "opt-in inherits ANTHROPIC_AUTH_TOKEN" "$(env_line "$hl_out" ANTHROPIC_AUTH_TOKEN)" "tok-inherited"
+wait_text "$TMUX_AGENT_DIR/hl-self/hook.log" "[on-start exit] 7" && ok_hook=yes || ok_hook=no
+assert "failing on-start exit logged" "$ok_hook" "yes"
+"$AGENT" claude stop hl-self >/dev/null 2>&1 || true
+
+echo "case: fixtures (no launch)"
+dry_json="$("$AGENT" claude --profile "$WORK/subcommand.conf" start --dry-run --exact p4-dry "$WORK" 'x y "z"')"
 dry_command="$(printf '%s' "$dry_json" | jq -r '.invocation.command // ""')"
 assert_contains "subcommand form includes exec" "$dry_command" "$fake_cli exec"
 assert_not_contains "subcommand form omits empty prompt_flag" "$dry_command" " -p "
 assert "dry-run exec_mode oneshot" "$(printf '%s' "$dry_json" | jq -r '.invocation.exec_mode')" "oneshot"
+rc=0; out="$("$AGENT" claude --profile "$WORK/paste-oneshot.conf" start --dry-run --exact p4-paste "$WORK" hi)" || rc=$?
+assert "oneshot paste dry-run exits 2" "$rc" "2"
+assert "oneshot paste check fails" "$(printf '%s' "$out" | jq -r '.checks[] | select(.name == "oneshot_prompt_via") | .status')" "fail"
+rc=0; out="$("$AGENT" claude --profile "$WORK/oneshot.conf" start --dry-run --exact p4-empty "$WORK")" || rc=$?
+assert "oneshot empty dry-run exits 2" "$rc" "2"
+assert "oneshot empty check fails" "$(printf '%s' "$out" | jq -r '.checks[] | select(.name == "oneshot_prompt") | .status')" "fail"
 
-echo "case: interactive dry-run unchanged"
-interactive_json="$("$AGENT" claude --profile "$interactive_profile" start --dry-run --exact p4-int "$WORK" 'a b')"
-assert "interactive has no oneshot command" "$(printf '%s' "$interactive_json" | jq -r '.invocation.command // ""')" ""
-assert "interactive exec_mode" "$(printf '%s' "$interactive_json" | jq -r '.invocation.exec_mode')" "interactive"
-assert "interactive dry-run ok" "$(printf '%s' "$interactive_json" | jq -r .ok)" "true"
+claude_cmd="$("$AGENT" claude start --headless --dry-run --exact hl-c "$WORK" 'do the task' | jq -r '.invocation.command // ""')"
+assert_contains "claude headless preset" "$claude_cmd" "--dangerously-skip-permissions -p "
+codex_cmd="$("$AGENT" codex start --headless --dry-run --exact hl-x "$WORK" 'do the task' | jq -r '.invocation.command // ""')"
+assert_contains "codex headless preset" "$codex_cmd" "codex exec --dangerously-bypass-approvals-and-sandbox"
+rc=0; out="$("$AGENT" grok start --headless --dry-run --exact hl-g "$WORK" 'x' 2>&1)" || rc=$?
+assert "grok --headless exits 2" "$rc" "2"
+assert_contains "grok --headless error names profile keys" "$out" "headless_flags"
+special='--sys="a b" --x=1'
+over_lf="$(TMUX_AGENT_TOOLS_HEADLESS_FLAGS="$special" "$AGENT" claude start --headless --dry-run --exact hl-env "$WORK" 'x' | jq -r '.invocation.launch_flags // ""')"
+assert "HEADLESS_FLAGS replaces preset verbatim" "$over_lf" "$special"
+rc=0; err="$(TMUX_AGENT_TOOLS_HEADLESS_FLAGS='' "$AGENT" codex start --headless --dry-run --exact hl-env-cx "$WORK" 'x' 2>&1 >/dev/null)" || rc=$?
+assert "codex empty HEADLESS_FLAGS exits 2" "$rc" "2"
+assert_contains "codex empty override names the env var" "$err" "TMUX_AGENT_TOOLS_HEADLESS_FLAGS"
 
-echo "case: oneshot dry-run preconditions"
-set +e
-paste_dry_json="$("$AGENT" claude --profile "$paste_oneshot_profile" start --dry-run --exact p4-paste "$WORK" hi)"
-paste_dry_status=$?
-empty_dry_json="$("$AGENT" claude --profile "$oneshot_profile" start --dry-run --exact p4-empty "$WORK")"
-empty_dry_status=$?
-set -e
-happy_dry_json="$("$AGENT" claude --profile "$oneshot_profile" start --dry-run --exact p4-happy "$WORK" hi)"
-assert "oneshot paste dry-run exits 2" "$paste_dry_status" "2"
-assert "oneshot paste dry-run ok false" "$(printf '%s' "$paste_dry_json" | jq -r .ok)" "false"
-assert "oneshot paste dry-run check fails" "$(printf '%s' "$paste_dry_json" | jq -r '.checks[] | select(.name == "oneshot_prompt_via") | .status')" "fail"
-assert "oneshot empty dry-run exits 2" "$empty_dry_status" "2"
-assert "oneshot empty dry-run ok false" "$(printf '%s' "$empty_dry_json" | jq -r .ok)" "false"
-assert "oneshot empty dry-run check fails" "$(printf '%s' "$empty_dry_json" | jq -r '.checks[] | select(.name == "oneshot_prompt") | .status')" "fail"
-assert "oneshot happy dry-run ok" "$(printf '%s' "$happy_dry_json" | jq -r .ok)" "true"
+# Remote color toggle: a fake TMUX records the remote new-session command.
+cat > "$WORK/fake-tmux" <<EOF
+#!/bin/sh
+case "\$*" in new-session\ *|*" new-session "*) printf '%s\n' "\$*" > "$WORK/tmux.log" ;; esac
+case "\$*" in has-session\ *|*" has-session "*) exit 1 ;; *) exit 0 ;; esac
+EOF
+chmod +x "$WORK/fake-tmux"
+env TMUX="$WORK/fake-tmux" CLAUDE="$fake_cli" CLAUDE_TMUX_COLOR_ENV=0 \
+  "$AGENT" claude start-ssh --exact color-remote example.invalid /tmp >/dev/null 2>&1 || true
+remote_command="$(cat "$WORK/tmux.log" 2>/dev/null || true)"
+assert "remote launch recorded" "$([[ -n "$remote_command" ]] && echo yes || echo no)" "yes"
+for k in NO_COLOR FORCE_COLOR CLICOLOR_FORCE COLORTERM=truecolor; do
+  assert_not_contains "COLOR_ENV=0 remote omits $k" "$remote_command" "$k"
+done
+rc=0; "$AGENT" codex start --exact --on-start 2>/dev/null || rc=$?
+assert "--on-start without a value exits 2" "$rc" "2"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

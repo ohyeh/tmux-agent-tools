@@ -158,7 +158,7 @@ Use `--max-lines`, `--max-bytes`, and repeated `--redact-pattern` on `summarize`
 
 ## Fanout (one-to-many)
 
-`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix `claude:` and `codex:` in a single call) or one per `--workdir` (legacy single-tool form). Each child writes its own `result.json` under `--result-dir`; the parent emits a consolidated summary on stdout (schema: `schemas/fanout-summary.schema.json`). The summary and per-child results are authoritative; do not scrape child panes in a fanout loop.
+`tmux-agent-fanout run` spawns one agent per `--agent tool:name` (mix `claude:` and `codex:` in a single call) or one per `--workdir` (all on the `--tool` CLI, default claude). Each child writes its own `result.json` under `--result-dir`; the parent emits a consolidated summary on stdout (schema: `schemas/fanout-summary.schema.json`). The summary and per-child results are authoritative; do not scrape child panes in a fanout loop.
 
 ```bash
 tmux-agent-fanout run \
@@ -174,4 +174,4 @@ tmux-agent-fanout run \
 - Failure isolation: each agent's `result.json` is preserved on disk even if a sibling fails or times out.
 - The wrappers have no `--no-cascade` flag. Enforce no-cascade by writing it into the prompt sent to every child.
 
-Daemon / async / supervisor-tree / cross-agent cancellation are deferred. See `docs/design-issue-184-fanout.md`.
+Daemon / async / supervisor-tree / cross-agent cancellation are deferred.

@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Wrapper-side Known limits closed by plan R8.4/R8.5 (tui-retro plan §2):
 #   a. name collision: a second start/resume of a live name refuses (a2: also
@@ -14,7 +15,14 @@ source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 #      starts. Exactly one wins; the loser writes none of the winner's state
 #      (result, launch state, pane-id); an empty or unreadable pane-id makes
 #      stop refuse
-#   f. the protocol docs name no `current` seq pointer (it has no writer/reader)
+#   h. a stop that verified the old pane cannot kill a replacement start
+#   i. start --dry-run refuses a bad workdir and leaves no session, state, or transcript
+#   j. a start that spawns the server leaves it on /, not the worker's directory
+#      (a deleted worker dir broke every later codex pane on the shared server);
+#      j2: self-test spawns its server on / too
+#   k. a start that spawns the default server loads no agent conf into it; the
+#      worker session alone gets the scoped options (mouse, vi copy-mode keys,
+#      history-limit, passthrough, status style)
 # Two private servers: B is tmux's default socket under a private TMUX_TMPDIR,
 # A is an explicit -S socket. Never the user's server.
 set -euo pipefail
@@ -24,7 +32,7 @@ REPO_ROOT="${SCRIPT_DIR:h}"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 COMMANDER="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-commander"
 
-WORK="$(mktemp -d -t tas-limits.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tas-limits.XXXXXX")"
 unset TMUX TMUX_PANE TMUX_AGENT_TMUX_SOCKET AGENT_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 export TMUX_AGENT_DIR="$WORK/state"
 export XDG_CONFIG_HOME="$WORK/xdg"
@@ -227,7 +235,7 @@ assert "g: A reached the cut point" "$([[ -e "$WORK/at-cut" ]] && echo yes || ec
 pid_b=$!
 # Before the fix B finishes at once (A is only paused); after it B waits on A's lock.
 winner=""
-for (( i = 0; i < 25; i++ )); do kill -0 $pid_b 2>/dev/null || { winner=B; break; }; sleep 0.1; done
+for (( i = 0; i < 20; i++ )); do kill -0 $pid_b 2>/dev/null || { winner=B; break; }; sleep 0.05; done
 code_a=0; code_b=0
 if [[ $winner == B ]]; then
   wait $pid_b || code_b=$?
@@ -289,12 +297,13 @@ assert "h: stop reached the cut point" "$([[ -e "$WORK/at-kill" ]] && echo yes |
 tmux_b kill-session -t '=wlim-hname'
 "$AGENT_TMUX" fakecli start --exact hname "$WORK/repo" >"$WORK/hb.out" 2>&1 &
 pid_n=$!
-sleep 1.5
+# A lockless start would bind its pane in this window; the fixed start waits on the stop (1 s).
+for (( i = 0; i < 20; i++ )); do [[ "$(tr -d '[:space:]' < "$H/pane-id" 2>/dev/null)" != "$old" ]] && break; sleep 0.05; done
 : > "$WORK/release-kill"
 wait $pid_s || true
 code_n=0; wait $pid_n || code_n=$?
 new="$(tmux_b display-message -p -t '=wlim-hname:' '#{pane_id}' 2>/dev/null || true)"
-print -r -- "  h: old=$old replacement=$new start_exit=$code_n"
+print -r -- "  h: old=$old replacement=$new start_exit=$code_n polls=$i"
 assert "h: the replacement start exits 0" "$code_n" 0
 assert "h: the replacement session survives the stale stop" "$(tmux_b has-session -t '=wlim-hname' 2>/dev/null && echo yes || echo no)" yes
 assert "h: pane-id is the replacement pane" "$(tr -d '[:space:]' < "$H/pane-id")" "$new"
@@ -307,9 +316,74 @@ assert "h: unknown name exits as before (0)" "$code" 0
 assert_contains "h: unknown name says Already stopped" "$out" "Already stopped"
 assert "h: no <state>/<name> dir was created" "$([[ -e "$TMUX_AGENT_DIR/nosuchname" ]] && echo yes || echo no)" no
 
-print -r -- "case f: the protocol docs name no \`current\` seq pointer"
-hits="$(cd "$REPO_ROOT" && grep -n '`current`' mods/tmux-agent/README.md README.md skills/tmux-agent-tools/SKILL.md skills/tmux-agent-tools/references/*.md || true)"
-assert "f: no \`current\` in the protocol docs" "$hits" ""
+print -r -- "case i: start --dry-run refuses a bad workdir and leaves no state"
+code=0
+out="$("$AGENT_TMUX" fakecli start --exact --dry-run dry /no/such/dir 2>&1)" || code=$?
+assert "i: bad workdir exits 2" "$code" 2
+assert "i: the bad-workdir check fails" "$(print -r -- "$out" | jq -r '.checks[] | select(.name=="workdir_exists") | .status' 2>/dev/null)" fail
+code=0
+out="$("$AGENT_TMUX" fakecli start --exact --dry-run --transcript "$WORK/dry.jsonl" dry "$WORK/repo" 2>&1)" || code=$?
+assert "i: a valid dry-run exits 0" "$code" 0
+assert "i: a valid dry-run says ok" "$(print -r -- "$out" | jq -r .ok 2>/dev/null)" true
+assert "i: no session" "$(tmux_b has-session -t '=wlim-dry' 2>/dev/null && echo yes || echo no)" no
+assert "i: no <state>/<name> dir" "$([[ -e "$TMUX_AGENT_DIR/dry" ]] && echo yes || echo no)" no
+assert "i: no transcript file" "$([[ -e "$WORK/dry.jsonl" ]] && echo yes || echo no)" no
+
+print -r -- "case j: a start that spawns the server leaves its cwd on /"
+smoke_socket j
+SOCK_J="$REPLY"
+mkdir -p "$WORK/jdir"
+( cd "$WORK/jdir" && TMUX_AGENT_TMUX_SOCKET="$SOCK_J" "$AGENT_TMUX" fakecli start --exact spawn . >/dev/null 2>&1 ) || true
+jpid="$(command env -u TMUX "$REAL_TMUX" -S "$SOCK_J" display -p '#{pid}' 2>/dev/null || true)"
+assert "j: server cwd is /" "$(lsof -a -p "${jpid:-0}" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" /
+assert "j: the pane still runs in the worker dir" \
+  "$(command env -u TMUX "$REAL_TMUX" -S "$SOCK_J" display -p -t '=wlim-spawn:' '#{pane_start_path}' 2>/dev/null)" "$WORK/jdir"
+assert "j: the server on the named socket loaded the agent conf" \
+  "$(command env -u TMUX "$REAL_TMUX" -S "$SOCK_J" show -gv mouse 2>/dev/null)" on
+assert "j: the conf sets the scoped options globally there" \
+  "$(command env -u TMUX "$REAL_TMUX" -S "$SOCK_J" show -gv history-limit 2>/dev/null)" 50000
+TMUX_AGENT_TMUX_SOCKET="$SOCK_J" "$AGENT_TMUX" fakecli stop spawn >/dev/null 2>&1 || true
+
+print -r -- "case j2: self-test spawns its server on /, not the caller's directory"
+smoke_socket j2
+SOCK_J2="$REPLY"
+( cd "$WORK/jdir" && TMUX_AGENT_TMUX_SOCKET="$SOCK_J2" "$AGENT_TMUX" claude self-test >"$WORK/selftest.out" 2>&1 ) &
+st_pid=$!
+# Earlier self-test steps start workers (already via tmux_spawn), and the server
+# exits when they stop; the watch-count step's bare new-session spawns the next one.
+j2pid=""
+for (( i = 0; i < 300; i++ )); do
+  if command env -u TMUX "$REAL_TMUX" -S "$SOCK_J2" list-sessions -F '#{session_name}' 2>/dev/null | grep -q st-watch-count; then
+    j2pid="$(command env -u TMUX "$REAL_TMUX" -S "$SOCK_J2" display -p '#{pid}' 2>/dev/null || true)"
+    break
+  fi
+  sleep 0.1
+done
+assert "j2: self-test server cwd is /" "$(lsof -a -p "${j2pid:-0}" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" /
+code=0; wait "$st_pid" || code=$?
+assert "j2: self-test exits 0" "$code" 0
+command env -u TMUX "$REAL_TMUX" -S "$SOCK_J2" kill-server 2>/dev/null || true
+
+print -r -- "case k: a start that spawns the default server leaves its global options alone"
+tmux_b kill-server 2>/dev/null || true
+"$AGENT_TMUX" fakecli start --exact defopt "$WORK/repo" >/dev/null 2>&1 || true
+assert "k: the worker is on the default server" "$(tmux_b has-session -t '=wlim-defopt' 2>/dev/null && echo yes || echo no)" yes
+assert "k: global mouse is tmux's default" "$(tmux_b show -gv mouse 2>/dev/null)" off
+assert "k: global status-left is not the agent conf's" "$(tmux_b show -gv status-left 2>/dev/null | grep -c Claude || true)" 0
+assert "k: the worker session has mouse on" "$(tmux_b show -t wlim-defopt -v mouse 2>/dev/null)" on
+assert "k: the worker window has vi copy-mode keys" "$(tmux_b show -wv -t '=wlim-defopt:' mode-keys 2>/dev/null)" vi
+assert "k: the worker pane keeps 50000 lines" "$(tmux_b display -p -t '=wlim-defopt:' '#{history_limit}' 2>/dev/null)" 50000
+assert "k: the worker window allows passthrough" "$(tmux_b show -wv -t '=wlim-defopt:' allow-passthrough 2>/dev/null)" on
+assert "k: the worker session has the agent status style" "$(tmux_b show -v -t wlim-defopt status-style 2>/dev/null)" "bg=#020617,fg=#e5e7eb"
+assert "k: global history-limit is tmux's default" "$(tmux_b show -gv history-limit 2>/dev/null)" 2000
+assert "k: global allow-passthrough is tmux's default" "$(tmux_b show -gwv allow-passthrough 2>/dev/null)" off
+assert "k: global status-style is tmux's default" "$(tmux_b show -gv status-style 2>/dev/null)" "bg=green,fg=black"
+"$AGENT_TMUX" fakecli stop defopt >/dev/null 2>&1 || true
+code=0
+AGENT_TMUX_MOUSE=bogus "$AGENT_TMUX" fakecli start --exact badmouse "$WORK/repo" >/dev/null 2>&1 || code=$?
+assert "k: a mouse value tmux rejects fails before any session" \
+  "$code/$(tmux_b has-session -t '=wlim-badmouse' 2>/dev/null && echo yes || echo no)" 2/no
+tmux_b kill-server 2>/dev/null || true
 
 print -r -- "pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))

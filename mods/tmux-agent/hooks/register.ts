@@ -19,6 +19,7 @@ import {
   BASH_GATE_RE,
   HELP_RE,
   PANEL_KEY,
+  FOLD_KEY,
   POLL_MS,
   ORPHAN_MS,
   MIRROR_MS,
@@ -35,6 +36,10 @@ import {
   type TellInput,
   type StopInput,
   type PeekInput,
+  type AwaitInput,
+  awaitWorker,
+  AWAIT_MAX_SECONDS,
+  AWAIT_DEFAULT_SECONDS,
   type KeysInput,
   type Host,
   displayCells,
@@ -93,7 +98,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.46.0'
+const MOD_VERSION = '0.46.13'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -118,6 +123,7 @@ const PEEK_TOOL = 'mcp__tmux-agent__peek'
 const KEYS_TOOL = 'mcp__tmux-agent__keys'
 const RELOAD_TOOL = 'mcp__tmux-agent__reload'
 const PANEL_TOOL = 'mcp__tmux-agent__panel'
+const AWAIT_TOOL = 'mcp__tmux-agent__await'
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
 // The $.tmux contract (types/index.d.ts) must stay self-contained, so it restates
 // the record types; these two lines hold it to the core's definitions.
@@ -624,6 +630,24 @@ export const register: Register = on => {
     })
 
     await $.tool.register({
+      name: 'await',
+      description:
+        'Wait for one episode of a worker and return its result in THIS loop — for a workflow agent or subagent, ' +
+        'whose result the collector would otherwise deliver only to the owner session. Blocks up to max_seconds, ' +
+        `then returns the terminal result, or pending with a progress snapshot (call again). A read: it acks nothing, ` +
+        'so the owner session still gets one notice. In the main loop, end the turn instead; the collector wakes you.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'worker name as the assign receipt returned it' },
+          seq: { type: 'number', description: 'episode number (1 = the assign, each tell adds one); default the latest' },
+          max_seconds: { type: 'number', description: `seconds to wait (default ${AWAIT_DEFAULT_SECONDS}, max ${AWAIT_MAX_SECONDS})` },
+        },
+        required: ['name'],
+      },
+    })
+
+    await $.tool.register({
       name: 'peek',
       description:
         'Look at a worker mid-flight, or at a project tmux session currently listed on /workers: ' +
@@ -643,9 +667,9 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'reload',
       description:
-        'Reload this session\'s plugins, so an update already installed with `claude plugin update` takes ' +
-        'effect without a restart. Runs /reload-plugins once the current turn ends; the panel title then ' +
-        'shows the new mod version.',
+        'Reload this session\'s plugins and skills, so an update already installed with `claude plugin update` ' +
+        'or `npx skills update -g` takes effect without a restart. Runs /reload-plugins, then /reload-skills, ' +
+        'once the current turn ends; the panel title then shows the new mod version.',
       inputSchema: { type: 'object', properties: {} },
     })
 
@@ -703,13 +727,14 @@ export const register: Register = on => {
     // condition measured in quarter-hours.
     await reconcileOnce(host, gate, false)
 
-    // A reload closed this session's panel (the module's state went with it):
-    // open it again, through the same code /workers runs.
-    const open = await host.storeGet(PANEL_KEY).catch((error: unknown) => {
+    // The panel is there from the session start (and again after a reload), folded until the person opens it,
+    // unless they hid it in this session: through the same code /workers runs.
+    const hidden = await host.storeGet(PANEL_KEY).catch((error: unknown) => {
       host.log(`tmux-agent: panel state unreadable: ${String(error)}`)
       return undefined
     })
-    if (Array.isArray(open) && open.includes(sessionId)) {
+    panel.folded = (await host.storeGet(FOLD_KEY).catch(() => undefined)) !== 'open'
+    if (!(Array.isArray(hidden) && hidden.includes(sessionId))) {
       $.clock.after(0, async () => {
         if (panel.open) return
         const failed = await openPanel(
@@ -847,13 +872,13 @@ export const register: Register = on => {
     const compact = used > e.props.maxRows
     if (compact) panel.rows_available = 0
 
-    if (down && !compact) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `⚠ ${down}` }))
+    // A stall is a warning, not a footnote: it keeps its colour (never dim-only).
+    if (down && !compact) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `⚠ ${down}` }))
     // The header names the keys: this is the only place a person learns them.
     // `r`/`x`/`q` press only while the band is focused; digits from an empty
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
-    // The hint names the slash commands: they work in any terminal, where a
-    // letter hotkey needs the band focused and ctrl+x tab may never arrive.
-    // The title, `[ refresh ]` and `[ hide ]`; the hint is padded so the bar
+    // No prose help in the bar: the slash commands live in the compact line.
+    // The title, `[ refresh ]` and `[ hide ]`; a blank filler is padded so the bar
     // spans the row up to the engine's own `[-]` collapse control, which the band
     // draws over its last cells (observed live: it covered `[ hide ]`).
     const tmuxRunning = panel.rows.filter(r => !r.project && !r.terminal).length
@@ -861,7 +886,8 @@ export const register: Register = on => {
     // (asked 2026-09-26: the 專案 count told less than whose panel it is; the
     // project rows still say 專案 themselves).
     const me = world?.owner()
-    const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning} · 內部 ${panel.internal}`
+    const tally = `tmux ${tmuxRunning} · 內部 ${panel.internal}`
+    const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}${tally}`
     // `[ clear ]` stops every worker this mod started; drawn only when there is one.
     const clearable = panel.rows.some(r => !r.project)
     const clearArmed = panel.armedStop?.id === CLEAR_ID && now < panel.armedStop.until
@@ -872,6 +898,7 @@ export const register: Register = on => {
     const cellsOf = (words: boolean) =>
       displayCells(words ? '[ + new ][ ↻ refresh ][ ⧉ tui ]' : '[ + ][ ↻ ][ ⧉ ]') +
       (clearable ? displayCells(`[ ${clearLabel} ]`) : 0) +
+      displayCells(words ? '[ ▾ fold ]' : '[ ▾ ]') +
       displayCells('[ hide ]') +
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
@@ -883,16 +910,11 @@ export const register: Register = on => {
     // (2026-10-02 screenshot). There only the title Text carries the accent.
     const barBg = e.surface === 'desktop' ? undefined : PANEL_ACCENT
     const buttonCells = cellsOf(words)
-    const titleText = displayCells(full) + buttonCells <= width ? full : ` ${counts} `
+    // The name and version always stay (mods/README.md rule 11): the session id goes first, then the counts.
+    const name = ` workers v${MOD_VERSION} `
+    const titleText = [full, ` workers v${MOD_VERSION} · ${tally} `, name].find(t => displayCells(t) + buttonCells <= width) ?? name
     const titleCells = displayCells(titleText) + buttonCells
     const hintRoom = Math.max(0, width - titleCells)
-    // Whole pieces, dropped from the right: a sliced hint ended mid-command
-    // ("· /workers stop <" at 72 columns).
-    let hint = ''
-    for (const piece of ['  /workers stop <name>', ' · /workers tell <name> <text>']) {
-      if (displayCells(hint) + displayCells(piece) + 1 > hintRoom) break
-      hint += piece
-    }
     // A coloured title bar marks where the panel starts, so its rows do not read
     // as the session's own output. Background, not a border: a border costs two
     // of the band's few rows, and the mirror needs them.
@@ -951,14 +973,29 @@ export const register: Register = on => {
                 }),
               ]
             : []),
-          Text({ color: barBg ? 'black' : undefined, dimColor: !barBg, backgroundColor: barBg, wrap: 'truncate-end', children: padCells(hint, hintRoom) }),
+          Text({ color: barBg ? 'black' : undefined, dimColor: !barBg, backgroundColor: barBg, wrap: 'truncate-end', children: padCells('', hintRoom) }),
           // Last and apart from refresh: hiding is undone by /workers, but it should
           // not sit one key away from the button people press most.
-          Button({ key: 'close', label: 'hide', hotkey: 'q', dimColor: true, onPress: () => void panel.close?.() }),
+          // Fold keeps the title bar (counts and the stall line still show); hide takes the band away.
+          Button({
+            key: 'fold',
+            label: words ? (panel.folded ? '▸ open' : '▾ fold') : panel.folded ? '▸' : '▾',
+            onPress: () => {
+              panel.folded = !panel.folded
+              $.ui.invalidate('ui.render')
+              const w = world
+              if (w) void w.storeSet(FOLD_KEY, panel.folded ? 'folded' : 'open').catch(err => w.log(`tmux-agent: fold not saved: ${String(err)}`))
+            },
+          }),
+          Button({ key: 'close', label: 'hide', hotkey: 'q', onPress: () => void panel.close?.() }),
         ],
       }),
     )
 
+    if (panel.folded) {
+      panel.rows_available = 0
+      return Box({ flexDirection: 'column', children: [below, ...children] })
+    }
     if (compact) {
       if (e.props.maxRows >= 2) {
         children.push(
@@ -1533,6 +1570,20 @@ export const register: Register = on => {
     return out.ok ? { result: out.text } : { deny: `tmux-agent: ${out.text}` }
   }).catch(($, e, next) => toolFailed(PEEK_TOOL, next.error))
 
+  on('tool.call', { tool: AWAIT_TOOL }, async ($, e) => {
+    const input = e as unknown as AwaitInput
+    if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
+    const host = world
+    if (!host) return { deny: 'tmux-agent: the mod did not bind' }
+    const eps = (await scan(host, { claim: false })).episodes.get(input.name) ?? []
+    const d = typeof input.seq === 'number' ? eps.find(x => x.seq === input.seq) : eps.at(-1)
+    if (!d) {
+      return { deny: eps.length ? `tmux-agent: "${input.name}" has no episode ${input.seq} (episodes: ${eps.map(x => x.seq).join(', ')})` : `tmux-agent: no worker "${input.name}" was dispatched by this mod` }
+    }
+    const out = await awaitWorker(host, d, typeof input.max_seconds === 'number' ? input.max_seconds : AWAIT_DEFAULT_SECONDS, d === eps.at(-1))
+    return out.ok ? { result: out.text } : { deny: `tmux-agent: ${out.text}` }
+  }).catch(($, e, next) => toolFailed(AWAIT_TOOL, next.error))
+
   on('tool.call', { tool: KEYS_TOOL }, async ($, e) => {
     const input = e as unknown as KeysInput
     if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
@@ -1565,13 +1616,12 @@ export const register: Register = on => {
   // $.command.run rejects there); a timer queues it for when the session is idle.
   // Before this, every update waited for the person to type /reload-plugins.
   on('tool.call', { tool: RELOAD_TOOL }, async $ => {
-    $.clock.after(0, () =>
-      $.command.run({ command: 'reload-plugins' }).then(
-        () => undefined,
-        err => $.ui.log(`/reload-plugins failed: ${String(err)}`),
-      ),
-    )
-    return { result: `/reload-plugins is queued for when this turn ends (mod ${MOD_VERSION} now).` }
+    $.clock.after(0, async () => {
+      for (const command of ['reload-plugins', 'reload-skills'] as const) {
+        await $.command.run({ command }).catch(err => $.ui.log(`/${command} failed: ${String(err)}`))
+      }
+    })
+    return { result: `/reload-plugins and /reload-skills are queued for when this turn ends (mod ${MOD_VERSION} now).` }
   }).catch(($, e, next) => toolFailed(RELOAD_TOOL, next.error))
 
   // While this mod is loaded the wrapper verbs have tools, and the collector owns

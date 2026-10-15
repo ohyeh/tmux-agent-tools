@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Clean-install smoke for the MCP bundle (plan R7.1/R7.2): copy ONLY the skill
 # dir to a temp path with a space, outside the repo, with no node_modules on any
 # resolution path and NODE_PATH unset. Start tmux-agent-mcp through a symlink and
@@ -10,6 +11,10 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
+
+# Adapter source contracts (ownership, ack, restart, malformed I/O, reserve) that the
+# bundle lifecycle below does not reach; needs mcp-adapter's installed devDependencies.
+node "$REPO_ROOT/mcp-adapter/test/adapter-smoke.js" || { echo "  FAIL mcp-adapter/test/adapter-smoke.js" >&2; exit 1; }
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/tmux agent mcp.XXXXXX")"
 tmp="${tmp:A}"

@@ -1,18 +1,25 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+# Smoke test for the waits that hand control back: supervise (silent until a
+# terminal result, seed/empty results not terminal, lost liveness terminal),
+# wait-and-capture --wait-for-human (outlives its timeout until the marker),
+# and tmux-agent-monitor --stop-on-change. The slow waits run side by side.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+MONITOR="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-monitor"
 WRAPPER="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-WORK="$(mktemp -d -t tmux-agent-supervise-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-supervise-smoke.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
-trap '"$WRAPPER" stop supervise-ok >/dev/null 2>&1 || true; "$WRAPPER" stop supervise-lost >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+trap '"$WRAPPER" stop supervise-ok >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 cat > "$WORK/fake-cli" <<'EOF'
 #!/bin/sh
-sleep 60
+printf 'fake ready\n'
+while IFS= read -r _; do :; done
 EOF
 chmod +x "$WORK/fake-cli"
 
@@ -25,49 +32,81 @@ assert() {
     echo "  FAIL $label expected=$expected got=$actual" >&2; fail=$((fail + 1))
   fi
 }
+# Finished result.json shapes; status=success needs a non-empty summary.
+result() { printf '{"schema_version":1,"status":"success","summary":"%s","artifacts":[],"errors":[]}\n' "$1"; }
 
-echo "case: unchanged state is silent until terminal result"
 CODEX="$WORK/fake-cli" "$WRAPPER" start --exact supervise-ok "$WORK" >/dev/null
-out="$WORK/supervise.out"
-set +e
-"$WRAPPER" supervise --timeout 15 --interval 1 --result-required --silent-while-unchanged --json supervise-ok >"$out" &
-pid=$!
-set -e
-sleep 2
-assert "no output while unchanged" "$([[ -s "$out" ]] && echo noisy || echo silent)" "silent"
-mkdir -p "$TMUX_AGENT_DIR/supervise-ok"
-printf '%s\n' '{"schema_version":1,"status":"success","summary":"done","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/supervise-ok/result.json"
-sup_code=0
-wait "$pid" || sup_code=$?
-assert "terminal supervise exit" "$sup_code" "0"
-assert "terminal event" "$(jq -r .event "$out")" "terminal"
-assert "terminal status" "$(jq -r .status "$out")" "success"
-assert "terminal does not guess worker liveness" "$(jq -r 'has("worker_alive")' "$out")" "false"
+CODEX="$WORK/fake-cli" "$WRAPPER" start --exact supervise-lost "$WORK" >/dev/null
+"$WRAPPER" stop supervise-lost >/dev/null
+"$WRAPPER" wait-text supervise-ok "fake ready" 2 >/dev/null
 
-echo "case: #317 result init seed must not satisfy terminal"
+# Background: supervise waiting on supervise-ok, and a wait-for-human on the
+# same pane whose 1 s --timeout must not end it.
+sup_out="$WORK/supervise.out"
+"$WRAPPER" supervise --timeout 15 --interval 1 --result-required --silent-while-unchanged --json supervise-ok >"$sup_out" &
+sup_pid=$!
+wfh_out="$WORK/wfh.json"
+marker="HUMAN-wfh-DONE"
+"$WRAPPER" wait-and-capture --wait-for-human --cancel-file "$WORK/wfh.cancel" \
+  --marker "$marker" --timeout 1 --json supervise-ok >"$wfh_out" 2>"$WORK/wfh.err" &
+wfh_pid=$!
+
+echo "case: #317 seed and empty-summary results are not terminal"
 "$WRAPPER" result init seed-probe >/dev/null
-seed_status="$(jq -r .status "$TMUX_AGENT_DIR/seed-probe/result.json")"
-assert "init seeds non-terminal status" "$seed_status" "pending"
+assert "init seeds non-terminal status" "$(jq -r .status "$TMUX_AGENT_DIR/seed-probe/result.json")" "pending"
 seed_val="$("$WRAPPER" result validate seed-probe --json 2>/dev/null)"
-assert "seed is schema-valid" "$(printf '%s' "$seed_val" | jq -r .valid)" "true"
-assert "seed canonical is non-terminal" "$(printf '%s' "$seed_val" | jq -r .canonical_status)" "pending"
-seed_code=0
-seed_out="$("$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json seed-probe)" || seed_code=$?
-assert "seed does not report terminal success" "$seed_code" "1"
-assert "seed supervise event is not terminal" "$(printf '%s' "$seed_out" | jq -r '.event != "terminal"')" "true"
-# A legacy-shaped success seed (empty summary) must also be rejected: supervise
-# enforces the same non-empty completion evidence as `result wait-required`.
-printf '%s\n' '{"schema_version":1,"status":"success","summary":"","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/seed-probe/result.json"
-empty_code=0
-empty_out="$("$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json seed-probe)" || empty_code=$?
-assert "empty-summary success is not terminal" "$empty_code" "1"
-assert "empty-summary success event is not terminal" "$(printf '%s' "$empty_out" | jq -r '.event != "terminal"')" "true"
-# Backward compat: a real success with a non-empty summary still terminates.
-printf '%s\n' '{"schema_version":1,"status":"success","summary":"did the thing","artifacts":[],"errors":[]}' > "$TMUX_AGENT_DIR/seed-probe/result.json"
-ok_code=0
-ok_out="$("$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json seed-probe)" || ok_code=$?
-assert "non-empty summary success is terminal" "$ok_code" "0"
-assert "non-empty summary success event" "$(printf '%s' "$ok_out" | jq -r .event)" "terminal"
+assert "seed is schema-valid, canonical pending" "$(jq -r '"\(.valid) \(.canonical_status)"' <<< "$seed_val")" "true pending"
+mkdir -p "$TMUX_AGENT_DIR/empty-probe" "$TMUX_AGENT_DIR/done-probe"
+result "" > "$TMUX_AGENT_DIR/empty-probe/result.json"
+result "did the thing" > "$TMUX_AGENT_DIR/done-probe/result.json"
+probe_pids=()
+for n in seed-probe empty-probe done-probe; do
+  "$WRAPPER" supervise --timeout 1 --interval 1 --result-required --silent-while-unchanged --json "$n" >"$WORK/$n.out" &
+  probe_pids+=($!)
+done
+
+echo "case: tmux-agent-monitor stop-on-change"
+cat > "$WORK/change-command.sh" <<'EOF'
+#!/bin/sh
+state="$1"
+if [ -f "$state" ]; then
+  printf 'changed\n'
+else
+  printf 'initial\n'
+  : > "$state"
+fi
+EOF
+chmod +x "$WORK/change-command.sh"
+cat > "$WORK/monitor-manifest.json" <<EOF
+{
+  "commands": [
+    {"name": "steady", "command": "printf steady"},
+    {"name": "empty_stdout", "command": "true"},
+    {"name": "flip", "command": "$WORK/change-command.sh $WORK/flip.state"},
+    {"name": "false_cmd", "command": "false"}
+  ],
+  "expected": {
+    "steady": {"stdout": "steady", "exit_code": 0},
+    "empty_stdout": {"stdout": "", "exit_code": 0},
+    "flip": {"stdout": "initial", "exit_code": 0},
+    "false_cmd": {"exit_code": 1}
+  }
+}
+EOF
+monitor_jsonl="$WORK/monitor.jsonl"
+monitor_summary="$WORK/monitor-summary.json"
+"$MONITOR" --name smoke --every 1s --until 5s --commands "$WORK/monitor-manifest.json" \
+  --stop-on-change --summary-out "$monitor_summary" --json > "$monitor_jsonl"
+assert "monitor: two ticks of observations" "$(jq -r 'select(.event=="observation") | .name' "$monitor_jsonl" | wc -l | tr -d ' ')" "8"
+assert "monitor: one changed output" "$(jq -r '.changed' "$monitor_jsonl" | grep -c '^true$' | tr -d ' ')" "1"
+assert "monitor: summary reason changed, also printed" "$(jq -r .reason "$monitor_summary") $(tail -1 "$monitor_jsonl" | jq -r .event)" "changed summary"
+
+codes=()
+for p in "${probe_pids[@]}"; do code=0; wait "$p" || code=$?; codes+=($code); done
+assert "supervise exits: seed 1, empty 1, done 0" "${codes[*]}" "1 1 0"
+assert "seed: not terminal" "$(jq -r '.event != "terminal"' "$WORK/seed-probe.out")" "true"
+assert "empty summary: not terminal" "$(jq -r '.event != "terminal"' "$WORK/empty-probe.out")" "true"
+assert "non-empty summary: terminal" "$(jq -r .event "$WORK/done-probe.out")" "terminal"
 
 echo "case: ownership flags are explicit"
 flags_code=0
@@ -75,12 +114,24 @@ flags_code=0
 assert "missing ownership flags rejected" "$flags_code" "2"
 
 echo "case: lost liveness is terminal without capture"
-CODEX="$WORK/fake-cli" "$WRAPPER" start --exact supervise-lost "$WORK" >/dev/null
-"$WRAPPER" stop supervise-lost >/dev/null
 code=0
-lost="$($WRAPPER supervise --timeout 5 --interval 1 --result-required --silent-while-unchanged --json supervise-lost)" || code=$?
-assert "lost liveness exit" "$code" "1"
-assert "lost liveness event" "$(printf '%s' "$lost" | jq -r .event)" "lost-liveness"
+lost="$("$WRAPPER" supervise --timeout 5 --interval 1 --result-required --silent-while-unchanged --json supervise-lost)" || code=$?
+assert "lost liveness exit 1, event" "$code $(jq -r .event <<< "$lost")" "1 lost-liveness"
+
+echo "case: wait-for-human outlives its timeout; supervise silent while unchanged"
+# By now (monitor's 1 s tick and the 1 s supervise runs) the 1 s --timeout is past.
+assert "wait-for-human still waiting" "$(kill -0 "$wfh_pid" 2>/dev/null && echo alive || echo gone)" "alive"
+state_file="$TMUX_AGENT_DIR/supervise-ok/awaiting-next-round.json"
+assert "awaiting state" "$(jq -r .state "$state_file" 2>/dev/null)" "awaiting_next_round"
+assert "no supervise output while unchanged" "$([[ -s "$sup_out" ]] && echo noisy || echo silent)" "silent"
+tmux send-keys -t "codex-cli-supervise-ok" "$marker" Enter
+code=0; wait "$wfh_pid" || code=$?
+assert "wait-for-human matched" "$code $(jq -r '"\(.matched) \(.reason)"' "$wfh_out")" "0 true matched"
+assert "awaiting resolved" "$(jq -r .state "$state_file")" "resolved"
+result done > "$TMUX_AGENT_DIR/supervise-ok/result.json"
+code=0; wait "$sup_pid" || code=$?
+assert "terminal supervise exit" "$code" "0"
+assert "terminal event, status, no liveness guess" "$(jq -r '"\(.event) \(.status) \(has("worker_alive"))"' "$sup_out")" "terminal success false"
 
 echo "supervise smoke: $pass passed, $fail failed"
 (( fail == 0 ))

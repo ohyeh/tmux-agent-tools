@@ -2,6 +2,105 @@
 
 ## Unreleased
 
+## v0.46.13 - 2026-10-16
+
+- Not verified: Linux; a reload with the panel unfolded seen live (contract tests only).
+- Band: every session opens the panel at its start, folded to the title bar until `[ ▸ open ]` is pressed. The fold choice is kept across sessions (`tmux-agent.fold`, absent = folded). `/workers` hiding the panel is kept for that session only.
+- Store: `tmux-agent.panel` (the sessions with the panel open) is replaced by `tmux-agent.panel-hidden` (the sessions that hid it, the newest 20). No migration: an old key is ignored.
+
+## v0.46.12 - 2026-10-16
+
+- Not verified: Linux; the band and the TUI seen rendered live in a terminal (contract tests only); the band's yellow on the desktop surface.
+- Band: the title bar no longer carries the `/workers stop <name> · /workers tell <name> <text>` hint; the bar is padded blank up to `[ hide ]`. The slash commands still show on the compact line when the band is too short for a row.
+- Band: the `⚠` collector-down line is yellow, not dim: a stall is a warning.
+- TUI: the title names its version (` workers v0.46.12 · …`), read from `AGENT_TMUX_VERSION` beside `lib/` (the value version-sync ties to the band's `MOD_VERSION`). When the title is short of room, the hint words go first, then the session id, then the counts; the name and version always stay (before: the name went first; at 80 columns with a session the hints now show as `[ n ] [ + ] [ r ] …`).
+- Band: `[ ▾ fold ]` folds the band to its title bar (`[ ▸ open ]` brings the rows back; icons only when narrow). Unlike `[ hide ]` the band stays, with its counts and the `⚠` line. `[ hide ]` is no longer dim. The title keeps `workers vX` at any width: the session id gives way first, then the counts (before: the name and version went first).
+
+## v0.46.11 - 2026-10-15
+
+- Not verified: Linux; a terminal that answers mouse reports in X10 (detected, mouse turned off); colour preview not yet seen rendered (contract test and `capture --color` output only); `test-core-contract-smoke` times out at its 90 s cap under the 4-job suite (as in 0.46.10).
+
+- TUI: the row list stays at the top; the selected row's hints and preview come after the last row, so rows no longer jump when the selection moves.
+- TUI: the preview keeps the pane's colours. New `agent-tmux capture --color` (tmux `-e`); a secret split by a colour change is still redacted (that capture then comes without colour). Project panes are captured with `-e` too.
+- Fix (tui): the wheel step no longer bounds the scroll (one notch back from the oldest line moves at once); mouse reporting is SGR only: an X10 report (a terminal that ignores SGR 1006) is detected, mouse reporting is turned off and the status line says why (`b`/`f` still scroll). Ctrl-C cuts a partial report. Limit: an X10 payload byte >= 0x80 (column or row > 95) can leak up to 2 chars as keys once before mouse is off.
+
+- Fix (tui): the mouse wheel scrolls the preview and the detail (3 lines a notch). Without mouse reporting a terminal turns the wheel into ↑/↓, which only moved the selection. The TUI now turns on mouse reporting (1000 + SGR 1006) and turns it off on every exit path; clicks are ignored; select text with Shift-drag (Warp, iTerm2). `b`/`f` scroll too, as `PgUp`/`PgDn` do. A Mac laptop has no PgUp/PgDn key (fn+arrows), and some terminals keep those keys for their own window; Warp passes them (checked 2026-10-15). A project session has no episode, so `Enter` no longer opens an empty detail page; its hint says `b/f scroll`.
+
+## v0.46.10 - 2026-10-15
+
+- Not verified: Linux; two TUIs on one worker live (contract only); `tsc` (not installed); `test-core-contract-smoke` times out at its 90 s cap under the 4-job suite (also on 0.46.9; passes alone, 344 tests in 71 s).
+- Fix (tui): the preview of a worker fills the TUI. A detached worker kept tmux's default-size 80x24, so the preview showed 24 lines and blank rows. A select (j/k) or a TUI resize now sizes the worker's window to the preview, owner and viewer alike; the tick only captures, so the window follows the last TUI action, as tmux's `window-size latest` follows the last client. A window with an attached client is left alone; `agent-tmux attach` unsets the manual window-size the fit leaves. Not verified: Linux; two TUIs on one worker live (contract only).
+- Tests: deleted `test-relay-heldout` (545 lines; 56-112 s under load). Its auth, exit, framing, message and roster cases are in `relay.contract.node.ts`, its notify cases in `test-relay-smoke`; the three it alone held moved to the contract: a hanging whois fails closed at its deadline, a body that never arrives does not block health, exit code `true` is refused. tui-e2e: one resize round (80x24), no header-text check (`tui.contract` renders every size). `run-all-smokes` starts the slowest smokes first.
+
+## v0.46.9 - 2026-10-11
+
+- Not verified: Linux.
+- Fix (tests): a `lint-no-path-tied-locals` failure in the `run-all-smokes` preflight prints the violating file:line lines; 0.46.8 hid them and exited 1 with no reason.
+
+## v0.46.8 - 2026-10-11
+
+- Not verified: Linux; the `tsc`-on-PATH branch of the permissions smoke end to end (the host has the mcp-adapter copy); attaching to a worker to look at the status bar (option values were read with `show`/`display`); copy-pipe bindings, escape-time, terminal-features and default-terminal on default-server workers (server-global, still only on a named socket).
+- Fix (launch): `-f <conf>` is passed only when `TMUX_AGENT_TMUX_SOCKET` names a private server; a launch on the default server no longer loads the agent conf into the user's server. Worker look-and-feel moved to one list (`TMUX_SCOPED_OPTS`: mouse, mode-keys, status-keys, allow-passthrough, history-limit, status/border/message/mode styles) set per session after `new-session`, so the user's global values stay as they are. A bad `TMUX_AGENT_MOUSE` value fails before any session starts. Smoke: wrapper-limits k (on 0.46.7: 10 failures, e.g. `global mouse is tmux's default: got 'on' want 'off'`).
+- Fix (self-test): starts its server through `tmux_spawn`, so its cwd is `/`. Smoke: wrapper-limits j2.
+- Removed: `tmux-agent-fanout` legacy form (no `run` subcommand).
+- Tests: the permissions smoke uses mcp-adapter's `tsc` first, `tsc` on PATH only when that is absent, and refuses tsc below 5.6.3. assign-dialog moving-counter cases get a 15 s confirm window (failed 1 in 4 under load). `run-all-smokes` also runs `test-relay-heldout` (raw HTTP/peer/notify cases, 30 checks, ~23 s) and the `lint-no-path-tied-locals` preflight; `test-mcp-bundle-smoke` runs `mcp-adapter/test/adapter-smoke.js` (source contracts the bundle lifecycle does not reach, ~21 s).
+- Deleted: wiki Recipes/Troubleshooting (byte-identical to `skills/tmux-agent-tools/references/`; links now point there), the panel fixture nothing read, the bash-gate model eval and the skill evals.json (no runner), `docs/learn-from-thariq.md`, `docs/lessons-dispatch-2026-08.md`, `docs/workers-core-release-checklist.md`. Dead refs to `docs/design-issue-18x` removed. support-matrix marks its 2026-10-01 PASS cells as historical.
+- Skill: probes and tests run on a private server (`-L`/`-S` or `TMUX_AGENT_TMUX_SOCKET`), never the shared one.
+
+## v0.46.7 - 2026-10-11
+
+- Not verified: Linux; a server spawned by `start-ssh` on a host where the default server is already running (the fix only matters when the launch spawns the server).
+- Fix (launch): the tmux client of a worker launch runs from `/` (`tmux_spawn`), and `<directory>` is made absolute first. A launch that spawned the shared tmux server used to leave that server's cwd on the worker's directory; once the directory was deleted, interactive codex in every later pane on the server exited with `No such file or directory (os error 2)`. Seen 2026-10-11: the default server (started by a codex worker launch into a scratch worktree) broke every codex worker on the host. Smoke: wrapper-limits case j (fails without the fix: server cwd was the worker dir).
+
+## v0.46.6 - 2026-10-11
+
+- Not verified: the dropped cases below were judged duplicate or low value by review, not by a coverage tool.
+- Correction (0.46.5 entry): it said the coverage given up was listed in the body of commit `test: cut the smoke suite to its integration boundaries`. That commit body does not hold the list. The list:
+  - assign family: stuckclaude (claude family, `spinner=false`), reflow (>20 s, no result), slowcli (15 s with no draw), paste-split demo, pastecli two-Enter success, fold-short `--show 2`, trustcli case 1, start-readiness 18 s slow boot.
+  - launch family: max-idle idle-reset and both-flags trips (the plain `max_idle` trip was restored in 0.46.5), color-env all-engine matrix, claude matrices in prompt-file and secret-uri, sentinel `hang`/`markerhang` deadlines and the local headless/resume/composite launches, dry-run model/effort/extra-flags checks.
+  - commander/gates: fanout legacy form without `run`, dag self-dependency / duplicate-dependency / out-of-order execution, replay refuse-to-overwrite and text-mode diff, worktree `always-keep` policy, commander `--width 1` panel fixture and the second owner/reuse set, gate-receipt gate-off dry-run.
+  - core/packaging: tui-e2e detail/refresh/paste/viewer/Ctrl-C cases (covered by `tui.contract.node.ts`), tui-entry `--bogus`, `claude plugin test` moved out of the smoke lane (it is its own release lane).
+  - status: hook-trust start-with-initial-text refusal, the second degrade CLI.
+- Contributing: shipping step 2 updates both plugins (`tmux-agent` and `tmux-agent-tools`).
+
+## v0.46.5 - 2026-10-11
+
+- Not verified: per-file smoke budgets under load on a host other than this Mac; real SSH for the remote sentinel path; Linux behavior of the relay fixture's `0.0.0.1` dead peer; other hosts (.44) not updated.
+- Breaking: removed `agent-tmux pair|team` (collab), `checkpoint`/`restore`, the `tmux-agent-history` and `tmux-agent-notify` binaries, and `tmux-agent-replay fixture-validate`, with their docs and router lines. No executable caller in the three ecosystem repos (Sol review + advisor, 2026-10-11). `start-ssh --notify`, replay `diff`/`redact` and `--record` stay.
+- Tests: the smoke suite went from 80 files / 13,480 lines / 5:32 wall to 33 files / 1:07.70 wall (`suite wall: 68s (33 tests, PARALLEL_JOBS=4)`, all PASS). One owner per behavior, data checks as no-wait fixtures, fakes answer at once, one real deadline case only where the deadline is the contract. Coverage given up on purpose is listed per file in the commit `test: cut the smoke suite to its integration boundaries`.
+- Runner: every job gets its own `TMPDIR`, and the summary prints the suite wall time. Smokes name their temp dir under `TMPDIR` (macOS `mktemp -t` ignored it here, so work dirs landed outside the job tree).
+- mod-permissions absorbs the mod typecheck and runs the TypeScript pinned in `mcp-adapter` (devDependency `typescript@5.9.3`), not npx into each job's HOME (37 s -> 3 s).
+- Fix (audit-verify): a log of two or more lines printed zsh `local` re-declarations ahead of the JSON.
+- Fix (send-wait): a matched nonce left its `agent-tmux-send-start.*` marker file in the user's temp dir.
+- Contributing: smoke budget 180 s at `PARALLEL_JOBS=4`, one test owner per behavior, no test-wait env knobs, each required lane once; breaking removals happen in one change with code, tests and docs.
+
+## v0.46.4 - 2026-10-11
+
+- Not verified: `--trust` on cursor-agent versions other than 2026.10.01-e373342.
+- Fix (cursor profile): `launch_flags=--trust --yolo`, as claude/agy (`--dangerously-skip-permissions`) and codex (`--yolo`) already launch (user policy: a worker dispatched to a dir trusts it). cursor-agent's Workspace Trust dialog (`▶ [a] Trust this workspace`) is not the selected-option shape `assign` answers, so every never-trusted dir failed `send` with `permission_prompt`; after a manual Enter the old box with `⏳ Trusting workspace...` stays above the composer. Live (2026-10-11, cursor-agent 2026.10.01): launched as `cursor-agent --trust --yolo`, a fresh dir showed no dialog and `echo YOLO-OK` ran without an approval prompt.
+
+## v0.46.3 - 2026-10-11
+
+- Not verified: the Contributing steps on a host other than this Mac.
+- Docs (Contributing): "Shipping a change locally": every shipped change bumps the version (no tag), then plugin update, `npx skills update -g`, the agent-scripts `skills-lock.json` pin, and `mcp__tmux-agent__reload`.
+
+## v0.46.2 - 2026-10-11
+
+- Not verified: `/reload-skills` run through `$.command.run` before this deploy (checked live right after it).
+- Change (tmux-agent mod, `reload` tool): runs `/reload-plugins`, then `/reload-skills`, when the turn ends; a skill updated with `npx skills update -g` took effect only after the person typed `/reload-skills`.
+
+## v0.46.1 - 2026-10-11
+
+- Not verified: the `await` tool on profiles other than codex; `plan-pipeline` and `feature-plan-consensus` driving it live (agent-scripts); hosts other than this Mac.
+- Fix (tmux-agent mod, collector; "old messages"): a worker's terminal result is delivered only once the worker is quiet. A CLI often rewrites result.json in the same turn: on 2026-10-10 18:01:28Z a codex worker wrote it, the collector delivered it, and at 18:02:15Z the same turn rewrote it; after the session's `tell` opened episode 2, the rewrite went out as an `unattributed` notice under episode 2's `delivery_id`, which read as an old message re-sent. 17 of 19 duplicate-looking notices in the local transcripts (2026-10-02..10-10) were this case. Now `collect` holds a terminal result while `agent-tmux status --json` shows the pane live and changed within `SETTLE_IDLE_SECONDS` (20 s); a result unchanged for `SETTLE_CAP_MS` (10 min) is delivered anyway, and a status that cannot answer (error, no idle measurement) does not hold it (logged). Only the worker's latest open episode is held: after a `tell`, the pane moves for the next episode, so an earlier episode's result is delivered at once. A pass that has no time left for the check defers that result to the next pass; in a batch of many simultaneous terminal results only the first few are checked per 4 s pass, the rest follow on later passes. A closed episode's result rewritten after delivery is named as that episode ("episode N's result changed after it was delivered"). Each notice has its own id: `delivery_id` gains `/launch`, `/exited`, or `/unattributed-<hash>-<mtime>` for those notices, and the line says "only a re-report of this same notice repeats this id" (the old text, "a re-report of a notice already handled has the same id", told the model to ignore a real result). Tests: a busy worker's result waits for a quiet pane and the final text is delivered once; a result unchanged for 10 min is delivered while the pane moves; a closed episode's rewrite is named and carries its own id.
+- Feature (tmux-agent mod, `await` tool): `mcp__tmux-agent__await {name, seq?, max_seconds?}` blocks up to `max_seconds` (default 60, cap 540) on one worker episode and returns the terminal result (`{status, episode, result, delivery_id}` plus the summary), or a pending progress line (`state`, `elapsed`, `idle_seconds`, last 5 pane lines). A tool result reaches the agent that called it, so a workflow agent can now `assign` a CLI worker and `await` it without Bash. This reverses the W42-16 premise ("a workflow conduit agent has to drive and wait on its worker itself" through Bash `agent-tmux`); the Bash pass for subagents stays. `await` is a pure read: it never acks, and the collector is unchanged, so the owner session still gets one notice for the same result (trade-off chosen over a second delivery destination, which needs recipient grouping and refusal handling). A result is terminal only when its episode matches and, for the latest episode, the pane is quiet (same settle rule as the collector); while it settles, `await` re-reads every 5 s inside `max_seconds` instead of returning pending at once (live 2026-10-11: a codex pane kept moving ~10 s after its result, and six awaits returned in 1–2 s each). Unknown worker or episode: denied with the known names. Tests: terminal result, pending with progress, unknown worker, a settling result waited for, an earlier episode not held by the next one. Live 2026-10-11: before the settle fix, two concurrent workflow awaits blocked ~80 s and ~5 min and returned (pending: settling) to the agent; after it, one workflow agent got a terminal result from a single await per round for `assign` (episode 1, ROUND1-DONE) and `tell` (`await {seq:2}`, ROUND2-DONE).
+- Feature (`result wait-required --result-path <abs>/result.json`): wait on an episode's own result file (a `tell` writes `episodes/<seq>/result.json`) instead of the worker's default; a relative path or another basename exits 2. `test-result-contract-smoke` covers both.
+- Fix (`assign --detach`): the harvest hint now includes the required `--fields status,summary` (it printed a command that exits 2), and with `--result-path` the hint and the final JSON `result_path` name the override path instead of the default one (which `wait-required` reads, and which the worker was never told).
+
+- Fix (smokes, safety): a smoke never runs with the real HOME. On 2026-10-09 a mutation run removed the `start-ssh --on-exit-allow` refusal; the test's fake `ssh` ran the "remote" hook on this Mac with the real HOME, and the hook (destructive test data) deleted much of the home directory. Now `run-all-smokes` gives each job its own HOME (`<job>/home`; XDG_* and ZDOTDIR unset), every smoke sources `scripts/lib/smoke-home-guard.sh` on line 2, which exits 3 before any work when HOME is the real home (passwd entry) or empty, and the fake `ssh` in `test-sentinel-smoke` and `test-relay-smoke` runs the "remote" command with `$W/rhome` as HOME. Run one smoke with `scripts/run-all-smokes <test>`; a direct run now exits 3. `test-home-guard-smoke` checks the job HOME, the guard line in every smoke, and the exit 3 for a real or empty HOME (it fails with the guard disabled).
+- Test (tmux-agent mod): one test runs the whole stall chain (agent-scripts W42-22): a worker's owner session stops heartbeating, a new collector adopts the same episode, a 30-minute quiet run is neither failed nor woken, a quota stop wakes the new owner once, and the late result is delivered once with `adopted from session <old>`. It fails when a quiet run counts as a stall and when the adoption line is dropped.
+- Fix (assign): `assign[4/5] WARNING: result-path delivery UNCONFIRMED` fired on every dispatch with `--result-path` (every tmux-agent mod assign), because only the default path writes the sentinel. The warning named the default path, not the dispatch's, and its "re-prompt" advice was followed with a `tell`, which opens a new episode: one result was delivered 3 times (agent-scripts W42-9). Now an override is judged by this send's own delivery proof, the warning names the override path, and it says to re-send in a plain `agent-tmux <cli> send` (a `tell` opens a new episode). Side effect: for a family whose delivery cannot be checked, an override send now prints the existing "instruction delivery UNCONFIRMED" line (before, it was silently counted as delivered). `test-assign-dialog-smoke` covers both cases.
+
 ## v0.46.0 - 2026-10-09
 
 - Not verified: the tailnet relay and `start-ssh --notify` ran against one remote host (a Mac mini) only; `start-ssh --sentinel` / `--on-exit-allow` on a Linux login shell only through the smoke ssh shim; the gating-hook `.catch` on matcher registrations (UNCONFIRMED above).

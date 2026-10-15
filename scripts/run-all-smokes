@@ -4,6 +4,7 @@ set -u
 script_dir="${0:A:h}"
 repo_root="${script_dir:h}"
 node "$script_dir/check-tmux-socket-isolation" || exit 1
+lint_out="$(zsh "$script_dir/lint-no-path-tied-locals" 2>&1)" || { print -r -- "$lint_out" >&2; exit 1; }
 
 unset TMUX TMUX_PANE
 export TMUX_TMPDIR="$(mktemp -d /tmp/tas-main.XXXXXX)"
@@ -64,7 +65,10 @@ if (( $# > 0 )); then
     test_files+=("${candidate_file:A}")
   done
 else
-  test_files=("$script_dir"/test-*-smoke(N))
+  # Longest first, so the slow ones do not land in the tail of the pool.
+  typeset -a slow=("$script_dir"/{test-core-contract-smoke,test-tui-e2e-smoke,test-mcp-bundle-smoke,test-dispatch-delivery-smoke,test-audit-smoke})
+  typeset -a rest=("$script_dir"/test-*-smoke(N))
+  test_files=($slow ${rest:|slow})
 fi
 
 if (( ${#test_files[@]} == 0 )); then
@@ -98,6 +102,14 @@ run_job() {
     unset TMUX TMUX_PANE
     export TMUX_TMPDIR="$job_dir"
     export TAS_JOB_DIR="$job_dir"
+    # Smokes that never source lib/smoke-tmux.sh still put their temp files in the job tree.
+    export TMPDIR="$job_dir/tmp"
+    mkdir -p -m 0700 "$TMPDIR"
+    # Each job gets its own HOME (lib/smoke-home-guard.sh refuses the real one): a hook, a shim or a
+    # mutation can then only touch this directory. XDG and ZDOTDIR would point back at the real home.
+    export HOME="$job_dir/home"
+    mkdir -p -m 0700 "$HOME"
+    unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME ZDOTDIR
     local socket="$job_dir/tmux-$(id -u)/default"
     mkdir -p -m 0700 "${socket:h}"
     trap 'kill_job_sockets "$job_dir"; rm -rf "$job_dir"' EXIT
@@ -122,6 +134,7 @@ run_job() {
 }
 
 typeset -i active_jobs=0
+suite_started_at="$(date +%s)"
 
 wait_for_slot() {
   while (( active_jobs >= PARALLEL_JOBS )); do
@@ -203,4 +216,5 @@ for idx in {1..${#result_names[@]}}; do
     "${result_durations[$idx]}"
 done
 
+echo "suite wall: $(( $(date +%s) - suite_started_at ))s (${#result_names[@]} tests, PARALLEL_JOBS=$PARALLEL_JOBS)"
 exit "$overall_failed"

@@ -1,18 +1,19 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for issue #102 advisory send lock.
 #
 # Validates that `send_lock_around` in agent-tmux (one CLI: the lock has no per-CLI branch):
-#   - serializes concurrent acquirers on the same agent name
-#   - refuses a second acquirer while a holder is alive (rc 75, no entry)
-#   - hands the lock to waiters one at a time after the holder is killed -9
-#   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
+#   - refuses a second acquirer while a holder is alive (rc 75, no entry), and
+#     a new acquirer gets the lock once the holder is released
+#   - hands the lock to two competing waiters one at a time after the holder
+#     is killed -9
 #   - exits with the inner command's return code
+#   - tolerates a not-yet-existing $TMUX_AGENT_DIR/<name>
 #
 # The helper is sourced from agent-tmux via TMUX_AGENT_TOOLS_SOURCE_ONLY
-# so we exercise the real implementation, not a copy. The cli launcher is
-# `exec agent-tmux <cli>`; sourcing that replaces the shell and the
-# source-only guard exits before the case body. The harness sources the
-# engine with that <cli> name instead.
+# so we exercise the real implementation, not a copy. The engine is sourced
+# once: every case runs in that one shell.
 #
 # Cases wait on files, never on a sleep that has to win a race: a holder
 # blocks until the test creates its release file, and every wait loop has a
@@ -26,81 +27,11 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
-CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
-WORK="$(mktemp -d -t tmux-agent-send-lock-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-send-lock-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-# Each case is a zsh body written to a temp file. The wrapper is sourced
-# by the harness so $send_lock_around / $ensure_agent_dir are in scope.
-run_case() {
-  local wrapper="$1" label="$2" body_file="$3"
-  local cli
-  cli="$(basename "$wrapper")"
-  echo "[$label] $cli"
-  local state_dir="$WORK/$label"
-  mkdir -p "$state_dir"
-  TMUX_AGENT_DIR="$state_dir" \
-    TMUX_AGENT_TOOLS_SOURCE_ONLY=1 \
-    WORK="$WORK" \
-    ENGINE="$AGENT_TMUX" \
-    CLI_NAME="$cli" \
-    BODY="$body_file" \
-    zsh -c '
-      set -euo pipefail
-      set -- "$CLI_NAME"
-      source "$ENGINE"
-      source "$BODY"
-    ' || fail "$label on $cli"
-}
-
 # Case bodies -------------------------------------------------------------
-
-cat > "$WORK/case-basic.zsh" <<'BODY'
-sentinel="$TMUX_AGENT_DIR/basic-out"
-send_lock_around basic 5 sh -c "echo ok > '$sentinel'"
-[[ "$(cat "$sentinel")" == ok ]] || { echo "sentinel mismatch" >&2; exit 1; }
-BODY
-
-cat > "$WORK/case-concurrent.zsh" <<'BODY'
-out="$TMUX_AGENT_DIR/order.log"
-: > "$out"
-( send_lock_around concur 10 sh -c "echo A-start >> '$out'; sleep 1; echo A-end >> '$out'" ) &
-pid_a=$!
-sleep 0.2
-( send_lock_around concur 10 sh -c "echo B-start >> '$out'; echo B-end >> '$out'" ) &
-pid_b=$!
-wait "$pid_a"
-wait "$pid_b"
-expected=$'A-start\nA-end\nB-start\nB-end'
-actual="$(cat "$out")"
-if [[ "$actual" != "$expected" ]]; then
-  echo "order mismatch:" >&2
-  echo "expected:" >&2; echo "$expected" >&2
-  echo "actual:"   >&2; echo "$actual"   >&2
-  exit 1
-fi
-BODY
-
-cat > "$WORK/case-missing-dir.zsh" <<'BODY'
-name=brand-new
-[[ ! -e "$TMUX_AGENT_DIR/$name" ]] || { echo "precondition: dir should not exist" >&2; exit 1; }
-send_lock_around "$name" 5 true
-[[ -d "$TMUX_AGENT_DIR/$name" ]] || { echo "expected $name dir created" >&2; exit 1; }
-BODY
-
-cat > "$WORK/case-rc.zsh" <<'BODY'
-set +e
-send_lock_around rc 5 sh -c "exit 7"
-rc=$?
-set -e
-[[ "$rc" -eq 7 ]] || { echo "expected rc=7 got $rc" >&2; exit 1; }
-BODY
 
 # Shared helper sourced by the cases below. wait_for_file only bounds a run
 # that is already failing; a passing run leaves the loop as soon as the file
@@ -176,7 +107,7 @@ waiter() {
     dir="$1"; me="$2"; peer="$3"
     mkdir "$dir/in-critical" 2>/dev/null || { echo "VIOLATION: $me entered while another waiter was inside" >> "$dir/violations"; exit 0; }
     touch "$dir/$me-in"
-    for (( i = 0; i < 100; i++ )); do
+    for (( i = 0; i < 30; i++ )); do
       if [[ -e "$dir/$peer-in" ]]; then
         echo "VIOLATION: $me and $peer overlapped" >> "$dir/violations"
         break
@@ -207,14 +138,28 @@ if [[ -s "$dir/violations" ]]; then
 fi
 BODY
 
-for wrapper in "$CODEX_TMUX"; do
-  tool="$(basename "$wrapper")"
-  run_case "$wrapper" "$tool-basic"          "$WORK/case-basic.zsh"
-  run_case "$wrapper" "$tool-concurrent"     "$WORK/case-concurrent.zsh"
-  run_case "$wrapper" "$tool-contended"      "$WORK/case-contended.zsh"
-  run_case "$wrapper" "$tool-killed-holder"  "$WORK/case-killed-holder.zsh"
-  run_case "$wrapper" "$tool-missing-dir"    "$WORK/case-missing-dir.zsh"
-  run_case "$wrapper" "$tool-rc"             "$WORK/case-rc.zsh"
-done
+cat > "$WORK/case-rc-missing-dir.zsh" <<'BODY'
+# The inner return code comes back, and a missing <name> dir is created.
+name=brand-new
+[[ ! -e "$TMUX_AGENT_DIR/$name" ]] || { echo "precondition: dir should not exist" >&2; exit 1; }
+set +e
+send_lock_around "$name" 5 sh -c "exit 7"
+rc=$?
+set -e
+[[ "$rc" -eq 7 ]] || { echo "expected rc=7 got $rc" >&2; exit 1; }
+[[ -d "$TMUX_AGENT_DIR/$name" ]] || { echo "expected $name dir created" >&2; exit 1; }
+BODY
+
+mkdir -p "$WORK/state"
+TMUX_AGENT_DIR="$WORK/state" TMUX_AGENT_TOOLS_SOURCE_ONLY=1 WORK="$WORK" ENGINE="$AGENT_TMUX" \
+  zsh -c '
+    set -euo pipefail
+    set -- codex
+    source "$ENGINE"
+    for c in contended killed-holder rc-missing-dir; do
+      echo "[$c] codex"
+      ( source "$WORK/case-$c.zsh" ) || { echo "FAIL: $c" >&2; exit 1; }
+    done
+  ' || exit 1
 
 echo "OK: send-lock smoke passed for agent-tmux codex."

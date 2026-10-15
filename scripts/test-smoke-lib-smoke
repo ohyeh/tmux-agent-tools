@@ -1,15 +1,20 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke for scripts/lib/smoke-tmux.sh itself: a child smoke that aborts through
-# errexit on a failing function call still runs its EXIT trap and smoke_cleanup
-# (zsh 5.9.2 skips both on that path; the lib's ZERR handler exits for real), and
-# keeps its exit code. errexit-exempt failures (`||`, `if`, a subshell) do not
-# end or clean up the child early.
+# Smoke for the smoke harness itself:
+# - lib/smoke-tmux.sh: a child smoke that aborts through errexit on a failing function
+#   call still runs its EXIT trap and smoke_cleanup (zsh 5.9.2 skips both on that path;
+#   the lib's ZERR handler exits for real), and keeps its exit code. errexit-exempt
+#   failures (`||`, `if`, a subshell) do not end or clean up the child early.
+#   exit/TERM/INT/HUP remove a registered server; the runner removes a SIGKILL orphan.
+# - lib/smoke-home-guard.sh: every smoke sources it on line 2; it refuses the real HOME.
+# - check-tmux-socket-isolation and lint-no-path-tied-locals reject their known decoys.
 set -euo pipefail
 
+SCRIPT_DIR="${0:A:h}"
 W="$TMPDIR/smoke-lib"
 mkdir -p "$W"
-LIB="${0:A:h}/lib/smoke-tmux.sh"
+LIB="$SCRIPT_DIR/lib/smoke-tmux.sh"
 PASS=0
 FAIL=0
 ok() { print -r -- "  ok   $1"; PASS=$((PASS + 1)); }
@@ -63,6 +68,175 @@ echo "case: a subshell's errexit stays in the subshell"
 rc="$(child sub '( set -e; g() { false; }; g ) || true; tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" has-session -t held')"
 assert "subshell: parent continued with its server" "$rc" "0"
 assert "subshell: parent reached the end" "$(tr '\n' ' ' < "$W/sub.log")" "end exit-trap "
+
+echo "case: exit/TERM/INT/HUP remove the registered server"
+cat > "$W/sig-fixture" <<'EOF'
+#!/usr/bin/env zsh
+source "$SMOKE_HELPER"
+smoke_socket child
+tmux -S "$REPLY" new-session -d -s child 'exec cat'
+print -r -- "$REPLY" > "$SOCKET_RECORD"
+if [[ "$MODE" == kill ]]; then kill -KILL $$; fi
+if [[ "$MODE" == exit ]]; then exit 0; fi
+while :; do sleep 0.05; done
+EOF
+chmod +x "$W/sig-fixture"
+export SMOKE_HELPER="$LIB" SOCKET_RECORD="$W/socket"
+server_gone() {
+  local i
+  for i in {1..40}; do
+    "$SMOKE_TMUX_BIN" -S "$1" has-session 2>/dev/null || { echo gone; return; }
+    sleep 0.05
+  done
+  echo present
+}
+for mode in exit TERM INT HUP; do
+  rm -f "$SOCKET_RECORD"
+  child_dir="$(mktemp -d "$TMPDIR/child.XXXXXX")"
+  MODE="$mode" TAS_JOB_DIR="$child_dir" zsh "$W/sig-fixture" &
+  pid=$!
+  for i in {1..40}; do [[ -s "$SOCKET_RECORD" ]] && break; sleep 0.05; done
+  [[ -s "$SOCKET_RECORD" ]] || { kill "$pid" 2>/dev/null || true; echo 'fixture did not start' >&2; exit 1; }
+  if [[ "$mode" != exit ]]; then kill -"$mode" "$pid"; fi
+  wait "$pid" 2>/dev/null || true
+  assert "$mode removes the registered server" "$(server_gone "$(cat "$SOCKET_RECORD")")" "gone"
+done
+
+echo "case: the runner removes a SIGKILL orphan"
+# SIGKILL cannot run a trap. The runner must find the socket before deleting it.
+code=0
+MODE=kill zsh "$SCRIPT_DIR/run-all-smokes" "$W/sig-fixture" > "$W/runner.out" 2>&1 || code=$?
+[[ "$code" == 1 ]] || cat "$W/runner.out"
+assert "runner reports the killed smoke as failed" "$code" "1"
+assert "runner removes the SIGKILL orphan" "$(server_gone "$(cat "$SOCKET_RECORD")")" "gone"
+
+echo "case: home guard"
+real_home="$(eval "printf '%s' ~$(id -un)")"
+assert "this job's HOME is not the real home" "$([[ "${HOME:A}" != "${real_home:A}" ]] && echo yes)" "yes"
+assert "this job's HOME is inside its job dir" "$([[ -n "${TAS_JOB_DIR:-}" && "${HOME:A}" == "${TAS_JOB_DIR:A}"/* ]] && echo yes)" "yes"
+# Every smoke starts with the guard, so none can run before it.
+missing=()
+for f in "$SCRIPT_DIR"/test-*-smoke; do
+  [[ "$(sed -n 2p "$f")" == *'lib/smoke-home-guard.sh'* ]] || missing+=("${f:t}")
+done
+assert "every smoke sources the guard on line 2" "${missing[*]:-none}" "none"
+# With the real (or an empty) HOME, a guarded script exits 3 and its body never runs.
+printf '#!/usr/bin/env zsh\n. %s\necho BODY-RAN\n' "${(q)SCRIPT_DIR}/lib/smoke-home-guard.sh" > "$W/guarded"
+chmod +x "$W/guarded"
+out="$(HOME="$real_home" "$W/guarded" 2>&1)" && rc=0 || rc=$?
+assert "real HOME: exit 3" "$rc" "3"
+assert "real HOME: refused before the body" "$([[ "$out" == *"refusing to run with the real HOME"* && "$out" != *BODY-RAN* ]] && echo yes)" "yes"
+out="$(HOME= "$W/guarded" 2>&1)" && rc=0 || rc=$?
+assert "empty HOME: exit 3" "$rc" "3"
+
+echo "case: socket-isolation checker rejects decoys"
+# Build the server command at runtime so this file does not trigger the checker.
+b_srv() { printf '%s-%s' "kill" "server"; }
+SRV="$(b_srv)"
+cat > "$W/n1.contract.node.ts" <<EOF
+function badWrapper(args) {
+  const decoy = ["-S"]
+  return execFile("tmux", args)
+}
+async function main() {
+  badWrapper(["$SRV"])
+}
+EOF
+{
+  echo 'function longWrapper(args) {'
+  for i in {1..35}; do echo "  const dummy$i = $i"; done
+  echo '  return execFile("tmux", ["-S", process.env.TMUX_TMPDIR + "/sock", ...args])'
+  echo '}'
+  echo 'async function main() {'
+  echo "  longWrapper([\"$SRV\"])"
+  echo '}'
+} > "$W/t1.contract.node.ts"
+cat > "$W/r3.contract.node.ts" <<EOF
+function badWrapperR3(args) {
+  const note = "tmux ['-S']"
+  return execFile("tmux", args)
+}
+async function main() {
+  badWrapperR3(["$SRV"])
+}
+EOF
+cat > "$W/f4.contract.node.ts" <<EOF
+function safe(args) {
+  const label = "}"
+  return execFile("tmux", ["-S", process.env.TMUX_TMPDIR + "/sock", ...args])
+}
+safe(["$SRV"])
+EOF
+cat > "$W/f5.contract.node.ts" <<EOF
+function safe(args) {
+  const argv = ["-S", process.env.TMUX_TMPDIR + "/sock", ...args]
+  return execFile("tmux", argv)
+}
+safe(["$SRV"])
+EOF
+cat > "$W/f5d.contract.node.ts" <<EOF
+function unsafe(args) {
+  const decoy = ["-S", process.env.TMUX_TMPDIR + "/sock"]
+  const argv = [...args]
+  return execFile("tmux", argv)
+}
+unsafe(["$SRV"])
+EOF
+printf 'execFile("tmux", ["-S", "%s", "%s"])\n' /tmp/escape.sock "$SRV" > "$W/escape.contract.node.ts"
+printf 'export %s="/tmp/escape"\n' TMUX_TMPDIR > "$W/socket-dir.sh"
+guard_rc() { "$SCRIPT_DIR/check-tmux-socket-isolation" "$W/$1" >/dev/null 2>&1 && echo 0 || echo $?; }
+assert "unused decoy const decoy = ['-S'] is rejected (N1)" "$(guard_rc n1.contract.node.ts)" 1
+assert "wrapper body > 30 lines with real -S passes (T1)" "$(guard_rc t1.contract.node.ts)" 0
+assert "line-level short-circuit decoy is rejected (R3)" "$(guard_rc r3.contract.node.ts)" 1
+assert "brace inside a string does not end the wrapper body (F4)" "$(guard_rc f4.contract.node.ts)" 0
+assert "argv declared without a semicolon passes (F5)" "$(guard_rc f5.contract.node.ts)" 0
+assert "unused decoy without a semicolon is rejected (F5)" "$(guard_rc f5d.contract.node.ts)" 1
+assert "literal out-of-dir socket is rejected" "$(guard_rc escape.contract.node.ts)" 1
+assert "smoke cannot replace the run directory" "$(guard_rc socket-dir.sh)" 1
+
+echo "case: tied-name lint flags each violator, not the safe renames"
+# Build banned names at runtime: the lint scans scripts/, this file included.
+b_path() { local n="p"; printf '%s' "${n}ath"; }
+b_status() { local n="sta"; printf '%s' "${n}tus"; }
+b_lines() { local n="lin"; printf '%s' "${n}es"; }
+P="$(b_path)" S="$(b_status)" L="$(b_lines)"
+typeset -A VIOLATORS=(
+  single "some_fn() { local $P=\"\$1\"; }"
+  bare "some_fn() { local $P; }"
+  multi1 "some_fn() { local $P agent foo; }"
+  multi2 "some_fn() { local foo $P bar; }"
+  multi3 "some_fn() { local foo=1 $P=2 bar=3; }"
+  flag "some_fn() { local -i $S=0; }"
+  arr "some_fn() { local -a $L; }"
+)
+# The lint takes no path: plant beside it in scripts/ (one run for all), remove on exit.
+PLANTED=()
+trap 'rm -f "${PLANTED[@]}"' EXIT
+for tag in "${(@k)VIOLATORS}"; do
+  PLANTED+=("$SCRIPT_DIR/_tmp_lint_violator_${tag}_$$")
+  printf '#!/bin/sh\n%s\n' "${VIOLATORS[$tag]}" > "${PLANTED[-1]}"
+done
+SAFE="$SCRIPT_DIR/_tmp_lint_safe_$$"
+PLANTED+=("$SAFE")
+cat > "$SAFE" <<'EOF'
+some_fn() {
+  local check_status=0
+  local out_lines
+  local -a out_lines2
+  local wt_path="/tmp/x"
+  local target="$1"
+  local foo=bar_path baz_status=1
+  echo "$target $check_status $wt_path"
+}
+EOF
+code=0
+lint_out="$("$SCRIPT_DIR/lint-no-path-tied-locals" 2>&1)" || code=$?
+assert "lint exits 1 with violators planted" "$code" "1"
+for tag in "${(@k)VIOLATORS}"; do
+  assert "lint flags $tag" "$([[ "$lint_out" == *"_tmp_lint_violator_${tag}_$$:"* ]] && echo yes)" "yes"
+done
+assert "lint does not flag the safe renames" "$([[ "$lint_out" != *"${SAFE:t}"* ]] && echo yes)" "yes"
+rm -f "${PLANTED[@]}"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

@@ -37,20 +37,20 @@ All JSON surfaces carry `schema_version: 1`.
 
 - [Getting Started](Getting-Started) — install, hello-world, doctor
 - [Using as a Skill](Using-as-a-Skill) — for agent operators and automation scripts
-- [Recipes](Recipes) — single-agent, fanout, DAG, approval-gate, dialogue
+- [Recipes](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md) — single-agent, fanout, DAG, approval-gate, dialogue
 - [Observability and Secrets](Observability-and-Secrets) — audit log, transcript, `--secret` backends
-- [Troubleshooting](Troubleshooting) — failure mode cheatsheet
+- [Troubleshooting](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/troubleshooting.md) — failure mode cheatsheet
 - [Contributing](Contributing) — repo layout, smoke tests, release process
 
 ## Conventions
 
 - Code, identifiers, commands, filenames, API names remain in English.
-- All examples in this wiki are copy-pasteable and tested against `main`.
+- All examples in this wiki are copy-pasteable.
 - `--exact` skips the random suffix `start` normally appends. Use it whenever you need a stable name for later `send` / `capture` / `stop`.
 
 ## Non-goals
 
-This project intentionally does **not** ship: resident daemons, hidden async autonomy, supervisor trees, cross-host non-repudiation, parallel DAG execution, or auto merge-back from worktrees. Every surface is operator-explicit and synchronous. See `docs/design-l5-l6-policy-block.md` in the repo for the full non-goal rationale.
+This project intentionally does **not** ship: resident daemons, hidden async autonomy, supervisor trees, cross-host non-repudiation, parallel DAG execution, or auto merge-back from worktrees. Every surface is operator-explicit and synchronous.
 
 ## Source of truth
 

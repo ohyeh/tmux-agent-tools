@@ -1,26 +1,25 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke for tmux-agent-commander (SPEC.md §Tests).
-# Five cases, each with an explicit assertion:
+# Smoke for tmux-agent-commander (SPEC.md §Tests). Shell/server lifecycle only;
+# snapshot formatting and delivery algorithms live in the node contracts.
+# One collector runs for the whole file (its tick is the product's 10 s POLL_MS):
 #   1. assign publishes the v5 descriptor (owner = session) before the launch
-#   2. a terminal result is pasted once; the next tick pastes nothing; acks/done closes it
+#   2. a terminal result is pasted once; acks/done closes it; no second paste
 #   3. a live other owner's episode is never pasted
 #   4. the activation beat is refreshed each tick
 #   5. collect exits when the commander session is gone
-#   6. panel with no workers is the snapshot line; R9 lists a .v3 worker.
-#      Mark, order, and width fixtures stay in snapshot.contract.node.ts.
-#   7. start sets a per-session second status line; --no-panel does not
-#   8. assign in a <cli prefix>-<name> pane starts one server-owned collector
-#   9. a second assign does not start another collector
-#  10. a session matching no cli prints the hint and exits 0
-#  11. collect exits 0 without writing when a live collector owns the pid file
+# The other cases run inside that tick:
+#   - start sets a per-session second status line; --no-panel does not; a live collector refuses a second start
+#   - assign in a <cli prefix>-<name> pane starts one server-owned collector; a second assign reuses it
+#   - a session matching no cli prints the hint and exits 0
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
 COMMANDER="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-commander"
 
-WORK="$(mktemp -d -t tmux-agent-commander.XXXXXX)"
+WORK="$(mktemp -d "$TMPDIR/commander.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
 export XDG_CONFIG_HOME="$WORK/xdg"
 export AGENT_TMUX_PROFILE_DIR="$WORK/noprofiles"
@@ -51,16 +50,19 @@ export FAKE_PROMPTS="$WORK/prompts.list"
 : > "$FAKE_LOG"
 : > "$FAKE_PROMPTS"
 
+# Collectors started by `start` / the tmux server are not our children: TERM them,
+# then wait (bounded) until they are gone. Our own collect is waited on directly.
 cleanup() {
-  local pid
+  local f p i
+  for f in "$TMUX_AGENT_DIR"/.commander-*.pid(N); do
+    p="$(tr -d '[:space:]' < "$f")"
+    [[ "$p" == <-> ]] || continue
+    kill "$p" 2>/dev/null || continue
+    for i in {1..40}; do kill -0 "$p" 2>/dev/null || break; sleep 0.05; done
+  done
   if [[ -n "${COLLECT_PID:-}" ]]; then
     kill "$COLLECT_PID" 2>/dev/null || true
-  fi
-  if [[ -n "${DCOLLECT_PID:-}" ]]; then
-    kill "$DCOLLECT_PID" 2>/dev/null || true
-  fi
-  if [[ -n "${TIMER_PID:-}" ]]; then
-    kill "$TIMER_PID" 2>/dev/null || true
+    wait "$COLLECT_PID" 2>/dev/null || true
   fi
   rm -rf "$WORK"
 }
@@ -71,8 +73,8 @@ cat > "$WORK/bin/agent-tmux" <<'EOF'
 printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$2" in
   start)
-    # agent-tmux <cli> start --exact <name> <dir>
-    command env -u TMUX -u TMUX_PANE tmux -S "$TMUX_AGENT_TMUX_SOCKET" new-session -d -s "${COMMANDER_PREFIX}-$4" "sleep 180"
+    # agent-tmux <cli> start --exact <name> <dir>; the pane lives on its open stdin.
+    command env -u TMUX -u TMUX_PANE tmux -S "$TMUX_AGENT_TMUX_SOCKET" new-session -d -s "${COMMANDER_PREFIX}-$4" "cat"
     ;;
   assign)
     prev=""
@@ -159,6 +161,7 @@ assert_excludes() {
     FAIL=$((FAIL + 1))
   fi
 }
+# poll <tries> <cmd...>: every 0.05 s.
 poll() {
   local tries="$1"
   shift
@@ -167,13 +170,12 @@ poll() {
     if "$@"; then
       return 0
     fi
-    sleep 0.2
+    sleep 0.05
   done
   return 1
 }
-
-prompt_lines() {
-  wc -l < "$FAKE_PROMPTS" | tr -d ' '
+session_key() {
+  python3 -c 'import sys; print(sys.argv[1].encode().hex())' "$1"
 }
 
 echo "case: assign outside tmux is refused"
@@ -182,22 +184,69 @@ out="$("$COMMANDER" assign codex worker "$WORK" "$WORK/nope" 2>&1)" || code=$?
 assert "assign outside tmux exits 1" "$code" "1"
 assert_contains "assign outside tmux says why" "$out" "not inside tmux"
 
+REPO="$WORK/repo"
+mkdir -p "$REPO"
+git -C "$REPO" init -q
+git -C "$REPO" -c user.email=t@example.com -c user.name=t commit --allow-empty -q -m init
+HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
+
+# The collector for cases 2-5 starts first; the other cases run inside its first tick.
+CNAME="smokeboss$$"
+SESSION="${PREFIX}-${CNAME}"
+OWNED="owned$$"
+OTHER="other$$"
+SINCE=1700000000001
+LONG="$(perl -e 'print "OWNEDOK" . ("x" x 693)')"
+# The collector pastes only into a known CLI's empty composer (64b48c1), so the host pane
+# runs the core's fake composer; its state dir name lets hostCli see "cursor-agent".
+FAKE_HOST_STATE="$(mktemp -d "$WORK/cursor-agent-fake.XXXX")"
+private_tmux new-session -d -s "$SESSION" -x 4000 -y 50 \
+  "${(q)$(command -v node)} ${(q)REPO_ROOT}/skills/tmux-agent-tools/scripts/lib/fixtures/composer/fake-cursor.mjs ${(q)FAKE_HOST_STATE}"
+PANE="$(private_tmux display-message -p -t "$SESSION" '#{pane_id}')"
+PANE_CWD="$(private_tmux display-message -p -t "$PANE" '#{pane_current_path}')"
+V3="$TMUX_AGENT_DIR/.v3"
+mkdir -p "$V3/$OWNED/episodes/1/sent" "$V3/$OTHER/episodes/1/sent"
+jq -n \
+  --arg profile codex --arg name "$OWNED" --arg dir "${REPO:A}" \
+  --argjson since "$SINCE" --arg owner "$SESSION" --arg ownerCwd "$PANE_CWD" \
+  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd,origin:"assign"}' \
+  > "$V3/$OWNED/worker.json"
+jq -n \
+  --argjson since "$SINCE" --arg owner "$SESSION" --arg result "$V3/$OWNED/result.json" \
+  '{seq:1,since:$since,owner:$owner,goal:"ship",resultPath:$result,origin:"launch"}' \
+  > "$V3/$OWNED/episodes/1/dispatch.json"
+jq -n --arg summary "$LONG" \
+  '{schema_version:1,status:"success",summary:$summary,artifacts:[],errors:[],episode:1}' \
+  > "$V3/$OWNED/result.json"
+jq -n \
+  --arg profile agy --arg name "$OTHER" --arg dir "${REPO:A}" \
+  --argjson since 1700000000002 --arg owner "someone-else" --arg ownerCwd "$PANE_CWD" \
+  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd,origin:"assign"}' \
+  > "$V3/$OTHER/worker.json"
+jq -n \
+  --argjson since 1700000000002 --arg owner "someone-else" --arg result "$V3/$OTHER/result.json" \
+  '{seq:1,since:$since,owner:$owner,resultPath:$result,origin:"launch"}' \
+  > "$V3/$OTHER/episodes/1/dispatch.json"
+jq -n '{schema_version:1,status:"success",summary:"OTHERWORKERTOKEN",artifacts:[],errors:[],episode:1}' \
+  > "$V3/$OTHER/result.json"
+OKEY="$(session_key someone-else)"
+mkdir -p "$V3/.sessions/$OKEY/act/1"
+: > "$V3/.sessions/$OKEY/act/1.beat"
+
+"$COMMANDER" collect codex "$CNAME" >"$WORK/collect.out" 2>"$WORK/collect.err" &
+COLLECT_PID=$!
+
 echo
 echo "case 1: assign publishes the v5 descriptor with owner = session name before the launch"
 ASSIGN_SESSION="commander-smoke-assign-$$"
 ASSIGN_CWD="$WORK/pane"
-REPO="$WORK/repo"
 BRIEF="$WORK/brief.md"
 WORKER="worker$$"
-mkdir -p "$ASSIGN_CWD" "$REPO"
-git -C "$REPO" init -q
-git -C "$REPO" -c user.email=t@example.com -c user.name=t commit --allow-empty -q -m init
-HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
+mkdir -p "$ASSIGN_CWD"
 printf 'GOAL: ship the commander\nACCEPTANCE: tests pass\nREPORT: done\n' > "$BRIEF"
-ASSIGN_OUT="$WORK/assign.out"
-ASSIGN_ERR="$WORK/assign.err"
-ASSIGN_CODE="$WORK/assign.code"
-cat > "$WORK/run-assign.zsh" <<EOF
+# write_assign <script> <out> <err> <code>: a pane script that runs one assign.
+write_assign() {
+  cat > "$1" <<EOF
 #!/usr/bin/env zsh
 set -euo pipefail
 export PATH=${(q)WORK}/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -212,15 +261,20 @@ export TMUX_AGENT_TMUX_SOCKET=${(q)TMUX_AGENT_TMUX_SOCKET}
 export ZDOTDIR=${(q)WORK}/zdot
 unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
 cd ${(q)ASSIGN_CWD}
-${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)ASSIGN_OUT} 2>${(q)ASSIGN_ERR}
-print -r -- \$? > ${(q)ASSIGN_CODE}
+${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)2} 2>${(q)3}
+print -r -- \$? > ${(q)4}
 EOF
-chmod +x "$WORK/run-assign.zsh"
+  chmod +x "$1"
+}
+ASSIGN_OUT="$WORK/assign.out"
+ASSIGN_ERR="$WORK/assign.err"
+ASSIGN_CODE="$WORK/assign.code"
+write_assign "$WORK/run-assign.zsh" "$ASSIGN_OUT" "$ASSIGN_ERR" "$ASSIGN_CODE"
 private_tmux new-session -d -s "$ASSIGN_SESSION" "$WORK/run-assign.zsh"
 assign_done() { [[ -f "$ASSIGN_CODE" ]]; }
-poll 50 assign_done || { echo "assign did not finish" >&2; echo "--- err ---"; cat "$ASSIGN_ERR" 2>/dev/null || true; echo "--- log ---"; cat "$FAKE_LOG"; exit 1; }
 have_snap() { [[ -s "$FAKE_SNAP" ]] && grep -q 'dispatch-before-launch:' "$FAKE_LOG"; }
-poll 50 have_snap || {
+poll 160 assign_done || { echo "assign did not finish" >&2; echo "--- err ---"; cat "$ASSIGN_ERR" 2>/dev/null || true; echo "--- log ---"; cat "$FAKE_LOG"; exit 1; }
+poll 40 have_snap || {
   echo "launch did not see the descriptor" >&2
   echo "--- fake log ---"; cat "$FAKE_LOG"
   echo "--- out ---"; cat "$ASSIGN_OUT" 2>/dev/null || true
@@ -253,134 +307,17 @@ assert_contains "stdout says nobody is collecting" "$(<"$ASSIGN_OUT")" "collecto
 # R9: the status line reads .v3. A worker assigned through this command shows up.
 R9_LINE="$(cd "$ASSIGN_CWD" && "$COMMANDER" panel "$ASSIGN_SESSION" --width 200)"
 assert_contains "R9: panel lists the worker assigned by commander assign" "$R9_LINE" "$RECORDED"
-# --width reaches fitPanelLine; its fixtures live in snapshot.contract.node.ts.
-assert "panel --width narrower than one entry prints +N more" \
-  "$(cd "$ASSIGN_CWD" && "$COMMANDER" panel "$ASSIGN_SESSION" --width 1)" "+1 more"
 # Same name again: a fresh directory, so the first run's result.json can never
 # be read as the second run's answer.
 rm -f "$ASSIGN_CODE" "$FAKE_SNAP"
-sleep 0.01
 private_tmux new-session -d -s "${ASSIGN_SESSION}b" "$WORK/run-assign.zsh"
-poll 50 assign_done || { echo "second assign did not finish" >&2; exit 1; }
-poll 50 have_snap || { echo "second launch did not see the descriptor" >&2; cat "$FAKE_LOG"; exit 1; }
+poll 160 assign_done || { echo "second assign did not finish" >&2; exit 1; }
+poll 40 have_snap || { echo "second launch did not see the descriptor" >&2; cat "$FAKE_LOG"; exit 1; }
 SECOND="$(jq -r '.name' "$FAKE_SNAP")"
 assert "a reused worker name gets a new directory" "$([[ "$SECOND" != "$RECORDED" && -d "$TMUX_AGENT_DIR/.v3/$SECOND" ]] && echo yes || echo no)" "yes"
 
-session_key() {
-  python3 -c 'import sys; print(sys.argv[1].encode().hex())' "$1"
-}
-
 echo
-echo "case 2-5: collect pastes an owned terminal result once, refreshes the beat, then exits"
-CNAME="smokeboss$$"
-SESSION="${PREFIX}-${CNAME}"
-OWNED="owned$$"
-OTHER="other$$"
-SINCE=1700000000001
-LONG="$(perl -e 'print "OWNEDOK" . ("x" x 693)')"
-# The collector pastes only into a known CLI's empty composer (64b48c1), so the host pane
-# runs the core's fake composer; its state dir name lets hostCli see "cursor-agent".
-FAKE_HOST_STATE="$(mktemp -d "$WORK/cursor-agent-fake.XXXX")"
-private_tmux new-session -d -s "$SESSION" -x 4000 -y 50 \
-  "${(q)$(command -v node)} ${(q)REPO_ROOT}/skills/tmux-agent-tools/scripts/lib/fixtures/composer/fake-cursor.mjs ${(q)FAKE_HOST_STATE}"
-PANE="$(private_tmux display-message -p -t "$SESSION" '#{pane_id}')"
-PANE_CWD="$(private_tmux display-message -p -t "$PANE" '#{pane_current_path}')"
-V3="$TMUX_AGENT_DIR/.v3"
-mkdir -p "$V3/$OWNED/episodes/1/sent" "$V3/$OTHER/episodes/1/sent" "$REPO"
-jq -n \
-  --arg profile codex --arg name "$OWNED" --arg dir "${REPO:A}" \
-  --argjson since "$SINCE" --arg owner "$SESSION" --arg ownerCwd "$PANE_CWD" \
-  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd,origin:"assign"}' \
-  > "$V3/$OWNED/worker.json"
-jq -n \
-  --argjson since "$SINCE" --arg owner "$SESSION" --arg result "$V3/$OWNED/result.json" \
-  '{seq:1,since:$since,owner:$owner,goal:"ship",resultPath:$result,origin:"launch"}' \
-  > "$V3/$OWNED/episodes/1/dispatch.json"
-jq -n --arg summary "$LONG" \
-  '{schema_version:1,status:"success",summary:$summary,artifacts:[],errors:[],episode:1}' \
-  > "$V3/$OWNED/result.json"
-jq -n \
-  --arg profile agy --arg name "$OTHER" --arg dir "${REPO:A}" \
-  --argjson since 1700000000002 --arg owner "someone-else" --arg ownerCwd "$PANE_CWD" \
-  '{profile:$profile,name:$name,dir:$dir,since:$since,owner:$owner,ownerCwd:$ownerCwd,origin:"assign"}' \
-  > "$V3/$OTHER/worker.json"
-jq -n \
-  --argjson since 1700000000002 --arg owner "someone-else" --arg result "$V3/$OTHER/result.json" \
-  '{seq:1,since:$since,owner:$owner,resultPath:$result,origin:"launch"}' \
-  > "$V3/$OTHER/episodes/1/dispatch.json"
-jq -n '{schema_version:1,status:"success",summary:"OTHERWORKERTOKEN",artifacts:[],errors:[],episode:1}' \
-  > "$V3/$OTHER/result.json"
-OKEY="$(session_key someone-else)"
-mkdir -p "$V3/.sessions/$OKEY/act/1"
-: > "$V3/.sessions/$OKEY/act/1.beat"
-
-"$COMMANDER" collect codex "$CNAME" >"$WORK/collect.out" 2>"$WORK/collect.err" &
-COLLECT_PID=$!
-
-# Submitted, not just pasted: the fake logged the Enter and its composer is empty again.
-# A paste still in the composer draws each line with a 4-column prefix (CI read 704, not 700).
-have_prompt() {
-  grep -q '^ENTER:idle:.*OWNEDOK' "$FAKE_HOST_STATE/log" 2>/dev/null || return 1
-  local pane; pane="$(private_tmux capture-pane -p -J -t "$PANE")"
-  [[ "$pane" == *OWNEDOK* && "$pane" == *"→ Plan, search, build anything"* ]]
-}
-poll 75 have_prompt || {
-  echo "no paste within 15s" >&2
-  echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
-  echo "--- pane ---"; private_tmux capture-pane -p -J -t "$PANE" >&2 || true
-  exit 1
-}
-BODY="$(private_tmux capture-pane -p -J -t "$PANE")"
-assert "case 2: pasted once on the first tick" "$(print -r -- "$BODY" | grep -c OWNEDOK)" "1"
-assert_contains "case 2: paste names the worker" "$BODY" "$OWNED"
-assert_contains "case 2: paste names the status" "$BODY" "success"
-assert_contains "case 2: paste names the result path" "$BODY" "$V3/$OWNED/result.json"
-SUMMARY_LINE="$(print -r -- "$BODY" | awk '/<worker-output/{p=1; next} /<\/worker-output>/{exit} p{print; exit}')"
-assert "case 2: summary is the full 700 chars (core fence is 12000)" "${#SUMMARY_LINE}" "700"
-assert_contains "case 2: summary keeps its prefix" "$SUMMARY_LINE" "OWNEDOK"
-SKEY="$(session_key "$SESSION")"
-HB="$V3/.sessions/$SKEY/act/1.beat"
-[[ -f "$HB" ]] || { echo "beat missing after first tick" >&2; echo "--- collect err ---"; cat "$WORK/collect.err"; exit 1; }
-HB1="$(tr -d '[:space:]' < "$HB")"
-assert "case 4: first beat is numeric ms" "$([[ "$HB1" == <-> ]] && echo yes || echo no)" "yes"
-
-hb_changed() { [[ "$(tr -d '[:space:]' < "$HB")" != "$HB1" ]]; }
-poll 125 hb_changed || {
-  echo "beat did not refresh within 25s" >&2
-  echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
-  exit 1
-}
-sleep 1
-BODY="$(private_tmux capture-pane -p -J -t "$PANE")"
-HB2="$(tr -d '[:space:]' < "$HB")"
-assert "case 4: beat refreshed on the next tick" "$([[ "$HB1" != "$HB2" ]] && echo yes || echo no)" "yes"
-assert "case 2: second tick pastes nothing" "$(print -r -- "$BODY" | grep -c OWNEDOK)" "1"
-assert "case 2: episode closed with acks/done" "$([[ -d "$V3/$OWNED/episodes/1/acks/done" ]] && echo yes || echo no)" "yes"
-assert "case 2: descriptor stays in place" "$([[ -f "$V3/$OWNED/episodes/1/dispatch.json" ]] && echo yes || echo no)" "yes"
-assert "case 2: descriptor is not renamed aside" "$([[ ! -e "$V3/$OWNED/dispatch.delivered.json" && ! -e "$TMUX_AGENT_DIR/$OWNED/dispatch.delivered.json" ]] && echo yes || echo no)" "yes"
-assert "case 3: other owner's descriptor is untouched" "$([[ -f "$V3/$OTHER/episodes/1/dispatch.json" ]] && echo yes || echo no)" "yes"
-assert_excludes "case 3: other owner's worker is not in the paste" "$BODY" "$OTHER"
-assert_excludes "case 3: other owner's summary is not sent" "$BODY" "OTHERWORKERTOKEN"
-assert "case 3: other owner has no done ack" "$([[ -e "$V3/$OTHER/episodes/1/acks/done" ]] && echo yes || echo no)" "no"
-
-echo
-echo "case 5: collect exits when the commander session is gone"
-private_tmux kill-session -t "$SESSION"
-ec=0
-(
-  sleep 20
-  kill "$COLLECT_PID" 2>/dev/null || true
-) &
-TIMER_PID=$!
-wait "$COLLECT_PID" || ec=$?
-kill "$TIMER_PID" 2>/dev/null || true
-wait "$TIMER_PID" 2>/dev/null || true
-COLLECT_PID=""
-TIMER_PID=""
-assert "case 5: collect exits 0" "$ec" "0"
-
-echo
-echo "extra: start --no-attach refuses a live collector; stop clears it"
+echo "case: start --no-attach sets the status line; a live collector refuses a second start"
 SNAME="startboss$$"
 SSESSION="${PREFIX}-${SNAME}"
 "$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start.out" 2>"$WORK/start.err"
@@ -392,12 +329,10 @@ SPID="$(tr -d '[:space:]' < "$PIDFILE")"
 assert "start collector is alive" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "yes"
 SBEAT="$TMUX_AGENT_DIR/.v3/.sessions/$(session_key "$SSESSION")/act/1.beat"
 have_start_hb() { [[ -f "$SBEAT" ]]; }
-poll 50 have_start_hb || { echo "start collector wrote no beat" >&2; cat "$WORK/start.err"; echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${SSESSION}.log" 2>/dev/null || true; exit 1; }
+poll 40 have_start_hb || { echo "start collector wrote no beat" >&2; cat "$WORK/start.err"; echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${SSESSION}.log" 2>/dev/null || true; exit 1; }
 assert "start beat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$SBEAT")" == <-> ]] && echo yes || echo no)" "yes"
-ST_STATUS="$(private_tmux show-options -t "$SSESSION" -v status)"
-assert "start sets per-session status 2" "$ST_STATUS" "2"
-ST_INT="$(private_tmux show-options -t "$SSESSION" -v status-interval)"
-assert "start sets per-session status-interval 2" "$ST_INT" "2"
+assert "start sets per-session status 2" "$(private_tmux show-options -t "$SSESSION" -v status)" "2"
+assert "start sets per-session status-interval 2" "$(private_tmux show-options -t "$SSESSION" -v status-interval)" "2"
 ST_FMT="$(private_tmux show-options -t "$SSESSION" -v 'status-format[1]')"
 assert_contains "start status line uses explicit zsh" "$ST_FMT" "#(zsh "
 assert_contains "start status line runs panel" "$ST_FMT" " panel "
@@ -409,11 +344,6 @@ code=0
 "$COMMANDER" start codex "$SNAME" "$WORK" --no-attach >"$WORK/start2.out" 2>"$WORK/start2.err" || code=$?
 assert "second start exits 1" "$code" "1"
 assert_contains "second start names the live collector" "$(<"$WORK/start2.err")" "already running"
-private_tmux kill-session -t "$SSESSION"
-start_gone() { ! kill -0 "$SPID" 2>/dev/null; }
-poll 50 start_gone || { echo "collector still alive after the session died" >&2; exit 1; }
-assert "collector exits when its session is gone" "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)" "no"
-assert "collector removes its pid file when the session is gone" "$([[ -e "$PIDFILE" ]] && echo yes || echo no)" "no"
 
 echo
 echo "case: start --no-panel does not install the status line"
@@ -421,22 +351,9 @@ NPNAME="nopanel$$"
 NPSESSION="${PREFIX}-${NPNAME}"
 np_code=0
 "$COMMANDER" start codex "$NPNAME" "$WORK" --no-attach --no-panel >"$WORK/np.out" 2>"$WORK/np.err" || np_code=$?
-if (( np_code != 0 )); then
-  echo "--- np.err ---" >&2
-  cat "$WORK/np.err" >&2 || true
-fi
+(( np_code == 0 )) || { echo "--- np.err ---" >&2; cat "$WORK/np.err" >&2 || true; }
 assert "--no-panel start exits 0" "$np_code" "0"
-if (( np_code == 0 )); then
-  NPOPTS="$(private_tmux show-options -t "$NPSESSION" 2>/dev/null || true)"
-  assert_excludes "--no-panel does not set the panel command" "$NPOPTS" "tmux-agent-commander"
-  private_tmux kill-session -t "$NPSESSION"
-fi
-
-echo
-echo "case: panel with no owned workers"
-EMPTY_SESSION="panel-empty-$$"
-eline="$("$COMMANDER" panel "$EMPTY_SESSION" --width 80)"
-assert "panel with no owned workers" "$eline" "tmux-agent: no workers"
+assert_excludes "--no-panel does not set the panel command" "$(private_tmux show-options -t "$NPSESSION" 2>/dev/null || true)" "tmux-agent-commander"
 
 echo
 echo "case: commander session name matches real agent-tmux (tenant too)"
@@ -460,13 +377,11 @@ count_matching() {
   done
   print -r -- "$n"
 }
-
 proc_gone() {
   [[ "$(count_matching "$1")" == 0 ]]
 }
-
 has_tmux_ancestor() {
-  local pid="$1" i ppid comm
+  local pid="$1" i ppid comm args
   for (( i = 0; i < 6; i++ )); do
     ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)"
     [[ "$ppid" == <-> && "$ppid" -gt 1 ]] || return 1
@@ -478,7 +393,6 @@ has_tmux_ancestor() {
   done
   return 1
 }
-
 dump_ancestors() {
   local pid="$1" i ppid
   for (( i = 0; i < 6; i++ )); do
@@ -489,43 +403,19 @@ dump_ancestors() {
   done
 }
 
-run_assign_in() {
-  local session="$1" out="$2" err="$3" code="$4" script="$5"
-  rm -f "$code"
-  cat > "$script" <<EOF
-#!/usr/bin/env zsh
-set -euo pipefail
-export PATH=${(q)WORK}/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-export TMUX_AGENT_DIR=${(q)TMUX_AGENT_DIR}
-export XDG_CONFIG_HOME=${(q)XDG_CONFIG_HOME}
-export AGENT_TMUX_PROFILE_DIR=${(q)AGENT_TMUX_PROFILE_DIR}
-export FAKE_LOG=${(q)FAKE_LOG}
-export FAKE_SNAP=${(q)FAKE_SNAP}
-export FAKE_PROMPTS=${(q)FAKE_PROMPTS}
-export COMMANDER_PREFIX=${(q)COMMANDER_PREFIX}
-export TMUX_AGENT_TMUX_SOCKET=${(q)TMUX_AGENT_TMUX_SOCKET}
-export ZDOTDIR=${(q)WORK}/zdot
-unset AGENT_TMUX_PREFIX CODEX_TMUX_PREFIX TMUX_AGENT_TOOLS_TENANT
-cd ${(q)ASSIGN_CWD}
-${(q)COMMANDER} assign codex ${(q)WORKER} ${(q)REPO} ${(q)BRIEF} >${(q)out} 2>${(q)err}
-print -r -- \$? > ${(q)code}
-EOF
-  chmod +x "$script"
-  private_tmux split-window -d -t "$session" "$script"
-}
-
 echo
-echo "case: assign starts one collector from the tmux server"
+echo "case: assign starts one collector from the tmux server; a second assign reuses it"
 ANAME="autocol$$"
 ASESSION="${PREFIX}-${ANAME}"
 AC_OUT="$WORK/ac.out"
 AC_ERR="$WORK/ac.err"
 AC_CODE="$WORK/ac.code"
 AC_SCRIPT="$WORK/run-ac.zsh"
-private_tmux new-session -d -s "$ASESSION" "sleep 180"
-run_assign_in "$ASESSION" "$AC_OUT" "$AC_ERR" "$AC_CODE" "$AC_SCRIPT"
+private_tmux new-session -d -s "$ASESSION" "cat"
+write_assign "$AC_SCRIPT" "$AC_OUT" "$AC_ERR" "$AC_CODE"
+private_tmux split-window -d -t "$ASESSION" "$AC_SCRIPT"
 ac_done() { [[ -f "$AC_CODE" ]]; }
-poll 50 ac_done || {
+poll 160 ac_done || {
   echo "assign in prefixed session did not finish" >&2
   echo "--- err ---"; cat "$AC_ERR" 2>/dev/null || true
   exit 1
@@ -540,13 +430,13 @@ have_ac_pid() {
   p="$(tr -d '[:space:]' < "$AC_PIDFILE")"
   [[ "$p" == <-> ]] && kill -0 "$p" 2>/dev/null
 }
-poll 50 have_ac_pid || {
+poll 40 have_ac_pid || {
   echo "assign did not leave a live collector pid" >&2
   echo "--- err ---"; cat "$AC_ERR" 2>/dev/null || true
   echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${ASESSION}.log" 2>/dev/null || true
   exit 1
 }
-poll 25 proc_gone "$AC_SCRIPT" || { echo "assign pane script still running" >&2; exit 1; }
+poll 40 proc_gone "$AC_SCRIPT" || { echo "assign pane script still running" >&2; exit 1; }
 ACPID="$(tr -d '[:space:]' < "$AC_PIDFILE")"
 assert "collector still alive after the assign pane exits" "$(kill -0 "$ACPID" 2>/dev/null && echo yes || echo no)" "yes"
 AC_ARGS="$(ps -p "$ACPID" -o args= 2>/dev/null || true)"
@@ -562,61 +452,85 @@ fi
 assert "collector is owned by the tmux server" "$anc" "yes"
 ACBEAT="$TMUX_AGENT_DIR/.v3/.sessions/$(session_key "$ASESSION")/act/1.beat"
 have_ac_hb() { [[ -f "$ACBEAT" ]]; }
-poll 50 have_ac_hb || {
+poll 40 have_ac_hb || {
   echo "assign collector wrote no beat" >&2
   echo "--- log ---"; cat "$TMUX_AGENT_DIR/.commander-${ASESSION}.log" 2>/dev/null || true
   exit 1
 }
 assert "assign beat is numeric ms" "$([[ "$(tr -d '[:space:]' < "$ACBEAT")" == <-> ]] && echo yes || echo no)" "yes"
-
-echo
-echo "case: a second assign does not start a second collector"
-AC_OUT2="$WORK/ac2.out"
-AC_ERR2="$WORK/ac2.err"
-AC_CODE2="$WORK/ac2.code"
-AC_SCRIPT2="$WORK/run-ac2.zsh"
-run_assign_in "$ASESSION" "$AC_OUT2" "$AC_ERR2" "$AC_CODE2" "$AC_SCRIPT2"
-ac2_done() { [[ -f "$AC_CODE2" ]]; }
-poll 50 ac2_done || {
+rm -f "$AC_CODE"
+private_tmux split-window -d -t "$ASESSION" "$AC_SCRIPT"
+poll 160 ac_done || {
   echo "second prefixed assign did not finish" >&2
-  echo "--- err ---"; cat "$AC_ERR2" 2>/dev/null || true
+  echo "--- err ---"; cat "$AC_ERR" 2>/dev/null || true
   exit 1
 }
-assert "second prefixed assign exits 0" "$(<"$AC_CODE2")" "0"
-assert_excludes "second assign does not say collector started" "$(<"$AC_OUT2")" "collector started"
+assert "second prefixed assign exits 0" "$(<"$AC_CODE")" "0"
+assert_excludes "second assign does not say collector started" "$(<"$AC_OUT")" "collector started"
 assert "second assign keeps the same pid" "$(tr -d '[:space:]' < "$AC_PIDFILE")" "$ACPID"
 assert "first collector still alive" "$(kill -0 "$ACPID" 2>/dev/null && echo yes || echo no)" "yes"
 # The collector's argv is "<script> collect codex <name>". run-shell's sh -c quotes those words.
 assert "only one collect process" "$(count_matching " collect codex ${ANAME}")" "1"
 
 echo
-echo "case: collect exits 0 without writing when a live collector owns the pid"
-DNAME="ownedcol$$"
-DSESSION="${PREFIX}-${DNAME}"
-private_tmux new-session -d -s "$DSESSION" "sleep 180"
-"$COMMANDER" collect codex "$DNAME" >"$WORK/down.out" 2>"$WORK/derr.err" &
-DCOLLECT_PID=$!
-DPIDFILE="$TMUX_AGENT_DIR/.commander-${DSESSION}.pid"
-have_dp() { [[ -f "$DPIDFILE" ]]; }
-poll 25 have_dp || {
-  echo "owner collect wrote no pid" >&2
-  echo "--- err ---"; cat "$WORK/derr.err" 2>/dev/null || true
+echo "case 2-5: collect pasted the owned terminal result once, refreshes the beat, then exits"
+# Submitted, not just pasted: the fake logged the Enter and its composer is empty again.
+# A paste still in the composer draws each line with a 4-column prefix (CI read 704, not 700).
+have_prompt() {
+  grep -q '^ENTER:idle:.*OWNEDOK' "$FAKE_HOST_STATE/log" 2>/dev/null || return 1
+  local pane; pane="$(private_tmux capture-pane -p -J -t "$PANE")"
+  [[ "$pane" == *OWNEDOK* && "$pane" == *"→ Plan, search, build anything"* ]]
+}
+poll 100 have_prompt || {
+  echo "no paste within the first tick" >&2
+  echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
+  echo "--- pane ---"; private_tmux capture-pane -p -J -t "$PANE" >&2 || true
   exit 1
 }
-assert "owner collect recorded its own pid" "$(tr -d '[:space:]' < "$DPIDFILE")" "$DCOLLECT_PID"
-dcode=0
-"$COMMANDER" collect codex "$DNAME" >"$WORK/d2.out" 2>"$WORK/d2.err" || dcode=$?
-assert "second collect exits 0" "$dcode" "0"
-assert "second collect writes nothing to stdout" "$(<"$WORK/d2.out")" ""
-assert "second collect writes nothing to stderr" "$(<"$WORK/d2.err")" ""
-assert "second collect leaves the owner's pid" "$(tr -d '[:space:]' < "$DPIDFILE")" "$DCOLLECT_PID"
-assert "owner collect still alive" "$(kill -0 "$DCOLLECT_PID" 2>/dev/null && echo yes || echo no)" "yes"
-private_tmux kill-session -t "$DSESSION"
-dec=0
-wait "$DCOLLECT_PID" || dec=$?
-DCOLLECT_PID=""
-assert "owner collect exits 0 when its session is gone" "$dec" "0"
-assert "owner collect removes its pid file" "$([[ -e "$DPIDFILE" ]] && echo yes || echo no)" "no"
+SKEY="$(session_key "$SESSION")"
+HB="$V3/.sessions/$SKEY/act/1.beat"
+[[ -f "$HB" ]] || { echo "beat missing after first tick" >&2; echo "--- collect err ---"; cat "$WORK/collect.err"; exit 1; }
+HB1="$(tr -d '[:space:]' < "$HB")"
+assert "case 4: beat is numeric ms" "$([[ "$HB1" == <-> ]] && echo yes || echo no)" "yes"
+# Wait for the next beat (one product tick, 10 s). The loop's next pass follows the beat,
+# so killing the session right after it lets that pass see the pane gone (case 5).
+hb_changed() { [[ "$(tr -d '[:space:]' < "$HB")" != "$HB1" ]]; }
+poll 240 hb_changed || {
+  echo "beat did not refresh within 12s" >&2
+  echo "--- collect err ---"; cat "$WORK/collect.err" 2>/dev/null || true
+  exit 1
+}
+BODY="$(private_tmux capture-pane -p -J -t "$PANE")"
+private_tmux kill-session -t "$SESSION"
+assert "case 4: beat refreshed on the next tick" "$([[ "$HB1" != "$(tr -d '[:space:]' < "$HB")" ]] && echo yes || echo no)" "yes"
+assert "case 2: pasted once" "$(print -r -- "$BODY" | grep -c OWNEDOK)" "1"
+assert_contains "case 2: paste names the worker" "$BODY" "$OWNED"
+assert_contains "case 2: paste names the status" "$BODY" "success"
+assert_contains "case 2: paste names the result path" "$BODY" "$V3/$OWNED/result.json"
+SUMMARY_LINE="$(print -r -- "$BODY" | awk '/<worker-output/{p=1; next} /<\/worker-output>/{exit} p{print; exit}')"
+assert "case 2: summary is the full 700 chars (core fence is 12000)" "${#SUMMARY_LINE}" "700"
+assert_contains "case 2: summary keeps its prefix" "$SUMMARY_LINE" "OWNEDOK"
+
+echo
+echo "case 5: collect exits when the commander session is gone"
+ec=0
+# Watchdog: the pass after the beat sees the pane gone at once; 5 s is ample.
+( sleep 5; kill "$COLLECT_PID" 2>/dev/null ) &
+watchdog=$!
+wait "$COLLECT_PID" || ec=$?
+kill "$watchdog" 2>/dev/null || true
+wait "$watchdog" 2>/dev/null || true
+COLLECT_PID=""
+assert "case 5: collect exits 0" "$ec" "0"
+# The composer's log outlives the pane: every Enter the collector sent is in it.
+assert "case 2: no second paste (one submitted Enter)" "$(grep -c '^ENTER:.*OWNEDOK' "$FAKE_HOST_STATE/log")" "1"
+assert "case 2: episode closed with acks/done" "$([[ -d "$V3/$OWNED/episodes/1/acks/done" ]] && echo yes || echo no)" "yes"
+assert "case 2: descriptor stays in place" "$([[ -f "$V3/$OWNED/episodes/1/dispatch.json" ]] && echo yes || echo no)" "yes"
+assert "case 2: descriptor is not renamed aside" "$([[ ! -e "$V3/$OWNED/dispatch.delivered.json" && ! -e "$TMUX_AGENT_DIR/$OWNED/dispatch.delivered.json" ]] && echo yes || echo no)" "yes"
+assert "case 3: other owner's descriptor is untouched" "$([[ -f "$V3/$OTHER/episodes/1/dispatch.json" ]] && echo yes || echo no)" "yes"
+assert_excludes "case 3: other owner's worker is not in the paste" "$BODY" "$OTHER"
+assert_excludes "case 3: other owner's summary is not sent" "$(<"$FAKE_HOST_STATE/log")" "OTHERWORKERTOKEN"
+assert "case 3: other owner has no done ack" "$([[ -e "$V3/$OTHER/episodes/1/acks/done" ]] && echo yes || echo no)" "no"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

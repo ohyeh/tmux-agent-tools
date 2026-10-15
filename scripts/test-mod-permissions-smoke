@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # The mod's permission surface is a contract with whoever installs it: the
 # events it hooks, the engine calls it makes, the env it reads and writes. The
 # community's first reaction to function-hook mods was to scan them for exactly
@@ -10,11 +11,14 @@
 # the diff; an intended change is committed by refreshing the file with
 # `scripts/test-mod-permissions-smoke --update`.
 #
-# Also runs the mod's own test suite (`claude plugin test`), which nothing else
-# in CI did before this: 54 mocked tests only ever ran on a developer's machine.
+# Also type-checks the mod and the node core: `claude plugin validate` and `claude
+# plugin test` do NOT, and v0.3.0 shipped four tsc errors past both (an omitted
+# required argument, an unassignable render child, two malformed ConfigRow mocks).
+# It runs the TypeScript pinned in mcp-adapter: npx would download it into each job's HOME.
+# The mod's own suite (`claude plugin test`) is its own release lane, not a smoke.
 #
 # CLAUDE_BIN names the real Claude Code binary when a stub `claude` shadows it
-# on PATH (CI installs sleep-stubs for the tmux smokes).
+# on PATH (some smokes put sleep-stubs on PATH).
 
 set -euo pipefail
 
@@ -42,7 +46,7 @@ if ! "$CLAUDE" plugin validate --help </dev/null >/dev/null 2>&1; then
   exit 1
 fi
 
-actual="$(mktemp)"
+actual="$(mktemp "${TMPDIR:-/tmp}/mod-permissions.XXXXXX")"
 trap 'rm -f "$actual"' EXIT
 # Only the derived surface lines; the header carries an absolute path.
 # Capture first: under pipefail a failing validate or a grep with no match
@@ -69,18 +73,25 @@ else
   bad "permission surface drifted from $PINNED (diff above). Intended? Review, then --update"
 fi
 
-echo "running the mod's test suite"
-if out="$("$CLAUDE" plugin test "$MOD" </dev/null 2>&1)"; then
-  summary="$(printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail)$' | tr -s ' ' | paste -sd, -)"
-  if printf '%s\n' "$out" | grep -qE '^ *0 fail$'; then
-    ok "plugin test:${summary}"
-  else
-    bad "plugin test reported failures:${summary}"
-    printf '%s\n' "$out" | grep -E '\(fail\)' >&2 || true
-  fi
+# The mod config covers hooks/lib, the mod's byte-identical copy of the non-node core
+# files (scripts/sync-mod-core --check). The node-run core files (`lib/*.node.ts`) get
+# their own config with @types/node from mcp-adapter.
+# The copy that ships with mcp-adapter first; `tsc` on PATH only when it is absent.
+# The floor: tsc 5.0.2 rejects target es2023.
+autoload -Uz is-at-least
+tsc_bin=mcp-adapter/node_modules/.bin/tsc
+[[ -x "$tsc_bin" ]] || tsc_bin="$(command -v tsc 2>/dev/null || true)"
+tsc_ver="$([[ -n "$tsc_bin" ]] && "$tsc_bin" -v 2>/dev/null | sed -n 's/^Version //p' || true)"
+if [[ -z "$tsc_bin" || ! -d mcp-adapter/node_modules/@types/node ]]; then
+  bad "typescript or @types/node missing: run npm --prefix mcp-adapter ci"
+elif ! is-at-least 5.6.3 "${tsc_ver:-0}"; then
+  bad "tsc $tsc_bin is ${tsc_ver:-unknown}; need >= 5.6.3 (run npm --prefix mcp-adapter ci)"
 else
-  bad "plugin test exited non-zero"
-  printf '%s\n' "$out" | tail -20 >&2
+  echo "  tsc: $tsc_bin ($tsc_ver)"
+  for cfg in $MOD/tsconfig.json tsconfig.node.json; do
+    if "$tsc_bin" --noEmit -p "$cfg"; then ok "typecheck clean: $cfg"
+    else bad "typecheck errors in $cfg (above)"; fi
+  done
 fi
 
 echo "$pass passed, $fail failed"

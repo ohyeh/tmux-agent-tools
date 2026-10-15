@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Standardization guard (#286): the three plugin manifests must agree with each
 # other AND with the latest released version in CHANGELOG.md. This makes version
 # drift a CI failure instead of something noticed releases later.
@@ -68,7 +69,7 @@ assert "mods/tmux-agent/hooks/register.ts MOD_VERSION matches the mod manifest" 
 if scripts/sync-mod-core --check; then core=same; else core=differs; fi
 assert "mods/tmux-agent/hooks/lib matches the core (scripts/sync-mod-core)" "$core" "same"
 
-# Finding M4/R4 (notes stop at the next section) lives in test-release-notes-smoke: release-notes
+# Finding M4/R4 (notes stop at the next section) is a release-notes fixture case below: it
 # now also gates the tag and `Not verified:`, which a past release need not meet.
 
 # The MCP bundle (plan R7.1, §1c S6) is generated and committed: a rebuild must
@@ -80,7 +81,7 @@ if [[ ! -d mcp-adapter/node_modules/esbuild ]]; then
   echo "  FAIL esbuild missing: run npm --prefix mcp-adapter ci" >&2
   FAIL=$((FAIL + 1))
 else
-  rebuild_dir="$(mktemp -d)"
+  rebuild_dir="$(mktemp -d "${TMPDIR:-/tmp}/version-sync-rebuild.XXXXXX")"
   node mcp-adapter/build.mjs --out "$rebuild_dir"
   for f in mcp-server.mjs mcp-server.LICENSES.txt; do
     if cmp -s "$rebuild_dir/$f" "$bundle_dir/$f"; then same=same; else same=differs; fi
@@ -93,6 +94,85 @@ fi
 assert "$bundle_dir/mcp-server.mjs banner version matches CHANGELOG" \
   "$(sed -n '1s|^// tmux-agent-mcp v\([0-9.]*\)\. .*|\1|p' "$bundle_dir/mcp-server.mjs")" \
   "$changelog_version"
+
+
+# Cases folded in below (packaging, codex manifest, release-notes, the version probes)
+# create files and run agent-tmux: every temp file and socket goes under the job dir.
+source "$SCRIPT_DIR/lib/smoke-tmux.sh"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/version-sync-smoke.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# Packaging: skill-packaged schema copies match their repo canonicals, no dev-only
+# evals/ ships, and the .codex skill symlink points at the canonical skill.
+SKILL_DIR=skills/tmux-agent-tools
+typeset -A DOC_PAIRS=(
+  ["schemas/result-status-summary.schema.json"]="schemas/result-status-summary.schema.json"
+  ["schemas/fanout-summary.schema.json"]="schemas/fanout-summary.schema.json"
+)
+for src in "${(k)DOC_PAIRS[@]}"; do
+  if cmp -s "$src" "$SKILL_DIR/${DOC_PAIRS[$src]}"; then same=same; else same=differs; fi
+  assert "skill copy $SKILL_DIR/${DOC_PAIRS[$src]} matches $src" "$same" "same"
+done
+if [[ -e "$SKILL_DIR/evals" ]]; then evals=present; else evals=absent; fi
+assert "skill payload carries no evals/ dir (dev-only)" "$evals" "absent"
+assert ".codex/skills/tmux-agent-tools links the canonical skill" \
+  "$(readlink .codex/skills/tmux-agent-tools 2>/dev/null || echo not-a-link)" "../../skills/tmux-agent-tools"
+
+# Codex manifest (codex-cli 0.160.0, observed 2026-10-02): with no `hooks` in
+# .codex-plugin/plugin.json codex parses hooks/hooks.json, Claude Code's file, and fails
+# on its `modules` key; the codex hooks file may hold only description/hooks. Codex
+# ignores an interface.defaultPrompt entry over 128 characters.
+CM=.codex-plugin/plugin.json
+codex_hooks="$(jq -r '.hooks // empty' "$CM")"
+if [[ -n "$codex_hooks" && "$codex_hooks" != ./hooks/hooks.json && "$codex_hooks" != hooks/hooks.json ]]; then
+  assert "$codex_hooks has only description/hooks" \
+    "$(jq -r 'keys - ["description","hooks"] | join(",")' "$codex_hooks" 2>/dev/null || echo PARSE_ERROR)" ""
+else
+  assert "$CM names its own codex hooks file" "${codex_hooks:-none}" "a file other than hooks/hooks.json"
+fi
+assert "$CM interface.defaultPrompt entries over 128 characters" \
+  "$(jq -r '[.interface.defaultPrompt[]? | select(length > 128)] | length' "$CM")" "0"
+
+# scripts/release-notes refuses a section without `Not verified:` and a tag that is not
+# on the `chore(release): X.Y.Z` commit (W40-8, W40-11); a ready release prints its notes,
+# which stop at the next section (M4/R4).
+RN="$WORK/release-notes"
+mkdir -p "$RN"
+rn_git() { git -C "$RN" -c user.name=t -c user.email=t@t "$@"; }
+rn_check() { # $1 label, $2 expected exit (0 or nonzero), $3 output pattern
+  local code=0 got
+  RELEASE_NOTES_ROOT="$RN" ruby scripts/release-notes v1.0.0 >"$WORK/rn.out" 2>"$WORK/rn.err" || code=$?
+  if [[ "$2" == 0 && $code == 0 ]] || [[ "$2" != 0 && $code != 0 ]] && grep -q -- "$3" "$WORK/rn.err" "$WORK/rn.out"; then got=ok
+  else got="exit $code: $(cat "$WORK/rn.err")"; fi
+  assert "release-notes: $1" "$got" "ok"
+}
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+git -C "$RN" init -q
+printf '# Changelog\n\n## v1.0.0 - 2026-10-09\n\n- Fix: a thing.\n' > "$RN/CHANGELOG.md"
+rn_git add -A && rn_git commit -qm 'chore(release): 1.0.0' && rn_git tag v1.0.0
+rn_check "section without Not verified: fails" 1 'Not verified:'
+printf '# Changelog\n\n## v1.0.0 - 2026-10-09\n\n- Fix: a thing.\n- Not verified: Linux hosts.\n\n## 0.10.1\n\n- Older.\n' > "$RN/CHANGELOG.md"
+rn_git tag -d v1.0.0 >/dev/null
+rn_check "missing tag fails" 1 'does not exist'
+rn_git commit -qam 'chore: later work' && rn_git tag v1.0.0
+rn_check "tag on a non-release commit fails" 1 'not "chore(release): 1.0.0"'
+rn_git tag -d v1.0.0 >/dev/null && rn_git tag v1.0.0 HEAD~1
+rn_check "ready release prints its notes" 0 'Not verified: Linux hosts.'
+if grep -q -e '^## ' -e 'Older' "$WORK/rn.out"; then leak=leaks; else leak=stops; fi
+assert "release-notes: notes stop at the next section" "$leak" "stops"
+
+# What `--version`, per-cli `version` and `doctor` print is the offline signal for skill-copy
+# drift. The fake CLI answers doctor's `--version` probe at once and waits on stdin otherwise.
+AGENT=skills/tmux-agent-tools/scripts/agent-tmux
+FAKE_CLI="$WORK/fake-cli"
+printf '#!/bin/sh\n[ "$1" = --version ] && { echo fake 1.0; exit 0; }\nexec cat\n' > "$FAKE_CLI"
+chmod +x "$FAKE_CLI"
+ver_top="$(TMUX_AGENT_DIR="$WORK/state" "$AGENT" --version)"
+assert "agent-tmux --version matches CHANGELOG" "$ver_top" "$changelog_version"
+assert "agent-tmux claude version matches --version" "$(TMUX_AGENT_DIR="$WORK/state" "$AGENT" claude version)" "$ver_top"
+assert "agent-tmux claude doctor --json version check" \
+  "$(TMUX_AGENT_DIR="$WORK/state" CLAUDE="$FAKE_CLI" "$AGENT" claude doctor --json 2>/dev/null | jq -r '.checks[] | select(.name=="version") | .detail')" \
+  "$changelog_version ($PWD/$AGENT)"
 
 echo "version-sync smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

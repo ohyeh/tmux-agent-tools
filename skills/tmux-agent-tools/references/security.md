@@ -50,7 +50,7 @@ tmux-agent-audit rotate [--log PATH] [--force]
 tmux-agent-audit path
 ```
 
-Event schema (`schema_version: 1`) and rotation semantics: `docs/design-issue-188-audit-surface.md`.
+Event schema (`schema_version: 1`) and rotation semantics: `scripts/tmux-agent-audit`.
 
 `secret.read` events carry only `secret_name` + `backend`, never the value.
 
@@ -64,7 +64,7 @@ Event schema (`schema_version: 1`) and rotation semantics: `docs/design-issue-18
 | `CLAUDE_TMUX_PREFIX` / `CODEX_TMUX_PREFIX` | tmux session name prefix per tool |
 | `CLAUDE_TMUX_STABLE_SECONDS` / `CODEX_TMUX_STABLE_SECONDS` | How long pane must be quiet to count as stable |
 | `CLAUDE_TMUX_SUBMIT_DELAY` / `CODEX_TMUX_SUBMIT_DELAY` | Raise when multiline prompts sit in CLI input box without submitting |
-| `CLAUDE_TMUX_CONF` / `CODEX_TMUX_CONF` | Per-tool tmux config file |
+| `CLAUDE_TMUX_CONF` / `CODEX_TMUX_CONF` | Per-tool tmux config file (loaded only by a server started on `TMUX_AGENT_TMUX_SOCKET`) |
 | `CLAUDE_TMUX_MOUSE` / `CODEX_TMUX_MOUSE` | Enable mouse mode |
 | `CLAUDE_TMUX_CLIPBOARD` / `CODEX_TMUX_CLIPBOARD` | `auto`, `internal`, or a copy command |
 | `CLAUDE_TMUX_STATUS_TAIL_LINES` / `CODEX_TMUX_STATUS_TAIL_LINES` | Lines included in `status` output |

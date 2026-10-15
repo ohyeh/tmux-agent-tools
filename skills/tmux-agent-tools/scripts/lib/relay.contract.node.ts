@@ -6,11 +6,11 @@ import { chmod, mkdir, mkdtemp, readFile, symlink, unlink, writeFile } from 'nod
 import { request } from 'node:http'
 import { writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import type { AddressInfo } from 'node:net'
+import { connect, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, beforeEach, describe, it } from 'node:test'
-import { checkBind, cleanText, createRelay, normalizePeer, parseWhois, systemAgentTmux, validName, writeOnce, type Identity, type RunResult } from './relay.node.ts'
+import { checkBind, cleanText, createRelay, normalizePeer, parseWhois, systemAgentTmux, systemWhois, validName, writeOnce, type Identity, type RunResult } from './relay.node.ts'
 
 const SELF: Identity = { node: 'nSELF', name: 'mbp', login: 'me@example.com', tagged: false }
 const MINI: Identity = { node: 'nMINI', name: 'mini', login: 'me@example.com', tagged: false }
@@ -171,6 +171,28 @@ describe('relay auth (socket peer + whois)', () => {
     assert.equal(await exists(join(w.dir, 'utf', 'remote.exit')), false)
     assert.equal(await raw(Buffer.from(`{"pad":"${'x'.repeat(17 * 1024)}"}`), true), 413)
   })
+  it('a whois that hangs fails closed at its deadline', async () => {
+    const fake = join(w.dir, 'whois-hang')
+    writeFileSync(fake, '#!/bin/sh\nsleep 20\n')
+    await chmod(fake, 0o755)
+    const old = process.env.TMUX_AGENT_RELAY_WHOIS
+    process.env.TMUX_AGENT_RELAY_WHOIS = fake
+    const t0 = Date.now()
+    try {
+      await assert.rejects(systemWhois('100.64.0.9'))
+    } finally {
+      if (old === undefined) delete process.env.TMUX_AGENT_RELAY_WHOIS
+      else process.env.TMUX_AGENT_RELAY_WHOIS = old
+    }
+    assert.ok(Date.now() - t0 < 10_000, 'whois deadline')
+  })
+  it('a body that never arrives does not block another request', async () => {
+    const s = connect(Number(new URL(w.url).port), '127.0.0.1')
+    await new Promise<void>((ok) => s.once('connect', () => ok()))
+    s.write('POST /v1/exit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{')
+    assert.equal((await fetch(`${w.url}/v1/health`)).status, 200)
+    s.destroy()
+  })
   it('caps whois work in flight at 8 distinct peers (503), sharing one lookup per IP', async () => {
     const pending: Array<() => void> = []
     let n = 0
@@ -214,7 +236,7 @@ describe('POST /v1/exit', () => {
     assert.equal((await post(w, '/v1/exit', { name: 'job', launch_id: 'L1', code: 0 }, { 'content-type': 'text/plain' })).status, 415)
     assert.equal((await post(w, '/v1/exit', 'not json')).status, 400)
     assert.equal((await post(w, '/v1/exit', '[1]')).status, 400)
-    for (const code of [-1, 256, 1.5, '0', null]) assert.equal((await post(w, '/v1/exit', { name: 'job', launch_id: 'L1', code })).status, 400, `code ${code}`)
+    for (const code of [-1, 256, 1.5, '0', null, true]) assert.equal((await post(w, '/v1/exit', { name: 'job', launch_id: 'L1', code })).status, 400, `code ${code}`)
     assert.equal((await post(w, '/v1/exit', { name: "it's", launch_id: 'L1', code: 0 })).status, 400)
     assert.equal((await post(w, '/v1/exit', { name: '../job', launch_id: 'L1', code: 0 })).status, 400)
     assert.equal((await post(w, '/v1/exit', { name: 'job', launch_id: 'L1', code: 0, pad: 'x'.repeat(17 * 1024) })).status, 413)

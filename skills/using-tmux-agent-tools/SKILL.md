@@ -200,8 +200,8 @@ yourself.
 - Inspect / housekeep existing sessions → `tmux-agent-sessions` (resolve,
   inventory, cleanup) · live overview → `tmux-agent-dashboard`.
 - Dependencies → `tmux-agent-dag`
-  · evidence polling → `tmux-agent-monitor` · alerts → `tmux-agent-notify`.
-- Records → `tmux-agent-audit` / `tmux-agent-history` / `tmux-agent-replay`
+  · evidence polling → `tmux-agent-monitor`.
+- Records → `tmux-agent-audit` / `tmux-agent-replay`
   · worktrees → `tmux-agent-worktrees`.
 
 Then read the chosen wrapper's row in the canonical capability table:
@@ -218,6 +218,11 @@ capability table**. Never paraphrase that table from memory.
   depth-capped); Codex workers have no equivalent exception.
 - **Engine-only, never raw tmux**: no hand-rolled `send-keys` /
   `capture-pane` / `new-session`. Plain shell only for genuine gaps — say so.
+- **Private server for probes and tests**: run a probe or test worker on a
+  private socket (`TMUX_AGENT_TMUX_SOCKET`) or in the smoke harness, never on
+  the shared default tmux server. Stop a worker before you delete its
+  directory: a deleted worker directory once broke every codex worker on the
+  shared server (fixed in 0.46.7; keep the habit).
 - **Verify every send**: prefer `send-wait`. A timeout means submission is
   UNCONFIRMED — check liveness (`status --json`; `probe --metric
   tool_active`, or `--metric active_spinner` for claude) and resend only if

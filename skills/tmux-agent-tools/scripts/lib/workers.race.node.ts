@@ -52,7 +52,8 @@ const host: Host = {
       const live = (env.LIVE ?? '').split(',').filter(Boolean)
       return { exitCode: 0, stdout: live.map(s => `${s}\t${cwd}\t0\n`).join(''), stderr: '' }
     }
-    if (argv[0] === 'agent-tmux') return { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":1}', stderr: '' }
+    // Live, quiet past the settle window, far from a stall.
+    if (argv[0] === 'agent-tmux') return { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":30}', stderr: '' }
     if (argv[0] === 'git') return { exitCode: 0, stdout: '', stderr: '' }
     return base.run(argv, dir, ms)
   },

@@ -1,7 +1,7 @@
 {
   "name": "tmux-agent-tools",
-  "version": "0.46.0",
-  "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent pair/team orchestration.",
+  "version": "0.46.13",
+  "description": "Tmux wrappers and a skill for running Claude Code or Codex CLI as controllable, supervised named sessions: an inline-vs-worker delegation gate, start/resume, send, wait, capture, status/doctor/setup, result files, human approval gates, and multi-agent dialogue/fanout orchestration.",
   "author": {
     "name": "PaulYeh",
     "url": "https://github.com/ohyeh"
@@ -24,7 +24,7 @@
   "interface": {
     "displayName": "tmux-agent-tools",
     "shortDescription": "Supervise Claude Code / Codex CLI as controllable tmux sessions",
-    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent pair/team orchestration through shell wrappers, exposed here as a skill plus the tmux-agent-mcp worker-lifecycle MCP server.",
+    "longDescription": "tmux-agent-tools turns Claude Code and Codex CLI into controllable, supervised tmux sessions. It provides start/resume, send, wait, capture, status/doctor, structured result files, human approval gates, and multi-agent dialogue/fanout orchestration through shell wrappers, exposed here as a skill plus the tmux-agent-mcp worker-lifecycle MCP server.",
     "developerName": "PaulYeh",
     "category": "Productivity",
     "capabilities": [
@@ -33,7 +33,7 @@
       "Send prompts, wait for markers, and capture pane output without attaching",
       "Read structured result.json files instead of scraping panes",
       "Gate destructive actions behind human approval files",
-      "Orchestrate multi-agent pair and team review workflows"
+      "Orchestrate bounded multi-agent dialogue and fanout review workflows"
     ],
     "defaultPrompt": [
       "Start a supervised codex or claude worker with agent-tmux and report its structured result."

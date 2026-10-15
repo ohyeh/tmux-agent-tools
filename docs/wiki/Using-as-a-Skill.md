@@ -97,17 +97,17 @@ In your prompt, be explicit: **"Write `$TMUX_AGENT_RESULT` before signaling done
 | Fire-and-forget single agent with structured result | `start --transcript ... --sentinel ... ; wait for sentinel ; result --json` |
 | Inject large handoff / goal packet | `send --from-file /abs/prompt.md --enter-count 3 <name>` |
 | Poll CLI-specific progress | `probe --metric context_percent --json <name>` |
-| Long-running agent with mid-run human approval | `wait-and-capture --pause-until-file <marker>` ([approval gate recipe](Recipes#approval-gate)) |
-| Parallel agents on one prompt | `tmux-agent-fanout run --agent ... --result-dir ...` ([fanout recipe](Recipes#fanout)) |
-| Dependency-ordered pipeline | `tmux-agent-dag <manifest.json>` ([DAG recipe](Recipes#dag)) |
+| Long-running agent with mid-run human approval | `wait-and-capture --pause-until-file <marker>` ([approval gate recipe](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md#approval-gate)) |
+| Parallel agents on one prompt | `tmux-agent-fanout run --agent ... --result-dir ...` ([fanout recipe](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md#fanout)) |
+| Dependency-ordered pipeline | `tmux-agent-dag <manifest.json>` ([DAG recipe](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md#dag)) |
 | Two-agent critique | `tmux-agent-dialogue critic ...` |
 
 ## Skill payload contents
 
-The installable skill directory (`skills/tmux-agent-tools/`) bundles more than the scripts: `schemas/` holds the `result.json`/fanout-summary JSON Schemas the scripts fall back to offline, and `references/troubleshooting.md` and `references/recipes.md` are packaged copies of this wiki's [Troubleshooting](Troubleshooting) and [Recipes](Recipes) pages for offline/skill-context use. The inline-vs-worker gate and one-shot forwarding pattern that used to ship as a separate `agents/` subagent bundle (`tmux-delegate`, `claude-oneshot`, `codex-oneshot`) are retired; that decision logic now lives directly in the `using-tmux-agent-tools` skill's decision tree — there is nothing to copy into `~/.claude/agents/` anymore.
+The installable skill directory (`skills/tmux-agent-tools/`) bundles more than the scripts: `schemas/` holds the `result.json`/fanout-summary JSON Schemas the scripts fall back to offline, and `references/troubleshooting.md` and `references/recipes.md` are the canonical troubleshooting and recipes pages, packaged for offline/skill-context use. The inline-vs-worker gate and one-shot forwarding pattern that used to ship as a separate `agents/` subagent bundle (`tmux-delegate`, `claude-oneshot`, `codex-oneshot`) are retired; that decision logic now lives directly in the `using-tmux-agent-tools` skill's decision tree — there is nothing to copy into `~/.claude/agents/` anymore.
 
 ## What to read next
 
-- [Recipes](Recipes) — concrete copy-pasteable workflows
+- [Recipes](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md) — concrete copy-pasteable workflows
 - [Observability and Secrets](Observability-and-Secrets) — audit log, redaction, secret backends
-- [Troubleshooting](Troubleshooting) — failure modes you'll hit
+- [Troubleshooting](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/troubleshooting.md) — failure modes you'll hit

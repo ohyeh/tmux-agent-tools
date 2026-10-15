@@ -26,25 +26,25 @@ fi
 
 shellcheck "$0"
 
-for path in "$repo_root"/skills/tmux-agent-tools/scripts/*; do
-  [ -f "$path" ] || continue
-  first_line="$(sed -n '1p' "$path")"
+for script_file in "$repo_root"/skills/tmux-agent-tools/scripts/*; do
+  [ -f "$script_file" ] || continue
+  first_line="$(sed -n '1p' "$script_file")"
   case "$first_line" in
     '#!'*zsh*)
-      shellcheck -e SC1071 "$path"
-      printf 'shellcheck: %s uses zsh; SC1071-only compatibility sentinel passed\n' "${path#"$repo_root"/}"
+      shellcheck -e SC1071 "$script_file"
+      printf 'shellcheck: %s uses zsh; SC1071-only compatibility sentinel passed\n' "${script_file#"$repo_root"/}"
       ;;
     '#!'*bash*)
-      shellcheck "$path"
+      shellcheck "$script_file"
       ;;
     '#!'*ksh*)
-      shellcheck "$path"
+      shellcheck "$script_file"
       ;;
     '#!'*sh*)
-      shellcheck "$path"
+      shellcheck "$script_file"
       ;;
     *)
-      printf 'shellcheck: skipping %s; no supported shell shebang\n' "${path#"$repo_root"/}"
+      printf 'shellcheck: skipping %s; no supported shell shebang\n' "${script_file#"$repo_root"/}"
       ;;
   esac
 done

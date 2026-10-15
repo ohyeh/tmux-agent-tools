@@ -31,14 +31,6 @@ The `send --from-file` transcript event carries `multiline: true`, `bytes`, and
 `text_sha256`. If audit logging is enabled, the audit event is `send.multiline`
 and records only size/hash metadata, never the prompt body.
 
-### Validating a transcript
-
-```bash
-tmux-agent-replay fixture-validate /tmp/worker.jsonl
-```
-
-Checks: all lines parse, all entries carry `schema_version: 1`, all timestamps are ISO-8601 UTC, at least one `start` event present.
-
 ### Diffing two transcripts
 
 ```bash

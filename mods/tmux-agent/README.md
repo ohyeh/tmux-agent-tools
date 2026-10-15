@@ -100,7 +100,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上）；按 `[ ⧉ ]` 時一次 `/bin/sh -c` 找 `node`、`agent-tmux` 旁的 `lib/tui.node.ts` 與 `tmux-agent-tui`，在 tmux 裡再一次 `tmux split-window` |
 | `fs.read/write/list/stat` | 寫只在 state root 的 `.v3/` 底下：`worker.json`、每輪的 `dispatch.json`／`tell.md`／`waiter`、`brief.md`、`launch.exit`、`mod-assign.log`、`result.json`、activation 心跳。建目錄、`ln -sn` 鎖、`mv` 發佈、`rm` 走 `process.run`（引擎的 `fs` 沒有 mkdir／rename）。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
 | `fs.exists` | state root 之外兩種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；以及 `resume` 找 session id 在哪個 CLI 的 store（下面 `[ + ]` 那節列的路徑）。只問「在不在」 |
-| `store.get/set/keys/delete` | 只放 UI 偏好：面板開著沒（`tmux-agent.panel`）。交付帳不在 store（見上面 `.v3/`） |
+| `store.get/set/keys/delete` | 只放 UI 偏好：哪些 session 關了面板（`tmux-agent.panel-hidden`，最多記 20 個）、面板收合沒（`tmux-agent.fold`，沒記就是收合）。交付帳不在 store（見上面 `.v3/`） |
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的（主 session；子代理放行） `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
 | `agent.spawn` | brief 有一行 `runtime: tmux/<profile>` 時派工，並把這次 Agent 呼叫改成 `tmux-waiter`（sonnet、背景；清單裡看得到——`isOffered: false` 連派工也擋）。設了 `name` 則拒絕。waiter 沒註冊成功時，維持舊的拒絕。沒有那一行則原樣放行 |
 | `$.agent.register` | `session.start` 註冊 `tmux-waiter`（只有 Bash、sonnet、不帶 CLAUDE.md）。失敗 log 一次，之後 runtime spawn 改回拒絕 |
@@ -234,7 +234,7 @@ worker 一個子行程，每個 session 都去探別人的會倍增。
 
 `claude plugin update tmux-agent@tmux-agent-tools` 之後，呼叫 `reload` tool：它在這一輪結束時執行
 `/reload-plugins`，面板標題會顯示新版號。不必等人手打 `/reload-plugins`。
-reload 會重跑 module，面板原本會跟著關掉；0.7.10 起開著的面板會自己重新打開（記在 store 的 `tmux-agent.panel`，只記這個 session），但選中的列不會保留。
+session 一開始就打開面板，收合成一條標題列（`[ ▸ open ]` 展開，選擇記在 `tmux-agent.fold`，跨 session 保留）。用 `/workers` 關掉的話，只有這個 session 記住不再自己打開（`tmux-agent.panel-hidden`）；reload 後照這兩個記錄重開，選中的列不會保留。
 
 ## launch requested ≠ worker started
 
@@ -333,7 +333,8 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
   同一套操作再跑一次：⚠ collector 警告行消失，其餘畫面與行為相同；10 秒對帳
   時鐘與 2 秒鏡像時鐘並存，鏡像照常更新。
 - 已知邊界：面板開著時存檔 plugin 目錄（熱重載）→ 新模組 `panel.open=false`，
-  之後的 `q` 會打進 composer 變成 prompt。正常使用不會發生。
+  之後的 `q` 會打進 composer 變成 prompt。正常使用不會發生。（0.7.10 前的紀錄；現在 session start 時
+  依 `tmux-agent.panel-hidden`／`tmux-agent.fold` 重開面板。）
 
 在 `--plugin-dir` + `--settings` + `TMUX_AGENT_DIR` 的 headless session 實跑：
 
@@ -452,7 +453,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-`/workers` 開關面板。標題是 `workers v<MOD_VERSION> · @<本 session> · tmux N · 內部 M`（目前為 `workers v0.46.0`，列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N/共 T：@<id> n ]`（`n` 是該 session 的列數，含已完成的），按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+session 開始時面板就在、預設收合；`/workers` 開關面板。標題是 `workers v<MOD_VERSION> · @<本 session> · tmux N · 內部 M`（目前為 `workers v0.46.13`，列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N/共 T：@<id> n ]`（`n` 是該 session 的列數，含已完成的），按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上還沒有終態 result 的 worker（`success`／`failed`／`blocked`／`needs-input` 不算，專案列也不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
@@ -485,8 +486,10 @@ TUI 的按鍵（plan R4.6；畫出來的每個鍵都有 handler，contract 測�
   `[ - cancel ]`（按兩次；關掉這個 episode，pane 不動，與 `workers.cli.node.ts cancel`
   同一個 core 呼叫）、`[ U unlock ]`（按兩次；維護用，與 `unlock <name> confirm` 同一個
   core 呼叫，只在持有者確定已死時才移除鎖）。`Enter` 打開細節：row 狀態與 result 狀態
-  分開列、完整 summary（不受 12000 字截斷）、blocked 原因、result 路徑；`PgUp`／`PgDn`
-  捲動，`Enter` 或 `Esc` 收合。
+  分開列、完整 summary（不受 12000 字截斷）、blocked 原因、result 路徑；`b`／`f`（或 `PgUp`／`PgDn`）
+  捲動，`Enter` 或 `Esc` 收合。鏡像同樣用滑鼠滾輪或 `b`／`f` 捲 scrollback，捲到底回到即時。
+  TUI 開了滑鼠回報，點擊不做事；要選字複製用 Shift＋拖曳。
+  project session 沒有 episode，`Enter` 不開細節。
 - 版面（R4.1）：一個函式依高度、寬度、選中列與展開狀態分配各區塊的行數；鏡像抓的
   行數就是它算出的 viewport。縮放時重算，縮放前開始的 capture 結果直接丟掉。
 - 空狀態三種：沒有 outstanding、被篩選掉（按 `a` 看全部）、讀取失敗（附 errno）。

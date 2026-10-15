@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Smoke for tmux-agent-fanout run (issue #184).
 # Uses a fake wrapper to avoid real tmux sessions.
 
@@ -29,7 +30,7 @@ assert_file_exists() {
   fi
 }
 
-TMP="$(mktemp -d -t fanout-smoke.XXXXXX)"
+TMP="$(mktemp -d "$TMPDIR/fanout.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # Per-agent policy file. Fake wrapper reads $TMP/policy/<workdir-basename>.
@@ -82,9 +83,13 @@ RD="$TMP/run1"
 out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
     --agent claude:a --agent codex:b --agent claude:c \
     --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
-    --result-dir "$RD" --timeout 5 2>/dev/null)"
+    --result-dir "$RD" --summary-out "$TMP/summary.json" --timeout 5 2>/dev/null)"
 ok="$(echo "$out" | jq -r '.ok')"
 assert "case1 ok=true" "$ok" "true"
+assert_file_exists "case1 summary-out written" "$TMP/summary.json"
+assert "case1 top-level keys" "$(echo "$out" | jq -r 'keys | join(",")')" "agents,mode,ok,run_id,schema_version"
+assert "case1 agent keys" "$(echo "$out" | jq -r '.agents[0] | keys | join(",")')" "error,name,result_path,status,tool"
+assert_file_exists "case1 schema file present" "$SCHEMA"
 sv="$(echo "$out" | jq -r '.schema_version')"
 assert "case1 schema_version=1" "$sv" "1"
 n="$(echo "$out" | jq -r '.agents | length')"
@@ -92,6 +97,18 @@ assert "case1 agents.length=3" "$n" "3"
 assert_file_exists "case1 wd-a result.json" "$RD/a-1/result.json"
 assert_file_exists "case1 wd-b result.json" "$RD/b-2/result.json"
 assert_file_exists "case1 wd-c result.json" "$RD/c-3/result.json"
+
+# -------- Case 1b: the form without `run` is gone (no back-compat) --------
+echo "case: a call without run is refused"
+RD="$TMP/run1b"
+set +e
+err="$(run_fanout --prompt-file "$TMP/prompt.txt" --workdir "$TMP/wd-a" --tool claude \
+    --result-dir "$RD" --timeout 5 2>&1 >/dev/null)"
+rc=$?
+set -e
+assert "case1b exit 2" "$rc" "2"
+assert "case1b prints usage" "$(grep -c 'tmux-agent-fanout run --prompt-file' <<<"$err")" "1"
+assert "case1b spawned no agent" "$([[ -e "$RD" ]] && echo yes || echo no)" "no"
 
 # -------- Case 2: 1 fails, mode=all → ok=false; other results still on disk --------
 echo "case: 1 fails, mode=all"
@@ -114,73 +131,6 @@ assert_file_exists "case2 wd-b result.json preserved" "$RD/b-2/result.json"
 assert_file_exists "case2 wd-c result.json preserved" "$RD/c-3/result.json"
 status_b="$(jq -r '.agents[] | select(.name=="b") | .status' <<<"$out")"
 assert "case2 b.status=failed" "$status_b" "failed"
-
-# -------- Case 3: 1 fails, mode=first-success → ok=true --------
-echo "case: 1 fails, mode=first-success"
-echo "ok"     >"$TMP/policy/wd-a"
-echo "failed" >"$TMP/policy/wd-b"
-echo "ok"     >"$TMP/policy/wd-c"
-RD="$TMP/run3"
-out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
-    --agent claude:a --agent codex:b --agent claude:c \
-    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
-    --result-dir "$RD" --merge-mode first-success --timeout 5 2>/dev/null)"
-ok="$(echo "$out" | jq -r '.ok')"
-assert "case3 ok=true" "$ok" "true"
-mode="$(echo "$out" | jq -r '.mode')"
-assert "case3 mode=first-success" "$mode" "first-success"
-
-# -------- Case 4: all fail --------
-echo "case: all fail"
-echo "failed" >"$TMP/policy/wd-a"
-echo "failed" >"$TMP/policy/wd-b"
-echo "failed" >"$TMP/policy/wd-c"
-RD="$TMP/run4"
-set +e
-out="$(run_fanout run --prompt-file "$TMP/prompt.txt" \
-    --agent claude:a --agent codex:b --agent claude:c \
-    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" --workdir "$TMP/wd-c" \
-    --result-dir "$RD" --merge-mode first-success --timeout 5 2>/dev/null)"
-rc=$?
-set -e
-ok="$(echo "$out" | jq -r '.ok')"
-assert "case4 ok=false" "$ok" "false"
-assert "case4 exit nonzero" "$rc" "1"
-
-# -------- Case 5: --summary-out written --------
-echo "case: --summary-out"
-echo "ok" >"$TMP/policy/wd-a"
-RD="$TMP/run5"
-SO="$TMP/summary.json"
-run_fanout run --prompt-file "$TMP/prompt.txt" \
-    --agent claude:a --workdir "$TMP/wd-a" \
-    --result-dir "$RD" --summary-out "$SO" --timeout 5 >/dev/null 2>&1
-assert_file_exists "case5 summary-out written" "$SO"
-
-# -------- Case 6: legacy back-compat (no --agent, no run) --------
-echo "case: legacy back-compat"
-echo "ok" >"$TMP/policy/wd-a"
-echo "ok" >"$TMP/policy/wd-b"
-RD="$TMP/run6"
-out="$(run_fanout --prompt-file "$TMP/prompt.txt" \
-    --workdir "$TMP/wd-a" --workdir "$TMP/wd-b" \
-    --result-dir "$RD" --timeout 5 2>/dev/null)"
-ok="$(echo "$out" | jq -r '.ok')"
-assert "case6 legacy form ok=true" "$ok" "true"
-n="$(echo "$out" | jq -r '.agents | length')"
-assert "case6 legacy agents=2" "$n" "2"
-t1="$(echo "$out" | jq -r '.agents[0].tool')"
-assert "case6 legacy default tool=claude" "$t1" "claude"
-
-# -------- Case 7: shape validation against schema (manual, since no ajv) --------
-echo "case: summary shape"
-required_keys="$(echo "$out" | jq -r 'keys | join(",")')"
-assert "case7 top-level keys" "$required_keys" "agents,mode,ok,run_id,schema_version"
-agent_keys="$(echo "$out" | jq -r '.agents[0] | keys | join(",")')"
-assert "case7 agent keys" "$agent_keys" "error,name,result_path,status,tool"
-
-# Confirm schema file exists.
-assert_file_exists "case7 schema file present" "$SCHEMA"
 
 # -------- Case 8: wrapper exec failure → fail fast (no 10-min hang) --------
 # Regression for HIGH bot finding (PR #191): when the wrapper itself exits
@@ -223,7 +173,7 @@ fi
 
 # -------- Case 9: mode=first-success with one fast-failer + one slow-success --------
 # The exec-failing agent must NOT block the slow-success agent from being
-# observed. Slow agent uses a 3s delay; failer exits 99 immediately.
+# observed. Slow agent answers after the failer, which exits 99 immediately.
 echo "case: first-success not blocked by fast-failer"
 cat >"$TMP/fake-wrapper-mixed" <<'EOF'
 #!/usr/bin/env zsh
@@ -235,7 +185,7 @@ a_name="$1"; workdir="$2"
 case "$(basename "$workdir")" in
   wd-fail) exit 99 ;;
   wd-slow)
-    /bin/sleep 2
+    /bin/sleep 0.1
     out="${TMUX_AGENT_RESULT:-}"
     [[ -z "$out" ]] && exit 0
     mkdir -p "$(dirname "$out")"

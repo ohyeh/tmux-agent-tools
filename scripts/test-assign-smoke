@@ -1,112 +1,228 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test for `assign` (W32 retro M5): the stepwise dispatch sequence as
-# one command — start → result init → send --from-file → confirm-processing →
-# blocking supervise --result-required. Uses a fake CLI that shows a ready
-# prompt, echoes input, and keeps the pane changing (so the generic-family
-# still-changing fallback confirms processing); the smoke then writes a
-# terminal result.json and expects assign to exit 0 with the supervise JSON.
-# Style mirrors scripts/test-start-readiness-smoke.
-
+# Smoke test for `assign` (W32 retro M5) and the launch paths it rides on:
+#  - one assign proves start → result init → send → confirm → supervise: the
+#    fake writes a terminal result.json the moment it reads the brief;
+#  - --detach returns at once with the worker still alive;
+#  - `resume` launches each CLI with the flag that opens a SPECIFIC session;
+#  - a CLI that is not up by the ready window gets no brief (start and assign).
+# Independent launches run concurrently: every assign waits the product's 3 s
+# settle before it sends (agent-tmux _ASSIGN_SEND_SETTLE), so serial cases
+# would spend the budget on that floor alone.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
-WORK="$(mktemp -d -t tmux-agent-assign.XXXXXX)"
+WORK="$(mktemp -d "$TMPDIR/work.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
-trap '"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
-
-fail() { echo "FAIL: $1" >&2; exit 1 }
-
-# Fake CLI: ready prompt, echoes stdin, and ticks once per second so the
-# pane keeps changing while "working".
-cat > "$WORK/fakecli" <<'EOF'
-#!/bin/sh
-# Answer the launch probe (assign step 0) like a real CLI does.
-[ "$1" = "--version" ] && { echo "fakecli 1.0"; exit 0; }
-echo "› Write a prompt"
-( i=0; while :; do i=$((i+1)); echo "tick $i"; sleep 1; done ) &
-TICKER=$!
-trap 'kill $TICKER 2>/dev/null' EXIT
-while IFS= read -r line; do echo "got:$line"; done
-EOF
-chmod +x "$WORK/fakecli"
+export TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/audit.jsonl"
+# The bundled resume defaults are under test: no user profile may override them.
+export XDG_CONFIG_HOME="$WORK/config"
+unset AGENT_TMUX_PROFILE_DIR
 export PATH="$WORK:$PATH"
+# smoke-tmux.sh kills this run's tmux server, and with it every worker.
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0; FAIL=0
+assert() {
+  local label="$1" got="$2" want="$3"
+  if [[ "$got" == "$want" ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: got '$got' want '$want'"; FAIL=$((FAIL+1)); fi
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: '$needle' not in output"; FAIL=$((FAIL+1)); fi
+}
+refute_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then print -r -- "  ok   $label"; PASS=$((PASS+1))
+  else print -r -- "  FAIL $label: '$needle' is in output"; FAIL=$((FAIL+1)); fi
+}
+poll() {  # <cmd...>: true within 2 s, 0.05 s steps
+  local i; for i in {1..40}; do "$@" && return 0; sleep 0.05; done; return 1
+}
+
+# fastcli: ready prompt, logs and echoes every line it reads, and writes a
+# terminal result when it reads the brief's last line. Paths arrive as launch
+# flags: a running tmux server hands its own env to new panes.
+cat > "$WORK/fastcli" <<'EOF'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "fastcli 1.0"; exit 0; }
+LOG=/dev/null; RES=""
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; --result) RES="$2"; shift 2 ;; *) shift ;; esac; done
+stty -echo 2>/dev/null
+echo "› Write a prompt"
+while IFS= read -r line; do
+  printf 'input:%s\n' "$line" >> "$LOG"; printf 'got:%s\n' "$line"
+  case "$line" in REPORT:*) [ -n "$RES" ] && printf '{"schema_version":1,"status":"success","summary":"done"}\n' > "$RES" ;; esac
+done
+EOF
+# nodrawcli: alive, draws nothing (a self-update, a slow sign-in).
+cat > "$WORK/nodrawcli" <<'EOF'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "nodrawcli 1.0"; exit 0; }
+LOG=/dev/null
+while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac; done
+stty -echo 2>/dev/null
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$LOG"; done
+EOF
+# exitcli: exits during boot.
+printf '#!/bin/sh\n[ "$1" = "--version" ] && { echo "exitcli 1.0"; exit 0; }\nexit 3\n' > "$WORK/exitcli"
+# Startup screens for the `start` readiness poll; each logs what it reads.
+cat > "$WORK/fake-verify.sh" <<'EOF'
+#!/bin/sh
+echo "We're finishing verifying your account eligibility."
+echo "This usually takes a moment. Please try again shortly."
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$0.log"; done
+EOF
+cat > "$WORK/fake-login.sh" <<'EOF'
+#!/bin/sh
+echo "Not logged in"
+echo "Please run /login"
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$0.log"; done
+EOF
+# Clears after 1 s: long enough that start's first readiness look sees it.
+cat > "$WORK/fake-clears.sh" <<'EOF'
+#!/bin/sh
+echo "We're finishing verifying your account eligibility."
+sleep 1
+printf '\033[2J\033[H› Write a prompt\n'
+while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$0.log"; printf 'got:%s\n' "$line"; done
+EOF
+# Resume fakes record their argv (a pane does not inherit this shell's env).
+for cli in cursor agy; do
+  printf '#!/bin/sh\necho "$*" > "%s/argv.%s"\nexec cat >/dev/null\n' "$WORK" "$cli" > "$WORK/fake-$cli.sh"
+done
+chmod +x "$WORK"/fastcli "$WORK"/nodrawcli "$WORK"/exitcli "$WORK"/fake-*.sh
 
 printf 'GOAL: demo\n\nACCEPTANCE: none\n\nREPORT: none\n' > "$WORK/prompt.txt"
 
-# 1) invalid-arg guards (no tmux needed)
-"$AGENT_TMUX" fakecli assign 2>/dev/null && fail "assign with no args must exit non-zero"
-"$AGENT_TMUX" fakecli assign n "$WORK" relative.txt 2>/dev/null && fail "relative prompt path must be rejected"
+echo "case: argument guards"
+code=0; "$AGENT_TMUX" fastcli assign >/dev/null 2>&1 || code=$?
+assert "no args exits non-zero" "$(( code != 0 ))" "1"
+code=0; "$AGENT_TMUX" fastcli assign n "$WORK" relative.txt >/dev/null 2>&1 || code=$?
+assert "relative prompt path rejected" "$(( code != 0 ))" "1"
 : > "$WORK/empty.txt"
-"$AGENT_TMUX" fakecli assign n "$WORK" "$WORK/empty.txt" 2>/dev/null && fail "empty prompt file must be rejected"
-echo "ok: argument guards"
+code=0; "$AGENT_TMUX" fastcli assign n "$WORK" "$WORK/empty.txt" >/dev/null 2>&1 || code=$?
+assert "empty prompt file rejected" "$(( code != 0 ))" "1"
 
-# 2) full sequence — background assign, then complete the result contract.
-OUT="$WORK/assign.out"
-"$AGENT_TMUX" fakecli assign --timeout 120 --confirm-window 60 assign-smoke "$WORK" "$WORK/prompt.txt" \
-  > "$OUT" 2> "$WORK/assign.err" &
-ASSIGN_PID=$!
+# ---- concurrent launches; assertions follow below ---------------------------
+launch_assign() {  # <name> [assign flags]: background fastcli assign
+  local n="$1"; shift
+  mkdir -p "$TMUX_AGENT_DIR/$n"; : > "$WORK/$n.log"
+  AGENT_TMUX_LAUNCH_FLAGS="--log $WORK/$n.log --result $TMUX_AGENT_DIR/$n/result.json" \
+    "$AGENT_TMUX" fastcli assign --timeout 8 --confirm-window 5 "$@" "$n" "$WORK" "$WORK/prompt.txt" \
+    >"$WORK/$n.out" 2>"$WORK/$n.err" &
+}
+launch_assign full; PID_FULL=$!
+launch_assign det --detach; PID_DET=$!
+# Ready refusal: the window is the product's own AGENT_TMUX_START_READY_TIMEOUT, fixed at 2.
+: > "$WORK/nodraw.log"
+AGENT_TMUX_START_READY_TIMEOUT=2 AGENT_TMUX_LAUNCH_FLAGS="--log $WORK/nodraw.log" \
+  "$AGENT_TMUX" nodrawcli assign --timeout 8 --confirm-window 5 --detach \
+    --result-path "$WORK/nodraw-result.json" --episode 7 nodraw "$WORK" "$WORK/prompt.txt" \
+    >"$WORK/nodraw.out" 2>"$WORK/nodraw.err" &
+PID_NODRAW=$!
+AGENT_TMUX_START_READY_TIMEOUT=40 \
+  "$AGENT_TMUX" exitcli assign --timeout 8 --confirm-window 5 --detach exit-smoke "$WORK" "$WORK/prompt.txt" \
+    >"$WORK/exit.out" 2>"$WORK/exit.err" &
+PID_EXIT=$!
+env CODEX="$WORK/fake-verify.sh" AGENT_TMUX_START_READY_TIMEOUT=2 \
+  "$CODEX_TMUX" start --exact verify "$WORK" "must-not-send-verify" >"$WORK/verify.out" 2>&1 &
+PID_VERIFY=$!
+CODEX="$WORK/fake-login.sh" "$CODEX_TMUX" start --exact login "$WORK" "must-not-send-login" >"$WORK/login.out" 2>&1 &
+PID_LOGIN=$!
+env CODEX="$WORK/fake-clears.sh" AGENT_TMUX_START_READY_TIMEOUT=8 \
+  "$CODEX_TMUX" start --exact clears "$WORK" "delayed-initial-prompt-marker" >"$WORK/clears.out" 2>"$WORK/clears.err" &
+PID_CLEARS=$!
+SID='5ea32e6e-0000-4000-8000-000000000001'
+CURSOR="$WORK/fake-cursor.sh" "$AGENT_TMUX" cursor resume --exact rkw-cursor "$WORK" "$SID" >/dev/null 2>&1 &
+PID_RC=$!
+AGY="$WORK/fake-agy.sh" "$AGENT_TMUX" agy resume --exact rkw-agy "$WORK" "$SID" >/dev/null 2>&1 &
+PID_RA=$!
+t0=$SECONDS
 
-# Wait until the sequence reaches supervise (result.json path exists after
-# step 2; the send + confirm steps are visible in stderr).
-RESULT_PATH=""
-for _ in {1..60}; do
-  RESULT_PATH="$("$AGENT_TMUX" fakecli result path assign-smoke 2>/dev/null || true)"
-  [[ -n "$RESULT_PATH" && -e "$RESULT_PATH" ]] && break
-  sleep 1
-done
-[[ -n "$RESULT_PATH" ]] || { cat "$WORK/assign.err" >&2; fail "result init never produced a result path" }
+echo
+echo "case: resume launches each CLI with its session-id flag"
+wait $PID_RC || true; wait $PID_RA || true
+poll test -s "$WORK/argv.cursor" || true
+poll test -s "$WORK/argv.agy" || true
+assert "cursor resumes by id with --resume" "$(cat "$WORK/argv.cursor" 2>/dev/null)" "--trust --yolo --resume $SID"
+assert "agy resumes by id with --conversation" "$(cat "$WORK/argv.agy" 2>/dev/null)" "--dangerously-skip-permissions --conversation $SID"
 
-# Give confirm-processing time to pass, then finish the worker's contract.
-for _ in {1..90}; do
-  grep -q 'assign\[5/5\]' "$WORK/assign.err" && break
-  kill -0 $ASSIGN_PID 2>/dev/null || break
-  sleep 1
-done
-grep -q 'assign\[5/5\]' "$WORK/assign.err" || { cat "$WORK/assign.err" >&2; fail "never reached supervise step (confirm-processing failed?)" }
+echo
+echo "case: start refuses a startup screen that never clears, and send stays blocked"
+code=0; wait $PID_VERIFY || code=$?
+json_line="$(tail -1 "$WORK/verify.out")"
+assert "verify: start exit=1" "$code" "1"
+assert "verify: submitted=false" "$(jq -r .submitted <<< "$json_line" 2>/dev/null)" "false"
+assert "verify: blocked_reason startup_pending" "$(jq -r .blocked_reason <<< "$json_line" 2>/dev/null)" "startup_pending"
+st="$("$CODEX_TMUX" status --json verify 2>/dev/null || true)"
+assert "verify: status says startup_pending" "$(jq -r .blocked_reason <<< "$st")" "startup_pending"
+assert "verify: status carries a diagnostic" "$(jq -r '.diagnostic | type' <<< "$st")" "string"
+code=0; out="$("$CODEX_TMUX" send verify "must-not-send-later" 2>&1)" || code=$?
+assert "verify: send blocked exit=1" "$code" "1"
+assert "verify: send names startup_pending" "$(jq -r .blocked_reason <<< "${out##*$'\n'}" 2>/dev/null)" "startup_pending"
+assert "verify: the CLI read nothing" "$(cat "$WORK/fake-verify.sh.log" 2>/dev/null)" ""
 
-printf '{"schema_version":1,"status":"success","summary":"smoke done"}\n' > "$RESULT_PATH"
+echo
+echo "case: start waits out a clearing startup screen, then the CLI reads the prompt once"
+code=0; wait $PID_CLEARS || code=$?
+assert "clears: start exit=0" "$code" "0"
+assert "clears: the CLI read the initial prompt exactly once" \
+  "$(grep -c 'delayed-initial-prompt-marker' "$WORK/fake-clears.sh.log" 2>/dev/null || true)" "1"
+refute_contains "clears: start did not resend" "$(cat "$WORK/clears.err")" "not echoed"
 
-if ! wait $ASSIGN_PID; then
-  cat "$WORK/assign.err" >&2; cat "$OUT" >&2
-  fail "assign exited non-zero after terminal result.json"
-fi
-grep -q '"status"' "$OUT" || { cat "$OUT" >&2; fail "supervise JSON missing from stdout" }
-echo "ok: full assign sequence (start → init → send → confirm → supervise)"
+echo
+echo "case: 'Please run /login' classifies as login_prompt and blocks start"
+code=0; wait $PID_LOGIN || code=$?
+assert "login: start exit=1" "$code" "1"
+assert "login: blocked_reason login_prompt" "$(tail -1 "$WORK/login.out" | jq -r .blocked_reason 2>/dev/null)" "login_prompt"
+assert "login: the CLI read nothing" "$(cat "$WORK/fake-login.sh.log" 2>/dev/null)" ""
 
-# 3) A fast terminal result is processing evidence and must not trigger resend.
-"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
-FAST_OUT="$WORK/fast.out"
-"$AGENT_TMUX" fakecli assign --timeout 30 --confirm-window 30 assign-smoke "$WORK" "$WORK/prompt.txt" \
-  > "$FAST_OUT" 2> "$WORK/fast.err" &
-FAST_PID=$!
-for _ in {1..60}; do
-  grep -q 'assign\[4/5\]' "$WORK/fast.err" && break
-  sleep 1
-done
-grep -q 'assign\[4/5\]' "$WORK/fast.err" || { cat "$WORK/fast.err" >&2; fail "fast assign never reached confirmation"; }
-RESULT_PATH="$("$AGENT_TMUX" fakecli result path assign-smoke 2>/dev/null || true)"
-[[ -n "$RESULT_PATH" && -e "$RESULT_PATH" ]] || { cat "$WORK/fast.err" >&2; fail "fast result path missing"; }
-printf '{"schema_version":1,"status":"success","summary":"fast done"}\n' > "$RESULT_PATH"
-wait $FAST_PID || { cat "$WORK/fast.err" >&2; fail "fast terminal result was not accepted"; }
-grep -q 'attempt 2/2' "$WORK/fast.err" && { cat "$WORK/fast.err" >&2; fail "fast terminal result triggered a resend"; }
-grep -q '"status"' "$FAST_OUT" || { cat "$FAST_OUT" >&2; fail "fast terminal result missing from stdout"; }
-echo "ok: fast terminal result prevents resend"
+echo
+echo "case: a CLI that exits during boot fails at once, with no send"
+code=0; wait $PID_EXIT || code=$?
+assert "exit: assign failed" "$code" "1"
+assert_contains "exit: the diagnostic says the CLI exited" "$(jq -r .diagnostic "$WORK/exit.out" 2>/dev/null)" "CLI exited before it was up"
+assert "exit: it failed well inside the 40 s window" "$(( SECONDS - t0 < 30 ))" "1"
 
-# 4) --detach: steps 1-4 then immediate return with assigned:true JSON —
-#    no long-lived supervise process left behind (reaper-hostile harnesses).
-"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
-DOUT="$WORK/detach.out"
-"$AGENT_TMUX" fakecli assign --detach --confirm-window 60 assign-smoke "$WORK" "$WORK/prompt.txt" \
-  > "$DOUT" 2> "$WORK/detach.err" || { cat "$WORK/detach.err" >&2; fail "assign --detach exited non-zero" }
-grep -q '"detached":true' "$DOUT" || { cat "$DOUT" >&2; fail "detach JSON missing detached:true" }
-grep -q '"assigned":true' "$DOUT" || { cat "$DOUT" >&2; fail "detach JSON missing assigned:true" }
-grep -q 'assign\[5/5\] detached' "$WORK/detach.err" || { cat "$WORK/detach.err" >&2; fail "detach step-5 banner missing" }
-"$AGENT_TMUX" fakecli status --json assign-smoke >/dev/null 2>&1 || fail "worker not alive after --detach returned"
-"$AGENT_TMUX" fakecli stop assign-smoke >/dev/null 2>&1 || true
-echo "ok: assign --detach (verified dispatch, immediate return, worker still alive)"
+echo
+echo "case: a CLI still not up at the ready window is left running and handed to the caller"
+code=0; wait $PID_NODRAW || code=$?
+nd_diag="$(jq -r .diagnostic "$WORK/nodraw.out" 2>/dev/null)"
+assert "nodraw: assign returned to the caller" "$code" "1"
+assert "nodraw: the failed step is send" "$(jq -r .failed_step "$WORK/nodraw.out" 2>/dev/null)" "send"
+assert_contains "nodraw: the brief was not sent" "$nd_diag" "the brief was NOT sent"
+assert_contains "nodraw: the worker is left running" "$nd_diag" "left running"
+assert_contains "nodraw: the named send keeps the dispatch route" "$nd_diag" "--result-path $WORK/nodraw-result.json --episode 7"
+assert "nodraw: nothing reached the CLI" "$(cat "$WORK/nodraw.log")" ""
+assert "nodraw: the worker is still up" "$("$AGENT_TMUX" nodrawcli status --json nodraw 2>/dev/null | jq -r .running)" "true"
 
+echo
+echo "case: one assign runs start → init → send → confirm → supervise on a fast terminal result"
+code=0; wait $PID_FULL || code=$?
+assert "full: assign exit=0" "$code" "0"
+assert_contains "full: supervise JSON on stdout" "$(cat "$WORK/full.out")" '"status"'
+assert_contains "full: reached the supervise step" "$(cat "$WORK/full.err")" "assign[5/5]"
+refute_contains "full: a terminal result is processing evidence, no resend" "$(cat "$WORK/full.err")" "attempt 2/2"
+assert "full: the CLI read the brief exactly once" "$(grep -c '^input:GOAL: demo' "$WORK/full.log" || true)" "1"
+
+echo
+echo "case: --detach returns after a verified dispatch with the worker alive"
+code=0; wait $PID_DET || code=$?
+assert "detach: assign exit=0" "$code" "0"
+assert_contains "detach: detached:true" "$(cat "$WORK/det.out")" '"detached":true'
+assert_contains "detach: assigned:true" "$(cat "$WORK/det.out")" '"assigned":true'
+assert_contains "detach: step-5 banner" "$(cat "$WORK/det.err")" "assign[5/5] detached"
+assert "detach: the worker is still up" "$("$AGENT_TMUX" fastcli status --json det 2>/dev/null | jq -r .running)" "true"
+
+echo
+echo "summary: $PASS passed, $FAIL failed"
+(( FAIL == 0 )) || exit 1
 echo "PASS: assign smoke"

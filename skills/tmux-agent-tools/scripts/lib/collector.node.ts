@@ -23,7 +23,7 @@
 // proves a ready collector only while its pid still runs with that pidStart (the
 // launcher checks both), and a launcher that started it accepts only its own `nonce`.
 import { execFile } from 'node:child_process'
-import { realpathSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -210,11 +210,11 @@ export async function readCollectorRecord(path: string): Promise<CollectorRecord
 }
 
 /** `AGENT_TMUX_VERSION` of the wrapper beside lib/, the version every install ships. Throws with the path. */
-async function coreVersion(): Promise<string> {
+export function coreVersion(): string {
   const path = fileURLToPath(new URL('../agent-tmux', import.meta.url))
   let text: string
   try {
-    text = await readFile(path, 'utf8')
+    text = readFileSync(path, 'utf8')
   } catch (error) {
     throw new Error(`could not read the core version from ${path}: ${String(error)}`)
   }
@@ -279,7 +279,7 @@ async function main(): Promise<void> {
   // Before registering: a start that cannot get ready must not fence the running activation.
   let version = ''
   try {
-    version = await coreVersion()
+    version = coreVersion()
   } catch (error) {
     notReady((error as Error).message)
   }

@@ -1,17 +1,26 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke for #119 audit log.
+# Smoke for the audit log (#119, #188): append/verify/tamper, query, rotation,
+# concurrent appends, default path, disable, append failure. One real start; every
+# other event comes from `stop` of an absent worker (it still appends wrapper.stop).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+AUDIT_BIN="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-audit"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
-WORK="$(mktemp -d -t tmux-agent-audit-smoke.XXXXXX)"
+# Every log (and so every <log>.lock / .lock.d) lives inside WORK, inside the job tree.
+WORK="$(mktemp -d "$TMPDIR/audit.XXXXXX")"  # not -t: here mktemp -t wrote outside TMPDIR (measured 2026-10-11)
 export TMUX_AGENT_DIR="$WORK/state"
 export XDG_STATE_HOME="$WORK/xdg"
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+  TMUX_AGENT_TOOLS_AUDIT_LOG="${LOG:-$WORK/audit.jsonl}" "$CODEX_TMUX" stop a-codex >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+add-zsh-hook zshexit cleanup
 
 cat > "$WORK/fake.sh" <<'EOF'
 #!/bin/sh
@@ -30,89 +39,105 @@ assert() {
     FAIL=$((FAIL + 1))
   fi
 }
+count() { wc -l | tr -d ' '; }
 
-run_audit() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  local audit_log="$WORK/$prefix-audit.jsonl"
-  echo "case: $prefix audit log append + verify"
-  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit_log" env "$cli_env=$WORK/fake.sh" \
-    "$wrapper" start --exact "$prefix-a" "$WORK" >/dev/null
-  /bin/sleep 1
-  assert "$prefix audit log created" "$(test -s "$audit_log" && echo yes)" "yes"
-  local first_line
-  first_line="$(head -1 "$audit_log")"
-  assert "$prefix has schema_version" "$(printf '%s' "$first_line" | jq -r .schema_version)" "1"
-  assert "$prefix has chain_hash" "$(printf '%s' "$first_line" | jq -r '.chain_hash | length')" "64"
-  assert "$prefix has prev_chain_hash" "$(printf '%s' "$first_line" | jq -r '.prev_chain_hash | length')" "64"
+LOG="$WORK/audit.jsonl"
 
-  local verify_out code=0
-  verify_out="$("$wrapper" audit-verify "$audit_log" 2>&1)" || code=$?
-  assert "$prefix verify exit=0 on clean" "$code" "0"
-  assert "$prefix verify ok=true" "$(printf '%s' "$verify_out" | jq -r .ok)" "true"
+echo "case: append + verify + tamper"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG" CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact a-codex "$WORK" >/dev/null
+assert "log created" "$(test -s "$LOG" && echo yes)" "yes"
+first_line="$(head -1 "$LOG")"
+assert "start is audited" "$(printf '%s' "$first_line" | jq -r .event)" "wrapper.start"
+assert "has schema_version" "$(printf '%s' "$first_line" | jq -r .schema_version)" "1"
+assert "has chain_hash" "$(printf '%s' "$first_line" | jq -r '.chain_hash | length')" "64"
+assert "has prev_chain_hash" "$(printf '%s' "$first_line" | jq -r '.prev_chain_hash | length')" "64"
+code=0
+verify_out="$("$CODEX_TMUX" audit-verify "$LOG")" || code=$?
+assert "verify exit=0 on clean" "$code" "0"
+assert "verify ok=true" "$(printf '%s' "$verify_out" | jq -r .ok)" "true"
+cp "$LOG" "$WORK/tampered.jsonl"
+sed -i.bak 's/"event":"wrapper.start"/"event":"tampered"/' "$WORK/tampered.jsonl"
+code=0
+"$CODEX_TMUX" audit-verify "$WORK/tampered.jsonl" >/dev/null 2>&1 || code=$?
+assert "verify exit=2 on tamper" "$code" "2"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG" "$CODEX_TMUX" stop a-codex >/dev/null 2>&1 || true
+assert "stop is audited" "$(jq -r 'select(.event=="wrapper.stop") | "\(.name) \(.stopped)"' "$LOG")" "a-codex true"
+# Two lines: audit-verify once printed zsh `local` re-declarations ahead of its JSON from line 2 on.
+assert "verify ok=true on a two-line log" "$("$CODEX_TMUX" audit-verify "$LOG" | jq -r .ok)" "true"
 
-  # Tamper with the log: change first event then verify should fail.
-  sed -i.bak 's/"event":"wrapper.start"/"event":"tampered"/' "$audit_log"
-  rm -f "$audit_log.bak"
-  code=0
-  "$wrapper" audit-verify "$audit_log" >/dev/null 2>&1 || code=$?
-  assert "$prefix verify exit=2 on tamper" "$code" "2"
+echo "case: query filters"
+# Tenant on the command that writes: without it the wrapper resolves the unprefixed name.
+TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG" TMUX_AGENT_TOOLS_TENANT=alpha "$CLAUDE_TMUX" stop q-claude-a >/dev/null 2>&1 || true
+TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG" TMUX_AGENT_TOOLS_TENANT=beta "$CODEX_TMUX" stop q-codex-b >/dev/null 2>&1 || true
+q() { "$AUDIT_BIN" query --log "$LOG" "$@"; }
+assert "filter tool=claude" "$(q --tool claude | jq -r 'select(.tool!="claude") | .event' | count)" "0"
+assert "filter tool=claude nonzero" "$(q --tool claude | count)" "1"
+assert "filter tool=codex" "$(q --tool codex | jq -r 'select(.tool!="codex") | .event' | count)" "0"
+assert "filter tenant=alpha" "$(q --tenant alpha | jq -r .name)" "q-claude-a"
+assert "filter agent" "$(q --agent q-codex-b | jq -r .tenant)" "beta"
+assert "filter event=wrapper.start" "$(q --event wrapper.start | count)" "1"
+assert "since=PAST returns all" "$(q --since 1970-01-01T00:00:00Z | count)" "$(count < "$LOG")"
+assert "until=PAST returns none" "$(q --until 1970-01-01T00:00:00Z | count)" "0"
+assert "since=FUTURE returns none" "$(q --since 9999-12-31T23:59:59Z | count)" "0"
+assert "no secret_value leaks" "$(q | jq -r 'select(has("secret_value")) | .event' | count)" "0"
 
-  TMUX_AGENT_TOOLS_AUDIT_LOG="$audit_log" "$wrapper" stop "$prefix-a" >/dev/null 2>&1 || true
-  assert "$prefix stop is audited" "$(jq -r 'select(.event=="wrapper.stop") | "\(.name) \(.stopped)"' "$audit_log")" "$prefix-a true"
+echo "case: rotation keeps the chain"
+assert "verify clean pre-rotate" "$("$AUDIT_BIN" verify --log "$LOG" | jq -r .ok)" "true"
+TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$LOG" --force >/dev/null
+assert "rotated file exists" "$(test -f "$LOG.1" && echo yes)" "yes"
+assert "new log has HEAD-link" "$(head -1 "$LOG" | jq -r .event)" "audit.rotation"
+assert "HEAD-link prev matches old last hash" \
+  "$(head -1 "$LOG" | jq -r .prev_chain_hash)" "$(tail -1 "$LOG.1" | jq -r .chain_hash)"
+assert "verify rotated-out file" "$("$AUDIT_BIN" verify --log "$LOG.1" | jq -r .ok)" "true"
+assert "verify new file" "$("$AUDIT_BIN" verify --log "$LOG" | jq -r .ok)" "true"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG" "$CLAUDE_TMUX" stop rot-b >/dev/null 2>&1 || true
+assert "verify after append" "$("$AUDIT_BIN" verify --log "$LOG" | jq -r .ok)" "true"
+for i in 1 2 3 4 5; do
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$LOG" "$CLAUDE_TMUX" stop "rot-loop-$i" >/dev/null 2>&1 || true
+  TMUX_AGENT_TOOLS_AUDIT_RETAIN=3 TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$LOG" --force >/dev/null
+done
+assert "retain caps at 3" "$(test ! -f "$LOG.4" && echo yes)" "yes"
+assert ".3 exists post-loop" "$(test -f "$LOG.3" && echo yes)" "yes"
+
+echo "case: concurrent appends + rotations keep the chain (HIGH on PR #193)"
+CON_LOG="$WORK/concurrent.jsonl"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" "$CLAUDE_TMUX" stop con-seed >/dev/null 2>&1 || true
+appender() {
+  local i
+  for i in 1 2 3 4 5 6; do
+    TMUX_AGENT_TOOLS_AUDIT_LOG="$CON_LOG" "$CLAUDE_TMUX" stop "con-$1-$i" >/dev/null 2>&1 || true
+  done
 }
-
-run_default_log() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  local audit_log="$XDG_STATE_HOME/tmux-agent-tools/audit.jsonl"
-  echo "case: $prefix without env → default audit log written"
-  unset TMUX_AGENT_TOOLS_AUDIT_LOG
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-noenv" "$WORK" >/dev/null
-  /bin/sleep 1
-  if [[ -s "$audit_log" ]]; then
-    echo "  ok   $prefix default audit log created"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $prefix default audit log missing" >&2
-    FAIL=$((FAIL + 1))
-  fi
-  "$wrapper" stop "$prefix-noenv" >/dev/null 2>&1 || true
+rotator() {
+  local i
+  for i in 1 2 3 4 5 6; do
+    TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES=1 "$AUDIT_BIN" rotate --log "$CON_LOG" --force >/dev/null 2>&1 || true
+  done
 }
+appender a & A=$!
+appender b & B=$!
+rotator & R=$!
+wait "$A" "$B" "$R"
+assert "concurrent: verify active log" "$("$AUDIT_BIN" verify --log "$CON_LOG" | jq -r .ok)" "true"
+con_bad=0
+for f in "$CON_LOG".<->(N); do
+  [[ "$("$AUDIT_BIN" verify --log "$f" | jq -r .ok)" == "true" ]] || { con_bad=$((con_bad + 1)); echo "  rotated file failed verify: $f" >&2; }
+done
+assert "concurrent: rotated files clean" "$con_bad" "0"
 
-run_disabled_no_log() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  local audit_log="$XDG_STATE_HOME/tmux-agent-tools/audit.jsonl"
-  echo "case: $prefix AUDIT_LOG=0 → no audit log written"
-  unset TMUX_AGENT_TOOLS_AUDIT_LOG
-  rm -f "$audit_log"
-  AUDIT_LOG=0 env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact "$prefix-disabled" "$WORK" >/dev/null
-  /bin/sleep 1
-  if [[ -f "$audit_log" ]]; then
-    echo "  FAIL $prefix disabled audit log unexpectedly created" >&2
-    FAIL=$((FAIL + 1))
-  else
-    echo "  ok   $prefix no audit log when disabled"
-    PASS=$((PASS + 1))
-  fi
-  AUDIT_LOG=0 "$wrapper" stop "$prefix-disabled" >/dev/null 2>&1 || true
-}
-
-run_append_failure() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix append failure → command fails"
-  if TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK" env "$cli_env=$WORK/fake.sh" \
-    "$wrapper" start --exact "$prefix-fail" "$WORK" >/dev/null 2>&1; then
-    echo "  FAIL $prefix append failure was swallowed" >&2
-    FAIL=$((FAIL + 1))
-  else
-    echo "  ok   $prefix append failure surfaced"
-    PASS=$((PASS + 1))
-  fi
-}
-
-run_audit "$CODEX_TMUX"  "CODEX"  "a-codex"
-run_default_log "$CODEX_TMUX"  "CODEX"  "n-codex"
-run_disabled_no_log "$CODEX_TMUX"  "CODEX"  "d-codex"
-run_append_failure "$CODEX_TMUX" "CODEX" "f-codex"
+echo "case: default path, disable, append failure"
+default_log="$XDG_STATE_HOME/tmux-agent-tools/audit.jsonl"
+assert "default path" "$("$AUDIT_BIN" path)" "$default_log"
+"$CODEX_TMUX" stop n-codex >/dev/null 2>&1 || true
+assert "default audit log created" "$(test -s "$default_log" && echo yes)" "yes"
+rm -f "$default_log"
+AUDIT_LOG=0 "$CODEX_TMUX" stop d-codex >/dev/null 2>&1 || true
+assert "no audit log when disabled" "$(test -e "$default_log" && echo yes || echo no)" "no"
+# A directory as the log path: the append fails and so does the command.
+mkdir -p "$WORK/logdir"
+code=0
+TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/logdir" "$CODEX_TMUX" stop f-codex >/dev/null 2>&1 || code=$?
+assert "append failure surfaced" "$(( code != 0 ))" "1"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

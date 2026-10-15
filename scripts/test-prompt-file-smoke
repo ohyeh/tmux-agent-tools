@@ -1,341 +1,135 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test for issue #289: --from-file / --prompt-file / stdin (-) support
-# across start, send, send-wait, send-wait-literal.
+# Smoke for prompt text from a file or stdin: --from-file / --prompt-file / - (#289),
+# multi-line sends (#202) and the `brief` compiler that feeds --from-file.
+#   fixtures (dry-run, no launch): leading/trailing flag, stdin, refusals, brief
+#   live workers whose fake CLI appends every line it reads to one log:
+#   send-wait and send-wait-literal with the flag between positionals, send from
+#   stdin, and a 17 KB multi-line send (transcript + audit metadata, no body)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
-WORK="$(mktemp -d -t tmux-agent-prompt-file-smoke.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
-
-# Minimal fake CLI that exits 0 immediately.
-cat > "$WORK/fake.sh" <<'EOF'
-#!/bin/sh
-exit 0
-EOF
-chmod +x "$WORK/fake.sh"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-prompt-file-smoke.XXXXXX")"
+export TMUX_AGENT_DIR="$WORK/state"
+trap '"$CODEX_TMUX" stop pf-live >/dev/null 2>&1 || true; "$CODEX_TMUX" stop pf-live2 >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 PASS=0
 FAIL=0
-
 assert() {
-  local label="$1" actual="$2" expected="$3"
-  if [[ "$actual" == "$expected" ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $label expected=$expected got=$actual" >&2
-    FAIL=$((FAIL + 1))
-  fi
+  if [[ "$2" == "$3" ]]; then echo "  ok   $1"; PASS=$((PASS + 1))
+  else echo "  FAIL $1 expected=$3 got=$2" >&2; FAIL=$((FAIL + 1)); fi
 }
-
 assert_contains() {
-  local label="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL $label (needle not found)" >&2
-    echo "    needle:   $needle" >&2
-    echo "    haystack: ${haystack:0:300}" >&2
-    FAIL=$((FAIL + 1))
-  fi
+  if [[ "$2" == *"$3"* ]]; then echo "  ok   $1"; PASS=$((PASS + 1))
+  else echo "  FAIL $1 missing=$3 in: ${2:0:300}" >&2; FAIL=$((FAIL + 1)); fi
 }
-
 jq_val() { printf '%s' "$1" | jq -r "$2"; }
-
-# ── start --from-file / --prompt-file ────────────────────────────────────────
-
-run_start_from_file() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix start --from-file / --prompt-file"
-
-  # Write a prompt file
-  local pfile="$WORK/$prefix-prompt.txt"
-  printf 'Hello from file\n' > "$pfile"
-
-  # --from-file with --dry-run: the dry-run JSON should capture initial_text
-  local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    --from-file "$pfile" "${prefix}-ff" "$WORK" 2>&1)" || code=$?
-  assert "$prefix start --from-file exit=0" "$code" "0"
-  assert "$prefix start --from-file ok=true" "$(jq_val "$out" .ok)" "true"
-  assert "$prefix start --from-file initial_text" \
-    "$(jq_val "$out" .invocation.initial_text)" "Hello from file"
-
-  # --prompt-file alias
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    --prompt-file "$pfile" "${prefix}-pf" "$WORK" 2>&1)" || code=$?
-  assert "$prefix start --prompt-file exit=0" "$code" "0"
-  assert "$prefix start --prompt-file initial_text" \
-    "$(jq_val "$out" .invocation.initial_text)" "Hello from file"
-
-  # --from-file and inline text together → must error
-  code=0
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    --from-file "$pfile" "${prefix}-mx" "$WORK" "also inline" >/dev/null 2>&1 || code=$?
-  assert "$prefix start mutual-exclusion exit≠0" "$code" "2"
-
-  # Non-existent file → error
-  code=0
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    --from-file "/no/such/file.txt" "${prefix}-ne" "$WORK" >/dev/null 2>&1 || code=$?
-  assert "$prefix start nonexistent-file exit≠0" "$code" "2"
-
-  # Relative path → error
-  code=0
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    --from-file "relative.txt" "${prefix}-rel" "$WORK" >/dev/null 2>&1 || code=$?
-  assert "$prefix start relative-path exit≠0" "$code" "2"
-
-  # stdin via -
-  code=0
-  out="$(printf 'stdin prompt\n' | env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    --from-file - "${prefix}-stdin" "$WORK" 2>&1)" || code=$?
-  assert "$prefix start stdin exit=0" "$code" "0"
-  assert "$prefix start stdin initial_text" \
-    "$(jq_val "$out" .invocation.initial_text)" "stdin prompt"
+# wait_got <text>: poll the receive log 0.05 s, 2 s bound.
+wait_got() {
+  local i
+  for (( i = 0; i < 40; i++ )); do
+    grep -qF -- "$1" "$WORK/got" 2>/dev/null && return 0
+    sleep 0.05
+  done
+  return 1
 }
+printf '#!/bin/sh\nexit 0\n' > "$WORK/fake.sh"; chmod +x "$WORK/fake.sh"
+dry() { CODEX="$WORK/fake.sh" "$CODEX_TMUX" start --exact --dry-run "$@"; }
 
-# ── help text mentions --from-file ────────────────────────────────────────────
+echo "case: start --from-file / --prompt-file / - (dry-run)"
+pfile="$WORK/prompt.txt"
+printf 'Hello from file\n' > "$pfile"
+out="$(dry --from-file "$pfile" pf-lead "$WORK")"
+assert "leading --from-file initial_text" "$(jq_val "$out" .invocation.initial_text)" "Hello from file"
+out="$(dry pf-trail "$WORK" --prompt-file "$pfile")"
+assert "trailing --prompt-file initial_text" "$(jq_val "$out" .invocation.initial_text)" "Hello from file"
+out="$(printf 'stdin prompt\n' | dry pf-stdin "$WORK" --from-file -)"
+assert "stdin - initial_text" "$(jq_val "$out" .invocation.initial_text)" "stdin prompt"
+# refusal table: <label>|<args...> (each must exit 2)
+for row in "file plus inline text|--from-file $pfile pf-mx $WORK also-inline" \
+           "trailing file plus inline text|pf-tmx $WORK --prompt-file $pfile also-inline" \
+           "missing file|--from-file /no/such/file.txt pf-ne $WORK" \
+           "relative path|--from-file relative.txt pf-rel $WORK"; do
+  rc=0; dry ${=row#*|} >/dev/null 2>&1 || rc=$?
+  assert "start ${row%%|*} exits 2" "$rc" "2"
+done
+rc=0; "$CODEX_TMUX" send-wait --from-file relative.txt myagent 2>/dev/null || rc=$?
+assert "send-wait relative path exits 2" "$rc" "2"
+rc=0; "$CODEX_TMUX" send-wait-literal --from-file /no/such/file.txt myagent DONE 2>/dev/null || rc=$?
+assert "send-wait-literal missing file exits 2" "$rc" "2"
+rc=0; out="$("$CODEX_TMUX" send --prompt-file 2>&1)" || rc=$?
+assert "send --prompt-file without value exits 2" "$rc" "2"
+assert "send --prompt-file is a known flag" "$([[ "$out" == *"Unknown flag"* ]] && echo unknown || echo known)" "known"
 
-run_help_from_file() {
-  local wrapper="$1" prefix="$2"
-  echo "case: $prefix help text includes --from-file"
+echo "case: brief compiles a prompt file that start --from-file consumes"
+bfile="$("$CODEX_TMUX" brief --template implement --goal 'Fix flaky login test' --acceptance 'pytest tests/test_login.py passes')"
+out="$(dry --from-file "$bfile" pf-brief "$WORK")"
+btext="$(jq_val "$out" .invocation.initial_text)"
+assert_contains "brief GOAL" "$btext" "GOAL: Fix flaky login test"
+assert_contains "brief ACCEPTANCE" "$btext" "ACCEPTANCE: pytest tests/test_login.py passes"
+assert_contains "brief REPORT" "$btext" "REPORT:"
+rc=0; out="$("$CODEX_TMUX" brief --template implement --goal 'only goal' 2>&1)" || rc=$?
+assert "brief without --acceptance exits 2" "$rc" "2"
+assert_contains "brief usage text" "$out" "Usage: agent-tmux brief"
 
-  local out
-  out="$("$wrapper" help start 2>&1)"
-  assert_contains "$prefix help start --from-file" "$out" "--from-file"
-  assert_contains "$prefix help start --prompt-file" "$out" "--prompt-file"
-
-  out="$("$wrapper" help send 2>&1)"
-  assert_contains "$prefix help send --from-file" "$out" "--from-file"
-  assert_contains "$prefix help send --prompt-file" "$out" "--prompt-file"
-
-  out="$("$wrapper" help send-wait 2>&1)"
-  assert_contains "$prefix help send-wait --from-file" "$out" "--from-file"
-
-  out="$("$wrapper" help send-wait-literal 2>&1)"
-  assert_contains "$prefix help send-wait-literal --from-file" "$out" "--from-file"
-}
-
-# ── send-wait / send-wait-literal flag parse (error paths only, no real tmux) ─
-
-run_send_wait_error_paths() {
-  local wrapper="$1" prefix="$2"
-  echo "case: $prefix send-wait / send-wait-literal error paths"
-
-  # send-wait: missing name → error
-  local code=0
-  "$wrapper" send-wait 2>/dev/null || code=$?
-  assert "$prefix send-wait no-args exit≠0" "$code" "2"
-
-  # send-wait: --from-file nonexistent file → error
-  code=0
-  "$wrapper" send-wait --from-file /no/such/file.txt myagent 2>/dev/null || code=$?
-  assert "$prefix send-wait nonexistent-file exit≠0" "$code" "2"
-
-  # send-wait: --from-file relative path → error
-  code=0
-  "$wrapper" send-wait --from-file relative.txt myagent 2>/dev/null || code=$?
-  assert "$prefix send-wait relative-path exit≠0" "$code" "2"
-
-  # send-wait-literal: --from-file nonexistent file → error
-  code=0
-  "$wrapper" send-wait-literal --from-file /no/such/file.txt myagent DONE 2>/dev/null || code=$?
-  assert "$prefix send-wait-literal nonexistent-file exit≠0" "$code" "2"
-
-  # send-wait-literal: --from-file missing marker → error
-  local pfile="$WORK/$prefix-sw-prompt.txt"
-  printf 'test prompt\n' > "$pfile"
-  code=0
-  "$wrapper" send-wait-literal --from-file "$pfile" 2>/dev/null || code=$?
-  # missing name and marker → exits 2 (needs at least name + literal)
-  # exit code may be 2 (usage) or 1 (no session), accept either non-zero
-  [[ "$code" -ne 0 ]] && { echo "  ok   $prefix send-wait-literal missing-args exit≠0"; PASS=$((PASS+1)); } || \
-    { echo "  FAIL $prefix send-wait-literal missing-args expected non-zero got 0" >&2; FAIL=$((FAIL+1)); }
-}
-
-# ── send --prompt-file alias (flag recognised, not "unknown flag") ────────────
-
-run_send_prompt_file_alias() {
-  local wrapper="$1" prefix="$2"
-  echo "case: $prefix send --prompt-file alias recognised"
-
-  # --prompt-file with missing value → usage error (exit 2), not "unknown flag"
-  local code=0 out=""
-  out="$("$wrapper" send --prompt-file 2>&1)" || code=$?
-  assert "$prefix send --prompt-file no-value exit=2" "$code" "2"
-  # must NOT say "Unknown flag"
-  if [[ "$out" == *"Unknown flag"* ]]; then
-    echo "  FAIL $prefix send --prompt-file unknown-flag leak" >&2
-    FAIL=$((FAIL + 1))
-  else
-    echo "  ok   $prefix send --prompt-file no unknown-flag leak"
-    PASS=$((PASS + 1))
-  fi
-}
-
-# ── start: trailing --prompt-file / --from-file (issue #289 round 2) ─────────
-
-run_start_trailing_flag() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix start trailing --prompt-file / --from-file"
-
-  local pfile="$WORK/$prefix-trail.txt"
-  printf 'Trailing flag content\n' > "$pfile"
-
-  # <name> <dir> --prompt-file <file>  (trailing)
-  local out code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    "${prefix}-trail" "$WORK" --prompt-file "$pfile" 2>&1)" || code=$?
-  assert "$prefix start trailing --prompt-file exit=0" "$code" "0"
-  assert "$prefix start trailing --prompt-file initial_text" \
-    "$(jq_val "$out" .invocation.initial_text)" "Trailing flag content"
-
-  # <name> <dir> --from-file <file>  (trailing alias)
-  code=0
-  out="$(env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    "${prefix}-trailff" "$WORK" --from-file "$pfile" 2>&1)" || code=$?
-  assert "$prefix start trailing --from-file exit=0" "$code" "0"
-  assert "$prefix start trailing --from-file initial_text" \
-    "$(jq_val "$out" .invocation.initial_text)" "Trailing flag content"
-
-  # <name> <dir> --from-file -  (stdin in trailing position)
-  code=0
-  out="$(printf 'Trailing stdin content\n' | env "$cli_env=$WORK/fake.sh" "$wrapper" \
-    start --exact --dry-run "${prefix}-trailstdin" "$WORK" --from-file - 2>&1)" || code=$?
-  assert "$prefix start trailing stdin exit=0" "$code" "0"
-  assert "$prefix start trailing stdin initial_text" \
-    "$(jq_val "$out" .invocation.initial_text)" "Trailing stdin content"
-
-  # Trailing --prompt-file + inline text → still errors
-  code=0
-  env "$cli_env=$WORK/fake.sh" "$wrapper" start --exact --dry-run \
-    "${prefix}-trailmx" "$WORK" --prompt-file "$pfile" "also inline" >/dev/null 2>&1 || code=$?
-  assert "$prefix start trailing mutual-exclusion exit≠0" "$code" "2"
-}
-
-# ── send-wait / send-wait-literal: real positional ordering (fake CLI + tmux) ─
-# Exercises the EXACT shapes from issue #289: flag in middle or trailing position,
-# then verifies the file body was submitted (not the literal flag text) and that
-# timeout / literal were parsed correctly.
-
-run_positional_ordering_real() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-
-  local tmux_bin
-  tmux_bin="$(command -v tmux 2>/dev/null || true)"
-  if [[ -z "$tmux_bin" || ! -x "$tmux_bin" ]]; then
-    echo "  skip $prefix positional-ordering real (tmux not available)"
-    return 0
-  fi
-
-  echo "case: $prefix send-wait/send-wait-literal positional ordering (real submission)"
-
-  # Fake CLI: reads lines; echoes the nonce standalone (for send-wait) and
-  # echoes [SWLDONE] standalone (for send-wait-literal).
-  cat > "$WORK/fake-pos-$prefix.sh" <<'FAKEOF'
+echo "case: one live worker receives file, stdin, and multi-line sends"
+# Fake CLI: logs each line read; echoes a MARK-<hex> nonce or [SWLDONE] alone for the waits.
+cat > "$WORK/fake-live.sh" <<EOF
 #!/bin/sh
 printf 'fake cli ready\n'
-handle() {
-  nonce="$(printf '%s\n' "$1" | sed -nE 's/.*(MARK-[0-9a-fA-F]+).*/\1/p' | tail -1)"
-  [ -n "$nonce" ] && printf '%s\n' "$nonce"
-  case "$1" in *'[SWLDONE]'*) printf '[SWLDONE]\n' ;; esac
-}
 while IFS= read -r line; do
-  case "$line" in
-    # A file-ref line (claude's delivery): read the named file like the CLI.
-    'Your task is in the file '*)
-      f="${line#Your task is in the file }"; f="${f%% — *}"
-      while IFS= read -r l; do printf 'read:%s\n' "$l"; handle "$l"; done < "$f" ;;
-    *) handle "$line" ;;
-  esac
+  printf 'got:%s\n' "\$line" >> ${(q)WORK}/got
+  nonce="\$(printf '%s\n' "\$line" | sed -nE 's/.*(MARK-[0-9a-fA-F]+).*/\1/p' | tail -1)"
+  [ -n "\$nonce" ] && printf '%s\n' "\$nonce"
+  case "\$line" in *'[SWLDONE]'*) printf '[SWLDONE]\n' ;; esac
 done
-FAKEOF
-  chmod +x "$WORK/fake-pos-$prefix.sh"
+EOF
+chmod +x "$WORK/fake-live.sh"
+transcript="$WORK/live.transcript.jsonl"
+audit="$WORK/live.audit.jsonl"
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact --transcript "$transcript" pf-live "$WORK" >/dev/null
+# A second worker on the same log takes send-wait-literal: the waits poll each second, so run both at once.
+CODEX="$WORK/fake-live.sh" "$CODEX_TMUX" start --exact pf-live2 "$WORK" >/dev/null
+"$CODEX_TMUX" wait-text pf-live "fake cli ready" 5 >/dev/null 2>&1 || true
+"$CODEX_TMUX" wait-text pf-live2 "fake cli ready" 5 >/dev/null 2>&1 || true
 
-  # ── send-wait <name> --prompt-file <file> <timeout> ──────────────────────
+printf 'SW_FILE_BODY_CONTENT\n' > "$WORK/sw.txt"
+printf 'SWL_FILE_BODY\n[SWLDONE]\n' > "$WORK/swl.txt"
+( rc=0; "$CODEX_TMUX" send-wait-literal pf-live2 --prompt-file "$WORK/swl.txt" "[SWLDONE]" 8 >/dev/null 2>&1 || rc=$?; echo $rc > "$WORK/swl.rc" ) &
+swl_job=$!
+rc=0; "$CODEX_TMUX" send-wait pf-live --prompt-file "$WORK/sw.txt" 8 >/dev/null 2>&1 || rc=$?
+wait $swl_job || true
+assert "send-wait flag between positionals exits 0" "$rc" "0"
+assert "send-wait-literal flag between positionals exits 0" "$(cat "$WORK/swl.rc" 2>/dev/null)" "0"
+wait_got "SW_FILE_BODY_CONTENT" || true
+assert_contains "send-wait file body received" "$(cat "$WORK/got" 2>/dev/null)" "got:SW_FILE_BODY_CONTENT"
+assert_contains "send-wait-literal file body received" "$(cat "$WORK/got" 2>/dev/null)" "got:SWL_FILE_BODY"
+assert "no --prompt-file literal received" "$(grep -c -- '--prompt-file' "$WORK/got" 2>/dev/null || true)" "0"
 
-  local pfile_sw="$WORK/$prefix-sw-body.txt"
-  printf 'SW_FILE_BODY_CONTENT\n' > "$pfile_sw"
-  local sess_sw="${prefix}-posord-sw"
+printf 'stdin-send-line\n' | "$CODEX_TMUX" send --from-file - pf-live >/dev/null
+wait_got "got:stdin-send-line" && r=yes || r=no
+assert "send --from-file - received" "$r" "yes"
 
-  env "$cli_env=$WORK/fake-pos-$prefix.sh" \
-    "$wrapper" start --exact "$sess_sw" "$WORK" >/dev/null 2>&1 || true
-  local ready_sw=0
-  "$wrapper" wait-text "$sess_sw" "fake cli ready" 8 >/dev/null 2>&1 || ready_sw=$?
-  if [[ "$ready_sw" -ne 0 ]]; then
-    echo "  FAIL $prefix send-wait positional: session not ready" >&2
-    FAIL=$((FAIL + 1))
-    "$wrapper" stop "$sess_sw" >/dev/null 2>&1 || true
-    return 0
-  fi
-
-  local sw_code=0
-  "$wrapper" send-wait "$sess_sw" --prompt-file "$pfile_sw" 10 >/dev/null 2>&1 || sw_code=$?
-  assert "$prefix send-wait flag-between-positionals exit=0" "$sw_code" "0"
-
-  local sw_pane
-  sw_pane="$("$wrapper" capture "$sess_sw" 150 2>/dev/null || true)"
-  assert_contains "$prefix send-wait file body reached pane" "$sw_pane" "SW_FILE_BODY_CONTENT"
-  if [[ "$sw_pane" == *"--prompt-file"* ]]; then
-    echo "  FAIL $prefix send-wait: literal --prompt-file leaked into pane" >&2
-    FAIL=$((FAIL + 1))
-  else
-    echo "  ok   $prefix send-wait: no --prompt-file literal in pane"
-    PASS=$((PASS + 1))
-  fi
-
-  "$wrapper" stop "$sess_sw" >/dev/null 2>&1 || true
-
-  # ── send-wait-literal <name> --prompt-file <file> <literal> <timeout> ───
-
-  local pfile_swl="$WORK/$prefix-swl-body.txt"
-  printf 'SWL_FILE_BODY\n[SWLDONE]\n' > "$pfile_swl"
-  local sess_swl="${prefix}-posord-swl"
-
-  env "$cli_env=$WORK/fake-pos-$prefix.sh" \
-    "$wrapper" start --exact "$sess_swl" "$WORK" >/dev/null 2>&1 || true
-  local ready_swl=0
-  "$wrapper" wait-text "$sess_swl" "fake cli ready" 8 >/dev/null 2>&1 || ready_swl=$?
-  if [[ "$ready_swl" -ne 0 ]]; then
-    echo "  FAIL $prefix send-wait-literal positional: session not ready" >&2
-    FAIL=$((FAIL + 1))
-    "$wrapper" stop "$sess_swl" >/dev/null 2>&1 || true
-    return 0
-  fi
-
-  local swl_code=0
-  "$wrapper" send-wait-literal "$sess_swl" --prompt-file "$pfile_swl" "[SWLDONE]" 10 \
-    >/dev/null 2>&1 || swl_code=$?
-  assert "$prefix send-wait-literal flag-between-positionals exit=0" "$swl_code" "0"
-
-  local swl_pane
-  swl_pane="$("$wrapper" capture "$sess_swl" 150 2>/dev/null || true)"
-  assert_contains "$prefix send-wait-literal file body reached pane" "$swl_pane" "SWL_FILE_BODY"
-
-  "$wrapper" stop "$sess_swl" >/dev/null 2>&1 || true
-}
-
-# ── run all cases ─────────────────────────────────────────────────────────────
-
-# Argv parsing is shared: one CLI is enough.
-run_start_from_file           "$CODEX_TMUX" CODEX cd
-run_start_trailing_flag       "$CODEX_TMUX" CODEX cd
-run_help_from_file            "$CODEX_TMUX" cd
-run_send_wait_error_paths     "$CODEX_TMUX" cd
-run_send_prompt_file_alias    "$CODEX_TMUX" cd
-# Delivery differs per CLI (claude: file-ref, codex: paste).
-run_positional_ordering_real  "$CODEX_TMUX"  CODEX  cd
-run_positional_ordering_real  "$CLAUDE_TMUX" CLAUDE cl
+payload="$WORK/payload.txt"
+{ printf 'alpha\n'; printf 'beta: with colon\n'; perl -e 'print "x" x 17000'; } > "$payload"
+TMUX_AGENT_TOOLS_AUDIT_LOG="$audit" "$CODEX_TMUX" send --from-file "$payload" --enter-count 3 --enter-delay 0.05 pf-live >/dev/null
+wait_got "got:beta: with colon" || true
+assert_contains "multi-line first line received" "$(cat "$WORK/got" 2>/dev/null)" "got:alpha"
+assert_contains "multi-line second line received" "$(cat "$WORK/got" 2>/dev/null)" "got:beta: with colon"
+send_line="$(grep '"event":"send"' "$transcript" | tail -1)"
+assert "transcript multiline=true" "$(jq_val "$send_line" .multiline)" "true"
+assert "transcript has sha" "$(jq_val "$send_line" '.text_sha256 | type')" "string"
+assert "transcript bytes > 16k" "$(jq_val "$send_line" '.text_bytes > 16000')" "true"
+audit_line="$(grep '"event":"send.multiline"' "$audit" | tail -1)"
+assert "audit multiline event" "$(jq_val "$audit_line" .event)" "send.multiline"
+assert "audit omits body" "$(jq_val "$audit_line" 'has("text")')" "false"
+assert "audit enter_count" "$(jq_val "$audit_line" .enter_count)" "3"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

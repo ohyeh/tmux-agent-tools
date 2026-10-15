@@ -5,7 +5,7 @@
 # self-dependency / cycle detection via Kahn's algorithm) BEFORE launching
 # any task, then executes tasks in topological order synchronously.
 #
-# Manifest schema (JSON, canonical — see docs/design-issue-186-dag-manifest.md):
+# Manifest schema (JSON, canonical):
 #   {
 #     "schema_version": 1,
 #     "fail_fast": true,                       # default true
@@ -67,8 +67,7 @@ Validates the manifest as a DAG before launching any task. Fails fast on:
   - self-dependency
   - cycle (Kahn's algorithm)
 
-Then executes tasks in topological order. See
-docs/design-issue-186-dag-manifest.md for the full schema and semantics.
+Then executes tasks in topological order.
 EOF
 }
 

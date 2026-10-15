@@ -1,17 +1,59 @@
 #!/usr/bin/env bash
-# Smoke test for hooks/tmux-dispatch-gate.sh — feeds PreToolUse-shaped
-# stdin JSON straight into the hook and asserts exit codes + deny messages.
-# No tmux, no Claude runtime needed.
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
+source "$(cd "$(dirname "$0")" && pwd)/lib/smoke-tmux.sh"
+# Smoke for the dispatch gates:
+# - hooks/tmux-dispatch-gate.sh: PreToolUse-shaped stdin JSON straight into the hook;
+#   asserts exit codes + deny messages. No tmux, no Claude runtime.
+# - agent-tmux AGENT_TMUX_REQUIRE_GATE_RECEIPT: dispatch commands refuse without the
+#   receipt file (gate_receipt_missing); help stays ungated.
+# - wait-and-capture --pause-until-file (#185 approval gate): approve -> 0, reject -> 7,
+#   pause-timeout -> 8, with status/transcript/audit records. One live pause.
 set -euo pipefail
 
-HOOK="$(cd "$(dirname "$0")/.." && pwd)/hooks/tmux-dispatch-gate.sh"
-# The hook writes under $HOME/.local/state; keep it off the real home.
-HOME="$(mktemp -d)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOOK="$REPO_ROOT/hooks/tmux-dispatch-gate.sh"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+WORK="$(mktemp -d "$TMPDIR/gate.XXXXXX")"
+export TMUX_AGENT_DIR="$WORK/state"
+# The hook writes under $HOME/.local/state; keep it in this job.
+HOME="$WORK/home"
+mkdir -p "$HOME"
 export HOME
 SID="smoke-$$"
 STATE_DIR="$HOME/.local/state/agent-hooks/$SID"
-cleanup() { chmod -R u+rwx "$HOME" 2>/dev/null; rm -rf "$HOME"; }
+cleanup() {
+  local n
+  for n in ag-approve ag-reject ag-timeout; do "$AGENT_TMUX" codex stop "$n" >/dev/null 2>&1 || true; done
+  wait
+  chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK"
+  smoke_cleanup
+}
 trap cleanup EXIT
+
+# Approval sessions start first and run while the hook checks below run.
+printf '#!/bin/sh\nprintf "AG-MARKER\\n"\nexec cat\n' > "$WORK/fake-mark.sh"
+chmod +x "$WORK/fake-mark.sh"
+approval_case() { # approval_case <name> [wait-and-capture flags...]: rc -> $WORK/<name>.rc
+  local name="$1"; shift
+  env CODEX="$WORK/fake-mark.sh" "$AGENT_TMUX" codex start --exact --transcript "$WORK/$name.transcript.jsonl" "$name" "$WORK" >/dev/null
+  local rc=0
+  TMUX_AGENT_TOOLS_AUDIT_LOG="$WORK/$name.audit.jsonl" "$AGENT_TMUX" codex wait-and-capture --literal --marker AG-MARKER \
+    --timeout 8 --pause-until-file "$WORK/$name.marker" "$@" "$name" >/dev/null 2>&1 || rc=$?
+  echo "$rc" > "$WORK/$name.rc"
+}
+printf 'reject not-safe\n' > "$WORK/ag-reject.marker"
+approval_case ag-approve &
+approval_case ag-reject &
+approval_case ag-timeout --pause-timeout 1 &
+# The one live pause: approve only after the gate reports awaiting_approval.
+(
+  for _ in $(seq 100); do
+    [ "$(jq -r .state "$TMUX_AGENT_DIR/ag-approve/approval-status.json" 2>/dev/null)" = awaiting_approval ] && break
+    sleep 0.05
+  done
+  jq -r .state "$TMUX_AGENT_DIR/ag-approve/approval-status.json" > "$WORK/ag-approve.seen" 2>/dev/null
+  printf 'approve\n' > "$WORK/ag-approve.marker"
+) &
 
 FAILS=0
 check() { # check <name> <expected_exit> <json> [expected_stderr_grep]
@@ -30,6 +72,20 @@ check() { # check <name> <expected_exit> <json> [expected_stderr_grep]
 j() { # j <command> -> parent-context PreToolUse JSON
   printf '{"session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$SID" "$1"
 }
+
+# A copy that died before writing its line is no pass (Sol r11 #2). The hook waits 2 s for
+# that copy, so this case runs in its own session beside the others; results merge at the end.
+(
+  SIDD="smoke5d-$$"; STD="$HOME/.local/state/agent-hooks/$SIDD"
+  jd() { printf '{"session_id":"%s","tool_use_id":"%s","tool_name":"Shell","tool_input":{"command":"%s"}}' "$SIDD" "$1" "$2"; }
+  if command -v sha256sum >/dev/null 2>&1; then h="$(printf '%s' dead-copy | sha256sum)"; else h="$(printf '%s' dead-copy | shasum -a 256)"; fi
+  mkdir -p "$STD"   # fresh: exactly one counted dispatch before the dead copy
+  printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$STD/gate-receipt-parent-dispatch"
+  check "dead-copy-setup-1st-pass" 0 "$(jd first 'agent-tmux codex start sol_review_a')"
+  mkdir -p "$STD/seen/id-${h%% *}"   # the recording copy made its marker, then died before its line
+  check "dead-copy-no-pass" 2 "$(jd dead-copy 'agent-tmux codex start sol_review_c')" "did not finish recording"
+  rm -rf "$STD"
+) > "$WORK/dead-copy.out" 2>&1 &
 
 # 1. non-dispatch command passes
 check "non-dispatch" 0 "$(j 'git status')"
@@ -69,11 +125,11 @@ rm -rf "$HOME/.local/state/agent-hooks/$SID2"
 
 # 14–16. one tool call counts once for GATE 2 (F6): cursor-agent runs the gate
 # once per loaded copy of the plugin, with the same tool_use_id, concurrently.
-SID3="smoke3-$$"; ST3="$HOME/.local/state/agent-hooks/$SID3"
+copy_pids=(); SID3="smoke3-$$"; ST3="$HOME/.local/state/agent-hooks/$SID3"
 mkdir -p "$ST3"
 printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST3/gate-receipt-parent-dispatch"
 j3() { printf '{"session_id":"%s","tool_use_id":"%s","tool_name":"Shell","tool_input":{"command":"%s"}}' "$SID3" "$1" "$2"; }
-for i in 1 2 3; do ( printf '%s' "$(j3 call-a 'agent-tmux codex start sol_review_a')" | bash "$HOOK" >"$ST3/out$i" 2>&1; echo $? >"$ST3/rc$i" ) & done; wait
+for i in 1 2 3; do ( printf '%s' "$(j3 call-a 'agent-tmux codex start sol_review_a')" | bash "$HOOK" >"$ST3/out$i" 2>&1; echo $? >"$ST3/rc$i" ) & copy_pids+=($!); done; wait "${copy_pids[@]}"
 lines="$(wc -l < "$ST3/review-dispatch.log" | tr -d ' ')"
 if [ "$lines" = 1 ]; then echo "PASS [same-id-concurrent-counts-once]"; else echo "FAIL [same-id-concurrent-counts-once] log lines=$lines want=1"; FAILS=$((FAILS+1)); fi
 copies="$(cat "$ST3"/rc1 "$ST3"/rc2 "$ST3"/rc3 | tr -d '\n'):$(cat "$ST3"/out1 "$ST3"/out2 "$ST3"/out3)"
@@ -100,16 +156,9 @@ j5() { printf '{"session_id":"%s","tool_use_id":"%s","tool_name":"Shell","tool_i
 long="$(printf 'a%.0s' $(seq 127))"
 check "long-id-1st-pass" 0 "$(j5 first 'agent-tmux codex start sol_review_a')"
 check "long-id-2nd-review-deny" 2 "$(j5 "$long" 'agent-tmux codex start sol_review_b')" "dispatch #2"
-if command -v sha256sum >/dev/null 2>&1; then h="$(printf '%s' dead-copy | sha256sum)"; else h="$(printf '%s' dead-copy | shasum -a 256)"; fi
-rm -rf "$ST5"; mkdir -p "$ST5"   # fresh: exactly one counted dispatch before the dead copy
-printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST5/gate-receipt-parent-dispatch"
-check "dead-copy-setup-1st-pass" 0 "$(j5 first 'agent-tmux codex start sol_review_a')"
-mkdir -p "$ST5/seen/id-${h%% *}"   # the recording copy made its marker, then died before its line
-check "dead-copy-no-pass" 2 "$(j5 dead-copy 'agent-tmux codex start sol_review_c')" "did not finish recording"
-rm -rf "$ST5"
 
 # 20. no working sha256 tool: deny, never share one `id-` marker (Sol r11 ep2).
-SID6="smoke6-$$"; ST6="$HOME/.local/state/agent-hooks/$SID6"; FAKE="$(mktemp -d)"
+SID6="smoke6-$$"; ST6="$HOME/.local/state/agent-hooks/$SID6"; FAKE="$(mktemp -d "$TMPDIR/fake.XXXXXX")"
 mkdir -p "$ST6"
 printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST6/gate-receipt-parent-dispatch"
 printf '#!/bin/sh\nexit 1\n' > "$FAKE/sha256sum"; chmod +x "$FAKE/sha256sum"
@@ -130,6 +179,53 @@ fresh7
 check "newline-id-1st-pass" 0 "$(j7 'call-a' 'agent-tmux codex start sol_review_a')"
 check "newline-id-2nd-review-deny" 2 "$(j7 'call-a\n' 'agent-tmux codex start sol_review_b')" "dispatch #2"
 chmod -R u+rw "$ST7" 2>/dev/null; rm -rf "$ST7"
+
+# Gate receipt (agent-tmux): blocked paths exit before tmux; allowed paths use start --dry-run.
+blocked() { # blocked <name> <command field> <cmd...>: exit 1 with gate_receipt_missing JSON
+  local name="$1" field="$2"; shift 2
+  local out rc=0 last
+  out="$("$@" 2>&1)" || rc=$?
+  last="${out##*$'\n'}"
+  if [ "$rc" = 1 ] && [ "$(printf '%s' "$last" | jq -r '.blocked_reason + ":" + (.submitted|tostring) + ":" + .command')" = "gate_receipt_missing:false:$field" ]; then
+    echo "PASS [$name]"
+  else
+    echo "FAIL [$name] rc=$rc $last"; FAILS=$((FAILS+1))
+  fi
+}
+blocked "receipt-unset-start-deny" start env CODEX="$WORK/fake-mark.sh" AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 \
+  "$AGENT_TMUX" codex start --exact --dry-run gate-novar "$WORK"
+blocked "receipt-missing-send-deny" send env AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 AGENT_TMUX_GATE_RECEIPT="$WORK/receipt" \
+  "$AGENT_TMUX" codex send no-such-session "text"
+touch "$WORK/receipt"
+rc=0
+env CODEX="$WORK/fake-mark.sh" AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 AGENT_TMUX_GATE_RECEIPT="$WORK/receipt" \
+  "$AGENT_TMUX" codex start --exact --dry-run gate-ok "$WORK" >/dev/null 2>&1 || rc=$?
+if [ "$rc" = 0 ]; then echo "PASS [receipt-present-start-pass]"; else echo "FAIL [receipt-present-start-pass] rc=$rc"; FAILS=$((FAILS+1)); fi
+rc=0
+out="$(env AGENT_TMUX_REQUIRE_GATE_RECEIPT=1 "$AGENT_TMUX" codex help 2>&1)" || rc=$?
+case "$rc:$out" in
+  0:*gate_receipt_missing*|[!0]*) echo "FAIL [help-ungated] rc=$rc"; FAILS=$((FAILS+1)) ;;
+  *) echo "PASS [help-ungated]" ;;
+esac
+
+# Background results (started at the top).
+wait
+cat "$WORK/dead-copy.out"
+FAILS=$((FAILS + $(grep -c '^FAIL' "$WORK/dead-copy.out" || true)))
+want() { # want <name> <got> <expected>
+  if [ "$2" = "$3" ]; then echo "PASS [$1]"; else echo "FAIL [$1] got=$2 want=$3"; FAILS=$((FAILS+1)); fi
+}
+grep_in() { grep -h "$2" "$WORK/$1" 2>/dev/null | head -1; }
+want "approve-paused-first" "$(cat "$WORK/ag-approve.seen" 2>/dev/null)" awaiting_approval
+want "approve-exit-0" "$(cat "$WORK/ag-approve.rc")" 0
+want "approve-status-decision" "$(jq -r .decision "$TMUX_AGENT_DIR/ag-approve/approval-status.json" 2>/dev/null)" approve
+line="$(grep_in ag-approve.transcript.jsonl '"kind":"approval"')"
+want "approve-transcript-event" "$(printf '%s' "$line" | jq -r '[.decision, (.marker_path|type), (.decided_at|type)] | join(",")' 2>/dev/null)" "approve,string,string"
+want "approve-audit-event" "$(grep_in ag-approve.audit.jsonl '"event":"approval.approve"' | jq -r '.marker_path|type' 2>/dev/null)" string
+want "reject-exit-7" "$(cat "$WORK/ag-reject.rc")" 7
+want "reject-audit-event" "$(grep_in ag-reject.audit.jsonl '"event":"approval.reject"' | jq -r .event 2>/dev/null)" approval.reject
+want "timeout-exit-8" "$(cat "$WORK/ag-timeout.rc")" 8
+want "timeout-audit-event" "$(grep_in ag-timeout.audit.jsonl '"event":"approval.timeout"' | jq -r .event 2>/dev/null)" approval.timeout
 
 if [ "$FAILS" -ne 0 ]; then echo "SMOKE FAIL ($FAILS)"; exit 1; fi
 echo "SMOKE OK — all checks passed"

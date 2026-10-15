@@ -18,19 +18,12 @@ usage() {
   cat <<'EOF'
 tmux-agent-fanout - synchronous fan-out coordinator.
 
-Canonical:
+Usage:
   tmux-agent-fanout run --prompt-file <prompt> \
                         (--agent claude:foo --agent codex:bar ... | --workdir <dir> ...) \
-                        [--result-dir <path>] [--summary-out <path>] \
+                        [--tool claude|codex] [--result-dir <path>] [--summary-out <path>] \
                         [--merge-mode all|first-success] \
                         [--timeout <seconds>] [--name-prefix <p>]
-
-Legacy (back-compat):
-  tmux-agent-fanout --prompt-file <prompt> --workdir <a> [--workdir <b> ...] \
-                    [--tool claude|codex] [--timeout <seconds>] [--name-prefix <p>]
-
-  Bare invocation forwards to `run` only when the legacy arg shape is
-  detected (--prompt-file + --workdir present, no --agent).
 
 Flags:
   --prompt-file <path>   Prompt body sent to every spawned agent. Required.
@@ -41,15 +34,15 @@ Flags:
                          --workdir[i] positionally.
   --workdir <dir>        Repeatable working directory. Without --agent the
                          tool defaults to claude:default-<i>.
-  --tool <claude|codex>  Legacy single-tool selector (applies when only
-                         --workdir is used). Default: claude.
+  --tool <claude|codex>  Tool for every agent when only --workdir is
+                         used. Default: claude.
   --result-dir <path>    Directory for per-agent result.json files. Each
                          agent writes <result-dir>/<name>-<i>/result.json.
                          Default: $XDG_STATE_HOME/tmux-agent-tools/fanout/<run-id>/
                          The chosen path is printed to stderr at start.
   --summary-out <path>   Also write consolidated JSON to this path.
   --merge-mode <mode>    all (default) or first-success. Custom/majority
-                         deferred — see docs/design-issue-184-fanout.md.
+                         deferred.
   --timeout <seconds>    Per-run wait deadline. Default: 600.
   --name-prefix <p>      Prefix for synthesized agent names. Default: fan.
   -h, --help             Show this help.
@@ -79,42 +72,16 @@ result_status_is_success() {
 
 # -------- Parse argv --------
 
-subcommand=""
-typeset -a raw_args
-raw_args=("$@")
-
 if (( $# == 0 )); then
   usage
   exit 0
 fi
 
-case "${1:-}" in
+case "$1" in
   -h|--help|help) usage; exit 0 ;;
-  run) subcommand="run"; shift ;;
-  *)
-    # Legacy back-compat: forward to `run` if arg shape matches
-    # (no --agent, has --prompt-file and --workdir).
-    has_pf=0; has_wd=0; has_agent=0
-    for a in "${raw_args[@]}"; do
-      case "$a" in
-        --prompt-file) has_pf=1 ;;
-        --workdir) has_wd=1 ;;
-        --agent) has_agent=1 ;;
-      esac
-    done
-    if (( has_pf == 1 && has_wd == 1 && has_agent == 0 )); then
-      subcommand="run"
-    else
-      usage
-      exit 2
-    fi
-    ;;
+  run) shift ;;
+  *) usage >&2; exit 2 ;;
 esac
-
-if [[ "$subcommand" != "run" ]]; then
-  usage
-  exit 2
-fi
 
 prompt_file=""
 typeset -a workdirs agent_specs

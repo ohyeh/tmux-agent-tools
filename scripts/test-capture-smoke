@@ -1,9 +1,12 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test for issue #96 token-efficient capture variants.
+# Smoke test for issue #96 token-efficient capture variants and issue #99
+# wait-and-capture.
 #
-# Exercises --strip-ansi / --since-marker / --json against synthetic
-# panes that emit known content. No real Claude / Codex required.
+# Exercises capture --strip-ansi / --since-marker / --json / --tail and
+# wait-and-capture literal / regex / timeout / session_gone against one
+# synthetic pane. No real Claude / Codex required.
 
 set -euo pipefail
 
@@ -20,11 +23,11 @@ for wrapper in "$CODEX_TMUX"; do
   fi
 done
 
-WORK="$(mktemp -d -t tmux-agent-capture-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-capture-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 # Synthetic CLI: emits a colored line + a literal marker + two follow-up
-# lines, then sleeps so the pane remains capturable.
+# lines, then waits on stdin so the pane remains capturable.
 cat > "$WORK/fake-content.sh" <<'EOF'
 #!/bin/sh
 # #135 extended strip-ansi: emit one example of every escape category so
@@ -43,8 +46,10 @@ printf '\033PHIDE-DCS\033\\DCS-AFTER\n'
 printf '\033_APC-HIDDEN\033\\APC-AFTER\n'
 printf '\033^PM-HIDDEN\033\\PM-AFTER\n'
 printf '\033XSOS-HIDDEN\033\\SOS-AFTER\n'
+# "Doing" holds every letter of the ERE class [DONE] (partner R6, PR #137).
+printf 'Doing some work first\n'
 printf 'MARKER-CAP\nafter1\nafter2\n'
-sleep 30
+while IFS= read -r _; do :; done
 EOF
 chmod +x "$WORK/fake-content.sh"
 
@@ -92,7 +97,11 @@ run_capture_variants() {
   echo "case: $prefix ($wrapper)"
   env "$cli_env=$WORK/fake-content.sh" "$wrapper" start --exact \
     "$prefix" "$WORK" >/dev/null
-  sleep 2
+  local i
+  for i in {1..40}; do
+    "$wrapper" capture "$prefix" 20 2>/dev/null | grep -q after2 && break
+    sleep 0.05
+  done
 
   local raw_output strip_output since_output json_output
 
@@ -160,7 +169,25 @@ run_capture_variants() {
   tail_over_lr="$("$wrapper" capture --tail 7 --json "$prefix" 20 2>/dev/null | jq -r .lines_requested 2>/dev/null || echo PARSE_FAIL)"
   assert "$prefix --tail wins over positional value" "$tail_over_lr" "7"
 
+  echo "case: $prefix wait-and-capture"
+  local body json_payload rc
+  json_payload="$("$wrapper" wait-and-capture --literal --marker MARKER-CAP --timeout 2 --json "$prefix" 2>&1)"
+  assert "$prefix w&c literal matched" "$(printf '%s' "$json_payload" | jq -r '"\(.schema_version) \(.matched) \(.reason) \(.since_marker)"')" "1 true matched MARKER-CAP"
+  body="$("$wrapper" wait-and-capture --regex --marker 'MARK[A-Z]+-CAP' --timeout 2 "$prefix" 2>&1)"
+  assert_contains "$prefix w&c regex body after the marker" "$body" "after1"
+  # One no-match, both timeout modes at once: the default literal style must
+  # not take "Doing" as the class [DONE] (that would match at once).
+  "$wrapper" wait-and-capture --marker '[DONE]' --timeout 1 "$prefix" >/dev/null 2>&1 &
+  local plain_pid=$!
+  json_payload="$("$wrapper" wait-and-capture --marker '[DONE]' --timeout 1 --json --no-timeout-error "$prefix" 2>/dev/null)" && rc=0 || rc=$?
+  assert "$prefix w&c --no-timeout-error exit=0, reason timeout" "$rc $(printf '%s' "$json_payload" | jq -r '"\(.matched) \(.reason)"')" "0 false timeout"
+  rc=0; wait "$plain_pid" || rc=$?
+  assert "$prefix w&c timeout default exit=1" "$rc" "1"
+
   "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
+  # session_gone is a HARD failure: --no-timeout-error must NOT suppress it.
+  json_payload="$("$wrapper" wait-and-capture --literal --marker MARKER-CAP --timeout 1 --json --no-timeout-error "$prefix" 2>/dev/null)" && rc=0 || rc=$?
+  assert "$prefix w&c session_gone exit=1" "$rc $(printf '%s' "$json_payload" | jq -r .reason)" "1 session_gone"
 }
 
 run_missing_value_reject() {
@@ -195,6 +222,11 @@ run_missing_value_reject() {
   local bound_rc=0
   "$wrapper" capture -- "$prefix-nosess" --tail 7 2>/dev/null || bound_rc=$?
   assert "$prefix -- boundary keeps --tail positional (exit 2)" "$bound_rc" "2"
+  local flag rc
+  for flag in "--marker" "--literal --marker X --timeout" "--since-marker"; do
+    rc=0; "$wrapper" wait-and-capture ${=flag} 2>/dev/null || rc=$?
+    assert "w&c $flag missing value rejected" "$rc" "2"
+  done
 }
 
 run_capture_variants "$CODEX_TMUX"  "CODEX"  "capture-codex"

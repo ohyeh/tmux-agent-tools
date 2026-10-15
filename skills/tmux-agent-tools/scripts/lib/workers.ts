@@ -125,8 +125,10 @@ export const PEEK_MAX = 200
 export const BASH_GATE_RE =
   /(^|[\s;&|(])agent-tmux\s+[A-Za-z0-9._-]+\s+(assign|send|send-wait|stop|status|capture|probe|result)(\s|$)/
 export const HELP_RE = /(^|\s)--help(\s|$)/
-/** Sessions whose panel is open, newest first: a reload drops the module's state, and session.start reopens it. */
-export const PANEL_KEY = 'tmux-agent.panel'
+/** Sessions whose person hid the panel, newest first: every other session opens it at session.start (and after a reload). */
+export const PANEL_KEY = 'tmux-agent.panel-hidden'
+/** 'open' once the person unfolded the band; absent or 'folded': it opens as its title bar. */
+export const FOLD_KEY = 'tmux-agent.fold'
 export const POLL_MS = 10_000
 /**
  * A collector proves it is alive by touching `<root>/.collector-<sessionId>`
@@ -191,6 +193,15 @@ export const STALL_PROBE_MAX = 8
 export const STALL_SWEEP_MS = 4_000
 /** One probe's own ceiling. Capturing a pane is fast or it is not answering. */
 export const STALL_PROBE_MS = 3_000
+/**
+ * A terminal result waits until its worker is quiet: the pane unchanged this long
+ * (`status --json` idle_seconds). A CLI often rewrites result.json in the same turn
+ * (2026-10-11, codex: written 18:01:28, delivered, rewritten 18:02:15; the rewrite went
+ * out as an unattributed notice under the next episode's id).
+ */
+export const SETTLE_IDLE_SECONDS = 20
+/** A result unchanged this long is delivered even while the pane still moves (a TUI clock, a human typing). */
+export const SETTLE_CAP_MS = 10 * 60_000
 /** Refused stall wake-ups one episode gets before the mod stops trying and logs it. */
 export const STALL_WAKE_MAX = 3
 /** A result's `commit`: the full sha, never an abbreviation git could resolve ambiguously. */
@@ -257,7 +268,8 @@ export function underCwd(sessionPath: string, cwd: string): boolean {
   const path = normPath(sessionPath)
   const root = normPath(cwd)
   if (!path || !root) return false
-  return path === root || path.startsWith(`${root}/`)
+  // `/` is the whole machine: the TUI viewer's scope.
+  return root === '/' || path === root || path.startsWith(`${root}/`)
 }
 /** Mirror lines when no render has told us how tall the body is yet. */
 export const MIRROR_ROWS = 12
@@ -295,6 +307,9 @@ export const CTRL_RE = /[\x00-\x1f\x7f]/
  * strip that used CTRL_RE left every escape after the first one in the string.
  */
 export const CTRL_ALL_RE = /[\x00-\x1f\x7f]/g
+/** CTRL_ALL_RE minus ESC: a colour capture keeps its escapes for the TUI's sanitizeAnsi. */
+const CTRL_BUT_ESC_RE = /[\x00-\x1a\x1c-\x1f\x7f]/g
+const SGR_ONLY_RE = /\x1b\[[0-9;:]*m/g
 export const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 export type AssignInput = { profile: string; name: string; dir: string; brief: string }
 /** What the tool and the spawn hook share besides `$` and the brief. Both are closed over inside `register`. */
@@ -313,6 +328,7 @@ export type AssignExtra = {
 export type TellInput = { name: string; text: string }
 export type StopInput = { name?: string; all?: boolean }
 export type PeekInput = { name: string; lines?: number }
+export type AwaitInput = { name: string; seq?: number; max_seconds?: number }
 export type KeysInput = { name: string; keys: string[] }
 
 /**
@@ -515,6 +531,8 @@ export type Panel = {
   timer?: { cancel: () => void }
   /** The `[ + ]` field is open: one row, `[profile] <session-id> [name]`. */
   adding?: boolean
+  /** `[ ▾ fold ]`: the band shows its title bar only, still there (unlike hide). */
+  folded?: boolean
 }
 
 export type PanelRow = {
@@ -669,6 +687,14 @@ export const idOf = (d: TmuxDispatch) => `${d.name}#${d.seq ?? 0}`
  * gen0 is the descriptor's owner, so the id does not change when the episode is claimed.
  */
 export const deliveryIdOf = (d: TmuxDispatch) => `${d.adoptedFrom ?? d.owner ?? ''}/${d.name}/${d.seq ?? 0}`
+/**
+ * One id per notice, not per episode: a launch-failed, an exited, or an unattributed
+ * snapshot notice is its own news, so it must not share the id of the episode's result
+ * (2026-10-10: a stale snapshot carried the next episode's id and read as a re-report).
+ */
+export const noticeIdOf = (f: { d: TmuxDispatch; status: string; observation?: string }) =>
+  deliveryIdOf(f.d) +
+  (f.status === UNATTRIBUTED && f.observation ? `/${f.observation}` : f.status === LAUNCH_FAILED ? '/launch' : f.status === EXITED ? '/exited' : '')
 /** The ack of a launch-failed notice: it closes the notice, not the episode (see `collect`). */
 export const LAUNCH_ACK = '#launch'
 export const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
@@ -948,10 +974,10 @@ export type Scan = {
   withheld: Set<string>
 }
 
-/** Same repo = same cwd string, the field `assign` stamped; a record without one is anyone's. */
+/** Same repo = same cwd string, the field `assign` stamped; a record without one is anyone's. A cwd of `/` (the TUI viewer, which never claims) sees every project. */
 export function sameProject(host: Host, d: { ownerCwd?: string }): boolean {
   const cwd = host.cwd()
-  return !d.ownerCwd || !cwd || d.ownerCwd === cwd
+  return !d.ownerCwd || !cwd || cwd === '/' || d.ownerCwd === cwd
 }
 
 /**
@@ -1400,6 +1426,16 @@ export async function collect(
         out.push({ d, path, status: EXPIRED, summary: `(${status}, finished ${elapsed(now - at)} ago) ${typeof s === 'string' ? s : ''}`, ...(observation ? { observation } : {}) })
         continue
       }
+      // A worker still writing holds its result (SETTLE_IDLE_SECONDS); the next pass reads it again.
+      // Only its latest episode: after a tell the pane moves for the next episode, not for this result.
+      if (!ready.some(o => o.name === d.name && (o.seq ?? 0) > (d.seq ?? 0))) {
+        const hold = await busy(host, d, path, now, i === 0 ? STALL_PROBE_MS : Math.min(STALL_PROBE_MS, deadline - (await host.now())))
+        if (hold === DEFERRED) {
+          resume ??= idOf(d)
+          continue
+        }
+        if (hold) continue
+      }
       const sha = raw.commit ?? raw.body?.commit
       // Only a success claim is bound to its commit; absent or null (a read-only
       // or review worker) delivers exactly as before. '' is a malformed claim.
@@ -1421,6 +1457,28 @@ export async function collect(
     }
   }
   return { finished: out, unfinished, terminal: terminalIds, read, ...(resume ? { resume } : {}) }
+}
+
+/**
+ * True only on evidence that the worker is still at work: its pane is live and changed
+ * within SETTLE_IDLE_SECONDS, and the result is younger than SETTLE_CAP_MS. No time
+ * left in this pass: DEFERRED (the next pass checks it). A status that cannot answer
+ * (an error, no idle measurement) does not hold the result.
+ */
+export async function busy(host: Host, d: TmuxDispatch, path: string, now: number, limitMs: number): Promise<boolean | typeof DEFERRED> {
+  const st = await host.stat(path).catch(() => undefined)
+  if (!st || now - st.mtimeMs >= SETTLE_CAP_MS) return false
+  if (limitMs <= 0) return DEFERRED
+  let probe: { exitCode: number; stdout: string }
+  try {
+    probe = await host.run(['agent-tmux', d.profile, 'status', '--json', d.name], d.dir, limitMs)
+  } catch (error) {
+    host.log(`tmux-agent: settle check for ${d.name} could not run status (${String(error)}); delivering without it`)
+    return false
+  }
+  const row = probe.exitCode === 0 ? (parseJson(probe.stdout) as { exists?: unknown; exit_detected?: unknown; idle_seconds?: unknown } | undefined) : undefined
+  if (!row || typeof row !== 'object' || row.exists !== true || row.exit_detected === true) return false
+  return typeof row.idle_seconds === 'number' && row.idle_seconds < SETTLE_IDLE_SECONDS
 }
 
 /** The file's own `episode` names this seq: the number, or a decimal string of it (r5 F5-3). */
@@ -1483,11 +1541,15 @@ export async function observe(host: Host, s: Scan, budget: number, read: Readonl
       const observation = await identity(text, b.mtimeMs)
       if (acked.has(observation)) continue
       const sum = raw?.summary ?? raw?.body?.summary
+      // A closed episode's result rewritten after its delivery: say which one, so it never reads as the open episode's answer.
+      const closed = eps.find(d => s.reported.has(idOf(d)) && episodeMatches(raw?.episode ?? raw?.body?.episode, d.seq))
       out.push({
         d: target,
         path,
         status: UNATTRIBUTED,
-        summary: `${status}: ${typeof sum === 'string' ? sum : ''} (open episodes: ${open.map(d => d.seq).join(', ')}; this result names no open episode)`,
+        summary: closed
+          ? `${status}: ${typeof sum === 'string' ? sum : ''} (episode ${closed.seq}'s result changed after it was delivered; open episodes: ${open.map(d => d.seq).join(', ')} are still running)`
+          : `${status}: ${typeof sum === 'string' ? sum : ''} (open episodes: ${open.map(d => d.seq).join(', ')}; this result names no open episode)`,
         observation,
       })
     }
@@ -1563,7 +1625,7 @@ export function payloadOf(done: readonly Finished[]): { text: string; included: 
       ...(f.d.adoptedFrom ? [`  adopted from session ${f.d.adoptedFrom} (it stopped collecting)`] : []),
       `  dir: ${f.d.dir}`,
       `  result: ${f.path}`,
-      `  delivery_id: ${deliveryIdOf(f.d)} (a re-report of a notice already handled has the same id)`,
+      `  delivery_id: ${noticeIdOf(f)} (only a re-report of this same notice repeats this id)`,
       fence(summary, f.path),
     ].join('\n')
   for (const f of done) {
@@ -2053,24 +2115,21 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
 }
 
 /**
- * The tail of one worker's pane, as plain text.
- *
- * `--strip-ansi` is deliberate: the engine's `Text` takes a `color` string whose
- * accepted spellings are undocumented, so mapping 256-colour and truecolour
- * escapes onto it would be guesswork shipped as a feature. Plain text is the
- * honest v1; `tmux attach` is still the way to see the real thing.
+ * The tail of one worker's pane, as plain text. `color` keeps its escapes: only
+ * for a caller that runs every line through sanitizeAnsi (the TUI); the mod panel
+ * prints lines as they are.
  */
-export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number): Promise<MirrorCapture> {
+export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number, color = false): Promise<MirrorCapture> {
   const probe = await host
     .run(
-      ['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', String(rows), d.name],
+      ['agent-tmux', d.profile, 'capture', color ? '--color' : '--strip-ansi', '--tail', String(rows), d.name],
       d.dir,
       MIRROR_PROBE_MS,
     )
     .catch((err: unknown) => err)
   const error = captureError(probe)
   if (error) return { lines: [], error }
-  return { lines: (probe as RunResult).stdout.split('\n').slice(-rows).map(l => l.replace(CTRL_ALL_RE, ' ')) }
+  return { lines: (probe as RunResult).stdout.split('\n').slice(-rows).map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' ')) }
 }
 
 /** One pane capture: its lines, or why there are none. A failure is not an empty pane. */
@@ -2096,9 +2155,9 @@ function captureError(probe: unknown): string | undefined {
  * output included: a tail of it was all blanks for a pane with one line of
  * output at the top (live 2026-09-26). `agent-tmux capture --tail` trims; this does too.
  */
-export function paneTail(stdout: string, n: number): string[] {
-  const lines = stdout.split('\n').map(l => l.replace(CTRL_ALL_RE, ' '))
-  while (lines.length && !lines[lines.length - 1]!.trim()) lines.pop()
+export function paneTail(stdout: string, n: number, color = false): string[] {
+  const lines = stdout.split('\n').map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' '))
+  while (lines.length && !lines[lines.length - 1]!.replace(SGR_ONLY_RE, '').trim()) lines.pop()
   return lines.slice(-n)
 }
 
@@ -2109,16 +2168,17 @@ export function exactSessionTarget(session: string): string {
   return `=${session}:`
 }
 
-/** The selected project row's pane. Same cap as the worker mirror; one row at a time. */
-export async function mirrorProject(host: Host, name: string, rows: number): Promise<MirrorCapture> {
+/** The selected project row's pane. Same cap as the worker mirror; one row at a time. `color` as in mirrorOf. */
+export async function mirrorProject(host: Host, name: string, rows: number, color = false): Promise<MirrorCapture> {
   const cwd = host.cwd()
   if (!cwd) return { lines: [], error: 'no session cwd' }
+  // -S reaches into scrollback: without it a short pane caps the mirror at one screen.
   const probe = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', ...(color ? ['-e'] : []), '-S', `-${rows}`, '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
     .catch((err: unknown) => err)
   const error = captureError(probe)
   if (error) return { lines: [], error }
-  return { lines: paneTail((probe as RunResult).stdout, rows) }
+  return { lines: paneTail((probe as RunResult).stdout, rows, color) }
 }
 
 /**
@@ -2754,7 +2814,7 @@ export async function rememberPanel(host: Host, open: boolean): Promise<void> {
   if (!id) return
   const prev = await host.storeGet(PANEL_KEY)
   const others = Array.isArray(prev) ? prev.filter((x): x is string => typeof x === 'string' && x !== id) : []
-  await host.storeSet(PANEL_KEY, open ? [id, ...others].slice(0, 20) : others)
+  await host.storeSet(PANEL_KEY, open ? others : [id, ...others].slice(0, 20))
 }
 
 /** `seq` = the episode this tell opened, also when the send may or may not have arrived. */
@@ -2942,6 +3002,72 @@ export async function peekWorker(host: Host, d: TmuxDispatch, lines: number, res
   return { ok: true, text: untrustedPane(`"${d.name}" on ${d.profile}: ${state}. Last ${n} pane lines:`, body) }
 }
 
+/** `await`'s longest single wait: `$.process.run` stops a call at ten minutes; the rest is margin. */
+export const AWAIT_MAX_SECONDS = 540
+export const AWAIT_DEFAULT_SECONDS = 60
+const AWAIT_SETTLE_POLL_SECONDS = 5
+
+/**
+ * One episode's result for a caller that needs it in its own loop (a workflow
+ * agent: the collector's notice goes to the owner session, never into a script).
+ * A read only: it never acks, so the collector still delivers the notice once,
+ * and a caller that dies loses nothing. Terminal = attributed to this episode
+ * (as `collect`) and settled (`busy` false); else `pending` with a progress
+ * snapshot the script can log.
+ */
+export async function awaitWorker(host: Host, d: TmuxDispatch, seconds: number, latest = true): Promise<Outcome> {
+  const path = d.resultPath
+  if (!path) return { ok: false, text: `"${d.name}" episode ${d.seq ?? 0} has no result path (a resumed worker before its first tell)` }
+  let left = Math.max(0, Math.min(AWAIT_MAX_SECONDS, Math.floor(seconds)))
+  let terminal = false
+  for (;;) {
+    const run = await host
+      .run(
+        ['agent-tmux', d.profile, 'result', 'wait-required', d.name, '--fields', 'status,summary', '--wait', String(left), '--json', '--result-path', path],
+        d.dir,
+        (left + 15) * 1000,
+      )
+      .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+    // 0 terminal, 1 timeout, 3 terminal with a field missing; anything else is a failed read.
+    if (![0, 1, 3].includes(run.exitCode)) {
+      return { ok: false, text: `wait-required for "${d.name}" exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
+    }
+    const got = parseJson(run.stdout) as { body?: { status?: unknown; summary?: unknown; episode?: unknown } } | undefined
+    const status = got?.body?.status
+    terminal = run.exitCode !== 1 && typeof status === 'string' && TERMINAL.has(status) && episodeMatches(got?.body?.episode, d.seq)
+    // Only the latest episode settles: after a tell the pane moves for the next episode (as `collect`).
+    if (terminal && (!latest || (await busy(host, d, path, await host.now(), STALL_PROBE_MS)) !== true)) {
+      const summary = typeof got?.body?.summary === 'string' ? got.body.summary : ''
+      return {
+        ok: true,
+        text:
+          JSON.stringify({ status, episode: d.seq, result: path, delivery_id: deliveryIdOf(d) }) +
+          '\n' +
+          fence(summary, path) +
+          '\nThe collector also notifies the owner session once, under the same delivery_id.',
+      }
+    }
+    if (!terminal || left < AWAIT_SETTLE_POLL_SECONDS) break
+    // shortcut: only the sleeps count against max_seconds (a settled re-read returns at once); count wall time if a re-read ever blocks.
+    const slept = await host.run(['sleep', String(AWAIT_SETTLE_POLL_SECONDS)], d.dir, (AWAIT_SETTLE_POLL_SECONDS + 5) * 1000).catch(() => undefined)
+    if (slept?.exitCode !== 0) break
+    left -= AWAIT_SETTLE_POLL_SECONDS
+  }
+  const st = await host.run(['agent-tmux', d.profile, 'status', '--json', d.name], d.dir, STALL_PROBE_MS).catch(() => undefined)
+  const row = (st && st.exitCode === 0 ? parseJson(st.stdout) : undefined) as { exists?: unknown; idle_seconds?: unknown; last_capture_lines?: unknown } | undefined
+  const progress = {
+    state: terminal ? 'settling (result written, pane still moving)' : !row ? 'status unavailable' : row.exists === false ? 'pane gone' : 'working',
+    elapsed: elapsed((await host.now()) - d.since),
+    idle_seconds: typeof row?.idle_seconds === 'number' ? row.idle_seconds : undefined,
+  }
+  const lines = Array.isArray(row?.last_capture_lines) ? row.last_capture_lines.filter((l): l is string => typeof l === 'string' && !!l.trim()) : []
+  const tail = lines.slice(-5).join('\n')
+  return {
+    ok: true,
+    text: JSON.stringify({ status: 'pending', episode: d.seq, progress }) + (tail ? `\n${untrustedPane('last pane lines:', tail.replace(CTRL_ALL_RE, ' '))}` : '') + '\nCall await again to keep waiting.',
+  }
+}
+
 /** Pane text is data. The fence is the same one `peekWorker` uses. */
 export function untrustedPane(intro: string, body: string): string {
   return (
@@ -2958,7 +3084,7 @@ export async function peekProject(host: Host, name: string, lines: number): Prom
   const cwd = host.cwd()
   if (!cwd) return { ok: false, text: `no cwd; cannot capture "${name}"` }
   const pane = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', '-S', `-${n}`, '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (pane.exitCode !== 0) {
     return { ok: false, text: `capture for "${name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
@@ -2985,6 +3111,31 @@ export async function pressKeys(host: Host, d: TmuxDispatch, keys: readonly stri
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (run.exitCode !== 0) return { ok: false, text: `send-keys exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
   return { ok: true, text: `pressed ${keys.join(' ')} in ${session}; peek to see what it did` }
+}
+
+/**
+ * Size a detached worker's window like an attached client would: it keeps tmux's
+ * default-size (80x24), so its screen never fills a larger preview. The window's
+ * live size is read each time (another TUI or an attach may have changed it); a
+ * window with an attached client is left to that client. resize-window sets
+ * window-size=manual; `agent-tmux attach` unsets it.
+ */
+export async function fitWorker(host: Host, d: TmuxDispatch, cols: number, rows: number): Promise<Outcome> {
+  const alive = await liveSessions(host, d.dir)
+  const session = [...alive].find(sname => sname.endsWith(`-${d.name}`))
+  if (!session) return { ok: false, text: `no tmux session for "${d.name}" — it is not running` }
+  const target = exactSessionTarget(session)
+  const fail = (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) })
+  const probe = await host
+    .run(['tmux', 'display-message', '-p', '-t', target, '#{window_width} #{window_height} #{session_attached}'], d.dir, LIVE_PROBE_MS)
+    .catch(fail)
+  if (probe.exitCode !== 0) return { ok: false, text: `display-message exited ${probe.exitCode}: ${(probe.stderr || probe.stdout).trim().slice(-300)}` }
+  const [w, h, attached] = probe.stdout.trim().split(' ').map(Number)
+  if (attached) return { ok: true, text: `${session} has an attached client; left at ${w}x${h}` }
+  if (w === cols && h === rows) return { ok: true, text: `${session} is ${cols}x${rows}` }
+  const run = await host.run(['tmux', 'resize-window', '-t', target, '-x', String(cols), '-y', String(rows)], d.dir, LIVE_PROBE_MS).catch(fail)
+  if (run.exitCode !== 0) return { ok: false, text: `resize-window exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
+  return { ok: true, text: `${session} resized to ${cols}x${rows}` }
 }
 
 

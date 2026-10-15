@@ -1,9 +1,10 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for the wrapper-owned terminal envelope + append-only launch
 # ledger (agent-tmux-lifecycle spec). Covers the happy path AND the failure
 # paths the spec calls out: stop with no result, ledger-less state dirs, and
-# dry-run. Style mirrors scripts/test-stats-smoke (assert/mkfake/trap).
+# dry-run. Also the --record/--transcript JSONL producer (#100, #127, #140, #141).
 
 set -euo pipefail
 
@@ -11,13 +12,14 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 
-WORK="$(mktemp -d -t tmux-agent-lifecycle-smoke.XXXXXX)"
+WORK="$(mktemp -d "$TMPDIR/lifecycle.XXXXXX")"  # not -t: here mktemp -t wrote outside TMPDIR (measured 2026-10-11)
 export TMUX_AGENT_DIR="$WORK/state"
 cleanup() {
   local n
   for n in linit lexit; do
     TMUX_AGENT_DIR="$TMUX_AGENT_DIR" "$AGENT" claude stop "$n" >/dev/null 2>&1 || true
   done
+  TMUX_AGENT_DIR="$WORK/rec-state" "$AGENT" codex stop rec >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -61,14 +63,14 @@ mkfake_launch() {
 }
 
 poll_result() {
-  # Wait (up to ~10s) for result.json to carry a terminal_reason (the in-pane
+  # Wait (up to 2 s) for result.json to carry a terminal_reason (the in-pane
   # envelope runs asynchronously after the wrapper returns).
   local name="$1" i rp="$TMUX_AGENT_DIR/$1/result.json"
-  for i in {1..50}; do
+  for i in {1..40}; do
     if [[ -s "$rp" ]] && [[ "$(jq -r '.terminal_reason // ""' "$rp" 2>/dev/null)" != "" ]]; then
       return 0
     fi
-    sleep 0.2
+    sleep 0.05
   done
   return 1
 }
@@ -99,9 +101,36 @@ EOF
 prof_ok="$WORK/ok.conf";   profile_for "$fake_ok" "$prof_ok"
 prof_fail="$WORK/fail.conf"; profile_for "$fake_fail" "$prof_fail"
 
+# --- The --record producer runs beside the ledger cases, with its own state dir
+# (its usage_init must not reach the stats counts below). --record is the alias of
+# --transcript; one real producer covers the event set, send text truncation (#140)
+# and wait events (#141). Asserts are in the --record case at the end.
+fake_ready="$WORK/fake-ready"
+printf '#!/bin/sh\necho ready\nexec sleep 30\n' > "$fake_ready"
+chmod +x "$fake_ready"
+tr="$WORK/rec.jsonl"
+record_producer() {
+  local -x TMUX_AGENT_DIR="$WORK/rec-state"
+  CODEX="$fake_ready" "$AGENT" codex start --exact --record "$tr" --transcript-text-truncate 20 rec "$WORK" >/dev/null
+  "$AGENT" codex wait-literal rec "ready" 2 >/dev/null
+  "$AGENT" codex wait-text --regex rec "rea.*" 2 >/dev/null
+  # The 1 s deadline is the contract; let it run beside the sends.
+  "$AGENT" codex wait-literal rec "MISS-MARKER" 1 >/dev/null 2>&1 &
+  local miss_pid=$!
+  "$AGENT" codex send rec "short" >/dev/null
+  "$AGENT" codex send rec "this is a long prompt past twenty bytes" >/dev/null
+  "$AGENT" codex capture rec 10 >/dev/null
+  wait "$miss_pid" || true
+  "$AGENT" codex stop rec >/dev/null 2>&1 || true
+}
+record_producer &
+rec_pid=$!
+
 echo "case: start writes launch_id to launch-meta + ledger init event"
-"$AGENT" claude --profile "$prof_ok" start --exact linit "$WORK" 'task one' >/dev/null 2>&1 || true
+"$AGENT" claude --profile "$prof_ok" start --exact --task-shape bounded linit "$WORK" 'task one' >/dev/null 2>&1 || true
 lm="$TMUX_AGENT_DIR/linit/launch-meta.json"
+assert "launch-meta schema/cli/exec_mode/task_shape" \
+  "$(jq -c '[.schema_version, .cli, .exec_mode, .task_shape]' "$lm" 2>/dev/null)" '[1,"claude","oneshot","bounded"]'
 assert "launch-meta has launch_id" \
   "$([[ -n "$(jq -r '.launch_id // ""' "$lm" 2>/dev/null)" ]] && echo yes || echo no)" "yes"
 assert "usage_init count is 1" "$(grep -c usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl")" "1"
@@ -265,6 +294,37 @@ echo "case: --usage rejects a relative path"
 code=0
 "$AGENT" claude --profile "$prof_ok" start --exact --usage rel.jsonl lusagerel "$WORK" 'x' >/dev/null 2>&1 || code=$?
 assert "relative --usage exit=2" "$code" "2"
+
+echo "case: --record writes one JSONL transcript (start/send/wait/capture/stop)"
+# The producer ran beside the cases above (record_producer); collect it here.
+wait "$rec_pid" || assert "record producer ran to the end" "failed" "ok"
+assert "events" "$(jq -r .event "$tr" | sort | paste -sd, -)" "capture,send,send,start,stop,wait_literal,wait_literal,wait_text"
+assert "start first, stop last" "$(jq -r .event "$tr" | sed -n '1p;$p' | paste -sd, -)" "start,stop"
+assert "every line schema_version=1" "$(jq -c 'select(.schema_version != 1)' "$tr" | wc -l | tr -d ' ')" "0"
+assert "start tool=codex" "$(head -1 "$tr" | jq -r .tool)" "codex"
+assert "wait_literal matched" "$(jq -c 'select(.event=="wait_literal" and .outcome=="matched") | .needle' "$tr")" '"ready"'
+assert "wait_text matched" "$(jq -c 'select(.event=="wait_text" and .outcome=="matched") | .needle' "$tr")" '"rea.*"'
+assert "wait_literal timeout" "$(jq -c 'select(.event=="wait_literal" and .outcome=="timeout") | .needle' "$tr")" '"MISS-MARKER"'
+assert "short send verbatim" "$(jq -c 'select(.event=="send") | [.text, .text_sha256, .text_bytes]' "$tr" | head -1)" '["short",null,5]'
+long_send="$(jq -c 'select(.event=="send")' "$tr" | tail -1)"
+assert "long send truncated" "$(printf '%s' "$long_send" | jq -r '.text | startswith("[truncated")')" "true"
+assert "long send sha256 hex" "$(printf '%s' "$long_send" | jq -r '.text_sha256 | test("^[a-f0-9]{64}$")')" "true"
+assert "long send bytes>20" "$(printf '%s' "$long_send" | jq -r '.text_bytes > 20')" "true"
+
+echo "case: transcript path rejects"
+printf 'stale\n' > "$WORK/stale.jsonl"
+code=0; CODEX="$fake_ready" "$AGENT" codex start --exact --transcript "$WORK/stale.jsonl" rstale "$WORK" >/dev/null 2>&1 || code=$?
+assert "pre-existing transcript exit=1" "$code" "1"
+mkdir -p "$WORK/noperm"; chmod 555 "$WORK/noperm"
+code=0; CODEX="$fake_ready" "$AGENT" codex start --exact --transcript "$WORK/noperm/t.jsonl" rnoperm "$WORK" >/dev/null 2>&1 || code=$?
+chmod 755 "$WORK/noperm"
+assert "unwritable transcript exit=1" "$code" "1"
+code=0; "$AGENT" codex start --exact --transcript >/dev/null 2>&1 || code=$?
+assert "missing --transcript value exit=2" "$code" "2"
+for bad in notanumber 0; do
+  code=0; "$AGENT" codex start --exact --transcript "$WORK/t-$bad.jsonl" --transcript-text-truncate "$bad" "rt$bad" "$WORK" >/dev/null 2>&1 || code=$?
+  assert "--transcript-text-truncate $bad exit=2" "$code" "2"
+done
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

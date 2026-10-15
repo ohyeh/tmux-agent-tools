@@ -1,126 +1,256 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test for issue #97 result-file convention and `result` subcommand.
-#
-# Verifies that the wrapper:
-#   - exports TMUX_AGENT_NAME and TMUX_AGENT_RESULT into the pane shell
-#   - the conventional <TMUX_AGENT_DIR>/<name>/ directory is created
-#   - `result <name>` plain/--field/--wait/--json work as documented
-#   - missing-file paths exit non-zero in text mode but emit a structured
-#     `present: false` payload in --json mode.
+# Smoke for the result contract: one real producer (#97: TMUX_AGENT_RESULT in the
+# pane, `result` plain/--field/--wait/--json), then no-wait fixtures for path/init/
+# validate/wait-required (Wave 2), the v1 schema validator (#125), `outcome` (the
+# label joins the exact result.json), and the stats JSON over one fixture tree.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+SCHEMA="$REPO_ROOT/schemas/result-status-summary.schema.json"
 
-AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
-CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-
-WORK="$(mktemp -d -t tmux-agent-result-smoke.XXXXXX)"
+WORK="$(mktemp -d "$TMPDIR/result.XXXXXX")"  # not -t: here mktemp -t wrote outside TMPDIR (measured 2026-10-11)
 export TMUX_AGENT_DIR="$WORK/state"
-trap 'rm -rf "$WORK"' EXIT
-
-# Fake CLI that immediately writes a structured result to TMUX_AGENT_RESULT
-# then sleeps so the pane survives long enough to inspect.
-cat > "$WORK/fake-writer.sh" <<'EOF'
-#!/bin/sh
-printf '%s' '{"status":"ok","summary":"hello from fake","errors":[],"artifacts":[]}' > "$TMUX_AGENT_RESULT"
-sleep 30
-EOF
-chmod +x "$WORK/fake-writer.sh"
+cleanup() {
+  "$AGENT" codex stop rp >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+add-zsh-hook zshexit cleanup
 
 PASS=0
 FAIL=0
-
 assert() {
   local label="$1" actual="$2" expected="$3"
   if [[ "$actual" == "$expected" ]]; then
-    echo "  ok   $label"
-    PASS=$((PASS + 1))
+    echo "  ok   $label"; PASS=$((PASS + 1))
   else
-    echo "  FAIL $label" >&2
-    echo "    expected: $expected" >&2
-    echo "    got:      $actual" >&2
+    echo "  FAIL $label expected=$expected got=$actual" >&2
     FAIL=$((FAIL + 1))
   fi
 }
-
-run_result_variants() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix ($wrapper)"
-
-  env "$cli_env=$WORK/fake-writer.sh" "$wrapper" start --exact \
-    "$prefix" "$WORK" >/dev/null
-  # Give the fake CLI a moment to write the result file.
-  sleep 3
-
-  local status_value summary_value json_present json_schema_v json_missing canonical_status
-  status_value="$("$wrapper" result --field .status "$prefix" 2>&1 || true)"
-  assert "$prefix --field .status" "$status_value" "ok"
-
-  summary_value="$("$wrapper" result --field .summary "$prefix" 2>&1 || true)"
-  assert "$prefix --field .summary" "$summary_value" "hello from fake"
-
-  json_present="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .present || true)"
-  assert "$prefix --json present=true" "$json_present" "true"
-
-  json_schema_v="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .schema_version || true)"
-  assert "$prefix --json schema_version=1" "$json_schema_v" "1"
-
-  local valid_flag
-  valid_flag="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
-  assert "$prefix --json valid=true on parseable JSON" "$valid_flag" "true"
-  canonical_status="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .canonical_status || true)"
-  assert "$prefix --json normalizes legacy ok" "$canonical_status" "success"
-
-  # --wait when file already present is essentially a no-op (must run
-  # BEFORE the invalid-JSON test since it overwrites result.json).
-  local wait_value
-  wait_value="$("$wrapper" result --wait 2 --field .status "$prefix" 2>&1 || true)"
-  assert "$prefix --wait existing file" "$wait_value" "ok"
-
-  # invalid JSON case: overwrite result.json with non-JSON bytes. Runs
-  # LAST in this block because it permanently corrupts the file.
-  printf 'this is not valid json' > "$TMUX_AGENT_DIR/$prefix/result.json"
-  local inv_valid inv_body
-  inv_valid="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .valid || true)"
-  inv_body="$("$wrapper" result --json "$prefix" 2>&1 | jq -r .body || true)"
-  assert "$prefix --json valid=false on invalid JSON" "$inv_valid" "false"
-  assert "$prefix --json body=raw-string on invalid JSON" "$inv_body" "this is not valid json"
-
-  "$wrapper" stop "$prefix" >/dev/null 2>&1 || true
-
-  # Missing file behavior: directory removed so the file is gone
-  rm -rf "$TMUX_AGENT_DIR/$prefix"
-
-  local rc=0
-  "$wrapper" result "$prefix" 2>/dev/null || rc=$?
-  assert "$prefix missing file exit=1 (text mode)" "$rc" "1"
-
-  json_missing="$("$wrapper" result --json "$prefix" 2>/dev/null | jq -r .present || true)"
-  assert "$prefix missing file --json present=false" "$json_missing" "false"
-
-  # gemini-code-assist on PR #136: --json missing-file must exit 0 (the
-  # structured payload IS the success). text mode keeps exit=1.
-  rc=0
-  "$wrapper" result --json "$prefix" >/dev/null 2>&1 || rc=$?
-  assert "$prefix missing file --json exit=0" "$rc" "0"
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  ok   $label"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL $label missing=$needle" >&2
+    FAIL=$((FAIL + 1))
+  fi
 }
-
-run_missing_value_reject() {
-  local wrapper="$1" prefix="$2"
-  echo "case: $prefix-missing-value ($wrapper)"
-  local rc=0
-  "$wrapper" result --field 2>/dev/null || rc=$?
-  assert "$prefix-missing-value rejected" "$rc" "2"
-  rc=0
-  "$wrapper" result --wait 2>/dev/null || rc=$?
-  assert "$prefix-wait-missing rejected" "$rc" "2"
+yn() { "$@" && echo yes || echo no; }
+cx() { "$AGENT" codex "$@"; }
+write_result() {
+  mkdir -p "$TMUX_AGENT_DIR/$1"
+  printf '%s\n' "$2" > "$TMUX_AGENT_DIR/$1/result.json"
 }
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
-run_result_variants "$CODEX_TMUX"  "CODEX"  "result-codex"
-run_missing_value_reject "$CODEX_TMUX"  "codex"
+echo "case: real producer writes TMUX_AGENT_RESULT; result reads it"
+cat > "$WORK/fake-writer.sh" <<'EOF'
+#!/bin/sh
+printf '%s' '{"status":"ok","summary":"hello from fake","errors":[],"artifacts":[]}' > "$TMUX_AGENT_RESULT"
+exec sleep 30
+EOF
+chmod +x "$WORK/fake-writer.sh"
+CODEX="$WORK/fake-writer.sh" cx start --exact rp "$WORK" >/dev/null
+rp_file="$TMUX_AGENT_DIR/rp/result.json"
+for _ in {1..40}; do [[ -s "$rp_file" ]] && break; sleep 0.05; done
+assert "--wait existing file" "$(cx result --wait 2 --field .status rp 2>&1 || true)" "ok"
+assert "--field .summary" "$(cx result --field .summary rp 2>&1 || true)" "hello from fake"
+assert "--json present/schema/valid/canonical" \
+  "$(cx result --json rp | jq -c '[.present, .schema_version, .valid, .canonical_status]')" '[true,1,true,"success"]'
+printf 'this is not valid json' > "$rp_file"
+assert "--json invalid JSON keeps raw body" "$(cx result --json rp | jq -c '[.valid, .body]')" '[false,"this is not valid json"]'
+cx stop rp >/dev/null 2>&1 || true
+rm -rf "$TMUX_AGENT_DIR/rp"
+code=0; cx result rp >/dev/null 2>&1 || code=$?
+assert "missing file exit=1 (text mode)" "$code" "1"
+code=0; out="$(cx result --json rp 2>/dev/null)" || code=$?
+assert "missing file --json present=false exit=0" "$(printf '%s' "$out" | jq -r .present) $code" "false 0"
+code=0; cx result --field >/dev/null 2>&1 || code=$?
+assert "--field without value exit=2" "$code" "2"
+code=0; cx result --wait >/dev/null 2>&1 || code=$?
+assert "--wait without value exit=2" "$code" "2"
+
+echo "case: result path / init / validate"
+code=0; out="$(cx result --path c-path-missing 2>&1)" || code=$?
+assert "path missing exit=0" "$code" "0"
+assert "path missing prints expected path" "$out" "$TMUX_AGENT_DIR/c-path-missing/result.json"
+assert "path missing does not create file" "$(yn test -f "$out")" "no"
+init_path="$(cx result init c-init)"
+assert "init writes file" "$(yn test -f "$init_path")" "yes"
+assert "init validates" "$(cx result validate c-init --json | jq -r .valid)" "true"
+code=0; out="$(cx result validate c-missing --json 2>&1)" || code=$?
+assert "validate missing exit=1 present=false" "$code $(printf '%s' "$out" | jq -r .present)" "1 false"
+# name | result body | expected exit | text the output must name ("" = valid)
+validate_table=(
+  c-invalid '{"schema_version":1,"status":"ok"}' 2 summary
+  c-valid '{"schema_version":1,"status":"ok","summary":"done","artifacts":[],"errors":[],"verdict":{"verdict":"ACCEPT_WITH_CHANGES","blockers":[],"marker":"W2"},"decision":{"decision_by":"delegate","delegate_name":"reviewer","authority":"assigned","scope":"result contract","decision":"accept","evidence":[],"limits":[]}}' 0 ""
+  c-bad-verdict '{"schema_version":1,"status":"ok","summary":"done","verdict":{"verdict":"MAYBE","blockers":[],"marker":"W2"}}' 2 "invalid verdict"
+  c-bad-decision '{"schema_version":1,"status":"ok","summary":"done","decision":{"decision_by":"committee","decision":"accept"}}' 2 "invalid decision_by"
+)
+for name body want needle in "${validate_table[@]}"; do
+  write_result "$name" "$body"
+  code=0; out="$(cx result validate "$name" --json 2>&1)" || code=$?
+  assert "validate $name exit=$want" "$code" "$want"
+  if [[ -n "$needle" ]]; then assert_contains "validate $name names $needle" "$out" "$needle"
+  else assert "validate $name valid=true" "$(printf '%s' "$out" | jq -r .valid)" "true"; fi
+done
+
+echo "case: wait-required (timeouts use --wait 0: the payload is the contract, not the clock)"
+wr() { cx result wait-required "$1" --fields "${2:-status,summary}" --wait "${3:-0}" --json "${@:4}" 2>&1; }
+code=0; out="$(wr w-missing)" || code=$?
+assert "missing exit=1 timeout" "$code $(printf '%s' "$out" | jq -r .timeout)" "1 true"
+write_result w-incomplete '{"schema_version":1,"status":"ok","summary":"","artifacts":[],"errors":[]}'
+code=0; out="$(wr w-incomplete)" || code=$?
+assert "incomplete exit=1 timeout missing summary" "$code $(printf '%s' "$out" | jq -c '[.timeout, .missing_fields]')" '1 [true,["summary"]]'
+write_result w-malformed '{"status":'
+code=0; out="$(wr w-malformed)" || code=$?
+assert "malformed exit=1 payload" "$code $(printf '%s' "$out" | jq -c '[.present, .timeout, .missing_fields]')" '1 [true,true,["status","summary"]]'
+write_result w-complete '{"schema_version":1,"status":"ok","summary":"done","artifacts":[{"kind":"file","ref":"x"}],"errors":[]}'
+code=0; out="$(wr w-complete status,summary 2)" || code=$?
+assert "complete exit=0 present" "$code $(printf '%s' "$out" | jq -r .present)" "0 true"
+# --result-path: an episode's own file (a tell writes episodes/<seq>/result.json), not the worker's.
+write_result w-episode '{"schema_version":1,"status":"pending","summary":"","artifacts":[],"errors":[]}'
+ep="$TMUX_AGENT_DIR/w-episode/episodes/2/result.json"
+mkdir -p "${ep:h}"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"ep2","artifacts":[],"errors":[]}' > "$ep"
+code=0; out="$(wr w-episode status,summary 1 --result-path "$ep")" || code=$?
+assert "episode result-path exit=0 summary" "$code $(printf '%s' "$out" | jq -r .body.summary)" "0 ep2"
+code=0; wr w-episode status,summary 0 --result-path rel/result.json >/dev/null || code=$?
+assert "relative result-path exit=2" "$code" "2"
+# Real 2026-09-08 failure: the parent waited 40 min for artifact_path after both workers finished.
+code=0; out="$(wr w-complete status,summary,artifact_path 2)" || code=$?
+assert "terminal field mismatch exit=3" "$code" "3"
+assert "terminal mismatch payload" "$(printf '%s' "$out" | jq -c '[.timeout, .valid, .body.summary, .missing_fields]')" '[false,true,"done",["artifact_path"]]'
+write_result w-progress '{"schema_version":1,"status":"pending","summary":"working","artifacts":[],"errors":[]}'
+code=0; wr w-progress >/dev/null || code=$?
+assert "progress summary is not completion" "$code" "1"
+write_result w-blocked '{"schema_version":1,"status":"blocked","summary":"login required","artifacts":[],"errors":[]}'
+code=0; out="$(wr w-blocked status,summary 2)" || code=$?
+assert "blocked returns for parent action" "$code $(printf '%s' "$out" | jq -r .body.status)" "0 blocked"
+
+echo "case: result --validate against the v1 schema (#125)"
+assert "schema defines canonical status enum" "$(jq -c '.definitions.canonicalStatus.enum' "$SCHEMA")" '["success","failed","blocked","needs-input"]'
+schema_case() {  # name body -> sets code/out
+  mkdir -p "$TMUX_AGENT_DIR/$1"
+  printf '%s\n' "$SCHEMA" > "$TMUX_AGENT_DIR/$1/result-schema-path"
+  [[ -n "$2" ]] && printf '%s\n' "$2" > "$TMUX_AGENT_DIR/$1/result.json"
+  code=0; out="$(cx result --validate "$1" 2>&1)" || code=$?
+}
+schema_case s-ok '{"schema_version":1,"status":"ok","summary":"all good"}'
+assert "valid: exit/valid/errors/schema_version" "$code $(printf '%s' "$out" | jq -c '[.valid, (.errors|length), .schema_version]')" '0 [true,0,1]'
+schema_case s-missing '{"schema_version":1,"status":"ok"}'
+assert "missing key exit=2 valid=false" "$code $(printf '%s' "$out" | jq -r .valid)" "2 false"
+assert_contains "missing key named" "$out" "summary"
+schema_case s-extra '{"schema_version":1,"status":"ok","summary":"x","extra":1}'
+assert "extra key exit=2 valid=false" "$code $(printf '%s' "$out" | jq -r .valid)" "2 false"
+assert_contains "extra key named" "$out" "extra"
+schema_case s-bad 'not-json-at-all'
+assert "non-JSON valid=false" "$(printf '%s' "$out" | jq -r .valid)" "false"
+assert_contains "non-JSON parse_error" "$out" "parse_error"
+schema_case s-noresult ''
+assert "no result present=false valid=false" "$(printf '%s' "$out" | jq -c '[.present, .valid]')" '[false,false]'
+sha40="$(printf 'a%.0s' {1..40})"
+schema_case s-commit-ok "{\"schema_version\":1,\"status\":\"success\",\"summary\":\"x\",\"commit\":\"$sha40\"}"
+assert "commit 40-hex exit=0" "$code" "0"
+# jq's `$` matches before a final newline: the LF and CRLF cases are the 41/42-char shas the pattern alone let through.
+for c in '"abc123"' 'null' '{}' '""' "\"${sha40:u}\"" "\"${sha40}\\n\"" "\"${sha40}\\r\\n\"" "\" ${sha40}\"" "\"${sha40} \""; do
+  schema_case s-commit-bad "{\"schema_version\":1,\"status\":\"success\",\"summary\":\"x\",\"commit\":$c}"
+  assert "commit $c rejected at path commit" "$code $(printf '%s' "$out" | jq -c '[.valid, .errors[0].path]')" '2 [false,"commit"]'
+done
+code=0; cx start --exact --result-schema relative.json s-rel "$WORK" >/dev/null 2>&1 || code=$?
+assert "start --result-schema relative exit=2" "$code" "2"
+code=0; cx start --exact --result-schema /no/such/schema.json s-nox "$WORK" >/dev/null 2>&1 || code=$?
+assert "start --result-schema missing file exit=1" "$code" "1"
+
+echo "case: result validate emits canonical_status, hint on unknown, verdict on invalid"
+write_result v-ok '{"schema_version":1,"status":"success","summary":"ok","artifacts":[],"errors":[]}'
+assert "validate canonical success" "$("$AGENT" claude result validate v-ok --json 2>/dev/null | jq -c '[.status_bucket, .canonical_status]')" '["success","success"]'
+write_result v-wobble '{"schema_version":1,"status":"wobble","summary":"s","artifacts":[],"errors":[]}'
+vraw="$("$AGENT" claude result validate v-wobble --json 2>"$WORK/hint.err" || true)"
+assert "unknown status bucket" "$(printf '%s' "$vraw" | jq -r .status_bucket)" "unknown"
+assert_contains "unknown emits hint naming the canonical set" "$(<"$WORK/hint.err")" "not recognized"
+assert_contains "hint names canonical set" "$(<"$WORK/hint.err")" "success|failed|blocked|needs-input"
+# A schema-invalid result still prints the verdict and keeps its non-zero exit.
+write_result v-inv '{"status":"success","summary":"no schema_version"}'
+code=0; vinv="$("$AGENT" claude result validate v-inv --json 2>/dev/null)" || code=$?
+assert "invalid result: verdict + bucket + non-zero exit" "$(printf '%s' "$vinv" | jq -c '[.valid, .status_bucket]') $(( code != 0 ))" '[false,"success"] 1'
+
+echo "case: outcome joins the exact result.json it judged"
+oc() { "$AGENT" claude outcome "$@"; }
+od="$TMUX_AGENT_DIR/o1"
+mkdir -p "$od"
+code=0; oc o1 met >/dev/null 2>&1 || code=$?
+assert "no result.json refused, nothing written" "$(( code != 0 )) $(yn test -e "$od/outcome.json")" "1 no"
+code=0; oc nosuch met >/dev/null 2>&1 || code=$?
+assert "unknown worker refused, no dir" "$(( code != 0 )) $(yn test -d "$TMUX_AGENT_DIR/nosuch")" "1 no"
+code=0; oc ../escape met >/dev/null 2>&1 || code=$?
+assert "path-escaping name exit=2, nothing created" "$code $(yn test -e "$WORK/escape")" "2 no"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"done"}' > "$od/result.json"
+code=0; oc o1 maybe >/dev/null 2>&1 || code=$?
+assert "label outside met|not-met|unknown exit=2" "$code" "2"
+out="$(oc o1 not-met --note "acceptance item 2 missing")"
+assert "prints outcome path" "$out" "$od/outcome.json"
+assert "label fields" "$(jq -c '[.outcome, .status_reported, .profile]' "$out")" '["not-met","success","claude"]'
+assert "joins on result_sha256" "$(jq -r .result_sha256 "$out")" "$(sha "$od/result.json")"
+printf '%s\n' '{"schema_version":1,"status":"success","summary":"second episode"}' > "$od/result.json"
+assert "reset result does not inherit the label" "$([[ "$(jq -r .result_sha256 "$out")" != "$(sha "$od/result.json")" ]] && echo yes)" "yes"
+oc o1 unknown >/dev/null
+assert "unknown stored explicitly" "$(jq -r .outcome "$od/outcome.json")" "unknown"
+pids=()
+for l in met not-met unknown met not-met unknown; do oc o1 "$l" >/dev/null & pids+=($!); done
+oc_bad=0
+for p in "${pids[@]}"; do wait "$p" || oc_bad=$((oc_bad + 1)); done
+assert "6 concurrent labels all succeed" "$oc_bad" "0"
+assert "one complete outcome.json" "$(jq -r '.outcome | test("^(met|not-met|unknown)$")' "$od/outcome.json")" "true"
+assert "no temp files left" "$(find "$od" -name 'outcome.json.tmp.*' -o -name '.result-snapshot.*' | wc -l | tr -d ' ')" "0"
+printf '%s\n' 'not json' > "$od/result.json"
+code=0; oc o1 met >/dev/null 2>&1 || code=$?
+assert "invalid result.json refused, no snapshot" "$(( code != 0 )) $(find "$od" -name '.result-snapshot.*' | wc -l | tr -d ' ')" "1 0"
+
+echo "case: stats --json over one fixture tree"
+SD="$WORK/stats"
+mkw() {  # name started_at [launch-meta] [result status]
+  mkdir -p "$SD/$1"
+  printf '%s' "$2" > "$SD/$1/started_at"
+  [[ -n "${3:-}" ]] && printf '%s' "$3" > "$SD/$1/launch-meta.json"
+  [[ -n "${4:-}" ]] && jq -n --arg s "$4" '{schema_version:1,status:$s,summary:"s",artifacts:[],errors:[]}' > "$SD/$1/result.json"
+  return 0
+}
+mkw w1 2026-06-01T10:00:00Z '{"schema_version":1,"cli":"claude","exec_mode":"headless","task_shape":"bounded"}' success
+mkw w2 2026-06-15T10:00:00Z '{"schema_version":1,"cli":"codex","exec_mode":"oneshot"}' SHOULD_FIX
+mkw w3 2026-07-02T10:00:00Z  # no launch-meta, no result
+# self-test names, and lookalikes the CLI-anchored patterns must keep
+for n in wc-claude codex-smoke wc-fake probe-smoke; do mkw "$n" 2026-07-03T10:00:00Z; done
+legacy=(success ok PASS pass completed complete done APPROVE blocked failed FAIL CONCERN needs-fixes)
+for i in {1..${#legacy}}; do mkw "l$i" 2026-07-18T00:00:00Z '' "${legacy[$i]}"; done
+mkdir -p "$SD/worktrees/junk"; printf x > "$SD/worktrees/junk/note.txt"  # no started_at: ignored
+sjson="$(TMUX_AGENT_DIR="$SD" "$AGENT" claude stats --json)"
+# total 20 = w1-w3 + 4 self-test/lookalike + 13 legacy; with_result 15.
+assert "stats totals" "$(printf '%s' "$sjson" | jq -c '[.total, .by_month["2026-06"], .by_month["2026-07"]]')" '[20,2,18]'
+assert "by_exec_mode" "$(printf '%s' "$sjson" | jq -c '.by_exec_mode | [.headless, .oneshot, .unknown, .tui]')" '[1,1,18,0]'
+assert "by_cli" "$(printf '%s' "$sjson" | jq -c '.by_cli | [.claude, .codex, .unknown]')" '[1,1,18]'
+assert "result_coverage" "$(printf '%s' "$sjson" | jq -c '.result_coverage | [.with_result, .without_result, .pct]')" '[15,5,75]'
+# legacy values fold into canonical buckets: 8 success, 2 failed, 1 blocked, needs-input 2 + SHOULD_FIX
+assert "status_buckets" "$(printf '%s' "$sjson" | jq -c '.status_buckets | [.success, .failed, .blocked, .["needs-input"], .no_result]')" '[9,2,1,3,5]'
+assert "status_raw_top capped at 10, success first" "$(printf '%s' "$sjson" | jq -c '[(.status_raw_top | length), .status_raw_top[0].status, .status_raw_top[0].count]')" '[10,"success",2]'
+assert "task_shape" "$(printf '%s' "$sjson" | jq -c '[.by_task_shape.bounded, .by_task_shape.unspecified, .by_task_shape.series, .task_shape_coverage.with, .task_shape_coverage.without, .task_shape_coverage.pct]')" '[1,19,0,1,19,5]'
+assert "legacy raw files unchanged" "$(jq -r .status "$SD/l3/result.json")" "PASS"
+# --since is inclusive (the 07-03 dirs count); --exclude-selftest drops only the two self-test names.
+fjson="$(TMUX_AGENT_DIR="$SD" "$AGENT" claude stats --json --since 2026-07-03 --exclude-selftest)"
+assert "--since + --exclude-selftest" "$(printf '%s' "$fjson" | jq -c '[.total, .excluded_selftest]')" '[15,2]'
+
+echo "case: start --task-shape validates the enum; start-ssh writes launch metadata (static)"
+code=0; "$AGENT" claude start --dry-run --exact --task-shape bogus ts-w "$WORK" x 2>"$WORK/shape.err" >/dev/null || code=$?
+assert "invalid --task-shape exit=2" "$code" "2"
+assert_contains "invalid --task-shape names the enum" "$(<"$WORK/shape.err")" "bounded|series|review-loop|exploratory"
+ssh_fn="$(awk '/^start_ssh_session\(\)/,/^\}/' "$AGENT")"
+for fn in write_launch_meta record_started_at usage_init_event; do assert_contains "start-ssh calls $fn" "$ssh_fn" "$fn"; done
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

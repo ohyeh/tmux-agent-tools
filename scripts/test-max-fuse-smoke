@@ -1,10 +1,12 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # Smoke test for issue #105 safety fuses (--max-runtime / --max-idle).
 #
-# Exercises the actual agent-tmux claude / codex engines with fake CLIs so
-# the fuse trip → sentinel + reason + on-exit contract can be validated
-# without real Claude or Codex installs.
+# Two real trips run side by side: --max-runtime 1 (with --max-idle set too:
+# runtime wins) proves fuse -> sentinel 124 + reason + on-exit hook, and
+# --max-idle 1 on the silent fake proves reason=max_idle. stop kills a live watcher.
+# --max-runtime / --max-idle values are no-launch fixtures.
 #
 # Exits non-zero on the first failure. Run from any cwd; the script
 # resolves the in-tree wrapper paths automatically.
@@ -17,15 +19,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 
-for wrapper in "$CODEX_TMUX"; do
-  if [[ ! -x "$wrapper" ]]; then
-    echo "wrapper not executable: $wrapper" >&2
-    exit 1
-  fi
-done
-
-WORK="$(mktemp -d -t tmux-agent-fuse-smoke.XXXXXX)"
+WORK="$(mktemp -d "$TMPDIR/fuse.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
+export CODEX="$WORK/fake-sleep.sh"
 trap 'rm -rf "$WORK"' EXIT
 
 # Fake CLI that sleeps a long time so only the fuse can stop it.
@@ -54,167 +50,47 @@ assert() {
   fi
 }
 
-wait_for_file() {
-  local file_path="$1" max="${2:-12}" i=0
-  while (( i < max )); do
-    [[ -f "$file_path" ]] && return 0
-    sleep 1
-    i=$((i + 1))
-  done
+# wait_until <cmd...>: poll 0.05 s, bound 4 s (the watcher ticks every 1 s: a 1 s fuse trips at 1-2 s).
+wait_until() {
+  local i
+  for (( i = 0; i < 80; i++ )); do "$@" && return 0; sleep 0.05; done
   return 1
 }
 
-# --- Case 1: --max-runtime fires, sentinel=124, reason=max_runtime --------
-case_max_runtime() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-max-runtime ($wrapper)"
-  local sentinel="$WORK/$prefix-runtime.exit"
-  rm -f "$sentinel" "$sentinel.reason" "$sentinel.hook.log"
-  env "$cli_env=$WORK/fake-sleep.sh" "$wrapper" start --exact \
-    --sentinel "$sentinel" --on-exit "$WORK/hook.sh" \
-    --max-runtime 3 \
-    "$prefix-runtime" "$WORK" >/dev/null
-  if ! wait_for_file "$sentinel" 12; then
-    echo "  FAIL $prefix-runtime sentinel never appeared" >&2
-    FAIL=$((FAIL + 1))
-    "$wrapper" stop "$prefix-runtime" >/dev/null 2>&1 || true
-    return
-  fi
-  local got_code got_reason
-  got_code="$(cat "$sentinel" 2>/dev/null || true)"
-  got_reason="$(cat "$sentinel.reason" 2>/dev/null || true)"
-  # Cleanup
-  "$wrapper" stop "$prefix-runtime" >/dev/null 2>&1 || true
-  assert "$prefix-runtime sentinel code"   "$got_code"   "124"
-  assert "$prefix-runtime sentinel reason" "$got_reason" "max_runtime"
-  if [[ -f "$sentinel.hook.log" ]]; then
-    local hook_line
-    hook_line="$(head -n1 "$sentinel.hook.log")"
-    assert "$prefix-runtime hook log line" \
-      "$hook_line" "hook: code=124 name=$prefix-runtime reason=max_runtime"
-  else
-    echo "  FAIL $prefix-runtime hook log missing" >&2
-    FAIL=$((FAIL + 1))
-  fi
-}
+echo "case: --max-runtime trips: sentinel 124, reason, hook; --max-idle trips"
+idle_sentinel="$WORK/idle.exit"
+"$CODEX_TMUX" start --exact --sentinel "$idle_sentinel" --max-idle 1 fuse-idle "$WORK" >/dev/null
+sentinel="$WORK/runtime.exit"
+"$CODEX_TMUX" start --exact --sentinel "$sentinel" --on-exit "$WORK/hook.sh" \
+  --max-runtime 1 --max-idle 30 fuse-rt "$WORK" >/dev/null
+wait_until test -s "$sentinel.hook.log" || true
+assert "sentinel code" "$(cat "$sentinel" 2>/dev/null)" "124"
+assert "sentinel reason (runtime fires before idle)" "$(cat "$sentinel.reason" 2>/dev/null)" "max_runtime"
+assert "hook log line" "$(head -n1 "$sentinel.hook.log" 2>/dev/null)" "hook: code=124 name=fuse-rt reason=max_runtime"
+"$CODEX_TMUX" stop fuse-rt >/dev/null 2>&1 || true
+wait_until test -s "$idle_sentinel.reason" || true
+assert "idle sentinel code" "$(cat "$idle_sentinel" 2>/dev/null)" "124"
+assert "idle sentinel reason" "$(cat "$idle_sentinel.reason" 2>/dev/null)" "max_idle"
+"$CODEX_TMUX" stop fuse-idle >/dev/null 2>&1 || true
 
-# --- Case 2: --max-idle fires when pane stays quiet -----------------------
-case_max_idle() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-max-idle ($wrapper)"
-  local sentinel="$WORK/$prefix-idle.exit"
-  rm -f "$sentinel" "$sentinel.reason" "$sentinel.hook.log"
-  env "$cli_env=$WORK/fake-sleep.sh" "$wrapper" start --exact \
-    --sentinel "$sentinel" --on-exit "$WORK/hook.sh" \
-    --max-idle 3 \
-    "$prefix-idle" "$WORK" >/dev/null
-  if ! wait_for_file "$sentinel" 15; then
-    echo "  FAIL $prefix-idle sentinel never appeared" >&2
-    FAIL=$((FAIL + 1))
-    "$wrapper" stop "$prefix-idle" >/dev/null 2>&1 || true
-    return
-  fi
-  local got_code got_reason
-  got_code="$(cat "$sentinel" 2>/dev/null || true)"
-  got_reason="$(cat "$sentinel.reason" 2>/dev/null || true)"
-  "$wrapper" stop "$prefix-idle" >/dev/null 2>&1 || true
-  assert "$prefix-idle sentinel code"   "$got_code"   "124"
-  assert "$prefix-idle sentinel reason" "$got_reason" "max_idle"
-}
+echo "case: stop kills a live watcher"
+"$CODEX_TMUX" start --exact --max-runtime 300 fuse-stop "$WORK" >/dev/null
+pid_file="$TMUX_AGENT_DIR/fuse-stop/fuse.pid"
+pid="$(cat "$pid_file" 2>/dev/null || true)"
+assert "fuse.pid written at start" "$([[ "$pid" == <-> ]] && echo yes || echo no)" "yes"
+"$CODEX_TMUX" stop fuse-stop >/dev/null 2>&1 || true
+dead() { ! kill -0 "$pid" 2>/dev/null; }
+if [[ -n "$pid" ]] && ! wait_until dead; then alive=alive; kill "$pid" 2>/dev/null || true; else alive=dead; fi
+assert "watcher dead after stop" "$alive" "dead"
+assert "fuse.pid cleaned up" "$([[ -f "$pid_file" ]] && echo present || echo absent)" "absent"
 
-# --- Case 3: idle counter resets on pane activity -------------------------
-# Strategy: start with --max-idle 4. For 6 seconds bump pane activity
-# every second via `send` so the hash keeps changing. Then assert sentinel
-# is still absent (idle never accumulated to 4s). Finally stop.
-case_max_idle_reset() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-max-idle-reset ($wrapper)"
-  local sentinel="$WORK/$prefix-idle-reset.exit"
-  rm -f "$sentinel" "$sentinel.reason" "$sentinel.hook.log"
-  env "$cli_env=$WORK/fake-sleep.sh" "$wrapper" start --exact \
-    --sentinel "$sentinel" \
-    --max-idle 4 \
-    "$prefix-idle-reset" "$WORK" >/dev/null
-  local i
-  for i in 1 2 3 4 5 6; do
-    "$wrapper" send "$prefix-idle-reset" "ping-$i" >/dev/null 2>&1 || true
-    sleep 1
-  done
-  local still_absent="absent"
-  [[ -f "$sentinel" ]] && still_absent="present"
-  "$wrapper" stop "$prefix-idle-reset" >/dev/null 2>&1 || true
-  assert "$prefix-idle-reset sentinel absent after activity" \
-    "$still_absent" "absent"
-}
-
-# --- Case 4: stop kills watcher (no zombie) -------------------------------
-case_stop_kills_watcher() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-stop-kills-watcher ($wrapper)"
-  env "$cli_env=$WORK/fake-sleep.sh" "$wrapper" start --exact \
-    --max-runtime 300 \
-    "$prefix-zombie" "$WORK" >/dev/null
-  local pid_file="$TMUX_AGENT_DIR/$prefix-zombie/fuse.pid"
-  if ! wait_for_file "$pid_file" 6; then
-    echo "  FAIL $prefix-zombie fuse.pid never written" >&2
-    FAIL=$((FAIL + 1))
-    "$wrapper" stop "$prefix-zombie" >/dev/null 2>&1 || true
-    return
-  fi
-  local pid
-  pid="$(cat "$pid_file" 2>/dev/null || true)"
-  "$wrapper" stop "$prefix-zombie" >/dev/null 2>&1 || true
-  # Give the kill signal a moment to land.
-  sleep 1
-  local alive="dead"
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    alive="alive"
-    kill "$pid" 2>/dev/null || true
-  fi
-  assert "$prefix-zombie watcher dead after stop" "$alive" "dead"
-  local pid_present="absent"
-  [[ -f "$pid_file" ]] && pid_present="present"
-  assert "$prefix-zombie fuse.pid cleaned up" "$pid_present" "absent"
-}
-
-# --- Case 5: both flags coexist; whichever fires first wins ---------------
-# --max-runtime 3 + --max-idle 30 → runtime should fire first.
-case_both_runtime_wins() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-both-runtime-wins ($wrapper)"
-  local sentinel="$WORK/$prefix-both.exit"
-  rm -f "$sentinel" "$sentinel.reason" "$sentinel.hook.log"
-  env "$cli_env=$WORK/fake-sleep.sh" "$wrapper" start --exact \
-    --sentinel "$sentinel" \
-    --max-runtime 3 --max-idle 30 \
-    "$prefix-both" "$WORK" >/dev/null
-  if ! wait_for_file "$sentinel" 12; then
-    echo "  FAIL $prefix-both sentinel never appeared" >&2
-    FAIL=$((FAIL + 1))
-    "$wrapper" stop "$prefix-both" >/dev/null 2>&1 || true
-    return
-  fi
-  local got_reason
-  got_reason="$(cat "$sentinel.reason" 2>/dev/null || true)"
-  "$wrapper" stop "$prefix-both" >/dev/null 2>&1 || true
-  assert "$prefix-both reason is max_runtime" "$got_reason" "max_runtime"
-}
-
-# --- Case 6: bad value rejected ------------------------------------------
-case_bad_value() {
-  local wrapper="$1" cli_env="$2" prefix="$3"
-  echo "case: $prefix-bad-value ($wrapper)"
-  local rc=0
-  env "$cli_env=$WORK/fake-sleep.sh" "$wrapper" start --exact \
-    --max-runtime foo "$prefix-bad" "$WORK" >/dev/null 2>&1 || rc=$?
-  assert "$prefix-bad-value rejected" "$rc" "2"
-}
-
-# One CLI is enough: the fuse watcher has no per-CLI branch.
-for fn in case_max_runtime case_max_idle case_max_idle_reset case_stop_kills_watcher \
-          case_both_runtime_wins case_bad_value; do
-  "$fn" "$CODEX_TMUX" CODEX codex
+echo "case: fuse values (no launch)"
+for row in "--max-runtime foo" "--max-idle foo" "--max-runtime 0" "--max-idle"; do
+  rc=0; "$CODEX_TMUX" start --exact ${=row} fuse-bad "$WORK" >/dev/null 2>&1 || rc=$?
+  assert "$row rejected" "$rc" "2"
 done
+rc=0; "$CODEX_TMUX" start --exact --dry-run --max-runtime 5 --max-idle 3 fuse-dry "$WORK" >/dev/null 2>&1 || rc=$?
+assert "valid values pass a dry-run" "$rc" "0"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

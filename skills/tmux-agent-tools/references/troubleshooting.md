@@ -169,7 +169,7 @@ This was a real bug — fixed in `v0.11.0`. If you still see it, you're on `v0.1
 - `status` → `check_status` / `task_status`
 - `lines` → `out_lines` / `pane_lines`
 
-CI lint at `scripts/lint-no-path-tied-locals` enforces this. If your lint passes but `$PATH` still breaks, you may have hit the multi-name `local` form (`local path agent foo`). [Issue #196](https://github.com/ohyeh/tmux-agent-tools/issues/196) tracks widening the lint.
+`scripts/lint-no-path-tied-locals` (run by `scripts/run-all-smokes`) enforces this. If your lint passes but `$PATH` still breaks, you may have hit the multi-name `local` form (`local path agent foo`). [Issue #196](https://github.com/ohyeh/tmux-agent-tools/issues/196) tracks widening the lint.
 
 ## doctor says everything is fine but the wrapper still misbehaves
 

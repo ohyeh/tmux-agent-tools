@@ -40,13 +40,6 @@ tmux-agent-fanout run \
   --summary-out /tmp/fanout-demo/summary.json
 ```
 
-Legacy form (single tool, list of workdirs) still works:
-
-```bash
-tmux-agent-fanout --prompt-file ./prompt.txt \
-  --workdir ~/a --workdir ~/b --tool claude
-```
-
 Merge modes: `all` (default — `ok=true` iff every agent ok) or
 `first-success` (any agent ok; others continue running and are still
 recorded — they are NOT killed). Majority/custom modes are explicitly
@@ -486,7 +479,7 @@ While blocked, `$TMUX_AGENT_DIR/<name>/approval-status.json` records
 On resolution, the same file is rewritten with the final decision. When
 a transcript or `TMUX_AGENT_TOOLS_AUDIT_LOG` is configured, the wrapper
 emits a `kind: "approval"` transcript event and an `approval.<decision>`
-audit event respectively. See `docs/design-issue-185-approval-gate.md`.
+audit event respectively.
 
 ### Result-file convention (`result` subcommand)
 
@@ -612,7 +605,7 @@ curl -sS -H 'Content-Type: application/json' \
   "$TMUX_AGENT_RELAY_URL/v1/message"
 ```
 
-Interactive sessions keep mouse support on by default. Copy-mode `y`, `Enter`, and mouse drag release use the first available system clipboard command (`pbcopy`, `wl-copy`, `xclip`, or `xsel`); when none exists, they fall back to tmux's internal selection so keyboard copy does not fail just because a platform clipboard helper is missing. Set `CLAUDE_TMUX_CLIPBOARD=internal` or `CODEX_TMUX_CLIPBOARD=internal` to force tmux internal selection, or set either variable to a custom copy command when a terminal needs a specific clipboard bridge.
+Interactive sessions keep mouse support and vi copy-mode keys on by default; agent-tmux sets them on the worker session only. The generated tmux config (status line, clipboard bindings, server options) loads only into a server that agent-tmux starts on `TMUX_AGENT_TMUX_SOCKET`; it never changes the global options of your default server. On that server, copy-mode `y`, `Enter`, and mouse drag release use the first available system clipboard command (`pbcopy`, `wl-copy`, `xclip`, or `xsel`); when none exists, they fall back to tmux's internal selection so keyboard copy does not fail just because a platform clipboard helper is missing. Set `CLAUDE_TMUX_CLIPBOARD=internal` or `CODEX_TMUX_CLIPBOARD=internal` to force tmux internal selection, or set either variable to a custom copy command when a terminal needs a specific clipboard bridge.
 
 `status --json` is a stable machine-readable contract for both wrappers. It is built with `jq` and uses the same fields for Claude and Codex:
 
@@ -808,7 +801,7 @@ Audit logging is enabled by default at
 Size-based rotation triggers at `TMUX_AGENT_TOOLS_AUDIT_MAX_BYTES` (default
 10MB), retaining `TMUX_AGENT_TOOLS_AUDIT_RETAIN` files (default 5). A
 `audit.rotation` HEAD-link record preserves the chain across rotations.
-Schema documented in `docs/design-issue-188-audit-surface.md`.
+Schema: `skills/tmux-agent-tools/scripts/tmux-agent-audit`.
 
 ## Privacy and Data Handling
 
@@ -824,10 +817,9 @@ no telemetry; nothing is sent to the plugin author or to Anthropic.
   name (a file, an env file, 1Password `op read`, or the macOS Keychain), put
   it in that worker's tmux environment, and redact it from captures and logs.
   The value never leaves your machine.
-- **Outbound traffic:** only when you ask for it. `tmux-agent-notify` posts a
-  JSON summary (worker name, exit code, the context flags you pass) to a
-  webhook URL you supply, such as Slack; an `--on-exit`/`--on-start` hook runs
-  the command you give it. Without those, the tools make no network calls.
+- **Outbound traffic:** only when you ask for it. An `--on-exit`/`--on-start`
+  hook runs the command you give it. Without those, the tools make no network
+  calls.
 - **Retention:** local files stay until you remove them; the audit log rotates
   (see above).
 

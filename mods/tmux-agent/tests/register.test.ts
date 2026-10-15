@@ -370,8 +370,10 @@ function mockStore(
   seedKey = 'tmux-agent.reported',
   /** More keys to seed, e.g. another session's. */
   more: Record<string, string[]> = {},
-): { acked: () => string[]; key: (k: string) => string[]; keys: () => string[] } {
-  const kv = new Map<string, unknown>(Object.entries(more))
+): { acked: () => string[]; key: (k: string) => string[]; raw: (k: string) => unknown; keys: () => string[] } {
+  // As before 0.46.13: the panel opens on /workers and unfolded. The start-open, folded default has its own test (it passes
+  // `more` with these keys unset).
+  const kv = new Map<string, unknown>([['tmux-agent.panel-hidden', ['sess-test', 'real-sess', 'sess-A', 'sess-B']], ['tmux-agent.fold', 'open'], ...Object.entries(more)])
   if (seed.length) kv.set(seedKey, seed)
   seededAcks.splice(0, seededAcks.length, ...seed)
   on('store.get', ($, e) => ({ value: kv.get(e.key) }))
@@ -389,6 +391,7 @@ function mockStore(
     /** Every notice recorded (see `ackedIn`): acks are create-once dirs on disk now, not store keys (§5). */
     acked: () => ackedIn(fsNow),
     key: k => ids(kv.get(k)),
+    raw: k => kv.get(k),
     keys: () => [...kv.keys()].filter(k => k.startsWith('tmux-agent.reported')).sort(),
   }
 }
@@ -528,7 +531,8 @@ describe('ownership', () => {
 
     await $.session.start(session())
     await $.command.run(run('workers'))
-    const folded = textOf(await $.ui.render(bandRender()))
+    // At 100 columns: at 80 a [ ✕ clear ] and [ ▾ ] leave no room, and the session id gives way before the version.
+    const folded = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(folded, 'the title names this session').toContain('@sess-A · tmux')
     expect(folded, 'ours is listed, untagged').toMatch(/mine(?!  @)/)
     expect(folded, 'theirs by holder, one line; no heartbeat file = @unknown').toContain('展開 · 其他 session 運行中 0/共 2：@sess-B 1 · @unknown 1')
@@ -914,6 +918,85 @@ describe('delivery', () => {
     expect(store.acked()).toEqual(['w1#1'])
   })
 
+  // 2026-10-11: a codex worker wrote result.json, it was delivered, and the same turn rewrote it 47 s later.
+  const settleRun = (on: On, idle: () => number) =>
+    onRun(on, ($, e) => ({
+      value: { exitCode: 0, stdout: e.argv[2] === 'status' ? JSON.stringify({ exists: true, running: true, idle_seconds: idle() }) : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+
+  test('a result written while the worker is still busy waits for a quiet pane, then is delivered once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mockClock(on, { now: 1_000 })
+    const files: Files = { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished('draft') }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    let idle = 3
+    settleRun(on, () => idle)
+
+    await $.turn.complete(turn())
+    expect(woken.length, 'the pane still moves: the result is held').toEqual(0)
+    files[`${V3}/w1/result.json`] = finished('final')
+    idle = 25
+    await $.turn.complete(turn())
+
+    expect(woken.length).toEqual(1)
+    expect(woken[0]).toContain('final')
+    expect(woken[0]).not.toContain('draft')
+    expect(store.acked()).toEqual(['w1#1'])
+  })
+
+  test('a result unchanged for SETTLE_CAP_MS is delivered even while the pane keeps moving', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on, { now: 1_000 })
+    mockFs(on, { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished() })
+    const woken = mockWake(on)
+    settleRun(on, () => 1)
+
+    await $.turn.complete(turn())
+    expect(woken.length).toEqual(0)
+    await clock.advance(10 * 60_000)
+    await $.turn.complete(turn())
+
+    expect(woken.length).toEqual(1)
+  })
+
+  test('a result is not held by a pane that moves for the next episode (a tell went out first)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mockClock(on, { now: 1_000 })
+    mockFs(on, { ...worker('w1', 0), ...episode('w1', 2, 500), [`${V3}/w1/result.json`]: finished('first', 1) })
+    const woken = mockWake(on)
+    settleRun(on, () => 1)
+
+    await $.turn.complete(turn())
+
+    expect(woken.length).toEqual(1)
+    expect(woken[0]).toContain('first')
+    expect(store.acked()).toEqual(['w1#1'])
+  })
+
+  test('a closed episode\'s result rewritten after delivery is named as that episode, with its own notice id', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on, { now: 1_000 })
+    mockFs(on, {
+      ...worker('w1', 0),
+      ...acked('w1', 1),
+      ...episode('w1', 2, 500),
+      [`${V3}/w1/result.json`]: finished('revised verdict', 1),
+    })
+    const woken = mockWake(on)
+    settleRun(on, () => 60)
+
+    await $.turn.complete(turn())
+
+    expect(woken.length).toEqual(1)
+    expect(woken[0]).toContain("episode 1's result changed after it was delivered")
+    expect(woken[0]).toMatch(/delivery_id: \/w1\/2\/unattributed-[0-9a-f]{16}-\d+ /)
+  })
+
   /**
    * A worker's repo: object id → type, and the commits that descend from BASE.
    * Records every git argv.
@@ -926,6 +1009,8 @@ describe('delivery', () => {
   ) => {
     const calls: (readonly string[])[] = []
     onRun(on, async ($, e) => {
+      // The settle check's status probe: a quiet pane, not a git call.
+      if (e.argv[2] === 'status') return { value: { exitCode: 0, stdout: '{"exists":true,"idle_seconds":60}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       calls.push(e.argv)
       await onCall()
       const [, , , verb, a, b, c] = e.argv
@@ -1641,6 +1726,51 @@ describe('stall detection', () => {
     expect(logs.length, 'an idle notice is given once, not every tick').toEqual(1)
   })
 
+  // W42-22: the whole chain in one run — dispatch, the owner's heartbeat lost, a new
+  // collector, a long quiet run, a real stall, then a late end event.
+  test('an owner that died mid-run: the new collector adopts, keeps a quiet run alive, flags the stall once, delivers the late result once', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    setSessionId(on, 'sess-B')
+    // sess-A dispatched "long" and then stopped heartbeating (no beat file).
+    const files: Files = { ...worker('long', 0, { owner: 'sess-A', ownerCwd: '/work' }) }
+    mockFs(on, files)
+    const woken = mockWake(on)
+    mockSessionStart(on)
+    on('ui.status', () => ({ value: undefined }))
+    const status: Record<string, unknown> = {
+      running: true,
+      idle_seconds: 30 * 60,
+      last_capture_lines: ['Running cargo build', '  Compiling foo v0.1'],
+    }
+    mockStatus(on, status)
+
+    await $.session.start(session())
+    expect(ownerIn(files, 'long'), 'the restarted collector takes over the same episode').toEqual({ owner: 'sess-B', gen: 1 })
+
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(woken, 'a long quiet run is not a failure and wakes nobody').toEqual([])
+    expect(closedIn(files), 'nothing is closed while it runs').toEqual([])
+
+    Object.assign(status, { idle_seconds: 3 * 60, blocked_reason: 'quota_exhausted', blocked_evidence: 'usage limit reached' })
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(woken.length, 'a real stall wakes the new owner once').toEqual(1)
+    expect(woken[0]).toContain('"long" on codex: stalled')
+    expect((await $.command.run(run('stalled'))).text).toEqual('long:180')
+
+    files[`${V3}/long/result.json`] = finished('late but done')
+    await $.turn.complete(turn())
+    await $.turn.complete(turn())
+    expect(woken.length, 'the late end event is delivered once').toEqual(2)
+    expect(woken[1]).toContain('late but done')
+    expect(woken[1], 'identity survives the restart').toContain('adopted from session sess-A')
+    expect(closedIn(files)).toEqual(['long#1'])
+    expect((await $.command.run(run('stalled'))).text).toEqual('')
+  })
+
   test('a worker the CLI stopped on a usage limit is stalled and wakes the session once', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
@@ -2048,7 +2178,7 @@ function headerBarCells(node: unknown): number | undefined {
   const visit = (current: unknown) => {
     const kids = nodeKids(current)
     const hide = kids.some(k => field(k, 'key') === 'close')
-    const titled = kids.some(k => nodeKids(k).some(c => typeof c === 'string' && c.includes('內部')))
+    const titled = kids.some(k => nodeKids(k).some(c => typeof c === 'string' && c.includes('workers v')))
     if (hide && titled) found = kids
     for (const kid of kids) visit(kid)
   }
@@ -2938,9 +3068,9 @@ describe('teammates', () => {
 
     for (const columns of [80, 60]) {
       const tree = await $.ui.render(bandRender(40, 39, columns))
-      expect(textOf(tree)).toContain('tmux 0 · 內部 0')
-      // The full title + buttons is 69 cells: at 60 the name and version go, the counts stay.
-      expect(textOf(tree).includes('workers v'), `${columns} columns`).toBe(columns === 80)
+      // The name and version always stay (mods/README.md rule 11); the session id, then the counts, give way.
+      expect(textOf(tree), `${columns} columns`).toContain('workers v')
+      expect(textOf(tree).includes('tmux 0 · 內部 0'), `${columns} columns`).toBe(columns === 80)
       expect(headerBarCells(tree), `${columns} columns`).toBe(columns)
       expect(keysOf(tree)).toContain('close')
     }
@@ -2984,6 +3114,105 @@ describe('teammates', () => {
     expect(out, 'a pane cannot close the fence around itself').toContain('&lt;worker-pane> spoof')
     expect(captures(panel.argv).map(a => a.join(' '))).toEqual([`${WRAPPER} codex capture --strip-ansi --tail 3 w1`])
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__peek' as const, name: 'ghost' }))).toContain('no worker')
+  })
+
+  /** wait-required answers `body` (exit `code`); status answers a quiet pane. Records every argv. */
+  const awaitRun = (on: On, body: unknown, code = 0, idles = [60]) => {
+    const argv: string[][] = []
+    let probes = 0
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('command.run', () => ({ text: '' }))
+    on('tool.register', ($, e) => ({ value: { tool: e.name } }))
+    on('agent.register', ($, e) => ({ value: { agent: `tmux-agent:${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('ui.status', () => ({ value: undefined }))
+    on('ui.log', () => ({ value: undefined }))
+    on('ui.toast', () => ({ value: undefined }))
+    on('ui.invalidate', () => ({ value: undefined }))
+    on('turn.complete', () => ({ text: '' }))
+    onRun(on, ($, e) => {
+      argv.push([...e.argv])
+      const idle = e.argv[2] === 'status' ? idles[Math.min(probes++, idles.length - 1)] : 60
+      const out = e.argv[3] === 'wait-required' ? JSON.stringify(body) : JSON.stringify({ exists: true, running: true, idle_seconds: idle, last_capture_lines: ['line a', 'working…'] })
+      return { value: { exitCode: e.argv[3] === 'wait-required' ? code : 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    return argv
+  }
+
+  test('await returns an attributed, settled result in the calling loop and acks nothing', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    mockClock(on, { now: 1_000 })
+    mockFs(on, { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished('verdict') })
+    const argv = awaitRun(on, { body: { status: 'success', summary: 'verdict', episode: 1 } })
+
+    await $.session.start(session())
+    const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__await' as const, name: 'w1', max_seconds: 5 }))
+
+    expect(out).toContain('\\"status\\":\\"success\\"')
+    expect(out).toContain('verdict')
+    expect(out).toContain('/w1/1')
+    const wait = argv.find(a => a[3] === 'wait-required')!
+    expect(wait.slice(-2)).toEqual(['--result-path', `${V3}/w1/result.json`])
+    expect(wait[wait.indexOf('--wait') + 1]).toEqual('5')
+    expect(store.acked(), 'a read: the collector still delivers once').toEqual([])
+  })
+
+  test('await reads the asked episode\'s own path, and a result naming another episode is pending', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on, { now: 1_000 })
+    mockFs(on, { ...worker('w1', 0), ...acked('w1', 1), ...episode('w1', 2, 500) })
+    const argv = awaitRun(on, { body: { status: 'success', summary: 'old', episode: 1 } })
+
+    await $.session.start(session())
+    const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__await' as const, name: 'w1', seq: 2, max_seconds: 999 }))
+
+    expect(out).toContain('\\"status\\":\\"pending\\"')
+    expect(out).toContain('working…')
+    const wait = argv.find(a => a[3] === 'wait-required')!
+    expect(wait.slice(-2)).toEqual(['--result-path', `${V3}/w1/episodes/2/result.json`])
+    expect(wait[wait.indexOf('--wait') + 1], 'capped').toEqual('540')
+  })
+
+  test('await keeps waiting while the result settles, then returns it', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on, { now: 1_000 })
+    mockFs(on, { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished('final') })
+    const argv = awaitRun(on, { body: { status: 'success', summary: 'final', episode: 1 } }, 0, [1, 1, 60])
+
+    await $.session.start(session())
+    const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__await' as const, name: 'w1', max_seconds: 60 }))
+
+    expect(out).toContain('\\"status\\":\\"success\\"')
+    expect(argv.filter(a => a[0] === 'sleep').length, 'waited at least one settle poll').toBeGreaterThan(0)
+  })
+
+  test('await does not hold an earlier episode for the next episode\'s pane activity', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on, { now: 1_000 })
+    mockFs(on, { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished('ep1'), ...episode('w1', 2, 500) })
+    const argv = awaitRun(on, { body: { status: 'success', summary: 'ep1', episode: 1 } }, 0, [1])
+
+    await $.session.start(session())
+    const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__await' as const, name: 'w1', seq: 1, max_seconds: 60 }))
+
+    expect(out).toContain('\\"status\\":\\"success\\"')
+    expect(argv.some(a => a[0] === 'sleep')).toBe(false)
+  })
+
+  test('await refuses an unknown worker and a missing episode', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    awaitRun(on, {})
+
+    await $.session.start(session())
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__await' as const, name: 'nope' }))).toContain('no worker')
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__await' as const, name: 'w1', seq: 3 }))).toContain('has no episode 3')
   })
 
   test('peek calls a worker with a terminal result finished, whatever the wrapper says about its pane', WITH_DRIVER, async ($, on) => {
@@ -3364,6 +3593,7 @@ test('re-review: a commit whose ancestry did not fit stays outstanding',WITH_DRI
   }
   mockFs(on,files);const wake=mockWake(on);let count=0;
   onRun(on, async ($,e)=>{
+    if (e.argv[2] === 'status') return { value: { exitCode: 0, stdout: '{"exists":true,"idle_seconds":60}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } // settle probe: quiet, instant
     count++;
     await clock.advance(Math.min(1500,e.init?.timeoutMs??1500));
     return {value:{exitCode:0,stdout:e.argv.includes('cat-file')?'commit\n':'',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
@@ -3473,6 +3703,7 @@ describe('astra re-review of 3b83a9e',()=>{
     });
     const wake=mockWake(on),windows:number[]=[];
     onRun(on, async($,e)=>{
+      if (e.argv[2] === 'status') return { value: { exitCode: 0, stdout: '{"exists":true,"idle_seconds":60}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } // settle probe: quiet, instant
       if(e.argv.includes('cat-file')){
         await clock.advance(1900);
         return {value:{exitCode:0,stdout:'commit\n',stderr:'', isStdoutTruncated: false, isStderrTruncated: false }};
@@ -3524,6 +3755,7 @@ test('re-review: a pass that ran out of budget resumes at the claim it deferred,
   mockFs(on, files)
   mockWake(on)
   onRun(on, async ($, e) => {
+    if (e.argv[2] === 'status') return { value: { exitCode: 0, stdout: '{"exists":true,"idle_seconds":60}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } // settle probe: quiet, instant
     await clock.advance(e.init?.timeoutMs ?? 0)
     return { value: { exitCode: 0, stdout: e.argv.includes('cat-file') ? 'commit\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -4267,6 +4499,26 @@ describe('cursor review of 34e2a1e', () => {
     expect(cells.reduce((a, b) => a + b, 0), 'title bar plus the engine\'s " [-]" fit 80 columns').toBeLessThanOrEqual(80 - ' [-]'.length)
   })
 
+  test('[ ▾ fold ] keeps the title bar only (not hidden); [ ▸ open ] brings the rows back; hide is not dim', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 5 })
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    const open = await $.ui.render(bandRender())
+    expect(textOf(open)).toContain('w1')
+    expect(JSON.stringify(open)).not.toMatch(/"key":"close"[^}]*"dimColor":true/)
+    await $.ui.press({ plugin: 'tmux-agent', key: 'fold', requestId: 'above-prompt' })
+    const folded = await $.ui.render(bandRender())
+    expect(textOf(folded), 'folded is not hidden').toContain('workers v')
+    expect(textOf(folded)).not.toContain('w1')
+    expect(keysOf(folded)).toContain('fold')
+    await $.ui.press({ plugin: 'tmux-agent', key: 'fold', requestId: 'above-prompt' })
+    expect(textOf(await $.ui.render(bandRender()))).toContain('w1')
+  })
+
   const TUI_SH = '/opt/node/bin/node\n/skills/tmux-agent-tools/scripts/lib/tui.node.ts\n/skills/tmux-agent-tools/scripts/tmux-agent-tui\n'
   const wait50 = () => new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
 
@@ -4472,7 +4724,8 @@ describe('live e2e of 0.7.6', () => {
         const ans = statusFor(String(e.argv[4]))
         return { value: { exitCode: ans.exitCode, stdout: ans.stdout, stderr: ans.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
-      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":5}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      // Quiet past SETTLE_IDLE_SECONDS, far from a stall: a terminal result is delivered.
+      return { value: { exitCode: 0, stdout: '{"exists":true,"running":true,"idle_seconds":30}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     return { argv, logs, stopped: () => argv.filter(a => a[2] === 'stop').map(a => a[3]) }
   }
@@ -4546,7 +4799,7 @@ describe('live e2e of 0.7.6', () => {
     expect(text, 'a send-step failure is not called maybe-working').not.toContain('may be working')
   })
 
-  test('reload queues /reload-plugins for when the turn ends', WITH_DRIVER, async ($, on) => {
+  test('reload queues /reload-plugins, then /reload-skills, for when the turn ends', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mockStore(on)
     const clock = mockClock(on)
@@ -4558,17 +4811,17 @@ describe('live e2e of 0.7.6', () => {
     })
 
     const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__reload' as const }))
-    expect(out).toContain('/reload-plugins is queued')
+    expect(out).toContain('/reload-plugins and /reload-skills are queued')
     expect(ran, 'not inside the tool call').toEqual([])
     await clock.advance(1)
-    for (let i = 0; i < 20 && !ran.length; i += 1) await settle()
-    expect(ran).toEqual(['reload-plugins'])
+    for (let i = 0; i < 20 && ran.length < 2; i += 1) await settle()
+    expect(ran).toEqual(['reload-plugins', 'reload-skills'])
   })
 
-  test('a reload reopens a panel that was open, and only for that session', WITH_DRIVER, async ($, on) => {
+  test('a session opens the panel at its start, folded until opened; the fold choice is kept; hiding it is kept for that session', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
-    // As a reload finds it: this session's panel was open, the module state is gone.
-    const store = mockStore(on, [], 'tmux-agent.reported', { 'tmux-agent.panel': ['sess-B', 'sess-A'] })
+    // As a person who never opened or hid it: no fold choice, only another session hid its panel.
+    const store = mockStore(on, [], 'tmux-agent.reported', { 'tmux-agent.panel-hidden': ['sess-B'], 'tmux-agent.fold': [] })
     const clock = mockClock(on)
     setSessionId(on, 'sess-A')
     mockFs(on, { ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work' }) })
@@ -4576,18 +4829,33 @@ describe('live e2e of 0.7.6', () => {
 
     await $.session.start(session())
     await clock.advance(1)
-    for (let i = 0; i < 20 && !textOf(await $.ui.render(bandRender())).includes('w1'); i += 1) await settle()
-    expect(textOf(await $.ui.render(bandRender())), 'the panel is back').toContain('w1')
+    for (let i = 0; i < 20 && !textOf(await $.ui.render(bandRender())).includes('workers v'); i += 1) await settle()
+    let tree = await $.ui.render(bandRender())
+    expect(textOf(tree), 'open from the start').toContain('workers v')
+    expect(textOf(tree), 'folded: the title bar only').not.toContain('w1')
+    expect(textOf(tree), 'the fold button shows open (its icon at 80 columns)').toContain('▸')
+    await $.ui.press({ plugin: 'tmux-agent', key: 'fold', requestId: 'above-prompt' })
+    tree = await $.ui.render(bandRender())
+    expect(textOf(tree)).toContain('w1')
+    for (let i = 0; i < 20 && store.raw("tmux-agent.fold") !== 'open'; i += 1) await settle()
+    expect(store.raw("tmux-agent.fold")).toBe('open')
+    // And back: folded again, and that choice is kept too.
+    await $.ui.press({ plugin: 'tmux-agent', key: 'fold', requestId: 'above-prompt' })
+    tree = await $.ui.render(bandRender())
+    expect(textOf(tree), 'folded again').not.toContain('w1')
+    expect(textOf(tree)).toContain('workers v')
+    for (let i = 0; i < 20 && store.raw("tmux-agent.fold") !== 'folded'; i += 1) await settle()
+    expect(store.raw("tmux-agent.fold")).toBe('folded')
 
-    // Closing it forgets this session only.
+    // Hiding it is kept for this session only.
     expect((await $.command.run(run('workers'))).text).toContain('closed')
-    for (let i = 0; i < 20 && store.key('tmux-agent.panel').includes('sess-A'); i += 1) await settle()
-    expect(store.key('tmux-agent.panel')).toEqual(['sess-B'])
+    for (let i = 0; i < 20 && !store.key('tmux-agent.panel-hidden').includes('sess-A'); i += 1) await settle()
+    expect(store.key('tmux-agent.panel-hidden')).toEqual(['sess-A', 'sess-B'])
   })
 
-  test('opening the panel records it; a session whose panel was closed does not reopen it', WITH_DRIVER, async ($, on) => {
+  test('a session whose panel was hidden does not reopen it at start; /workers opens it and forgets the hide', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
-    const store = mockStore(on)
+    const store = mockStore(on, [], 'tmux-agent.reported', { 'tmux-agent.panel-hidden': ['sess-A'] })
     const clock = mockClock(on)
     setSessionId(on, 'sess-A')
     mockFs(on, {})
@@ -4596,13 +4864,13 @@ describe('live e2e of 0.7.6', () => {
     await $.session.start(session())
     await clock.advance(1)
     for (let i = 0; i < 5; i += 1) await settle()
-    expect(panel.open, 'nothing to reopen').toEqual([])
+    expect(panel.open, 'hidden: not reopened').toEqual([])
     await $.command.run(run('workers'))
-    for (let i = 0; i < 20 && !store.key('tmux-agent.panel').length; i += 1) await settle()
-    expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
+    for (let i = 0; i < 20 && store.key('tmux-agent.panel-hidden').length; i += 1) await settle()
+    expect(store.key('tmux-agent.panel-hidden')).toEqual([])
   })
 
-  test('the panel tool opens and closes the panel the way /workers does, and records it for reopen', WITH_DRIVER, async ($, on) => {
+  test('the panel tool opens and closes the panel the way /workers does, and records it', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     const store = mockStore(on)
     mockClock(on)
@@ -4613,8 +4881,8 @@ describe('live e2e of 0.7.6', () => {
     await $.session.start(session())
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const }))).toContain('opened above the prompt (1 worker row(s))')
     expect(textOf(await $.ui.render(bandRender())), 'drawn').toContain('w1')
-    for (let i = 0; i < 20 && !store.key('tmux-agent.panel').length; i += 1) await settle()
-    expect(store.key('tmux-agent.panel')).toEqual(['sess-A'])
+    for (let i = 0; i < 20 && store.key('tmux-agent.panel-hidden').includes('sess-A'); i += 1) await settle()
+    expect(store.key('tmux-agent.panel-hidden'), 'opened: no longer hidden').not.toContain('sess-A')
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const }))).toContain('already open')
 
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__panel' as const, action: 'close' }))).toContain('workers panel closed.')
@@ -4856,8 +5124,9 @@ describe('project sessions', () => {
 
     await $.ui.press({ plugin: 'tmux-agent', key: 'project:hg-android', requestId: 'above-prompt' })
     await clock.advance(2_000)
+    // -S reaches into scrollback: a pane shorter than the mirror still fills it.
     expect(panel.argv.filter(a => a[1] === 'capture-pane')).toEqual([
-      ['tmux', 'capture-pane', '-p', '-J', '-t', '=hg-android:'],
+      ['tmux', 'capture-pane', '-p', '-J', '-S', expect.stringMatching(/^-\d+$/), '-t', '=hg-android:'],
     ])
     expect(textOf(await $.ui.render(bandRender()))).toContain('from-pane')
 

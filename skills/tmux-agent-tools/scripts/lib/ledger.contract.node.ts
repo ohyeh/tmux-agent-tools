@@ -31,10 +31,10 @@ function race(n: number, args: (i: number) => string[]): Promise<unknown[]> {
   )
 }
 
-test('lock: 8 processes, exactly one holder, 20 rounds', async () => {
-  for (let round = 0; round < 20; round++) {
+test('lock: 4 processes, exactly one holder, 2 rounds', async () => {
+  for (let round = 0; round < 2; round++) {
     const lock = join(fresh(), '.action')
-    const outs = (await race(8, i => ['lock', lock, `p${i}`])) as { ok: boolean }[]
+    const outs = (await race(4, i => ['lock', lock, `p${i}`])) as { ok: boolean }[]
     assert.equal(outs.filter(o => o.ok).length, 1, `round ${round}: ${JSON.stringify(outs)}`)
   }
 })

@@ -1,29 +1,76 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# Smoke test: `status --json` names a worker the CLI stopped on a usage limit or
-# lost credentials for (blocked_reason quota_exhausted / login_required, with
-# the matching line in blocked_evidence), and does NOT fire on a worker's own
-# prose or on a banner that is old history. The quota pane is the live codex
-# screen of 2026-09-24 (banner above the `›` input, outside the prompt area).
+# Smoke test: what `status --json` reads off a worker's screen.
+#   - Classification is a no-wait fixture table run through the engine's own
+#     functions (sourced): runtime blockers (blocked_reason quota_exhausted /
+#     login_required / model_error with blocked_evidence) and dialog prompts
+#     (hook_trust / permission / approval / login), plus the prose, tool-output,
+#     scrollback and idle-chrome screens that must NOT read as either.
+#   - Liveness/activity/probe parse helpers as fixtures too.
+#   - Two real panes for the CLI entries: a permission pane that refuses send,
+#     send-wait and send-wait-literal, then clears and takes a send (liveness
+#     fields, marker_seen, ping ok on the same pane); a quiet claude pane for
+#     the runtime blocker wired through status, probe and the ping timeout.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
-CURSOR_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" cursor)"
+CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
 
-WORK="$(mktemp -d -t tmux-agent-runtime-blocker.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-runtime-blocker.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+FX="$WORK/fx"
+mkdir -p "$FX"
 
-fake() {
-  local file="$WORK/$1.sh"
-  { print -r -- '#!/bin/sh'; print -r -- 'cat <<'"'"'PANE'"'"''; cat; print -r -- 'PANE'; print -r -- 'while IFS= read -r line; do : ; done'; } > "$file"
-  chmod +x "$file"
+PASS=0
+FAIL=0
+assert() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
+  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
+}
+ISO_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+# --- Real panes: start first so they draw while the fixtures run ------------
+cat > "$WORK/fake-permission.sh" <<'EOF'
+#!/bin/sh
+echo "Do you trust the contents of this directory?"
+if IFS= read -r answer; then
+  echo "trusted:$answer"
+fi
+echo "› Write a prompt"
+while IFS= read -r line; do echo "got:$line"; done
+EOF
+cat > "$WORK/fake-claude.sh" <<'EOF'
+#!/bin/sh
+echo "Claude footer: Context 73%"
+echo "Goal active: rotate session"
+echo "⠋ Thinking"
+echo "  ⎿  Credit balance is too low"
+exec sleep 600
+EOF
+chmod +x "$WORK/fake-permission.sh" "$WORK/fake-claude.sh"
+CODEX="$WORK/fake-permission.sh" "$CODEX_TMUX" start --exact perm "$WORK" >/dev/null &
+CLAUDE="$WORK/fake-claude.sh" "$CLAUDE_TMUX" start --exact quiet "$WORK" >/dev/null &
+
+# --- Classification fixture table --------------------------------------------
+# fx <name> <blocked_reason|null> [blocked_evidence] <<'EOF' <screen> EOF
+typeset -A want_reason want_evidence
+fx() {
+  want_reason[$1]="$2"
+  if (( $# > 2 )); then want_evidence[$1]="$3"
+  elif [[ "$2" == null ]]; then want_evidence[$1]=null; fi
+  cat > "$FX/$1"
 }
 
-fake codex-quota <<'EOF'
+# The quota pane is the live codex screen of 2026-09-24 (banner above the `›`
+# input, outside the prompt area).
+fx codex-quota quota_exhausted '■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),' <<'EOF'
   Do not spawn additional tmux sessions or delegate further.
 ↳ Hook · PONYTAIL:FULL
 • Hook failed
@@ -38,13 +85,13 @@ again at Sep 25th, 2026 12:32 AM.
   GPT-6-Astra low · tmux-agent-tools · ⚠ 1 warning · f2 to view
 EOF
 
-fake prose <<'EOF'
+fx prose null <<'EOF'
 • Implemented rate limit handling and a usage limit counter in api/client.ts.
 • Error handling now covers quota errors from the upstream.
 › Ask Codex to do anything
 EOF
 
-fake old-banner <<'EOF'
+fx old-banner null <<'EOF'
 ■ You’ve hit your usage limit. try again at 12:32 AM.
 • resumed after the reset
 • step 1
@@ -60,12 +107,13 @@ fake old-banner <<'EOF'
 › Ask Codex to do anything
 EOF
 
-fake auth <<'EOF'
+fx auth login_required 'Error: invalid api key — check your credentials.' <<'EOF'
 Error: invalid api key — check your credentials.
 › Ask Codex to do anything
 EOF
 
-fake no-boundary <<'EOF'
+# Shape UNCONFIRMED on a live claude pane.
+fx no-boundary quota_exhausted <<'EOF'
 ⏺ Working on the migration.
   ⎿  Claude usage limit reached. Your limit will reset at 3am.
 ────────────────────────────────────────
@@ -73,29 +121,29 @@ fake no-boundary <<'EOF'
 EOF
 
 # The astra re-review's counterexamples (2026-09-25), each once a wrong answer.
-fake quoted <<'EOF'
+fx quoted null <<'EOF'
 Added a test for "invalid api key" responses.
 › Ask Codex to do anything
 EOF
 
-fake resumed-recent <<'EOF'
+fx resumed-recent null <<'EOF'
 ■ You’ve hit your usage limit.
 • resumed after reset
 • Running slow build
 › Ask Codex to do anything
 EOF
 
-fake rate-limit <<'EOF'
+fx rate-limit quota_exhausted 'Error: rate limit exceeded' <<'EOF'
 Error: rate limit exceeded
 › Ask Codex to do anything
 EOF
 
-fake after-boundary <<'EOF'
+fx after-boundary quota_exhausted <<'EOF'
 › run tests
 ■ You’ve hit your usage limit.
 EOF
 
-fake tool-output <<'EOF'
+fx tool-output null <<'EOF'
 ⏺ Bash(rg "usage limit" src)
   ⎿  src/client.ts: // usage limit reached → back off
   ⎿  Error: invalid api key
@@ -105,40 +153,40 @@ EOF
 
 # The re-review of 3b83a9e (2026-09-25): "Error" without its colon is prose; a
 # tool's multi-line output indents its lines; the agy banner starts with ⚠.
-fake error-word-prose <<'EOF'
+fx error-word-prose null <<'EOF'
 Error handling for invalid api key responses is now implemented.
 › Ask Codex to do anything
 EOF
 
-fake multiline-tool-output <<'EOF'
+fx multiline-tool-output null <<'EOF'
 ⏺ Bash(cat error-fixture.txt)
   ⎿  Expected error text:
      Error: invalid api key
 ? for shortcuts
 EOF
 
-fake claude-retried <<'EOF'
+fx claude-retried null <<'EOF'
 ⏺ Reading the config.
   ⎿  API Error: 429 rate limit exceeded
   ⎿  Read 20 lines
 EOF
 
-fake api-error-prose <<'EOF'
+fx api-error-prose null <<'EOF'
 API Error handling for invalid api key responses is now implemented.
 › Ask Codex to do anything
 EOF
 
-fake claude-api-error <<'EOF'
+fx claude-api-error quota_exhausted <<'EOF'
 ⏺ Reading the config.
   ⎿  API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}
 EOF
 
-fake tool-api-error-prose <<'EOF'
+fx tool-api-error-prose null <<'EOF'
 ⏺ Update(src/client.ts)
   ⎿  API Error handling added for invalid api key responses
 EOF
 
-fake agy-quota <<'EOF'
+fx agy-quota quota_exhausted <<'EOF'
 ⚠ Individual quota reached
 ? for shortcuts
 >
@@ -146,38 +194,38 @@ EOF
 
 # The cursor review of 4d0af09 (2026-09-25, O1/O7): real stop strings from
 # claude transcripts and the codex/agy/grok binaries, and a ⚠ that is only a warning.
-fake claude-session-limit <<'EOF'
+fx claude-session-limit quota_exhausted <<'EOF'
 ⏺ Reading the config.
   ⎿  You've hit your session limit · resets 2:10pm (Asia/Taipei)
 EOF
 
-fake claude-credit <<'EOF'
+fx claude-credit quota_exhausted <<'EOF'
 ⏺ Reading the config.
   ⎿  Credit balance is too low
 EOF
 
-fake tool-session-limit-prose <<'EOF'
+fx tool-session-limit-prose null <<'EOF'
 ⏺ Bash(rg "session limit" src)
   ⎿  src/ui.ts: You've hit your session limit · resets soon
 EOF
 
-fake codex-token <<'EOF'
+fx codex-token login_required <<'EOF'
 ■ Your access token could not be refreshed. Please log out and sign in again.
 › Ask Codex to do anything
 EOF
 
-fake agy-exhausted <<'EOF'
+fx agy-exhausted quota_exhausted <<'EOF'
 ⚠ You have exhausted your quota on this model.
 ? for shortcuts
 >
 EOF
 
-fake grok-free <<'EOF'
+fx grok-free quota_exhausted <<'EOF'
 Error: You hit your free usage limit.
 >
 EOF
 
-fake mcp-warning <<'EOF'
+fx mcp-warning null <<'EOF'
 ⚠ MCP client for `linear` failed to start: authentication required
 › GOAL: port the poller
   and keep the tests green
@@ -185,24 +233,24 @@ fake mcp-warning <<'EOF'
 EOF
 
 # The cursor weekly limit block (2026-09-29): structured key and chatMessage
-fake cursor-quota <<'EOF'
+fx cursor-quota quota_exhausted '  unifiedSkuWeeklyLimit: true' <<'EOF'
   chatMessage: *Weekly usage limit reached. It resets in 6 days.*
   unifiedSkuWeeklyLimit: true
   unifiedSkuWeeklyLimitResetDays: 6
 →
 EOF
 
-fake cursor-headless-quota <<'EOF'
+fx cursor-headless-quota quota_exhausted 'ActionRequiredError: Weekly usage limit reached. It resets in 6 days. Buy credits to keep going now, or upgrade your plan for more weekly usage.' <<'EOF'
 ActionRequiredError: Weekly usage limit reached. It resets in 6 days. Buy credits to keep going now, or upgrade your plan for more weekly usage.
 →
 EOF
 
-fake cursor-prose <<'EOF'
+fx cursor-prose null <<'EOF'
 • Checked the usage limit reached path
 →
 EOF
 
-fake cursor-recovered <<'EOF'
+fx cursor-recovered null <<'EOF'
   chatMessage: *Weekly usage limit reached. It resets in 6 days.*
   unifiedSkuWeeklyLimit: true
   unifiedSkuWeeklyLimitResetDays: 6
@@ -220,19 +268,19 @@ fake cursor-recovered <<'EOF'
 → Ask Cursor to do anything
 EOF
 
-fake cursor-limit-false <<'EOF'
+fx cursor-limit-false null <<'EOF'
   chatMessage: *Working on task*
   unifiedSkuWeeklyLimit: false
   unifiedSkuWeeklyLimitResetDays: 0
 →
 EOF
 
-fake cursor-quoted <<'EOF'
+fx cursor-quoted null <<'EOF'
 Added a test for "usage limit reached" handling.
 →
 EOF
 
-fake cursor-tool-output <<'EOF'
+fx cursor-tool-output null <<'EOF'
 • Reading the usage fixture
 └ cat usage.json
     unifiedSkuWeeklyLimit: true
@@ -240,7 +288,7 @@ fake cursor-tool-output <<'EOF'
 →
 EOF
 
-fake cursor-false-then-true <<'EOF'
+fx cursor-false-then-true quota_exhausted '  unifiedSkuWeeklyLimit: true' <<'EOF'
   chatMessage: *Working on task*
   unifiedSkuWeeklyLimit: false
 • Resuming task
@@ -252,203 +300,231 @@ EOF
 
 # agy draws a column-0 ⚠ for a model/API failure that is not a quota banner
 # (live: "⚠ … 404 NOT_FOUND"). The same text under └ is the tool's output.
-fake agy-model-404 <<'EOF'
+fx agy-model-404 model_error '⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND' <<'EOF'
 ⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND
 ? for shortcuts
 >
 EOF
 
-fake model-error-in-tool <<'EOF'
+fx model-error-in-tool null <<'EOF'
 • Reading the model fixture
 └ cat model-error.txt
     ⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND
 >
 EOF
 
-PASS=0
-FAIL=0
-assert() {
-  local label="$1" actual="$2" expected="$3"
-  if [[ "$actual" == "$expected" ]]; then echo "  ok   $label"; PASS=$((PASS + 1))
-  else echo "  FAIL $label"; echo "    expected: $expected"; echo "    got:      $actual"; FAIL=$((FAIL + 1)); fi
-}
+# Dialog prompts (issue #283 and later live misreads).
+fx hook-trust hook_trust_prompt <<'EOF'
+1 hook needs review before this session can continue.
+Press t to trust the ponytail@ponytail SubagentStart hook.
+EOF
 
-status_of() {
-  # Unique per run: two runs at once (run-all-smokes beside a mutation run) must
-  # not share tmux sessions, or one reads the other's pane.
-  local fixture="$1" cli="${2:-codex}" name="$1-$$"
-  local launcher env_var
-  case "$cli" in
-    cursor) launcher="$CURSOR_TMUX"; env_var="CURSOR" ;;
-    *)      launcher="$CODEX_TMUX";  env_var="CODEX" ;;
-  esac
-  env "$env_var=$WORK/$fixture.sh" "$launcher" start --exact "$name" "$WORK" >/dev/null
-  # Wait until the fixture is on screen: a `status` of a pane that has not drawn
-  # yet answers null, and every "not blocked" case would then pass vacuously.
-  local first i
-  first="$(sed -n 3p "$WORK/$fixture.sh" | tr -d '[:space:]' | cut -c1-20)"
-  for i in {1..40}; do
-    "$launcher" capture --strip-ansi --tail 60 "$name" 2>/dev/null | tr -d '[:space:]' | grep -qF -- "$first" && break
-    sleep 0.25
-  done
-  if (( i >= 40 )); then
-    # Not a pass by default: a case that saw no pane checked nothing.
-    print -r -- '{"blocked_reason":"FIXTURE_NEVER_DREW"}'
-    "$launcher" stop "$name" >/dev/null 2>&1 || true
-    return
+fx permission permission_prompt <<'EOF'
+Do you trust the contents of this directory?
+EOF
+
+fx approval approval_prompt <<'EOF'
+Approval required before continuing [y/n]
+EOF
+
+fx codex-login login_prompt <<'EOF'
+Please log in to Codex to continue.
+EOF
+
+# Ordinary "needs review" prose is not a hook-trust prompt.
+fx prose-review null <<'EOF'
+The submitted pull request still needs review by a maintainer.
+EOF
+
+fx mcp-login-warning null <<'EOF'
+The cloudflare-api MCP server is not logged in. Run codex mcp login cloudflare-api
+› Write a prompt
+EOF
+
+# Trigger words in history above the current prompt.
+{
+  for i in {1..76}; do print -r -- "history $i"; done
+  print -r -- "commit summary: Fix Codex login prompt docs and detection; approval and permission prose only."
+  print -r -- "more historical prose: please log in to codex is not the active prompt here."
+  print -r -- "─ Worked for 1s ─"
+  print -r -- "› Write a prompt"
+} | fx scrollback-ready null
+
+# Live 2026-09-25: a cursor-agent worker's final report quoted "Verifying your
+# account"; with no `›` in the pane the whole capture was scanned, so the idle
+# worker read as startup_pending forever and `tell` was refused.
+fx cursor-quotes null <<'EOF'
+  Report: the agy boot shows Verifying your account eligibility first.
+  Then it asks: Do you trust this folder? and waits for [y/n].
+  Do you want to proceed? was the question I answered in the fixture.
+
+ → Add a follow-up
+   Opus 5.5 · 12% · 3 files edited
+EOF
+
+# Live 2026-09-25: a brief echoed above cursor-agent's banner, before any
+# composer was drawn. With no composer only the last 20 non-empty lines count.
+{
+  print -r -- "Write answer.txt: Verifying your account / trust this folder / [y/n]"
+  for i in {1..22}; do print -r -- "  banner line $i"; done
+} | fx nocomposer null
+
+# Live 2026-09-25: grok 1.0.41 never signed in drew a browser sign-in whose
+# "Waiting for approval..." read as approval_prompt.
+fx browser-login login_prompt <<'EOF'
+                  Approve in your browser to finish signing in.
+                                    JZW2-3R3B
+                             Waiting for approval...
+                                  ctrl+q  quit
+EOF
+
+# Issue #320: idle CLI chrome and the worker's own launch flags containing
+# "approve" are not an approval prompt.
+fx agy-idle null <<'EOF'
+Antigravity CLI 1.1.22
+> Accept-edits mode: file edits auto-approved (shift+tab to cycle)
+EOF
+
+fx cursor-launch null <<'EOF'
+cursor-agent --trust --approve-mcps
+EOF
+
+# One engine process classifies every fixture the way status_session does
+# (prompt-area dialogs first, then runtime blockers on the whole screen), and
+# runs the pure liveness/probe helpers. No errexit: the engine's helpers
+# return non-zero on "no match".
+cat > "$WORK/classify.zsh" <<'EOF'
+set -- codex
+source "$ENGINE"
+for f in "$FX"/*; do
+  text="$(<"$f")"
+  area="$(current_prompt_area_for_text "$text")"
+  reason="$(blocked_reason_for_text "${area:l}")"
+  evidence=""
+  if [[ -z "$reason" ]]; then
+    rb="$(runtime_blocker_for_text "$text")"
+    if [[ -n "$rb" ]]; then reason="${rb%%$'\t'*}"; evidence="${${rb#*$'\t'}[1,300]}"; fi
   fi
-  "$launcher" status --json "$name"
-  "$launcher" stop "$name" >/dev/null 2>&1 || true
+  print -r -- "${f:t}"$'\t'"${reason:-null}"$'\t'"${evidence:-null}"
+done
+# idle_seconds ignores what a CLI redraws below its composer (issue #98 follow-up).
+same() { [[ "$(pane_activity_text "$1")" == "$(pane_activity_text "$2")" ]] && print same || print differs; }
+print -r -- "act:footer"$'\t'"$(same $'answer: done\n→ Add a follow-up\nUsage 9% (1)' $'answer: done\n→ Add a follow-up\nUsage 9% (2)')"
+print -r -- "act:output"$'\t'"$(same $'working 1\n→ Add a follow-up\nUsage 9%' $'working 2\n→ Add a follow-up\nUsage 9%')"
+q1="> quoted"; q2="> quoted"
+for i in {1..13}; do q1+=$'\n'"line $i 1"; q2+=$'\n'"line $i 2"; done
+print -r -- "act:quote"$'\t'"$(same "$q1" "$q2")"
+# codex/generic probe parse (issue #203).
+ptext=$'Codex progress 42%\nrunning shell command\napproval pending: allow command?'
+for metric in progress tool_active approval_pending; do
+  value=null; probe_generic_metric_parse "$metric" "$ptext"
+  print -r -- "probe:$metric"$'\t'"$value"
+done
+# #144: a pane-hash that cannot be written degrades to the stored stamp.
+d="$(ensure_agent_dir deg)"
+print -r -- "oldhash 2001-01-01T00:00:00Z" > "$d/pane-hash"
+chmod 444 "$d/pane-hash"; chmod 555 "$d"
+out="$(update_pane_hash deg "changed pane")"; rc=$?
+print -r -- "degrade"$'\t'"$rc:$out"
+EOF
+typeset -A got got_evidence
+while IFS=$'\t' read -r key a b; do got[$key]="$a"; got_evidence[$key]="$b"; done < <(
+  TMUX_AGENT_TOOLS_SOURCE_ONLY=1 ENGINE="$AGENT_TMUX" FX="$FX" zsh "$WORK/classify.zsh"
+)
+
+echo "case: classification fixtures (${#want_reason} screens)"
+for name in ${(ko)want_reason}; do
+  assert "$name blocked_reason" "${got[$name]}" "${want_reason[$name]}"
+  if (( ${+want_evidence[$name]} )); then
+    assert "$name blocked_evidence" "${got_evidence[$name]}" "${want_evidence[$name]}"
+  fi
+done
+echo "case: activity, probe parse and degrade helpers"
+assert "a footer-only redraw is not activity" "${got[act:footer]}" "same"
+assert "a change above the composer is activity" "${got[act:output]}" "differs"
+assert "a quote high in the output is not a composer" "${got[act:quote]}" "differs"
+assert "codex progress parsed" "${got[probe:progress]}" "42"
+assert "codex tool_active parsed" "${got[probe:tool_active]}" "true"
+assert "codex approval_pending parsed" "${got[probe:approval_pending]}" "true"
+assert "unwritable pane-hash keeps the stored stamp" "${got[degrade]}" "0:2001-01-01T00:00:00Z"
+
+# --- No session: null liveness, ping dead, probe refuses ---------------------
+echo "case: missing session"
+st="$("$CODEX_TMUX" status --json "missing-$$")"
+assert "missing liveness fields" "$(jq -c '[.exists,.started_at,.last_change_at,.bytes_in_pane,.idle_seconds,(.marker_seen|length)]' <<< "$st")" '[false,null,null,null,null,0]'
+code=0; st="$("$CODEX_TMUX" ping --json --timeout 1 "missing-$$")" || code=$?
+assert "missing ping dead exit=2" "$code:$(jq -r '"\(.schema_version):\(.result)"' <<< "$st")" "2:1:dead"
+code=0; "$CODEX_TMUX" probe --json --metric progress "missing-$$" >/dev/null 2>&1 || code=$?
+assert "missing probe exit=1" "$code" "1"
+
+# --- Real panes --------------------------------------------------------------
+wait
+wait_pane() {  # <launcher> <name> <text>
+  local i
+  for i in {1..40}; do
+    "$1" capture --strip-ansi --tail 60 "$2" 2>/dev/null | grep -qF -- "$3" && return 0
+    sleep 0.05
+  done
+  echo "  FAIL $2 never showed: $3"; FAIL=$((FAIL + 1)); return 1
 }
 
-echo "case: live codex usage-limit banner above the prompt"
-st="$(status_of codex-quota)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-assert "evidence is the banner line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),"
+echo "case: quiet claude pane — runtime blocker through status, probe, ping timeout"
+wait_pane "$CLAUDE_TMUX" quiet "Credit balance"
+st="$("$CLAUDE_TMUX" status --json quiet)"
+assert "blocked_reason quota_exhausted" "$(jq -r .blocked_reason <<< "$st")" "quota_exhausted"
+assert "evidence is claude's line" "$(jq -r .blocked_evidence <<< "$st")" "  ⎿  Credit balance is too low"
 assert "not a confirmation dialog" "$(jq -r .confirmation_detected <<< "$st")" "false"
 assert "diagnostic names the limit" "$(jq -r '.diagnostic // ""' <<< "$st" | grep -c 'usage/quota limit')" "1"
+st="$("$CLAUDE_TMUX" probe --json --metric context_percent quiet)"
+assert "claude context probe" "$(jq -r '"\(.schema_version) \(.value) \(.confidence)"' <<< "$st")" "1 73 high"
+assert "claude goal_active probe" "$("$CLAUDE_TMUX" probe --json --metric goal_active quiet | jq -r .value)" "true"
+code=0; "$CLAUDE_TMUX" probe --metric nope quiet >/dev/null 2>&1 || code=$?
+assert "unknown metric exit=2" "$code" "2"
+code=0; st="$("$CLAUDE_TMUX" ping --json --timeout 1 quiet)" || code=$?
+assert "silent pane ping timeout exit=1" "$code:$(jq -r .result <<< "$st")" "1:timeout"
+assert "ping waited its 1 s" "$(jq -r '.rtt_ms >= 1000' <<< "$st")" "true"
 
-echo "case: a worker's own prose about rate/usage limits is not a blocker"
-st="$(status_of prose)"
-assert "prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-assert "prose has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
+echo "case: permission pane — every send path refuses, then clears"
+wait_pane "$CODEX_TMUX" perm "trust the contents"
+st="$("$CODEX_TMUX" status --json perm)"
+assert "permission_prompt confirmation" "$(jq -r '"\(.blocked_reason) \(.confirmation_detected) \(.diagnostic|type)"' <<< "$st")" "permission_prompt true string"
+for spec in "send|m-plain" "send-wait|m-wait|1" "send-wait-literal|m-literal|never-seen|1"; do
+  args=("${(@s:|:)spec}")
+  code=0; out="$("$CODEX_TMUX" "${args[1]}" perm "${(@)args[2,-1]}" 2>&1)" || code=$?
+  assert "${args[1]} refused" "$code:$(jq -r '"\(.blocked) \(.submitted) \(.blocked_reason) \(.diagnostic|type)"' <<< "${out##*$'\n'}")" "1:true false permission_prompt string"
+  assert "${args[1]} pasted nothing" "$("$CODEX_TMUX" capture --strip-ansi --tail 60 perm | grep -cF -- "${args[2]}" || true)" "0"
+done
+"$CODEX_TMUX" send --raw --enter-count 1 perm y >/dev/null
+wait_pane "$CODEX_TMUX" perm "Write a prompt"
+st="$("$CODEX_TMUX" status --json perm)"
+assert "cleared prompt not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
+assert "schema_version=1" "$(jq -r .schema_version <<< "$st")" "1"
+assert "started_at ISO-8601 UTC" "$([[ "$(jq -r .started_at <<< "$st")" =~ $ISO_RE ]] && echo yes)" "yes"
+assert "last_change_at ISO-8601 UTC" "$([[ "$(jq -r .last_change_at <<< "$st")" =~ $ISO_RE ]] && echo yes)" "yes"
+assert "bytes_in_pane non-zero" "$(jq -r '.bytes_in_pane > 0' <<< "$st")" "true"
+assert "marker_seen empty at start" "$(jq -r '.marker_seen | length' <<< "$st")" "0"
+# An unchanged pane keeps its last_change_at: age the stored stamp, no sleep.
+hash_file="$TMUX_AGENT_DIR/perm/pane-hash"
+read -r h _ < "$hash_file"; print -r -- "$h 2000-01-01T00:00:00Z" > "$hash_file"
+st="$("$CODEX_TMUX" status --json perm)"
+assert "unchanged pane keeps last_change_at" "$(jq -r .last_change_at <<< "$st")" "2000-01-01T00:00:00Z"
+assert "idle_seconds grows" "$(jq -r '.idle_seconds > 1000' <<< "$st")" "true"
+markers() { "$CODEX_TMUX" status --json perm | jq -c .marker_seen; }
+"$CODEX_TMUX" wait-literal perm "Write a prompt" 2 >/dev/null
+assert "wait-literal records its marker" "$(markers)" '["Write a prompt"]'
+"$CODEX_TMUX" wait-literal perm "Write a prompt" 2 >/dev/null
+"$CODEX_TMUX" wait-text --regex perm 'Write a pro.*' 2 >/dev/null
+assert "repeat deduped, wait-text adds nothing" "$(markers)" '["Write a prompt"]'
+seq 1 101 | awk '{printf "m-%d\n", $1}' > "$TMUX_AGENT_DIR/perm/marker_seen"
+"$CODEX_TMUX" wait-literal perm "trusted:y" 2 >/dev/null
+assert "marker_seen FIFO-capped at 100" "$(markers | jq -r '"\(length) \(.[0])"')" "100 m-3"
+"$CODEX_TMUX" send perm after-clear-marker >/dev/null
+wait_pane "$CODEX_TMUX" perm "got:after-clear-marker" && { echo "  ok   send works after the prompt cleared"; PASS=$((PASS + 1)); }
+code=0; st="$("$CODEX_TMUX" ping --json --timeout 5 perm)" || code=$?
+assert "live pane ping ok exit=0" "$code:$(jq -r '"\(.schema_version) \(.result) \(.rtt_ms >= 0)"' <<< "$st")" "0:1 ok true"
+assert "human ping output" "$("$CODEX_TMUX" ping --timeout 5 perm | cut -d' ' -f1-3)" "ping ok: perm"
 
-echo "case: a banner pushed out of the last output lines is history"
-st="$(status_of old-banner)"
-assert "old banner not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: lost credentials mid-run"
-st="$(status_of auth)"
-assert "blocked_reason login_required" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "login_required"
-assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "Error: invalid api key — check your credentials."
-
-echo "case: a pane with no prompt boundary reads its last lines (shape UNCONFIRMED on a live claude pane)"
-st="$(status_of no-boundary)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: a worker's own line quoting an error phrase is not the CLI's error"
-st="$(status_of quoted)"
-assert "quoted not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: output after a recent banner means the worker resumed"
-st="$(status_of resumed-recent)"
-assert "resumed not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: a rate limit the CLI stopped on"
-st="$(status_of rate-limit)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-assert "evidence is the error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "Error: rate limit exceeded"
-
-echo "case: an error printed after an echoed prompt is the newest output"
-st="$(status_of after-boundary)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: a tool's output under ⎿ is the tool's, not the CLI's"
-st="$(status_of tool-output)"
-assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: prose that opens with the word Error is not an error line"
-st="$(status_of error-word-prose)"
-assert "prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: an error line inside a tool's multi-line output is the tool's"
-st="$(status_of multiline-tool-output)"
-assert "tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: tool output under ⎿ after an API error means claude retried"
-st="$(status_of claude-retried)"
-assert "retried not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: prose opening with API Error (no colon) is not an error line"
-st="$(status_of api-error-prose)"
-assert "api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: claude's own API error under ⎿ still counts"
-st="$(status_of claude-api-error)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: a tool line under ⎿ opening with API Error (no colon) is the tool's"
-st="$(status_of tool-api-error-prose)"
-assert "tool api-error prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: the documented agy quota banner"
-st="$(status_of agy-quota)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: claude's session limit under ⎿"
-st="$(status_of claude-session-limit)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: claude's credit balance under ⎿"
-st="$(status_of claude-credit)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: a tool line quoting the session-limit text is the tool's"
-st="$(status_of tool-session-limit-prose)"
-assert "tool quote not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: codex lost its token"
-st="$(status_of codex-token)"
-assert "blocked_reason login_required" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "login_required"
-
-echo "case: agy exhausted its model quota"
-st="$(status_of agy-exhausted)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: grok's free usage limit"
-st="$(status_of grok-free)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-
-echo "case: a ⚠ MCP auth warning is not a stop"
-st="$(status_of mcp-warning)"
-assert "warning not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: cursor weekly limit block with structured key (cursor profile)"
-st="$(status_of cursor-quota cursor)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-assert "evidence is the structured key line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "  unifiedSkuWeeklyLimit: true"
-
-echo "case: cursor headless weekly limit (ActionRequiredError)"
-st="$(status_of cursor-headless-quota cursor)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-assert "evidence is the ActionRequiredError line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "ActionRequiredError: Weekly usage limit reached. It resets in 6 days. Buy credits to keep going now, or upgrade your plan for more weekly usage."
-
-echo "case: cursor worker's own prose is not a blocker"
-st="$(status_of cursor-prose cursor)"
-assert "cursor prose not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-assert "cursor prose has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
-
-echo "case: cursor error block scrolled above prompt boundary is history"
-st="$(status_of cursor-recovered cursor)"
-assert "cursor recovered not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: cursor unifiedSkuWeeklyLimit false is not a blocker"
-st="$(status_of cursor-limit-false cursor)"
-assert "cursor limit false not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: cursor prose quoting phrase is not a blocker"
-st="$(status_of cursor-quoted cursor)"
-assert "cursor quoted not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-
-echo "case: cursor tool output under └ is not a blocker"
-st="$(status_of cursor-tool-output cursor)"
-assert "cursor tool output not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-assert "cursor tool output has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
-
-echo "case: cursor false block followed by newer true block is quota_exhausted"
-st="$(status_of cursor-false-then-true cursor)"
-assert "blocked_reason quota_exhausted" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "quota_exhausted"
-assert "evidence is the structured key line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "  unifiedSkuWeeklyLimit: true"
-
-echo "case: agy ⚠ model 404 is a model error, not a quota stop and not running"
-st="$(status_of agy-model-404)"
-assert "blocked_reason model_error" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "model_error"
-assert "evidence is the model error line" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "⚠ Request to model gemini-2.5-pro failed: 404 NOT_FOUND"
-
-echo "case: the same ⚠ model error under └ is tool output"
-st="$(status_of model-error-in-tool)"
-assert "tool model error not blocked" "$(jq -r '.blocked_reason // "null"' <<< "$st")" "null"
-assert "tool model error has no evidence" "$(jq -r '.blocked_evidence // "null"' <<< "$st")" "null"
-
+"$CODEX_TMUX" stop perm >/dev/null 2>&1 || true
+"$CLAUDE_TMUX" stop quiet >/dev/null 2>&1 || true
 echo "runtime-blocker-status smoke: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

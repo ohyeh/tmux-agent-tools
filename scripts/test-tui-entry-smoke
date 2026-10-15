@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 # Smoke for the tmux-agent-tui entry (plan R2.1): it runs from an install-bin
 # link in a path with a space, `%`, `#` and a non-ASCII char, from a cwd outside
 # the repo, checks the Node floor in the shell, refuses a non-TTY, and passes
@@ -10,7 +11,7 @@ zmodload zsh/zpty
 SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
 
-WORK="$(mktemp -d -t tmux-agent-tui-entry-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-tui-entry-smoke.XXXXXX")"
 WORK="${WORK:A}"
 trap 'zpty -d tui 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
@@ -113,6 +114,16 @@ TMUX_AGENT_TMUX_SOCKET=$WORK/sock
 pwd=$WORK/elsewhere"
 check "argv and env reach lib/tui.node.ts beside the resolved script" test "$got" = "$expected"
 [[ "$got" == "$expected" ]] || printf 'expected:\n%s\ngot:\n%s\n' "$expected" "$got" >&2
+
+# The tmux-agent-dashboard shell entry really reaches lib/snapshot.node.ts (real node) and
+# `--watch --count` ends; the snapshot's content is snapshot.contract.node.ts's.
+source "$SCRIPT_DIR/lib/smoke-tmux.sh"
+echo "case: tmux-agent-dashboard --watch --count 2 prints two snapshots and exits"
+rc=0
+out="$(TMUX_AGENT_DIR="$WORK/dash state" perl -e 'alarm 30; exec @ARGV' zsh "$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-dashboard" --watch --count 2 --interval 0 2>&1)" || rc=$?
+check "dashboard exit 0 within 30 s (rc=$rc)" test "$rc" -eq 0
+check "two snapshots, each schema_version 1 with a sessions array" \
+  test "$(printf '%s' "$out" | jq -s '[.[] | select(.schema_version == 1 and (.sessions | type) == "array")] | length' 2>/dev/null)" = 2
 
 echo
 echo "$PASS passed, $FAIL failed"

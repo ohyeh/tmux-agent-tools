@@ -5,6 +5,10 @@ path, or a blocker and the action that closes it. Nothing here is inferred.
 
 `$R` = `.workflow/202610011947-tui-closure`. All paths are relative to the repo root.
 
+Historical record: `$R` was a local run dir and is not in the repo, so its artifacts
+cannot be re-read. Every PASS below records the 2026-10-01 run on `ff31398`; for the
+current release each such cell is UNCONFIRMED until re-run.
+
 ## Terms
 
 - **Host**: the AI coding tool that dispatches work and receives results.

@@ -495,14 +495,16 @@ exit 0
 const LIB = (f: string) => pathToFileURL(fileURLToPath(new URL(f, import.meta.url))).href
 
 /**
- * One contender as its own OS process: take the launcher lock, hold it `HOLD` ms,
- * release it only when `RELEASE=1` (otherwise exit holding it: a crashed launcher).
+ * One contender as its own OS process: take the launcher lock, hold it `HOLD` ms (or until
+ * the file `HOLD_UNTIL` exists), release it only when `RELEASE=1` (otherwise exit holding
+ * it: a crashed launcher).
  * `CRASH=after-ln`: exit 9 right after the `ln -sn` that took the lock.
  */
 const CONTENDER = `
 const { takeLauncherLock } = await import(process.env.L)
 const { nodeHost } = await import(process.env.H)
 const { releaseLock } = await import(process.env.LE)
+const { existsSync } = await import('node:fs')
 const base = nodeHost({ log: () => {} })
 const host = { ...base, run: async (argv, cwd, ms) => {
   const r = await base.run(argv, cwd, ms)
@@ -514,6 +516,7 @@ try {
   const token = await takeLauncherLock(host, process.env.DIR, process.env.S)
   say({ won: token })
   await new Promise(r => setTimeout(r, Number(process.env.HOLD || 0)))
+  while (process.env.HOLD_UNTIL && !existsSync(process.env.HOLD_UNTIL)) await new Promise(r => setTimeout(r, 50))
   // releasing is stamped before the unlink: a waiter can win before released is written.
   if (process.env.RELEASE === '1') say({ releasing: true })
   if (process.env.RELEASE === '1') say({ released: (await releaseLock(host, process.env.DIR + '/collector.owner', token)).ok })
@@ -612,20 +615,20 @@ test('C-lock: crash right after the ln -sn publish → busy (no steal); unlock n
   }
 })
 
-test('C-lock: a holder alive for more than 10s is never stolen; a delayed release lets the waiter in after it', { timeout: 60_000 }, async () => {
+test('C-lock: a live holder is never stolen; its release lets the waiter in after it', { timeout: 60_000 }, async () => {
   const w = lockDir()
   try {
-    // HOLD leaves 3.5s after the 10.5s check for a slow runner to start the unlock while
-    // the holder still holds (CI: 0.5s was too little, the unlock ran after the release).
-    const holder = contender(w.dir, { HOLD: '14000', RELEASE: '1' })
+    // The holder holds until the test publishes `go`: no timer decides when it lets go.
+    const go = join(w.root, 'go')
+    const holder = contender(w.dir, { HOLD_UNTIL: go, RELEASE: '1' })
     await until(() => linked(w.lock), 'the holder to take the lock')
     const token = holderOf(w.lock).token
     const waiter = contender(w.dir, { RELEASE: '1' })
-    await sleep(10_500)
-    assert.equal(holderOf(w.lock).token, token, 'still the first holder after 10.5s')
     const unlock = await maintenance(w.root, ['--unlock-launcher', 'lock-s', '--yes'])
     assert.equal(unlock.code, 1)
     assert.match(unlock.out, /still running/)
+    assert.equal(holderOf(w.lock).token, token, 'still the first holder while it runs')
+    writeFileSync(go, '')
     const [h, x] = await Promise.all([holder, waiter])
     const releasing = h.said.find(s => s.releasing)!
     assert.ok(h.said.find(s => s.released), JSON.stringify(h.said))
@@ -716,7 +719,7 @@ test('C-lock: an old holder\'s late finally never deletes the new lock', async (
 // ── §1c S2 legacy migration and R6.2 collector identity, on private tmux servers ──
 
 /** A process whose full args name `script` and the session, as an old launcher's or collector's would. */
-function fake(w: Live, script: string, extra: string[] = []): ChildProcess {
+function fake(w: { session: string; children: ChildProcess[] }, script: string, extra: string[] = []): ChildProcess {
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', script, '--session', w.session, ...extra], { stdio: 'ignore' })
   w.children.push(child)
   return child
@@ -740,110 +743,84 @@ async function busyLaunch(w: Live, pane: string): Promise<string> {
   return child.err
 }
 
-test('S2: launcher holds the legacy lock dir, no pid yet — busy + migrate; migrate refuses while it runs, then moves', { timeout: 60_000 }, () =>
+// --migrate-launcher reads only the session dir and ps: its refusals are fixtures, no tmux.
+test('S2 migrate: refuses while a legacy launcher or collector runs, moves (never deletes) after it stops, nothing to migrate when clean', { timeout: 60_000 }, async () => {
+  const w = { ...lockDir(), session: 'lock-s', children: [] as ChildProcess[] }
+  try {
+    // A legacy lock dir, its launcher still running (no pid file yet).
+    mkdirSync(`${w.dir}/collector.lock`)
+    let old = fake(w, 'launcher.node.ts')
+    let refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+    assert.equal(refused.code, 1, refused.out)
+    assert.match(refused.out, new RegExp(`busy: .*pid ${old.pid}`))
+    assert.ok(existsSync(`${w.dir}/collector.lock`), 'nothing moved while the old launcher runs')
+    assert.ok(alive(old.pid!), 'migrate kills nothing')
+    old.kill('SIGTERM')
+    await until(() => !alive(old.pid!), 'the old launcher to exit')
+    const dry = await maintenance(w.root, ['--migrate-launcher', w.session])
+    assert.equal(dry.code, 1)
+    assert.match(dry.out, /would move collector\.lock/)
+    let moved = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+    assert.equal(moved.code, 0, moved.out)
+    const legacy = readdirSync(w.dir).filter(n => n.startsWith('legacy-'))
+    assert.equal(legacy.length, 1)
+    assert.ok(existsSync(`${w.dir}/${legacy[0]}/collector.lock`), 'moved, not deleted')
+    assert.ok(!existsSync(`${w.dir}/collector.lock`))
+
+    // A legacy pid file whose collector is dead, its launcher alive.
+    const gone = spawn(process.execPath, ['-e', ''])
+    await new Promise(r => gone.on('exit', r))
+    writeFileSync(`${w.dir}/collector.pid`, `${gone.pid} %1\n`)
+    old = fake(w, 'launcher.node.ts')
+    refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+    assert.equal(refused.code, 1, refused.out)
+    assert.ok(alive(old.pid!))
+    assert.ok(existsSync(`${w.dir}/collector.pid`))
+    old.kill('SIGTERM')
+    await until(() => !alive(old.pid!), 'the old launcher to exit')
+    moved = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+    assert.equal(moved.code, 0, moved.out)
+    assert.ok(!existsSync(`${w.dir}/collector.pid`))
+
+    // A live legacy collector named by the pid file, on another socket: refused, not killed.
+    old = fake(w, 'collector.node.ts', ['--pane', '%1', '--socket', '/elsewhere/other.sock'])
+    writeFileSync(`${w.dir}/collector.pid`, `${old.pid} %1\n`)
+    refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+    assert.equal(refused.code, 1, refused.out)
+    assert.match(refused.out, /SIGTERM/)
+    assert.ok(alive(old.pid!), 'not killed')
+    old.kill('SIGTERM')
+    await until(() => !alive(old.pid!), 'the old collector to exit')
+    rmSync(`${w.dir}/collector.pid`)
+
+    const nothing = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
+    assert.equal(nothing.code, 0, nothing.out)
+    assert.match(nothing.out, /nothing to migrate/)
+  } finally {
+    for (const child of w.children) child.kill('SIGTERM')
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test('S2 launch: legacy state → busy + migrate, nothing started; after migrate it starts its own beside a stateless legacy collector, untouched', { timeout: 60_000 }, () =>
   exclusive(async () => {
     let w: Live | undefined
     try {
-      w = await live('s2a')
+      w = await live('s2')
       const dir = sessionDirOf(v3Of(w.root), w.session)
       mkdirSync(`${dir}/collector.lock`, { recursive: true })
-      const old = fake(w, 'launcher.node.ts')
       const pane = await hostPane(w.session)
-      const err = await busyLaunch(w, pane)
-      assert.match(err, /busy: .*collector\.lock.*--migrate-launcher/)
+      assert.match(await busyLaunch(w, pane), /busy: .*collector\.lock.*--migrate-launcher/)
       assert.ok(!hasRecord(w), 'no fake readiness')
       assert.equal(collectors(w.session).length, 0, 'nothing started')
-      const refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
-      assert.equal(refused.code, 1, refused.out)
-      assert.match(refused.out, new RegExp(`busy: .*pid ${old.pid}`))
-      assert.ok(existsSync(`${dir}/collector.lock`), 'nothing moved while the old launcher runs')
-      assert.ok(alive(old.pid!), 'migrate kills nothing')
-      old.kill('SIGTERM')
-      await until(() => !alive(old.pid!), 'the old launcher to exit')
-      const dry = await maintenance(w.root, ['--migrate-launcher', w.session])
-      assert.equal(dry.code, 1)
-      assert.match(dry.out, /would move collector\.lock/)
       const moved = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
       assert.equal(moved.code, 0, moved.out)
-      const legacy = readdirSync(dir).filter(n => n.startsWith('legacy-'))
-      assert.equal(legacy.length, 1)
-      assert.ok(existsSync(`${dir}/${legacy[0]}/collector.lock`), 'moved, not deleted')
-      assert.ok(!existsSync(`${dir}/collector.lock`))
-      const status = await ready(spawnLauncher(w, pane))
-      assert.equal(status.how, 'started')
-      assert.equal(record(w).pid, status.pid)
-    } finally {
-      await cleanup(w)
-    }
-  }),
-)
-
-test('S2: legacy collector dead but its launcher alive — busy; no reuse, no kill', { timeout: 60_000 }, () =>
-  exclusive(async () => {
-    let w: Live | undefined
-    try {
-      w = await live('s2b')
-      const dir = sessionDirOf(v3Of(w.root), w.session)
-      const gone = spawn(process.execPath, ['-e', ''])
-      await new Promise(r => gone.on('exit', r))
-      const pane = await hostPane(w.session)
-      mkdirSync(dir, { recursive: true })
-      writeFileSync(`${dir}/collector.pid`, `${gone.pid} ${pane}\n`)
-      const old = fake(w, 'launcher.node.ts')
-      assert.match(await busyLaunch(w, pane), /busy: .*collector\.pid.*--migrate-launcher/)
-      assert.ok(!hasRecord(w))
-      const refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
-      assert.equal(refused.code, 1)
-      assert.ok(alive(old.pid!))
-      assert.ok(existsSync(`${dir}/collector.pid`))
-      old.kill('SIGTERM')
-      await until(() => !alive(old.pid!), 'the old launcher to exit')
-      const moved = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
-      assert.equal(moved.code, 0, moved.out)
-      assert.ok(!existsSync(`${dir}/collector.pid`))
-    } finally {
-      await cleanup(w)
-    }
-  }),
-)
-
-test('S2: a live legacy collector whose pid file names this pane number on another socket — busy, not reused, not killed', { timeout: 60_000 }, () =>
-  exclusive(async () => {
-    let w: Live | undefined
-    try {
-      w = await live('s2c')
-      const dir = sessionDirOf(v3Of(w.root), w.session)
-      const pane = await hostPane(w.session)
-      const old = fake(w, 'collector.node.ts', ['--pane', pane, '--socket', '/elsewhere/other.sock'])
-      mkdirSync(dir, { recursive: true })
-      writeFileSync(`${dir}/collector.pid`, `${old.pid} ${pane}\n`)
-      assert.match(await busyLaunch(w, pane), /busy: .*--migrate-launcher/)
-      assert.ok(!hasRecord(w), 'no reuse by pane number')
-      const refused = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
-      assert.equal(refused.code, 1)
-      assert.match(refused.out, /SIGTERM/)
-      assert.ok(alive(old.pid!), 'not killed')
-    } finally {
-      await cleanup(w)
-    }
-  }),
-)
-
-test('S2: a legacy collector without state — the launcher starts its own (readiness from its own pid), the old one untouched', { timeout: 60_000 }, () =>
-  exclusive(async () => {
-    let w: Live | undefined
-    try {
-      w = await live('s2d')
-      const pane = await hostPane(w.session)
       const old = fake(w, 'collector.node.ts', ['--pane', pane])
       const status = await ready(spawnLauncher(w, pane))
       assert.equal(status.how, 'started')
       assert.notEqual(status.pid, old.pid)
       assert.equal(record(w).pid, status.pid)
       assert.ok(alive(old.pid!), 'no wrong kill')
-      const nothing = await maintenance(w.root, ['--migrate-launcher', w.session, '--yes'])
-      assert.equal(nothing.code, 0)
-      assert.match(nothing.out, /nothing to migrate/)
     } finally {
       await cleanup(w)
     }

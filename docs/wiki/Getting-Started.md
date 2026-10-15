@@ -62,9 +62,9 @@ Look around the state directory to understand what the wrapper persists.
 ## Common next steps
 
 - **A longer agent run that signals completion across processes** — pass `start --sentinel /tmp/x.exit` and watch the sentinel file from another shell.
-- **A reusable structured result** — make the agent write the wrapper-provided literal result path and read it via `result --json --wait 30 <name>` or `result wait-required <name> --fields status,summary --wait 60 --json`. See [Recipes](Recipes).
+- **A reusable structured result** — make the agent write the wrapper-provided literal result path and read it via `result --json --wait 30 <name>` or `result wait-required <name> --fields status,summary --wait 60 --json`. See [Recipes](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md).
 - **Inject a secret without leaking it into the command line** — `--secret KEY=op://Vault/Item/field`. See [Observability and Secrets](Observability-and-Secrets).
-- **Run two agents in parallel on the same prompt** — `tmux-agent-fanout run --agent claude:r --agent codex:r --workdir . ...`. See [Recipes](Recipes).
+- **Run two agents in parallel on the same prompt** — `tmux-agent-fanout run --agent claude:r --agent codex:r --workdir . ...`. See [Recipes](https://github.com/ohyeh/tmux-agent-tools/blob/main/skills/tmux-agent-tools/references/recipes.md).
 
 ## When to stop using this
 

@@ -1,5 +1,11 @@
 #!/usr/bin/env zsh
-# Smoke test for Wave 3 session lifecycle helpers in tmux-agent-sessions.
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+# Smoke test for session naming and inventory:
+#   - tmux-agent-sessions resolve/list/diff/cleanup and the watch event stream,
+#     over a fake tmux (no waits: the fake `ls` steps through snapshots);
+#   - the tenant prefix and the wrong-engine hint (status/watch) on one real
+#     session, including no hint across tenant namespaces.
 
 set -euo pipefail
 
@@ -8,13 +14,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
 
 [[ -x "$SESSIONS" ]] || { echo "not executable: $SESSIONS" >&2; exit 1; }
+AGENT="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
 
-WORK="$(mktemp -d -t tmux-agent-sessions-resolve-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-sessions-resolve-smoke.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
-export CLAUDE_TMUX_PREFIX="claude-cli-smoke"
-export CODEX_TMUX_PREFIX="codex-cli-smoke"
-export AGY_TMUX_PREFIX="agy-cli-smoke"
-export TMUX="$WORK/fake-tmux"
+CLAUDE_TMUX_PREFIX="claude-cli-smoke"
+CODEX_TMUX_PREFIX="codex-cli-smoke"
+AGY_TMUX_PREFIX="agy-cli-smoke"
+FAKE_TMUX="$WORK/fake-tmux"
+# Only tmux-agent-sessions gets the fake tmux and prefixes; the engine below
+# uses the real tmux and default prefixes.
+sessions() {
+  TMUX="$FAKE_TMUX" CLAUDE_TMUX_PREFIX="$CLAUDE_TMUX_PREFIX" CODEX_TMUX_PREFIX="$CODEX_TMUX_PREFIX" \
+    AGY_TMUX_PREFIX="$AGY_TMUX_PREFIX" "$SESSIONS" "$@"
+}
 
 cleanup() {
   rm -rf "$WORK"
@@ -22,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$TMUX_AGENT_DIR"
-cat > "$TMUX" <<'EOF'
+cat > "$FAKE_TMUX" <<'EOF'
 #!/usr/bin/env zsh
 set -euo pipefail
 # session_target sends =name: ; real tmux treats that as the exact session name.
@@ -37,7 +50,14 @@ target_session() {
 cmd="${1:-}"
 case "$cmd" in
   ls)
-    cat "$FAKE_TMUX_LS"
+    # With FAKE_TMUX_LS_SEQ each call prints the next numbered snapshot.
+    if [[ -n "${FAKE_TMUX_LS_SEQ:-}" ]]; then
+      n="$(<"$FAKE_TMUX_LS_SEQ/i")"
+      cat "$FAKE_TMUX_LS_SEQ/$n"
+      [[ -f "$FAKE_TMUX_LS_SEQ/$((n + 1))" ]] && print -r -- $((n + 1)) > "$FAKE_TMUX_LS_SEQ/i"
+    else
+      cat "$FAKE_TMUX_LS"
+    fi
     ;;
   has-session)
     shift
@@ -83,7 +103,7 @@ case "$cmd" in
     ;;
 esac
 EOF
-chmod +x "$TMUX"
+chmod +x "$FAKE_TMUX"
 
 export FAKE_TMUX_LS="$WORK/tmux-ls"
 export FAKE_TMUX_CWD="$WORK/tmux-cwd"
@@ -140,55 +160,104 @@ assert_nonzero() {
 }
 
 echo "case: resolve full tmux session"
-full_json="$("$SESSIONS" resolve --name "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475" --json)"
+full_json="$(sessions resolve --name "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475" --json)"
 assert_eq "full session resolves agent name" "$(print -r -- "$full_json" | jq -r '.agent_name')" "trade-pine-c5b475"
 assert_eq "full session resolves wrapper" "$(print -r -- "$full_json" | jq -r '.wrapper')" "agent-tmux claude"
 assert_eq "full session includes wait-and-capture command" "$(print -r -- "$full_json" | jq -r '.recommended_next_commands[] | select(test("wait-and-capture"))' | wc -l | tr -d ' ')" "1"
 
 echo "case: resolve short name"
-short_json="$("$SESSIONS" resolve --name build-bot --json)"
+short_json="$(sessions resolve --name build-bot --json)"
 assert_eq "short name resolves tmux session" "$(print -r -- "$short_json" | jq -r '.tmux_session')" "$CODEX_TMUX_PREFIX-build-bot"
 
 echo "case: resolve ambiguous and no-match fail"
 code=0
-"$SESSIONS" resolve --name trade-pine --json >/dev/null 2>"$WORK/ambiguous.err" || code=$?
+sessions resolve --name trade-pine --json >/dev/null 2>"$WORK/ambiguous.err" || code=$?
 assert_nonzero "ambiguous exits non-zero" "$code"
 assert_eq "ambiguous lists candidates" "$(jq -r '.candidates | length' "$WORK/ambiguous.err")" "2"
 code=0
-"$SESSIONS" resolve --name missing --json >/dev/null 2>"$WORK/missing.err" || code=$?
+sessions resolve --name missing --json >/dev/null 2>"$WORK/missing.err" || code=$?
 assert_nonzero "no-match exits non-zero" "$code"
 
 echo "case: list created-after and diff since"
-created_count="$("$SESSIONS" list --created-after 2026-01-01T12:00:00Z --json | jq -s 'length')"
+created_count="$(sessions list --created-after 2026-01-01T12:00:00Z --json | jq -s 'length')"
 assert_eq "created-after filters list rows" "$created_count" "2"
-cwd_count="$("$SESSIONS" list --cwd "$WORK/repo-b" --json | jq -s 'length')"
+cwd_count="$(sessions list --cwd "$WORK/repo-b" --json | jq -s 'length')"
 assert_eq "cwd filters list rows" "$cwd_count" "1"
-diff_count="$("$SESSIONS" diff --since 2026-01-02T12:00:00Z --json | jq 'length')"
+diff_count="$(sessions diff --since 2026-01-02T12:00:00Z --json | jq 'length')"
 assert_eq "diff returns sessions since timestamp" "$diff_count" "1"
 
 echo "case: cleanup refuses dirty managed worktree unless forced"
 code=0
-"$SESSIONS" cleanup --execute --name trade-pine-c5b475 >/dev/null 2>"$WORK/dirty.err" || code=$?
+sessions cleanup --execute --name trade-pine-c5b475 >/dev/null 2>"$WORK/dirty.err" || code=$?
 assert_nonzero "dirty cleanup exits non-zero" "$code"
 assert_eq "dirty cleanup does not kill" "$(cat "$FAKE_TMUX_KILLS")" ""
-"$SESSIONS" cleanup --execute --name trade-pine-c5b475 --force >/dev/null
+sessions cleanup --execute --name trade-pine-c5b475 --force >/dev/null
 assert_eq "force cleanup kills session" "$(cat "$FAKE_TMUX_KILLS")" "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475"
 
 echo "case: --tool agy accepted and session recognised"
 code=0
-"$SESSIONS" list --tool agy >/dev/null 2>&1 || code=$?
+sessions list --tool agy >/dev/null 2>&1 || code=$?
 assert_eq "--tool agy accepted (exit 0)" "$code" "0"
-agy_count="$("$SESSIONS" list --json --tool agy | jq -s 'map(select(.tool == "agy")) | length')"
+agy_count="$(sessions list --json --tool agy | jq -s 'map(select(.tool == "agy")) | length')"
 assert_eq "agy-cli-smoke-worker1 listed with --tool agy" "$agy_count" "1"
-unfiltered_agy="$("$SESSIONS" list --json | jq -s 'map(select(.tool == "agy" and .agent_name == "worker1")) | length')"
+unfiltered_agy="$(sessions list --json | jq -s 'map(select(.tool == "agy" and .agent_name == "worker1")) | length')"
 assert_eq "agy-cli-smoke-worker1 in unfiltered list" "$unfiltered_agy" "1"
 
 echo "case: invalid --tool error enumerates agy"
 code=0
-"$SESSIONS" list --tool notreal >/dev/null 2>"$WORK/invalid-tool.err" || code=$?
+sessions list --tool notreal >/dev/null 2>"$WORK/invalid-tool.err" || code=$?
 assert_nonzero "invalid --tool exits non-zero" "$code"
 agy_in_err=0; [[ "$(cat "$WORK/invalid-tool.err")" == *"agy"* ]] && agy_in_err=1
 assert_eq "invalid --tool error enumerates agy" "$agy_in_err" "1"
+
+echo "case: watch emits added/removed between ticks, nothing on stable ticks (issue #104)"
+SEQ="$WORK/ls-seq"
+mkdir -p "$SEQ"
+print -r -- 1 > "$SEQ/i"
+cp "$FAKE_TMUX_LS" "$SEQ/1"
+{ cat "$FAKE_TMUX_LS"; print -r -- "$CLAUDE_TMUX_PREFIX-watch-a: 1 windows"; } > "$SEQ/2"
+cp "$FAKE_TMUX_LS" "$SEQ/3"
+events="$(FAKE_TMUX_LS_SEQ="$SEQ" sessions watch --count 3 --interval 0 --tool claude)"
+assert_eq "one session_added for watch-a" "$(jq -sc 'map(select(.event == "session_added")) | map([.schema_version, .tool, .name])' <<< "$events")" '[[1,"claude","watch-a"]]'
+assert_eq "one session_removed for watch-a" "$(jq -sc 'map(select(.event == "session_removed")) | map(.name)' <<< "$events")" '["watch-a"]'
+assert_eq "stable ticks are silent" "$(sessions watch --count 2 --interval 0 --tool claude)" ""
+code=0
+sessions watch --count abc 2>/dev/null || code=$?
+assert_nonzero "bad --count rejected" "$code"
+
+echo "case: tenant prefix"
+assert_eq "default prefix" "$("$AGENT" codex tenant)" "codex-cli"
+assert_eq "tenant suffix" "$(TMUX_AGENT_TOOLS_TENANT=alice "$AGENT" codex tenant)" "codex-cli-alice"
+assert_eq "empty tenant is unset" "$(TMUX_AGENT_TOOLS_TENANT= "$AGENT" codex tenant)" "codex-cli"
+
+echo "case: one real session under tenant t1 — wrong-engine hint, tenant isolation"
+# Answers the preflight --version at once; any other mode waits on stdin.
+FAKE_CLI="$WORK/fake-cli"
+cat > "$FAKE_CLI" <<'EOF'
+#!/bin/sh
+case "${1:-}" in --version) echo "fake 0.0.0"; exit 0 ;; esac
+while IFS= read -r _; do :; done
+EOF
+chmod +x "$FAKE_CLI"
+export TMUX_AGENT_TOOLS_TENANT=t1 CLAUDE="$FAKE_CLI" CODEX="$FAKE_CLI"
+"$AGENT" claude start --exact we-live "$WORK" >/dev/null
+assert_eq "tenant prefix names the tmux session" "$(tmux ls -F '#S' | grep -c '^claude-cli-t1-we-live$')" "1"
+HINT="session exists under claude prefix — wrong engine?"
+own="$("$AGENT" claude status --json we-live 2>/dev/null)"
+assert_eq "owning engine: running, no hint" "$(jq -r '"\(.running) \(.wrong_engine_hint // "absent")"' <<< "$own")" "true absent"
+code=0
+codex_json="$("$AGENT" codex status --json we-live 2>"$WORK/codex.err")" || code=$?
+assert_eq "codex status exit unchanged (0)" "$code" "0"
+assert_eq "codex status stderr hint" "$(cat "$WORK/codex.err")" "hint: $HINT"
+assert_eq "codex status --json hint field" "$(jq -r '.wrong_engine_hint // "absent"' <<< "$codex_json")" "$HINT"
+watch_json="$("$AGENT" codex watch --json --any --timeout 1 --interval 0.1 we-live 2>"$WORK/watch.err" || true)"
+assert_eq "codex watch stderr hint" "$(grep -c -F "hint: $HINT" "$WORK/watch.err")" "1"
+assert_eq "codex watch --json per-agent hint" "$(jq -r '.agents[0].wrong_engine_hint // "absent"' <<< "$watch_json")" "$HINT"
+absent_json="$("$AGENT" codex status --json we-absent 2>"$WORK/absent.err")"
+assert_eq "no hint for a globally absent name" "$(cat "$WORK/absent.err")$(jq -r '.wrong_engine_hint // "absent"' <<< "$absent_json")" "absent"
+ten_json="$(TMUX_AGENT_TOOLS_TENANT=t2 "$AGENT" codex status --json we-live 2>"$WORK/ten.err")"
+assert_eq "another tenant sees no hint" "$(cat "$WORK/ten.err")$(jq -r '.wrong_engine_hint // "absent"' <<< "$ten_json")" "absent"
+"$AGENT" claude stop we-live >/dev/null 2>&1 || true
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

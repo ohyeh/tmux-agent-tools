@@ -1,13 +1,16 @@
 #!/usr/bin/env zsh
-# Smoke test for v2 session-meta.json sidecar contract and session_id_pattern
-# profile parser.
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
+source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
+# Smoke test for v2 session-meta.json sidecar contract, session_id_pattern
+# profile parser and per-session tags.
 #
-# Covers (source-only-safe — no real tmux sessions):
+# Covers:
 #   - sidecar seeded null by result init
 #   - profile parser accepts session_id_pattern (no unknown-key warning)
 #   - profile parser warns on unknown key
-#   - capture no-op when pattern unset (explicit blank-pattern profile)
-#   - result --field .cli_session_id fallback reads sidecar (B1)
+#   - result --field .cli_session_id lookups (fixture table: sidecar / result.json)
+#   - --tag persisted and read back, sessions list --tag filter (one real session)
+#   - codex/agy transcript correlation fixtures, transcript bail signal
 #   - real session_meta_validate: missing / null / valid / malformed UUID
 #   - real spawn_session_id_capture over a fake tmux pane: label-anchored
 #     UUID written, decoy UUID ignored, non-UUID pane leaves the sidecar null
@@ -18,11 +21,57 @@ SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 CLAUDE_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" claude)"
+CODEX_TMUX="$("$REPO_ROOT/scripts/lib/cli-launcher" codex)"
 AGENT_TMUX="$REPO_ROOT/skills/tmux-agent-tools/scripts/agent-tmux"
+SESSIONS="$REPO_ROOT/skills/tmux-agent-tools/scripts/tmux-agent-sessions"
 
-WORK="$(mktemp -d -t tmux-agent-meta-smoke.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-meta-smoke.XXXXXX")"
 export TMUX_AGENT_DIR="$WORK/state"
 trap 'rm -rf "$WORK"' EXIT
+
+# The pane capturer sleeps 2 s before each read (product constant): start its
+# loops first, in their own engine process, so the wait overlaps the rest.
+# This fake tmux prints $FAKE_PANES/<session> and logs each read; a missing
+# file fails the read, which ends that loop.
+FAKE_PANES="$WORK/panes"
+mkdir -p "$FAKE_PANES"
+cat > "$WORK/fake-tmux" <<FAKE
+#!/bin/sh
+while [ \$# -gt 0 ]; do [ "\$1" = -t ] && t="\$2"; shift; done
+t="\${t#=}"; t="\${t%:}"
+echo "\$t" >> "$WORK/pane-reads"
+cat "$FAKE_PANES/\$t"
+FAKE
+chmod +x "$WORK/fake-tmux"
+LABEL_UUID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+DECOY_UUID="ddddeeee-ffff-1111-2222-333344445555"
+printf 'Starting claude...\nSession ID: %s\nReady.\n' "$LABEL_UUID" > "$FAKE_PANES/label"
+printf 'Tool call result: %s\nSession ID: %s\nReady.\n' "$DECOY_UUID" "$LABEL_UUID" > "$FAKE_PANES/decoy"
+printf 'Session: short-not-uuid\nid: 12345\n' > "$FAKE_PANES/nouuid"
+for c in label decoy nouuid; do jq -n '{schema_version:1, cli_session_id: null}' > "$WORK/cap-$c.json"; done
+: > "$WORK/pane-reads"
+# The loops run behind start; whatever they print lands on start's stdout (cap.out).
+TMUX_AGENT_TOOLS_SOURCE_ONLY=1 ENGINE="$AGENT_TMUX" W="$WORK" zsh -c '
+  set -- codex
+  source "$ENGINE"
+  TMUX="$W/fake-tmux"; TMUX_SOCKET_ARGS=()
+  SESSION_ID_PATTERN="Session ID:"
+  spawn_session_id_capture label label "$W/cap-label.json"
+  spawn_session_id_capture decoy decoy "$W/cap-decoy.json"
+  SESSION_ID_PATTERN="."
+  spawn_session_id_capture nouuid nouuid "$W/cap-nouuid.json"
+' > "$WORK/cap.out"
+
+# One real tagged session (#124). The fake answers the preflight --version at
+# once; any other mode waits on stdin.
+FAKE_CLI="$WORK/fake-cli"
+cat > "$FAKE_CLI" <<'EOF'
+#!/bin/sh
+case "${1:-}" in --version) echo "fake 0.0.0"; exit 0 ;; esac
+while IFS= read -r _; do :; done
+EOF
+chmod +x "$FAKE_CLI"
+CODEX="$FAKE_CLI" "$CODEX_TMUX" start --exact --tag project=alpha --tag owner=paul tagged "$WORK" >/dev/null
 
 PASS=0
 FAIL=0
@@ -95,7 +144,7 @@ usage_kind=Code
 session_id_pattern=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}
 PROFILE
 
-KNOWN_KEY_OUT="$(AGENT_TMUX_PROFILE_DIR="$PROF_DIR" "$CLAUDE_TMUX" doctor 2>&1 || true)"
+KNOWN_KEY_OUT="$(AGENT_TMUX_PROFILE_DIR="$PROF_DIR" "$CLAUDE_TMUX" tenant 2>&1 || true)"
 if [[ "$KNOWN_KEY_OUT" == *"unknown profile key 'session_id_pattern'"* ]]; then
   echo "  FAIL session_id_pattern treated as unknown key" >&2
   FAIL=$((FAIL + 1))
@@ -113,103 +162,44 @@ heuristic_family=claude
 truly_unknown_key=something
 PROFILE
 
-WARN_OUT="$(AGENT_TMUX_PROFILE_DIR="$PROF_DIR" "$CLAUDE_TMUX" doctor 2>&1 || true)"
+WARN_OUT="$(AGENT_TMUX_PROFILE_DIR="$PROF_DIR" "$CLAUDE_TMUX" tenant 2>&1 || true)"
 assert_contains "unknown key triggers warning" "$WARN_OUT" "unknown profile key"
 
 # ---------------------------------------------------------------------------
-# Part 4: capture no-op when pattern explicitly blank
-# (bundled claude.conf now HAS a pattern; use a custom profile with empty pattern)
+# Part 6: result --field cli_session_id lookups (fixture table)
 # ---------------------------------------------------------------------------
-echo "--- Part 4: capture no-op when pattern unset/blank"
+echo "--- Part 6: result --field cli_session_id lookups"
 
-NOOP_PROF_DIR="$WORK/noop-profiles"
-mkdir -p "$NOOP_PROF_DIR"
-cat > "$NOOP_PROF_DIR/claude.conf" <<'PROFILE'
-bin=claude
-env_ns=CLAUDE
-prefix=claude-cli
-heuristic_family=claude
-session_id_pattern=
-PROFILE
-
-mkdir -p "$TMUX_AGENT_DIR/noop-test"
-"$CLAUDE_TMUX" result init noop-test >/dev/null
-NOOP_META="$TMUX_AGENT_DIR/noop-test/session-meta.json"
-sleep 1  # no background capture should fire with blank pattern
-assert "capture no-op: sidecar stays null with blank pattern" \
-  "$(jq -r '.cli_session_id // "null"' "$NOOP_META")" "null"
-
-# ---------------------------------------------------------------------------
-# Part 6: result --field .cli_session_id sidecar read
-# ---------------------------------------------------------------------------
-echo "--- Part 6: result --field .cli_session_id sidecar read"
-
-mkdir -p "$TMUX_AGENT_DIR/field-test"
-"$CLAUDE_TMUX" result init field-test >/dev/null
-FIELD_META="$TMUX_AGENT_DIR/field-test/session-meta.json"
-
-# 6a: sidecar null → exit 1 (result init seeds null)
-code=0
-out="$("$CLAUDE_TMUX" result --field .cli_session_id field-test 2>&1)" || code=$?
-assert "field: null sidecar exits 1" "$code" "1"
-
-# 6b: write a UUID into sidecar; result.json present (seeded by result init)
 FIELD_UUID="bbbbcccc-dddd-4444-aaaa-eeeeffffaaaa"
-jq -n --arg id "$FIELD_UUID" '{schema_version:1, cli_session_id: $id}' > "$FIELD_META"
-code=0
-out="$("$CLAUDE_TMUX" result --field .cli_session_id field-test 2>&1)" || code=$?
-assert "field: UUID from sidecar exit=0 (result.json present)" "$code" "0"
-assert "field: UUID value correct" "$out" "$FIELD_UUID"
-
-# 6c: dot-less variant also works
-code=0
-out="$("$CLAUDE_TMUX" result --field cli_session_id field-test 2>&1)" || code=$?
-assert "field: no-dot variant works" "$code" "0"
-assert "field: no-dot UUID value correct" "$out" "$FIELD_UUID"
-
-# ---------------------------------------------------------------------------
-# Part 6d: timing — result --field .cli_session_id works when result.json ABSENT
-# This is the primary v2 resume window: post-start, pre-final-result.
-# result init is NOT called here — reproduces the real use-case.
-# ---------------------------------------------------------------------------
-echo "--- Part 6d: field read when result.json absent (timing fix)"
-
-TIMING_UUID="ccccdddd-eeee-4444-9999-aaaabbbbcccc"
-mkdir -p "$TMUX_AGENT_DIR/timing-test"
-# Write ONLY the sidecar — no result.json (mirrors post-start state).
-jq -n --arg id "$TIMING_UUID" '{schema_version:1, cli_session_id: $id}' \
-  > "$TMUX_AGENT_DIR/timing-test/session-meta.json"
-
-code=0
-out="$("$CLAUDE_TMUX" result --field .cli_session_id timing-test 2>&1)" || code=$?
-assert "timing: UUID returned when result.json absent (exit=0)" "$code" "0"
-assert "timing: UUID value correct" "$out" "$TIMING_UUID"
-
-# Also confirm no result.json was created as a side-effect.
-assert "timing: result.json still absent after field read" \
-  "$(test -f "$TMUX_AGENT_DIR/timing-test/result.json" && echo yes || echo no)" "no"
+# <name> <result init: 1|0> <sidecar cli_session_id: json> <field> <expected exit:stdout>
+# init=0 is the v2 resume window: post-start, pre-final-result (no result.json).
+while read -r name init sid field want; do
+  mkdir -p "$TMUX_AGENT_DIR/$name"
+  (( init )) && "$CLAUDE_TMUX" result init "$name" >/dev/null </dev/null
+  [[ "$sid" == seeded ]] || jq -n --argjson id "$sid" '{schema_version:1, cli_session_id: $id}' > "$TMUX_AGENT_DIR/$name/session-meta.json"
+  code=0; out="$("$CLAUDE_TMUX" result --field "$field" "$name" 2>/dev/null </dev/null)" || code=$?
+  assert "field $name" "$code:$out" "${want//UUID/$FIELD_UUID}"
+done <<EOF
+null-sidecar   1 seeded        .cli_session_id 1:
+uuid-sidecar   1 "$FIELD_UUID" .cli_session_id 0:UUID
+no-dot         1 "$FIELD_UUID" cli_session_id  0:UUID
+no-result-json 0 "$FIELD_UUID" .cli_session_id 0:UUID
+non-uuid       1 "not-a-uuid"  .cli_session_id 1:
+EOF
+assert "field read creates no result.json" \
+  "$(test -f "$TMUX_AGENT_DIR/no-result-json/result.json" && echo yes || echo no)" "no"
 
 # ---------------------------------------------------------------------------
-# Part 7: B1 security — read rejects non-UUID sidecar
+# Part 8: --tag persisted and read back; sessions list --tag filter (#124)
 # ---------------------------------------------------------------------------
-echo "--- Part 7: B1 validation guards"
-# read fallback rejects hand-written non-UUID sidecar → exit 1
-mkdir -p "$TMUX_AGENT_DIR/invalid-sid-test"
-"$CLAUDE_TMUX" result init invalid-sid-test >/dev/null
-INVALID_META="$TMUX_AGENT_DIR/invalid-sid-test/session-meta.json"
-# Overwrite sidecar with a non-UUID value (simulates hand-edit or CLI format drift)
-jq -n '{schema_version:1, cli_session_id: "not-a-uuid"}' > "$INVALID_META"
-code=0
-out="$("$CLAUDE_TMUX" result --field .cli_session_id invalid-sid-test 2>&1)" || code=$?
-assert "read: non-UUID sidecar → exit 1" "$code" "1"
-# Must not print the invalid value to stdout
-if [[ "$out" == *"not-a-uuid"* ]]; then
-  echo "  FAIL read: non-UUID value leaked to stdout" >&2
-  FAIL=$((FAIL + 1))
-else
-  echo "  ok   read: non-UUID value not printed to stdout"
-  PASS=$((PASS + 1))
-fi
+echo "--- Part 8: tags"
+assert "tags read back" "$("$CODEX_TMUX" tags tagged | jq -c '[.project, .owner]')" '["alpha","paul"]'
+tag_rows() { "$SESSIONS" list --json --tag "$1" 2>/dev/null | jq -rs 'map(select(.name == "tagged")) | length'; }
+assert "list --tag project=alpha finds it" "$(tag_rows project=alpha)" "1"
+assert "list --tag project=beta does not" "$(tag_rows project=beta)" "0"
+code=0; "$CODEX_TMUX" start --exact --tag noequals bad "$WORK" >/dev/null 2>&1 || code=$?
+assert "--tag without = exit=2" "$code" "2"
+"$CODEX_TMUX" stop tagged >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Part 9: structured transcript/store correlation helpers (P3)
@@ -276,7 +266,6 @@ rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
 MULTI_A="66666666-6666-4666-8666-666666666666"
 MULTI_B="77777777-7777-4777-8777-777777777777"
 _codex_file "$MULTI_A" "$MULTI_A" "$CODEX_CWD" >/dev/null
-sleep 1
 _codex_file "$MULTI_B" "$MULTI_B" "$CODEX_CWD" >/dev/null
 touch -t 203001010001.00 "$CODEX_ROOT/2030/01/01/rollout-2030-01-01T00-00-00-$MULTI_B.jsonl"
 code=0; out="$(session_id_correlate_codex "$CODEX_ROOT" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT")" || code=$?
@@ -340,17 +329,13 @@ code=0; out="$(session_id_correlate_agy "$AGY_ROOT" "$AGY_CWD" "$SINCE")" || cod
 assert "agy correlate: decoy db ignored" "$out" "ok $AGY_UUID"
 
 BAIL_META="$WORK/bail-meta.json"
-BAIL_ERR="$WORK/bail.err"
 jq -n '{schema_version:1, cli_session_id:null}' > "$BAIL_META"
 rm -rf "$CODEX_ROOT"; mkdir -p "$CODEX_ROOT/2030/01/01"
 AGENT_TMUX_CODEX_SESSIONS_ROOT="$CODEX_ROOT"
 AGENT_TMUX_SESSION_ID_CAPTURE_TIMEOUT=0
-(
-  spawn_transcript_session_id_capture codex bail-test "$BAIL_META" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT"
-  sleep 2
-) 2> "$BAIL_ERR"
+# The capturer is disowned; the substitution returns when it closes stderr (exits).
+BAIL_TEXT="$( (spawn_transcript_session_id_capture codex bail-test "$BAIL_META" "$CODEX_CWD" "$SINCE" "$CODEX_SNAPSHOT") 2>&1 >/dev/null )"
 unset AGENT_TMUX_CODEX_SESSIONS_ROOT AGENT_TMUX_SESSION_ID_CAPTURE_TIMEOUT
-BAIL_TEXT="$(<"$BAIL_ERR")"
 BAIL_LINES=("${(@f)BAIL_TEXT}")
 assert "transcript bail: exactly one signal" "${#BAIL_LINES[@]}" "1"
 assert_contains "transcript bail: signal reason" "${BAIL_LINES[1]}" '"reason":"no_candidate"'
@@ -376,46 +361,26 @@ assert "malformed UUID sidecar -> malformed:not-a-uuid" "$(validate "$WORK/meta-
 jq -n '{schema_version:1, cli_session_id: "550e8400-e29b-41d4-a716"}' > "$WORK/meta-badlen.json"
 assert_contains "truncated UUID sidecar -> malformed: prefix" "$(validate "$WORK/meta-badlen.json")" "malformed:"
 
-# The capturer reads `$TMUX capture-pane -t =<session>: -p`. This fake prints
-# $FAKE_PANES/<session>; a missing file fails, which ends the capture loop.
-FAKE_PANES="$WORK/panes"
-mkdir -p "$FAKE_PANES"
-cat > "$WORK/fake-tmux" <<FAKE
-#!/bin/sh
-while [ \$# -gt 0 ]; do [ "\$1" = -t ] && t="\$2"; shift; done
-t="\${t#=}"; t="\${t%:}"
-cat "$FAKE_PANES/\$t"
-FAKE
-chmod +x "$WORK/fake-tmux"
-TMUX="$WORK/fake-tmux"
-TMUX_SOCKET_ARGS=()
-
-LABEL_UUID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-DECOY_UUID="ddddeeee-ffff-1111-2222-333344445555"
-printf 'Starting claude...\nSession ID: %s\nReady.\n' "$LABEL_UUID" > "$FAKE_PANES/label"
-printf 'Tool call result: %s\nSession ID: %s\nReady.\n' "$DECOY_UUID" "$LABEL_UUID" > "$FAKE_PANES/decoy"
-printf 'Session: short-not-uuid\nid: 12345\n' > "$FAKE_PANES/nouuid"
-for c in label decoy nouuid; do jq -n '{schema_version:1, cli_session_id: null}' > "$WORK/cap-$c.json"; done
-SESSION_ID_PATTERN='Session ID:'
-# The loop runs behind start; whatever it prints lands on start's stdout.
-spawn_session_id_capture label label "$WORK/cap-label.json" >>"$WORK/cap.out"
-spawn_session_id_capture decoy decoy "$WORK/cap-decoy.json" >>"$WORK/cap.out"
-SESSION_ID_PATTERN='.'
-spawn_session_id_capture nouuid nouuid "$WORK/cap-nouuid.json" >>"$WORK/cap.out"
+# The capture loops were started at the top. Each pass reads the pane 2 s
+# apart (product constant), so the polls below are bounded past that.
+reads() { grep -cx -- "$1" "$WORK/pane-reads" || true; }
+until_reads() {  # <session> <count>: wait for that many reads, 0.05 s polls
+  local i
+  for i in {1..60}; do (( $(reads "$1") >= $2 )) && return 0; sleep 0.05; done
+  return 1
+}
 captured() { jq -r '.cli_session_id // "null"' "$WORK/cap-$1.json"; }
-# The loop sleeps 2 s before its first read; all three start together.
-for _ in {1..40}; do
-  [[ "$(captured label)" != null && "$(captured decoy)" != null ]] && break
-  sleep 0.25
-done
-sleep 0.5
+until_reads nouuid 1 || echo "  (nouuid first read never came)"
+# Drop the pane after pass 1: pass 2 runs the loop body again (a repeated zsh
+# `local` once printed the pane there), then its read fails and the loop ends.
+rm -f "$FAKE_PANES/nouuid"
+until_reads nouuid 2 || echo "  (nouuid second read never came)"
 assert "capture: labeled UUID written" "$(captured label)" "$LABEL_UUID"
 assert "capture: decoy UUID on an unlabeled line ignored" "$(captured decoy)" "$LABEL_UUID"
 assert "capture: non-UUID pane leaves the sidecar null" "$(captured nouuid)" "null"
 assert "capture: written sidecar validates ok" "$(validate "$WORK/cap-label.json")" "ok"
-sleep 2.5  # the nouuid loop's second pass (a repeated zsh `local` printed the pane)
+assert "capture: second pass ran" "$(reads nouuid)" "2"
 assert "capture: prints nothing to start's stdout" "$(cat "$WORK/cap.out")" ""
-rm -f "$FAKE_PANES/nouuid"  # its loop polls until the pane read fails
 
 # ---------------------------------------------------------------------------
 echo
