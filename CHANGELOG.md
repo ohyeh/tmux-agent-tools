@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Smokes: `run-all-smokes` stops with one line when `mcp-adapter/node_modules` is missing (exit 2), and runs three load-sensitive smokes (dispatch-delivery, assign-dialog, session-meta) alone after the parallel pool (remote-44 B10; suite wall 96 s → about 150 s locally).
+- Smokes: a failing smoke's output is kept in `$XDG_STATE_HOME/tmux-agent-tools/smoke-failures/<time>/` and the path is printed; the scratch dir is still removed.
+- Skill `using-tmux-agent-tools` §COLLECTOR: a chain of steps that need no commander judgment runs as one runbook with per-step evidence, not a `tell` per step; the worker stops at a hard-stop gate or the first failure.
+- Not verified: Linux; remote-44 rerun of the full suite.
+
 ## v0.46.13 - 2026-10-16
 
 - Not verified: Linux; a reload with the panel unfolded seen live (contract tests only).
