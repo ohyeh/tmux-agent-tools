@@ -222,6 +222,10 @@ for test_file in "${test_files[@]}"; do
 
   if (( m_code != 0 )); then
     overall_failed=1
+    # Kept after the scratch dir is gone: a caller that truncates stdout still has the assertion (W43-23).
+    [[ -n "${kept_dir:-}" ]] || kept_dir="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/smoke-failures/$(date +%Y%m%dT%H%M%S)"
+    [[ ! -f "$out_file" ]] || { mkdir -p "$kept_dir" && cp "$out_file" "$kept_dir/"; } \
+      || echo "run-all-smokes: could not keep failing output in $kept_dir" >&2
   fi
 done
 
@@ -238,4 +242,5 @@ for idx in {1..${#result_names[@]}}; do
 done
 
 echo "suite wall: $(( $(date +%s) - suite_started_at ))s (${#result_names[@]} tests, PARALLEL_JOBS=$PARALLEL_JOBS)"
+[[ -z "${kept_dir:-}" ]] || echo "failing output kept: $kept_dir"
 exit "$overall_failed"
