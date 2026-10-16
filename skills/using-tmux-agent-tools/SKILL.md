@@ -90,6 +90,14 @@ and uses "commander is not Claude Code" below.
    answer. Done with it → `mcp__tmux-agent__stop`. Never `send`, `send-wait`,
    `status`, `capture`, `result` or `stop` from Bash while the mod is loaded —
    its Bash gate denies them and names the tool to use instead (`--help` passes).
+   A chain whose steps need no commander judgment (device run 1 → 2 → 3, build →
+   install → test) is ONE runbook, not a `tell` per step: the brief names the
+   runbook file and the host-wide lock of each exclusive resource it uses; the
+   worker takes the locks, runs a step, writes that step's command and output to
+   the run dir, and goes on to the next step itself. It stops and reports at a
+   hard-stop gate (user approval, an irreversible step) or on the first failure;
+   only then does the commander step in.
+   Negative case: a `tell` loop whose messages only say "next step".
 6. `profile` is any agent-tmux cli or profile name — `codex`, `agy`, `cursor`,
    `grok`, `claude`, or a custom `~/.config/agent-tmux/profiles/<name>.conf`
    (a second `claude` on a provider gateway via its own `--settings` file, or a
