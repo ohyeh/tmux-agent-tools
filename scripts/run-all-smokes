@@ -69,7 +69,16 @@ else
   typeset -a slow=("$script_dir"/{test-core-contract-smoke,test-tui-e2e-smoke,test-mcp-bundle-smoke,test-dispatch-delivery-smoke,test-audit-smoke})
   typeset -a rest=("$script_dir"/test-*-smoke(N))
   test_files=($slow ${rest:|slow})
+  # A fresh clone has no adapter deps: mcp-bundle, mod-permissions and version-sync would fail
+  # three ways for one missing step (remote-44 B10, 2026-10-15).
+  if [[ ! -d "$repo_root/mcp-adapter/node_modules" ]]; then
+    echo "run-all-smokes: mcp-adapter/node_modules missing; run: npm --prefix mcp-adapter ci" >&2
+    exit 2
+  fi
 fi
+# Load-sensitive: FAIL under PARALLEL_JOBS=4 on remote-44 and PASS alone (B10). They run one at a
+# time after the pool, so the default job count needs no manual serial rerun.
+typeset -a serial_names=(test-dispatch-delivery-smoke test-assign-dialog-smoke test-session-meta-smoke)
 
 if (( ${#test_files[@]} == 0 )); then
   echo "run-all-smokes: no smoke tests found" >&2
@@ -150,24 +159,36 @@ wait_for_slot() {
   done
 }
 
-for test_file in "${test_files[@]}"; do
-  test_name="${test_file:t}"
-  out_file="$scratch_dir/${test_name}.out"
-  meta_file="$scratch_dir/${test_name}.meta"
+start_job() {
+  local test_file="$1" test_name="${1:t}" job_dir
   job_dir="$(mktemp -d /tmp/tas-job.XXXXXX)"
   job_dirs+=("$job_dir")
-
-  wait_for_slot
-
-  run_job "$test_file" "$out_file" "$meta_file" "$job_dir" &
+  run_job "$test_file" "$scratch_dir/${test_name}.out" "$scratch_dir/${test_name}.meta" "$job_dir" &
   pids+=($!)
   active_jobs=$(( active_jobs + 1 ))
-done
+}
+wait_all() {
+  for p in "${pids[@]}"; do
+    wait "$p" 2>/dev/null || true
+  done
+  pids=()
+  active_jobs=0
+}
 
-for p in "${pids[@]}"; do
-  wait "$p" 2>/dev/null || true
+typeset -a serial_files=()
+for test_file in "${test_files[@]}"; do
+  if (( ${serial_names[(Ie)${test_file:t}]} )); then
+    serial_files+=("$test_file")
+    continue
+  fi
+  wait_for_slot
+  start_job "$test_file"
 done
-pids=()
+wait_all
+for test_file in "${serial_files[@]}"; do
+  start_job "$test_file"
+  wait_all
+done
 
 typeset -a result_names=() result_labels=() result_codes=() result_durations=() result_attempts=()
 typeset -i overall_failed=0
