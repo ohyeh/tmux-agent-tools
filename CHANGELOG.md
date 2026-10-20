@@ -1,13 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.46.14 - 2026-10-20
 
 - Wrapper: a later round's result instruction (`--episode` 2 or more) adds "Write it only to that path: the result path of an earlier round is closed." on the schema line (the marker line stays `<marker> <path>`). Cause: argon wrote every round to the first round's root `result.json` too (that file reached `episode=5`). SKILL.md: a missing result is re-prompted with that round's `resultPath` from `episodes/<n>/dispatch.json`; `result --path <name>` is the first round's path only. Consensus advisor + sol (`agent-scripts/.workflow/202610201030-episode-result-paths/consensus.md`); moving round 1 to `episodes/1/` is a backlog item there. Test: `test-result-path-once-smoke` asserts the line on episode 2 and not on episode 1 (fails without the change). Known, not from this change: `test-assign-smoke` "cursor resumes by id" fails at cd95cec too (`--trust --yolo` twice).
 - Fix (tmux-agent mod, collector; duplicate notice): a result copied to another episode's path is not a second notice. On 2026-10-20 an argon worker wrote episode 2's result to `episodes/2/result.json` and, 2 s later, the same bytes to the root `result.json` (episode 1's path). `observe` sent the root copy as `unattributed` at once, and `collect` sent the real one after the settle hold: the same text twice. Now `observe` skips a snapshot whose `episode` names another episode when that episode's own path holds the same bytes; that file is (or was) delivered by its collector. A copy that differs, or a named episode with nothing on its own path, is still a notice; an unreadable own path (logged) is no notice that tick (F7/F8). Test: both paths with one text give one notice, before and after the episode closes (fails without the change). Core contract 346 pass, plugin tests 224 pass, mod typecheck and version sync pass.
 - Smokes: `run-all-smokes` stops with one line when `mcp-adapter/node_modules` is missing (exit 2), and runs three load-sensitive smokes (dispatch-delivery, assign-dialog, session-meta) alone after the parallel pool (remote-44 B10; suite wall 96 s → about 150 s locally).
 - Smokes: a failing smoke's output is kept in `$XDG_STATE_HOME/tmux-agent-tools/smoke-failures/<time>/` and the path is printed; the scratch dir is still removed.
 - Skill `using-tmux-agent-tools` §COLLECTOR: a chain of steps that need no commander judgment runs as one runbook with per-step evidence, not a `tell` per step; the worker stops at a hard-stop gate or the first failure.
-- Not verified: Linux; remote-44 rerun of the full suite.
+- Not verified: Linux; remote-44 rerun of the full suite. Known failing: `test-assign-smoke` "cursor resumes by id" (`--trust --yolo` twice), failing at cd95cec before this release's changes.
 
 ## v0.46.13 - 2026-10-16
 
@@ -348,7 +348,7 @@
 - The collector heartbeat runs on its own 10s clock. Before, it rode `reconcileOnce`, which joins an in-flight pass, so one pass slower than 90s stopped the beat and another session in the same repo adopted this live session's workers and took their delivery (observed 2026-09-26: five workers re-owned by an idle session). A paused collector still stops beating on purpose. Reply strings say `workers panel`. Mod tests 152 pass; the new heartbeat test fails with the old wiring.
 - An orphan whose current episode is already acknowledged (by any session) is not claimed: it has nothing left to deliver, and claiming it only moved `owner` away from the session that dispatched it (the five above were all delivered). A `tell` starts a new episode, which is claimable again. Mod tests 153 pass; the new test fails without the guard.
 
-## Unreleased
+## v0.46.14 - 2026-10-20
 
 ## v0.46.0 - 2026-10-09
 
