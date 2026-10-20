@@ -250,6 +250,30 @@ test('unattributed: a closed episode path is still watched (F4-6); an unchanged 
   assert.ok(!existsSync(`${r.stateDir}/episodes/2/acks/done`))
 })
 
+test('unattributed: a copy of the open episode’s result on an older episode’s path is not a second notice', async () => {
+  const w = world()
+  const r = await assigned(w)
+  writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+  const gate = newGate()
+  await reconcile(w.host, gate, false)
+  const d = (await scan(w.host, { claim: false })).visible[0]!
+  await tellWorker(w.host, d, 'next')
+  const copy = result({ episode: 2, summary: 'round two' })
+  mkdirSync(`${r.stateDir}/episodes/2`, { recursive: true })
+  writeFileSync(`${r.stateDir}/episodes/2/result.json`, copy)
+  writeFileSync(`${r.stateDir}/result.json`, copy)
+  utimesSync(`${r.stateDir}/result.json`, new Date(), new Date(Date.now() + 2000))
+  await reconcile(w.host, gate, false)
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 2, 'episode 1, then episode 2 once')
+  assert.match(w.woken[1]!, /round two/)
+  assert.doesNotMatch(w.woken[1]!, /unattributed/)
+  const e = (await scan(w.host, { claim: false })).visible[0]!
+  await tellWorker(w.host, e, 'third')
+  await reconcile(w.host, gate, false)
+  assert.equal(w.woken.length, 2, 'the copy is not news after episode 2 closed either')
+})
+
 test('expiry: an attributed result older than the window is delivered once as expired and closes (F4-5); a stale seed closes nothing', async () => {
   const w = world()
   const r = await assigned(w)

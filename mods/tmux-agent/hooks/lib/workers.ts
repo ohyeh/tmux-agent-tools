@@ -1538,6 +1538,10 @@ export async function observe(host: Host, s: Scan, budget: number, read: Readonl
       if (typeof status !== 'string' || !TERMINAL.has(status)) continue
       // Attributed to the path's own OPEN episode: that episode's collector delivers it.
       if (own && episodeMatches(raw?.episode ?? raw?.body?.episode, own.seq)) continue
+      // A copy, on another episode's path, of what the named episode's own path holds: that
+      // file is (or was) delivered by its collector (2026-10-20: argon wrote episode 2's result to both).
+      const named = eps.find(d => d.resultPath && d.resultPath !== path && episodeMatches(raw?.episode ?? raw?.body?.episode, d.seq))
+      if (named && (await readOrAbsent(host, named.resultPath!)) === text) continue
       const observation = await identity(text, b.mtimeMs)
       if (acked.has(observation)) continue
       const sum = raw?.summary ?? raw?.body?.summary
