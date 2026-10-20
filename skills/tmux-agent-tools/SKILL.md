@@ -120,7 +120,7 @@ agent-tmux codex result --json --wait 30 worker
 agent-tmux codex supervise --result-required --silent-while-unchanged --json worker
 ```
 
-If `.present:false`, the agent never wrote the file — re-prompt with the literal path from `result --path <name>`. Full schema, worked example, `status --json` fields, approval-gate exit codes, concurrency model: `references/contracts.md`.
+If `.present:false`, the agent never wrote the file — re-prompt with that round's literal path: `resultPath` in `episodes/<n>/dispatch.json` of the open round (`result --path <name>` is the first round's path only). Full schema, worked example, `status --json` fields, approval-gate exit codes, concurrency model: `references/contracts.md`.
 
 ## Safety
 

@@ -2969,6 +2969,8 @@ result_path_should_inject() {
 result_path_prepend() {
   local schema="$RESULT_SCHEMA_LINE"
   [[ -n "$RESULT_EPISODE" ]] && schema+=" Also include episode: the number $RESULT_EPISODE (not a string)."
+  # A later round restates the path: a worker writes the first round's path from memory (2026-10-20, argon).
+  [[ "$RESULT_EPISODE" =~ ^[0-9]+$ ]] && (( RESULT_EPISODE > 1 )) && schema+=" Write it only to that path: the result path of an earlier round is closed."
   printf '%s %s\n%s\n\n%s' "$RESULT_PATH_MARKER" "${RESULT_PATH_OVERRIDE:-$(agent_root_dir)/$1/result.json}" \
     "$schema" "$2"
 }

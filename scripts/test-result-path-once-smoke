@@ -110,6 +110,7 @@ route_start() {
   p="$(pane_until rp-start "got:first-task")"
   assert_contains "start names the given path" "$p" "$RP: $P1"
   assert_contains "start asks for episode 1" "$p" "episode: the number 1"
+  assert "episode 1 has no earlier round" "$(yn grep -q 'earlier round' <<<"$p")" "no"
   default_rp="$(cx result --path rp-start)"
   sentinel="${default_rp:h}/.result-path-injected"
   assert "route leaves the session sentinel alone" "$(yn test -e "$sentinel")" "no"
@@ -202,6 +203,7 @@ cx send --result-path "$P2" --episode 2 rp1 "second-again" >/dev/null
 p="$(pane_until rp1 "got:second-again")"
 assert "episode-2 path named on each send" "$c1 $(count "$p" "$RP: $P2")" "1 2"
 assert_contains "episode 2 asked for" "$p" "episode: the number 2"
+assert_contains "episode 2 closes earlier paths" "$p" "earlier round is closed"
 assert "still no session sentinel" "$(yn test -e "$sentinel")" "no"
 
 echo "case: bad route flags are refused before anything is sent"
