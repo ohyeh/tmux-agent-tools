@@ -1541,7 +1541,9 @@ export async function observe(host: Host, s: Scan, budget: number, read: Readonl
       // A copy, on another episode's path, of what the named episode's own path holds: that
       // file is (or was) delivered by its collector (2026-10-20: argon wrote episode 2's result to both).
       const named = eps.find(d => d.resultPath && d.resultPath !== path && episodeMatches(raw?.episode ?? raw?.body?.episode, d.seq))
-      if (named && (await readOrAbsent(host, named.resultPath!)) === text) continue
+      // Unknown (logged) is no notice this tick, never a guess (F7/F8).
+      const theirs = named && (await readOrAbsent(host, named.resultPath!))
+      if (theirs === text || theirs === UNKNOWN) continue
       const observation = await identity(text, b.mtimeMs)
       if (acked.has(observation)) continue
       const sum = raw?.summary ?? raw?.body?.summary
