@@ -54,7 +54,7 @@ marketplace checkout 裡的那份（`~/.claude/plugins/marketplaces/tmux-agent-t
 - `.v3/<name>/episodes/<seq>/dispatch.json`：每一輪（assign 是第 1 輪，每次 `tell` 開下一輪）
   的描述，寫一次不改：`seq`、`since`、開它的 session（第 0 代 owner）、`goal`、`base`、
   這一輪的 `resultPath`、`origin`。
-- `episodes/<seq>/sent/`、`acks/<kind>/`：`mkdir` 建一次、不刪不剪。`acks/done|expired|cancel`
+- `episodes/<seq>/sent/`、`acks/<kind>/`：`mkdir` 建一次、不刪不剪。`acks/done|expired|cancel|superseded`
   關掉這一輪；`acks/launch|exited|unattributed-*` 只記通知送過了。
 - `episodes/<seq>/claims/<gen>/owner`：接手孤兒時 `mkdir` 下一代，搶輸的拿到 `EEXIST`。
 - `.v3/.sessions/<hex(sid)>/act/<n>` 加 `.beat`（key 是 session id 的 UTF-8 位元組 hex）：每次 reload 註冊一個 activation，每次對帳

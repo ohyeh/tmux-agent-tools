@@ -296,6 +296,8 @@ export const TERMINAL = new Set(['success', 'failed', 'blocked', 'needs-input'])
 /** Not a worker status: this mod's own word for "the launch itself never took". */
 export const LAUNCH_FAILED = 'launch-failed'
 export const EXITED = 'exited'
+/** Not a worker status: a later episode of the same worker opened before this one wrote a result. Acked, never announced. */
+export const SUPERSEDED = 'superseded'
 // agent-tmux has no `--` terminator (assign_session's flag loop has no `--)` case),
 // so this anchored allowlist IS the guard against argv flag smuggling.
 export const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
@@ -712,11 +714,12 @@ export const settled = (reported: ReadonlySet<string>, d: TmuxDispatch) => repor
 /** An episode's dir under the v5 root. */
 export const episodeDirOf = (v3: string, d: TmuxDispatch) => `${v3}/${d.name}/episodes/${d.seq ?? 0}`
 /** Closed = done | expired | cancel (contract N1). */
-export const CLOSED_ACKS = ['done', 'expired', 'cancel']
+export const CLOSED_ACKS = ['done', 'expired', 'cancel', SUPERSEDED]
 /** The ack directory a finished notice is recorded under (§5). */
 export function ackKindOf(f: Finished): string {
   if (f.status === LAUNCH_FAILED) return 'launch'
   if (f.status === EXITED) return 'exited'
+  if (f.status === SUPERSEDED) return SUPERSEDED
   if (f.status === EXPIRED) return 'expired'
   if (f.status === UNATTRIBUTED) return f.observation!
   return 'done'
@@ -1406,6 +1409,15 @@ export async function collect(
         }
       }
       if (!terminal || !raw || typeof status !== 'string') {
+        // A tell opened a later episode before this one wrote a result: the work
+        // went on there. Closed quietly, so a gone pane later reports only the
+        // latest episode (observed 2026-10-21: six old episodes re-reported).
+        // A result it still writes is delivered by `observe` as unattributed.
+        const later = ready.find(o => o.name === d.name && (o.seq ?? 0) > (d.seq ?? 0))
+        if (later) {
+          out.push({ d, path, status: SUPERSEDED, summary: `superseded by episode ${later.seq} before it wrote a result` })
+          continue
+        }
         // No result and no pane: nothing will ever arrive. Delivered once as
         // `exited` and acknowledged, so it leaves /workers instead of sitting there
         // until someone presses stop (observed 2026-09-17: two dead fixtures on
@@ -1788,7 +1800,7 @@ export async function flagStalls(
         if (!exitText || !exitText.trim()) continue
       }
       gate.stalled.delete(id)
-      if (wake && !gate.exited.has(id)) host.log(`tmux-agent: ${d.name}: pane gone with no result (status exists=${String(row.exists)} running=${String(row.running)})`)
+      if (wake && !gate.exited.has(id)) host.log(`tmux-agent: ${d.name}: episode ${d.seq ?? 0} pane gone with no result (status exists=${String(row.exists)} running=${String(row.running)})`)
       gate.exited.add(id)
       continue
     }
@@ -2198,7 +2210,10 @@ export async function partitionWaiters(
   gate: Gate,
   done: readonly Finished[],
 ): Promise<{ deliver: Finished[]; silent: Finished[] }> {
-  if (!done.some(f => f.d.waiter)) return { deliver: [...done], silent: [] }
+  // A superseded episode is closed, never announced, whoever waits on it.
+  const quiet = done.filter(f => f.status === SUPERSEDED)
+  done = done.filter(f => f.status !== SUPERSEDED)
+  if (!done.some(f => f.d.waiter)) return { deliver: [...done], silent: quiet }
   let listed: readonly { id: string; status: string }[]
   try {
     listed = await host.agentList()
@@ -2208,11 +2223,11 @@ export async function partitionWaiters(
       const kind = error instanceof Error ? error.name : typeof error
       host.log(`tmux-agent: agent.list failed: ${kind}: ${String(error)}`)
     }
-    return { deliver: done.filter(f => !f.d.waiter), silent: [] }
+    return { deliver: done.filter(f => !f.d.waiter), silent: quiet }
   }
   const byId = new Map(listed.map(a => [a.id, a.status]))
   const deliver: Finished[] = []
-  const silent: Finished[] = []
+  const silent: Finished[] = [...quiet]
   for (const f of done) {
     const waiter = f.d.waiter
     if (!waiter) {

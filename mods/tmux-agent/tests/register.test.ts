@@ -308,7 +308,7 @@ const live = (session: string): Files => ({
 /** Every `<name>#<seq>` with a closing ack (done | expired | cancel): what the collector delivered or closed. */
 const closedIn = (files: Files) =>
   Object.keys(files)
-    .map(k => /^.*\/\.v3\/([^/]+)\/episodes\/(\d+)\/acks\/(done|expired|cancel)\/$/.exec(k))
+    .map(k => /^.*\/\.v3\/([^/]+)\/episodes\/(\d+)\/acks\/(done|expired|cancel|superseded)\/$/.exec(k))
     .filter((m): m is RegExpExecArray => !!m)
     .map(m => `${m[1]}#${m[2]}`)
     .sort()
@@ -316,7 +316,7 @@ const closedIn = (files: Files) =>
 /** Every notice the collector recorded: closing acks as `<name>#<seq>`, launch/exit notices as `<name>#<seq>#launch|exited`. */
 const ackedIn = (files: Files) =>
   Object.keys(files)
-    .map(k => /^.*\/\.v3\/([^/]+)\/episodes\/(\d+)\/acks\/(done|expired|cancel|launch|exited)\/$/.exec(k))
+    .map(k => /^.*\/\.v3\/([^/]+)\/episodes\/(\d+)\/acks\/(done|expired|cancel|superseded|launch|exited)\/$/.exec(k))
     .filter((m): m is RegExpExecArray => !!m)
     .map(m => (['launch', 'exited'].includes(m[3]!) ? `${m[1]}#${m[2]}#${m[3]}` : `${m[1]}#${m[2]}`))
     .sort()
@@ -1894,6 +1894,26 @@ describe('stall detection', () => {
     }
     expect(woken.length, 'exited is said once').toEqual(1)
     expect(namesIn((await $.command.run(run('outstanding'))).text)).toEqual([])
+  })
+
+  test('a gone pane reports only its latest episode; earlier ones with no result close quietly as superseded', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0), ...episode('w1', 2, 1), ...episode('w1', 3, 2), [`${V3}/w1/launch.exit`]: '0\n' })
+    const woken: string[] = []
+    const logs = mockQuiet(on, woken)
+    mockStatus(on, { exists: false, running: false })
+
+    for (let i = 0; i < 4; i += 1) {
+      await $.turn.complete(turn())
+      await clock.advance(10_000)
+    }
+
+    expect(woken.length, 'one notice, for the latest episode').toEqual(1)
+    expect(woken[0]).toContain('"w1" on codex: exited')
+    expect(store.acked().sort()).toEqual(['w1#1', 'w1#2', 'w1#3#exited'])
+    expect(logs.filter(l => l.includes('pane gone')).every(l => l.includes('episode 3 '))).toEqual(true)
   })
 
   test('a session that does not exist YET is not exited: the launch receipt gates the verdict', WITH_DRIVER, async ($, on) => {

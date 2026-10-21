@@ -316,7 +316,7 @@ export async function currentOwner(host: Host, episode: string, gen0Owner: strin
   return { gen: g, session: complete ? text.trim() : undefined, complete, createdMs }
 }
 
-const CLAIM_CLOSED = ['done', 'expired', 'cancel'] as const
+const CLAIM_CLOSED = ['done', 'expired', 'cancel', 'superseded'] as const
 
 /** `true` when a closing ack exists. `unknown` = the ack dirs could not be read (not "open"). */
 async function closedForClaim(host: Host, episode: string): Promise<boolean | 'unknown'> {
@@ -335,7 +335,7 @@ async function closedForClaim(host: Host, episode: string): Promise<boolean | 'u
 /**
  * Contest the next claim gen for `me`. Allowed only when the current owner session is
  * non-live, or the max gen is incomplete and ORPHAN_MS old. A closed episode
- * (`acks/done|expired|cancel`) is never re-claimed. The owner file is
+ * (`acks/done|expired|cancel|superseded`) is never re-claimed. The owner file is
  * published by tmp + rename, newline-terminated, so a torn read is incomplete.
  */
 export async function claim(
