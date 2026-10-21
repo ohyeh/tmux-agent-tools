@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix (mod): an episode with no result is closed as `acks/superseded`, with no notice, once a later episode of the same worker exists (open or delivered). Before, a gone pane re-reported every such episode as `exited` (six at once, 2026-10-21). A result it writes later still arrives as unattributed. The `pane gone` log names its episode.
+
 ## v0.46.14 - 2026-10-20
 
 - Wrapper: a later round's result instruction (`--episode` 2 or more) adds "Write it only to that path: the result path of an earlier round is closed." on the schema line (the marker line stays `<marker> <path>`). Cause: argon wrote every round to the first round's root `result.json` too (that file reached `episode=5`). SKILL.md: a missing result is re-prompted with that round's `resultPath` from `episodes/<n>/dispatch.json`; `result --path <name>` is the first round's path only. Consensus advisor + sol (`agent-scripts/.workflow/202610201030-episode-result-paths/consensus.md`); moving round 1 to `episodes/1/` is a backlog item there. Test: `test-result-path-once-smoke` asserts the line on episode 2 and not on episode 1 (fails without the change). Known, not from this change: `test-assign-smoke` "cursor resumes by id" fails at cd95cec too (`--trust --yolo` twice).

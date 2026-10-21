@@ -1343,6 +1343,8 @@ export async function collect(
   exited: ReadonlySet<string> = new Set(),
   reported: ReadonlySet<string> = new Set(),
   from?: string,
+  // Every episode on disk, closed ones too: a later one supersedes whether or not it delivered.
+  all: readonly TmuxDispatch[] = ready,
 ): Promise<{ finished: Finished[]; unfinished: TmuxDispatch[]; terminal: Set<string>; read: Set<string>; resume?: string }> {
   const now = await host.now()
   const deadline = now + COLLECT_BUDGET_MS
@@ -1413,7 +1415,7 @@ export async function collect(
         // went on there. Closed quietly, so a gone pane later reports only the
         // latest episode (observed 2026-10-21: six old episodes re-reported).
         // A result it still writes is delivered by `observe` as unattributed.
-        const later = ready.find(o => o.name === d.name && (o.seq ?? 0) > (d.seq ?? 0))
+        const later = all.find(o => o.name === d.name && (o.seq ?? 0) > (d.seq ?? 0))
         if (later) {
           out.push({ d, path, status: SUPERSEDED, summary: `superseded by episode ${later.seq} before it wrote a result` })
           continue
@@ -2307,7 +2309,7 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
   await refreshProjects(host, gate, s.visible)
   const reported = s.reported
   const pending = s.dispatches.filter(d => d.seq && !reported.has(idOf(d)))
-  const { finished: collected, unfinished, terminal, read, resume } = await collect(host, v3, pending, gate.exited, reported, gate.collectFrom)
+  const { finished: collected, unfinished, terminal, read, resume } = await collect(host, v3, pending, gate.exited, reported, gate.collectFrom, s.dispatches)
   gate.collectFrom = resume
   const done = [...collected, ...(await observe(host, s, Math.max(0, BATCH_MAX - collected.length), read, terminal))]
 

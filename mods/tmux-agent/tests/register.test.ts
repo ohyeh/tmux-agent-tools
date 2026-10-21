@@ -1913,7 +1913,27 @@ describe('stall detection', () => {
     expect(woken.length, 'one notice, for the latest episode').toEqual(1)
     expect(woken[0]).toContain('"w1" on codex: exited')
     expect(store.acked().sort()).toEqual(['w1#1', 'w1#2', 'w1#3#exited'])
-    expect(logs.filter(l => l.includes('pane gone')).every(l => l.includes('episode 3 '))).toEqual(true)
+    const gone = logs.filter(l => l.includes('pane gone'))
+    expect(gone.length).toBeGreaterThan(0)
+    expect(gone.every(l => l.includes('episode 3 '))).toEqual(true)
+  })
+
+  test('an episode a later DELIVERED one superseded is closed quietly when the pane goes', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    const store = mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0), ...episode('w1', 2, 1), ...acked('w1', 2), [`${V3}/w1/launch.exit`]: '0\n' })
+    const woken: string[] = []
+    mockQuiet(on, woken)
+    mockStatus(on, { exists: false, running: false })
+
+    for (let i = 0; i < 4; i += 1) {
+      await $.turn.complete(turn())
+      await clock.advance(10_000)
+    }
+
+    expect(woken, 'the work went on in episode 2, which delivered').toEqual([])
+    expect(store.acked().sort()).toEqual(['w1#1', 'w1#2'])
   })
 
   test('a session that does not exist YET is not exited: the launch receipt gates the verdict', WITH_DRIVER, async ($, on) => {
