@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.46.15 - 2026-10-21
 
+- Not verified: Linux; the superseded close seen live on a real gone pane (plugin tests only).
 - Fix (mod): an episode with no result is closed as `acks/superseded`, with no notice, once a later episode of the same worker exists (open or delivered). Before, a gone pane re-reported every such episode as `exited` (six at once, 2026-10-21). A result it writes later still arrives as unattributed. The `pane gone` log names its episode.
 
 ## v0.46.14 - 2026-10-20
