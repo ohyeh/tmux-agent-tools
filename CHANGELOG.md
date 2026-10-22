@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.46.20 - 2026-10-23
+
+- Fix (`status` runtime blocker, W43-24/W44-11): a codex worker stopped on a usage limit read "running" when codex drew finished `• Called` cells below its `■` banner: the classifier read only the last 10 lines, and any later bullet cleared the hit. It now scans from the last sent prompt (a column-0 glyph line; an indented `>`/`→` is tool output), and a `■` banner holds while the CLI sits at its drawn composer, until a newer prompt. With no composer drawn, later cells end it as before. The real W43-24 pane is a fixture; smoke on v0.46.19: 122 passed, 4 failed; after: 126 passed. Live (old classifier, other pane shape): the collector reported a stuck sol worker "stalled for 2 min — quota_exhausted".
+- Not verified: a claude/agy `■`-style banner on a live pane; non-`■` hits are now read from the whole pane when no column-0 prompt sits above them (the old 10-line tail dropped an old hit; no live pane has this shape); `test-dispatch-gate-hook-smoke` failed once under the parallel `run-all-smokes` and passed twice alone; a codex footer or open slash menu below a stuck composer (L1: both err toward missing the banner). Pre-existing failures as in v0.46.19.
+
 ## v0.46.19 - 2026-10-23
 
 - Fix (core `tellWorker`): v0.46.18 refused every give-back tell on cursor (live): the given-back message was multi-line text and C-u cleared only the wrapped line before the cursor, so the composer stayed a draft and the tell sent nothing (no message lost). One C-c empties a non-empty cursor composer; it then shows "Press Ctrl+C again to exit" for under 2 s. The clear key is now C-c when the interrupt key was C-c (cursor), else C-u, and it is never pressed while "again to exit" shows. Live on cursor with this core: receipt "interrupted its running turn first (C-c); it had not answered, so the message it gave back (episode 3) is sent again ahead of this one"; the next episode answered the base message with its correction; the interrupted episode closed as superseded.
