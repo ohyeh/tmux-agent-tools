@@ -10,3 +10,4 @@ Pane captures for `agent-tmux <cli> composer-state` (collector.contract.node.ts)
   trusted folder with the real HOME (account email and project path redacted). `agy-permission.txt` is
   the trust-folder menu; agy runs tools with no prompt when `toolPermission` is `always-proceed`.
 - `fake-cursor.mjs`: a stand-in composer for the delivery tests.
+- `cursor-agent-busy-hint.txt`, `cursor-agent-interrupted-draft.txt`: real captures of cursor-agent v2026.10.22, 2026-10-23 (sid and path redacted): mid-turn with the `ctrl+c to stop` footer, and the screen after one C-c sent before any output (the cancelled message is back in the composer).

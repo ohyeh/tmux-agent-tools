@@ -1,0 +1,24 @@
+ux-agent-tools/scripts/agent-tmux cursor capture cint-probe.64vgt 120
+
+
+
+  Cursor Agent
+  v2026.10.22-27dcf5f
+  Tip: Use /run-everything to skip all approvals.
+
+                                                                               
+  [Pasted text #1 +9 lines]                                                    
+                                                                               
+
+ ⠘⠆ Working
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → Add a follow-up                                             ctrl+c to stop 
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  [Grok 4.7 500K High Fast] │ cursor-live
+  Sleep Probe Report
+  Context ░░░░░░ 0%
+  plan: 90% (2d 19h) | auto: 89% (2d 19h) | api: 100% (2d 19h)
+  1 CLAUDE.md | 2 MCPs | 9 hooks
+  sid: 00000000-0000-0000-0000-000000000000
+  max
+

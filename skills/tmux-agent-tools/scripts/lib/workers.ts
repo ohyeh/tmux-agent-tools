@@ -2855,6 +2855,8 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
     }
     const me = host.owner()
     if (!me) return { ok: false, text: 'this host has no session id; tell refuses to open an episode without an owner (§3)' }
+    const stopped = await interruptBeforeTell(host, d)
+    if (stopped && !stopped.ok) return stopped
     const since = Math.max(await host.now(), d.since + 1)
     // The new episode's work starts from wherever the repo is now.
     const head = await host.run(['git', '-C', d.dir, 'rev-parse', 'HEAD'], d.dir, COMMIT_PROBE_MS).catch(gitFailed)
@@ -2912,7 +2914,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
           `the message may have arrived. Peek at "${d.name}" before telling it again${moved}`,
       }
     }
-    return { ok: true, seq: ep.seq, text: `sent to "${d.name}" on ${d.profile} as episode ${ep.seq}; its result goes to ${ep.resultPath}${moved}` }
+    return { ok: true, seq: ep.seq, text: `sent to "${d.name}" on ${d.profile} as episode ${ep.seq}; its result goes to ${ep.resultPath}${moved}${stopped ? `; ${stopped.text}` : ''}` }
   }, releaseNote)
 }
 
@@ -3179,14 +3181,79 @@ export async function interruptWorker(host: Host, d: TmuxDispatch): Promise<Outc
     .run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(session)], d.dir, MIRROR_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (pane.exitCode !== 0) return { ok: false, text: `capture for "${d.name}" exited ${pane.exitCode}: ${(pane.stderr || pane.stdout).trim().slice(-300)}` }
-  const hint = paneTail(pane.stdout, 15).join('\n').match(INTERRUPT_HINT_RE)
+  const hint = interruptHint(pane.stdout)
   if (!hint) return { ok: false, text: `"${d.name}" shows no "esc/ctrl+c to interrupt" hint — it is not mid-turn; nothing sent` }
-  const key = /^esc/i.test(hint[1]!) ? 'Escape' : 'C-c'
+  const { key } = hint
   const run = await host
     .run(['tmux', 'send-keys', '-t', exactSessionTarget(session), key], d.dir, LIVE_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (run.exitCode !== 0) return { ok: false, text: `send-keys exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
-  return { ok: true, text: `interrupted ${d.name} with ${key} (its screen said "${hint[0]}"); the next message steers it` }
+  return { ok: true, text: `interrupted ${d.name} with ${key} (its screen said "${hint.said}"); the next message steers it` }
+}
+
+/** The interrupt hint in a pane's tail and the key it names, or undefined. */
+function interruptHint(pane: string): { key: 'Escape' | 'C-c'; said: string } | undefined {
+  const hint = paneTail(pane, 15).join('\n').match(INTERRUPT_HINT_RE)
+  return hint ? { key: /^esc/i.test(hint[1]!) ? 'Escape' : 'C-c', said: hint[0] } : undefined
+}
+
+/** How long a tell waits for an interrupted turn to stop before it gives up and sends nothing. */
+export const TELL_INTERRUPT_WAIT_MS = 10_000
+
+/**
+ * Is the worker mid-turn? A turn shows either its CLI's interrupt hint or a
+ * spinner `composer-state` classifies as `busy` (line 2: the key); each misses
+ * a real case (cursor's spinner without its footer, its footer without a spinner).
+ * `{ key }` = busy, no key = both probes answered and neither is busy (`state` is
+ * composer-state's line 1), `undefined` = a probe failed: not evidence either way.
+ */
+async function turnOf(host: Host, d: TmuxDispatch): Promise<{ key?: 'Escape' | 'C-c'; state?: string; session: string } | undefined> {
+  const session = [...(await liveSessions(host, d.dir))].find(sname => sname.endsWith(`-${d.name}`))
+  if (!session) return undefined
+  const fail = (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) })
+  const pane = await host.run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(session)], d.dir, MIRROR_PROBE_MS).catch(fail)
+  const hint = pane.exitCode === 0 ? interruptHint(pane.stdout) : undefined
+  if (hint) return { key: hint.key, session }
+  const cs = await host.run(['agent-tmux', d.profile, 'composer-state', d.name], d.dir, STALL_PROBE_MS).catch(fail)
+  if (cs.exitCode !== 0) return undefined
+  const [state, key] = cs.stdout.split('\n')
+  if (state === 'busy') return key === 'Escape' || key === 'C-c' ? { key, session } : undefined
+  return pane.exitCode === 0 ? { state, session } : undefined
+}
+
+/**
+ * Owner ruling 2026-10-23: a tell to a worker mid-turn stops that turn first.
+ * A CLI that queues a message sent mid-turn (cursor) would start it minutes
+ * later, and the old turn's result rewrites would read as news. One key, never
+ * two (C-c at an idle prompt quits some CLIs); then wait until a probe answers
+ * not-busy. A failed probe is not a stop. Cursor puts a message cancelled before
+ * any output back in the composer (live 2026-10-23): a draft there gets one C-u,
+ * and the tell goes out only once the composer reads empty. Known limit: a bare shell
+ * `agent-tmux send` does not take `.action` and can land between the key and the send.
+ * `undefined` = not mid-turn (or no evidence): send as before.
+ */
+async function interruptBeforeTell(host: Host, d: TmuxDispatch): Promise<Outcome | undefined> {
+  const first = await turnOf(host, d)
+  if (!first) host.log(`tmux-agent: tell ${d.name}: busy probe failed; sending without an interrupt`)
+  if (!first?.key || !first.session) return undefined
+  const sent = await host
+    .run(['tmux', 'send-keys', '-t', exactSessionTarget(first.session), first.key], d.dir, LIVE_PROBE_MS)
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  if (sent.exitCode !== 0) {
+    return { ok: false, text: `"${d.name}" is mid-turn and send-keys ${first.key} exited ${sent.exitCode}: ${(sent.stderr || sent.stdout).trim().slice(-300)}; nothing was sent` }
+  }
+  const deadline = (await host.now()) + TELL_INTERRUPT_WAIT_MS
+  let cleared = false
+  while ((await host.now()) < deadline) {
+    await host.run(['sleep', '1'], d.dir, 6_000).catch(() => undefined)
+    const now = await turnOf(host, d)
+    if (!now || now.key) continue
+    if (now.state !== 'draft') return { ok: true, text: `interrupted its running turn first (${first.key}${cleared ? ', then C-u on the message it gave back' : ''})` }
+    if (cleared) continue
+    cleared = true
+    await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(now.session), 'C-u'], d.dir, LIVE_PROBE_MS).catch(() => undefined)
+  }
+  return { ok: false, text: `"${d.name}" was mid-turn; ${first.key} did not leave it idle with an empty composer within ${TELL_INTERRUPT_WAIT_MS / 1000}s (or its screen could not be read); nothing was sent. Peek at it, then tell again or stop it` }
 }
 
 /** Touch this collector's heartbeat; a failure is logged once per tick, never fatal. */

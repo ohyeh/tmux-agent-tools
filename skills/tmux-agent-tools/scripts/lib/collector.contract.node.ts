@@ -578,6 +578,8 @@ test('composer-state: every captured pane gets its class (real codex, cursor-age
     ['cursor', 'cursor-agent-multiline.txt', 'empty'],
     ['cursor', 'cursor-agent-draft.txt', 'draft', 'R74-DRAFT-KEEPME unsent draft text'],
     ['cursor', 'cursor-agent-busy.txt', 'busy'],
+    ['cursor', 'cursor-agent-busy-hint.txt', 'busy'], // live 2026-10-23: `→ Add a follow-up … ctrl+c to stop` mid-turn
+    ['cursor', 'cursor-agent-interrupted-draft.txt', 'draft', '[Pasted text #1 +9 lines]'], // one C-c before any output: the message comes back
     ['claude', 'claude-empty.txt', 'empty'],
     ['claude', 'claude-draft.txt', 'draft', 'R74 draft text keep me'],
     ['claude', 'claude-multiline.txt', 'draft', 'GOAL: line one of the brief\nline two\nline three'],
@@ -607,6 +609,35 @@ test('composer-state: every captured pane gets its class (real codex, cursor-age
   } finally {
     await srv.tmux(['-S', srv.sock, 'kill-server'])
     rmSync(srv.dir, { recursive: true, force: true })
+  }
+})
+
+test('composer-state: busy names its key on line 2, and a profile is classified by its bin (tell interrupts with it)', async t => {
+  const profiles = mkdtempSync(join(tmpdir(), 'cprof-'))
+  writeFileSync(`${profiles}/myclaude.conf`, 'bin=claude\n')
+  writeFileSync(`${profiles}/mycursor.conf`, 'bin=cursor-agent\n')
+  const want: [string[], string, string][] = [
+    [['codex'], 'codex-busy.txt', 'busy\nEscape'],
+    [['cursor'], 'cursor-agent-busy.txt', 'busy\nC-c'],
+    [['myclaude', '--profile-dir', profiles], 'claude-busy.txt', 'busy\nEscape'],
+    [['mycursor', '--profile-dir', profiles], 'cursor-agent-busy.txt', 'busy\nC-c'],
+    [['myclaude', '--profile-dir', profiles], 'claude-empty.txt', 'empty'],
+  ]
+  const srv = privateServer()
+  try {
+    for (const [i, [cli, file, out]] of want.entries()) {
+      const path = new URL(`./fixtures/composer/${file}`, import.meta.url).pathname
+      const up = await srv.tmux(['new-session', '-d', '-s', `p${i}`, '-x', '200', '-y', '50', `cat ${path}; sleep 60`])
+      if (up.code !== 0) return t.skip('no private tmux server can start here')
+      const pane = (await srv.tmux(['display-message', '-p', '-t', `p${i}`, '#{pane_id}'])).out.trim()
+      await new Promise(r => setTimeout(r, 300))
+      const got = await new Promise<string>(resolve => execFile(AGENT_TMUX, [...cli, 'composer-state', '--pane', pane], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))
+      assert.equal(got.trim(), out, `${cli[0]} ${file}`)
+    }
+  } finally {
+    await srv.tmux(['-S', srv.sock, 'kill-server'])
+    rmSync(srv.dir, { recursive: true, force: true })
+    rmSync(profiles, { recursive: true, force: true })
   }
 })
 

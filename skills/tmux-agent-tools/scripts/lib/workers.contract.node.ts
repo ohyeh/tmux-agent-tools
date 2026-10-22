@@ -148,6 +148,104 @@ test('tell: resumed worker → seq 1 on episodes/1; assigned worker → seq 2; s
   assert.equal(read(`${r.stateDir}/episodes/2/dispatch.json`).resultPath, `${r.stateDir}/episodes/2/result.json`)
 })
 
+/**
+ * A worker whose screen changes per probe: each capture-pane answers the next
+ * screen (the last repeats); `null` = that probe fails. The clock moves 1 s a
+ * call and `sleep` returns at once, so the 10 s wait runs instantly.
+ */
+async function turnWorld(screens: { pane: string | null; cs?: string | null }[], keyExit = 0) {
+  let i = -1
+  let name = ''
+  const at = () => screens[Math.min(Math.max(i, 0), screens.length - 1)]!
+  const w = world({
+    answer: argv => {
+      if (argv[0] === 'tmux' && argv[1] === 'ls') return { exitCode: 0, stdout: `cli-astra-${name}\n`, stderr: '' }
+      if (argv[0] === 'tmux' && argv[1] === 'capture-pane') {
+        i++
+        return at().pane === null ? { exitCode: 1, stdout: '', stderr: 'no pane' } : { exitCode: 0, stdout: at().pane!, stderr: '' }
+      }
+      if (argv[0] === 'tmux' && argv[1] === 'send-keys') return { exitCode: keyExit, stdout: '', stderr: keyExit ? 'no server' : '' }
+      if (argv[0] === 'agent-tmux' && argv[2] === 'composer-state') {
+        const cs = at().cs
+        return cs === null ? { exitCode: 1, stdout: '', stderr: 'cannot capture' } : { exitCode: 0, stdout: `${cs ?? 'empty'}\n`, stderr: '' }
+      }
+      return undefined
+    },
+  })
+  const r = await assigned(w)
+  name = r.name
+  let t = await w.host.now()
+  const host: Host = {
+    ...w.host,
+    now: async () => (t += 1_000),
+    run: async (argv, cwd, ms) => (argv[0] === 'sleep' ? { exitCode: 0, stdout: '', stderr: '' } : w.host.run(argv, cwd, ms)),
+  }
+  const d = (await scan(host, { claim: false })).visible[0]!
+  const keys = () => w.calls.filter(c => c.argv[1] === 'send-keys').map(c => c.argv.at(-1))
+  const sent = () => w.calls.some(c => c.argv[0] === 'agent-tmux' && c.argv[2] === 'send')
+  return { ...w, host, d, r, keys, sent }
+}
+
+test('tell to a worker mid-turn: the key its screen names stops the turn first, then the tell goes out (owner 2026-10-23)', async () => {
+  const w = await turnWorld([{ pane: 'Grepping…\n → Add a follow-up        ctrl+c to stop' }, { pane: ' → Add a follow-up', cs: 'empty' }])
+  const out = await tellWorker(w.host, w.d, 'round 2')
+  assert.ok(out.ok, out.text)
+  assert.deepEqual(w.keys(), ['C-c'], 'one key, from the hint')
+  assert.match(out.text, /interrupted its running turn first \(C-c\)/)
+  const at = w.calls.findIndex(c => c.argv[1] === 'send-keys')
+  const send = w.calls.findIndex(c => c.argv[0] === 'agent-tmux' && c.argv[2] === 'send')
+  assert.ok(at >= 0 && send > at, 'the key goes before the send')
+  assert.ok(existsSync(`${w.r.stateDir}/episodes/2/sent`))
+})
+
+test('tell mid-turn with a spinner and no hint: composer-state names the key (a profile worker, Escape)', async () => {
+  const w = await turnWorld([{ pane: '● Ideating… (11s)', cs: 'busy\nEscape' }, { pane: '❯ ', cs: 'empty' }])
+  const out = await tellWorker(w.host, w.d, 'round 2')
+  assert.ok(out.ok, out.text)
+  assert.deepEqual(w.keys(), ['Escape'])
+})
+
+test('tell mid-turn: a turn that does not stop, a key that fails, or a screen that cannot be read after the key sends nothing and opens no episode', async () => {
+  for (const [why, screens, keyExit] of [
+    ['still busy', [{ pane: 'esc to interrupt' }], 0],
+    ['probes fail after the key', [{ pane: 'esc to interrupt' }, { pane: null, cs: null }], 0],
+    ['key fails', [{ pane: 'esc to interrupt' }], 1],
+  ] as const) {
+    const w = await turnWorld([...screens], keyExit)
+    const out = await tellWorker(w.host, w.d, 'round 2')
+    assert.ok(!out.ok, why)
+    assert.match(out.text, /nothing was sent/, why)
+    assert.ok(!w.sent(), `${why}: no send`)
+    assert.ok(!existsSync(`${w.r.stateDir}/episodes/2`), `${why}: no episode`)
+    assert.ok(w.keys().length <= 1, `${why}: never a second key`)
+  }
+})
+
+test('tell mid-turn: a message the interrupt gave back to the composer gets one C-u; a draft that stays sends nothing (cursor, live 2026-10-23)', async () => {
+  const back = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ [Pasted text #1 +9 lines]', cs: 'draft\n[Pasted text #1 +9 lines]' }, { pane: '→ Plan, search, build anything', cs: 'empty' }])
+  const out = await tellWorker(back.host, back.d, 'round 2')
+  assert.ok(out.ok, out.text)
+  assert.deepEqual(back.keys(), ['C-c', 'C-u'])
+  assert.match(out.text, /C-u on the message it gave back/)
+
+  const stays = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ draft', cs: 'draft\nhalf typed' }])
+  const no = await tellWorker(stays.host, stays.d, 'round 2')
+  assert.ok(!no.ok)
+  assert.deepEqual(stays.keys(), ['C-c', 'C-u'], 'one C-u, never repeated')
+  assert.ok(!stays.sent() && !existsSync(`${stays.r.stateDir}/episodes/2`))
+})
+
+test('tell with no busy evidence sends as before: no key (a draft, or a probe that fails is not evidence)', async () => {
+  for (const screens of [[{ pane: 'idle', cs: 'draft\nhalf typed' }], [{ pane: null, cs: null }]]) {
+    const w = await turnWorld(screens)
+    const out = await tellWorker(w.host, w.d, 'round 2')
+    assert.ok(out.ok, out.text)
+    assert.deepEqual(w.keys(), [])
+    assert.ok(w.sent())
+    assert.doesNotMatch(out.text, /interrupted/)
+  }
+})
+
 test('tell: a failed send is uncertain, not aborted (F4) — the episode stays watched and never re-sent', async () => {
   const w = world()
   const r = await assigned(w)

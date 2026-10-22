@@ -2677,10 +2677,15 @@ composer_state_session() {
       target="$(session_target "$(session_for_name "$1")")" ;;
   esac
   local kind=unknown cap
-  case "$CLI" in codex|claude|agy) kind="$CLI" ;; cursor|cursor-agent) kind=cursor ;; esac
+  # A profile (sol, fable, …) names its CLI only through `bin`.
+  case "$CLI" in codex|claude|agy) kind="$CLI" ;; cursor|cursor-agent) kind=cursor ;;
+    *) case "${_bin:t}" in codex|claude|agy) kind="${_bin:t}" ;; cursor|cursor-agent) kind=cursor ;; esac ;; esac
   cap="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane -J -p -t "$target" 2>/dev/null)" \
     || { echo "composer-state: cannot capture $target" >&2; exit 1; }
-  print -r -- "$cap" | _composer_classify "$kind"
+  local out; out="$(print -r -- "$cap" | _composer_classify "$kind")"
+  print -r -- "$out"
+  # busy: line 2 is the key that stops this CLI's turn (tell interrupts before it sends).
+  if [[ "${out%%$'\n'*}" == busy ]]; then [[ "$kind" == cursor ]] && print C-c || print Escape; fi
 }
 
 _paste_submitted_whole() {
