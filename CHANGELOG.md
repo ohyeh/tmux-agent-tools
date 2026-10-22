@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.46.18 - 2026-10-23
+
+- Fix (core `tellWorker`): a message the interrupt gave back is sent again, not cleared away. Cursor drops a message interrupted before any output from its history and puts it back in the composer; v0.46.17 then pressed C-u and the message was gone, so a tell written as a correction to it ("replaces section 1 and 3, the rest stays") had no base. The message is now read from disk first — the latest episode with a `sent` marker: its `tell.md`, or the assign's `brief.md` for episode 1 — then the composer is cleared and the new episode's `tell.md` carries it ahead of the new text (goal stays the new text's first line). Unreadable or empty: nothing cleared, nothing sent, the composer keeps it.
+- Not verified: Linux; the give-back re-send on a live cursor worker (contract tests, and the v0.46.17 live capture of the given-back draft). Assumed: the given-back draft is that latest sent message (its `+N lines` placeholder is not compared). Pre-existing on v0.46.16/17 (full `run-all-smokes`): `test-assign-smoke` "cursor resumes by id" fails; `test-core-contract-smoke` hits its 75 s file bound under parallel load (passes alone); `test-sentinel-smoke` deadline is load-sensitive.
+
 ## v0.46.17 - 2026-10-23
 
 - Feature (core `tellWorker`; mod tool, panel, TUI and workers CLI share it): a tell to a worker mid-turn stops that turn before it sends (owner ruling 2026-10-23). Live 2026-10-23: cursor queued a round-2 tell behind its running turn (`Add a follow-up`); the message started 9 minutes late, and three rewrites of the old turn's result went out as unattributed notices. Busy = the CLI's own interrupt hint on screen, or `composer-state` `busy`. One key (from the hint, else composer-state), then up to 10 s for a not-busy answer; a failed probe is not a stop, and an answer after the deadline sends nothing. A message the interrupt gave back to the composer (cursor, C-c before any output) gets one C-u. Still busy, unreadable, or a draft that stays: nothing sent, no episode. No busy evidence: unchanged. Known limit: a bare shell `agent-tmux send` does not take `.action` and can land between the key and the send.
