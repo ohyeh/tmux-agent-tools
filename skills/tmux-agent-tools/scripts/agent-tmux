@@ -8028,11 +8028,15 @@ runtime_model_error_phrase() {
 #   - the LAST block only: any newer output line (`•`, `⏺`, `⎿`, `└`, `✔`, a "Worked
 #     for" rule) after the error means the worker resumed, so the banner is
 #     history however recent. Unmarked lines are the block's continuation (the
-#     codex banner wraps onto "visit https://…" and "again at …");
-#   - the whole pane's last 10 non-empty lines, no prompt-boundary slicing: codex
-#     draws its banner above the `›` input, and an error printed right after an
-#     echoed `› prompt` is still the newest output. A `›` line is neither an
-#     error nor new output, so it changes nothing.
+#     codex banner wraps onto "visit https://…" and "again at …"). Except a `■`
+#     banner: codex ends its turn there and can still flush finished `• Called`
+#     cells below it (W43-24, live 2026-10-16), so only a newer prompt ends it;
+#   - the current turn: from the last submitted prompt (a composer-glyph line
+#     above the bottom one, which is the composer) down, the whole pane if there
+#     is none. An error printed right after an echoed `› prompt` is still the
+#     newest output; a fixed 10-line tail lost the W43-24 banner.
+#     shortcut: a pane with no composer drawn takes its last echoed prompt for
+#     the composer; add a case when a live CLI shows that shape.
 # Column 0 is a layout rule, not provenance: codex and claude indent a worker's
 # prose under its `•`/`⏺` bullet, so column-0 error text is normally the CLI's
 # own — but a worker can still print a quoted `Error:` there. That is why the
@@ -8043,11 +8047,12 @@ runtime_model_error_phrase() {
 # and the CLI binaries (2026-09-25); their on-screen layout is UNCONFIRMED — add a
 # row when a live pane is captured.
 runtime_blocker_for_text() {
-  local current="$1" line body rest hit="" structured_hit="" limit_false=false in_tool=false lead lead_len
+  local current="$1" line body rest hit="" banner="" structured_hit="" limit_false=false in_tool=false lead lead_len
   local -a recent
   recent=("${(@f)$(awk '
-    /[^[:space:]]/ { lines[++n] = $0 }
-    END { for (i = (n > 10 ? n - 9 : 1); i <= n; i++) print lines[i] }' <<< "$current")}")
+    /^[[:space:]]*(→|›|❯|>)([[:space:]]|$)/ && !/^[[:space:]]*(→|›|❯|>)[[:space:]]+[0-9]+[.)]/ { prev = last; last = NR }
+    { lines[NR] = $0 }
+    END { for (i = (prev ? prev : 1); i <= NR; i++) if (lines[i] ~ /[^[:space:]]/) print lines[i] }' <<< "$current")}")
   for line in "${recent[@]}"; do
     lead="${line%%[![:space:]]*}"
     lead_len="${#lead}"
@@ -8109,6 +8114,7 @@ runtime_blocker_for_text() {
         if [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]]; then
           hit="$(runtime_model_error_phrase "$line")"
         fi
+        [[ "$body" == '■'* && -n "$hit" ]] && banner="$hit"
         limit_false=false
       else
         case "$body" in
@@ -8121,7 +8127,7 @@ runtime_blocker_for_text() {
       fi
     fi
   done
-  local chosen="${structured_hit:-$hit}"
+  local chosen="${structured_hit:-${hit:-$banner}}"
   [[ -n "$chosen" ]] && print -r -- "$chosen"
   return 0
 }

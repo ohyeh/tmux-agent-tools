@@ -85,14 +85,46 @@ again at Sep 25th, 2026 12:32 AM.
   GPT-6-Astra low · tmux-agent-tools · ⚠ 1 warning · f2 to view
 EOF
 
+# W43-24, live codex pane 2026-10-16 (peek said "running", unchanged 8136s): codex
+# drew two `• Called` cells below its banner and stopped. They are not new work,
+# and the banner is more than 10 non-empty lines from the bottom.
+fx codex-quota-flushed-cells quota_exhausted '■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),' <<'EOF'
+› Write final JSON to this exact path: <home>/.local/state/tmux-agent…
+    + Show details
+
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),
+visit https://chatgpt.com/settings/usage to purchase more credits or try again
+at 4:20 PM.
+
+• Called context-mode.ctx_execute
+  └ ```
+
+    {"command":"PARALLEL_JOBS=4 zsh scripts/run-all-smokes","exit":1,"failures"…
+    + Show details
+
+• Called context-mode.ctx_execute
+  └ {"command":"node scripts/check-rules-invariants.mjs","exit":0,"ok":0,"outpu…
+    {"command":"bash scripts/deploy.sh --check","exit":1,"ok":0,"output":"PASS …
+    {"command":"bash scripts/test-deploy-check.sh","exit":1,"ok":2,"output":"FA…
+    + Show details
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol medium · agent-scripts · 01a14372-b8f7-7de1-b06a-6506c54a4f1e · C…
+  ? for shortcuts                                     ⚠ 6 warnings · f2 to view
+EOF
+
 fx prose null <<'EOF'
 • Implemented rate limit handling and a usage limit counter in api/client.ts.
 • Error handling now covers quota errors from the upstream.
 › Ask Codex to do anything
 EOF
 
+# A real resume is a new turn: the owner's next prompt sits below the banner.
 fx old-banner null <<'EOF'
 ■ You’ve hit your usage limit. try again at 12:32 AM.
+› continue
 • resumed after the reset
 • step 1
 • step 2
@@ -128,6 +160,7 @@ EOF
 
 fx resumed-recent null <<'EOF'
 ■ You’ve hit your usage limit.
+› continue
 • resumed after reset
 • Running slow build
 › Ask Codex to do anything
