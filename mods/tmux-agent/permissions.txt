@@ -14,4 +14,6 @@ types ./types/index.d.ts declares on $: $.tmux
 ./register.ts gating hook with .catch: agent.spawn
 ./register.ts calls: $.agent.list, $.agent.register, $.clock.after, $.clock.every, $.clock.now, $.command.register, $.command.run, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.fs.write, $.process.run, $.prompt.submit, $.session.cwd, $.session.id, $.store.delete, $.store.get, $.store.keys, $.store.set, $.tool.register, $.ui.invalidate, $.ui.log, $.ui.resolve, $.ui.toast
 ./register.ts env writes: nothing
-./register.ts env reads: HOME, PATH, TMUX_AGENT_DIR, TMUX_PANE, XDG_STATE_HOME
+./register.ts env reads: HOME, PATH, TMUX_AGENT_DIR, TMUX_AGENT_DISPATCH_GATE, TMUX_PANE, XDG_STATE_HOME
+.claude-plugin/plugin.json icon: No icon (ICON_MISSING). No icon found in the plugin. The validator looked for `icon` in plugin.json and for a file at .claude-plugin/icon.png or .svg, assets/icon.png or .svg, or a similar path.
+hooks/hooks.json names a hooks module (a code file listed under `modules`). The plugin directory has rules of its own for such code, and these checks apply none of them, so passing here does not mean the directory accepts the plugin. The developer portal's own validation applies those rules.

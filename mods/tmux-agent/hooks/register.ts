@@ -1,6 +1,7 @@
 import type {
   EngineInterface,
   HookFailure,
+  ProcessRunResult,
   Register,
   RenderElement,
 } from 'claude-code'
@@ -144,6 +145,35 @@ const WAITER_SYSTEM = [
 
 function stripRuntimeLine(prompt: string): string {
   return prompt.split('\n').filter(line => !RUNTIME_LINE.test(line)).join('\n')
+}
+
+/**
+ * Settings PreToolUse hooks never fire for a mod's tools, so the review-dispatch gate
+ * named by TMUX_AGENT_DISPATCH_GATE runs here, before every model-initiated dispatch,
+ * with a PreToolUse-shaped stdin. Unset: no gate. Exit 2: deny with its stderr. Exit 0:
+ * allow, its stderr as `note`. Anything else (missing file, other exit, spawn error,
+ * timeout) denies: a broken gate must not pass silently.
+ */
+async function runDispatchGate(
+  $: Pick<EngineInterface, 'env' | 'fs' | 'process'>,
+  toolName: string,
+  input: Record<string, string>,
+  session: { id?: string; cwd?: string },
+): Promise<{ deny: string } | { note?: string }> {
+  const gatePath = await $.env.get('TMUX_AGENT_DISPATCH_GATE')
+  if (!gatePath) return {}
+  if (!(await $.fs.exists(gatePath))) return { deny: `tmux-agent: dispatch gate ${gatePath} (TMUX_AGENT_DISPATCH_GATE) does not exist` }
+  const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: toolName, tool_input: input, session_id: session.id ?? '', cwd: session.cwd ?? '' })
+  let r: ProcessRunResult
+  try {
+    r = await $.process.run(['bash', gatePath], { stdin })
+  } catch (error) {
+    return { deny: `tmux-agent: dispatch gate ${gatePath} did not run (${error instanceof Error ? error.message : String(error)})` }
+  }
+  const stderr = r.stderr.trim()
+  if (r.exitCode === 2) return { deny: stderr || `tmux-agent: dispatch gate ${gatePath} denied (exit 2, no reason)` }
+  if (r.exitCode !== 0) return { deny: `tmux-agent: dispatch gate ${gatePath} failed (exit ${r.exitCode})${stderr ? `: ${stderr}` : ''}` }
+  return stderr ? { note: stderr } : {}
 }
 
 /** A spawn's description, reduced to a worker base name. Empty or illegal → `worker`. */
@@ -1494,13 +1524,17 @@ export const register: Register = on => {
   on('tool.call', { tool: TOOL }, async ($, e) => {
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
-    const out = await assignWorker(host, e as unknown as AssignInput, {
-      owner: await idNow(() => $.session.id()),
+    const input = e as unknown as AssignInput
+    const owner = await idNow(() => $.session.id())
+    const gated = await runDispatchGate($, TOOL, { profile: input.profile, name: input.name, dir: input.dir, brief: input.brief }, { id: owner, cwd: sessionCwd })
+    if ('deny' in gated) return gated
+    const out = await assignWorker(host, input, {
+      owner,
       ownerCwd: sessionCwd,
       down: () => collectorDown(gate),
     })
     if ('deny' in out) return { deny: out.deny }
-    return { result: out.receipt }
+    return { result: out.receipt, ...(gated.note ? { context: [gated.note] } : {}) }
   }).catch(($, e, next) => toolFailed(TOOL, next.error))
 
   /**
@@ -1526,10 +1560,13 @@ export const register: Register = on => {
     if (!d) {
       return { deny: `tmux-agent: no worker "${input.name}" was dispatched by this mod (use the exact name the assign receipt returned, suffix included)` }
     }
+    const gated = await runDispatchGate($, TELL_TOOL, { name: input.name, text: input.text }, { id: sessionId, cwd: sessionCwd })
+    if ('deny' in gated) return gated
     const told = await tellWorker(host, d, text)
     if (!told.ok) return { deny: `tmux-agent: ${told.text}` }
     const down = collectorDown(gate)
     return {
+      ...(gated.note ? { context: [gated.note] } : {}),
       result:
         `${told.text}. ` +
         (down
@@ -1677,12 +1714,18 @@ export const register: Register = on => {
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
     const brief = stripRuntimeLine(e.prompt)
+    const assignInput = { profile, name: workerBase(e.description), dir: e.cwd ?? sessionCwd ?? '', brief }
+    const owner = await idNow(() => $.session.id())
+    const gated = await runDispatchGate($, TOOL, assignInput, { id: owner, cwd: sessionCwd })
+    if ('deny' in gated) return gated
+    // shortcut: an Agent spawn result has no text channel to the model, so an exit-0 note is only logged; carry it on the Agent tool result if a gate note ever matters there.
+    if (gated.note) host.log(`dispatch gate note (${assignInput.name}): ${gated.note}`)
     let spawned: Awaited<ReturnType<typeof next>> | undefined
     const assigned = await assignWorker(
       host,
-      { profile, name: workerBase(e.description), dir: e.cwd ?? sessionCwd ?? '', brief },
+      assignInput,
       {
-        owner: await idNow(() => $.session.id()),
+        owner,
         ownerCwd: sessionCwd,
         down: () => collectorDown(gate),
         // Inside the action lock (§5, §8): the binding record names this lock's

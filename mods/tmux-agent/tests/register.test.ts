@@ -6023,3 +6023,116 @@ describe('mid-turn delivery', () => {
     expect(store.acked()).toEqual(['w1#1'])
   })
 })
+
+describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
+  const GATE = `${HOME}/gate.sh`
+  const BRIEF = 'GOAL: review it\nACCEPTANCE: a verdict\nREPORT: PASS or BLOCK'
+  const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  /** A fake gate at GATE answering `exitCode`/`stderr`; every argv and the gate's stdin are recorded. */
+  function setup(on: On, gate: { exitCode: number; stderr?: string } | undefined, env: Record<string, string> = { HOME, TMUX_AGENT_DISPATCH_GATE: GATE }, files: Files = { [GATE]: '#!/bin/bash\n' }) {
+    mock.env(on, env)
+    mock.store(on)
+    mockClock(on)
+    mockFs(on, files)
+    on('ui.log', () => ({ value: undefined }))
+    const argvs: string[][] = []
+    const stdins: unknown[] = []
+    onRun(on, ($, e) => {
+      argvs.push([...e.argv])
+      if (e.argv[0] === 'bash') {
+        stdins.push(JSON.parse(e.init?.stdin ?? 'null'))
+        return { value: { exitCode: gate?.exitCode ?? 0, stdout: '', stderr: gate?.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return ok(e.argv[0] === 'git' ? `${'a'.repeat(40)}\n` : '')
+    })
+    const assigned = () => Object.keys(files).some(p => p.endsWith('/worker.json') && !p.includes('/w1/')) || argvs.some(a => a[0] === 'sh')
+    return { files, argvs, stdins, assigned }
+  }
+  const assign = () => ({ tool: 'mcp__tmux-agent__assign' as const, profile: 'codex', name: 'w1', dir: '/work', brief: BRIEF })
+
+  test('exit 2 denies assign with the gate stderr; nothing is launched', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, { exitCode: 2, stderr: 'BLOCKED: reviewer shopping (w0 said BLOCK)\n' })
+    const out = await $.tool.call(assign())
+    expect(out).toEqual({ deny: 'BLOCKED: reviewer shopping (w0 said BLOCK)' })
+    expect(t.assigned(), 'assignWorker did not run').toBe(false)
+    expect(t.stdins[0]).toMatchObject({
+      hook_event_name: 'PreToolUse',
+      tool_name: 'mcp__tmux-agent__assign',
+      tool_input: { profile: 'codex', name: 'w1', dir: '/work', brief: BRIEF },
+      session_id: 'sess-test',
+    })
+  })
+
+  test('exit 0 lets assign run', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, { exitCode: 0 })
+    const out = await $.tool.call(assign())
+    expect(JSON.stringify(out)).toContain('launch requested')
+    expect(t.argvs.filter(a => a[0] === 'bash'), 'the gate ran once').toHaveLength(1)
+    expect(t.assigned(), 'the probe the deny cases rely on sees a launch').toBe(true)
+    expect(JSON.stringify(out)).not.toContain('context')
+  })
+
+  test('env set but the gate file is missing denies, naming the path', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, undefined, { HOME, TMUX_AGENT_DISPATCH_GATE: GATE }, {})
+    const out = await $.tool.call(assign())
+    expect(JSON.stringify(out)).toContain(`dispatch gate ${GATE}`)
+    expect('deny' in (out as object)).toBe(true)
+    expect(t.argvs.some(a => a[0] === 'bash')).toBe(false)
+    expect(t.assigned()).toBe(false)
+  })
+
+  test('env unset: assign runs and no gate process is spawned', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, { exitCode: 2, stderr: 'never' }, { HOME })
+    const out = await $.tool.call(assign())
+    expect(JSON.stringify(out)).toContain('launch requested')
+    expect(t.argvs.some(a => a[0] === 'bash')).toBe(false)
+  })
+
+  test('exit 0 with stderr: assign runs and the stderr rides on the result', WITH_DRIVER, async ($, on) => {
+    setup(on, { exitCode: 0, stderr: 'reminder: 2 reviews of this dir today\n' })
+    const out = await $.tool.call(assign())
+    expect(JSON.stringify(out)).toContain('launch requested')
+    expect((out as { context?: string[] }).context).toEqual(['reminder: 2 reviews of this dir today'])
+  })
+
+  test('another exit code denies: a broken gate does not pass', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, { exitCode: 127, stderr: 'jq: not found' })
+    const out = await $.tool.call(assign())
+    expect(JSON.stringify(out)).toContain('failed (exit 127): jq: not found')
+    expect(t.assigned()).toBe(false)
+  })
+
+  test('a RUNTIME tmux Agent spawn is gated as an assign: exit 2 denies, no worker, no waiter', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, { exitCode: 2, stderr: 'BLOCKED: reviewer shopping' })
+    mockSessionStart(on)
+    let spawnedBeneath = false
+    on('agent.spawn', () => {
+      spawnedBeneath = true
+      return { model: 'sonnet', agentId: 'waiter-1' }
+    })
+    await $.session.start(session())
+    const out = await $.agent.spawn({
+      tool_use_id: 'tu1',
+      prompt: `GOAL: review it\nruntime: tmux/codex\nACCEPTANCE: a verdict\nREPORT: PASS or BLOCK`,
+      description: 'review',
+      subagentType: 'general-purpose',
+      provider: { plugin: 'engine', tier: 'core' as const },
+      parentModel: 'opus',
+      background: false,
+      fork: false,
+      cwd: '/work',
+    })
+    expect(out).toEqual({ deny: 'BLOCKED: reviewer shopping' })
+    expect(spawnedBeneath).toBe(false)
+    expect(t.assigned()).toBe(false)
+    expect(t.stdins[0]).toMatchObject({ tool_name: 'mcp__tmux-agent__assign', tool_input: { profile: 'codex', name: 'review', dir: '/work', brief: BRIEF }, cwd: '/work' })
+  })
+
+  test('exit 2 denies tell; nothing is sent', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, { exitCode: 2, stderr: 'BLOCKED: re-review after BLOCK' }, undefined, { [GATE]: '#!/bin/bash\n', ...worker('w1', 0, { owner: 'sess-test', ownerCwd: '/work' }) })
+    const out = await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'review again' })
+    expect(out).toEqual({ deny: 'BLOCKED: re-review after BLOCK' })
+    expect(t.stdins[0]).toMatchObject({ tool_name: 'mcp__tmux-agent__tell', tool_input: { name: 'w1', text: 'review again' } })
+    expect(t.argvs.some(a => a.join(' ').includes('send')), 'tellWorker did not run').toBe(false)
+  })
+})

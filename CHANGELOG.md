@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.46.16 - 2026-10-22
+
+- Feature (tmux-agent mod, dispatch gate): settings.json PreToolUse hooks never fire for a mod's tools (agent-scripts deny-replay: `Agent` 352 rows, `mcp__tmux-agent__*` 0), so the review-dispatch gate never saw a tmux dispatch. The mod now runs it itself: with `TMUX_AGENT_DISPATCH_GATE` set to a gate script, the model's `assign`, `tell` and `runtime: tmux/<profile>` Agent spawn (sent as `mcp__tmux-agent__assign` with `{profile,name,dir,brief}`) first run `bash <gate>` through `$.process.run` with a PreToolUse-shaped stdin (`hook_event_name`, `tool_name`, `tool_input`, `session_id`, `cwd`). Exit 2 denies with the gate's stderr; exit 0 allows and the stderr rides on the tool result as `context` (a runtime spawn has no such channel: logged); a missing file, any other exit, a spawn error or a timeout denies. Unset: no gate. The panel's `/workers tell` (a person) is not gated. Design: agent-scripts `.workflow/202610221502-w44-must-land/design.md` §A, v3 F3. Known limit (design v3.1 F3 amend): the gate's Agent branch reads the transcript and its tmux branch worker.json, so a BLOCK in one history does not stop a reviewer in the other. Tests: 8 cases in `dispatch gate (TMUX_AGENT_DISPATCH_GATE)`; 7 fail without the change (the env-unset case passes either way).
+- Permission surface: `env reads` adds `TMUX_AGENT_DISPATCH_GATE`. The pin also takes two notes the current `claude plugin validate` prints for every mod (ICON_MISSING, hooks-module rules); not from this change.
+- Not verified: Linux; a live session with the real `review-dispatch-gate.sh` (fake gate in the mod suite only); the Agent-spawn exit-0 note reaching the model (logged only).
+
 ## v0.46.15 - 2026-10-21
 
 - Not verified: Linux; the superseded close seen live on a real gone pane (plugin tests only).

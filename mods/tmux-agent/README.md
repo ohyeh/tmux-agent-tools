@@ -109,7 +109,8 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `clock.every` | 兩條時鐘：10 秒對帳（永遠跑），2 秒面板鏡像（只在面板開著時存在） |
 | `ui.render/resolve/invalidate` | `/workers` 面板（畫在 `AbovePrompt` band；沒有 pane，所以沒有 `ui.open/close`） |
 | `ui.toast/log` | 診斷，不開 turn（不用 `ui.status`：引擎把它釘成 `⚠ tmux-agent: …` 直到被換掉） |
-| `env.get` | 只讀四個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME`、`PATH`（找 `agent-tmux`） |
+| `env.get` | 只讀五個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME`、`PATH`（找 `agent-tmux`），以及 `TMUX_AGENT_DISPATCH_GATE`（dispatch gate，見下） |
+| dispatch gate | settings 的 PreToolUse hook 不會為 mod 的工具觸發，所以 mod 自己跑：設了 `TMUX_AGENT_DISPATCH_GATE`（gate 腳本的絕對路徑）時，模型發起的 `assign`、`tell` 與 `runtime: tmux/<profile>` 的 Agent 呼叫，在派工前用 `process.run` 跑 `bash <gate>`，stdin 是 PreToolUse 形狀的 JSON（`hook_event_name`、`tool_name`、`tool_input`、`session_id`、`cwd`；runtime spawn 以 `mcp__tmux-agent__assign` 送出）。exit 2 拒絕（理由是 gate 的 stderr）；exit 0 放行，stderr 附在工具結果的 context（runtime spawn 沒有這個管道，只 log）；檔案不存在、其他 exit、啟動失敗或逾時都拒絕。沒設則不跑。面板的 `/workers tell` 是人的動作，不經 gate |
 
 **它不做的事**：沒有 `http.fetch`，不連網；不讀 credentials、shell history 或 state root 以外的檔案內容；不寫任何環境變數（pin 裡 `env writes: nothing`）；不改 `AskUserQuestion` 或其他工具的輸出。以上都能從下面那份 pin 對出來——pin 沒列的 API，mod 就沒有呼叫。
 
