@@ -2855,7 +2855,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
     }
     const me = host.owner()
     if (!me) return { ok: false, text: 'this host has no session id; tell refuses to open an episode without an owner (§3)' }
-    const stopped = await interruptBeforeTell(host, d)
+    const stopped = await interruptBeforeTell(host, d, w)
     if (stopped && !stopped.ok) return stopped
     const since = Math.max(await host.now(), d.since + 1)
     // The new episode's work starts from wherever the repo is now.
@@ -2875,7 +2875,8 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
     if (!ep) return { ok: false, text: `could not open a new episode for "${d.name}" (see the log); nothing was sent` }
     const epDir = `${w}/episodes/${ep.seq}`
     const tellPath = `${epDir}/tell.md`
-    await host.write(tellPath, text)
+    // tell.md is what goes into the pane: an interrupted, unanswered message rides ahead of this one.
+    await host.write(tellPath, stopped?.resend ? `${stopped.resend.trimEnd()}\n\n---\nThe message above was interrupted before you answered it; it is sent again. The message below follows it:\n\n${text}` : text)
     // The wrapper's send takes its lock (up to 30 s), pastes, then looks up to
     // 10 s for each injected instruction; a send to claude took 22.6 s (live
     // 2026-09-25). A run cut off at the deadline may have delivered.
@@ -3227,12 +3228,15 @@ async function turnOf(host: Host, d: TmuxDispatch): Promise<{ key?: 'Escape' | '
  * later, and the old turn's result rewrites would read as news. One key, never
  * two (C-c at an idle prompt quits some CLIs); then wait until a probe answers
  * not-busy. A failed probe is not a stop. Cursor puts a message cancelled before
- * any output back in the composer (live 2026-10-23): a draft there gets one C-u,
- * and the tell goes out only once the composer reads empty. Known limit: a bare shell
+ * any output back in the composer (live 2026-10-23) and drops it from its history:
+ * that message is read from disk first (the latest episode's brief.md or tell.md;
+ * unreadable = nothing cleared, nothing sent), then a draft gets one C-u and the
+ * tell carries the message again ahead of its own text (`resend`). The tell goes out
+ * only once the composer reads empty. Known limit: a bare shell
  * `agent-tmux send` does not take `.action` and can land between the key and the send.
  * `undefined` = not mid-turn (or no evidence): send as before.
  */
-async function interruptBeforeTell(host: Host, d: TmuxDispatch): Promise<Outcome | undefined> {
+async function interruptBeforeTell(host: Host, d: TmuxDispatch, w: string): Promise<(Outcome & { resend?: string }) | undefined> {
   const first = await turnOf(host, d)
   if (!first) host.log(`tmux-agent: tell ${d.name}: busy probe failed; sending without an interrupt`)
   if (!first?.key || !first.session) return undefined
@@ -3243,16 +3247,25 @@ async function interruptBeforeTell(host: Host, d: TmuxDispatch): Promise<Outcome
     return { ok: false, text: `"${d.name}" is mid-turn and send-keys ${first.key} exited ${sent.exitCode}: ${(sent.stderr || sent.stdout).trim().slice(-300)}; nothing was sent` }
   }
   const deadline = (await host.now()) + TELL_INTERRUPT_WAIT_MS
-  let cleared = false
+  let resend: { seq: number; text: string } | undefined
   while ((await host.now()) < deadline) {
     await host.run(['sleep', '1'], d.dir, 6_000).catch(() => undefined)
     const now = await turnOf(host, d)
     // A probe can outlast the budget: what it saw after the deadline sends nothing.
     if ((await host.now()) >= deadline) break
     if (!now || now.key) continue
-    if (now.state !== 'draft') return { ok: true, text: `interrupted its running turn first (${first.key}${cleared ? ', then C-u on the message it gave back' : ''})` }
-    if (cleared) continue
-    cleared = true
+    if (now.state !== 'draft') {
+      return resend
+        ? { ok: true, text: `interrupted its running turn first (${first.key}); it had not answered, so the message it gave back (episode ${resend.seq}) is sent again ahead of this one`, resend: resend.text }
+        : { ok: true, text: `interrupted its running turn first (${first.key})` }
+    }
+    if (resend) continue
+    const seq = (await numericChildren(host, `${w}/episodes`))?.at(-1)
+    const text = seq ? await host.read(seq === 1 ? `${w}/brief.md` : `${w}/episodes/${seq}/tell.md`).catch(() => undefined) : undefined
+    if (!seq || !text?.trim()) {
+      return { ok: false, text: `"${d.name}" was interrupted before it answered and its message is back in its composer; that message could not be read from disk, so the composer is left as is and nothing was sent. Peek at it` }
+    }
+    resend = { seq, text }
     await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(now.session), 'C-u'], d.dir, LIVE_PROBE_MS).catch(() => undefined)
   }
   return { ok: false, text: `"${d.name}" was mid-turn; ${first.key} did not leave it idle with an empty composer within ${TELL_INTERRUPT_WAIT_MS / 1000}s (or its screen could not be read); nothing was sent. Peek at it, then tell again or stop it` }

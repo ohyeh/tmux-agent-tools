@@ -231,7 +231,20 @@ test('tell mid-turn: a message the interrupt gave back to the composer gets one 
   const out = await tellWorker(back.host, back.d, 'round 2')
   assert.ok(out.ok, out.text)
   assert.deepEqual(back.keys(), ['C-c', 'C-u'])
-  assert.match(out.text, /C-u on the message it gave back/)
+  assert.match(out.text, /message it gave back \(episode 1\) is sent again/)
+  const told = readFileSync(`${back.r.stateDir}/episodes/2/tell.md`, 'utf8')
+  assert.ok(told.startsWith(BRIEF.trimEnd()), 'cursor dropped the unanswered brief: it goes again, first')
+  assert.ok(told.endsWith('round 2'))
+  assert.equal(read(`${back.r.stateDir}/episodes/2/dispatch.json`).goal, 'round 2', 'the goal is the new message')
+
+  // The message cannot be read back: the composer keeps it, nothing is cleared or sent (side-agent flag 2026-10-23).
+  const lost = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ [Pasted text #1 +9 lines]', cs: 'draft\n[Pasted text #1 +9 lines]' }])
+  rmSync(`${lost.r.stateDir}/brief.md`)
+  const no2 = await tellWorker(lost.host, lost.d, 'round 2')
+  assert.ok(!no2.ok)
+  assert.match(no2.text, /could not be read from disk/)
+  assert.deepEqual(lost.keys(), ['C-c'], 'no C-u on a message that cannot be re-sent')
+  assert.ok(!lost.sent() && !existsSync(`${lost.r.stateDir}/episodes/2`))
 
   const stays = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ draft', cs: 'draft\nhalf typed' }])
   const no = await tellWorker(stays.host, stays.d, 'round 2')
