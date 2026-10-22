@@ -237,6 +237,22 @@ test('tell mid-turn: a message the interrupt gave back to the composer gets one 
   assert.ok(told.endsWith('round 2'))
   assert.equal(read(`${back.r.stateDir}/episodes/2/dispatch.json`).goal, 'round 2', 'the goal is the new message')
 
+  // Sol resend-review: the source is the latest SENT episode's tell.md (a resumed worker has no
+  // brief.md; an aborted later episode never reached the pane).
+  const given = [{ pane: 'ctrl+c to stop' }, { pane: '→ [Pasted text #1 +3 lines]', cs: 'draft\n[Pasted text #1 +3 lines]' }, { pane: '→ Plan', cs: 'empty' }]
+  const resumed = await turnWorld(given)
+  rmSync(`${resumed.r.stateDir}/brief.md`)
+  writeFileSync(`${resumed.r.stateDir}/episodes/1/tell.md`, 'BASE from a resume')
+  assert.ok((await tellWorker(resumed.host, resumed.d, 'round 2')).ok)
+  assert.ok(readFileSync(`${resumed.r.stateDir}/episodes/2/tell.md`, 'utf8').startsWith('BASE from a resume'))
+  const aborted = await turnWorld(given)
+  mkdirSync(`${aborted.r.stateDir}/episodes/2/sent`, { recursive: true })
+  writeFileSync(`${aborted.r.stateDir}/episodes/2/tell.md`, 'BASE2 the running one')
+  mkdirSync(`${aborted.r.stateDir}/episodes/3`, { recursive: true }) // allocated, never sent
+  const out3 = await tellWorker(aborted.host, aborted.d, 'round 3')
+  assert.ok(out3.ok, out3.text)
+  assert.match(out3.text, /\(episode 2\) is sent again/)
+
   // The message cannot be read back: the composer keeps it, nothing is cleared or sent (side-agent flag 2026-10-23).
   const lost = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ [Pasted text #1 +9 lines]', cs: 'draft\n[Pasted text #1 +9 lines]' }])
   rmSync(`${lost.r.stateDir}/brief.md`)

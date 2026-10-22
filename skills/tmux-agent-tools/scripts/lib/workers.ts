@@ -3260,8 +3260,14 @@ async function interruptBeforeTell(host: Host, d: TmuxDispatch, w: string): Prom
         : { ok: true, text: `interrupted its running turn first (${first.key})` }
     }
     if (resend) continue
-    const seq = (await numericChildren(host, `${w}/episodes`))?.at(-1)
-    const text = seq ? await host.read(seq === 1 ? `${w}/brief.md` : `${w}/episodes/${seq}/tell.md`).catch(() => undefined) : undefined
+    // The latest episode that was sent (an aborted one never reached the pane): its
+    // tell.md, else for episode 1 the assign's brief.md (a resumed worker has only tell.md).
+    let seq: number | undefined
+    for (const s of [...((await numericChildren(host, `${w}/episodes`)) ?? [])].reverse()) {
+      if (await host.exists(`${w}/episodes/${s}/sent`)) { seq = s; break }
+    }
+    const read = (p: string) => host.read(p).catch(() => undefined)
+    const text = seq ? ((await read(`${w}/episodes/${seq}/tell.md`)) ?? (seq === 1 ? await read(`${w}/brief.md`) : undefined)) : undefined
     if (!seq || !text?.trim()) {
       return { ok: false, text: `"${d.name}" was interrupted before it answered and its message is back in its composer; that message could not be read from disk, so the composer is left as is and nothing was sent. Peek at it` }
     }
