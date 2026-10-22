@@ -3208,7 +3208,7 @@ export const TELL_INTERRUPT_WAIT_MS = 10_000
  * `{ key }` = busy, no key = both probes answered and neither is busy (`state` is
  * composer-state's line 1), `undefined` = a probe failed: not evidence either way.
  */
-async function turnOf(host: Host, d: TmuxDispatch): Promise<{ key?: 'Escape' | 'C-c'; state?: string; session: string } | undefined> {
+async function turnOf(host: Host, d: TmuxDispatch): Promise<{ key?: 'Escape' | 'C-c'; state?: string; armed?: boolean; session: string } | undefined> {
   const session = [...(await liveSessions(host, d.dir))].find(sname => sname.endsWith(`-${d.name}`))
   if (!session) return undefined
   const fail = (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) })
@@ -3219,7 +3219,8 @@ async function turnOf(host: Host, d: TmuxDispatch): Promise<{ key?: 'Escape' | '
   if (cs.exitCode !== 0) return undefined
   const [state, key] = cs.stdout.split('\n')
   if (state === 'busy') return key === 'Escape' || key === 'C-c' ? { key, session } : undefined
-  return pane.exitCode === 0 ? { state, session } : undefined
+  // `armed`: cursor's "Press Ctrl+C again to exit", up for under 2 s after a C-c (live 2026-10-23).
+  return pane.exitCode === 0 ? { state, armed: /again to exit/i.test(pane.stdout), session } : undefined
 }
 
 /**
@@ -3230,7 +3231,7 @@ async function turnOf(host: Host, d: TmuxDispatch): Promise<{ key?: 'Escape' | '
  * not-busy. A failed probe is not a stop. Cursor puts a message cancelled before
  * any output back in the composer (live 2026-10-23) and drops it from its history:
  * that message is read from disk first (the latest episode's brief.md or tell.md;
- * unreadable = nothing cleared, nothing sent), then a draft gets one C-u and the
+ * unreadable = nothing cleared, nothing sent), then a draft gets one clear key and the
  * tell carries the message again ahead of its own text (`resend`). The tell goes out
  * only once the composer reads empty. Known limit: a bare shell
  * `agent-tmux send` does not take `.action` and can land between the key and the send.
@@ -3259,7 +3260,7 @@ async function interruptBeforeTell(host: Host, d: TmuxDispatch, w: string): Prom
         ? { ok: true, text: `interrupted its running turn first (${first.key}); it had not answered, so the message it gave back (episode ${resend.seq}) is sent again ahead of this one`, resend: resend.text }
         : { ok: true, text: `interrupted its running turn first (${first.key})` }
     }
-    if (resend) continue
+    if (resend || now.armed) continue
     // The latest episode that was sent (an aborted one never reached the pane): its
     // tell.md, else for episode 1 the assign's brief.md (a resumed worker has only tell.md).
     let seq: number | undefined
@@ -3272,7 +3273,10 @@ async function interruptBeforeTell(host: Host, d: TmuxDispatch, w: string): Prom
       return { ok: false, text: `"${d.name}" was interrupted before it answered and its message is back in its composer; that message could not be read from disk, so the composer is left as is and nothing was sent. Peek at it` }
     }
     resend = { seq, text }
-    await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(now.session), 'C-u'], d.dir, LIVE_PROBE_MS).catch(() => undefined)
+    // Clearing a multi-line draft: cursor's C-c empties a non-empty composer (C-u only clears
+    // the wrapped line before the cursor, live 2026-10-23), pressed only once its exit arm is down.
+    // Other CLIs: C-u, unverified live; a draft that stays sends nothing.
+    await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(now.session), first.key === 'C-c' ? 'C-c' : 'C-u'], d.dir, LIVE_PROBE_MS).catch(() => undefined)
   }
   return { ok: false, text: `"${d.name}" was mid-turn; ${first.key} did not leave it idle with an empty composer within ${TELL_INTERRUPT_WAIT_MS / 1000}s (or its screen could not be read); nothing was sent. Peek at it, then tell again or stop it` }
 }

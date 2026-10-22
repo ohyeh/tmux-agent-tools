@@ -226,16 +226,25 @@ test('tell mid-turn: a turn that does not stop, a key that fails, or a screen th
   }
 })
 
-test('tell mid-turn: a message the interrupt gave back to the composer gets one C-u; a draft that stays sends nothing (cursor, live 2026-10-23)', async () => {
+test('tell mid-turn: a message the interrupt gave back to the composer is cleared once (cursor: C-c, after its exit arm is down); a draft that stays sends nothing (cursor, live 2026-10-23)', async () => {
   const back = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ [Pasted text #1 +9 lines]', cs: 'draft\n[Pasted text #1 +9 lines]' }, { pane: '→ Plan, search, build anything', cs: 'empty' }])
   const out = await tellWorker(back.host, back.d, 'round 2')
   assert.ok(out.ok, out.text)
-  assert.deepEqual(back.keys(), ['C-c', 'C-u'])
+  assert.deepEqual(back.keys(), ['C-c', 'C-c'])
   assert.match(out.text, /message it gave back \(episode 1\) is sent again/)
   const told = readFileSync(`${back.r.stateDir}/episodes/2/tell.md`, 'utf8')
   assert.ok(told.startsWith(BRIEF.trimEnd()), 'cursor dropped the unanswered brief: it goes again, first')
   assert.ok(told.endsWith('round 2'))
   assert.equal(read(`${back.r.stateDir}/episodes/2/dispatch.json`).goal, 'round 2', 'the goal is the new message')
+
+  // Cursor's exit arm is up: no clear key until it is down (a second C-c then would quit cursor).
+  const armed = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ BASE\n  Press Ctrl+C again to exit', cs: 'draft\nBASE' }])
+  assert.ok(!(await tellWorker(armed.host, armed.d, 'round 2')).ok)
+  assert.deepEqual(armed.keys(), ['C-c'], 'no C-c while "again to exit" shows')
+  // An Escape-family CLI clears with C-u.
+  const esc = await turnWorld([{ pane: 'esc to interrupt' }, { pane: '❯ BASE', cs: 'draft\nBASE' }, { pane: '❯ ', cs: 'empty' }])
+  assert.ok((await tellWorker(esc.host, esc.d, 'round 2')).ok)
+  assert.deepEqual(esc.keys(), ['Escape', 'C-u'])
 
   // Sol resend-review: the source is the latest SENT episode's tell.md (a resumed worker has no
   // brief.md; an aborted later episode never reached the pane).
@@ -265,7 +274,7 @@ test('tell mid-turn: a message the interrupt gave back to the composer gets one 
   const stays = await turnWorld([{ pane: 'ctrl+c to stop' }, { pane: '→ draft', cs: 'draft\nhalf typed' }])
   const no = await tellWorker(stays.host, stays.d, 'round 2')
   assert.ok(!no.ok)
-  assert.deepEqual(stays.keys(), ['C-c', 'C-u'], 'one C-u, never repeated')
+  assert.deepEqual(stays.keys(), ['C-c', 'C-c'], 'one clear key, never repeated')
   assert.ok(!stays.sent() && !existsSync(`${stays.r.stateDir}/episodes/2`))
 })
 
