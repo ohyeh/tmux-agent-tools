@@ -3247,6 +3247,8 @@ async function interruptBeforeTell(host: Host, d: TmuxDispatch): Promise<Outcome
   while ((await host.now()) < deadline) {
     await host.run(['sleep', '1'], d.dir, 6_000).catch(() => undefined)
     const now = await turnOf(host, d)
+    // A probe can outlast the budget: what it saw after the deadline sends nothing.
+    if ((await host.now()) >= deadline) break
     if (!now || now.key) continue
     if (now.state !== 'draft') return { ok: true, text: `interrupted its running turn first (${first.key}${cleared ? ', then C-u on the message it gave back' : ''})` }
     if (cleared) continue

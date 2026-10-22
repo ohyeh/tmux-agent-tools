@@ -153,7 +153,7 @@ test('tell: resumed worker → seq 1 on episodes/1; assigned worker → seq 2; s
  * screen (the last repeats); `null` = that probe fails. The clock moves 1 s a
  * call and `sleep` returns at once, so the 10 s wait runs instantly.
  */
-async function turnWorld(screens: { pane: string | null; cs?: string | null }[], keyExit = 0) {
+async function turnWorld(screens: { pane: string | null; cs?: string | null; ms?: number }[], keyExit = 0) {
   let i = -1
   let name = ''
   const at = () => screens[Math.min(Math.max(i, 0), screens.length - 1)]!
@@ -178,7 +178,12 @@ async function turnWorld(screens: { pane: string | null; cs?: string | null }[],
   const host: Host = {
     ...w.host,
     now: async () => (t += 1_000),
-    run: async (argv, cwd, ms) => (argv[0] === 'sleep' ? { exitCode: 0, stdout: '', stderr: '' } : w.host.run(argv, cwd, ms)),
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'sleep') return { exitCode: 0, stdout: '', stderr: '' }
+      const out = await w.host.run(argv, cwd, ms)
+      if (argv[1] === 'capture-pane') t += at().ms ?? 0 // a probe that costs time on the clock
+      return out
+    },
   }
   const d = (await scan(host, { claim: false })).visible[0]!
   const keys = () => w.calls.filter(c => c.argv[1] === 'send-keys').map(c => c.argv.at(-1))
@@ -233,6 +238,16 @@ test('tell mid-turn: a message the interrupt gave back to the composer gets one 
   assert.ok(!no.ok)
   assert.deepEqual(stays.keys(), ['C-c', 'C-u'], 'one C-u, never repeated')
   assert.ok(!stays.sent() && !existsSync(`${stays.r.stateDir}/episodes/2`))
+})
+
+test('tell mid-turn: an answer that arrives after the 10 s budget sends nothing and clears nothing (Sol r3)', async () => {
+  for (const cs of ['empty', 'draft\nhalf typed']) {
+    const w = await turnWorld([{ pane: 'esc to interrupt' }, { pane: 'esc to interrupt' }, { pane: '❯ ', cs, ms: 12_000 }])
+    const out = await tellWorker(w.host, w.d, 'round 2')
+    assert.ok(!out.ok, cs)
+    assert.deepEqual(w.keys(), ['Escape'], `${cs}: no C-u after the deadline`)
+    assert.ok(!w.sent() && !existsSync(`${w.r.stateDir}/episodes/2`), cs)
+  }
 })
 
 test('tell with no busy evidence sends as before: no key (a draft, or a probe that fails is not evidence)', async () => {
