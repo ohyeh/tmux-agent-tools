@@ -166,6 +166,31 @@ fx resumed-recent null <<'EOF'
 › Ask Codex to do anything
 EOF
 
+# W44-11 L1 review counterexamples: no composer drawn, output still coming below an
+# old banner (codex with an echoed prompt; claude with no glyph line).
+fx banner-no-composer null <<'EOF'
+■ You’ve hit your usage limit… try again at 4:20 PM.
+› continue
+• Running build
+  └ ok
+EOF
+
+fx banner-claude-cells null <<'EOF'
+■ You’ve hit your usage limit… try again at 4:20 PM.
+⏺ Reading file
+  ⎿ ok
+EOF
+
+# An indented `>` quote in tool output is not a prompt: the banner above it holds.
+fx banner-quoted-gt quota_exhausted '■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),' <<'EOF'
+› Write final JSON
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),
+• Called ctx_execute
+  └ diff:
+    > quoted line
+› Ask Codex to do anything
+EOF
+
 fx rate-limit quota_exhausted 'Error: rate limit exceeded' <<'EOF'
 Error: rate limit exceeded
 › Ask Codex to do anything

@@ -8030,13 +8030,13 @@ runtime_model_error_phrase() {
 #     history however recent. Unmarked lines are the block's continuation (the
 #     codex banner wraps onto "visit https://…" and "again at …"). Except a `■`
 #     banner: codex ends its turn there and can still flush finished `• Called`
-#     cells below it (W43-24, live 2026-10-16), so only a newer prompt ends it;
-#   - the current turn: from the last submitted prompt (a composer-glyph line
-#     above the bottom one, which is the composer) down, the whole pane if there
-#     is none. An error printed right after an echoed `› prompt` is still the
-#     newest output; a fixed 10-line tail lost the W43-24 banner.
-#     shortcut: a pane with no composer drawn takes its last echoed prompt for
-#     the composer; add a case when a live CLI shows that shape.
+#     cells below it (W43-24, live 2026-10-16), so while the CLI sits at its drawn
+#     composer only a newer prompt ends it. With no composer drawn (output still
+#     coming), later cells end it as they end any hit;
+#   - the current turn: from the last submitted prompt (a column-0 glyph line;
+#     the bottom one is the composer when no transcript cell follows it) down,
+#     the whole pane if there is none. Indented `>`/`→` lines are tool output,
+#     not prompts. A fixed 10-line tail lost the W43-24 banner.
 # Column 0 is a layout rule, not provenance: codex and claude indent a worker's
 # prose under its `•`/`⏺` bullet, so column-0 error text is normally the CLI's
 # own — but a worker can still print a quoted `Error:` there. That is why the
@@ -8049,10 +8049,19 @@ runtime_model_error_phrase() {
 runtime_blocker_for_text() {
   local current="$1" line body rest hit="" banner="" structured_hit="" limit_false=false in_tool=false lead lead_len
   local -a recent
+  # Line 1 is 1 when the bottom prompt line is a drawn composer (no transcript cell below it).
   recent=("${(@f)$(awk '
-    /^[[:space:]]*(→|›|❯|>)([[:space:]]|$)/ && !/^[[:space:]]*(→|›|❯|>)[[:space:]]+[0-9]+[.)]/ { prev = last; last = NR }
+    /^(→|›|❯|>)([[:space:]]|$)/ && !/^(→|›|❯|>)[[:space:]]+[0-9]+[.)]/ { prev = last; last = NR }
+    /^[[:space:]]*(•|⏺|└|⎿|✔|✓|■|↳)/ { cell = NR }
     { lines[NR] = $0 }
-    END { for (i = (prev ? prev : 1); i <= NR; i++) if (lines[i] ~ /[^[:space:]]/) print lines[i] }' <<< "$current")}")
+    END {
+      composer = (last && cell < last)
+      print composer
+      start = composer ? (prev ? prev : 1) : (last ? last : 1)
+      for (i = start; i <= NR; i++) if (lines[i] ~ /[^[:space:]]/) print lines[i]
+    }' <<< "$current")}")
+  local composer="${recent[1]}"
+  recent=("${(@)recent[2,-1]}")
   for line in "${recent[@]}"; do
     lead="${line%%[![:space:]]*}"
     lead_len="${#lead}"
@@ -8114,7 +8123,7 @@ runtime_blocker_for_text() {
         if [[ "$body" == '⚠'* && "$hit" != quota_exhausted$'\t'* ]]; then
           hit="$(runtime_model_error_phrase "$line")"
         fi
-        [[ "$body" == '■'* && -n "$hit" ]] && banner="$hit"
+        [[ "$body" == '■'* && -n "$hit" && "$composer" == 1 ]] && banner="$hit"
         limit_false=false
       else
         case "$body" in
