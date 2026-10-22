@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.46.19 - 2026-10-23
+
+- Fix (core `tellWorker`): v0.46.18 refused every give-back tell on cursor (live): the given-back message was multi-line text and C-u cleared only the wrapped line before the cursor, so the composer stayed a draft and the tell sent nothing (no message lost). One C-c empties a non-empty cursor composer; it then shows "Press Ctrl+C again to exit" for under 2 s. The clear key is now C-c when the interrupt key was C-c (cursor), else C-u, and it is never pressed while "again to exit" shows. Live on cursor with this core: receipt "interrupted its running turn first (C-c); it had not answered, so the message it gave back (episode 3) is sent again ahead of this one"; the next episode answered the base message with its correction; the interrupted episode closed as superseded.
+- Not verified: Linux; C-u clearing on Escape-family CLIs (codex, claude, agy); clearing on any non-cursor CLI whose interrupt key is C-c. Pre-existing on v0.46.16–18 (full `run-all-smokes`): `test-assign-smoke` "cursor resumes by id" fails; `test-core-contract-smoke` hits its 75 s file bound under parallel load (passes alone); `test-sentinel-smoke` deadline is load-sensitive.
+
 ## v0.46.18 - 2026-10-23
 
 - Fix (core `tellWorker`): a message the interrupt gave back is sent again, not cleared away. Cursor drops a message interrupted before any output from its history and puts it back in the composer; v0.46.17 then pressed C-u and the message was gone, so a tell written as a correction to it ("replaces section 1 and 3, the rest stays") had no base. The message is now read from disk first — the latest episode with a `sent` marker: its `tell.md`, or the assign's `brief.md` for episode 1 — then the composer is cleared and the new episode's `tell.md` carries it ahead of the new text (goal stays the new text's first line). Unreadable or empty: nothing cleared, nothing sent, the composer keeps it.
