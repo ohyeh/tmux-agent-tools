@@ -199,7 +199,7 @@ yourself.
 ## SELECT — wrapper by task shape
 
 - Loop-shaped chain (audit / plan→build / consensus / triage) → the
-  `using-workflows` skill, not this router.
+  `using-decision-tree` loops branch (`references/loops.md`), not this router.
 - ONE coding CLI as a supervised worker (most common) → `agent-tmux <cli>`
   (claude / codex / agy built in; gemini, cursor, custom via profile).
 - Same prompt across MANY workers → `tmux-agent-fanout`; bounded TWO-party
@@ -240,7 +240,7 @@ capability table**. Never paraphrase that table from memory.
   text, `--secret KEY=URI` for credentials) before the first worker command.
 - **After the result**: collect (`result --json`) → `stop`, or keep the
   teammate per the reuse protocol. Failure/blocked → follow up on the same
-  worker, or escalate via `using-workflows` `findings-triage`.
+  worker, or escalate via the `using-decision-tree` loops branch, `findings-triage`.
 
 ## NOT-FOUND
 

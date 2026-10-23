@@ -103,7 +103,7 @@ if printf '%s' "$cmd" | grep -Eq '[[:space:]]start[[:space:]]' \
     cat >&2 <<EOF
 BLOCKED by workflow gate: this is review-shaped worker dispatch #$n this
 session — a manual review round-loop is forming. Loop-shaped work runs via a
-workflow recipe: read ~/.agents/skills/using-workflows/SKILL.md and use
+workflow recipe: read ~/.agents/skills/using-decision-tree/references/loops.md and use
 consensus-gate / findings-triage (or the second-model-consensus skill).
 To proceed anyway, write the reason (today's date plus the chosen recipe, or
 a quote of the user's explicit direct-dispatch instruction) to
