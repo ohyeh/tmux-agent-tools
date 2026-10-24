@@ -71,6 +71,8 @@ while [ $# -gt 0 ]; do case "$1" in --log) LOG="$2"; shift 2 ;; *) shift ;; esac
 stty -echo 2>/dev/null
 while IFS= read -r line; do printf 'input:%s\n' "$line" >> "$LOG"; done
 EOF
+# slowcli: fastcli that boots for 4 s before it draws (a self-update, nine launches at once).
+sed 's/^echo "› Write a prompt"$/sleep 4; echo "› Write a prompt"/; s/fastcli 1.0/slowcli 1.0/' "$WORK/fastcli" > "$WORK/slowcli"
 # exitcli: exits during boot.
 printf '#!/bin/sh\n[ "$1" = "--version" ] && { echo "exitcli 1.0"; exit 0; }\nexit 3\n' > "$WORK/exitcli"
 # Startup screens for the `start` readiness poll; each logs what it reads.
@@ -98,7 +100,7 @@ EOF
 for cli in cursor agy; do
   printf '#!/bin/sh\necho "$*" > "%s/argv.%s"\nexec cat >/dev/null\n' "$WORK" "$cli" > "$WORK/fake-$cli.sh"
 done
-chmod +x "$WORK"/fastcli "$WORK"/nodrawcli "$WORK"/exitcli "$WORK"/fake-*.sh
+chmod +x "$WORK"/fastcli "$WORK"/slowcli "$WORK"/nodrawcli "$WORK"/exitcli "$WORK"/fake-*.sh
 
 printf 'GOAL: demo\n\nACCEPTANCE: none\n\nREPORT: none\n' > "$WORK/prompt.txt"
 
@@ -121,18 +123,24 @@ launch_assign() {  # <name> [assign flags]: background fastcli assign
 }
 launch_assign full; PID_FULL=$!
 launch_assign det --detach; PID_DET=$!
-# Ready refusal: the window is the product's own AGENT_TMUX_START_READY_TIMEOUT, fixed at 2.
+# Stall hand-off: the limit is the product's own AGENT_TMUX_START_STALL, fixed at 2.
 : > "$WORK/nodraw.log"
-AGENT_TMUX_START_READY_TIMEOUT=2 AGENT_TMUX_LAUNCH_FLAGS="--log $WORK/nodraw.log" \
+AGENT_TMUX_START_STALL=2 AGENT_TMUX_LAUNCH_FLAGS="--log $WORK/nodraw.log" \
   "$AGENT_TMUX" nodrawcli assign --timeout 8 --confirm-window 5 --detach \
     --result-path "$WORK/nodraw-result.json" --episode 7 nodraw "$WORK" "$WORK/prompt.txt" \
     >"$WORK/nodraw.out" 2>"$WORK/nodraw.err" &
 PID_NODRAW=$!
-AGENT_TMUX_START_READY_TIMEOUT=40 \
+# Boots for 4 s, longer than the old READY_TIMEOUT window of 2: elapsed time must not decide.
+mkdir -p "$TMUX_AGENT_DIR/slow"; : > "$WORK/slow.log"
+AGENT_TMUX_START_READY_TIMEOUT=2 AGENT_TMUX_LAUNCH_FLAGS="--log $WORK/slow.log --result $TMUX_AGENT_DIR/slow/result.json" \
+  "$AGENT_TMUX" slowcli assign --timeout 8 --confirm-window 5 slow "$WORK" "$WORK/prompt.txt" \
+    >"$WORK/slow.out" 2>"$WORK/slow.err" &
+PID_SLOW=$!
+AGENT_TMUX_START_STALL=40 \
   "$AGENT_TMUX" exitcli assign --timeout 8 --confirm-window 5 --detach exit-smoke "$WORK" "$WORK/prompt.txt" \
     >"$WORK/exit.out" 2>"$WORK/exit.err" &
 PID_EXIT=$!
-env CODEX="$WORK/fake-verify.sh" AGENT_TMUX_START_READY_TIMEOUT=2 \
+env CODEX="$WORK/fake-verify.sh" AGENT_TMUX_START_STALL=2 \
   "$CODEX_TMUX" start --exact verify "$WORK" "must-not-send-verify" >"$WORK/verify.out" 2>&1 &
 PID_VERIFY=$!
 CODEX="$WORK/fake-login.sh" "$CODEX_TMUX" start --exact login "$WORK" "must-not-send-login" >"$WORK/login.out" 2>&1 &
@@ -203,6 +211,13 @@ assert_contains "nodraw: the worker is left running" "$nd_diag" "left running"
 assert_contains "nodraw: the named send keeps the dispatch route" "$nd_diag" "--result-path $WORK/nodraw-result.json --episode 7"
 assert "nodraw: nothing reached the CLI" "$(cat "$WORK/nodraw.log")" ""
 assert "nodraw: the worker is still up" "$("$AGENT_TMUX" nodrawcli status --json nodraw 2>/dev/null | jq -r .running)" "true"
+
+echo
+echo "case: a CLI that boots longer than the old fixed window is not handed off; the brief goes out once it draws"
+code=0; wait $PID_SLOW || code=$?
+assert "slow: assign exit=0" "$code" "0"
+assert_contains "slow: the brief reached the CLI" "$(cat "$WORK/slow.log")" "input:GOAL: demo"
+refute_contains "slow: never handed off" "$(cat "$WORK/slow.err")" "CLI not up"
 
 echo
 echo "case: one assign runs start → init → send → confirm → supervise on a fast terminal result"

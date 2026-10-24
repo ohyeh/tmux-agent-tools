@@ -109,6 +109,10 @@ run_job() {
 
   (
     unset TMUX TMUX_PANE
+    # A developer's own <CLI>_TMUX_(EXTRA_)LAUNCH_FLAGS (e.g. exported in ~/.zshenv) would be added to the
+    # profile flags a test asserts on: v0.46.13 put --trust --yolo in cursor.conf and the cursor resume case
+    # saw them twice.
+    for _v in ${(k)parameters[(I)*_TMUX_(EXTRA_|)LAUNCH_FLAGS]}; do unset "$_v"; done
     export TMUX_TMPDIR="$job_dir"
     export TAS_JOB_DIR="$job_dir"
     # Smokes that never source lib/smoke-tmux.sh still put their temp files in the job tree.

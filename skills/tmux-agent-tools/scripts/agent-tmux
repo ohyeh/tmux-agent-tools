@@ -4660,19 +4660,23 @@ assign_session() {
   }
   # A CLI that is not up yet is not a failed one: it may be updating, signing
   # in, or just slow (cursor-agent took over 45s after a self-update, live
-  # 2026-09-30), and no fixed window tells those apart. So the window only
-  # hands the call to the agent: the brief stays unsent, the worker stays up,
-  # and the notice says how to look and how to send it by hand. A CLI that
-  # EXITED is the one case decided here, at once, and named as an exit.
+  # 2026-09-30; again under nine concurrent launches, 2026-10-24), and no
+  # fixed window tells those apart. So elapsed time never decides: the loop
+  # keeps looking and sends the moment the CLI draws. Only a CLI whose state
+  # has not changed for AGENT_TMUX_START_STALL seconds (default 600, the
+  # kernel's stall limit) is handed to the agent: the brief stays unsent, the
+  # worker stays up, and the notice says how to look and how to send it by
+  # hand. A CLI that EXITED is decided at once, and named as an exit.
   # The named send carries this dispatch's --result-path/--episode: without
   # them the worker is told the default path and no episode, and the
   # collector can never attribute what it writes.
   _assign_not_up() {
     local route="${RESULT_PATH_OVERRIDE:+ --result-path $RESULT_PATH_OVERRIDE}${RESULT_EPISODE:+ --episode $RESULT_EPISODE}"
-    _assign_fail send "CLI not up after ${AGENT_TMUX_START_READY_TIMEOUT:-45}s ($1) — the brief was NOT sent and the worker is left running. It may be updating, signing in or just slow: peek it, then when its UI is up send the brief yourself (agent-tmux $CLI send$route --from-file $prompt $name), or stop it" "$name"
+    _assign_fail send "CLI not up and unchanged for ${_stall}s ($1) — the brief was NOT sent and the worker is left running. It may be updating, signing in or just slow: peek it, then when its UI is up send the brief yourself (agent-tmux $CLI send$route --from-file $prompt $name), or stop it" "$name"
   }
   local _ASSIGN_SEND_SETTLE=3 _ASSIGN_SEND_LOOK=10 _trusted=0
-  local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle _saw_startup=0
+  local _stall=${AGENT_TMUX_START_STALL:-600} _ready_phase=""
+  local ready_deadline=$(( SECONDS + _stall )) look_deadline=$(( SECONDS + _ASSIGN_SEND_LOOK )) rj rreason ridle _saw_startup=0
   while :; do
     rj="$( ( status_session --json "$name" ) 2>/dev/null || true )"
     if [[ "$(printf '%s' "$rj" | "$JQ" -r 'if .exit_detected == true or .exists == false then "gone" else empty end' 2>/dev/null || true)" == gone ]]; then
@@ -4697,10 +4701,12 @@ assign_session() {
         _assign_fail send "worker blocked before send: $rreason — the brief was NOT sent. Look at the dialog (peek), answer it yourself if you trust it (keys), then send the brief again ($prompt)" "$name" ;;
       startup_pending)
         _saw_startup=1
+        [[ "$_ready_phase" == startup ]] || { _ready_phase=startup; ready_deadline=$(( SECONDS + _stall )); }
         (( SECONDS >= ready_deadline )) && _assign_not_up "startup_pending: still on its startup screen"
         sleep 2 ;;
       *)
         if ! _assign_cli_drew "$name"; then
+          [[ "$_ready_phase" == nodraw ]] || { _ready_phase=nodraw; ready_deadline=$(( SECONDS + _stall )); }
           (( SECONDS >= ready_deadline )) && _assign_not_up "nothing drawn below the launcher header"
           _saw_startup=1
           sleep 1; continue
@@ -5418,10 +5424,11 @@ start_session() {
     # "Verifying your account eligibility") swallow pasted text, so wait for
     # them to clear before injecting the initial prompt. Hard interactive
     # prompts (login/permission/approval/hook-trust) never clear on their own
-    # and fail immediately, as before. A screen still pending at the deadline
-    # fails loudly rather than pasting into a swallowing UI.
+    # and fail immediately, as before. A screen still pending after
+    # AGENT_TMUX_START_STALL seconds fails loudly rather than pasting into a
+    # swallowing UI.
     local preflight_reason preflight_diag preflight_json
-    local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_READY_TIMEOUT:-45} ))
+    local ready_deadline=$(( SECONDS + ${AGENT_TMUX_START_STALL:-600} ))
     while :; do
       preflight_json="$(status_session --json "$name")" || preflight_json=""
       preflight_reason="$("$JQ" -r '.blocked_reason // empty' <<< "$preflight_json" 2>/dev/null || true)"
