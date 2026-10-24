@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.46.22 - 2026-10-24
+
+- Fix (`assign`/`start` readiness): a CLI that was not up inside a fixed window (default 45s) was handed to the caller as launch-failed with the brief unsent. Under nine concurrent launches all three cursor workers hit it (live, 2026-10-24) and each needed a manual `peek` + `tell`. v0.44.5 had already written that "no fixed window tells those apart" but kept the window. Elapsed time no longer decides: `assign` keeps looking and sends the moment the CLI draws. It hands off only when its state (nothing drawn, or a startup screen) has not changed for `AGENT_TMUX_START_STALL` seconds (default 600, the kernel stall limit; a change of state starts the count again). `start`'s startup-screen wait uses the same limit. `AGENT_TMUX_START_READY_TIMEOUT` (45s) now only bounds the look for delivery proof after a paste. A CLI that exits is still named at once.
+- Test: `test-assign-smoke` case `slow` (a CLI that boots 4s with the old window set to 2s must get its brief); it fails on v0.46.21 and passes now. The `nodraw`, `exit` and `verify` cases use `AGENT_TMUX_START_STALL`.
+- Test harness: `run-all-smokes` clears `<CLI>_TMUX_(EXTRA_)LAUNCH_FLAGS` from each job's environment. A host that exports them doubled the profile flags a test asserts on: `test-assign-smoke` "cursor resumes by id" was red since v0.46.13 because `~/.zshenv` exports `CURSOR_TMUX_EXTRA_LAUNCH_FLAGS=--trust --yolo` and cursor.conf has carried the same flags since then. Full suite 33 PASS, wall 148s (158s with the one failure before).
+- Not verified: a live cursor launch after install; a boot that changes state many times. Not changed: that `~/.zshenv` export is now redundant and doubles the flags on live cursor launches on that host.
+
 ## v0.46.21 - 2026-10-23
 
 - Fix (dispatch gate, router skill): agent-scripts retired the `using-workflows` SKILL.md (its router moved to the `using-decision-tree` loops branch, agent-scripts 8f535ae). The workflow-gate BLOCKED message (`hooks/tmux-dispatch-gate.sh`) now points at `~/.agents/skills/using-decision-tree/references/loops.md`, and `using-tmux-agent-tools` SELECT and after-result lines name the loops branch. `test-dispatch-gate-hook-smoke` PASS.
