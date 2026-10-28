@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.46.23 - 2026-10-28
+
+- Fix (`mcp__tmux-agent__reload`): a call while a reload was queued queued a second timer, so `/reload-plugins` and `/reload-skills` ran twice (one remote session, 10-22: two calls 0.7 s apart). A call while one is queued now joins it and answers "already queued"; the flag clears before the commands run, so a later update gets its own reload. Found in a 7-day transcript scan of two hosts (10-28); sol and deepseek called it a fix, argon and advisor a leave, the owner chose fix.
+- Test: "a second reload while one is queued joins it; once it ran, a new call queues again" (fails on v0.46.22: the second call answers "are queued"). Mod suite 235 pass, 0 fail. `run-all-smokes` 31/33 under host load ~20: `test-core-contract-smoke` hit its 90s run bound and `test-mcp-bundle-smoke` failed an ack assertion; both PASS alone (core contract 66s at load ~6; `collector` 34/34 and `launcher` 37/37 with the bound lifted). Core lib `.ts` and that smoke script are unchanged since v0.46.22.
+- Same scan, no change here: the worker notice's mid-turn delivery (v0.45.0) works: 102 notices (remote) and 15 (local) rode a tool result, stamped at most 4 min late. The 17-117 min waits first read for worker notices were a FIFO-pairing error in the scan (argon).
+- Not verified: a live double reload after install. Local install only; no tag or GitHub release for this version yet.
+
 ## v0.46.22 - 2026-10-24
 
 - Fix (`assign`/`start` readiness): a CLI that was not up inside a fixed window (default 45s) was handed to the caller as launch-failed with the brief unsent. Under nine concurrent launches all three cursor workers hit it (live, 2026-10-24) and each needed a manual `peek` + `tell`. v0.44.5 had already written that "no fixed window tells those apart" but kept the window. Elapsed time no longer decides: `assign` keeps looking and sends the moment the CLI draws. It hands off only when its state (nothing drawn, or a startup screen) has not changed for `AGENT_TMUX_START_STALL` seconds (default 600, the kernel stall limit; a change of state starts the count again). `start`'s startup-screen wait uses the same limit. `AGENT_TMUX_START_READY_TIMEOUT` (45s) now only bounds the look for delivery proof after a paste. A CLI that exits is still named at once.
