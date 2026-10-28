@@ -4858,6 +4858,33 @@ describe('live e2e of 0.7.6', () => {
     expect(ran).toEqual(['reload-plugins', 'reload-skills'])
   })
 
+  test('a second reload while one is queued joins it; once it ran, a new call queues again', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, {})
+    const ran: string[] = []
+    on('command.run', ($, e) => {
+      ran.push(e.command)
+      return { text: '' }
+    })
+    const reload = async () => JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__reload' as const }))
+    const settled = async (n: number) => {
+      await clock.advance(1)
+      for (let i = 0; i < 20 && ran.length < n; i += 1) await settle()
+    }
+
+    expect(await reload()).toContain('are queued')
+    expect(await reload()).toContain('are already queued')
+    await settled(2)
+    for (let i = 0; i < 5; i += 1) await settle()
+    expect(ran, 'one reload, not two (10-22: two calls 0.7 s apart)').toEqual(['reload-plugins', 'reload-skills'])
+
+    expect(await reload()).toContain('are queued')
+    await settled(4)
+    expect(ran).toEqual(['reload-plugins', 'reload-skills', 'reload-plugins', 'reload-skills'])
+  })
+
   test('a session opens the panel at its start, folded until opened; the fold choice is kept; hiding it is kept for that session', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     // As a person who never opened or hid it: no fold choice, only another session hid its panel.

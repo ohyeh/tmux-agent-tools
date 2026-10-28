@@ -1652,8 +1652,14 @@ export const register: Register = on => {
   // /reload-plugins cannot run inside the tool call (the turn waits on it and
   // $.command.run rejects there); a timer queues it for when the session is idle.
   // Before this, every update waited for the person to type /reload-plugins.
+  // A call while one is queued joins it: two calls 0.7 s apart ran both reloads twice (10-22).
+  let reloadQueued = false
   on('tool.call', { tool: RELOAD_TOOL }, async $ => {
+    if (reloadQueued) return { result: `/reload-plugins and /reload-skills are already queued for when this turn ends (mod ${MOD_VERSION} now).` }
+    reloadQueued = true
     $.clock.after(0, async () => {
+      // Cleared before the commands run, so a later update gets its own reload.
+      reloadQueued = false
       for (const command of ['reload-plugins', 'reload-skills'] as const) {
         await $.command.run({ command }).catch(err => $.ui.log(`/${command} failed: ${String(err)}`))
       }
