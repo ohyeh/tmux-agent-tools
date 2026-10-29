@@ -65,6 +65,36 @@ export async function allocateNext(host: Host, dir: string, tries = 8): Promise<
 export type Holder = { token: string; session: string; activation: string; host: string; pid: number; pidStart: string }
 export type Lock = { ok: true; token: string } | { ok: false; busy: Holder | 'unreadable' | 'unknown' }
 
+// A cancelled caller can no longer run subprocesses. Keep its settled release
+// until a fresh collector callback can finish it; never release a running body.
+const actions = new Map<string, { token: string; settled: boolean; cleanup?: Promise<{ ok: true } | { ok: false; error: string }> }>()
+export const settledAction = (lock: string, token: string) => {
+  const action = actions.get(lock)
+  return action?.token === token && action.settled
+}
+
+export async function releaseSettledActions(host: Host): Promise<void> {
+  // Maintenance bodies have ended before their guards become settled. Remove
+  // those guards first, or they would prevent the outer action from releasing.
+  for (const [lock, action] of actions) {
+    if (action.settled && lock.endsWith('/.action.unlock')) await finishGuard(host, lock, action.token)
+  }
+  for (const [lock, action] of actions) {
+    if (action.settled && lock.endsWith('/.action')) await releaseLock(host, lock, action.token)
+  }
+}
+
+async function finishGuard(host: Host, lock: string, token: string) {
+  const action = actions.get(lock)
+  if (action?.token !== token) return unlinkHeld(host, lock, token)
+  action.settled = true
+  // One remover per token: a delayed second rm must not erase a newer guard.
+  if (action.cleanup) return action.cleanup
+  const run = unlinkHeld(host, lock, token)
+  action.cleanup = run
+  try { return await run } finally { action.cleanup = undefined }
+}
+
 /**
  * The lock's holder, `absent` (confirmed: not listed in its dir, or its dir is ENOENT),
  * or `unreadable` with why: a list error (EACCES, EIO), a listed lock readlink cannot
@@ -114,8 +144,16 @@ export async function readHolder(host: Host, lock: string): Promise<Holder | 'un
 export async function acquireLock(host: Host, lock: string, holder: Holder): Promise<Lock> {
   const r = await op(host, ['ln', '-sn', JSON.stringify(holder), lock])
   const c = contest(host, `lock ${lock}`, r)
-  if (c === 'won') return { ok: true, token: holder.token }
-  if (c === 'unknown') return { ok: false, busy: 'unknown' }
+  if (c === 'won') {
+    actions.set(lock, { token: holder.token, settled: false })
+    return { ok: true, token: holder.token }
+  }
+  if (c === 'unknown') {
+    // ln may have completed before its caller lost the reply. Only this exact
+    // token is eligible for cleanup; a fresh callback checks the actual holder.
+    if (!actions.has(lock)) actions.set(lock, { token: holder.token, settled: true })
+    return { ok: false, busy: 'unknown' }
+  }
   return { ok: false, busy: (await readHolder(host, lock)) ?? 'unknown' }
 }
 
@@ -127,11 +165,15 @@ export async function acquireLock(host: Host, lock: string, holder: Holder): Pro
 export async function unlinkHeld(host: Host, lock: string, token: string): Promise<{ ok: true } | { ok: false; error: string }> {
   const h = await readHolder(host, lock)
   if (!h || h === 'unreadable' || h.token !== token) {
+    if (h !== 'unreadable' && actions.get(lock)?.token === token) actions.delete(lock)
     host.log(`tmux-agent: release of ${lock} refused: not held by ${token}`)
     return { ok: false, error: `${lock} is not held by ${token}` }
   }
   const r = await op(host, ['rm', lock])
-  if (r.exitCode === 0) return { ok: true }
+  if (r.exitCode === 0) {
+    if (actions.get(lock)?.token === token) actions.delete(lock)
+    return { ok: true }
+  }
   return { ok: false, error: `rm ${lock} failed (exit ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim()}` : ''})` }
 }
 
@@ -157,8 +199,12 @@ export const releasedText = (lock: string, r: Extract<Released, { ok: false }>):
  * A guard held by a live section is waited out briefly; a stale one is never taken over.
  */
 export async function releaseLock(host: Host, lock: string, token: string): Promise<Released> {
+  const action = actions.get(lock)
+  if (action?.token === token) action.settled = true
   const h = await readHolder(host, lock)
   if (!h || h === 'unreadable' || h.token !== token) {
+    if (h === 'unreadable') return { ok: false, error: `${lock} holder could not be read; release is incomplete` }
+    if (actions.get(lock)?.token === token) actions.delete(lock)
     host.log(`tmux-agent: release of ${lock} refused: not held by ${token}`)
     return { ok: false, error: `${lock} is not held by ${token}` }
   }
@@ -229,11 +275,11 @@ export async function maintainLock<T>(host: Host, lock: string, me: Holder, fn: 
   try {
     value = await fn()
   } catch (error) {
-    const g = await unlinkHeld(host, path, me.token)
+    const g = await finishGuard(host, path, me.token)
     if (!g.ok) host.log(`tmux-agent: ${path} left behind after an error: ${g.error}`)
     throw error
   }
-  const g = await unlinkHeld(host, path, me.token)
+  const g = await finishGuard(host, path, me.token)
   if (g.ok) return { ok: true, value }
   host.log(`tmux-agent: could not release ${path}: ${g.error}; the next unlock reports it busy`)
   return { ok: false, ran: true, value, path, error: g.error }

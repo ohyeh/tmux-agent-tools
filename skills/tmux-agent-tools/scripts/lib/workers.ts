@@ -30,6 +30,7 @@ import {
   readWorker,
   recoverEpisodes,
   registerOnChannel,
+  releaseSettledActions,
   underLock,
   unlinkHeld,
   sessionKey,
@@ -2294,6 +2295,7 @@ export const newGate = (): Gate => ({
 })
 
 export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<void> {
+  await releaseSettledActions(host)
   if (gate.paused) return
   const now = await host.now()
   if (now < gate.nextAttemptAt) return

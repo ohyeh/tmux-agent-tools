@@ -16,6 +16,61 @@ import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessio
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
 
+test('lifecycle 1: caller timeout leaves no action lock after the next live collector pass', async () => {
+  const w = world()
+  try {
+    const r = await assigned(w)
+    const d = (await scan(w.host, { claim: false })).visible[0]!
+    let abandoned = false
+    const host: Host = { ...w.host, run: async (a, c, m) => {
+      if (a[0] === 'agent-tmux' && a[2] === 'send') {
+        // Cross a real subprocess timeout, then revoke this caller's command scope.
+        const timed = await nodeHost().run(['/bin/sh', '-c', 'sleep 1'], '/', 20)
+        assert.equal(timed.exitCode, -1)
+        abandoned = true
+        throw new Error('caller aborted after timeout')
+      }
+      if (abandoned) throw new Error('caller scope aborted')
+      return w.host.run(a, c, m)
+    } }
+    const out = await tellWorker(host, d, 'next')
+    assert.equal(out.ok, false)
+    const ep = `${r.stateDir}/episodes/2`
+    writeFileSync(`${ep}/result.json`, result({ episode: 2 }))
+    // The same process is alive; the collector has a fresh command scope.
+    const gate = newGate()
+    await reconcile(w.host, gate, false)
+    assert.throws(() => readlinkSync(`${r.stateDir}/.action`), 'abandoned action must be released by the live collector')
+    await reconcile(w.host, gate, false)
+    assert.equal(w.woken.length, 1, 'the result behind the abandoned lock is delivered')
+    const lostReply: Host = { ...w.host, run: async (a, c, m) => {
+      if (a[0] === 'ln' && a.at(-1) === `${r.stateDir}/.action`) {
+        await w.host.run(a, c, m)
+        throw new Error('acquisition reply aborted')
+      }
+      return w.host.run(a, c, m)
+    } }
+    assert.equal((await takeLock(lostReply, r.stateDir)).ok, false)
+    assert.doesNotThrow(() => readlinkSync(`${r.stateDir}/.action`), 'ln ran before its caller lost the reply')
+    await reconcile(w.host, gate, false)
+    assert.throws(() => readlinkSync(`${r.stateDir}/.action`), 'an abandoned acquire releases only its own token too')
+    const held = await takeLock(w.host, r.stateDir)
+    assert.ok(held.ok)
+    let cancelled = false
+    const revoked: Host = { ...w.host, run: async (a, c, m) => {
+      if (cancelled) throw new Error('caller cancelled during maintenance release')
+      const out = await w.host.run(a, c, m)
+      if (a[0] === 'ln' && a.at(-1) === `${r.stateDir}/.action.unlock`) cancelled = true
+      return out
+    } }
+    await releaseLock(revoked, `${r.stateDir}/.action`, held.token)
+    assert.doesNotThrow(() => readlinkSync(`${r.stateDir}/.action.unlock`))
+    await reconcile(w.host, gate, false)
+    assert.throws(() => readlinkSync(`${r.stateDir}/.action.unlock`), { code: 'ENOENT' })
+    assert.throws(() => readlinkSync(`${r.stateDir}/.action`), { code: 'ENOENT' })
+  } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+})
+
 type Call = { argv: readonly string[]; env?: Record<string, string> }
 
 /**
@@ -80,7 +135,7 @@ test('assign: v5 name, worker.json, E1 descriptor + sent, launch on the producer
   assert.equal(e1.base, SHA)
   assert.equal(e1.goal, 'probe')
   assert.ok(existsSync(`${r.stateDir}/episodes/1/sent`))
-  assert.ok(!existsSync(`${r.stateDir}/.action`), 'the lock is released')
+  assert.throws(() => readlinkSync(`${r.stateDir}/.action`), { code: 'ENOENT' }, 'the lock is released')
   const detach = w.calls.find(c => c.argv[0] === 'sh')!.argv
   assert.equal(detach[1], '-c')
   assert.match(detach[2]!, /setsid nohup .*setpgrp\(0, 0\)/, 'the launch runs in a process group of its own')
@@ -522,7 +577,7 @@ test('S3: mod and MCP both try one session — exactly one channel registers; th
   assert.match(loser.paused ?? '', new RegExp(`collected by its ${won} channel`))
   assert.deepEqual(actsOf(w), ['1'], 'one registration: the winner is not fenced')
   assert.equal(await heartbeat(w.host, winner), true)
-  assert.ok(!existsSync(`${sessionDirOf(w.v3, 'me')}/channel.lock`), 'the mutation lock is released')
+  assert.throws(() => readlinkSync(`${sessionDirOf(w.v3, 'me')}/channel.lock`), { code: 'ENOENT' }, 'the mutation lock is released')
   // A reload of the winning channel still fences the older one (S1 (a)).
   const reload = newGate()
   reload.channel = winner.channel
@@ -844,7 +899,7 @@ test('waiter release under the lock (F10): a held lock defers the release; free,
   ;(await import('node:fs')).unlinkSync(lock)
   await reconcile(host, newGate(), false)
   assert.deepEqual(read(`${r.stateDir}/episodes/1/waiter`), {})
-  assert.ok(!existsSync(lock), 'released')
+  assert.throws(() => readlinkSync(lock), { code: 'ENOENT' }, 'released')
 })
 
 test('autoStop re-reads max n (F10): a superseded activation stops nothing', async () => {
@@ -1505,7 +1560,7 @@ test('sol-review F2: tell stops when an earlier episode cannot be read — no ep
   assert.match(out.text, /nothing was sent/)
   assert.equal(sends().length, 0, 'nothing is sent on top of an unsettled episode')
   assert.ok(!existsSync(`${r.stateDir}/episodes/2`), 'no new episode')
-  assert.ok(!existsSync(`${r.stateDir}/.action`), 'the lock is released')
+  assert.throws(() => readlinkSync(`${r.stateDir}/.action`), { code: 'ENOENT' }, 'the lock is released')
   assert.ok(w.logs.some(l => l.includes('could not check') && l.includes('/episodes/1/sent')), 'recovery logs the read error')
 })
 
