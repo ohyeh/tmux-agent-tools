@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.46.24 - 2026-10-30
+
+- Fix (action lifecycle): a cancelled caller could lose its subprocess scope before `.action` release. The ledger now tracks each acquired token through completion and retries a settled release from a fresh collector callback. An uncertain acquisition also queues cleanup of that exact token. A running action is never released by this retry. Lock-absence tests now inspect the symlink itself instead of following its dangling JSON target.
+- Fix (recovery): `unlock <name> confirm` can finish a release when this live process recorded that exact action as settled. Unknown tokens, another process, and actions still in flight keep the existing no-online-stealing rule.
+- Fix (collector): a notice deferral is logged once per worker episode and reason until that state changes. Finished workers stay counted in the band and show a held action or delivery deferral.
+- Fix (owner after `/resume`): read the live engine session id on commands, tools and collector ticks. Transfer the previous session's worker record and episode ownership through the existing action-lock and claim ledger, and register a heartbeat for the new session. Busy workers retry the handoff; historical dispatch descriptors stay immutable.
+- Fix (changed plugin hooks): the band and collector notice show hook names and plugin. Agent `keys` refuses all keys at `hook_trust_prompt` and never accepts `t`. Only the owner-typed `/workers trust <name>` command may answer it; plugin, SDK and bridge origins are refused. It checks the current dialog under the action lock before sending one key.
+- Tests: the new lifecycle regressions fail against the exact v0.46.23 source; they cover a real child timeout with revoked caller capabilities, a live process before/after action completion, same-activation session change, deferral transitions, band rendering and command provenance.
+- Not verified: live Claude Code `/resume`, interruption and hook-trust approval after plugin installation; Linux hosts. No tag, release, push or plugin install was performed for this change.
+
 ## v0.46.23 - 2026-10-28
 
 - Fix (`mcp__tmux-agent__reload`): a call while a reload was queued queued a second timer, so `/reload-plugins` and `/reload-skills` ran twice (one remote session, 10-22: two calls 0.7 s apart). A call while one is queued now joins it and answers "already queued"; the flag clears before the commands run, so a later update gets its own reload. Found in a 7-day transcript scan of two hosts (10-28); sol and deepseek called it a fix, argon and advisor a leave, the owner chose fix.
