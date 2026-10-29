@@ -16,6 +16,22 @@ import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessio
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
 
+test('lifecycle 5: a paused collector registers again when its live session changes', async () => {
+  const w = world()
+  try {
+    let owner = 'me'
+    const host: Host = { ...w.host, owner: () => owner }
+    const gate = newGate()
+    assert.equal(await heartbeat(host, gate), true)
+    gate.paused = 'old session delivery refused'
+    gate.nextAttemptAt = Date.now() + 60_000
+    owner = 'resumed'
+    await reconcile(host, gate, false)
+    assert.equal(gate.paused, undefined, 'a pause belongs to the old session')
+    assert.equal(existsSync(`${sessionDirOf(w.v3, owner)}/act/1.beat`), true)
+  } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+})
+
 test('lifecycle 4: finished worker rows show a held action and deferred delivery', async () => {
   const w = world()
   try {

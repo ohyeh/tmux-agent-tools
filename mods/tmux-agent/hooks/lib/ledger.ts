@@ -391,15 +391,20 @@ export async function claim(
   gen0Owner: string | undefined,
   me: string,
   now: number,
+  previousOwner?: string,
 ): Promise<'claimed' | 'held' | 'lost' | 'unknown'> {
+  // A host-observed session change hands its own episodes over immediately.
+  // All other callers still need the orphan/liveness test below.
+  const transferring = previousOwner !== undefined
   const closed = await closedForClaim(host, episode)
   if (closed === 'unknown') return 'unknown'
-  if (closed) return 'held'
+  if (closed && !transferring) return 'held'
   const cur = await currentOwner(host, episode, gen0Owner)
   if (!cur) return 'unknown'
+  if (transferring && (!cur.complete || cur.session !== previousOwner)) return 'held'
   if (cur.complete) {
     if (cur.session === me) return 'held'
-    if (cur.session) {
+    if (cur.session && !transferring) {
       const live = await sessionLiveness(host, `${root}/.sessions/${sessionKey(cur.session)}`, now)
       if (live !== 'non-live') return live === 'unknown' ? 'unknown' : 'held'
     }

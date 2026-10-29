@@ -572,6 +572,7 @@ export type PanelRow = {
 
 /** Per-activation delivery state. A reload drops it; losing it only costs attempts. */
 export type Gate = {
+  session?: string
   inflight?: Promise<void>
   failures: number
   nextAttemptAt: number
@@ -2317,9 +2318,10 @@ export const newGate = (): Gate => ({
 
 export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): Promise<void> {
   await releaseSettledActions(host)
-  if (gate.paused) return
+  const changedSession = gate.session !== undefined && gate.session !== host.owner()
+  if (gate.paused && !changedSession) return
   const now = await host.now()
-  if (now < gate.nextAttemptAt) return
+  if (now < gate.nextAttemptAt && !changedSession) return
   const root = await rootOf(host)
   if (!root) return
   const v3 = v3Of(root)
@@ -3328,10 +3330,22 @@ export async function heartbeat(host: Host, gate: Gate): Promise<boolean> {
     host.log(`tmux-agent: not collecting — ${id ? 'no state root' : 'this host has no session id'}`)
     return false
   }
+  if (gate.session && gate.session !== id) {
+    gate.activation = undefined
+    gate.registering = undefined
+    gate.stateWritten = undefined
+    gate.paused = undefined
+    gate.waiting = undefined
+    gate.failures = 0
+    gate.nextAttemptAt = 0
+  }
+  gate.session = id
   const dir = sessionDirOf(v3Of(root), id)
   if (gate.activation === undefined) {
     gate.registering ??= registerChannelActivation(host, gate, dir)
-    gate.activation = await gate.registering
+    const activation = await gate.registering
+    if (gate.session !== id || host.owner() !== id) return false
+    gate.activation = activation
     if (gate.activation === undefined) {
       gate.registering = undefined
       return false
@@ -3453,6 +3467,57 @@ export async function takeLock(host: Host, workerDir: string, token = randomBase
   const me = await processId(host)
   const holder: Holder = { token, session: host.owner() ?? '', activation, ...me }
   return acquireLock(host, `${workerDir}/.action`, holder)
+}
+
+/** Transfer this host's previous session, not another live owner's workers. Busy workers retry on the next identity read. */
+export async function handoffOwner(host: Host, from: string, to: string): Promise<boolean> {
+  const root = await rootOf(host)
+  if (!root) return false
+  const v3 = v3Of(root)
+  const there = await host.exists(v3)
+  if (!there) return true
+  const entries = await host.list(v3)
+  let complete = true
+  for (const e of entries) {
+    if (e.kind !== 'dir' || e.name.startsWith('.')) continue
+    const w = `${v3}/${e.name}`
+    const rec = await readWorker(host, w)
+    if (rec === UNKNOWN) { complete = false; continue }
+    if (!rec || !sameProject(host, rec)) continue
+    const seqs = await numericChildren(host, `${w}/episodes`)
+    if (!seqs) { complete = false; continue }
+    // Avoid locking unrelated workers. Re-read all ownership under the lock.
+    let mine = rec.owner === from
+    for (const seq of seqs) {
+      const ep = `${w}/episodes/${seq}`
+      const desc = await readDescriptor(host, ep)
+      if (desc === UNKNOWN) { complete = false; continue }
+      if (desc) {
+        const owner = await currentOwner(host, ep, desc.owner)
+        if (!owner) complete = false
+        else if (owner.session === from) mine = true
+      }
+    }
+    if (!mine) continue
+    const lock = await takeLock(host, w)
+    if (!lock.ok) { complete = false; continue }
+    await underLock(host, `${w}/.action`, lock.token, async () => {
+      const current = await numericChildren(host, `${w}/episodes`)
+      if (!current) { complete = false; return }
+      for (const seq of current) {
+        const ep = `${w}/episodes/${seq}`
+        const desc = await readDescriptor(host, ep)
+        if (desc === UNKNOWN) { complete = false; continue }
+        if (!desc) continue
+        const moved = await claimEpisode(host, v3, ep, desc.owner, to, await host.now(), from)
+        if (moved === 'unknown' || moved === 'lost') complete = false
+      }
+      const fresh = await readWorker(host, w)
+      if (fresh === UNKNOWN) complete = false
+      else if (fresh?.owner === from && !(await publish(host, `${w}/worker.json`, JSON.stringify({ ...fresh, owner: to }), lock.token))) complete = false
+    }, releaseLog(host))
+  }
+  return complete
 }
 
 /**

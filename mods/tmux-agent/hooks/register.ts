@@ -83,6 +83,7 @@ import {
   pressKeys,
   interruptWorker,
   heartbeat,
+  handoffOwner,
   reconcileOnce,
   assignWorker,
   resumeWorker,
@@ -224,10 +225,23 @@ export const register: Register = on => {
   let listAgents: Host['agentList'] = () => Promise.reject(new Error('tmux-agent: agent.list before the session binds'))
   let sessionCwd: string | undefined
   let sessionId: string | undefined
-  /** The session id, asked again when the first read found none: no id, no owner (§3). */
-  const idNow = async (ask: () => Promise<string>): Promise<string | undefined> => {
-    sessionId ||= (await ask().catch(() => undefined)) || undefined
-    return sessionId
+  const previousOwners = new Set<string>()
+  let identityRead: Promise<unknown> = Promise.resolve()
+  /** session.start fires once per load, not on /resume; read the live id at every entry. */
+  const idNow = (ask: () => Promise<string>): Promise<string | undefined> => {
+    const read = identityRead.then(async () => {
+      const id = await ask()
+      if (!id) return sessionId
+      if (sessionId && sessionId !== id) previousOwners.add(sessionId)
+      sessionId = id
+      previousOwners.delete(id)
+      if (world) for (const from of previousOwners) {
+        if (await handoffOwner(world, from, id)) previousOwners.delete(from)
+      }
+      return sessionId
+    })
+    identityRead = read.catch(error => world?.log(`tmux-agent: session identity refresh failed: ${String(error)}`))
+    return read
   }
   /** False after a failed `$.agent.register`: the spawn hook then denies, as 0.9 did. */
   let waiterReady = false
@@ -526,7 +540,7 @@ export const register: Register = on => {
     world = host
     // A hot reload re-runs engine.create but not session.start, so the ids
     // would stay unset until the next session; ask the engine here as well.
-    void beneath.session.id().then(id => { sessionId ||= id }).catch(() => undefined)
+    void idNow(() => beneath.session.id()).catch(() => undefined)
     void beneath.session.cwd().then(cwd => { sessionCwd ||= cwd }).catch(() => undefined)
     const tmux: EngineInterface['tmux'] = {
       outstanding: () => outstanding(host),
@@ -738,6 +752,7 @@ export const register: Register = on => {
     // exists to close. Per-session acks (0.5.2) and owner-only delivery (0.6.0)
     // keep several collectors from duplicating.
     $.clock.every(POLL_MS, async () => {
+      await idNow(() => $.session.id())
       await reconcileOnce(host, gate)
     })
     // The heartbeat on its own clock: reconcileOnce joins an in-flight pass, so
@@ -746,7 +761,8 @@ export const register: Register = on => {
     // — workers this live session dispatched (observed 2026-09-26). A paused
     // collector still goes quiet on purpose, so its workers can be adopted.
     $.clock.every(POLL_MS, async () => {
-      if (!gate.paused) await heartbeat(host, gate)
+      await idNow(() => $.session.id())
+      if (!gate.paused || (gate.session !== undefined && gate.session !== host.owner())) await heartbeat(host, gate)
     })
 
     // Catch up on whatever finished while no collector was alive, through the same
@@ -1390,6 +1406,7 @@ export const register: Register = on => {
   }
 
   on('command.run', { command: 'workers' }, async ($, e) => {
+    await idNow(() => $.session.id())
     const redraw = () => void $.ui.invalidate('ui.render')
     // Typed forms of the panel's controls. They work in any terminal: a letter
     // hotkey presses only while the band is focused, and the chord that focuses
@@ -1577,6 +1594,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => toolFailed(TELL_TOOL, next.error))
 
   on('tool.call', { tool: STOP_TOOL }, async ($, e) => {
+    await idNow(() => $.session.id())
     const input = e as unknown as StopInput
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
@@ -1589,6 +1607,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => toolFailed(STOP_TOOL, next.error))
 
   on('tool.call', { tool: PEEK_TOOL }, async ($, e) => {
+    await idNow(() => $.session.id())
     const input = e as unknown as PeekInput
     if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
     const host = world
@@ -1608,6 +1627,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => toolFailed(PEEK_TOOL, next.error))
 
   on('tool.call', { tool: AWAIT_TOOL }, async ($, e) => {
+    await idNow(() => $.session.id())
     const input = e as unknown as AwaitInput
     if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
     const host = world
@@ -1622,6 +1642,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => toolFailed(AWAIT_TOOL, next.error))
 
   on('tool.call', { tool: KEYS_TOOL }, async ($, e) => {
+    await idNow(() => $.session.id())
     const input = e as unknown as KeysInput
     if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
     const host = world

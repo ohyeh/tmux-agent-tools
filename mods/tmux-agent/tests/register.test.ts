@@ -5,6 +5,26 @@ import { driver, run, turn } from './fixtures/driver'
 
 const WITH_DRIVER = { plugins: [driver] }
 
+test('lifecycle 5: same-process resume moves the band, old episodes and new dispatches to the current session', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME }); const store = mockStore(on); mockClock(on)
+  setSessionId(on, 'before-resume')
+  const files: Files = { ...worker('w1', 0, { owner: 'before-resume', ownerCwd: '/work' }) }
+  mockFs(on, files)
+  mockPanel(on, { running: true, idle_seconds: 60, sessions: ['codex-w1'] })
+  await $.session.start(session())
+  // /resume changes session.id without reloading this plugin or restarting the process.
+  setSessionId(on, 'after-resume')
+  files[`${V3}/w1/result.json`] = finished()
+  await $.turn.complete(turn())
+  await $.command.run(run('workers'))
+  expect(textOf(await $.ui.render(bandRender(40, 39, 140)))).toContain('@after-re')
+  expect(store.acked()).toContain('w1#1')
+  expect(files[`${V3}/w1/episodes/1/claims/1/owner`]).toEqual('after-resume\n')
+  expect(JSON.parse(files[`${V3}/w1/worker.json`]!).owner).toEqual('after-resume')
+  await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'continue' })
+  expect(JSON.parse(files[`${V3}/w1/episodes/2/dispatch.json`]!).owner).toEqual('after-resume')
+})
+
 test('lifecycle 4: the band counts a finished undelivered worker and shows its delivery state', WITH_DRIVER, async ($, on) => {
   mock.env(on, { HOME }); mockStore(on); mockClock(on)
   mockFs(on, { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished() })
