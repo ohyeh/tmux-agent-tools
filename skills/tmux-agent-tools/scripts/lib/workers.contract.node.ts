@@ -16,6 +16,23 @@ import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessio
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
 
+test('lifecycle 4: finished worker rows show a held action and deferred delivery', async () => {
+  const w = world()
+  try {
+    const r = await assigned(w)
+    writeFileSync(`${r.stateDir}/result.json`, result({ episode: 1 }))
+    const held = await takeLock(w.host, r.stateDir)
+    assert.ok(held.ok)
+    const gate = newGate()
+    const rows = await panelRows(w.host, gate, w.root)
+    assert.equal(rows.length, 1)
+    assert.match(rowMark(rows[0]!), /finished.*locked/, 'the row must name its held action')
+    await releaseLock(w.host, `${r.stateDir}/.action`, held.token)
+    gate.deferred = 'composer draft'
+    assert.match(rowMark((await panelRows(w.host, gate, w.root))[0]!), /delivery deferred.*composer draft/)
+  } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+})
+
 test('lifecycle 3: notice deferral logs once per episode and state transition', async () => {
   const w = world()
   try {

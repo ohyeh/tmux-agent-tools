@@ -5,6 +5,17 @@ import { driver, run, turn } from './fixtures/driver'
 
 const WITH_DRIVER = { plugins: [driver] }
 
+test('lifecycle 4: the band counts a finished undelivered worker and shows its delivery state', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME }); mockStore(on); mockClock(on)
+  mockFs(on, { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished() })
+  mockPanel(on, { running: true, idle_seconds: 60, sessions: ['codex-w1'] }, '', false, undefined, true)
+  await $.session.start(session())
+  await $.command.run(run('workers'))
+  const drawn = textOf(await $.ui.render(bandRender(40, 39, 140)))
+  expect(drawn).toContain('tmux 1')
+  expect(drawn).toContain('finished — awaiting delivery')
+})
+
 const HOME = '/h'
 const ROOT = `${HOME}/.local/state/tmux-agent-tools`
 
@@ -3077,7 +3088,7 @@ describe('teammates', () => {
 
     const drawn = textOf(await $.ui.render(bandRender(40, 39, 100)))
     expect(drawn, 'the done worker stays listed').toContain('w2')
-    expect(drawn).toMatch(/workers v\d+\.\d+\.\d+ · @\S+ · tmux 1 · 內部 2 /)
+    expect(drawn).toMatch(/workers v\d+\.\d+\.\d+ · @\S+ · tmux 2 · 內部 2 /)
   })
 
   test('a rejected agent.list shows 內部 ? and logs once', WITH_DRIVER, async ($, on) => {

@@ -911,7 +911,7 @@ export const register: Register = on => {
     // The title, `[ refresh ]` and `[ hide ]`; a blank filler is padded so the bar
     // spans the row up to the engine's own `[-]` collapse control, which the band
     // draws over its last cells (observed live: it covered `[ hide ]`).
-    const tmuxRunning = panel.rows.filter(r => !r.project && !r.terminal).length
+    const tmuxRunning = panel.rows.filter(r => !r.project && !r.incomplete).length
     // Which session this panel belongs to, so a row's `@<id>` reads against it
     // (asked 2026-09-26: the 專案 count told less than whose panel it is; the
     // project rows still say 專案 themselves).

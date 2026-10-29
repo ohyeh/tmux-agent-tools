@@ -557,6 +557,7 @@ export type PanelRow = {
   holder?: string
   /** A finished row's own words, so the panel can show what it did without a mirror. */
   summary?: string
+  delivery?: string
   /** The delivery of this episode was reserved (`delivering`) and never acknowledged: `stale` = its activation is gone, `unknown` = the marker could not be read. */
   reservation?: 'stale' | 'unknown'
   /** result.json status is in `TERMINAL`. Still listed, but not "running now". */
@@ -2079,6 +2080,11 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
     const held = v3 && d.seq && !reported.has(id) ? await reservationOf(host, v3, episodeDirOf(v3, d)) : 'none'
     const reservation = held === 'stale' || held === 'unknown' ? held : undefined
     const gone = resumedGone.get(d.name)
+    let delivery: string | undefined
+    if (done && !reported.has(id) && v3) {
+      const action = await readHolder(host, `${v3}/${d.name}/.action`)
+      delivery = action ? 'locked — delivery deferred' : gate.deferred ? `delivery deferred — ${gate.deferred}` : undefined
+    }
     if (reservation) {
       summary =
         reservation === 'stale'
@@ -2113,6 +2119,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       ageMs: Math.min(endedAt ?? now, now) - d.since,
       ...(holder ? { holder } : {}),
       ...(summary ? { summary } : {}),
+      ...(delivery ? { delivery } : {}),
       ...(reservation ? { reservation } : {}),
       ...(blockedReason ? { blockedReason } : {}),
       terminal: done,
@@ -2746,7 +2753,7 @@ export function rowMark(r: PanelRow): string {
   if (r.project) return r.shell ? `shell · ${r.shell}` : '專案'
   if (r.incomplete) return 'unknown — no worker.json (unfinished reservation)'
   return r.state === 'finished'
-    ? 'finished — awaiting delivery'
+    ? `finished — ${r.delivery ?? 'awaiting delivery'}`
     : r.state === 'delivered'
       ? 'done — tell it more, or stop it'
       : r.state === 'needs-input'
