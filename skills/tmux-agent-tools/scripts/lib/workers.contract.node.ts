@@ -11,10 +11,32 @@ import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
 import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, rootOf, v3Of, zshRun, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
-import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey } from './ledger.ts'
+import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey, underLock } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
+
+test('lifecycle 2: a live process refuses an in-flight action but can unlock its settled release', async () => {
+  const w = world()
+  try {
+    const r = await assigned(w)
+    const lock = `${r.stateDir}/.action`
+    const held = await takeLock(w.host, r.stateDir)
+    assert.ok(held.ok)
+    let finish!: () => void
+    const pending = new Promise<void>(resolve => { finish = resolve })
+    const denied: Host = { ...w.host, run: async (a, c, m) => a[0] === 'rm' && a[1] === lock
+      ? { exitCode: 1, stdout: '', stderr: 'EIO release' } : w.host.run(a, c, m) }
+    const action = underLock(denied, lock, held.token, () => pending, v => v)
+    assert.equal((await unlockWorker(w.host, r.name, 'confirm')).ok, false, 'a live action is never stolen')
+    finish()
+    await action
+    assert.equal(JSON.parse(readlinkSync(lock)).token, held.token)
+    const recovered = await unlockWorker(w.host, r.name, 'confirm')
+    assert.equal(recovered.ok, true, recovered.text)
+    assert.throws(() => readlinkSync(lock))
+  } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+})
 
 test('lifecycle 1: caller timeout leaves no action lock after the next live collector pass', async () => {
   const w = world()

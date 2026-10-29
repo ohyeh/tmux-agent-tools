@@ -31,6 +31,7 @@ import {
   recoverEpisodes,
   registerOnChannel,
   releaseSettledActions,
+  settledAction,
   underLock,
   unlinkHeld,
   sessionKey,
@@ -3620,6 +3621,14 @@ async function unlockHeld(
   const me = await processId(host)
   if (!h.host || !me.host || h.host !== me.host) return { ok: false, text: `not unlocking "${name}": held by ${who}, not provably this host (${me.host || '?'})` }
   if (!h.pid || !h.pidStart) return { ok: false, text: `not unlocking "${name}": holder ${who} records no process to check` }
+  // This is our own completed action, not an online takeover. Unknown tokens
+  // (including a previous module activation) still need proof of process death.
+  if (h.pid === me.pid && h.pidStart === me.pidStart && settledAction(lock, h.token)) {
+    const gone = await unlinkHeld(host, lock, h.token)
+    return gone.ok
+      ? { ok: true, text: `unlocked "${name}" (this process finished that action; its release is complete)` }
+      : { ok: false, text: `"${name}": settled action release failed (${gone.error})` }
+  }
   // The shared probe (a live session does not keep a dead process's lock): only ESRCH or a reused pid is gone; a broken ps is unknown, not dead.
   const alive = await holderProvablyAlive(host, h)
   if (alive === true) return { ok: false, text: `not unlocking "${name}": holder ${who} is still running` }
