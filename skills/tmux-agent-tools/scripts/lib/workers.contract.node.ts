@@ -16,6 +16,40 @@ import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessio
 const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
 
+test('lifecycle 3: notice deferral logs once per episode and state transition', async () => {
+  const w = world()
+  try {
+    const r = await assigned(w)
+    const gate = newGate()
+    const f = finishedOf(r, w.repo)
+    const held = await takeLock(w.host, r.stateDir)
+    assert.ok(held.ok)
+    await reserveDeliveries(w.host, gate, w.v3, [f])
+    await reserveDeliveries(w.host, gate, w.v3, [f])
+    const notices = () => w.logs.filter(l => /notice waits for the next pass/.test(l))
+    assert.equal(notices().length, 1, 'unchanged lock must not log every pass')
+    await releaseLock(w.host, `${r.stateDir}/.action`, held.token)
+    assert.equal((await reserveDeliveries(w.host, gate, w.v3, [f])).length, 1)
+    const again = await takeLock(w.host, r.stateDir)
+    assert.ok(again.ok)
+    await reserveDeliveries(w.host, gate, w.v3, [f])
+    assert.equal(notices().length, 2, 'a new deferral after success is news')
+    await releaseLock(w.host, `${r.stateDir}/.action`, again.token)
+    const markerFault: Host = { ...w.host, run: async (a, c, m) => a[0] === 'mv' && a[2]?.endsWith('/delivering')
+      ? { exitCode: 1, stdout: '', stderr: 'EIO marker-fault' } : w.host.run(a, c, m) }
+    await reserveDeliveries(markerFault, gate, w.v3, [f])
+    await reserveDeliveries(markerFault, gate, w.v3, [f])
+    assert.equal(w.logs.filter(l => l.includes('marker-fault')).length, 1, 'marker cause is retained without per-pass error spam')
+    const ackFault: Host = { ...w.host, exists: async p => p.endsWith('/acks') ? true : w.host.exists(p), list: async p => {
+      if (p.endsWith('/acks')) throw new Error('EIO ack-fault')
+      return w.host.list(p)
+    } }
+    await reserveDeliveries(ackFault, gate, w.v3, [f])
+    await reserveDeliveries(ackFault, gate, w.v3, [f])
+    assert.equal(w.logs.filter(l => l.includes('ack-fault')).length, 1, 'ack cause is retained without per-pass error spam')
+  } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+})
+
 test('lifecycle 2: a live process refuses an in-flight action but can unlock its settled release', async () => {
   const w = world()
   try {

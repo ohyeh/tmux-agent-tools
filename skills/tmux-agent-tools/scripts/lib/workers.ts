@@ -580,6 +580,7 @@ export type Gate = {
   waiting?: string
   /** Why the last delivery was deferred (host composer not empty, paste blocked); kept while it holds, cleared by a delivery. Published in `act/<n>.state` as `reason`. */
   deferred?: string
+  noticeDeferrals: Map<string, Deferral['why']>
   /** The registration's own guard that could not be removed (`ChannelRegistration.left`): the activation is registered, but the next one reports the channel busy until it is rm'd by hand. Published in `act/<n>.state` as `reason`. */
   registerLeft?: string
   /** A view's reading of its session's collector (`act/<n>.state` + beat, C-health). Unset on the collector. */
@@ -798,14 +799,19 @@ export async function reservationOf(host: Host, v3: string, epDir: string): Prom
 export type Deferral = { f: Finished; why: 'locked' | 'acks' | 'marker' }
 export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: readonly Finished[], deferred: Deferral[] = []): Promise<{ f: Finished; token: string }[]> {
   const out: { f: Finished; token: string }[] = []
+  const defer = (f: Finished, why: Deferral['why'], text: string) => {
+    const id = idOf(f.d)
+    if (gate.noticeDeferrals.get(id) !== why) host.log(`tmux-agent: ${id}: ${text}; its notice waits for the next pass (not delivered unreserved)`)
+    gate.noticeDeferrals.set(id, why)
+    deferred.push({ f, why })
+  }
   const names = [...new Set(fs.map(f => f.d.name))]
   for (const name of names) {
     const mine = fs.filter(f => f.d.name === name)
     const w = `${v3}/${name}`
     const lock = await takeLock(host, w, undefined, String(gate.activation ?? ''))
     if (!lock.ok) {
-      host.log(`tmux-agent: ${name} is locked by another action; its notice waits for the next pass (not delivered unreserved)`)
-      deferred.push(...mine.map(f => ({ f, why: 'locked' as const })))
+      for (const f of mine) defer(f, 'locked', 'locked by another action')
       continue
     }
     await underLock(host, `${w}/.action`, lock.token, async () => {
@@ -815,23 +821,29 @@ export async function reserveDeliveries(host: Host, gate: Gate, v3: string, fs: 
           out.push({ f, token: '' })
           continue
         }
-        const acks = await ackNames(host, ep)
+        const errors: string[] = []
+        const checked: Host = { ...host, log: text => errors.push(text) }
+        const acks = await ackNames(checked, ep)
         if (!acks) {
-          host.log(`tmux-agent: could not read the acks of ${idOf(f.d)}; its notice waits for the next pass`)
-          deferred.push({ f, why: 'acks' })
+          defer(f, 'acks', `could not read the acks (${errors.join('; ')})`)
           continue
         }
-        if (acks.some(n => CLOSED_ACKS.includes(n))) continue
+        if (acks.some(n => CLOSED_ACKS.includes(n))) {
+          gate.noticeDeferrals.delete(idOf(f.d))
+          continue
+        }
         const token = randomBase36(12)
         const marker = { token, activation: gate.activation, session: host.owner() ?? '', at: await host.now() }
-        const wrote = await publish(host, `${ep}/${DELIVERING}`, JSON.stringify(marker), token).catch((error: unknown) => {
-          host.log(`tmux-agent: could not publish ${ep}/${DELIVERING}: ${String(error)}`)
+        const wrote = await publish(checked, `${ep}/${DELIVERING}`, JSON.stringify(marker), token).catch((error: unknown) => {
+          errors.push(String(error))
           return false
         })
-        if (wrote) out.push({ f, token })
+        if (wrote) {
+          gate.noticeDeferrals.delete(idOf(f.d))
+          out.push({ f, token })
+        }
         else {
-          host.log(`tmux-agent: could not write the delivery marker of ${idOf(f.d)}; its notice waits for the next pass`)
-          deferred.push({ f, why: 'marker' })
+          defer(f, 'marker', `could not write the delivery marker (${errors.join('; ')})`)
         }
       }
     }, releaseLog(host))
@@ -2282,6 +2294,7 @@ export async function releaseEndedWaiters(host: Host, gate: Gate, v3: string, wa
 
 /** A collector's fresh per-activation state; every host starts from this. */
 export const newGate = (): Gate => ({
+  noticeDeferrals: new Map(),
   failures: 0,
   nextAttemptAt: 0,
   token: randomBase36(12),
@@ -2312,6 +2325,10 @@ export async function reconcile(host: Host, gate: Gate, probeStalls: boolean): P
   await refreshProjects(host, gate, s.visible)
   const reported = s.reported
   const pending = s.dispatches.filter(d => d.seq && !reported.has(idOf(d)))
+  if (s.complete) {
+    const ids = new Set(pending.map(idOf))
+    for (const id of gate.noticeDeferrals.keys()) if (!ids.has(id)) gate.noticeDeferrals.delete(id)
+  }
   const { finished: collected, unfinished, terminal, read, resume } = await collect(host, v3, pending, gate.exited, reported, gate.collectFrom, s.dispatches)
   gate.collectFrom = resume
   const done = [...collected, ...(await observe(host, s, Math.max(0, BATCH_MAX - collected.length), read, terminal))]
