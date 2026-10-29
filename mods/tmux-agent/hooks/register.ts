@@ -81,6 +81,7 @@ import {
   peekWorker,
   peekProject,
   pressKeys,
+  trustWorkerHooks,
   interruptWorker,
   heartbeat,
   handoffOwner,
@@ -1419,6 +1420,15 @@ export const register: Register = on => {
     if (verb) {
       const bound = world
       if (!bound) return { text: 'unavailable — the mod did not bind.' }
+      if (verb === 'trust') {
+        if (e.origin.kind !== 'composer') return { text: `the owner must type /workers trust ${target || '<name>'} in the Claude Code prompt; agent and plugin calls cannot trust hooks` }
+        if (!NAME_RE.test(target) || message.trim()) return { text: '/workers trust <name>' }
+        const d = (await scan(bound, { claim: false })).visible.find(w => w.name === target)
+        if (!d) return { text: `no worker "${target}" in this project` }
+        const out = await trustWorkerHooks(bound, d)
+        if (panel.open) void panel.refresh?.()
+        return { text: out.text }
+      }
       if (verb === 'probe') {
         await idNow(() => $.session.id())
         if (target !== '' && target !== 'show' && target !== 'on' && target !== 'off') return { text: '/workers probe on|off|show' }

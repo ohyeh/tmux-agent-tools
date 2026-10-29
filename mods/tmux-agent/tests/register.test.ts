@@ -5,6 +5,35 @@ import { driver, run, turn } from './fixtures/driver'
 
 const WITH_DRIVER = { plugins: [driver] }
 
+test('lifecycle 6: changed hooks are visible and only a composer command can trust them', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME }); mockStore(on); mockClock(on)
+  mockFs(on, { ...worker('w1', 0) })
+  const pane = { v: '3 hooks modified\nPress t to trust the ponytail@ponytail SubagentStart hook.\nPostToolUse Stop' }
+  const probe = { exists: true, running: true, idle_seconds: 60, blocked_reason: 'hook_trust_prompt', sessions: ['codex-w1'] }
+  const p = mockPanel(on, probe, pane)
+  await $.session.start(session())
+  await $.turn.complete(turn())
+  await $.command.run(run('workers'))
+  const drawn = textOf(await $.ui.render(bandRender(40, 39, 180)))
+  expect(drawn).toContain('ponytail@ponytail')
+  expect(drawn).toContain('SubagentStart')
+  const blocked = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__keys' as const, name: 'w1', keys: ['Enter'] }))
+  expect(blocked).toContain('owner must type /workers trust w1')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__keys' as const, name: 'w1', keys: ['t'] }))).toContain('refused: t')
+  await $.command.run(run('trust-as-plugin', 'w1'))
+  await $.turn.complete(turn())
+  const untrusted = await $.command.run(run('trust-as-plugin'))
+  expect(untrusted.text).toContain('owner must type')
+  expect(p.argv.filter(a => a[0] === 'tmux' && a[1] === 'send-keys').length).toEqual(0)
+  const trusted = await $.command.run(run('workers', 'trust w1'))
+  expect(trusted.text).toContain('trusted changed hooks')
+  pane.v = 'Ready for a task'
+  expect((await $.command.run(run('workers', 'trust w1'))).text).toContain('no key pressed')
+  probe.blocked_reason = 'permission_prompt'
+  expect((await $.command.run(run('workers', 'trust w1'))).text).toContain('no key pressed')
+  expect(p.argv.filter(a => a[0] === 'tmux' && a[1] === 'send-keys').map(a => a.at(-1))).toEqual(['t'])
+})
+
 test('lifecycle 5: same-process resume moves the band, old episodes and new dispatches to the current session', WITH_DRIVER, async ($, on) => {
   mock.env(on, { HOME }); const store = mockStore(on); mockClock(on)
   setSessionId(on, 'before-resume')

@@ -142,7 +142,7 @@ Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會�
 | `mcp__tmux-agent__tell` | 對同一個 worker 再說一句（下一個任務、修正）。它開下一輪 `episodes/<seq+1>/`（自己的 `result.json` 路徑與 `episode` 編號），把訊息連同這兩者送進去——collector 監看這一輪，worker 回到面板。對別的 session 派的 worker 也能用：新的一輪由你開，結果送你 |
 | `mcp__tmux-agent__stop` | 停掉 worker 並把它記為已回報，離開面板；之後不會再有任何投遞 |
 | `mcp__tmux-agent__peek` | 卡住時先看：pane 最後幾行，加上 running／idle／gone／needs input |
-| `mcp__tmux-agent__keys` | 回答 worker 停著的信任／權限對話框（只收白名單鍵）；答完用 `tell` 重送 brief |
+| `mcp__tmux-agent__keys` | 回答 worker 的一般權限對話框（只收白名單鍵）；遇到 changed plugin hooks 時拒絕全部按鍵，必須由 owner 處理 |
 | `mcp__tmux-agent__panel` | 開或關 `/workers` 面板，和人打 `/workers` 同一條路 |
 | `mcp__tmux-agent__reload` | `claude plugin update` 之後，本輪結束時跑 `/reload-plugins` |
 
@@ -663,6 +663,13 @@ band 連「一列加它的控制」都放不下時只畫標題列和一行指令
 - **卡在對話框的 worker 標 `needs input`。** status 的 `blocked_reason`（trust／
   permission／approval／login／ssh）一出現，該列立刻改標、toast 一次；Claude 用
   `peek` 看畫面、`keys` 按白名單鍵回答。不會等 15 分鐘才被當 stalled。
+  `hook_trust_prompt` 另在 band 與 collector notice 顯示 plugin 與 hook 名稱。
+  changed hooks 會以 owner 的權限執行程式：owner 看完後，必須親自在 Claude Code prompt
+  輸入 `/workers trust <name>`（使用 receipt 的完整 worker 名稱）。這個命令只接受
+  `composer` 來源，拒絕 plugin、SDK、bridge；agent tools 沒有信任動作，`keys` 也不收 `t`。
+  命令在 worker action lock 內重新查 status 與目前畫面，只在仍是 `hook_trust_prompt` 且畫面明示
+  `Press t to trust` 時對該 worker 送一個 `t`；其他狀態不送鍵。`tmux` 計數包含 finished
+  但尚未投遞的隊友，列上會顯示 locked 或 delivery deferred 原因。
 - **只鏡像選中的那一格。** 五個 worker 全鏡像等於每秒 2.5 個子行程，而且
   沒人在看。沒選任何一列就完全不抓。
 - **鏡像用 `--strip-ansi`，不上色。** 引擎的 `Text.color` 接受哪些寫法沒有

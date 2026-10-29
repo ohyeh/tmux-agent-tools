@@ -32,6 +32,25 @@ test('lifecycle 5: a paused collector registers again when its live session chan
   } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
 })
 
+test('lifecycle 6: the collector reports changed hook names and plugin once, without trusting them', async () => {
+  const pane = '3 hooks modified\nPress t to trust the ponytail@ponytail SubagentStart hook.\nPostToolUse Stop'
+  const w = world({ answer: a => a[0] === 'agent-tmux' && a[2] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify({ exists: true, running: true, idle_seconds: 1, blocked_reason: 'hook_trust_prompt' }), stderr: '' }
+    : a.includes('capture') ? { exitCode: 0, stdout: pane, stderr: '' } : undefined })
+  try {
+    await assigned(w)
+    const d = (await scan(w.host, { claim: false })).visible[0]!
+    const gate = newGate()
+    await flagStalls(w.host, gate, w.v3, [d], [d])
+    await flagStalls(w.host, gate, w.v3, [d], [d])
+    assert.equal(w.woken.length, 1, 'hook trust must wake the collector once')
+    assert.match(w.woken[0]!, /ponytail@ponytail.*SubagentStart/s)
+    assert.match(w.woken[0]!, /PostToolUse Stop/)
+    assert.match(w.woken[0]!, /owner must type \/workers trust/)
+    assert.equal(w.calls.filter(c => c.argv.includes('send-keys')).length, 0)
+  } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+})
+
 test('lifecycle 4: finished worker rows show a held action and deferred delivery', async () => {
   const w = world()
   try {

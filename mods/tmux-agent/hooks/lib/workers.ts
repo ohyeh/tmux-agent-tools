@@ -551,6 +551,7 @@ export type PanelRow = {
   state: 'running' | 'stalled' | 'finished' | 'delivered' | 'exited' | 'launch-failed' | 'needs-input' | 'unknown'
   /** The dialog the pane is stuck on, for a `needs-input` row. */
   blockedReason?: string
+  blockedDetail?: string
   idleSeconds?: number
   ageMs: number
   /** Whose teammate this is, as the row tags it: another live session's id, or `unknown`; absent when ours. */
@@ -616,6 +617,8 @@ export type Gate = {
   stallDrops: Map<string, number>
   /** Workers whose pane is sitting on a dialog (agent-tmux status `blocked_reason`). */
   blocked: Map<string, string>
+  blockedDetails: Map<string, string>
+  trustNoticed: Map<string, string>
   /** The last `tmux ls` that answered, so one slow tick cannot empty the panel. */
   alive?: Set<string>
   /** `tmux ls` answered at its last call. `false` = it did not (the set above is then an older answer, or empty). */
@@ -1718,7 +1721,7 @@ export async function flagStalls(
   wake = true,
 ): Promise<void> {
   const deadline = (await host.now()) + STALL_SWEEP_MS
-  const woken: { id: string; d: TmuxDispatch; text: string }[] = []
+  const woken: { id: string; d: TmuxDispatch; text: string; hook?: string }[] = []
   // State is kept for every worker still outstanding — one this pass did not
   // reach keeps what it had — and only `live` (read, no terminal result) is probed.
   const seen = new Set(outstanding.map(idOf))
@@ -1730,6 +1733,8 @@ export async function flagStalls(
   for (const id of [...gate.stallDrops.keys()]) if (!seen.has(id)) gate.stallDrops.delete(id)
   for (const id of [...gate.exited]) if (!seen.has(id)) gate.exited.delete(id)
   for (const id of [...gate.blocked.keys()]) if (!seen.has(id)) gate.blocked.delete(id)
+  for (const id of gate.blockedDetails.keys()) if (!seen.has(id)) gate.blockedDetails.delete(id)
+  for (const id of gate.trustNoticed.keys()) if (!seen.has(id)) gate.trustNoticed.delete(id)
   for (const id of [...gate.probedAt.keys()]) if (!seen.has(id)) gate.probedAt.delete(id)
   if (!live.length) return
 
@@ -1782,6 +1787,10 @@ export async function flagStalls(
       diagnostic?: unknown
     }
     const reason = typeof row.blocked_reason === 'string' ? row.blocked_reason : ''
+    if (reason !== 'hook_trust_prompt') {
+      gate.blockedDetails.delete(id)
+      gate.trustNoticed.delete(id)
+    }
     const runtime = RUNTIME_BLOCKERS.has(reason)
     // A pane parked on a trust/permission/login dialog is not working and not
     // stalled: it is waiting for a key. The row says so; `peek` shows the dialog
@@ -1791,6 +1800,14 @@ export async function flagStalls(
       if (wake && !gate.blocked.has(id)) host.toast(`tmux-agent: ${d.name} needs input — ${reason}`)
       gate.blocked.set(id, reason)
       gate.stalled.delete(id)
+      if (reason === 'hook_trust_prompt') {
+        const capture = await host.run(['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', '80', d.name], d.dir, Math.min(STALL_PROBE_MS, Math.max(1, deadline - await host.now())))
+          .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+        const detail = capture.exitCode === 0 ? capture.stdout.replace(CTRL_ALL_RE, ' ').trim().slice(0, 3000) : `hook names unavailable: ${capture.stderr.slice(-200)}; peek at the worker`
+        gate.blockedDetails.set(id, detail)
+        if (wake && gate.trustNoticed.get(id) !== detail) woken.push({ id, d, hook: detail, text:
+          `- "${d.name}" on ${d.profile}: hook_trust_prompt — ${detail}\n  Changed hooks run code with the owner's permissions. The owner must type /workers trust ${d.name} in the Claude Code prompt after reviewing them. Agent tools cannot trust hooks.` })
+      }
       continue
     }
     gate.blocked.delete(id)
@@ -1868,7 +1885,7 @@ export async function flagStalls(
   const still: typeof woken = []
   for (const item of woken) {
     const seq = item.d.seq
-    if (!seq) continue
+    if (!seq) { if (item.hook !== undefined) still.push(item); continue }
     const names = await ackNames(host, `${root}/${item.d.name}/episodes/${seq}`)
     if (names === undefined) continue
     if (names.some(n => CLOSED_ACKS.includes(n))) continue
@@ -1885,10 +1902,14 @@ export async function flagStalls(
   const answer = await host.submit(text).catch((error: unknown) => ({ drop: String(error), deferred: undefined }))
   if (answer?.deferred) return // nothing was sent: not noticed, not a drop; the next pass asks again
   if (!answer?.drop) {
-    for (const w of still) gate.stallNoticed.add(w.id)
+    for (const w of still) {
+      if (w.hook !== undefined) gate.trustNoticed.set(w.id, w.hook)
+      else gate.stallNoticed.add(w.id)
+    }
     return
   }
   for (const w of still) {
+    if (w.hook !== undefined) continue
     const drops = (gate.stallDrops.get(w.id) ?? 0) + 1
     gate.stallDrops.set(w.id, drops)
     if (drops < STALL_WAKE_MAX) continue
@@ -2054,6 +2075,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
     let failed = false
     let unreadable = false
     let summary: string | undefined
+    if (blockedReason === 'hook_trust_prompt') summary = gate.blockedDetails.get(id)
     // A finished worker's clock stops at its result: `done — 26:23` still
     // ticking read as work in progress (observed 2026-09-25).
     let endedAt: number | undefined
@@ -2123,6 +2145,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
       ...(delivery ? { delivery } : {}),
       ...(reservation ? { reservation } : {}),
       ...(blockedReason ? { blockedReason } : {}),
+      ...(blockedReason === 'hook_trust_prompt' ? { blockedDetail: gate.blockedDetails.get(id) } : {}),
       terminal: done,
     })
   }
@@ -2311,6 +2334,8 @@ export const newGate = (): Gate => ({
   stallDrops: new Map(),
   exited: new Set(),
   blocked: new Map(),
+  blockedDetails: new Map(),
+  trustNoticed: new Map(),
   probedAt: new Map(),
   deliveredAt: new Map(),
   projects: [],
@@ -2759,7 +2784,7 @@ export function rowMark(r: PanelRow): string {
     : r.state === 'delivered'
       ? 'done — tell it more, or stop it'
       : r.state === 'needs-input'
-        ? `needs input — ${r.blockedReason ?? 'dialog'}`
+        ? `needs input — ${r.blockedReason ?? 'dialog'}${r.blockedDetail ? ` — ${r.blockedDetail}` : ''}`
         : r.state === 'stalled'
           ? `stalled ${Math.round((r.idleSeconds ?? 0) / 60)}m`
           : r.state === 'exited'
@@ -3161,11 +3186,42 @@ export async function pressKeys(host: Host, d: TmuxDispatch, keys: readonly stri
   const alive = await liveSessions(host, d.dir)
   const session = [...alive].find(sname => sname.endsWith(`-${d.name}`))
   if (!session) return { ok: false, text: `no tmux session for "${d.name}" — it is not running` }
+  const status = await workerDialog(host, d)
+  if (!status) return { ok: false, text: 'status unavailable; no keys pressed' }
+  if (status.blocked_reason === 'hook_trust_prompt') return { ok: false, text: `the owner must type /workers trust ${d.name}; agent tools cannot trust changed hooks` }
   const run = await host
     .run(['tmux', 'send-keys', '-t', exactSessionTarget(session), ...keys], d.dir, LIVE_PROBE_MS)
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
   if (run.exitCode !== 0) return { ok: false, text: `send-keys exited ${run.exitCode}: ${(run.stderr || run.stdout).trim().slice(-300)}` }
   return { ok: true, text: `pressed ${keys.join(' ')} in ${session}; peek to see what it did` }
+}
+
+async function workerDialog(host: Host, d: TmuxDispatch): Promise<{ blocked_reason?: unknown } | undefined> {
+  const r = await host.run(['agent-tmux', d.profile, 'status', '--json', d.name], d.dir, STALL_PROBE_MS).catch(() => undefined)
+  const status = r?.exitCode === 0 ? parseJson(r.stdout) : undefined
+  return status && typeof status === 'object' && !Array.isArray(status) ? status : undefined
+}
+
+/** Called only by the mod's composer-origin command, never by a tool or a CLI verb. */
+export async function trustWorkerHooks(host: Host, d: TmuxDispatch): Promise<Outcome> {
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const w = `${v3Of(root)}/${d.name}`
+  const lock = await takeLock(host, w)
+  if (!lock.ok) return { ok: false, text: busyText(d.name, lock.busy) }
+  return underLock<Outcome>(host, `${w}/.action`, lock.token, async () => {
+    const alive = await liveSessions(host, d.dir)
+    const session = [...alive].find(n => n.endsWith(`-${d.name}`))
+    if (!session) return { ok: false, text: `no tmux session for "${d.name}"` }
+    const status = await workerDialog(host, d)
+    if (status?.blocked_reason !== 'hook_trust_prompt') return { ok: false, text: 'not at a hook_trust_prompt; no key pressed' }
+    const pane = await host.run(['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', '80', d.name], d.dir, MIRROR_PROBE_MS)
+    if (pane.exitCode !== 0 || !/press\s+t\s+to\s+trust/i.test(pane.stdout)) return { ok: false, text: 'the current pane does not offer Press t to trust; no key pressed' }
+    const sent = await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(session), 't'], d.dir, LIVE_PROBE_MS)
+    return sent.exitCode === 0
+      ? { ok: true, text: `trusted changed hooks for "${d.name}" at the owner's request; peek to check the next screen` }
+      : { ok: false, text: `send-keys exited ${sent.exitCode}: ${sent.stderr.slice(-300)}` }
+  }, releaseNote)
 }
 
 /**

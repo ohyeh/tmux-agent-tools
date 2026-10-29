@@ -8217,7 +8217,7 @@ diagnostic_for_blocked_reason() {
   local reason="$1"
   case "$reason" in
     hook_trust_prompt)
-      echo "session is blocked on a hook-trust prompt; inspect the hook and, only if you trust it, answer with a raw key (e.g. agent-tmux <cli> send --raw <name> t)"
+      echo "session is blocked on changed plugin hooks; the owner must review the hook names and plugin, then type /workers trust <name> in the Claude Code prompt (or answer the worker's dialog himself); agent tools must not trust changed hooks"
       ;;
     permission_prompt|approval_prompt|ssh_prompt|login_prompt)
       echo "session may be waiting for interactive confirmation; capture the pane to read the choices, then answer with a mapped key (the keys tool, or agent-tmux <cli> send --key up|down|enter <name>); send --raw is literal and types the word \"Enter\" instead of pressing it"

@@ -8,9 +8,11 @@ import type { Plugin } from 'claude-code/testing'
 export const driver: Plugin = {
   name: 'tmux-driver',
   register: on => {
+    let pendingTrust = '', trustAnswer = ''
     on('session.start', async ($, e, next) => {
       await $.command.register({ name: 'outstanding', description: 'list outstanding workers' })
       await $.command.register({ name: 'stalled', description: 'list stalled workers' })
+      await $.command.register({ name: 'trust-as-plugin', description: 'exercise command provenance' })
       return next(e)
     })
 
@@ -22,6 +24,11 @@ export const driver: Plugin = {
     // can raise reconcile at a point it chooses, without a 10s clock in between.
     on('turn.complete', async ($, e, next) => {
       await $.tmux.reconcile()
+      if (pendingTrust) {
+        const name = pendingTrust
+        pendingTrust = ''
+        trustAnswer = (await $.command.run({ command: 'workers', args: `trust ${name}` })).text ?? ''
+      }
       return next(e)
     })
 
@@ -32,6 +39,10 @@ export const driver: Plugin = {
     on('command.run', { command: 'stalled' }, async $ => ({
       text: (await $.tmux.stalled()).map(s => `${s.dispatch.name}:${s.idleSeconds}`).join(','),
     }))
+    on('command.run', { command: 'trust-as-plugin' }, ($, e) => {
+      if (e.args) pendingTrust = e.args
+      return { text: trustAnswer }
+    })
   },
 }
 
