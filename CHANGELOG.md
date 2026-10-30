@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.47.0 - 2026-10-30
+
+- Change (brief contract): require a non-empty MODEL section in the shared mod/MCP dispatch boundary. Supply current-system Mermaid with transitions/invariants, a system-model.json path, or `none — reason` for read-only/search work. The adapter never invents a MODEL exemption.
+- Change (brief producer): require `--model` for `agent-tmux <cli> brief`. Update existing producers and fixtures. Direct CLI assign still accepts caller-owned prompt files; it has no section check.
+- Tests: MODEL regressions exercise the shared core, mod tool, MCP formatter/dispatch and CLI producer. The shared-core/MCP negative cases fail on a31fd52.
+- Not verified: live behavior on remote hosts before their next start.
+
 ## v0.46.24 - 2026-10-30
 
 - Fix (action lifecycle): a cancelled caller could lose its subprocess scope before `.action` release. The ledger now tracks each acquired token through completion and retries a settled release from a fresh collector callback. An uncertain acquisition also queues cleanup of that exact token. A running action is never released by this retry. Lock-absence tests now inspect the symlink itself instead of following its dangling JSON target.
