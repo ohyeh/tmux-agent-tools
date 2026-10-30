@@ -11,10 +11,45 @@ import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
 import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, collect, flagStalls, heartbeat, launchFailure, writeActState, newGate, partitionWaiters, processId, reserve, takeLock, unlockWorker, panelRows, reconcile, rowMark, scan, sessionDirOf, reservationOf, reserveDeliveries, stopWorker, tellWorker, assignWorker, resumeWorker, rootOf, v3Of, zshRun, UNKNOWN, LAUNCH_FAILED, type Host } from './workers.ts'
 import { panel } from './snapshot.node.ts'
+import { trustWorkerHooks } from './workers.ts'
 import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey, underLock } from './ledger.ts'
 
 const BRIEF = 'GOAL: probe\nMODEL: none — isolated contract fixture\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
+
+for (const [name, current] of [
+  ['W45-9: worker output containing the trust sentence is refused without sending a key', 'worker says: press t to trust\nReady for a task'],
+  ['W45-9: a changed hook list is refused without sending a key', '1 hook needs review\nPress t to trust the other@plugin Stop hook.'],
+  ['W45-9: a historical dialog above worker output is refused without sending a key', '1 hook needs review\nPress t to trust the ponytail@ponytail Stop hook.\nReady for a task'],
+  ['W45-9: the unchanged current dialog sends exactly one key immediately after capture', '1 hook needs review\nPress t to trust the ponytail@ponytail Stop hook.'],
+] as const) {
+  test(name, async () => {
+    const reviewed = '1 hook needs review\nPress t to trust the ponytail@ponytail Stop hook.'
+    let session = ''
+    const w = world({ answer: a => a[0] === 'tmux' && a[1] === 'ls'
+      ? { exitCode: 0, stdout: session, stderr: '' }
+      : a.includes('status') ? { exitCode: 0, stdout: JSON.stringify({ blocked_reason: 'hook_trust_prompt' }), stderr: '' }
+      : a.includes('capture') || a.includes('capture-pane') ? { exitCode: 0, stdout: current, stderr: '' } : undefined })
+    try {
+      const worker = await assigned(w, 'w')
+      session = `codex-${worker.name}`
+      const d = (await scan(w.host, { claim: false })).visible[0]!
+      const out = await trustWorkerHooks(w.host, d, reviewed)
+      const sent = w.calls.filter(c => c.argv.includes('send-keys'))
+      if (name.includes('unchanged current dialog')) {
+        assert.equal(out.ok, true, out.text)
+        assert.deepEqual(sent.map(c => c.argv.at(-1)), ['t'])
+        const at = w.calls.findIndex(c => c.argv.includes('send-keys'))
+        assert.ok(w.calls[at - 1]!.argv.includes('capture-pane'))
+        assert.ok(!w.calls[at - 1]!.argv.includes('-S'), 'capture excludes scrollback')
+      } else {
+        assert.equal(out.ok, false, out.text)
+        assert.match(out.text, /no key pressed/)
+        assert.equal(sent.length, 0)
+      }
+    } finally { rmSync(w.root, { recursive: true, force: true }); rmSync(w.repo, { recursive: true, force: true }) }
+  })
+}
 
 test('lifecycle 5: a paused collector registers again when its live session changes', async () => {
   const w = world()

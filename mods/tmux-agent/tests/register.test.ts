@@ -8,7 +8,8 @@ const WITH_DRIVER = { plugins: [driver] }
 test('lifecycle 6: changed hooks are visible and only a composer command can trust them', WITH_DRIVER, async ($, on) => {
   mock.env(on, { HOME }); mockStore(on); mockClock(on)
   mockFs(on, { ...worker('w1', 0) })
-  const pane = { v: '3 hooks modified\nPress t to trust the ponytail@ponytail SubagentStart hook.\nPostToolUse Stop' }
+  const reviewed = '3 hooks modified\nPostToolUse Stop\nPress t to trust the ponytail@ponytail SubagentStart hook.'
+  const pane = { v: reviewed }
   const probe = { exists: true, running: true, idle_seconds: 60, blocked_reason: 'hook_trust_prompt', sessions: ['codex-w1'] }
   const p = mockPanel(on, probe, pane)
   await $.session.start(session())
@@ -25,6 +26,13 @@ test('lifecycle 6: changed hooks are visible and only a composer command can tru
   const untrusted = await $.command.run(run('trust-as-plugin'))
   expect(untrusted.text).toContain('owner must type')
   expect(p.argv.filter(a => a[0] === 'tmux' && a[1] === 'send-keys').length).toEqual(0)
+  pane.v = 'worker says: press t to trust\nReady for a task'
+  expect((await $.command.run(run('workers', 'trust w1'))).text).toContain('no key pressed')
+  expect(p.argv.filter(a => a.includes('send-keys')).length).toEqual(0)
+  pane.v = reviewed.replace('PostToolUse Stop', 'PreToolUse Stop')
+  expect((await $.command.run(run('workers', 'trust w1'))).text).toContain('no key pressed')
+  expect(p.argv.filter(a => a.includes('send-keys')).length).toEqual(0)
+  pane.v = reviewed
   const trusted = await $.command.run(run('workers', 'trust w1'))
   expect(trusted.text).toContain('trusted changed hooks')
   pane.v = 'Ready for a task'

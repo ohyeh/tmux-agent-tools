@@ -82,6 +82,7 @@ import {
   peekProject,
   pressKeys,
   trustWorkerHooks,
+  idOf,
   interruptWorker,
   heartbeat,
   handoffOwner,
@@ -1423,9 +1424,10 @@ export const register: Register = on => {
       if (verb === 'trust') {
         if (e.origin.kind !== 'composer') return { text: `the owner must type /workers trust ${target || '<name>'} in the Claude Code prompt; agent and plugin calls cannot trust hooks` }
         if (!NAME_RE.test(target) || message.trim()) return { text: '/workers trust <name>' }
+        const reviewed = new Map(gate.blockedDetails)
         const d = (await scan(bound, { claim: false })).visible.find(w => w.name === target)
         if (!d) return { text: `no worker "${target}" in this project` }
-        const out = await trustWorkerHooks(bound, d)
+        const out = await trustWorkerHooks(bound, d, reviewed.get(idOf(d)))
         if (panel.open) void panel.refresh?.()
         return { text: out.text }
       }

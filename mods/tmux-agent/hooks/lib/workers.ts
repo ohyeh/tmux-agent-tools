@@ -1810,7 +1810,7 @@ export async function flagStalls(
       if (reason === 'hook_trust_prompt') {
         const capture = await host.run(['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', '80', d.name], d.dir, Math.min(STALL_PROBE_MS, Math.max(1, deadline - await host.now())))
           .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
-        const detail = capture.exitCode === 0 ? capture.stdout.replace(CTRL_ALL_RE, ' ').trim().slice(0, 3000) : `hook names unavailable: ${capture.stderr.slice(-200)}; peek at the worker`
+        const detail = capture.exitCode === 0 ? capture.stdout.split('\n').map(line => line.replace(CTRL_ALL_RE, ' ')).join('\n').trim().slice(0, 3000) : `hook names unavailable: ${capture.stderr.slice(-200)}; peek at the worker`
         gate.blockedDetails.set(id, detail)
         if (wake && gate.trustNoticed.get(id) !== detail) woken.push({ id, d, hook: detail, text:
           `- "${d.name}" on ${d.profile}: hook_trust_prompt — ${detail}\n  Changed hooks run code with the owner's permissions. The owner must type /workers trust ${d.name} in the Claude Code prompt after reviewing them. Agent tools cannot trust hooks.` })
@@ -3209,8 +3209,17 @@ async function workerDialog(host: Host, d: TmuxDispatch): Promise<{ blocked_reas
   return status && typeof status === 'object' && !Array.isArray(status) ? status : undefined
 }
 
+function hookTrustDialog(text: string): string | undefined {
+  const lines = text.trim().split('\n').map(line => line.replace(CTRL_ALL_RE, ' ').trimEnd())
+  if (!/^Press t to trust\b[^\n]*$/i.test(lines.at(-1) ?? '')) return undefined
+  const start = lines.findLastIndex(line => /^\d+ hooks? (?:modified|needs? review)\b/i.test(line))
+  return start >= 0 ? lines.slice(start).join('\n') : undefined
+}
+
 /** Called only by the mod's composer-origin command, never by a tool or a CLI verb. */
-export async function trustWorkerHooks(host: Host, d: TmuxDispatch): Promise<Outcome> {
+export async function trustWorkerHooks(host: Host, d: TmuxDispatch, reviewed: string | undefined): Promise<Outcome> {
+  const expected = reviewed === undefined ? undefined : hookTrustDialog(reviewed)
+  if (!expected) return { ok: false, text: 'no reviewed hook dialog in the owner notice; no key pressed' }
   const root = await rootOf(host)
   if (!root) return { ok: false, text: 'no state root' }
   const w = `${v3Of(root)}/${d.name}`
@@ -3222,8 +3231,9 @@ export async function trustWorkerHooks(host: Host, d: TmuxDispatch): Promise<Out
     if (!session) return { ok: false, text: `no tmux session for "${d.name}"` }
     const status = await workerDialog(host, d)
     if (status?.blocked_reason !== 'hook_trust_prompt') return { ok: false, text: 'not at a hook_trust_prompt; no key pressed' }
-    const pane = await host.run(['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', '80', d.name], d.dir, MIRROR_PROBE_MS)
-    if (pane.exitCode !== 0 || !/press\s+t\s+to\s+trust/i.test(pane.stdout)) return { ok: false, text: 'the current pane does not offer Press t to trust; no key pressed' }
+    // Read the visible screen, excluding scrollback, immediately before sending.
+    const pane = await host.run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(session)], d.dir, MIRROR_PROBE_MS)
+    if (pane.exitCode !== 0 || hookTrustDialog(pane.stdout) !== expected) return { ok: false, text: 'the current hook dialog differs from the owner notice or is no longer the prompt; no key pressed' }
     const sent = await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(session), 't'], d.dir, LIVE_PROBE_MS)
     return sent.exitCode === 0
       ? { ok: true, text: `trusted changed hooks for "${d.name}" at the owner's request; peek to check the next screen` }
