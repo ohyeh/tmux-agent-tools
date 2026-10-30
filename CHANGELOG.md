@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.47.1 - 2026-10-30
+
+- Fix (trust): `/workers trust <name>` sends `t` only for the hook dialog the owner notice showed. It needs that dialog text, re-reads the visible screen (no scrollback) right before `send-keys`, and refuses unless the last line is `Press t to trust…` and the dialog equals the reviewed one. A worker's output that quotes the sentence, or a changed hook list, sends nothing. 22896bc searched the 80-line tail for the sentence anywhere.
+- Behavior: after a reload the notice cache is empty, so the command answers `no reviewed hook dialog in the owner notice; no key pressed` until the next stall scan shows the dialog again.
+- Tests: fixtures cover a worker output that quotes the sentence and a changed hook list; both send no key.
+- Not verified: `capture-pane` and `send-keys` are two operations, so a screen change between them is not excluded; live behavior on remote hosts before their next start.
+
 ## v0.47.0 - 2026-10-30
 
 - Change (brief contract): require a non-empty MODEL section in the shared mod/MCP dispatch boundary. Supply current-system Mermaid with transitions/invariants, a system-model.json path, or `none — reason` for read-only/search work. The adapter never invents a MODEL exemption.
