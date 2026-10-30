@@ -50,7 +50,7 @@ refute_contains() {
 }
 exists() { [[ -e "$1" ]] && echo yes || echo no; }
 
-printf 'GOAL: prove the brief survives the dialog.\nACCEPTANCE: every line arrives.\nREPORT: say done.\n' > "$WORK/brief.txt"
+printf 'GOAL: prove the brief survives the dialog.\nMODEL: none — isolated transport fixture\nACCEPTANCE: every line arrives.\nREPORT: say done.\n' > "$WORK/brief.txt"
 mkdir -p "$WORK/profiles"
 
 # Every fake takes its paths as launch flags (a running tmux server hands its

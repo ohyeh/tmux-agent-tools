@@ -387,7 +387,7 @@ agent-tmux - run Claude Code in tmux and drive it programmatically.
 Usage:
   agent-tmux <cli> [--profile <file> | --profile-dir <dir>] <command> ...
   agent-tmux <cli> assign [--timeout N] [--confirm-window N] [--detach] [--prompt-delivery paste|file-ref] [--result-path <abs> [--episode <n>]] <name> <directory> <prompt-file>
-  agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
+  agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> --model <text> [--report <text>] [--dry-run]
   agent-tmux <cli> start [--attach] [--exact] [--headless] [--allow-project-config] [--model <model>] [--effort <v>] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> [initial text]
   agent-tmux <cli> resume [--attach] [--exact] [--transcript <path>] [--transcript-text-truncate <N>] <name> <directory> <session-id>
   agent-tmux <cli> start-ssh [--attach] [--exact] [--allow-project-config] [--sentinel <remote-abs-path> [--on-exit <cmd> [--on-exit-allow <regex>]] [--notify]] <name> <ssh-target> <remote-directory> [initial text]
@@ -525,25 +525,26 @@ Flags:
   --confirm-window N   seconds to wait for processing evidence (default 90)
 
 Example:
-  p="$(agent-tmux brief --template implement --goal 'Fix X' --acceptance 'tests pass')"
+  p="$(agent-tmux claude brief --template implement --goal 'Fix X' --acceptance 'tests pass' --model '.workflow/run/system-model.json')"
   agent-tmux claude assign fixer ~/repo "$p"
 HELP_EOF
       return 0
       ;;
     brief)
       cat <<'HELP_EOF'
-agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]
+agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> --model <text> [--report <text>] [--dry-run]
 
-Render a GOAL/ACCEPTANCE/REPORT prompt from flags (backlog T1). Not a launcher:
+Render a GOAL/ACCEPTANCE/REPORT/MODEL prompt from flags (backlog T1). Not a launcher:
 compiles text only. Feed the result into start/send/send-wait via --from-file:
 
-  agent-tmux brief --template implement --goal 'Fix X' --acceptance 'tests pass' > /tmp/p.txt
+  agent-tmux claude brief --template implement --goal 'Fix X' --acceptance 'tests pass' --model '.workflow/run/system-model.json' > /tmp/p.txt
   agent-tmux start --exact worker1 ~/repo --from-file /tmp/p.txt
 
 Flags:
   --template implement           Required. Only "implement" is supported today.
   --goal <text>                  Required. Fills the GOAL section.
   --acceptance <text>            Required. Fills the ACCEPTANCE section.
+  --model <text>                 Required. Current-system model or none — reason for read-only/search work.
   --report <text>                Optional. Fills the REPORT section; defaults
                                   to a sane evidence-first requirement.
   --dry-run                      Print the compiled prompt to stdout instead
@@ -4445,7 +4446,7 @@ _check_result_route() {
   return 0
 }
 
-# ---- brief: render a GOAL/ACCEPTANCE/REPORT prompt from flags -------------
+# ---- brief: render a GOAL/ACCEPTANCE/REPORT/MODEL prompt from flags -------------
 # Backlog T1: delegated-worker prompts measured 4.3% GOAL/ACCEPTANCE/REPORT
 # compliant at the call site. This renders the `implement` template from
 # flags so the compiled text can feed --from-file/--prompt-file on start/
@@ -4457,19 +4458,20 @@ _brief_default_report() {
 }
 
 brief_session() {
-  local template="" goal="" acceptance="" report="" dry_run=0
+  local template="" goal="" acceptance="" report="" model="" dry_run=0
   while [[ "${1:-}" == --* ]]; do
     case "$1" in
       --template)    template="${2:-}"; shift 2 ;;
       --goal)        goal="${2:-}"; shift 2 ;;
       --acceptance)  acceptance="${2:-}"; shift 2 ;;
       --report)      report="${2:-}"; shift 2 ;;
+      --model)       (( $# >= 2 )) || { echo "brief: --model requires a value" >&2; return 2; }; model="$2"; shift 2 ;;
       --dry-run)     dry_run=1; shift ;;
       *) echo "brief: unknown flag: $1" >&2; return 2 ;;
     esac
   done
 
-  local usage_msg="Usage: agent-tmux brief --template implement --goal <text> --acceptance <text> [--report <text>] [--dry-run]"
+  local usage_msg="Usage: agent-tmux <cli> brief --template implement --goal <text> --acceptance <text> --model <text> [--report <text>] [--dry-run]"
   if [[ -z "$template" ]]; then
     echo "brief: missing required --template" >&2; echo "$usage_msg" >&2; return 2
   fi
@@ -4482,10 +4484,13 @@ brief_session() {
   if [[ -z "$acceptance" ]]; then
     echo "brief: missing required --acceptance" >&2; echo "$usage_msg" >&2; return 2
   fi
+  if [[ -z "${model//[[:space:]]/}" ]]; then
+    echo "brief: missing required --model (diagram with transitions/invariants, system-model.json path, or none — reason)" >&2; return 2
+  fi
   [[ -n "$report" ]] || report="$(_brief_default_report)"
 
   local compiled
-  compiled="$(printf 'GOAL: %s\n\nACCEPTANCE: %s\n\nREPORT: %s\n' "$goal" "$acceptance" "$report")"
+  compiled="$(printf 'GOAL: %s\n\nACCEPTANCE: %s\n\nREPORT: %s\n\nMODEL: %s\n' "$goal" "$acceptance" "$report" "$model")"
 
   if (( dry_run )); then
     printf '%s' "$compiled"

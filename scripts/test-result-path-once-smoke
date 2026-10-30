@@ -61,7 +61,7 @@ while IFS= read -r line; do
 done
 EOF
 chmod +x "$WORK/fake-live.sh" "$WORK/fake-nonce.sh"
-printf 'GOAL: g\nACCEPTANCE: a\nREPORT: r\n' > "$WORK/brief.md"
+printf 'GOAL: g\nMODEL: none — isolated transport fixture\nACCEPTANCE: a\nREPORT: r\n' > "$WORK/brief.md"
 
 PASS=0
 FAIL=0

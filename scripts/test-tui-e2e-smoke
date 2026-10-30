@@ -100,7 +100,7 @@ while IFS= read -r line; do
 done
 EOF
 chmod +x "$WORK/bin/e2ecli"
-printf 'GOAL: e2e worker\nACCEPTANCE: write the result\nREPORT: one line\n' > "$WORK/brief.md"
+printf 'GOAL: e2e worker\nMODEL: none — isolated transport fixture\nACCEPTANCE: write the result\nREPORT: one line\n' > "$WORK/brief.md"
 
 SESSION="e2e-owner"
 cli() { "$NODE_BIN" "$LIB/workers.cli.node.ts" "$@" --session "$SESSION" --cwd "$WORK/repo"; }

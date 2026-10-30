@@ -13,7 +13,7 @@ import { ackFinished, autoStop, AUTO_STOP_MS, cancelEpisode, clearIncomplete, co
 import { panel } from './snapshot.node.ts'
 import { ORPHAN_MS, publishWorker, registerActivation, beat, releaseLock, sessionKey, underLock } from './ledger.ts'
 
-const BRIEF = 'GOAL: probe\nACCEPTANCE: it runs\nREPORT: one line\n'
+const BRIEF = 'GOAL: probe\nMODEL: none — isolated contract fixture\nACCEPTANCE: it runs\nREPORT: one line\n'
 const SHA = 'a'.repeat(40)
 
 test('lifecycle 5: a paused collector registers again when its live session changes', async () => {

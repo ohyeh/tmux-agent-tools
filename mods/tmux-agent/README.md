@@ -129,7 +129,7 @@ Agent tool 的 brief 裡若有單獨一行 `runtime: tmux/<profile>`，mod 會�
 - waiter `failed`、`killed`、或清單裡已經沒有（例如 reload 之後）：照舊喚醒一次
 - `$.agent.list` 失敗：有 waiter 的通知不送，沒有 waiter 的照送，並 log 一次
 
-這行 spawn 不可以帶 `name`（有名字會變成閒置的 teammate，永遠不會 `completed`）。拿掉 runtime 那一行之後，brief 仍要有 GOAL、ACCEPTANCE、REPORT。`assign` 工具本身的行為不變。
+這行 spawn 不可以帶 `name`（有名字會變成閒置的 teammate，永遠不會 `completed`）。拿掉 runtime 那一行之後，brief 仍要有 GOAL、MODEL（現況 Mermaid + transitions/invariants、system-model.json 路徑，或唯讀工作的 none — reason）、ACCEPTANCE、REPORT。`assign` 工具本身的行為不變。
 
 ## 隊友：assign → tell → stop
 

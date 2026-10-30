@@ -24,7 +24,7 @@ native_code_review  -> Codex in-process sub-agent; no external CLI
 ```
 
 Names use lowercase ASCII snake case. The proxy brief follows
-`delegation-templates` (GOAL / ACCEPTANCE / REPORT) and passes
+`delegation-templates` (GOAL / MODEL / ACCEPTANCE / REPORT) and passes
 `model-dispatch.md`. On Claude Code use `general-purpose` on `sonnet`. On Codex
 prefer `gpt-5.6-luna` for shell supervision and progress summarization, fall
 back to `gpt-5.6-terra` when luna is unavailable, and use `gpt-5.6-sol` only
@@ -47,7 +47,7 @@ The proxy progress contract depends on execution mode:
 Example headless worker commands inside a `claude_research` proxy:
 
 ```bash
-agent-tmux claude start --exact --headless --task-shape bounded claude-research ~/repo '<GOAL / ACCEPTANCE / REPORT prompt>'
+agent-tmux claude start --exact --headless --task-shape bounded claude-research ~/repo '<GOAL / MODEL / ACCEPTANCE / REPORT prompt>'
 agent-tmux claude supervise --result-required --silent-while-unchanged --json claude-research
 ```
 

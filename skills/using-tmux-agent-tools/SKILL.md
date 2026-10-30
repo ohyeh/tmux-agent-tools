@@ -53,7 +53,7 @@ Applies ONLY when the tool `mcp__tmux-agent__assign` is present in this session
 and uses "commander is not Claude Code" below.
 
 1. Dispatch with the tool, not the shell: `mcp__tmux-agent__assign` with
-   `profile`, `name`, `dir`, and a `brief` carrying GOAL / ACCEPTANCE / REPORT.
+   `profile`, `name`, `dir`, and a `brief` carrying GOAL / MODEL / ACCEPTANCE / REPORT.
 2. Read the receipt's LAST sentence — it is the branch condition, not the
    tool's mere presence:
    - `collector: active in this session` → **end the turn.** The
@@ -219,7 +219,7 @@ capability table**. Never paraphrase that table from memory.
 ## DEFER — non-negotiable gates (mechanics live in the hub skill)
 
 - **Prompt shape**: every worker prompt filled from `delegation-templates`
-  (GOAL / ACCEPTANCE / REPORT + common footer + tmux addendum).
+  (GOAL / MODEL / ACCEPTANCE / REPORT + common footer + tmux addendum).
 - **No cascade**: every worker prompt carries the literal ban
   "Do not spawn additional tmux sessions or delegate further." Only a Claude
   Code worker may still use its own in-process `Agent` tool (CLI-supervised,

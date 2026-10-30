@@ -46,7 +46,7 @@ assert_contains() {
 }
 exists() { [[ -e "$1" ]] && echo yes || echo no; }
 
-printf 'GOAL: prove the whole prompt arrives.\nCONTEXT: read these first.\nACCEPTANCE: one input.\nREPORT: say done.\n' > "$WORK/multi.txt"
+printf 'GOAL: prove the whole prompt arrives.\nCONTEXT: read these first.\nMODEL: none — isolated transport fixture\nACCEPTANCE: one input.\nREPORT: say done.\n' > "$WORK/multi.txt"
 
 # pastecli (generic family): echoes what it reads and holds the paste
 # placeholder in its composer; a bare Enter only redraws (the redraw once read

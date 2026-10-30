@@ -79,11 +79,11 @@ function createServer() {
 
   server.registerTool("spawn_tmux_agent", {
     title: "Spawn tmux-agent-tools worker",
-    description: "Start one tmux-agent-tools worker and return its managed handle.",
+    description: "Start one tmux-agent-tools worker and return its managed handle. task requires MODEL: a current-system Mermaid diagram with transitions/invariants, a system-model.json path, or none — reason for read-only/search work.",
     inputSchema: {
       cli: z.string().min(1),
       repoPath: z.string().min(1),
-      task: z.string().min(1),
+      task: z.string().min(1).describe("Brief with a non-empty MODEL section. GOAL, ACCEPTANCE and REPORT may also be supplied."),
       name: z.string().optional(),
       timeoutSec: z.number().int().positive().optional(),
     },

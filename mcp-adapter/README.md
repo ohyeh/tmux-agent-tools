@@ -47,7 +47,7 @@ This is a managed external-worker adapter with a sub-agent-like lifecycle. It is
 
 The adapter runs on the shared `workers-core` through `nodeHost`:
 
-- `spawn_tmux_agent` → `assignWorker` (reserves v5 `<base>.<5 base36>` worker identity, publishes `worker.json`, opens episode 1 on the producer route `--result-path ... --episode 1`)
+- `spawn_tmux_agent` → `assignWorker` (requires non-empty `MODEL`: current-system Mermaid with transitions/invariants, a `system-model.json` path, or `none — reason` for read-only/search work; reserves v5 `<base>.<5 base36>` worker identity, publishes `worker.json`, opens episode 1 on the producer route `--result-path ... --episode 1`)
 - `send_tmux_agent` → `tellWorker` (takes per-worker `.action` lock, allocates episode seq, sends via `--result-path ... --episode <seq>`)
 - `wait_tmux_agent` → one delivery of that episode (`seq`, else the max seq at call time) through the core (`claim` when this session is not the owner), only while this process's activation is still the session's max (§3, §3.3, §4, §8). The response carries `delivery_id` = `<gen0 owner>/<name>/<seq>`; `ackFinished` runs after the response's stdout write callback (`AckingStdioTransport`, plan §1c S4), so delivery is at-least-once
 - `read_tmux_agent` → reads `result.json` if available, or pane status/capture via `peekWorker`

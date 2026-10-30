@@ -36247,6 +36247,9 @@ var require_adapter = __commonJS({
     }
     function formatBrief(task) {
       const missing = missingSections(task);
+      if (missing.includes("MODEL")) {
+        throw new Error("tmux-agent: brief is missing MODEL content. Use a current-system diagram with transitions/invariants, a system-model.json path, or MODEL: none \u2014 reason for read-only/search work.");
+      }
       if (missing.length === 0) return task;
       let brief = task.trim();
       if (missing.includes("GOAL")) {
@@ -36367,10 +36370,10 @@ REPORT: Final status and summary in result.json`;
       if (!cli || !repoPath || !task) {
         throw new Error("spawn_tmux_agent requires cli, repoPath, and task");
       }
+      const brief = formatBrief(task);
       const host = await getHost(repoPath);
       await ensureAdapterLive(host);
       const baseName = safeBaseName(cli, request.name);
-      const brief = formatBrief(task);
       const res = await assignWorker(
         host,
         { profile: cli, name: baseName, dir: repoPath, brief },
@@ -36943,11 +36946,11 @@ var require_server3 = __commonJS({
       });
       server.registerTool("spawn_tmux_agent", {
         title: "Spawn tmux-agent-tools worker",
-        description: "Start one tmux-agent-tools worker and return its managed handle.",
+        description: "Start one tmux-agent-tools worker and return its managed handle. task requires MODEL: a current-system Mermaid diagram with transitions/invariants, a system-model.json path, or none \u2014 reason for read-only/search work.",
         inputSchema: {
           cli: z.string().min(1),
           repoPath: z.string().min(1),
-          task: z.string().min(1),
+          task: z.string().min(1).describe("Brief with a non-empty MODEL section. GOAL, ACCEPTANCE and REPORT may also be supplied."),
           name: z.string().optional(),
           timeoutSec: z.number().int().positive().optional()
         }

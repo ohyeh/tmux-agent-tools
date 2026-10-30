@@ -68,7 +68,7 @@ assert "send --prompt-file without value exits 2" "$rc" "2"
 assert "send --prompt-file is a known flag" "$([[ "$out" == *"Unknown flag"* ]] && echo unknown || echo known)" "known"
 
 echo "case: brief compiles a prompt file that start --from-file consumes"
-bfile="$("$CODEX_TMUX" brief --template implement --goal 'Fix flaky login test' --acceptance 'pytest tests/test_login.py passes')"
+bfile="$("$CODEX_TMUX" brief --template implement --goal 'Fix flaky login test' --acceptance 'pytest tests/test_login.py passes' --model '.workflow/run/system-model.json')"
 out="$(dry --from-file "$bfile" pf-brief "$WORK")"
 btext="$(jq_val "$out" .invocation.initial_text)"
 assert_contains "brief GOAL" "$btext" "GOAL: Fix flaky login test"
@@ -76,7 +76,7 @@ assert_contains "brief ACCEPTANCE" "$btext" "ACCEPTANCE: pytest tests/test_login
 assert_contains "brief REPORT" "$btext" "REPORT:"
 rc=0; out="$("$CODEX_TMUX" brief --template implement --goal 'only goal' 2>&1)" || rc=$?
 assert "brief without --acceptance exits 2" "$rc" "2"
-assert_contains "brief usage text" "$out" "Usage: agent-tmux brief"
+assert_contains "brief usage text" "$out" "Usage: agent-tmux <cli> brief"
 
 echo "case: one live worker receives file, stdin, and multi-line sends"
 # Fake CLI: logs each line read; echoes a MARK-<hex> nonce or [SWLDONE] alone for the waits.

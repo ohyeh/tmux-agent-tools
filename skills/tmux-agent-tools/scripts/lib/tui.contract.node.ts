@@ -1105,7 +1105,7 @@ test('no-mutation core panelRows: reads a dead-owner orphan and mutates nothing'
   }
   const r = await assignWorker(
     deadHost,
-    { profile: 'claude', name: 'orphan-w', dir: repo, brief: 'GOAL: orphan\nACCEPTANCE: none\nREPORT: one line\n' },
+    { profile: 'claude', name: 'orphan-w', dir: repo, brief: 'GOAL: orphan\nMODEL: none — isolated contract fixture\nACCEPTANCE: none\nREPORT: one line\n' },
     { owner: 'dead-owner', ownerCwd: repo },
   )
   if ('deny' in r) assert.fail(r.deny)
@@ -1496,7 +1496,7 @@ test('no-mutation tui: runTui renders, refreshes, and leaves paths, mtimes, and 
   }
   const assigned = await assignWorker(
     deadHost,
-    { profile: 'claude', name: 'orphan-w', dir: repo, brief: 'GOAL: orphan\nACCEPTANCE: none\nREPORT: one line\n' },
+    { profile: 'claude', name: 'orphan-w', dir: repo, brief: 'GOAL: orphan\nMODEL: none — isolated contract fixture\nACCEPTANCE: none\nREPORT: one line\n' },
     { owner: 'dead-owner', ownerCwd: repo },
   )
   if ('deny' in assigned) assert.fail(assigned.deny)
@@ -2402,7 +2402,7 @@ test('cancel and unlock: the TUI keys run the same core calls as workers.cli.nod
   }
   const r = await assignWorker(
     host,
-    { profile: 'claude', name: 'can', dir: repo, brief: 'GOAL: g\nACCEPTANCE: a\nREPORT: r\n' },
+    { profile: 'claude', name: 'can', dir: repo, brief: 'GOAL: g\nMODEL: none — isolated contract fixture\nACCEPTANCE: a\nREPORT: r\n' },
     { owner: 'S', ownerCwd: repo },
   )
   if ('deny' in r) assert.fail(r.deny)
@@ -2915,7 +2915,7 @@ test('R8.5: a stale delivery reservation shows "unknown: 可能已送達" and - 
     run: async (argv: readonly string[], cwd: string, ms: number) =>
       outside.has(argv[0]!) ? { exitCode: 0, stdout: '', stderr: '' } : base.run(argv, cwd, ms),
   }
-  const r = await assignWorker(host, { profile: 'claude', name: 'res', dir: repo, brief: 'GOAL: g\nACCEPTANCE: a\nREPORT: r\n' }, { owner: 'S', ownerCwd: repo })
+  const r = await assignWorker(host, { profile: 'claude', name: 'res', dir: repo, brief: 'GOAL: g\nMODEL: none — isolated contract fixture\nACCEPTANCE: a\nREPORT: r\n' }, { owner: 'S', ownerCwd: repo })
   if ('deny' in r) assert.fail(r.deny)
   const rs = await resumeWorker(host, 'codex 12345678-1234-1234-1234-123456789abc')
   assert.ok(rs.ok, rs.text)

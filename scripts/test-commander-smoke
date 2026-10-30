@@ -243,7 +243,7 @@ ASSIGN_CWD="$WORK/pane"
 BRIEF="$WORK/brief.md"
 WORKER="worker$$"
 mkdir -p "$ASSIGN_CWD"
-printf 'GOAL: ship the commander\nACCEPTANCE: tests pass\nREPORT: done\n' > "$BRIEF"
+printf 'GOAL: ship the commander\nMODEL: none — isolated transport fixture\nACCEPTANCE: tests pass\nREPORT: done\n' > "$BRIEF"
 # write_assign <script> <out> <err> <code>: a pane script that runs one assign.
 write_assign() {
   cat > "$1" <<EOF

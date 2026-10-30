@@ -168,6 +168,9 @@ function parseJsonLoose(text) {
 
 function formatBrief(task) {
   const missing = missingSections(task);
+  if (missing.includes("MODEL")) {
+    throw new Error("tmux-agent: brief is missing MODEL content. Use a current-system diagram with transitions/invariants, a system-model.json path, or MODEL: none — reason for read-only/search work.");
+  }
   if (missing.length === 0) return task;
   let brief = task.trim();
   if (missing.includes("GOAL")) {
@@ -289,10 +292,10 @@ async function spawnTmuxAgent(request) {
     throw new Error("spawn_tmux_agent requires cli, repoPath, and task");
   }
 
+  const brief = formatBrief(task);
   const host = await getHost(repoPath);
   await ensureAdapterLive(host);
   const baseName = safeBaseName(cli, request.name);
-  const brief = formatBrief(task);
 
   const res = await assignWorker(
     host,

@@ -293,7 +293,7 @@ export const PANEL_ACCENT = 'cyan'
 export const MIRROR_MIN_ROWS = 6
 export const BACKOFF_MS = [10_000, 60_000]
 export const STATE_SUFFIX = '/.local/state/tmux-agent-tools'
-export const REQUIRED_SECTIONS = ['GOAL', 'ACCEPTANCE', 'REPORT']
+export const REQUIRED_SECTIONS = ['GOAL', 'ACCEPTANCE', 'REPORT', 'MODEL']
 export const TERMINAL = new Set(['success', 'failed', 'blocked', 'needs-input'])
 /** Not a worker status: this mod's own word for "the launch itself never took". */
 export const LAUNCH_FAILED = 'launch-failed'
@@ -652,7 +652,14 @@ export type Gate = {
 
 export function missingSections(brief: string): string[] {
   // A heading (`# GOAL`) or bold (`**GOAL**`) is still the section word.
-  return REQUIRED_SECTIONS.filter(s => !new RegExp(`^\\s*(?:#{1,6}\\s*|\\*\\*)?${s}\\b`, 'm').test(brief))
+  return REQUIRED_SECTIONS.filter(s => {
+    const heading = new RegExp(`^[ \\t]*(?:#{1,6}[ \\t]*|\\*\\*)?${s}\\b[^\\S\\r\\n]*(?::|\\*\\*)?`, 'm').exec(brief)
+    if (!heading) return true
+    if (s !== 'MODEL') return false
+    const body = brief.slice(heading.index + heading[0].length).replace(/^(?:\*\*|:)[ \t]*/, '')
+    // A later section cannot supply the content of an empty MODEL section.
+    return !body.split(/^[ \t]*(?:#{1,6}[ \t]*|\*\*)?[A-Z][A-Z _/-]*(?::|\*\*|[ \t]*$)/m)[0]?.trim()
+  })
 }
 
 /**
@@ -3870,7 +3877,7 @@ export async function assignWorker(
   extra?: AssignExtra,
 ): Promise<{ receipt: string; name: string; stateDir: string } | { deny: string }> {
   const missing = missingSections(input.brief ?? '')
-  if (missing.length) return { deny: `tmux-agent: brief is missing ${missing.join(', ')}` }
+  if (missing.length) return { deny: `tmux-agent: brief is missing ${missing.join(', ')}; MODEL needs content: a current-system diagram with transitions/invariants, a system-model.json path, or none — reason for read-only/search work` }
   if (!NAME_RE.test(input.name ?? '')) {
     return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars' }
   }

@@ -623,7 +623,7 @@ export const register: Register = on => {
         '(e.g. a second claude started with its own --settings file through a provider gateway). Returns at once; ' +
         'the collector session reconciles result.json and submits a prompt when the worker finishes. ' +
         'Follow up with mcp__tmux-agent__tell, dismiss with mcp__tmux-agent__stop. ' +
-        'brief must contain GOAL, ACCEPTANCE and REPORT sections.',
+        'brief must contain GOAL, ACCEPTANCE, REPORT and a non-empty MODEL section. MODEL: current-system Mermaid with transitions/invariants, a system-model.json path, or none — reason for read-only/search work.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -636,7 +636,7 @@ export const register: Register = on => {
           brief: {
             type: 'string',
             description:
-              'the task, with GOAL, ACCEPTANCE and REPORT sections; the wrapper prepends the result.json path and scope instructions, so do not repeat them',
+              'the task, with GOAL, ACCEPTANCE, REPORT and non-empty MODEL sections; MODEL holds current-system Mermaid plus transitions/invariants, a system-model.json path, or none — reason for read-only/search work; the wrapper prepends the result.json path and scope instructions',
           },
         },
         required: ['profile', 'name', 'dir', 'brief'],

@@ -102,7 +102,7 @@ for cli in cursor agy; do
 done
 chmod +x "$WORK"/fastcli "$WORK"/slowcli "$WORK"/nodrawcli "$WORK"/exitcli "$WORK"/fake-*.sh
 
-printf 'GOAL: demo\n\nACCEPTANCE: none\n\nREPORT: none\n' > "$WORK/prompt.txt"
+printf 'GOAL: demo\n\nMODEL: none — isolated transport fixture\n\nACCEPTANCE: none\n\nREPORT: none\n' > "$WORK/prompt.txt"
 
 echo "case: argument guards"
 code=0; "$AGENT_TMUX" fastcli assign >/dev/null 2>&1 || code=$?

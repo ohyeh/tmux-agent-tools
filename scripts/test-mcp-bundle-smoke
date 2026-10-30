@@ -93,7 +93,7 @@ try {
   ]);
   console.log("  ok   tools/list (5 tools)");
 
-  const spawned = await call("spawn_tmux_agent", { cli: "fake", repoPath: process.env.WORK, task: "bundle smoke", name: "bundle-rpc" });
+  const spawned = await call("spawn_tmux_agent", { cli: "fake", repoPath: process.env.WORK, task: "bundle smoke" + "\nMODEL: none — isolated lifecycle fixture", name: "bundle-rpc" });
   assert.match(spawned.agent_id, /^bundle-rpc\.[0-9a-z]{5}$/);
   assert.equal(spawned.seq, 1);
   writeFileSync(spawned.result_path, JSON.stringify({ schema_version: 1, status: "success", summary: "bundle ok", artifacts: [], errors: [], episode: 1 }));

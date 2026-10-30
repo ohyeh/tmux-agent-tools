@@ -1512,6 +1512,26 @@ describe('state root', () => {
 })
 
 describe('assign', () => {
+  test('MODEL: missing and bare are denied; an explicit read-only reason is accepted', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME }); mock.store(on); mockClock(on)
+    const files: Files = {}
+    mockFs(on, files)
+    const argvs: string[][] = []
+    onRun(on, ($, e) => {
+      argvs.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    const base = 'GOAL: probe\nACCEPTANCE: evidence\nREPORT: summary'
+    for (const brief of [base, `${base}\nMODEL:`, 'GOAL: probe\nMODEL:\nACCEPTANCE: evidence\nREPORT: summary']) {
+      const out = await $.tool.call({ tool: 'mcp__tmux-agent__assign', profile: 'codex', name: 'model-probe', dir: '/work', brief })
+      expect(JSON.stringify(out)).toContain('missing MODEL')
+      expect(argvs).toEqual([])
+      expect(Object.keys(files)).toEqual([])
+    }
+    const out = await $.tool.call({ tool: 'mcp__tmux-agent__assign', profile: 'codex', name: 'model-probe', dir: '/work', brief: `${base}\nMODEL: none — read-only search` })
+    expect(JSON.stringify(out)).toContain('launch requested')
+  })
+
   test('a brief missing a section is denied before anything runs', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mock.store(on)
@@ -1553,7 +1573,7 @@ describe('assign', () => {
       profile: '--exec=evil',
       name: 'w1',
       dir: '/work',
-      brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+      brief: 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z',
     })
 
     expect(JSON.stringify(out)).toContain('profile must match')
@@ -1578,7 +1598,7 @@ describe('assign', () => {
       profile: 'codex',
       name: 'w1',
       dir: '/work',
-      brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+      brief: 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z',
     })
 
     expect(JSON.stringify(out)).toContain('launch requested')
@@ -1606,7 +1626,7 @@ describe('assign', () => {
         profile: 'codex',
         name: 'w1',
         dir: '/work',
-        brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+        brief: 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z',
       }),
     )
 
@@ -1638,7 +1658,7 @@ describe('assign', () => {
       profile: 'codex',
       name: 'w1',
       dir: '/work',
-      brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+      brief: 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z',
     })
 
     const fresh = Object.keys(files).filter(p => /\/w1\.[0-9a-z]{5}\/worker\.json$/.test(p))
@@ -1672,7 +1692,7 @@ describe('assign', () => {
       profile: 'codex',
       name: 'a'.repeat(58) + '.abcde',
       dir: '/work',
-      brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+      brief: 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z',
     })
 
     const made = Object.keys(files).filter(p => p.endsWith('/worker.json'))
@@ -2863,7 +2883,7 @@ const assignInput = (name = 'w') => ({
   profile: 'codex',
   name,
   dir: '/work',
-  brief: 'GOAL: x\nACCEPTANCE: y\nREPORT: z',
+  brief: 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z',
 })
 
 /**
@@ -5051,8 +5071,8 @@ describe('live e2e of 0.7.6', () => {
     on('session.start', ($, e) => ({ cwd: e.cwd }))
     await $.session.start(session())
     const brief = (schemas.assign as { properties?: { brief?: { description?: string } } }).properties?.brief
-    expect(brief?.description).toContain('GOAL, ACCEPTANCE and REPORT')
-    expect(brief?.description).toContain('do not repeat them')
+    expect(brief?.description).toContain('GOAL, ACCEPTANCE, REPORT and non-empty MODEL')
+    expect(brief?.description).toContain('MODEL holds current-system')
   })
 
   test('a delivered teammate with no tell for 30 min is stopped, a dead owner\'s too; another live owner, mid-episode, young, gone or just delivered is not (F)', WITH_DRIVER, async ($, on) => {
@@ -5155,7 +5175,7 @@ describe('live e2e of 0.7.6', () => {
     mockPanel(on, { running: true, idle_seconds: 60 })
     await $.session.start(session())
     const ok = JSON.stringify(
-      await $.tool.call({ ...assignInput(), brief: '# GOAL: x\n## ACCEPTANCE: y\n## REPORT: z' }),
+      await $.tool.call({ ...assignInput(), brief: '# GOAL: x\n## MODEL: none — read-only fixture\n## ACCEPTANCE: y\n## REPORT: z' }),
     )
     expect(ok, '# GOAL and ## REPORT count').not.toContain('brief is missing')
     expect(ok).toContain('collector: active')
@@ -5282,7 +5302,7 @@ describe('project sessions', () => {
 })
 
 describe('native mirror', () => {
-  const BRIEF = 'GOAL: ship it\nruntime: tmux/cursor\nACCEPTANCE: tests pass\nREPORT: the sha'
+  const BRIEF = 'GOAL: ship it\nruntime: tmux/cursor\nMODEL: none — isolated contract fixture\nACCEPTANCE: tests pass\nREPORT: the sha'
   const spawnOf = (over: Record<string, unknown> = {}) => ({
     tool_use_id: 'tu1',
     prompt: BRIEF,
@@ -5527,7 +5547,7 @@ describe('native mirror', () => {
     })
 
     await $.session.start(session())
-    const prompt = 'GOAL: x\nACCEPTANCE: y\nREPORT: z'
+    const prompt = 'GOAL: x\nMODEL: none — isolated contract fixture\nACCEPTANCE: y\nREPORT: z'
     const out = await $.agent.spawn(spawnOf({ prompt }))
 
     expect(out).toEqual({ model: 'sonnet', agentId: 'native-1' })
@@ -6113,7 +6133,7 @@ describe('mid-turn delivery', () => {
 
 describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
   const GATE = `${HOME}/gate.sh`
-  const BRIEF = 'GOAL: review it\nACCEPTANCE: a verdict\nREPORT: PASS or BLOCK'
+  const BRIEF = 'GOAL: review it\nMODEL: none — isolated contract fixture\nACCEPTANCE: a verdict\nREPORT: PASS or BLOCK'
   const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   /** A fake gate at GATE answering `exitCode`/`stderr`; every argv and the gate's stdin are recorded. */
   function setup(on: On, gate: { exitCode: number; stderr?: string } | undefined, env: Record<string, string> = { HOME, TMUX_AGENT_DISPATCH_GATE: GATE }, files: Files = { [GATE]: '#!/bin/bash\n' }) {
@@ -6200,7 +6220,7 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     await $.session.start(session())
     const out = await $.agent.spawn({
       tool_use_id: 'tu1',
-      prompt: `GOAL: review it\nruntime: tmux/codex\nACCEPTANCE: a verdict\nREPORT: PASS or BLOCK`,
+      prompt: `GOAL: review it\nruntime: tmux/codex\nMODEL: none — isolated contract fixture\nACCEPTANCE: a verdict\nREPORT: PASS or BLOCK`,
       description: 'review',
       subagentType: 'general-purpose',
       provider: { plugin: 'engine', tier: 'core' as const },

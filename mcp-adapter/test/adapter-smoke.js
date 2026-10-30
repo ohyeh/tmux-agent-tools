@@ -96,7 +96,7 @@ async function runChild(kind, args) {
     const spawned = await spawnTmuxAgent({
       cli: "fake",
       repoPath: repo,
-      task: "deliver once",
+      task: "deliver once" + "\nMODEL: none — isolated lifecycle fixture",
       name: "adapter-once",
     });
     fs.writeFileSync(spawned.result_path, JSON.stringify({
@@ -121,7 +121,7 @@ async function runChild(kind, args) {
       await spawnTmuxAgent({
         cli: "fake",
         repoPath: repo,
-        task: "persist",
+        task: "persist" + "\nMODEL: none — isolated lifecycle fixture",
         name: "adapter-persist",
       });
       process.stdout.write(JSON.stringify({ threw: false, code: null, owner: (await getHost(repo)).owner() }));
@@ -181,7 +181,7 @@ async function testOverlappingWaitInSameProcessDeliversOnce() {
   const spawned = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
-    task: "overlap test",
+    task: "overlap test" + "\nMODEL: none — isolated lifecycle fixture",
     name: "adapter-overlap",
   });
 
@@ -217,7 +217,7 @@ async function testWaitTerminalAndEpisodeChecks() {
   const sp1 = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
-    task: "running test",
+    task: "running test" + "\nMODEL: none — isolated lifecycle fixture",
     name: "running-ag",
   });
   fs.writeFileSync(sp1.result_path, JSON.stringify({
@@ -236,7 +236,7 @@ async function testWaitTerminalAndEpisodeChecks() {
   const sp2 = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
-    task: "mismatch test",
+    task: "mismatch test" + "\nMODEL: none — isolated lifecycle fixture",
     name: "mismatch-ag",
   });
   fs.writeFileSync(sp2.result_path, JSON.stringify({
@@ -255,7 +255,7 @@ async function testWaitTerminalAndEpisodeChecks() {
   const sp3 = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
-    task: "empty status test",
+    task: "empty status test" + "\nMODEL: none — isolated lifecycle fixture",
     name: "empty-status-ag",
   });
   fs.writeFileSync(sp3.result_path, JSON.stringify({
@@ -344,8 +344,8 @@ async function testTwoHostProcessesEachAssignAndWait() {
   const [h1, h2] = await Promise.all([startServer(dir), startServer(dir)]);
   try {
     const [a, b] = await Promise.all([
-      call(h1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "host one", name: "r73-h1" }),
-      call(h2, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "host two", name: "r73-h2" }),
+      call(h1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "host one" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-h1" }),
+      call(h2, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "host two" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-h2" }),
     ]);
     assert.equal(a.seq, 1);
     writeResult(a.result_path, { summary: "one" });
@@ -377,7 +377,7 @@ async function testTwoHostProcessesEachAssignAndWait() {
 async function testRestartWaitsOnWorkerFromBeforeRestart() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-restart-"));
   const s1 = await startServer(dir);
-  const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "survive restart", name: "r73-restart" });
+  const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "survive restart" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-restart" });
   await s1.close();
   writeResult(sp.result_path, { summary: "survived restart" });
   const owner1 = workerOwner(dir, sp.agent_id);
@@ -404,7 +404,7 @@ async function testSameHostReload() {
   const s1 = await startServer(dir, env);
   const s2 = await startServer(dir, env);
   try {
-    const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "reload", name: "r73-reload" });
+    const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "reload" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-reload" });
     writeResult(sp.result_path);
     const old = await call(s1, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
     assert.deepEqual([old.status, old.reason], ["failed", "not_live"]);
@@ -425,7 +425,7 @@ async function testCrashBeforeAndAfterAck() {
   for (const cut of ["before-write", "write-no-cb", "flushed-no-ack"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `r73-crash-${cut}-`));
     const s1 = await startServer(dir, {}, cut);
-    const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: cut, name: "r73-crash" });
+    const sp = await call(s1, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: cut + "\nMODEL: none — isolated lifecycle fixture", name: "r73-crash" });
     writeResult(sp.result_path, { summary: cut });
     const owner1 = workerOwner(dir, sp.agent_id);
     const first = await s1
@@ -474,7 +474,7 @@ async function testAckBoundariesInProcess() {
     });
   let nextId = 100;
   async function finished(name) {
-    const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: name, name });
+    const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: name + "\nMODEL: none — isolated lifecycle fixture", name });
     writeResult(sp.result_path, { summary: name });
     return sp;
   }
@@ -622,7 +622,7 @@ async function testCancelParkedResponse() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r34-cancel-"));
   process.env.TMUX_AGENT_DIR = dir;
   process.env.FAKE_AGENT_TMUX_ROOT = dir;
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r34", name: "r34" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r34" + "\nMODEL: none — isolated lifecycle fixture", name: "r34" });
   writeResult(sp.result_path, { summary: "r34" });
   const requestId = 900;
   const w = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId, signal: new AbortController().signal } });
@@ -652,7 +652,7 @@ async function testEpisodesLateResultMalformedAndIoError() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r73-e1e2-"));
   process.env.TMUX_AGENT_DIR = dir;
   process.env.FAKE_AGENT_TMUX_ROOT = dir;
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "e1", name: "r73-e1e2" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "e1" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-e1e2" });
   const e1 = waitTmuxAgent(sp.agent_id, 5, { seq: sp.seq });
   process.env.FAKE_SEND_RESULT_JSON = "1";
   const sent = await sendTmuxAgent(sp.agent_id, "now e2");
@@ -670,7 +670,7 @@ async function testEpisodesLateResultMalformedAndIoError() {
   assert.equal((await readTmuxAgent(sp.agent_id, 1)).summary, "e1 late", "read with seq reads that episode");
 
   // Late result: a wait that timed out acks nothing; the result is delivered later.
-  const lr = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "late", name: "r73-late" });
+  const lr = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "late" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-late" });
   assert.equal((await waitTmuxAgent(lr.agent_id, 0, { seq: 1 })).status, "timed_out");
   assert.equal(doneAck(dir, lr.agent_id), false);
   writeResult(lr.result_path, { summary: "late" });
@@ -683,7 +683,7 @@ async function testEpisodesLateResultMalformedAndIoError() {
   await assert.rejects(readTmuxAgent(lr.agent_id, 99), (err) => err.code === "INVALID_SEQ");
 
   // Malformed result, then an IO error: nothing acked; once readable, delivered.
-  const mr = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "bad", name: "r73-malformed" });
+  const mr = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "bad" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-malformed" });
   fs.writeFileSync(mr.result_path, "{ torn");
   assert.equal((await waitTmuxAgent(mr.agent_id, 0, { seq: 1 })).reason, "invalid_result");
   writeResult(mr.result_path, { summary: "fixed" });
@@ -717,7 +717,7 @@ async function testChannelAuthorityModAndMcpBothTry() {
         assert.equal(await heartbeat(modHost, mod), false);
         assert.match(mod.paused, /collected by its mcp channel/);
       }
-      const sp = await call(s, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "S3", name: "r73-channel" });
+      const sp = await call(s, "spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "S3" + "\nMODEL: none — isolated lifecycle fixture", name: "r73-channel" });
       writeResult(sp.result_path);
       const w = await call(s, "wait_tmux_agent", { agent_id: sp.agent_id, seq: 1, timeoutSec: 0 });
       if (modFirst) {
@@ -803,7 +803,7 @@ const freshState = (tag) => {
 // F2: the brief carries no literal `undefined`.
 async function testBriefHasNoUndefined() {
   const dir = freshState("f2");
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "plain task", name: "r8-f2" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "plain task" + "\nMODEL: none — isolated lifecycle fixture", name: "r8-f2" });
   const brief = fs.readFileSync(path.join(dir, ".v3", sp.agent_id, "brief.md"), "utf8");
   assert.ok(!/undefined/.test(brief), `brief has a literal undefined:\n${brief}`);
 }
@@ -812,7 +812,7 @@ async function testBriefHasNoUndefined() {
 async function testSpawnThenWaitIsStartingNotDead() {
   const dir = freshState("f1");
   const sp = await withEnv({ FAKE_ASSIGN_DELAY_MS: "1500", FAKE_STATUS_ABSENT_BEFORE_ASSIGN: "1" }, async () => {
-    const spawned = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "slow launch", name: "r8-f1" });
+    const spawned = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "slow launch" + "\nMODEL: none — isolated lifecycle fixture", name: "r8-f1" });
     const early = await waitTmuxAgent(spawned.agent_id, 0, { seq: 1 });
     assert.equal(early.status, "pending", `an immediate wait: ${JSON.stringify(early)}`);
     assert.equal(early.reason, "starting");
@@ -820,7 +820,7 @@ async function testSpawnThenWaitIsStartingNotDead() {
   });
   // A launch that finished with a failure is a failure, with the wrapper's own reason.
   await withEnv({ FAKE_ASSIGN_EXIT: "3", FAKE_DEAD_SESSION: "1" }, async () => {
-    const failed = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "bad launch", name: "r8-f1b" });
+    const failed = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "bad launch" + "\nMODEL: none — isolated lifecycle fixture", name: "r8-f1b" });
     await poll(() => fs.existsSync(path.join(dir, ".v3", failed.agent_id, "launch.exit")), "launch.exit");
     const w = await waitTmuxAgent(failed.agent_id, 0, { seq: 1 });
     assert.deepEqual([w.status, w.reason], ["failed", "launch_failed"], JSON.stringify(w));
@@ -833,7 +833,7 @@ async function testSpawnThenWaitIsStartingNotDead() {
 async function testWaitCallIsCapped() {
   const dir = freshState("f7");
   assert.ok(WAIT_CAP_SEC > 0 && WAIT_CAP_SEC <= 45, `WAIT_CAP_SEC=${WAIT_CAP_SEC}`);
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "cap", name: "r8-f7" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "cap" + "\nMODEL: none — isolated lifecycle fixture", name: "r8-f7" });
   const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("wait outlived the cap")), 5000)).catch((e) => e);
   const capped = await Promise.race([waitTmuxAgent(sp.agent_id, 600, { seq: 1, capSec: 1 }), guard]);
   assert.ok(!(capped instanceof Error), String(capped));
@@ -852,7 +852,7 @@ async function testWaitBoundBehindInFlight() {
   const { AckingStdioTransport } = require("../src/server.js");
   const { PassThrough } = require("node:stream");
   const dir = freshState("r44");
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r44", name: "r4-4" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r44" + "\nMODEL: none — isolated lifecycle fixture", name: "r4-4" });
   writeResult(sp.result_path, { summary: "r44" });
   const first = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId: 7001, signal: new AbortController().signal } });
   assert.equal(first.status, "completed");
@@ -884,7 +884,7 @@ async function testWaitBoundBehindInFlight() {
 // while the earlier delivery is still releasing (gap between ack and in-flight release).
 async function testAckedWhileStillInFlight() {
   const dir = freshState("ackgap");
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "ackgap", name: "ack-gap" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "ackgap" + "\nMODEL: none — isolated lifecycle fixture", name: "ack-gap" });
   writeResult(sp.result_path, { summary: "ackgap" });
   const first = await waitTmuxAgent(sp.agent_id, 1, { seq: 1, extra: { requestId: 7101, signal: new AbortController().signal } });
   assert.equal(first.status, "completed");
@@ -903,7 +903,7 @@ async function testDeferredReserveIsPendingNotAcked() {
   const dir = freshState("r42");
   const core = require("../../skills/tmux-agent-tools/scripts/lib/workers.ts");
   const { nodeHost } = require("../../skills/tmux-agent-tools/scripts/lib/host.node.ts");
-  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r42", name: "r4-2" });
+  const sp = await spawnTmuxAgent({ cli: "fake", repoPath: REPO, task: "r42" + "\nMODEL: none — isolated lifecycle fixture", name: "r4-2" });
   writeResult(sp.result_path, { summary: "r42" });
   const other = nodeHost({ owner: "someone-else", cwd: dir, log: () => {} });
   const workerDir = path.join(dir, ".v3", sp.agent_id);
@@ -930,7 +930,7 @@ async function hostMode(dir, errFile, codeFile) {
   });
   const rpc = rawRpc(server);
   await rpc.start();
-  const sp = await rpc.tool("spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "orphan check", name: "r8-f3" });
+  const sp = await rpc.tool("spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "orphan check" + "\nMODEL: none — isolated lifecycle fixture", name: "r8-f3" });
   console.log(JSON.stringify(sp));
   void rpc.request("tools/call", { name: "wait_tmux_agent", arguments: { agent_id: sp.agent_id, seq: 1, timeoutSec: 30 } });
   setTimeout(() => console.log("waiting"), 300);
@@ -997,7 +997,7 @@ async function testLaunchSurvivesHostGroupKill() {
   });
   const rpc = rawRpc(server);
   await rpc.start();
-  const sp = await rpc.tool("spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "brief must survive", name: "r8-f4" });
+  const sp = await rpc.tool("spawn_tmux_agent", { cli: "fake", repoPath: REPO, task: "brief must survive" + "\nMODEL: none — isolated lifecycle fixture", name: "r8-f4" });
   process.kill(-server.pid, "SIGKILL");
   const state = path.join(dir, ".v3", sp.agent_id);
   await poll(() => fs.existsSync(path.join(state, "launch.exit")), "the launch receipt after the host group was killed");
@@ -1072,7 +1072,7 @@ async function main() {
   // tools/call over stdio JSON-RPC
   const rpcSpawnResult = await client.callTool({
     name: "spawn_tmux_agent",
-    arguments: { cli: "fake", repoPath: repo, task: "stdio rpc worker", name: "adapter-rpc" },
+    arguments: { cli: "fake", repoPath: repo, task: "stdio rpc worker" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-rpc" },
   });
   assert.ok(!rpcSpawnResult.isError);
   const rpcSpawned = rpcSpawnResult.structuredContent;
@@ -1111,7 +1111,7 @@ async function main() {
   const spawned = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
-    task: "write a result",
+    task: "write a result" + "\nMODEL: none — isolated lifecycle fixture",
     name: "adapter-smoke",
   });
   assert.match(spawned.agent_id, /^adapter-smoke\.[0-9a-z]{5}$/);
@@ -1119,6 +1119,7 @@ async function main() {
 
   const brief = fs.readFileSync(path.join(tmp, ".v3", spawned.agent_id, "brief.md"), "utf8");
   assert.match(brief, /GOAL: write a result/);
+  assert.match(brief, /MODEL: none — isolated lifecycle fixture/);
   assert.match(brief, /Result JSON must include schema_version, status, summary, artifacts, and errors\./);
   assert.ok(brief.includes(NO_CASCADE_GUARD));
   assert.ok(brief.includes(NO_BACKGROUND_JOBS_GUARD));
@@ -1143,7 +1144,7 @@ async function main() {
   const incomplete = await spawnTmuxAgent({
     cli: "fake",
     repoPath: repo,
-    task: "write an incomplete result",
+    task: "write an incomplete result" + "\nMODEL: none — isolated lifecycle fixture",
     name: "adapter-incomplete",
   });
   fs.writeFileSync(incomplete.result_path, JSON.stringify({ schema_version: 1, status: "done" }));
@@ -1157,8 +1158,8 @@ async function main() {
   assert.deepEqual(closed, { closed: true });
 
   // 9. multiple concurrent workers
-  const a = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "a", name: "adapter-a" });
-  const b = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "b", name: "adapter-b" });
+  const a = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "a" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-a" });
+  const b = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "b" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-b" });
   process.env.FAKE_SEND_RESULT_JSON = "1";
   await sendTmuxAgent(a.agent_id, "finish a");
   await sendTmuxAgent(b.agent_id, "finish b");
@@ -1167,7 +1168,7 @@ async function main() {
   delete process.env.FAKE_SEND_RESULT_JSON;
 
   // 10. edge cases: missing, timed out, blocked, invalid, dead
-  const missing = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "no result", name: "adapter-missing" });
+  const missing = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "no result" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-missing" });
   const timedOut = await waitTmuxAgent(missing.agent_id, 0);
   assert.equal(timedOut.status, "timed_out");
   assert.equal(timedOut.reason, "missing_result");
@@ -1201,15 +1202,15 @@ async function main() {
   assert.notEqual(deadline.reason, "dead_session");
   delete process.env.FAKE_STATUS_DEADLINE;
 
-  const invalid = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "invalid result", name: "adapter-invalid" });
+  const invalid = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "invalid result" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-invalid" });
   fs.writeFileSync(invalid.result_path, "{ corrupt json");
   const invalidWaited = await waitTmuxAgent(invalid.agent_id, 0);
   assert.equal(invalidWaited.status, "failed");
   assert.equal(invalidWaited.reason, "invalid_result");
 
   // 11. Prefix matching ambiguity check (Finding 6)
-  const prefixA = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "prefix 1", name: "adapter-multi" });
-  const prefixB = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "prefix 2", name: "adapter-multi" });
+  const prefixA = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "prefix 1" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-multi" });
+  const prefixB = await spawnTmuxAgent({ cli: "fake", repoPath: repo, task: "prefix 2" + "\nMODEL: none — isolated lifecycle fixture", name: "adapter-multi" });
   assert.notEqual(prefixA.agent_id, prefixB.agent_id);
   await assert.rejects(
     async () => {
