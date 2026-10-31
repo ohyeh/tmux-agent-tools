@@ -447,6 +447,34 @@ test('picker: cwd and session escapes are stripped before draw (FR-01)', async (
   assert.match(stripAnsi(drawn), /\[live\] badname /)
 })
 
+test('picker: the highlight scrolls into a one-page window (FR-04)', () => {
+  const entries = Array.from({ length: 30 }, (_, i) => ({
+    session: `session-${i}`,
+    liveness: (i === 29 ? 'live' : 'non-live') as const,
+    health: 'unknown',
+    cwdFrom: 'unknown' as const,
+  }))
+  let state: TuiState = {
+    ...ownerState(),
+    rows: [],
+    all: [],
+    selected: undefined,
+    mode: 'picker',
+    viewer: true,
+    owner: undefined,
+    pickerEntries: entries,
+    pickerIndex: 0,
+  }
+  for (let n = 0; n < 29; n++) state = nextKeyState(state, 'j', 1, { width: 120, height: 24 }).state
+  assert.equal(state.pickerIndex, 29)
+  const shown = renderTuiLines(state, 120, 24, 1).join('\n')
+  assert.match(shown, /session-29/)
+  assert.match(shown, /\[live\]/)
+  const top = renderTuiLines({ ...state, pickerIndex: 0 }, 120, 24, 1).join('\n')
+  assert.match(top, /session-0/)
+  assert.doesNotMatch(top, /session-29/)
+})
+
 test('ownLocator: a real PTY tty is the iTerm and Terminal locator, and a pipe does not publish unknown (FR-03)', async () => {
   const script = fileURLToPath(new URL('./tui-own-tty.node.ts', import.meta.url))
   const read = (child: ReturnType<typeof spawn>) =>

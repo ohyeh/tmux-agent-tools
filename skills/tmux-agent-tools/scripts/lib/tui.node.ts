@@ -1062,7 +1062,7 @@ export function frameOf(
 
 type Sections = { title: string; status: string[]; selExtra: string[]; footer: string[]; sel: number }
 
-function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): Sections {
+function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate, height = Number.POSITIVE_INFINITY): Sections {
   const tmuxRunning = state.rows.filter(r => !r.project && !r.terminal).length
   const me = state.owner
   const age = state.rowsAge ? ` · ${ageText(now, state.rowsAge)}` : ''
@@ -1089,11 +1089,19 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): S
     status.push('選擇 session：數字或 Enter 接手，Esc 返回')
     const entries = state.pickerEntries ?? []
     if (!entries.length) status.push('（沒有 session）')
-    entries.forEach((e, i) => {
-      const mark = i === (state.pickerIndex ?? 0) ? '› ' : '  '
-      const cwd = e.cwdFrom === 'unknown' || !e.cwd ? 'cwd unknown' : sanitizeAnsi(e.cwd)
-      status.push(`${mark}${i + 1} [${e.liveness}] ${sanitizeAnsi(e.session)} ${cwd}`)
-    })
+    else {
+      // Title + this prompt stay; the window follows the highlight. Lines after it are what a short frame drops.
+      const index = Math.min(Math.max(state.pickerIndex ?? 0, 0), entries.length - 1)
+      const room = Number.isFinite(height) ? Math.max(1, height - 2) : entries.length
+      const shown = Math.min(entries.length, room)
+      const first = firstShown(index, shown, entries.length)
+      for (let i = first; i < first + shown; i++) {
+        const e = entries[i]!
+        const mark = i === index ? '› ' : '  '
+        const cwd = e.cwdFrom === 'unknown' || !e.cwd ? 'cwd unknown' : sanitizeAnsi(e.cwd)
+        status.push(`${mark}${i + 1} [${e.liveness}] ${sanitizeAnsi(e.session)} ${cwd}`)
+      }
+    }
   } else if (state.viewer) status.push(`\x1b[2mviewer — no session; ${READ_ONLY} · ${health}\x1b[0m`)
   else {
     const ok = gate?.viewHealth?.kind === 'collecting' && !gate.viewHealth.reason // a deferral shows in yellow
@@ -1140,7 +1148,7 @@ function chromeLines(s: Sections): number {
 
 /** The layout runTui sizes the capture and the detail page with: the same one render draws. */
 export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number; frame: Frame } {
-  const s = sectionsOf(state, width, now, gate)
+  const s = sectionsOf(state, width, now, gate, height)
   const frame = frameOf(width, height, state.rows.length, s.sel, chromeLines(s), state.narrowView ?? 'list')
   const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
   const detailTotal = state.expanded && state.detail && state.detail.id === state.selected ? wrapCells(state.detail.lines.join('\n'), wrapW).length : 0
@@ -1211,7 +1219,7 @@ export function renderTuiLines(
   gate?: Gate,
 ): string[] {
   if (width < 1 || height < 1) return []
-  const s = sectionsOf(state, width, now, gate)
+  const s = sectionsOf(state, width, now, gate, height)
   if (height <= 2) {
     const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
     return [s.title, truncateAnsi(compact, width)].slice(0, height)
