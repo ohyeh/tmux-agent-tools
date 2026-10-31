@@ -52,7 +52,7 @@ import {
   graphemeWidth,
   graphemes,
   sanitizeAnsi,
-  layoutOf,
+  frameOf,
   tuiLayout,
   healthText,
   emptyText,
@@ -1857,25 +1857,31 @@ test('health writer: heartbeat publishes act/<n>.state for its channel, once per
   assert.deepEqual(act.filter(f => !/^\d+(\.json|\.beat|\.state)?$/.test(f)), [])
 })
 
-test('layout: one function sizes every section; hard-coded fixtures (R4.1, R4.2)', () => {
-  // [height, input] → expected. The sum of the sections never exceeds the height.
-  const fixtures: [number, Parameters<typeof layoutOf>[1], ReturnType<typeof layoutOf>][] = [
-    [24, { status: 1, rows: 3, sel: 2, selExtra: 2, footer: 1 }, { status: 1, first: 0, list: 3, hidden: 0, more: 0, selExtra: 2, body: 14, footer: 1 }],
-    [24, { status: 1, rows: 1, sel: 0, selExtra: 1, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 1, body: 18, footer: 0 }],
-    [60, { status: 1, rows: 1, sel: 0, selExtra: 1, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 1, body: 54, footer: 0 }],
-    [60, { status: 1, rows: 3, sel: 0, selExtra: 2, footer: 1 }, { status: 1, first: 0, list: 3, hidden: 0, more: 0, selExtra: 2, body: 50, footer: 1 }],
-    [10, { status: 1, rows: 5, sel: 4, selExtra: 2, footer: 0 }, { status: 1, first: 0, list: 5, hidden: 0, more: 0, selExtra: 2, body: 0, footer: 0 }],
-    [10, { status: 1, rows: 9, sel: 8, selExtra: 2, footer: 1 }, { status: 1, first: 5, list: 4, hidden: 5, more: 1, selExtra: 2, body: 0, footer: 1 }],
-    [10, { status: 1, rows: 1, sel: 0, selExtra: 2, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 2, body: 3, footer: 0 }],
-    [3, { status: 1, rows: 4, sel: 3, selExtra: 2, footer: 1 }, { status: 1, first: 3, list: 1, hidden: 3, more: 0, selExtra: 0, body: 0, footer: 0 }],
-    [5, { status: 2, rows: 0, sel: -1, selExtra: 0, footer: 3 }, { status: 2, first: 0, list: 0, hidden: 0, more: 0, selExtra: 0, body: 0, footer: 2 }],
-  ]
-  for (const [height, input, want] of fixtures) {
-    const got = layoutOf(height, input)
-    assert.deepEqual(got, want, `height ${height} ${JSON.stringify(input)}`)
-    const used = 1 + got.status + got.list + got.selExtra + (got.body ? got.body + 2 : 0) + got.more + got.footer
-    assert.ok(used <= height, `height ${height}: ${used} lines`)
+test('layout: frameOf keeps the preview at ceil(2C/3) for 0..40 rows, and wide uses every content row', () => {
+  const ceil2 = (c: number) => Math.ceil((2 * c) / 3)
+  for (let rows = 0; rows <= 40; rows++) {
+    const headers = 4
+    const frame = frameOf(100, 40, rows, rows > 0 ? 0 : -1, headers, 'list')
+    assert.equal(frame.mode, 'standard', `rows ${rows}`)
+    assert.ok(frame.preview.rows >= ceil2(frame.content), `rows ${rows}: preview ${frame.preview.rows} C ${frame.content}`)
+    assert.ok(frame.list.rows <= Math.floor(frame.content / 3), `rows ${rows}: list ${frame.list.rows}`)
+    assert.equal(frame.list.rows + frame.preview.rows, frame.content, `rows ${rows}`)
+    const used = headers + frame.more + (rows > 0 ? 2 : 0) + frame.list.rows + frame.preview.rows
+    assert.ok(used <= 40, `rows ${rows}: ${used} lines`)
   }
+  const wide = frameOf(120, 40, 30, 0, 2, 'list')
+  assert.equal(wide.mode, 'wide')
+  assert.equal(wide.preview.rows, wide.content, 'wide preview is every content row')
+  assert.equal(wide.preview.cols, 72)
+  assert.equal(wide.list.cols, 48)
+  const thirty = frameOf(100, 40, 30, 0, 4, 'list')
+  assert.equal(thirty.list.rows < 30 && thirty.preview.rows >= Math.ceil((2 * thirty.content) / 3), true)
+  const listed = frameOf(70, 24, 3, 0, 4, 'list')
+  const opened = frameOf(70, 24, 3, 0, 4, 'preview')
+  assert.equal(listed.mode, 'narrow')
+  assert.equal(listed.preview.rows, 0)
+  assert.equal(opened.list.rows, 0)
+  assert.ok(opened.preview.rows > 0)
 })
 
 test('mirror: capture asks for the whole scrollback; a resize drops the capture started before it (R4.1, R4.2)', async () => {
@@ -1934,31 +1940,54 @@ test('preview fills the frame in every state: height rows, footer last, rule and
   for (const height of [12, 24, 40, 60]) {
     for (const [name, extra, marker] of states) {
       const s = { ...base, ...extra }
-      const lay = tuiLayout(s, 70, height, NOW)
-      const frame = renderTuiLines(s, 70, height, NOW).map(stripAnsi)
+      const lay = tuiLayout(s, 100, height, NOW)
+      const frame = renderTuiLines(s, 100, height, NOW).map(stripAnsi)
       const at = `${name} h=${height}`
       assert.equal(frame.length, height, `${at}: frame is the full height`)
       assert.equal(frame.at(-1), 'tmux-agent: note', `${at}: footer on the last line`)
-      assert.ok(frame.every(l => cellWidth(l) <= 70), `${at}: no line wider than the screen`)
+      assert.ok(frame.every(l => cellWidth(l) <= 100), `${at}: no line wider than the screen`)
       const rule = frame.findIndex(l => l.startsWith('─'))
       assert.ok(rule > 0 && lay.body > 0, `${at}: the rule is drawn`)
       assert.ok(frame.slice(rule + 1, rule + 1 + lay.body).some(l => marker.test(l)), `${at}: ${marker} in the body`)
       assert.match(frame[rule + 1 + lay.body]!, s.expanded ? /^detail / : /^See it whole: /, `${at}: tail right after the body`)
-      for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
+      if (lay.list >= 3) for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
+      else assert.ok(frame.some(l => l.includes(' a')), `${at}: the selected row is listed`)
       assert.ok(!frame.some(l => l.includes('B-ONLY')), `${at}: never another row's content`)
     }
   }
-  // No preview (no selection; or a window too short for one): still full height, footer last (T1 C5).
+  // No selection: no preview. A short window still fills the height with the footer last (T1 C5).
   for (const [name, s, height] of [
     ['no selection', { ...base, selected: undefined }, 24],
-    ['h=9, the status line squeezes the body to 0', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 9],
+    ['h=9', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 9],
     ['h=8', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 8],
   ] as [string, TuiState, number][]) {
-    const frame = renderTuiLines(s, 70, height, NOW).map(stripAnsi)
-    assert.equal(tuiLayout(s, 70, height, NOW).body, 0, `${name}: no preview`)
+    const frame = renderTuiLines(s, 100, height, NOW).map(stripAnsi)
+    if (name === 'no selection') assert.equal(tuiLayout(s, 100, height, NOW).body, 0, `${name}: no preview`)
     assert.equal(frame.length, height, `${name}: frame is the full height`)
     assert.equal(frame.at(-1), 'tmux-agent: note', `${name}: footer on the last line`)
   }
+})
+
+test('narrow: Enter walks list, then preview, then Detail; Esc steps back', () => {
+  const rows = [mockRow('a')]
+  const screen = { width: 70, height: 24 }
+  let s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a' }
+  assert.equal(frameOf(70, 24, 1, 0, 4, 'list').preview.rows, 0)
+  let r = nextKeyState(s, '\r', 1, screen)
+  assert.equal(r.state.narrowView, 'preview')
+  assert.notEqual(r.state.expanded, true)
+  assert.equal(r.action, undefined)
+  r = nextKeyState(r.state, '\r', 1, screen)
+  assert.equal(r.state.expanded, true)
+  assert.equal(r.action?.type, 'detail')
+  r = nextKeyState(r.state, '\x1b', 1, screen)
+  assert.notEqual(r.state.expanded, true)
+  assert.equal(r.state.narrowView, 'preview')
+  r = nextKeyState(r.state, '\x1b', 1, screen)
+  assert.equal(r.state.narrowView, 'list')
+  const wide = nextKeyState(s, '\r', 1, { width: 100, height: 24 })
+  assert.equal(wide.action?.type, 'detail')
+  assert.equal(wide.state.narrowView, undefined)
 })
 
 test('mirror: capture failure reaches the preview as an error, not an empty pane (T1 C2b)', async () => {
@@ -2108,11 +2137,12 @@ test('fit: a select or a resize fits the worker window once; the tick only captu
     const after = captures
     await until(() => captures >= after + 3, 5_000, 'three tick captures')
     assert.equal(fits.length, 1, 'ticks do not fit')
-    assert.match(fits[0]!, /^80x\d+$/)
+    assert.match(fits[0]!, /^80x\d+$/, 'a standard preview is as wide as the terminal')
     stdout.columns = 120
     stdout.emit('resize')
     await until(() => fits.length === 2, 5_000, 'the resize fits')
-    assert.match(fits[1]!, /^120x\d+$/)
+    // Wide list is min(60, floor(120*0.4)) = 48, so the preview (and the worker) is 72.
+    assert.equal(fits[1], '72x21')
   } finally {
     stdin.emit('data', 'q')
     await run
@@ -2199,9 +2229,9 @@ test('mirror: PgUp scrolls back through the scrollback, PgDn to the end follows 
   const rows = [mockRow('a')]
   const lines = Array.from({ length: 300 }, (_, i) => `m${i}`)
   let s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a', mirror: { id: 'a', lines } }
-  const body = tuiLayout(s, 70, 24, NOW).body
+  const body = tuiLayout(s, 100, 24, NOW).body
   s = { ...s, page: body }
-  const frame = (st: TuiState) => renderTuiLines(st, 70, 24, NOW).map(stripAnsi)
+  const frame = (st: TuiState) => renderTuiLines(st, 100, 24, NOW).map(stripAnsi)
   assert.ok(frame(s).includes('m299'), 'live: the newest line')
   s = nextKeyState(s, PAGE_UP, NOW).state
   assert.equal(s.back, body)
@@ -2872,7 +2902,7 @@ test('Sol#12 colon SGR: one grammar for sanitize, strip, width, pad, truncate an
     mirror: { id: 'w-sgr', lines: [sgr] },
     quit: false,
   }
-  const lines = renderTuiLines(state, 12, 24, Date.now())
+  const lines = renderTuiLines(state, 80, 24, Date.now())
   assert.ok(lines.includes(sgr), `the mirror line is drawn unchanged: ${JSON.stringify(lines)}`)
 })
 

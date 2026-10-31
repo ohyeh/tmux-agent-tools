@@ -262,6 +262,8 @@ export interface TuiState {
   mirror?: { id: string } & MirrorCapture
   /** Enter on the selected row: its detail replaces the mirror. */
   expanded?: boolean
+  /** Narrow (<80): one pane. Enter walks list → preview → Detail. */
+  narrowView?: 'list' | 'preview'
   detail?: { id: string; lines: string[] }
   /** First detail line shown (PgUp/PgDn). */
   scroll?: number
@@ -541,7 +543,12 @@ const reselect = (state: TuiState, selected: string | undefined): TuiState => ({
   back: 0,
 })
 
-export function nextKeyState(state: TuiState, key: string, now: number): { state: TuiState; action?: TuiAction } {
+export function nextKeyState(
+  state: TuiState,
+  key: string,
+  now: number,
+  screen?: { width: number; height: number },
+): { state: TuiState; action?: TuiAction } {
   // Raw mode turns Ctrl-C into a key (no SIGINT): it quits from every mode, prompt included.
   if (key === '\x03') return { state: { ...state, quit: true }, action: { type: 'quit' } }
   if (key === INPUT_DROPPED) return say(state, 'input — dropped an unfinished paste or escape sequence (no end in time or too long)', now)
@@ -642,6 +649,18 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
   if (key === '\r' || key === '\n') {
     // A project session has no episode to show: Enter keeps the mirror.
     if (!row || row.project) return { state }
+    // Narrow is one pane: Enter walks list → preview → Detail. Wider widths keep the mirror/detail toggle.
+    if (screen && screen.width < 80 && screen.width >= 40 && screen.height >= 10) {
+      const view = state.narrowView ?? 'list'
+      if (view !== 'preview') return { state: { ...state, narrowView: 'preview', expanded: false, detail: undefined, scroll: 0 } }
+      if (!state.expanded) {
+        return {
+          state: { ...state, narrowView: 'preview', expanded: true, scroll: 0, armedStop: undefined },
+          action: { type: 'detail' },
+        }
+      }
+      return { state }
+    }
     const expanded = !state.expanded
     return {
       state: { ...state, expanded, scroll: 0, armedStop: undefined, ...(expanded ? {} : { detail: undefined }) },
@@ -699,6 +718,9 @@ export function nextKeyState(state: TuiState, key: string, now: number): { state
   if (key === '\x1b') {
     if (state.armedStop) return { state: { ...state, armedStop: undefined } }
     if (state.expanded) return { state: { ...state, expanded: false, detail: undefined, scroll: 0 } }
+    if (screen && screen.width < 80 && screen.width >= 40 && screen.height >= 10 && (state.narrowView ?? 'list') === 'preview') {
+      return { state: { ...state, narrowView: 'list' } }
+    }
     if (state.selected) return { state: reselect(state, undefined) }
   }
 
@@ -794,9 +816,7 @@ export function detailText(r: PanelRow, det: EpisodeDetail): string[] {
   return out
 }
 
-/** Mirror or detail rows below the selected row; fewer and it is not drawn. */
-export const BODY_MIN = 3
-/** The body's separator and its last line (see-whole / scroll position). */
+/** The preview's rule and its tail. They sit outside C, so they do not shrink the 2/3. */
 const BODY_CHROME = 2
 
 export type TuiLayout = {
@@ -809,42 +829,126 @@ export type TuiLayout = {
   more: number
   /** Lines under the selected row before the body (summary, key hints). */
   selExtra: number
-  /** Mirror or detail content rows: what capture asks for (R4.2). */
+  /** Mirror or detail content rows: the preview rectangle's pane (I4). */
   body: number
   footer: number
 }
 
+export type Rect = { x: number; y: number; cols: number; rows: number }
+export type NarrowView = 'list' | 'preview'
+export type Frame = {
+  mode: 'wide' | 'standard' | 'narrow' | 'tiny'
+  title: Rect
+  list: Rect & { first: number }
+  /** Capture and fitWorker use this rectangle, never the terminal width. */
+  preview: Rect
+  footer: Rect
+  /** Content rows after chrome, group headers and the more line. */
+  content: number
+  more: number
+  hidden: number
+}
+
+export function frameMode(width: number, height: number): Frame['mode'] {
+  if (width < 40 && height < 10) return 'tiny'
+  if (width >= 120) return 'wide'
+  if (width >= 80) return 'standard'
+  return 'narrow'
+}
+
+const firstShown = (selected: number, shown: number, rows: number) =>
+  selected >= 0 && shown > 0 ? Math.max(0, Math.min(selected - shown + 1, rows - shown)) : 0
+
 /**
- * The one layout (R4.1): title 1, then status lines, then at least one row (the
- * selected one), its extra lines, the footer, then more rows, and what is left is
- * the body. Every count is clamped, so the sum never exceeds `height`.
+ * One geometry (L1). `headers` is the full-width chrome (title, status, selection
+ * extra, footer, group headers). The preview's rule and tail are chrome too, so
+ * they are not part of C. Standard: list ≤ ⌊C/3⌋ and preview ≥ ⌈2C/3⌉. Wide:
+ * preview rows are all of C, and its width is the right-hand column.
  */
-export function layoutOf(
+export function frameOf(
+  width: number,
   height: number,
-  p: { status: number; rows: number; sel: number; selExtra: number; footer: number },
-): TuiLayout {
-  let left = Math.max(0, height - 1)
-  const status = Math.min(p.status, left)
-  left -= status
-  if (p.rows === 0 || left === 0) {
-    return { status, first: 0, list: 0, hidden: p.rows, more: 0, selExtra: 0, body: 0, footer: Math.min(p.footer, left) }
+  rows: number,
+  selected: number,
+  headers: number,
+  narrowView: NarrowView = 'list',
+): Frame {
+  const mode = frameMode(width, height)
+  const chrome = Math.min(Math.max(0, headers), Math.max(0, height))
+  const title: Rect = { x: 0, y: 0, cols: Math.max(0, width), rows: height > 0 ? 1 : 0 }
+  const footer: Rect = { x: 0, y: Math.max(0, height - 1), cols: Math.max(0, width), rows: 0 }
+  const empty = (content: number): Frame => ({
+    mode,
+    title,
+    list: { x: 0, y: chrome, cols: width, rows: 0, first: 0 },
+    preview: { x: 0, y: chrome, cols: width, rows: 0 },
+    footer,
+    content,
+    more: 0,
+    hidden: rows,
+  })
+  if (mode === 'tiny' || width < 1 || height < 1) return empty(0)
+
+  if (mode === 'wide') {
+    const listCols = Math.min(60, Math.floor(width * 0.4))
+    const C = Math.max(0, height - chrome)
+    let shown = Math.min(rows, C)
+    const more = rows > shown ? 1 : 0
+    if (more && shown + more > C) shown = Math.max(0, C - more)
+    return {
+      mode,
+      title,
+      list: { x: 0, y: chrome, cols: listCols, rows: C, first: firstShown(selected, shown, rows) },
+      preview: { x: listCols, y: chrome, cols: width - listCols, rows: selected >= 0 ? C : 0 },
+      footer,
+      content: C,
+      more,
+      hidden: rows - shown,
+    }
   }
-  left -= 1
-  const selExtra = p.sel >= 0 ? Math.min(p.selExtra, left) : 0
-  left -= selExtra
-  const footer = Math.min(p.footer, left)
-  left -= footer
-  const moreFor = (n: number) => (n < p.rows ? 1 : 0)
-  const want = BODY_MIN + BODY_CHROME
-  const reserve = p.sel >= 0 && moreFor(1) + want <= left ? want : 0
-  let list = 1
-  while (list < p.rows && list + moreFor(list + 1) + reserve <= left) list += 1
-  left -= list - 1
-  const more = moreFor(list) && left >= 1 ? 1 : 0
-  left -= more
-  const body = p.sel >= 0 && left >= want ? left - BODY_CHROME : 0
-  const first = p.sel >= 0 ? Math.max(0, Math.min(p.sel - list + 1, p.rows - list)) : 0
-  return { status, first, list, hidden: p.rows - list, more, selExtra, body, footer }
+
+  if (mode === 'narrow' && narrowView !== 'preview') {
+    let shown = Math.min(rows, Math.max(0, height - chrome))
+    let more = rows > shown ? 1 : 0
+    if (more) shown = Math.min(rows, Math.max(0, height - chrome - 1))
+    const C = Math.max(0, height - chrome - more)
+    return {
+      mode,
+      title,
+      list: { x: 0, y: chrome, cols: width, rows: shown, first: firstShown(selected, shown, rows) },
+      preview: { x: 0, y: chrome, cols: width, rows: 0 },
+      footer,
+      content: C,
+      more,
+      hidden: rows - shown,
+    }
+  }
+
+  // Standard, or narrow preview: the preview is the pane. Rule + tail sit outside C.
+  const previewChrome = selected >= 0 ? BODY_CHROME : 0
+  let more = 0
+  let C = 0
+  let shown = 0
+  let previewRows = 0
+  for (let pass = 0; pass < 3; pass++) {
+    C = Math.max(0, height - chrome - previewChrome - more)
+    const cap = selected >= 0 && rows > 0 ? Math.floor(C / 3) : C
+    shown = mode === 'narrow' ? 0 : Math.min(rows, cap)
+    previewRows = selected >= 0 ? C - shown : rows === 0 ? C : 0
+    const need = mode === 'narrow' ? 0 : rows > shown ? 1 : 0
+    if (need === more) break
+    more = need
+  }
+  return {
+    mode,
+    title,
+    list: { x: 0, y: chrome, cols: width, rows: shown, first: firstShown(selected, shown, rows) },
+    preview: { x: 0, y: chrome, cols: width, rows: previewRows },
+    footer,
+    content: C,
+    more,
+    hidden: rows - shown,
+  }
 }
 
 type Sections = { title: string; status: string[]; selExtra: string[]; footer: string[]; sel: number }
@@ -910,12 +1014,74 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): S
   return { title: titleLine, status, selExtra, footer, sel }
 }
 
+/** Full-width lines that are not list, more, or the preview pane. */
+function chromeLines(s: Sections): number {
+  return 1 + s.status.length + (s.sel >= 0 ? s.selExtra.length : 0) + s.footer.length
+}
+
 /** The layout runTui sizes the capture and the detail page with: the same one render draws. */
-export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number } {
+export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number; frame: Frame } {
   const s = sectionsOf(state, width, now, gate)
-  const lay = layoutOf(height, { status: s.status.length, rows: state.rows.length, sel: s.sel, selExtra: s.selExtra.length, footer: s.footer.length })
-  const detailTotal = state.expanded && state.detail && state.detail.id === state.selected ? wrapCells(state.detail.lines.join('\n'), width).length : 0
-  return { ...lay, detailTotal }
+  const frame = frameOf(width, height, state.rows.length, s.sel, chromeLines(s), state.narrowView ?? 'list')
+  const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
+  const detailTotal = state.expanded && state.detail && state.detail.id === state.selected ? wrapCells(state.detail.lines.join('\n'), wrapW).length : 0
+  const shown = Math.max(0, state.rows.length - frame.hidden)
+  return {
+    status: s.status.length,
+    first: frame.list.first,
+    list: shown,
+    hidden: frame.hidden,
+    more: frame.more,
+    selExtra: s.sel >= 0 ? s.selExtra.length : 0,
+    body: frame.preview.rows,
+    footer: s.footer.length,
+    detailTotal,
+    frame,
+  }
+}
+
+function rowLine(state: TuiState, index: number, selected: number): string {
+  const r = state.rows[index]!
+  const digitPrefix = index < 9 ? `${index + 1}: ` : '   '
+  const color = r.project ? ANSI_COLOR_MAP['blue'] : (ANSI_COLOR_MAP[STATE_COLOR[r.state]] ?? '')
+  return `${digitPrefix}${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}${sanitizeAnsi(rowLabel(r, index === selected))}`
+}
+
+/** Wide: list on the left, preview on the right, both as tall as the content band. */
+function renderWide(state: TuiState, width: number, height: number, s: Sections, lay: TuiLayout & { frame: Frame }): string[] {
+  const frame = lay.frame
+  const fit = (line: string, cols: number) => padCells(truncateAnsi(line, cols), cols)
+  const lines: string[] = [s.title, ...s.status.map(l => truncateAnsi(l, width))]
+  if (s.sel >= 0) lines.push(...s.selExtra.map(l => truncateAnsi(l, width)))
+  const left: string[] = []
+  const shown = Math.max(0, state.rows.length - frame.hidden)
+  for (let i = frame.list.first; i < frame.list.first + shown; i++) left.push(rowLine(state, i, s.sel))
+  if (frame.more) left.push(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`)
+  const right: string[] = []
+  const r = s.sel >= 0 ? state.rows[s.sel] : undefined
+  if (r && frame.preview.rows > 0) {
+    const cols = frame.preview.cols
+    const bodyN = frame.preview.rows
+    if (state.expanded) {
+      const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), cols) : ['loading…']
+      const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyN))
+      for (const l of all.slice(top, top + bodyN)) right.push(l || ' ')
+    } else {
+      const m = state.mirror?.id === r.id ? state.mirror : undefined
+      if (!m) right.push('\x1b[2mcapturing the pane…\x1b[0m')
+      else if (m.error) right.push(`\x1b[33mcapture failed: ${sanitizeAnsi(m.error)}\x1b[0m`)
+      else if (!m.lines.length) right.push('\x1b[2m(the pane is empty)\x1b[0m')
+      const total = m?.lines.length ?? 0
+      const end = total - Math.min(state.back ?? 0, Math.max(0, total - bodyN))
+      if (m && !m.error && total) for (const ml of m.lines.slice(Math.max(0, end - bodyN), end)) right.push(sanitizeAnsi(ml) || ' ')
+    }
+  }
+  for (let i = 0; i < frame.list.rows; i++) {
+    lines.push(fit(left[i] ?? '', frame.list.cols) + fit(right[i] ?? '', frame.preview.cols))
+  }
+  for (const f of s.footer) lines.push(truncateAnsi(f, width))
+  while (lines.length < height) lines.push(' ')
+  return lines.slice(0, height)
 }
 
 export function renderTuiLines(
@@ -931,7 +1097,8 @@ export function renderTuiLines(
     const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
     return [s.title, truncateAnsi(compact, width)].slice(0, height)
   }
-  const lay = layoutOf(height, { status: s.status.length, rows: state.rows.length, sel: s.sel, selExtra: s.selExtra.length, footer: s.footer.length })
+  const lay = tuiLayout(state, width, height, now, gate)
+  if (lay.frame.mode === 'wide') return renderWide(state, width, height, s, lay)
   const fit = (line: string) => truncateAnsi(line, width)
   const lines: string[] = [s.title, ...s.status.slice(0, lay.status).map(fit)]
 
@@ -1150,18 +1317,19 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     if (!state.selected || state.expanded) return false
     const row = state.rows.find(r => r.id === state.selected)
     if (!row) return false
-    const body = layout().body
-    if (body < 1) return false
+    const frame = layout().frame
+    const body = frame.preview.rows
+    if (body < 1 || frame.preview.cols < 1) return false
     const gen = generation
     capturing = true
     let landed = false
     try {
-      // The worker's screen is the view: size its window to the preview, as attach would.
+      // The worker's screen is the preview rectangle, not the terminal's width (I4, I5).
       // A viewer too (owner ruling 2026-10-15): read-only covers the ledger and the
       // worker's input, not the size of a window nobody is attached to.
       const fit = fitPending && !row.project
       fitPending = false
-      const fitOut = fit ? await fitWorker(host, row.d, width, body) : undefined
+      const fitOut = fit ? await fitWorker(host, row.d, frame.preview.cols, body) : undefined
       // The whole scrollback, like `tmux attach`; the view shows a window of it (PgUp/PgDn).
       // Colour on: every mirror line goes through sanitizeAnsi before it is printed.
       const cap = row.project ? await mirrorProject(host, row.d.name, MIRROR_HISTORY, true) : await mirrorOf(host, row.d, MIRROR_HISTORY, true)
@@ -1287,7 +1455,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       if (stopped) return
       try {
         for (const key of keys) {
-          const result = nextKeyState(state, key, Date.now())
+          const result = nextKeyState(state, key, Date.now(), { width, height })
           state = result.state
           if (result.action) await handleAction(result.action)
           if (state.quit) return stop()

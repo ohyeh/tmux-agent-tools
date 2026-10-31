@@ -5,7 +5,7 @@ source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
 # private tmux server, over a real ledger whose two workers are real tmux
 # sessions (a fake CLI, as the assign smokes use), driven with `send-keys` and
 # read back with `capture-pane`. One real PTY pass: j/k selection; the selected
-# worker's window takes the TUI width; resize to 80x24 (no line past the width,
+# worker's window takes the preview width; resize to 80x24 (no line past the width,
 # `capture-pane -J`); x (twice) stops a worker; q exits and the pane's stty is unchanged.
 # Detail, refresh, tell, paste, viewer, Ctrl-C and R8.5 wording are tui.contract's
 # and workers.contract's (real ledgers, pty runs). Bounded polls only.
@@ -149,8 +149,8 @@ check "j moves to the second row" wait_for "$P" '^2: .*› ' 25
 keys "$P" k
 check "k moves back to the first row" wait_for "$P" '^1: .*› ' 25
 check "the selected row shows its key hints" wait_for "$P" '\[ t tell \].*\[ x stop \].*\[ - cancel \].*\[ U unlock \]' 10
-# A detached worker starts at default-size 80x24; the preview sizes it to the TUI's width.
-check "the selected worker's window takes the TUI width" sh -c "for i in \$(seq 1 100); do tmux list-panes -a -F '#{session_name} #{pane_width}' | grep -Eq 'w[ab]\\..* 120\$' && exit 0; sleep 0.05; done; exit 1"
+# A detached worker starts at default-size 80x24. Wide (120) preview cols = 120 - min(60, floor(120*0.4)) = 72.
+check "the selected worker's window takes the preview width" sh -c "for i in \$(seq 1 100); do tmux list-panes -a -F '#{session_name} #{pane_width}' | grep -Eq 'w[ab]\\..* 72\$' && exit 0; sleep 0.05; done; exit 1"
 
 echo "case: resize re-lays out"
 # One real SIGWINCH; layout at other sizes is tui.contract's (renderTuiLines).
