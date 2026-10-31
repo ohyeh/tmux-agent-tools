@@ -97,8 +97,8 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 
 | 面 | 用途 |
 |---|---|
-| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上）；按 `[ ⧉ ]` 時一次 `/bin/sh -c` 找 `node`、`agent-tmux` 旁的 `lib/tui.node.ts` 與 `tmux-agent-tui`，在 tmux 裡再一次 `tmux split-window` |
-| `fs.read/write/list/stat` | 寫只在 state root 的 `.v3/` 底下：`worker.json`、每輪的 `dispatch.json`／`tell.md`／`waiter`、`brief.md`、`launch.exit`、`mod-assign.log`、`result.json`、activation 心跳。建目錄、`ln -sn` 鎖、`mv` 發佈、`rm` 走 `process.run`（引擎的 `fs` 沒有 mkdir／rename）。state root 之外只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
+| `process.run` | 派工（`sh -c 'nohup agent-tmux <profile> assign --detach ... &'`）、停滯探測（`agent-tmux <profile> status --json`）、面板鏡像（worker：`agent-tmux <profile> capture --strip-ansi --tail N`；專案 session：`tmux capture-pane -p -J -t <name>`）、隊友追話（`result init` + `send --prompt-file`）、收工（`stop`）、按 id 接回（`agent-tmux <profile> resume --exact <name> <dir> <id>`，以及對 claude／codex 的 session log 跑 `grep -m1 -o '"cwd":"[^"]*"'`），以及每 10 秒一次 `tmux list-sessions -F '#{session_name}\t#{session_path}\t#{session_created}'`（專案列；不在 2 秒時鐘上）；按 `[ ⧉ ]` 時一次 `/bin/sh -c` 找 `agent-tmux` 旁的 `tmux-agent-tui`，再依所在終端機開 TUI：在 tmux 裡 `tmux split-window`，Warp 是 `open warp://launch/<name>`，iTerm2 與 Terminal.app（含其他不認得的終端機）是 `osascript`；TUI 已在執行時，切過去用 `tmux select-pane`、`open -a Warp` 或 `osascript`（只帶到前景，不開第二個） |
+| `fs.read/write/list/stat` | 寫只在 state root 的 `.v3/` 底下：`worker.json`、每輪的 `dispatch.json`／`tell.md`／`waiter`、`brief.md`、`launch.exit`、`mod-assign.log`、`result.json`、activation 心跳。建目錄、`ln -sn` 鎖、`mv` 發佈、`rm` 走 `process.run`（引擎的 `fs` 沒有 mkdir／rename）。state root 之外只寫一處：按 `[ ⧉ ]` 在 Warp 開 TUI 時，寫 `~/.warp/launch_configurations/tmux-agent-tui-<session>-<token>.yaml`（開失敗或 30 秒沒人接手就刪掉，TUI 接手時自己刪）。其餘只讀、只在按 `[ + ]` 或打 `/workers resume` 時：列出 `~/.claude/projects`、`~/.cursor/chats`、`~/.codex/sessions/<年>/<月>/<日>` 的目錄名，讀 cursor 的 `<id>/meta.json` 和 agy 的 `cache/conversation_metadata.json`（只取 cwd） |
 | `fs.exists` | state root 之外兩種用途：找 `agent-tmux` —— 依序查 `PATH` 各目錄的 `agent-tmux`，再查 plugin／skill 安裝位置那一個檔名；以及 `resume` 找 session id 在哪個 CLI 的 store（下面 `[ + ]` 那節列的路徑）。只問「在不在」 |
 | `store.get/set/keys/delete` | 只放 UI 偏好：哪些 session 關了面板（`tmux-agent.panel-hidden`，最多記 20 個）、面板收合沒（`tmux-agent.fold`，沒記就是收合）。交付帳不在 store（見上面 `.v3/`） |
 | `tool.call` on `Bash` | **攔截**：mod 載入時，手打的（主 session；子代理放行） `agent-tmux <cli> assign/send/send-wait/stop/status/capture/probe/result` 會被拒絕並指向對應工具；帶 `--help` 的命令放行（gate 不擋；wrapper 本身接不接受 `--help` 是它的事） |
@@ -109,7 +109,7 @@ settings 裡若還留著 `pluginConfigs.tmux-agent.options.mode`，engine 會忽
 | `clock.every` | 兩條時鐘：10 秒對帳（永遠跑），2 秒面板鏡像（只在面板開著時存在） |
 | `ui.render/resolve/invalidate` | `/workers` 面板（畫在 `AbovePrompt` band；沒有 pane，所以沒有 `ui.open/close`） |
 | `ui.toast/log` | 診斷，不開 turn（不用 `ui.status`：引擎把它釘成 `⚠ tmux-agent: …` 直到被換掉） |
-| `env.get` | 只讀五個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME`、`PATH`（找 `agent-tmux`），以及 `TMUX_AGENT_DISPATCH_GATE`（dispatch gate，見下） |
+| `env.get` | 只讀這幾個：`TMUX_AGENT_DIR`、`XDG_STATE_HOME`、`HOME`、`PATH`（找 `agent-tmux`）、`TMUX_PANE`、`TERM_PROGRAM` 與 `SSH_TTY`（`[ ⧉ ]` 判斷在哪種終端機、是不是 SSH），以及 `TMUX_AGENT_DISPATCH_GATE`（dispatch gate，見下） |
 | dispatch gate | settings 的 PreToolUse hook 不會為 mod 的工具觸發，所以 mod 自己跑：設了 `TMUX_AGENT_DISPATCH_GATE`（gate 腳本的絕對路徑）時，模型發起的 `assign`、`tell` 與 `runtime: tmux/<profile>` 的 Agent 呼叫，在派工前用 `process.run` 跑 `bash <gate>`，stdin 是 PreToolUse 形狀的 JSON（`hook_event_name`、`tool_name`、`tool_input`、`session_id`、`cwd`；runtime spawn 以 `mcp__tmux-agent__assign` 送出）。exit 2 拒絕（理由是 gate 的 stderr）；exit 0 放行，stderr 附在工具結果的 context（runtime spawn 沒有這個管道，只 log）；檔案不存在、其他 exit、啟動失敗或逾時都拒絕。沒設則不跑。面板的 `/workers tell` 是人的動作，不經 gate |
 
 **它不做的事**：沒有 `http.fetch`，不連網；不讀 credentials、shell history 或 state root 以外的檔案內容；不寫任何環境變數（pin 裡 `env writes: nothing`）；不改 `AskUserQuestion` 或其他工具的輸出。以上都能從下面那份 pin 對出來——pin 沒列的 API，mod 就沒有呼叫。
@@ -470,12 +470,20 @@ brief 的 GOAL。標頭是青底的標題列，一眼就分得出面板和 sessi
 派出、還有 tmux session 的每個 worker，等同 `mcp__tmux-agent__stop` 帶 `all: true`。
 `shell` 列和專案列都不算，因為那些不是 mod 派的。沒有 worker 時這顆按鈕不畫。
 
-### `[ ⧉ ]`：在旁邊開全螢幕 TUI（plan P7）
+### `[ ⧉ ]`：開全螢幕 TUI（plan P7，T10）
 
-標題列的 `[ ⧉ ]`（hotkey `t`）把 Claude Code 所在的 tmux pane（`$TMUX_PANE`）切一半，
-右邊跑 `lib/tui.node.ts --session <這個 session>`，焦點留在左邊。不走 launcher：在
-Claude Code 裡 mod 自己就是 collector，launcher 會再起一個，同一份結果可能送兩次；TUI
-只看不收；狀態列的「收件」讀的是 mod 自己寫的 `act/<n>.state`（見下）。
+標題列的 `[ ⧉ ]`（hotkey `t`）按一下就開 TUI，不印指令。先搶這個 session 的 TUI 佔位（`pending`
+紀錄，帶 token），搶到才開：在 tmux 裡把 Claude Code 所在的 pane（`$TMUX_PANE`）切一半，右邊跑
+`tmux-agent-tui --session <這個 session> --cwd <cwd> --claim <token>`，焦點留在左邊；不在 tmux 裡就在
+所在的終端機 app 開新視窗（Warp、iTerm2、Terminal.app；`TERM_PROGRAM` 不認得的當 Terminal.app，toast 會
+說）。不走 launcher：在 Claude Code 裡 mod 自己就是 collector，launcher 會再起一個，同一份結果可能送兩次；
+TUI 只看不收；狀態列的「收件」讀的是 mod 自己寫的 `act/<n>.state`（見下）。
+
+按下時 TUI 已經有人佔：已就緒（`ready`）就用它的 locator 切過去（tmux pane，或把 Warp／iTerm2／Terminal.app
+帶到前景並講出分頁名），不開第二個；還在啟動（`pending`）或佔用者無法證明還活著，toast 照實說，不切換、不開窗。
+開窗失敗（SSH 裡開不了、`osascript` 失敗…）是 `FAILED`，原因在 toast、完整指令在 log，這次的佔位也放掉。送出
+Warp／AppleScript 的要求只算「已送出」；30 秒內 TUI 沒有接手，band 只放掉自己那筆還在 `pending` 的佔位並說「沒有接手」，
+TUI 已經 `ready` 的紀錄不動。
 
 TUI 的按鍵（plan R4.6；畫出來的每個鍵都有 handler，contract 測試逐一檢查）：
 
@@ -539,13 +547,8 @@ heartbeat 不算 quiescence，也不讀。mod 跑在 Claude Code process 裡，`
 TUI 結束時（`q`、Ctrl-C（任何模式，輸入列開著也一樣）、SIGINT、SIGTERM、stdin 關閉或出錯、例外）都走同一條 cleanup，把 tty 還原成啟動時的狀態（原本就是 raw 的 tty 維持 raw），並關掉 bracketed paste；SIGKILL 攔不到，終端機會留在 raw／alt screen，用 `reset` 或 `stty sane` 救回。還原的某一步失敗時，其他步驟照做，每個錯誤在離開 alt screen 後印到 stderr，TUI 以 exit 1 結束（按 `q` 結束也一樣）。啟動時任何一步（raw mode、resume、alt screen）失敗，TUI 不啟動：已做的步驟還原，錯誤印出，exit 1。TUI 開著時 terminal 是 bracketed paste（DECSET 2004）：貼上的 `q`、`x` 是文字，不是按鍵。沒有結束標記（`ESC[201~`）的 paste 或沒結束的 escape sequence 不會卡住 TUI：1 秒沒有新輸入、CSI 參數超過 256 個字元、或 paste 超過 65536 個字元時，整段丟掉，狀態列顯示 `input — dropped an unfinished paste or escape sequence …`，丟掉的內容不會變成按鍵。paste 開著時按 Ctrl-C：丟掉這段 paste 並結束 TUI（按一次即可；所以內容含 0x03 的 paste 也會結束 TUI）。
 
 TUI 的位置跟著 mod 已經在用的 `agent-tmux` 走（`PATH`、marketplace checkout、
-`npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。找不到 `node`、
-`lib/tui.node.ts` 或 `tmux-agent-tui` → `FAILED`。不在 tmux 裡時什麼都不切，也不自動開
-終端機 app：結果是 `ok`，toast 寫「已提供開啟指令」，加上完整、可直接執行的一行
-`'<絕對路徑>/tmux-agent-tui' --session '<id>' --cwd '<cwd>'`（每個參數都加單引號，
-空白與單引號都安全；mod 有 `TMUX_AGENT_DIR` 時前面加 `TMUX_AGENT_DIR='<root>'`）。整段
-超過 200 字時，完整指令寫進 log，toast 印「完整指令見 log」和前段。mod 的 tmux 呼叫
-都用預設 socket，所以指令不帶 socket。
+`npx skills` 的 skill 資料夾；symlink 會 `realpath` 解開），不寫死路徑。找不到 `agent-tmux` 旁的
+`tmux-agent-tui` → `FAILED`（舊版 skill：更新後重跑 install-bin），什麼都不佔、不開。
 
 `tmux-agent-tui`（R2.1）就是這個入口：自己的目錄以 `${0:A:h}` 解開 symlink，所以
 install-bin 的 link、`npx skills`、marketplace 都能用，路徑含空白、`%`、`#`、非 ASCII
@@ -555,6 +558,9 @@ install-bin 的 link、`npx skills`、marketplace 都能用，路徑含空白、
 原樣傳下去。升級：install-bin 只連結執行當下存在的腳本，更新 skill 之後要重跑
 `install-bin ~/.local/bin`；`agent-tmux <cli> doctor`／`setup` 會列出 `~/.local/bin` 少了
 哪些 link（`bin_links`，只是提示，不算失敗）。
+
+標題列在放得下時多一段 `更新 Ns 前`：列表上次讀成功到現在幾秒。列表讀取與鏡像各跑各的（同一個 2 秒 tick，
+互不等待）：列表讀取卡住時，鏡像照更新，`N` 一直長，所以卡住看得出來；放不下時它最先讓出（比 session id 先）。
 
 按鈕字樣：寬的終端機是 `[ + new ][ ↻ refresh ][ ⧉ tui ]`，放不下時只留符號；先讓出
 的是按鈕的字，再來是 `workers v…` 名稱，計數永遠留著。符號都是 East Asian Width N，

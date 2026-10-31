@@ -71,7 +71,13 @@ import {
   rowLabel,
   clearButtonLabel,
   stopButtonLabel,
-  openTuiBeside,
+  agentTmuxBin,
+  claimTui,
+  releaseTui,
+  focusTui,
+  openInTerminal,
+  processId,
+  TUI_PENDING_MS,
   rememberPanel,
   tellWorker,
   stopAll,
@@ -93,6 +99,7 @@ import {
   type TmuxDispatch as CoreDispatch,
   type TmuxStalled as CoreStalled,
 } from './lib/workers.ts'
+import { sessionKey } from './lib/ledger.ts'
 import type { TmuxDispatch, TmuxStalled } from '../types'
 
 /**
@@ -213,6 +220,8 @@ function waiterPrompt(stateDir: string, name: string): string {
 }
 export const register: Register = on => {
   // Per activation, shared by every entry point below.
+  /** When the rows were last read (ms). The header prints its age; a stuck read makes it grow (BD7). */
+  let rowsAt: number | undefined
   const panel: Panel = { open: false, rows: [], all: [], showAll: false, generation: 0, internal: 0, internalMissLogged: false }
   /**
    * The bound world, kept at activation scope because the panel's command hook
@@ -819,6 +828,96 @@ export const register: Register = on => {
     panel.mirror = undefined
   }
 
+  /**
+   * `[ ⧉ tui ]`: claim the session's TUI slot (pending), then open it where the
+   * person is: a tmux split (B1) or a new window in their terminal app (B2). A TUI
+   * that already runs is focused by its locator; one that is starting, or whose
+   * owner cannot be proven, is reported and nothing else is opened. A command to
+   * copy is never the result. `after` is the render hook's `$.clock.after`.
+   */
+  const openTuiBand = async (host: Host, pane: string | undefined, after: (ms: number, fn: () => Promise<void>) => unknown): Promise<Outcome> => {
+    const session = host.owner()
+    const cwd = host.cwd()
+    if (!session || !cwd) return { ok: false, text: 'no session id or cwd yet' }
+    const { bin, missing } = await agentTmuxBin(host)
+    if (missing) return { ok: false, text: missing }
+    const found = await host.run(
+      ['/bin/sh', '-c', 'w=$(command -v "$1") && w=$(realpath "$w") && e="${w%/*}/tmux-agent-tui" && [ -x "$e" ] && printf "%s\\n" "$e"', 'sh', bin],
+      cwd,
+      5_000,
+    )
+    const entry = found.stdout.trim().split('\n')[0]
+    if (found.exitCode !== 0 || !entry) {
+      return { ok: false, text: `no tmux-agent-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}; an older skill install? update it and re-run its install-bin` }
+    }
+    const root = await rootOf(host)
+    if (!root) return { ok: false, text: 'no state root: TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset' }
+    const home = await host.envHome()
+    const launchDir = home ? `${home}/.warp/launch_configurations` : undefined
+    const me = await processId(host)
+    const claim = await claimTui(host, root, session, me, { state: 'pending', ...(launchDir ? { launchDir } : {}) })
+    const appName = { warp: 'Warp', iterm: 'iTerm2', terminal: 'Terminal.app' } as const
+    switch (claim.kind) {
+      case 'occupied-ready': {
+        const raised = await focusTui(host, claim)
+        if ('refused' in raised) return { ok: false, text: `TUI 已在執行，但無法切過去：${raised.refused}` }
+        if (raised.raised === 'pane') return { ok: true, text: `TUI 已在執行，已切到 tmux pane ${claim.locator?.kind === 'tmux' ? claim.locator.pane : ''}`.trim() }
+        const loc = claim.locator
+        const app = loc?.kind === 'warp' ? 'Warp' : loc?.kind === 'iterm' ? 'iTerm2' : 'Terminal.app'
+        return { ok: true, text: `TUI 已在執行，已把 ${app} 帶到前景${raised.tabTitle ? `，請找分頁「${raised.tabTitle}」` : ''}` }
+      }
+      case 'occupied-pending':
+        return { ok: true, text: 'TUI 正在啟動（另一次開啟尚未接手），沒有開新視窗；稍後再按' }
+      case 'occupied-unknown':
+        return { ok: false, text: '無法確認 TUI 是否已在執行（佔用者狀態不明），沒有開新視窗也沒有切換；稍後再按' }
+      case 'stale':
+        return { ok: false, text: 'TUI 的佔用紀錄剛被別人改過，沒有開新視窗；再按一次' }
+      default:
+        break
+    }
+    const token = claim.claim.token
+    const dir = await host.envTmuxAgentDir()
+    const launchFile = `${launchDir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
+    const release = () => releaseTui(host, root, session, token, 'launcher', me)
+    try {
+      const opened = await openInTerminal(
+        host,
+        {
+          argv: [entry, '--session', session, '--cwd', cwd, '--claim', token],
+          cwd,
+          env: dir ? { TMUX_AGENT_DIR: dir } : {},
+          session,
+          launchToken: token,
+          ...(launchDir ? { launchDir } : {}),
+          ...(pane && /^%\d+$/.test(pane) ? { pane } : {}),
+        },
+        'tmux-agent tui',
+        true,
+      )
+      if (opened.kind === 'failed') {
+        await release()
+        host.log(`tmux-agent: tui open command: ${opened.command}`)
+        return { ok: false, text: `無法開啟 TUI：${opened.error}${opened.stderr.trim() ? `：${opened.stderr.trim()}` : ''}` }
+      }
+      // The TUI turns the pending claim ready when it starts. If it never does, this
+      // releases only the record this press made (still pending); a ready record stays.
+      after(TUI_PENDING_MS, async () => {
+        const released = await release().catch(error => {
+          host.log(`tmux-agent: tui claim release failed: ${String(error)}`)
+          return false
+        })
+        if (!released) return
+        if (launchDir) await host.run(['rm', '-f', launchFile], '/', 5_000).catch(error => host.log(`tmux-agent: tui launch file ${launchFile} remains: ${String(error)}`))
+        host.toast('tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手，已取消這次開啟；再按 [ ⧉ tui ] 重試')
+      })
+      if (opened.kind === 'split') return { ok: true, text: `TUI 已開在 ${opened.locator.pane}，在 ${pane} 旁` }
+      return { ok: true, text: `已送出 ${appName[opened.terminal]} 開啟 TUI 的要求，TUI 接手後才算就緒${opened.notice ? `；${opened.notice}` : ''}` }
+    } catch (error) {
+      await release().catch(err => host.log(`tmux-agent: tui claim release failed: ${String(err)}`))
+      throw error
+    }
+  }
+
   // The band above the prompt, NOT a `Pane`. Observed 2026-09-17 on two
   // machines: a Pane docks to the right of the transcript from 110 columns
   // (fullscreen layout) and sits inline under `CLAUDE_CODE_NO_FLICKER=0` or in
@@ -964,7 +1063,11 @@ export const register: Register = on => {
     const buttonCells = cellsOf(words)
     // The name and version always stay (mods/README.md rule 11): the session id goes first, then the counts.
     const name = ` workers v${MOD_VERSION} `
-    const titleText = [full, ` workers v${MOD_VERSION} · ${tally} `, name].find(t => displayCells(t) + buttonCells <= width) ?? name
+    // The age of the rows read (BD7): a stuck read shows as a growing number, not a frozen list.
+    // It gives way before the session id does, and it never decides whether the buttons carry words.
+    const age = rowsAt === undefined ? '' : ` · 更新 ${Math.max(0, Math.floor((now - rowsAt) / 1000))}s 前`
+    const short = ` workers v${MOD_VERSION} · ${tally}`
+    const titleText = (age ? [`${full.trimEnd()}${age} `, full, `${short}${age} `] : [full]).concat(`${short} `, name).find(t => displayCells(t) + buttonCells <= width) ?? name
     const titleCells = displayCells(titleText) + buttonCells
     const hintRoom = Math.max(0, width - titleCells)
     // A coloured title bar marks where the panel starts, so its rows do not read
@@ -1000,13 +1103,13 @@ export const register: Register = on => {
               void panel.refresh?.()
             },
           }),
-          // The full-screen TUI beside this pane (plan P7); outside tmux the toast
-          // names the command to run in another terminal.
+          // The full-screen TUI: a split beside this pane in tmux, a new window in
+          // the person's terminal app elsewhere (T10).
           Button({
             key: 'tui',
             label: tuiLabel,
             hotkey: 't',
-            onPress: () => void act('tui', async host => openTuiBeside(host, await $.env.get('TMUX_PANE'))),
+            onPress: () => void act('tui', async host => openTuiBand(host, await $.env.get('TMUX_PANE'), (ms, fn) => $.clock.after(ms, fn))),
           }),
           ...(clearable
             ? [
@@ -1343,6 +1446,7 @@ export const register: Register = on => {
     const [first] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
     if (panel.generation !== mine || !panel.open) return 'workers panel closed.'
     setRows(panel, first)
+    rowsAt = await bound.now()
     // The pane drew once, empty, while the rows were being read; without this
     // the first real frame waits for the 2s clock and the person sees
     // "No workers outstanding" over a fleet that is there (observed 2026-09-17).
@@ -1357,6 +1461,7 @@ export const register: Register = on => {
         const [rows] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
         if (panel.generation !== mine || !panel.open) return false
         setRows(panel, rows)
+        rowsAt = await bound.now()
         return true
       } finally {
         panel.refreshing = false
@@ -1372,41 +1477,48 @@ export const register: Register = on => {
       }
     }
     if (panel.timer) panel.timer.cancel()
+    // Two independent jobs on one tick (BD7): the rows read and the mirror capture.
+    // A slow or stuck rows read never skips the mirror, and a capture in flight
+    // never skips the rows. Each is single-flight on its own.
     panel.timer = every(MIRROR_MS, async () => {
       if (!panel.open || panel.generation !== mine) return
+      const rowsJob = refresh().catch(error => {
+        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
+        return false
+      })
       // Single-flight: a capture slower than the 2s tick must not start a second
       // subprocess on top of itself, and two in-flight captures could land out of
       // order and show older output than what is already on screen.
-      if (panel.capturing) return
-      let fresh = false
-      try {
-        fresh = await refresh()
-      } catch (error) {
-        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
-      }
-      if (!fresh) return
-      const row = panel.rows.find(r => r.id === panel.selected)
-      // No selection, no capture: the mirror is the only thing here that costs a
-      // process, and it costs it for one worker at a time.
-      // A zero here is the render telling us the pane is too short to mirror
-      // usefully; spending a subprocess on it would buy an empty box.
-      if (row && (panel.rows_available ?? MIRROR_ROWS) > 0) {
-        panel.capturing = true
-        try {
-          const cap = row.project
-            ? await mirrorProject(bound, row.d.name, panel.rows_available ?? MIRROR_ROWS)
-            : await mirrorOf(bound, row.d, panel.rows_available ?? MIRROR_ROWS)
-          // The selection may have moved, or the panel closed, while this ran.
-          if (panel.generation === mine && panel.open && panel.selected === row.id) {
-            panel.mirror = { id: row.id, ...cap }
+      const mirrorJob = async (): Promise<boolean> => {
+        if (panel.capturing) return false
+        const row = panel.rows.find(r => r.id === panel.selected)
+        // No selection, no capture: the mirror is the only thing here that costs a
+        // process, and it costs it for one worker at a time.
+        // A zero here is the render telling us the pane is too short to mirror
+        // usefully; spending a subprocess on it would buy an empty box.
+        if (row && (panel.rows_available ?? MIRROR_ROWS) > 0) {
+          panel.capturing = true
+          try {
+            const cap = row.project
+              ? await mirrorProject(bound, row.d.name, panel.rows_available ?? MIRROR_ROWS)
+              : await mirrorOf(bound, row.d, panel.rows_available ?? MIRROR_ROWS)
+            // The selection may have moved, or the panel closed, while this ran.
+            if (panel.generation === mine && panel.open && panel.selected === row.id) {
+              panel.mirror = { id: row.id, ...cap }
+            }
+          } finally {
+            panel.capturing = false
           }
-        } finally {
-          panel.capturing = false
+        } else {
+          panel.mirror = undefined
         }
-      } else {
-        panel.mirror = undefined
+        return true
       }
-      redraw()
+      const [fresh, mirrored] = await Promise.all([rowsJob, mirrorJob().catch(error => {
+        bound.log(`tmux-agent: panel mirror failed: ${String(error)}`)
+        return false
+      })])
+      if ((fresh || mirrored) && panel.open && panel.generation === mine) redraw()
     })
     return undefined
   }

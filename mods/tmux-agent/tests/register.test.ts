@@ -260,6 +260,8 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
   }
   // The one-per-process identity probe (workers.ts `processId`: the pid, host and start the lock holders record).
   if (cmd === '/bin/sh' && String(a[1]).includes('echo "$PPID"')) return ok('4242\nfake-host\nThu Jan  1 00:00:00 1970\n')
+  // `holderProvablyAlive`: pids 4242 (this mod) and 4243 (a TUI) run on fake-host; any other pid is gone to `ps` and unprovable to `kill`.
+  if (cmd === '/bin/sh' && String(a[1]).includes('ps -o lstart= -p "$1"')) return ['4242', '4243'].includes(String(a[3])) ? ok('Thu Jan  1 00:00:00 1970\n') : fail('')
   switch (cmd) {
     case 'mkdir': {
       if (a[0] === '-p') {
@@ -298,7 +300,18 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
       }
       return ok()
     }
+    case 'rmdir': {
+      const dir = a[0]!
+      if (files[`${dir}/`] === undefined) return fail(`rmdir: ${dir}: No such file or directory`)
+      if (Object.keys(files).some(k => k.startsWith(`${dir}/`) && k !== `${dir}/`)) return fail(`rmdir: ${dir}: Directory not empty`)
+      delete files[`${dir}/`]
+      return ok()
+    }
     case 'rm': {
+      if (a[0] === '-f') {
+        delete files[a[1]!]
+        return ok()
+      }
       if (a[0] === '-rf') {
         for (const k of Object.keys(files)) if (k === a[1] || k.startsWith(`${a[1]}/`)) delete files[k]
         for (const k of [...links.keys()]) if (k.startsWith(`${a[1]}/`)) links.delete(k)
@@ -2129,7 +2142,9 @@ function mockPanel(
     logs.push(e.text)
     return { value: undefined }
   })
-  on('agent.list', () => {
+  on('agent.list', async () => {
+    // `probe.holdRows`: a promise that keeps every rows read (it counts the in-process agents) in flight until it settles.
+    if (probe.holdRows instanceof Promise) await probe.holdRows
     if (agents === 'reject') throw new Error('agent.list refused')
     return { value: [...agents] }
   })
@@ -2221,6 +2236,54 @@ describe('panel', () => {
     await clock.advance(2_000)
 
     expect(captures(panel.argv), 'the mirror needs a selected row').toEqual([])
+  })
+
+  test('busy rows do not skip the mirror: a rows read in flight leaves the mirror job running (BD7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const probe: Record<string, unknown> = { running: true, idle_seconds: 60 }
+    const panel = mockPanel(on, probe, 'MIRRORED')
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    // [refresh] starts a rows read that does not return; it also closes any open row, so select after it.
+    let release = () => {}
+    probe.holdRows = new Promise<void>(resolve => { release = resolve })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'refresh', requestId: 'above-prompt' })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+
+    const afterPress = captures(panel.argv).length
+    await clock.advance(2_000)
+    await settle()
+
+    expect(captures(panel.argv).length, 'the rows job is busy; the mirror job still ticked and captured').toEqual(afterPress + 1)
+    release()
+  })
+
+  test('the header says how old the rows are, and the age keeps moving while a rows read is stuck (BD7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const probe: Record<string, unknown> = { running: true, idle_seconds: 60 }
+    mockPanel(on, probe)
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    expect(textOf(await $.ui.render(bandRender(40, 39, 160)))).toContain('更新 0s 前')
+    let release = () => {}
+    probe.holdRows = new Promise<void>(resolve => { release = resolve })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'refresh', requestId: 'above-prompt' })
+    await clock.advance(2_000)
+    await clock.advance(2_000)
+    await clock.advance(2_000)
+    expect(textOf(await $.ui.render(bandRender(40, 39, 160)))).toContain('更新 6s 前')
+    release()
+    await settle()
+    expect(textOf(await $.ui.render(bandRender(40, 39, 160))), 'a finished read resets the age').toContain('更新 0s 前')
   })
 
   test('closing the panel stops the mirror clock', WITH_DRIVER, async ($, on) => {
@@ -4647,88 +4710,175 @@ describe('cursor review of 34e2a1e', () => {
     expect(textOf(await $.ui.render(bandRender()))).toContain('w1')
   })
 
-  const TUI_SH = '/opt/node/bin/node\n/skills/tmux-agent-tools/scripts/lib/tui.node.ts\n/skills/tmux-agent-tools/scripts/tmux-agent-tui\n'
+  const TUI_ENTRY = '/skills/tmux-agent-tools/scripts/tmux-agent-tui'
+  const TUI_SH = `${TUI_ENTRY}\n`
   const wait50 = () => new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
-
-  test('[ ⧉ ] splits the host pane with the TUI bound to this session (P7)', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME, TMUX_PANE: '%5' })
+  const T0 = 1_000_000
+  const OWNER = `${V3}/.sessions/${hex('sess-test')}/tui.owner`
+  /** A TUI claim record held by fake-host pid 4243 (alive to the fake `ps`); `host: 'other-host'` is unprovable. */
+  const claimed = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ host: 'fake-host', pid: 4243, pidStart: 'Thu Jan  1 00:00:00 1970', token: 'abcdefghij12', state: 'ready', at: T0, ...over })
+  /** What opens a new TUI somewhere: a split, a Warp launch, or an AppleScript window. */
+  const opens = (argv: (readonly string[])[]) =>
+    argv.filter(a => a[1] === 'split-window' || a[1]?.startsWith('warp://') || (a[0] === 'osascript' && /create window|do script/.test(a[2] ?? '')))
+  /** What moves focus to a TUI that already runs. */
+  const focuses = (argv: (readonly string[])[]) =>
+    argv.filter(a => a[1] === 'select-pane' || (a[0] === 'open' && a[1] === '-a') || (a[0] === 'osascript' && /tty of/.test(a[2] ?? '')))
+  const pressTui = async ($: Engine) => {
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+  }
+  const band = (on: On, env: Record<string, string>, files: Files, probe: Record<string, unknown> = { running: true, idle_seconds: 5, sh: TUI_SH }) => {
+    mock.env(on, { HOME, ...env })
     mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+    const clock = mockClock(on, { now: T0 })
+    mockFs(on, files)
+    return { clock, p: mockPanel(on, probe) }
+  }
+
+  test('[ ⧉ ] in tmux claims pending, then splits the host pane with the TUI bound to that claim (B1)', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TMUX_PANE: '%5' }, files)
     await $.session.start(session())
     await $.command.run(run('workers'))
     expect(keysOf(await $.ui.render(bandRender()))).toContain('tui')
     await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
-    const split = p.argv.find(a => a[0] === 'tmux' && a[1] === 'split-window')
-    expect(split, 'one split-window, no launcher (the mod is the collector)').toBeDefined()
+    await wait50()
+    const split = opens(p.argv)
+    expect(split, 'one split-window, no launcher (the mod is the collector)').toHaveLength(1)
     expect(p.argv.some(a => a.some(x => x.includes('launcher.node.ts')))).toBe(false)
-    const s = split ?? []
+    const s = split[0] ?? []
     expect(s.slice(2, 6), '-f: full window height beside a half-height pane').toEqual(['-t', '%5', '-h', '-f'])
-    expect(s).toContain(`TMUX_AGENT_SESSION=${s[s.indexOf('--session') + 1]}`)
-    expect(s.slice(s.indexOf('/opt/node/bin/node'), s.indexOf('/opt/node/bin/node') + 2)).toEqual([
-      '/opt/node/bin/node',
-      '/skills/tmux-agent-tools/scripts/lib/tui.node.ts',
-    ])
-    expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI in %9 beside %5'])
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { state?: string; token?: string }
+    expect(rec.state, 'the claim is written before the window opens').toEqual('pending')
+    expect(s.slice(s.indexOf(TUI_ENTRY))).toEqual([TUI_ENTRY, '--session', 'sess-test', '--cwd', '/work', '--claim', rec.token ?? ''])
+    expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI 已開在 %9，在 %5 旁'])
   })
 
-  test('[ ⧉ ] outside tmux splits nothing and hands over the full tmux-agent-tui command (ok, D-q2)', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME })
-    mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+  test('[ ⧉ ] outside tmux in Warp opens through openInTerminal and never reports a cut command as success (B2)', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
     await $.session.start(session())
-    await $.command.run(run('workers'))
-    await $.ui.render(bandRender())
-    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await wait50()
-    expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
-    expect(p.toasts).toEqual([
-      "tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行：'/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'",
-    ])
-    expect(p.logs.join('\n'), 'a short command needs no log line').not.toContain('tui open command')
-  })
-
-  test('[ ⧉ ] outside tmux: a command over 200 chars goes whole to the log, quoted, and the toast says so', WITH_DRIVER, async ($, on) => {
-    // A state root with a space and a single quote: the quoting must survive both.
-    const dir = `/state/it's here/${'d'.repeat(160)}`
-    mock.env(on, { HOME, TMUX_AGENT_DIR: dir })
-    mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
-    await $.session.start(session())
-    await $.command.run(run('workers'))
-    await $.ui.render(bandRender())
-    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await wait50()
-    const full = `TMUX_AGENT_DIR='/state/it'\\''s here/${'d'.repeat(160)}' '/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'`
-    expect(p.logs, 'the whole command, runnable as logged').toContain(`tui open command: ${full}`)
-    expect(p.toasts).toHaveLength(1)
-    const toast = p.toasts[0]!
-    expect(toast.startsWith('tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行（完整指令見 log）：TMUX_AGENT_DIR=')).toBe(true)
-    expect(toast.endsWith('…'), 'the toast keeps a cut that act() does not cut again').toBe(true)
-    expect(toast.split('tmux-agent:').length - 1, 'prefix exactly once').toEqual(1)
-  })
-
-  test('[ ⧉ ] with no node or no tmux-agent-tui beside agent-tmux fails and splits nothing', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME, TMUX_PANE: '%5' })
-    mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: false })
-    await $.session.start(session())
-    await $.command.run(run('workers'))
-    await $.ui.render(bandRender())
-    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await wait50()
+    await pressTui($)
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { state?: string; token?: string }
+    expect(rec.state).toEqual('pending')
+    const launch = `${HOME}/.warp/launch_configurations/tmux-agent-tui-${hex('sess-test')}-${rec.token}.yaml`
+    expect(files[launch], 'the launch file carries this claim token').toContain(`'--claim' '${rec.token}'`)
+    expect(opens(p.argv).map(a => a.slice(0, 2))).toEqual([['open', `warp://launch/${encodeURIComponent(`tmux-agent-tui-${hex('sess-test')}-${rec.token}`)}`]])
     expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
     expect(p.toasts).toHaveLength(1)
-    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: no node, lib\/tui\.node\.ts or tmux-agent-tui beside /)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — ok: 已送出 Warp 開啟 TUI 的要求/)
+    expect(p.toasts[0], 'no command to copy, cut or whole').not.toMatch(/請在另一個終端機執行|tmux-agent-tui'|…$/)
+  })
+
+  for (const [term, label, script, notice] of [
+    ['iTerm.app', 'iTerm2', 'create window', ''],
+    ['Apple_Terminal', 'Terminal.app', 'do script', ''],
+    ['ghostty', 'Terminal.app', 'do script', 'ghostty has no adapter; opening Terminal.app'],
+  ] as const) {
+    test(`[ ⧉ ] outside tmux in ${term} opens a window through ${label} (any terminal app, not only Warp)`, WITH_DRIVER, async ($, on) => {
+      const files: Files = { ...worker('w1', 0) }
+      const { p } = band(on, { TERM_PROGRAM: term }, files)
+      await $.session.start(session())
+      await pressTui($)
+      expect(opens(p.argv).map(a => a[0])).toEqual(['osascript'])
+      expect(opens(p.argv)[0]?.[2]).toContain(script)
+      expect(p.toasts).toEqual([`tmux-agent: tui — ok: 已送出 ${label} 開啟 TUI 的要求，TUI 接手後才算就緒${notice ? `；${notice}` : ''}`])
+    })
+  }
+
+  test('[ ⧉ ] where the open fails says FAILED with the reason, keeps the command in the log, and releases its own pending claim', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal', SSH_TTY: '/dev/ttys001' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts).toHaveLength(1)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: 無法開啟 TUI：cannot open a window on your machine over SSH/)
+    expect(p.logs.join('\n'), 'the launch line is diagnostic text in the log').toContain(`'${TUI_ENTRY}' '--session' 'sess-test'`)
+    expect(files[OWNER], 'the failed open released its own pending claim').toBeUndefined()
+  })
+
+  test('[ ⧉ ] with no tmux-agent-tui beside agent-tmux fails and opens nothing', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TMUX_PANE: '%5' }, files, { running: true, idle_seconds: 5, sh: false })
+    await $.session.start(session())
+    await pressTui($)
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts).toHaveLength(1)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: no tmux-agent-tui beside /)
     expect(p.toasts[0], 'names the remedy for an older skill install').toContain('re-run its install-bin')
+    expect(files[OWNER], 'nothing was claimed').toBeUndefined()
+  })
+
+  test('[ ⧉ ] with a TUI already ready focuses it by its locator and opens no second window', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0), [OWNER]: claimed({ locator: { kind: 'tmux', pane: '%3' } }) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    expect(focuses(p.argv).map(a => a.join(' '))).toEqual(['tmux select-pane -t %3'])
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts).toEqual(['tmux-agent: tui — ok: TUI 已在執行，已切到 tmux pane %3'])
+    files[OWNER] = claimed({ locator: { kind: 'warp', tabTitle: 'tmux-agent-tui sess-tes' } })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+    expect(focuses(p.argv).at(-1)).toEqual(['open', '-a', 'Warp'])
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts.at(-1), 'the app was raised and the tab is named; no window is claimed focused').toEqual(
+      'tmux-agent: tui — ok: TUI 已在執行，已把 Warp 帶到前景，請找分頁「tmux-agent-tui sess-tes」',
+    )
+  })
+
+  test('[ ⧉ ] with a TUI still starting, or an owner it cannot prove, says so: no focus, no new window', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0), [OWNER]: claimed({ state: 'pending' }) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    expect(p.toasts.at(-1)).toMatch(/^tmux-agent: tui — ok: TUI 正在啟動/)
+    const pending = files[OWNER]
+    files[OWNER] = claimed({ host: 'other-host', locator: { kind: 'tmux', pane: '%3' } })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+    expect(p.toasts.at(-1)).toMatch(/^tmux-agent: tui — FAILED: 無法確認 TUI 是否已在執行/)
+    expect(p.toasts).toHaveLength(2)
+    expect(focuses(p.argv), 'unknown and pending are never focused').toEqual([])
+    expect(opens(p.argv), 'and never open a second window').toEqual([])
+    expect(pending, 'the pending record was left as it was').toEqual(claimed({ state: 'pending' }))
+    expect(files[OWNER]).toEqual(claimed({ host: 'other-host', locator: { kind: 'tmux', pane: '%3' } }))
+  })
+
+  test('the band late cleanup leaves a record the TUI has made ready', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p, clock } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { token: string; state: string }
+    expect(rec.state, 'the band claimed pending first').toEqual('pending')
+    // The TUI adopts its claim with its own process identity (pid 4243, not the band's 4242).
+    files[OWNER] = claimed({ token: rec.token, state: 'ready', locator: { kind: 'warp', tabTitle: 't' } })
+    await clock.advance(31_000)
+    await settle()
+    expect(JSON.parse(files[OWNER] ?? '{}').state, 'the late cleanup did not release a ready record').toEqual('ready')
+    expect(p.toasts, 'and says nothing about a failed start').toHaveLength(1)
+  })
+
+  test('the band timeout releases its own claim that is still pending, and says the TUI did not start', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p, clock } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { token: string }
+    const launch = `${HOME}/.warp/launch_configurations/tmux-agent-tui-${hex('sess-test')}-${rec.token}.yaml`
+    expect(files[launch]).toBeDefined()
+    await clock.advance(29_000)
+    expect(files[OWNER], 'not before the 30 s the claim lives').toBeDefined()
+    await clock.advance(2_000)
+    await settle()
+    expect(files[OWNER], 'released').toBeUndefined()
+    expect(files[launch], 'its own launch file goes with it').toBeUndefined()
+    expect(p.toasts.at(-1)).toMatch(/^tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手/)
   })
 })
 
