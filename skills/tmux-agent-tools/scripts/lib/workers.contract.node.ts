@@ -2523,20 +2523,23 @@ test('C13: observeRows records no pane probe; sweepStalls probes with wakes off'
     assert.equal(typeof sweepStalls, 'function', 'sweepStalls is not exported')
     const d = (await scan(w.host, { claim: false })).visible[0]
     assert.ok(d, 'fixture has a visible worker')
-    const paneProbe = (argv: readonly string[]) => argv[0] === 'agent-tmux' && argv.includes('status')
+    // Pane I/O in this core is a host.run. list-sessions is a session list, not a pane.
+    const paneTouch = (argv: readonly string[]) =>
+      argv.includes('capture-pane') || (argv[0] === 'agent-tmux' && argv.some(a => a === 'status' || a === 'capture' || a === 'probe'))
+    const statusSweep = (argv: readonly string[]) => argv[0] === 'agent-tmux' && argv.includes('status') && argv.includes('--no-write')
     const gate = newGate()
     const before = w.calls.length
     await observeRows(w.host, gate, w.root)
-    const duringRows = w.calls.slice(before).filter(c => paneProbe(c.argv))
+    const duringRows = w.calls.slice(before).filter(c => paneTouch(c.argv))
     assert.deepEqual(duringRows, [], `rows part probed a pane: ${JSON.stringify(duringRows.map(c => c.argv))}`)
     const marked = w.calls.length
     await sweepStalls(w.host, gate, w.root, [d])
-    const duringSweep = w.calls.slice(marked).filter(c => paneProbe(c.argv))
-    assert.ok(duringSweep.some(c => c.argv.includes('--no-write')), `sweep argv: ${JSON.stringify(duringSweep.map(c => c.argv))}`)
+    const duringSweep = w.calls.slice(marked).filter(c => statusSweep(c.argv))
+    assert.ok(duringSweep.length > 0, `sweep argv: ${JSON.stringify(w.calls.slice(marked).map(c => c.argv))}`)
     const atView = w.calls.length
     await core.observeView(w.host, newGate(), w.root)
-    const viewProbes = w.calls.slice(atView).filter(c => paneProbe(c.argv))
-    assert.ok(viewProbes.some(c => c.argv.includes('--no-write')), `observeView argv: ${JSON.stringify(viewProbes.map(c => c.argv))}`)
+    const viewProbes = w.calls.slice(atView).filter(c => statusSweep(c.argv))
+    assert.ok(viewProbes.length > 0, `observeView argv: ${JSON.stringify(w.calls.slice(atView).map(c => c.argv))}`)
   } finally {
     rmSync(w.root, { recursive: true, force: true })
     rmSync(w.repo, { recursive: true, force: true })
