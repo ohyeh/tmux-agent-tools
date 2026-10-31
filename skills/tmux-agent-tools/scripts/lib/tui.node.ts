@@ -1090,8 +1090,8 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): S
     if (!entries.length) status.push('（沒有 session）')
     entries.forEach((e, i) => {
       const mark = i === (state.pickerIndex ?? 0) ? '› ' : '  '
-      const cwd = e.cwdFrom === 'unknown' || !e.cwd ? 'cwd unknown' : e.cwd
-      status.push(`${mark}${i + 1} [${e.liveness}] ${e.session} ${cwd}`)
+      const cwd = e.cwdFrom === 'unknown' || !e.cwd ? 'cwd unknown' : sanitizeAnsi(e.cwd)
+      status.push(`${mark}${i + 1} [${e.liveness}] ${sanitizeAnsi(e.session)} ${cwd}`)
     })
   } else if (state.viewer) status.push(`\x1b[2mviewer — no session; ${READ_ONLY} · ${health}\x1b[0m`)
   else {

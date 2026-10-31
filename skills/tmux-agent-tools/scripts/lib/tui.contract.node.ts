@@ -415,6 +415,38 @@ test('picker: four liveness kinds, cwd order, claim ready, occupied stays viewer
   assert.match(again.state.statusMessage ?? '', /ready/)
 })
 
+test('picker: cwd and session escapes are stripped before draw (FR-01)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-pick-osc-'))
+  const osc = '\x1b]52;c;cmV2aWV3\x07'
+  const unsafe = join(root, `repo-${osc}`)
+  mkdirSync(unsafe, { recursive: true })
+  const v3 = v3Of(root)
+  const live = (id: string) => {
+    const sd = sessionDirOf(v3, id)
+    mkdirSync(join(sd, 'act', '1'), { recursive: true })
+    writeFileSync(join(sd, 'act', '1.json'), JSON.stringify({ token: 'review' }))
+    writeFileSync(join(sd, 'act', '1.state'), JSON.stringify({ channel: 'node', status: 'collecting', token: 'review', mode: 'auto' }))
+    writeFileSync(join(sd, 'act', '1.beat'), '')
+    return sd
+  }
+  const session = 'picker-live'
+  writeFileSync(join(live(session), 'collector.json'), JSON.stringify({ session, cwd: unsafe }))
+  const nasty = 'bad\x1b[2Jname'
+  live(nasty)
+  const listed = await listSessions(nodeHost({ cwd: root }), root, Date.now())
+  assert.equal(listed.some(e => e.liveness === 'live' && e.cwd === unsafe), true)
+  const drawn = renderTuiLines(
+    { ...ownerState(), rows: [], all: [], selected: undefined, mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 },
+    200,
+    30,
+    1,
+  ).join('\n')
+  assert.equal(drawn.includes(osc), false)
+  assert.equal(drawn.includes('\x1b[2J'), false)
+  assert.match(stripAnsi(drawn), /\[live\] picker-live /)
+  assert.match(stripAnsi(drawn), /\[live\] badname /)
+})
+
 test('launch claims before the alt screen; occupied and stale stay out (T8)', async () => {
   const prevPane = process.env.TMUX_PANE
   const prevTmux = process.env.TMUX
