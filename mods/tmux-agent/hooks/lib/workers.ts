@@ -3441,6 +3441,13 @@ export type TuiClaimResult =
 export type TuiFocus = { raised: 'app'; tabTitle?: string } | { raised: 'pane' } | { refused: string }
 
 const TUI_LOCK_TRIES = 40
+const TUI_LOCK_WAIT_MS = 50
+/** A lock older than the whole wait is a leftover, not a live section. It is not removed: its mv/rm child may still be running. */
+const TUI_LOCK_STALE_MS = TUI_LOCK_TRIES * TUI_LOCK_WAIT_MS
+
+function tuiLockNote(lock: string, why: string): string {
+  return `tmux-agent: tui lock ${lock} ${why}; rmdir it by hand only when no claim section is still running`
+}
 
 function tuiLocatorOk(v: unknown): v is TuiLocator {
   if (typeof v !== 'object' || v === null) return false
@@ -3456,7 +3463,8 @@ function tuiOwnerOk(v: unknown): v is TuiOwner {
   if (typeof v !== 'object' || v === null) return false
   const o = v as TuiOwner
   if (typeof o.host !== 'string' || !(o.pid > 0) || typeof o.pidStart !== 'string' || !o.pidStart) return false
-  if (typeof o.token !== 'string' || !o.token || typeof o.at !== 'number') return false
+  // randomBase36(12). A slash or dot-segment would leave launchDir when the token is a path.
+  if (typeof o.token !== 'string' || !/^[0-9a-z]{12}$/.test(o.token) || typeof o.at !== 'number') return false
   if (o.state !== 'pending' && o.state !== 'ready') return false
   if (o.locator !== undefined && !tuiLocatorOk(o.locator)) return false
   return true
@@ -3470,6 +3478,15 @@ function tuiLaunchPath(dir: string, session: string, token: string): string {
   return `${dir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
 }
 
+async function tuiLockStale(host: Host, lock: string): Promise<boolean> {
+  try {
+    const st = await host.stat(lock)
+    return (await host.now()) - st.mtimeMs > TUI_LOCK_STALE_MS
+  } catch {
+    return false
+  }
+}
+
 async function withTuiLock<T>(host: Host, root: string, session: string, body: (dir: string) => Promise<T>): Promise<T | undefined> {
   const dir = sessionDirOf(v3Of(root), session)
   const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
@@ -3477,27 +3494,54 @@ async function withTuiLock<T>(host: Host, root: string, session: string, body: (
   const lock = `${dir}/tui.owner.lock`
   for (let i = 0; i < TUI_LOCK_TRIES; i++) {
     const got = await mkdirExclusive(host, lock)
-    if (got === 'unknown') return undefined
+    if (got === 'unknown') {
+      host.log(tuiLockNote(lock, 'could not be created'))
+      return undefined
+    }
     if (got === 'lost') {
+      if (await tuiLockStale(host, lock)) {
+        host.log(tuiLockNote(lock, `is older than ${TUI_LOCK_STALE_MS}ms`))
+        return undefined
+      }
       await host.run(['sleep', '0.05'], '/', 1_000).catch(() => undefined)
       continue
     }
+    let value: T
+    let leftover = false
     try {
-      return await body(dir)
+      value = await body(dir)
     } finally {
-      await host.run(['rmdir', lock], '/', 5_000).catch(() => undefined)
+      try {
+        const rm = await host.run(['rmdir', lock], '/', 5_000)
+        if (rm.exitCode !== 0) {
+          leftover = true
+          host.log(tuiLockNote(lock, `remains after the section (${rm.stderr.trim() || `exit ${rm.exitCode}`})`))
+        }
+      } catch (error) {
+        leftover = true
+        host.log(tuiLockNote(lock, `remains after the section (${errorClass(error)} ${String(error)})`))
+      }
     }
+    if (leftover) return undefined
+    return value
   }
+  host.log(tuiLockNote(lock, 'stayed busy'))
   return undefined
 }
 
 async function readTuiOwner(host: Host, dir: string): Promise<TuiOwner | undefined | 'bad'> {
   const path = `${dir}/tui.owner`
-  if (!(await host.exists(path).catch(() => false))) return undefined
+  try {
+    if (!(await host.exists(path))) return undefined
+  } catch (error) {
+    host.log(`tmux-agent: could not read ${path}: ${errorClass(error)} ${String(error)}`)
+    return 'bad'
+  }
   try {
     const parsed = parseJson(await host.read(path))
     return tuiOwnerOk(parsed) ? parsed : 'bad'
-  } catch {
+  } catch (error) {
+    host.log(`tmux-agent: could not read ${path}: ${errorClass(error)} ${String(error)}`)
     return 'bad'
   }
 }
@@ -3531,8 +3575,9 @@ export async function claimTui(host: Host, root: string, session: string, me: Pr
   const out = await withTuiLock(host, root, session, async dir => {
     const now = await host.now()
     const cur = await readTuiOwner(host, dir)
+    if (cur === 'bad') return { kind: 'occupied-unknown' as const }
     if (opts.adopt !== undefined) {
-      if (cur && cur !== 'bad' && cur.state === 'pending' && cur.token === opts.adopt && now - cur.at <= TUI_PENDING_MS) {
+      if (cur && cur.state === 'pending' && cur.token === opts.adopt && now - cur.at <= TUI_PENDING_MS) {
         const next: TuiOwner = {
           host: me.host,
           pid: me.pid,
@@ -3547,14 +3592,23 @@ export async function claimTui(host: Host, root: string, session: string, me: Pr
       }
       return { kind: 'stale' as const }
     }
-    if (cur === 'bad') return { kind: 'occupied-unknown' as const }
     if (cur) {
       const slot = await tuiSlot(host, cur, now)
       if (slot === 'occupied-ready') return { kind: slot, claim: cur, locator: cur.locator }
       if (slot === 'occupied-pending') return { kind: slot, claim: cur }
       if (slot === 'occupied-unknown') return { kind: slot, claim: cur }
       if (cur.state === 'pending' && opts.launchDir) {
-        await host.run(['rm', '-f', tuiLaunchPath(opts.launchDir, session, cur.token)], '/', 5_000).catch(() => undefined)
+        const target = tuiLaunchPath(opts.launchDir, session, cur.token)
+        try {
+          const rm = await host.run(['rm', '-f', target], '/', 5_000)
+          if (rm.exitCode !== 0) {
+            host.log(`tmux-agent: could not remove ${target}: exit ${rm.exitCode} ${rm.stderr.trim()}`)
+            return { kind: 'occupied-unknown' as const, claim: cur }
+          }
+        } catch (error) {
+          host.log(`tmux-agent: could not remove ${target}: ${errorClass(error)} ${String(error)}`)
+          return { kind: 'occupied-unknown' as const, claim: cur }
+        }
       }
     }
     const next: TuiOwner = {
@@ -3606,11 +3660,60 @@ export async function focusTui(host: Host, result: TuiClaimResult): Promise<TuiF
     if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'select-pane failed' }
     return { raised: 'pane' }
   }
-  const app = loc.kind === 'warp' ? 'Warp' : loc.kind === 'iterm' ? 'iTerm' : 'Terminal'
-  const run = await host.run(['open', '-a', app], '/', 5_000).catch(() => undefined)
-  if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'open failed' }
-  return loc.kind === 'warp' ? { raised: 'app', tabTitle: loc.tabTitle } : { raised: 'app' }
+  if (loc.kind === 'warp') {
+    const run = await host.run(['open', '-a', 'Warp'], '/', 5_000).catch(() => undefined)
+    if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'open failed' }
+    return { raised: 'app', tabTitle: loc.tabTitle }
+  }
+  if (!loc.tty) return { refused: 'no tty' }
+  const argv = ['osascript', '-e', loc.kind === 'iterm' ? ITERM_FOCUS : TERMINAL_FOCUS, '--', loc.tty]
+  let run: { exitCode: number; stderr: string }
+  try {
+    run = await host.run(argv, '/', 5_000)
+  } catch (error) {
+    return { refused: `${errorClass(error)} ${String(error)}` }
+  }
+  if (run.exitCode !== 0) return { refused: run.stderr.trim() || 'osascript failed' }
+  return { raised: 'app' }
 }
+
+// tty is an argv element. Nothing from the locator is spliced into the script.
+const ITERM_FOCUS = `on run argv
+  set want to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            select w
+            select t
+            select s
+            activate
+            return
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "no iTerm2 session for " & want
+end run`
+const TERMINAL_FOCUS = `on run argv
+  set want to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is want then
+          set selected of t to true
+          set index of w to 1
+          set frontmost of w to true
+          activate
+          return
+        end if
+      end repeat
+    end repeat
+  end tell
+  error "no Terminal tab for " & want
+end run`
 
 /** What one TUI launch needs. Paths are absolute. The Warp directory is the caller's; this never picks ~/.warp. */
 export interface LaunchContext {

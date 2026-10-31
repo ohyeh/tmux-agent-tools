@@ -2678,6 +2678,12 @@ test('T2: launcher release after adopt leaves ready; the child release removes i
     const pending = await core.claimTui(host, d.root, d.session, launcher, { state: 'pending' })
     assert.equal(pending.kind, 'won')
     if (pending.kind !== 'won') return
+    const wrongRole = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'tui', launcher)
+    assert.equal(wrongRole, false, 'same process, wrong role')
+    assert.equal(d.readOwner().state, 'pending')
+    const wrongProc = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'launcher', child)
+    assert.equal(wrongProc, false, 'same role, different process')
+    assert.equal(d.readOwner().token, pending.claim.token)
     const adopted = await core.claimTui(host, d.root, d.session, child, {
       state: 'ready',
       adopt: pending.claim.token,
@@ -2686,6 +2692,12 @@ test('T2: launcher release after adopt leaves ready; the child release removes i
     assert.equal(adopted.kind, 'adopted')
     assert.equal(d.readOwner().state, 'ready')
     assert.equal(d.readOwner().pid, child.pid)
+    const readyWrongRole = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'launcher', child)
+    assert.equal(readyWrongRole, false, 'ready holder, launcher role')
+    assert.equal(d.readOwner().state, 'ready')
+    const readyWrongProc = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'tui', launcher)
+    assert.equal(readyWrongProc, false, 'tui role, launcher process')
+    assert.equal(d.readOwner().state, 'ready')
     const late = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'launcher', launcher)
     assert.equal(late, false)
     assert.equal(d.readOwner().state, 'ready', 'the launcher must not drop the child ready record')
@@ -2764,6 +2776,375 @@ test('T2: focusTui acts only on occupied-ready; Warp raises the app', async () =
       assert.deepEqual(pane, { raised: 'pane' })
       assert.ok(calls.some(a => a[0] === 'tmux' && a[1] === '-S' && a[2] === '/tmp/tui-claim-not-a-server'))
     } finally { readyDir.rm() }
+  } finally { d.rm() }
+})
+
+test('T2: an exists error does not overwrite a ready claim', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const base = nodeHost({ log: () => {} })
+  let arm = false
+  const writes: string[] = []
+  const host: Host = {
+    ...base,
+    exists: async path => {
+      if (arm && path.endsWith('/tui.owner')) throw Object.assign(new Error('EIO injected'), { code: 'EIO' })
+      return base.exists(path)
+    },
+    write: async (path, text) => { writes.push(path); await base.write(path, text) },
+  }
+  const me = await processId(host)
+  try {
+    const won = await core.claimTui(host, d.root, d.session, me, { state: 'ready' })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const before = readFileSync(d.ownerPath, 'utf8')
+    writes.length = 0
+    arm = true
+    const next = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+    assert.equal(next.kind, 'occupied-unknown')
+    assert.equal(readFileSync(d.ownerPath, 'utf8'), before)
+    assert.deepEqual(writes, [])
+  } finally { d.rm() }
+})
+
+test('T2: a read error and a malformed owner stay occupied-unknown', async () => {
+  const core = await tuiCore()
+  const base = nodeHost({ log: () => {} })
+  const me = await processId(base)
+  const readDir = tuiDirs()
+  const badDir = tuiDirs()
+  try {
+    let arm = false
+    const host: Host = {
+      ...base,
+      read: async path => {
+        if (arm && path.endsWith('/tui.owner')) throw Object.assign(new Error('EIO read'), { code: 'EIO' })
+        return base.read(path)
+      },
+    }
+    const won = await core.claimTui(host, readDir.root, readDir.session, me, { state: 'ready' })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const before = readFileSync(readDir.ownerPath, 'utf8')
+    arm = true
+    const next = await core.claimTui(host, readDir.root, readDir.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+    assert.equal(next.kind, 'occupied-unknown')
+    assert.equal(readFileSync(readDir.ownerPath, 'utf8'), before)
+    const badWon = await core.claimTui(base, badDir.root, badDir.session, me, { state: 'ready' })
+    assert.equal(badWon.kind, 'won')
+    writeFileSync(badDir.ownerPath, '{')
+    const malformed = await core.claimTui(base, badDir.root, badDir.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+    assert.equal(malformed.kind, 'occupied-unknown')
+    assert.equal(readFileSync(badDir.ownerPath, 'utf8'), '{')
+  } finally { readDir.rm(); badDir.rm() }
+})
+
+test('T2: an unsafe token is not used as a path', async () => {
+  const core = await tuiCore()
+  const base = nodeHost({ log: () => {} })
+  const me = await processId(base)
+  const calls: string[][] = []
+  const watch = (now: number): Host => ({
+    ...base,
+    now: async () => now,
+    write: async path => { calls.push(['write', path]); throw new Error('write') },
+    run: async (argv, cwd, ms) => {
+      calls.push([...argv])
+      if (argv[0] === 'rm' || argv[0] === 'mv') return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, cwd, ms)
+    },
+  })
+  const plant = (dir: ReturnType<typeof tuiDirs>, token: string, at: number) => {
+    mkdirSync(dir.ownerPath.slice(0, dir.ownerPath.lastIndexOf('/')), { recursive: true })
+    writeFileSync(dir.ownerPath, JSON.stringify({ host: me.host, pid: me.pid, pidStart: me.pidStart, token, state: 'pending', at }))
+  }
+  const adoptDir = tuiDirs()
+  const claimDir = tuiDirs()
+  try {
+    plant(adoptDir, 'x/../../outside', 1)
+    calls.length = 0
+    const adopted = await core.claimTui(watch(1_000), adoptDir.root, adoptDir.session, me, { state: 'ready', adopt: 'x/../../outside', launchDir: adoptDir.launch })
+    assert.equal(adopted.kind, 'occupied-unknown')
+    assert.equal(JSON.parse(readFileSync(adoptDir.ownerPath, 'utf8')).token, 'x/../../outside')
+    assert.equal(calls.flat().some(p => p.includes('..')), false, JSON.stringify(calls))
+    plant(claimDir, 'x/../../outside', 1)
+    writeFileSync(join(claimDir.launch, 'keep.yaml'), 'keep\n')
+    calls.length = 0
+    const next = await core.claimTui(watch(50_000), claimDir.root, claimDir.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending', launchDir: claimDir.launch })
+    assert.equal(next.kind, 'occupied-unknown')
+    assert.equal(JSON.parse(readFileSync(claimDir.ownerPath, 'utf8')).token, 'x/../../outside')
+    assert.equal(calls.flat().some(p => p.includes('..') || p.includes('outside.yaml')), false, JSON.stringify(calls))
+    assert.equal(readFileSync(join(claimDir.launch, 'keep.yaml'), 'utf8'), 'keep\n')
+  } finally { adoptDir.rm(); claimDir.rm() }
+})
+
+test('T2: a leftover lock is reported and a live lock is not removed', async () => {
+  const core = await tuiCore()
+  const base = nodeHost({ log: () => {} })
+  const me = await processId(base)
+  const logs: string[] = []
+  const rmdirs: string[] = []
+  const host: Host = {
+    ...base,
+    log: text => { logs.push(text) },
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'rmdir') { rmdirs.push(String(argv[1])); return { exitCode: 0, stdout: '', stderr: '' } }
+      if (argv[0] === 'sleep') return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const oldDir = tuiDirs()
+  const liveDir = tuiDirs()
+  try {
+    const oldLock = `${oldDir.ownerPath.slice(0, oldDir.ownerPath.lastIndexOf('/'))}/tui.owner.lock`
+    mkdirSync(oldLock, { recursive: true })
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(oldLock, old, old)
+    const stale = await core.claimTui(host, oldDir.root, oldDir.session, me, { state: 'pending' })
+    assert.equal(stale.kind, 'occupied-unknown')
+    assert.equal(existsSync(oldLock), true)
+    assert.equal(rmdirs.includes(oldLock), false)
+    assert.ok(logs.some(l => l.includes(oldLock) && /rmdir/.test(l)), logs.join('\n'))
+    logs.length = 0
+    const liveLock = `${liveDir.ownerPath.slice(0, liveDir.ownerPath.lastIndexOf('/'))}/tui.owner.lock`
+    mkdirSync(liveLock, { recursive: true })
+    const live = await core.claimTui(host, liveDir.root, liveDir.session, me, { state: 'pending' })
+    assert.equal(live.kind, 'occupied-unknown')
+    assert.equal(existsSync(liveLock), true)
+    assert.equal(rmdirs.includes(liveLock), false)
+    assert.ok(logs.some(l => l.includes(liveLock) && /rmdir/.test(l)), logs.join('\n'))
+  } finally { oldDir.rm(); liveDir.rm() }
+})
+
+test('T2: rmdir failure is not a plain won', async () => {
+  const core = await tuiCore()
+  const logs: string[] = []
+  const base = nodeHost({ log: text => { logs.push(text) } })
+  let mode: 'exit' | 'throw' = 'exit'
+  const host: Host = {
+    ...base,
+    log: text => { logs.push(text) },
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'rmdir' && String(argv[1]).endsWith('/tui.owner.lock')) {
+        if (mode === 'throw') throw new Error('EIO rmdir')
+        return { exitCode: 1, stdout: '', stderr: 'Directory not empty' }
+      }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const me = await processId(host)
+  const first = tuiDirs()
+  const second = tuiDirs()
+  try {
+    const exited = await core.claimTui(host, first.root, first.session, me, { state: 'pending' })
+    assert.notEqual(exited.kind, 'won')
+    assert.ok(logs.some(l => l.includes('tui.owner.lock') && l.includes('Directory not empty')), logs.join('\n'))
+    mode = 'throw'
+    logs.length = 0
+    const thrown = await core.claimTui(host, second.root, second.session, me, { state: 'pending' })
+    assert.notEqual(thrown.kind, 'won')
+    assert.ok(logs.some(l => l.includes('tui.owner.lock') && l.includes('EIO')), logs.join('\n'))
+  } finally { first.rm(); second.rm() }
+})
+
+test('T2: iTerm2 and Terminal focus pass the tty', async () => {
+  const core = await tuiCore()
+  const calls: string[][] = []
+  const base = nodeHost({ log: () => {} })
+  const host: Host = {
+    ...base,
+    run: async (argv, cwd, ms) => {
+      calls.push([...argv])
+      if (argv[0] === 'osascript' || argv[0] === 'open') return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const me = await processId(host)
+  const claim = { host: me.host, pid: me.pid, pidStart: me.pidStart, token: 'abcdefghijkl', state: 'ready' as const, at: 0 }
+  const focus = async (kind: 'iterm' | 'terminal', tty: string) => {
+    calls.length = 0
+    const raised = await core.focusTui(host, { kind: 'occupied-ready', locator: { kind, tty }, claim })
+    return { raised, argv: calls.find(a => a[0] === 'osascript'), calls: calls.map(a => [...a]) }
+  }
+  const a = await focus('iterm', '/dev/ttys001')
+  const b = await focus('iterm', '/dev/ttys002')
+  assert.equal(JSON.stringify(a.raised).includes('window'), false)
+  assert.ok(a.argv, JSON.stringify(a.calls))
+  assert.ok(b.argv)
+  assert.notEqual(a.argv.join('\0'), b.argv.join('\0'))
+  assert.ok(a.argv.includes('/dev/ttys001'))
+  assert.ok(b.argv.includes('/dev/ttys002'))
+  const script = a.argv[a.argv.indexOf('-e') + 1] ?? ''
+  assert.match(script, /on run argv/)
+  assert.equal(script.includes('/dev/ttys001'), false)
+  assert.match(script, /sessions of t/)
+  const term = await focus('terminal', '/dev/ttys003')
+  assert.ok(term.argv, JSON.stringify(term.calls))
+  assert.ok(term.argv.includes('/dev/ttys003'))
+  const tscript = term.argv[term.argv.indexOf('-e') + 1] ?? ''
+  assert.match(tscript, /on run argv/)
+  assert.match(tscript, /tty of t/)
+  assert.equal(tscript.includes('/dev/ttys003'), false)
+  assert.equal(term.calls.some(c => c[0] === 'open'), false)
+  const missed = await core.focusTui({
+    ...host,
+    run: async argv => argv[0] === 'osascript'
+      ? { exitCode: 1, stdout: '', stderr: 'no iTerm2 session for /dev/ttys009' }
+      : { exitCode: 0, stdout: '', stderr: '' },
+  }, { kind: 'occupied-ready', locator: { kind: 'iterm', tty: '/dev/ttys009' }, claim })
+  assert.equal('raised' in missed, false)
+  assert.match(JSON.stringify(missed), /no iTerm2 session/)
+})
+
+test('T2: reclaim stops when the launch file cannot be removed', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const logs: string[] = []
+  let now = 1_000_000
+  const base = nodeHost({ log: text => { logs.push(text) } })
+  let fail: 'off' | 'exit' | 'throw' = 'off'
+  const host: Host = {
+    ...base,
+    now: async () => now,
+    log: text => { logs.push(text) },
+    run: async (argv, cwd, ms) => {
+      if (fail !== 'off' && argv[0] === 'rm' && argv.some(a => String(a).includes('tmux-agent-tui-'))) {
+        if (fail === 'throw') throw new Error('EIO rm')
+        return { exitCode: 1, stdout: '', stderr: 'rm: Permission denied' }
+      }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const me = await processId(host)
+  try {
+    const won = await core.claimTui(host, d.root, d.session, me, { state: 'pending', launchDir: d.launch })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const mine = join(d.launch, `tmux-agent-tui-${sessionKey(d.session)}-${won.claim.token}.yaml`)
+    writeFileSync(mine, 'launch\n')
+    now += 30_001
+    fail = 'exit'
+    const next = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1, pidStart: 'next' }, { state: 'pending', launchDir: d.launch })
+    assert.notEqual(next.kind, 'won')
+    assert.equal(JSON.parse(readFileSync(d.ownerPath, 'utf8')).token, won.claim.token)
+    assert.equal(readFileSync(mine, 'utf8'), 'launch\n')
+    assert.ok(logs.some(l => l.includes(mine) && l.includes('Permission denied')), logs.join('\n'))
+    fail = 'throw'
+    logs.length = 0
+    const thrown = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1, pidStart: 'next' }, { state: 'pending', launchDir: d.launch })
+    assert.notEqual(thrown.kind, 'won')
+    assert.equal(JSON.parse(readFileSync(d.ownerPath, 'utf8')).token, won.claim.token)
+    assert.equal(existsSync(mine), true)
+    assert.ok(logs.some(l => l.includes(mine) && l.includes('EIO')), logs.join('\n'))
+  } finally { d.rm() }
+})
+
+test('T2: a proven-dead holder is reclaimed', async () => {
+  const core = await tuiCore()
+  let now = 8_000_000
+  const base: Host = { ...nodeHost({ log: () => {} }), now: async () => now }
+  const dead: Host = {
+    ...base,
+    run: async (argv, cwd, ms) => {
+      const line = argv.join(' ')
+      if (line.includes('ps -o lstart=')) return { exitCode: 0, stdout: 'not-the-recorded-lstart\n', stderr: '' }
+      if (line.includes('kill -0')) return { exitCode: 1, stdout: '', stderr: 'No such process' }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const me = await processId(base)
+  const pending = tuiDirs()
+  const ready = tuiDirs()
+  try {
+    const won = await core.claimTui(base, pending.root, pending.session, me, { state: 'pending', launchDir: pending.launch })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const mine = join(pending.launch, `tmux-agent-tui-${sessionKey(pending.session)}-${won.claim.token}.yaml`)
+    const other = join(pending.launch, `tmux-agent-tui-${sessionKey(pending.session)}-other.yaml`)
+    writeFileSync(mine, 'launch\n')
+    writeFileSync(other, 'keep\n')
+    now += 1_000
+    const next = await core.claimTui(dead, pending.root, pending.session, { ...me, pid: me.pid + 9, pidStart: 'next-dead' }, { state: 'pending', launchDir: pending.launch })
+    assert.equal(next.kind, 'won', 'unexpired pending with a proven-dead holder')
+    assert.equal(existsSync(mine), false)
+    assert.equal(readFileSync(other, 'utf8'), 'keep\n')
+    const readyWon = await core.claimTui(base, ready.root, ready.session, me, { state: 'ready', launchDir: ready.launch })
+    assert.equal(readyWon.kind, 'won')
+    if (readyWon.kind !== 'won') return
+    const readyFile = join(ready.launch, `tmux-agent-tui-${sessionKey(ready.session)}-${readyWon.claim.token}.yaml`)
+    writeFileSync(readyFile, 'ready\n')
+    const took = await core.claimTui(dead, ready.root, ready.session, { ...me, pid: me.pid + 9, pidStart: 'next-dead' }, { state: 'pending', launchDir: ready.launch })
+    assert.equal(took.kind, 'won', 'ready with a proven-dead holder')
+    assert.equal(readFileSync(readyFile, 'utf8'), 'ready\n')
+  } finally { pending.rm(); ready.rm() }
+})
+
+test('T2: a launcher releases its own pending and not its own ready', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const host = nodeHost({ log: () => {} })
+  const me = await processId(host)
+  try {
+    const pending = await core.claimTui(host, d.root, d.session, me, { state: 'pending' })
+    assert.equal(pending.kind, 'won')
+    if (pending.kind !== 'won') return
+    const released = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'launcher', me)
+    assert.equal(released, true)
+    assert.equal(existsSync(d.ownerPath), false)
+    const again = await core.claimTui(host, d.root, d.session, me, { state: 'pending' })
+    assert.equal(again.kind, 'won')
+    if (again.kind !== 'won') return
+    const adopted = await core.claimTui(host, d.root, d.session, me, { state: 'ready', adopt: again.claim.token, locator: { kind: 'warp', tabTitle: 'tab' } })
+    assert.equal(adopted.kind, 'adopted')
+    const late = await core.releaseTui(host, d.root, d.session, again.claim.token, 'launcher', me)
+    assert.equal(late, false)
+    assert.equal(d.readOwner().state, 'ready')
+  } finally { d.rm() }
+})
+
+test('T2: overlapping claims yield one won and one occupied-pending', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const base = nodeHost({ log: () => {} })
+  let entered = 0
+  let releaseSecond!: () => void
+  const secondArrived = new Promise<void>(r => { releaseSecond = r })
+  const host: Host = {
+    ...base,
+    run: async (argv, cwd, ms) => {
+      if (argv[0] === 'mkdir' && String(argv[1]).endsWith('/tui.owner.lock')) {
+        entered++
+        if (entered === 1) {
+          const result = await base.run(argv, cwd, ms)
+          await Promise.race([
+            secondArrived,
+            new Promise((_, rej) => setTimeout(() => rej(new Error('second claim did not reach the lock')), 3_000)),
+          ])
+          return result
+        }
+        const result = await base.run(argv, cwd, ms)
+        if (entered === 2) releaseSecond()
+        return result
+      }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const me = await processId(host)
+  const other = { ...me, pid: me.pid + 3, pidStart: 'overlap-other' }
+  try {
+    const [a, b] = await Promise.all([
+      core.claimTui(host, d.root, d.session, me, { state: 'pending' }),
+      core.claimTui(host, d.root, d.session, other, { state: 'pending' }),
+    ])
+    const kinds = [a.kind, b.kind].sort()
+    assert.deepEqual(kinds, ['occupied-pending', 'won'])
+    const won = a.kind === 'won' ? a : b
+    if (won.kind !== 'won') return
+    const owner = d.readOwner()
+    assert.equal(owner.token, won.claim.token)
+    assert.equal(owner.pid, won.claim.pid)
+    assert.ok(entered >= 2, `lock entries ${entered}`)
   } finally { d.rm() }
 })
 

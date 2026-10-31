@@ -40,14 +40,24 @@ if (( code != 0 )); then
 fi
 
 node --input-type=module -e '
-import { readdirSync, readFileSync } from "node:fs"
+import { readFileSync, readdirSync } from "node:fs"
+const { sessionDirOf, v3Of } = await import(process.argv[2])
 const dir = process.argv[1]
-const files = readdirSync(dir).filter(n => n.startsWith("result-"))
+const files = readdirSync(dir).filter(n => n.startsWith("result-")).sort()
 if (files.length !== 2) { console.error("expected 2 results, got " + files.length); process.exit(1) }
-const kinds = files.map(n => JSON.parse(readFileSync(dir + "/" + n, "utf8")).kind)
-const won = kinds.filter(k => k === "won").length
-if (won !== 1) { console.error("expected one won, got " + JSON.stringify(kinds)); process.exit(1) }
-console.log("ok   two-process TUI claim: one won (" + kinds.join(", ") + ")")
-' "$root"
+const results = files.map(n => JSON.parse(readFileSync(dir + "/" + n, "utf8")))
+const kinds = results.map(r => r.kind).sort()
+if (kinds.join(",") !== "occupied-pending,won") {
+  console.error("expected won + occupied-pending, got " + JSON.stringify(kinds))
+  process.exit(1)
+}
+const won = results.find(r => r.kind === "won")
+const owner = JSON.parse(readFileSync(sessionDirOf(v3Of(dir), "sess") + "/tui.owner", "utf8"))
+if (owner.token !== won.claim.token || owner.pid !== won.claim.pid || owner.host !== won.claim.host || owner.pidStart !== won.claim.pidStart) {
+  console.error("owner does not match the winner: " + JSON.stringify({ owner, won: won.claim }))
+  process.exit(1)
+}
+console.log("ok   two-process TUI claim: one won (" + results.map(r => r.kind).join(", ") + ")")
+' "$root" "$REPO_ROOT/skills/tmux-agent-tools/scripts/lib/workers.ts"
 
 echo "1 passed, 0 failed"
