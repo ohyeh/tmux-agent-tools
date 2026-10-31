@@ -1582,10 +1582,6 @@ async function claimLaunch(host: Host, root: string, session: string, opts: { cl
     process.stderr.write(`${occupiedWhere(result)}\n`)
     return { kind: 'stop', code: 0 }
   }
-  if (result.kind !== 'won' && result.kind !== 'adopted') {
-    process.stderr.write(`${occupiedWhere(result)}\n`)
-    return { kind: 'stop', code: 0 }
-  }
   if (opts.launchDir) {
     const target = tuiLaunchPath(opts.launchDir, session, result.claim.token)
     const fail = await dropLaunchFile(host, target, '/')

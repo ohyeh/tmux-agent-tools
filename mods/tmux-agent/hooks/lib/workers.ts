@@ -3859,6 +3859,13 @@ async function openAppleScript(host: Host, ctx: LaunchContext, script: string, l
   return notice ? { kind: 'sent', terminal, notice } : { kind: 'sent', terminal }
 }
 
+/** Display name for a terminal locator. An absent or tmux locator is Terminal.app, matching the ready-focus fallback. */
+export function appLabel(kind: string | undefined): string {
+  if (kind === 'warp') return 'Warp'
+  if (kind === 'iterm') return 'iTerm2'
+  return 'Terminal.app'
+}
+
 /**
  * Open the TUI in the caller's terminal. tmux splits when allowed (B1). Warp, iTerm2 and
  * Terminal.app are the adapters (B2). Anything else is Terminal.app, and the result says so.

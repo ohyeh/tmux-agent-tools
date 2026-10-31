@@ -78,6 +78,7 @@ import {
   openInTerminal,
   dropLaunchFile,
   tuiLaunchPath,
+  appLabel,
   processId,
   TUI_PENDING_MS,
   rememberPanel,
@@ -857,14 +858,12 @@ export const register: Register = on => {
     const launchDir = home ? `${home}/.warp/launch_configurations` : undefined
     const me = await processId(host)
     const claim = await claimTui(host, root, session, me, { state: 'pending', ...(launchDir ? { launchDir } : {}) })
-    const appName = { warp: 'Warp', iterm: 'iTerm2', terminal: 'Terminal.app' } as const
     switch (claim.kind) {
       case 'occupied-ready': {
         const raised = await focusTui(host, claim)
         if ('refused' in raised) return { ok: false, text: `TUI 已在執行，但無法切過去：${raised.refused}` }
         if (raised.raised === 'pane') return { ok: true, text: `TUI 已在執行，已切到 tmux pane ${claim.locator?.kind === 'tmux' ? claim.locator.pane : ''}`.trim() }
-        const loc = claim.locator
-        const app = loc?.kind === 'warp' || loc?.kind === 'iterm' || loc?.kind === 'terminal' ? appName[loc.kind] : 'Terminal.app'
+        const app = appLabel(claim.locator?.kind)
         return { ok: true, text: `TUI 已在執行，已把 ${app} 帶到前景${raised.tabTitle ? `，請找分頁「${raised.tabTitle}」` : ''}` }
       }
       case 'occupied-pending':
@@ -915,7 +914,7 @@ export const register: Register = on => {
         host.toast('tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手，已取消這次開啟；再按 [ ⧉ tui ] 重試')
       })
       if (opened.kind === 'split') return { ok: true, text: `TUI 已開在 ${opened.locator.pane}，在 ${pane} 旁` }
-      return { ok: true, text: `已送出 ${appName[opened.terminal]} 開啟 TUI 的要求，TUI 接手後才算就緒${opened.notice ? `；${opened.notice}` : ''}` }
+      return { ok: true, text: `已送出 ${appLabel(opened.terminal)} 開啟 TUI 的要求，TUI 接手後才算就緒${opened.notice ? `；${opened.notice}` : ''}` }
     } catch (error) {
       await release().catch(err => host.log(`tmux-agent: tui claim release failed: ${String(err)}`))
       throw error
