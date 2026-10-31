@@ -1,9 +1,9 @@
-// Process boundary for T2 lock recovery. Not a *.contract.node.ts: the two
-// 6s waits would sit in the 90s core lane. scripts/test-tui-lock-recover-smoke runs it.
+// Process boundary for T2 lock recovery. Not a *.contract.node.ts: it kills a
+// real child at the two v3.3 points. scripts/test-tui-lock-recover-smoke runs it.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
@@ -66,16 +66,6 @@ async function untilDead(child: ChildProcess): Promise<void> {
   })
 }
 
-async function untilAged(lock: string): Promise<void> {
-  const start = Date.now()
-  for (;;) {
-    const age = Date.now() - statSync(lock).mtimeMs
-    if (age > TUI_LOCK_RECOVER_MS) return
-    if (Date.now() - start > TUI_LOCK_RECOVER_MS + 5_000) throw new Error(`lock age ${age} did not pass ${TUI_LOCK_RECOVER_MS}`)
-    await new Promise(r => setTimeout(r, 200))
-  }
-}
-
 async function killed(mode: 'a' | 'b', ownerWritten: boolean): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'tui-recover-'))
   const session = 'sess-1'
@@ -86,7 +76,8 @@ async function killed(mode: 'a' | 'b', ownerWritten: boolean): Promise<void> {
     assert.equal(existsSync(lock), true, `${mode}: the lock is left behind`)
     const owner = `${sessionDirOf(v3Of(root), session)}/tui.owner`
     assert.equal(existsSync(owner), ownerWritten, `${mode}: tui.owner`)
-    await untilAged(lock)
+    const old = new Date(Date.now() - TUI_LOCK_RECOVER_MS - 1_000)
+    utimesSync(lock, old, old)
     const host = nodeHost({ log: () => {} })
     const me = await processId(host)
     const got = await claimTui(host, root, session, me, { state: 'pending' })
