@@ -1174,6 +1174,27 @@ function rowLine(state: TuiState, index: number, selected: number): string {
   return `${digitPrefix}${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}${sanitizeAnsi(rowLabel(r, index === selected))}`
 }
 
+/** Detail slice or mirror slice for one preview. The standard painter keeps its own tail line. */
+function previewLines(state: TuiState, cols: number, bodyRows: number): string[] {
+  const r = state.rows.find(row => row.id === state.selected)
+  if (!r || bodyRows <= 0) return []
+  const out: string[] = []
+  if (state.expanded) {
+    const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), cols) : ['loading…']
+    const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyRows))
+    for (const l of all.slice(top, top + bodyRows)) out.push(l || ' ')
+    return out
+  }
+  const m = state.mirror?.id === r.id ? state.mirror : undefined
+  if (!m) out.push('\x1b[2mcapturing the pane…\x1b[0m')
+  else if (m.error) out.push(`\x1b[33mcapture failed: ${sanitizeAnsi(m.error)}\x1b[0m`)
+  else if (!m.lines.length) out.push('\x1b[2m(the pane is empty)\x1b[0m')
+  const total = m?.lines.length ?? 0
+  const end = total - Math.min(state.back ?? 0, Math.max(0, total - bodyRows))
+  if (m && !m.error && total) for (const ml of m.lines.slice(Math.max(0, end - bodyRows), end)) out.push(sanitizeAnsi(ml) || ' ')
+  return out
+}
+
 /** Wide: list on the left, preview on the right, both as tall as the content band. */
 function renderWide(state: TuiState, width: number, height: number, s: Sections, lay: TuiLayout & { frame: Frame }): string[] {
   const frame = lay.frame
@@ -1186,23 +1207,7 @@ function renderWide(state: TuiState, width: number, height: number, s: Sections,
   if (frame.more) left.push(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`)
   const right: string[] = []
   const r = s.sel >= 0 ? state.rows[s.sel] : undefined
-  if (r && frame.preview.rows > 0) {
-    const cols = frame.preview.cols
-    const bodyN = frame.preview.rows
-    if (state.expanded) {
-      const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), cols) : ['loading…']
-      const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyN))
-      for (const l of all.slice(top, top + bodyN)) right.push(l || ' ')
-    } else {
-      const m = state.mirror?.id === r.id ? state.mirror : undefined
-      if (!m) right.push('\x1b[2mcapturing the pane…\x1b[0m')
-      else if (m.error) right.push(`\x1b[33mcapture failed: ${sanitizeAnsi(m.error)}\x1b[0m`)
-      else if (!m.lines.length) right.push('\x1b[2m(the pane is empty)\x1b[0m')
-      const total = m?.lines.length ?? 0
-      const end = total - Math.min(state.back ?? 0, Math.max(0, total - bodyN))
-      if (m && !m.error && total) for (const ml of m.lines.slice(Math.max(0, end - bodyN), end)) right.push(sanitizeAnsi(ml) || ' ')
-    }
-  }
+  if (r && frame.preview.rows > 0) right.push(...previewLines(state, frame.preview.cols, frame.preview.rows))
   for (let i = 0; i < frame.list.rows; i++) {
     lines.push(fit(left[i] ?? '', frame.list.cols) + fit(right[i] ?? '', frame.preview.cols))
   }
@@ -1246,22 +1251,17 @@ export function renderTuiLines(
     // The preview owns its rule, `lay.body` rows and a tail line in every state, so
     // the frame is `height` rows and the footer stays at the bottom (T1 C1).
     const rule = `\x1b[2m${'─'.repeat(Math.max(0, Math.min(width, 60) - 1))}\x1b[0m`
-    const body: string[] = []
+    const body = previewLines(state, width, lay.body)
     let tail: string
     if (state.expanded) {
       const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), width) : ['loading…']
       const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - lay.body))
-      for (const l of all.slice(top, top + lay.body)) body.push(l || ' ')
       const end = Math.min(all.length, top + lay.body)
       tail = `\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · b/f scroll · Enter mirror\x1b[0m`
     } else {
       const m = state.mirror?.id === r.id ? state.mirror : undefined
-      if (!m) body.push('\x1b[2mcapturing the pane…\x1b[0m')
-      else if (m.error) body.push(`\x1b[33mcapture failed: ${sanitizeAnsi(m.error)}\x1b[0m`)
-      else if (!m.lines.length) body.push('\x1b[2m(the pane is empty)\x1b[0m')
       const total = m?.lines.length ?? 0
       const end = total - Math.min(state.back ?? 0, Math.max(0, total - lay.body))
-      if (m && !m.error && total) for (const ml of m.lines.slice(Math.max(0, end - lay.body), end)) body.push(sanitizeAnsi(ml) || ' ')
       tail =
         end < total
           ? `\x1b[2mscrollback ${Math.max(1, end - lay.body + 1)}–${end} of ${total} · b/f scroll · f to the end follows live\x1b[0m`
