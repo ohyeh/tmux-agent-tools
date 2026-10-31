@@ -217,15 +217,31 @@ tmux-agent-tui --session <session-id> --cwd <dir>   # owner: act on that session
 tmux-agent-tui                                      # viewer: every worker, labeled, read-only
 ```
 
-- Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI acts for
-  that session. Without one it is a viewer that only lists.
+- Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI holds
+  that session. Without one it is a viewer. `e` in a viewer opens the session
+  picker; picking a live session claims it in this process.
+- Opens in 預覽. `e` enters 編輯 when this process holds the owner. 預覽:
+  `j`/`k` and `1`–`9` select; `↑`/`↓` scroll one line; `b`/`f` and PgUp/PgDn
+  scroll a page; Enter opens detail; `a` toggles all/own; `r` re-reads and
+  clears the selection; `q` quits. 編輯 adds `n`, `+`, `t`, `i`, `x`, `-`, `U`,
+  `c` (`x`, `-`, `U`, `c` ask twice). `n` and `+` refuse when the cwd is
+  unknown. Esc disarms, closes detail, leaves a narrow preview, leaves the
+  picker, leaves 編輯, clears the selection, then quits. Mouse reporting stays
+  off (`?1007h` turns the wheel into `↑`/`↓`).
+- One ready TUI per owner. A second launch focuses the first and does not draw.
+  Warp focus raises the app (`open -a Warp`) and names the tab. It does not
+  focus a window.
+- The title shows `更新 Ns 前`, and ` …` while the rows read is in flight.
+  Rows every 2s, mirror every 1s, stall sweep every 10s. Each job is
+  single-flight; `r` during a run queues one more.
 - Needs Node >= 22.18 (`NODE=/path/to/node` picks one) and a terminal. With no
   TTY it exits 2; for a JSON snapshot use `tmux-agent-dashboard`.
   `TMUX_AGENT_DIR` and `TMUX_AGENT_TMUX_SOCKET` pass through.
-- In Claude Code, the mod's `[ ⧉ ]` opens it in a tmux split. The split is
-  full window height (`split-window -h -f`), also beside a pane that is the top
-  half of a window. Outside tmux, the toast gives the full command to run in
-  another terminal (over 200 characters, the whole command is in the log).
+- The band `[ ⧉ tui ]` (hotkey `t`) opens it. Inside tmux it splits the pane
+  (B1, `split-window -h -f`). Warp, iTerm2, and Terminal.app open a window
+  (B2). Zed and any other terminal open Terminal.app, and the toast says so.
+  SSH without tmux cannot open a window; the toast has the reason and the full
+  command. A second press focuses the existing TUI.
 - The TUI fills its pane. If the window itself is smaller than your terminal,
   another tmux client on the same session is the cause: with tmux's default
   `window-size latest`, the window takes the size of the client used last.

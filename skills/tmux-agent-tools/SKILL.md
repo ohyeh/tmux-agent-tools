@@ -107,7 +107,19 @@ Full walkthrough: `references/core-workflow.md`.
 
 ## v5 ledger (non-Claude hosts)
 
-Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). The workers TUI is `scripts/tmux-agent-tui [--session <id>] [--cwd <dir>]`: with a session id it is the owner and acts on that session's workers; without one it is a read-only viewer. It needs Node >= 22.18 and a TTY (exit 2 otherwise; `--help` needs neither). After a skill update, re-run `scripts/install-bin`: it links only the scripts that existed when it last ran, and `agent-tmux <cli> doctor` names the missing links. Layout, ownership, and delivery are in the repository document `mods/tmux-agent/README.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only. Across hosts on one tailnet: `scripts/tmux-agent-relay` (`ensure`, `send <host> <worker> <text>`, `roster`) and `start-ssh --sentinel … --notify` (the remote exit lands in `status --json` as `exit_source: "relay"`); trust model and refusals are in the README section "Relay (tailnet)".
+Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). The workers TUI is `scripts/tmux-agent-tui [--session <id>] [--cwd <dir>]`. Keys, modes, and the band button are in "Workers TUI" below. It needs Node >= 22.18 and a TTY (exit 2 otherwise; `--help` needs neither). After a skill update, re-run `scripts/install-bin`: it links only the scripts that existed when it last ran, and `agent-tmux <cli> doctor` names the missing links. Layout, ownership, and delivery are in the repository document `mods/tmux-agent/README.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only. Across hosts on one tailnet: `scripts/tmux-agent-relay` (`ensure`, `send <host> <worker> <text>`, `roster`) and `start-ssh --sentinel … --notify` (the remote exit lands in `status --json` as `exit_source: "relay"`); trust model and refusals are in the README section "Relay (tailnet)".
+
+## Workers TUI
+
+`tmux-agent-tui` opens in 預覽. `e` enters 編輯 when this process holds the session. With no session, `e` opens the picker: `j`/`k` or `1`–`9` move, Enter claims that live session in this process. One ready TUI per owner. A second launch focuses the first and does not draw. Quit with `q`, Ctrl-C, or Esc at the top of 預覽.
+
+預覽: `j`/`k` and `1`–`9` select a row. `↑`/`↓` scroll one line. `b`/`f` and PgUp/PgDn scroll a page. Enter opens detail. `a` toggles all workers and this session. `r` re-reads the rows and clears the selection. Mouse reporting stays off, so the terminal's own drag-select is free. `?1007h` turns the wheel into `↑`/`↓`.
+
+編輯 adds `n` (resume), `+` (assign), `t` (tell), `i` (interrupt), `x` (stop), `-` (cancel), `U` (unlock), and `c` (clear all). `x`, `-`, `U`, and `c` ask twice. `n` and `+` refuse when the cwd is unknown. `e` returns to 預覽. Esc disarms a confirm, closes detail, leaves a narrow preview, leaves the picker, leaves 編輯, clears the selection, then quits.
+
+The title shows `更新 Ns 前`, and ` …` while the rows read is still in flight. Rows run every 2s, the mirror every 1s, the stall sweep every 10s. Each job is single-flight. `r` during a run queues one more. A failed read keeps the previous age.
+
+The band button `[ ⧉ tui ]` (hotkey `t`) opens this TUI. Inside tmux it splits the pane (B1). Warp, iTerm2, and Terminal.app open a window (B2). Zed and any other `TERM_PROGRAM` open Terminal.app, and the toast says so. SSH without tmux cannot open a window and prints the full command. A second press focuses the existing TUI. Warp only raises the app and names the tab.
 
 ## result.json completion contract
 

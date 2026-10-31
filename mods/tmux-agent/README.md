@@ -454,7 +454,7 @@ delivering from the next tick`，`dispatch.json` 變成 `owner=<本 sid>`、
 
 ## `/workers` 面板
 
-session 開始時面板就在、預設收合；`/workers` 開關面板。標題是 `workers v<MOD_VERSION> · @<本 session> · tmux N · 內部 M`（目前為 `workers v0.46.24`，列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N/共 T：@<id> n ]`（`n` 是該 session 的列數，含已完成的），按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上的 worker 總數（含 finished、尚未投遞與已投遞但 pane 仍在的隊友；專案列與未完成的 reservation 不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
+session 開始時面板就在、預設收合；`/workers` 開關面板。標題是 `workers v<MOD_VERSION> · @<本 session> · tmux N · 內部 M`（目前為 `workers v0.48.0`，標題列在計數旁顯示 `更新 Ns 前`，是列上次讀成功的時間。band 的列與鏡像在同一個 2 秒 tick 上各跑各的，慢的列讀不會跳過鏡像。列上的 `@<id>` 是別的 live session 持有的 worker，`@unknown` 是沒有 heartbeat 的孤兒，自己的不標）。別的 session 的 worker 預設收成一行 `◌ [ 展開 · 其他 session 運行中 N/共 T：@<id> n ]`（`n` 是該 session 的列數，含已完成的），按它（hotkey `a`）逐列展開，再按收回；收起時 `/workers tell|stop <name>` 照樣找得到；沒有別人就沒有這行：`tmux N` 是面板上的 worker 總數（含 finished、尚未投遞與已投遞但 pane 仍在的隊友；專案列與未完成的 reservation 不算，0 也印）；`內部 M` 是這個 session `$.agent.list()` 裡 `status === 'running'` 的數量（teammate 也算），只在面板開著時跟 2 秒時鐘一起讀。`list` 失敗顯示 `內部 ?` 並 log 一次。面板畫在 **prompt 正上方的 band**（`AbovePrompt`），不是
 `Pane`：不管終端機多寬、有沒有 `CLAUDE_CODE_NO_FLICKER=0`、在不在 tmux 裡，
 位置都一樣。（0.4.x 用 `Pane`，≥110 欄會 dock 到右邊、inline 時按鈕完全按不了——
 引擎只在 fullscreen 佈局回報滑鼠 click，`hotkey` 又只有 band 認；2026-09-17
@@ -485,20 +485,14 @@ TUI 只看不收；狀態列的「收件」讀的是 mod 自己寫的 `act/<n>.s
 Warp／AppleScript 的要求只算「已送出」；30 秒內 TUI 沒有接手，band 只放掉自己那筆還在 `pending` 的佔位並說「沒有接手」，
 TUI 已經 `ready` 的紀錄不動。
 
-TUI 的按鍵（plan R4.6；畫出來的每個鍵都有 handler，contract 測試逐一檢查）：
+TUI 的按鍵（預設是預覽；畫出來的每個鍵都有 handler）：
 
-- 標題列：`[ n resume ]`（按 session id 接回）、`[ + assign ]`（輸入
-  `<profile> <name> <brief 檔>`，走 core 的 `assign`，與 MCP、mod 同一條路）、
-  `[ r refresh ]`、`[ c clear ]`（按兩次）、`[ q quit ]`；`a` 切換全部／只看自己，
-  `j`／`k`、方向鍵、`1`–`9` 選列。寬度不夠時先拿掉 `a all · j/k select`，再只留鍵。
-- 選中的列：`[ t tell ]`（追話）、`[ i interrupt ]`、`[ x stop ]`（按兩次）、
-  `[ - cancel ]`（按兩次；關掉這個 episode，pane 不動，與 `workers.cli.node.ts cancel`
-  同一個 core 呼叫）、`[ U unlock ]`（按兩次；維護用，與 `unlock <name> confirm` 同一個
-  core 呼叫，只在持有者確定已死時才移除鎖）。`Enter` 打開細節：row 狀態與 result 狀態
-  分開列、完整 summary（不受 12000 字截斷）、blocked 原因、result 路徑；`b`／`f`（或 `PgUp`／`PgDn`）
-  捲動，`Enter` 或 `Esc` 收合。鏡像同樣用滑鼠滾輪或 `b`／`f` 捲 scrollback，捲到底回到即時。
-  TUI 開了滑鼠回報，點擊不做事；要選字複製用 Shift＋拖曳。
-  project session 沒有 episode，`Enter` 不開細節。
+- 預覽：`j`／`k` 與 `1`–`9` 選列。`↑`／`↓` 捲一行（不再選列）。`b`／`f` 與 PgUp／PgDn 捲一頁。Enter 開細節。`a` 切換全部／只看自己。`r` 重讀列並清掉選取。`q` 離開。`e` 在這個 TUI 持有 session 時進入編輯；沒有 session 就開 picker（`j`／`k` 或 `1`–`9`，Enter 在這個行程裡 claim）。滑鼠回報關著，終端自己的反白可以複製。`?1007h` 讓滾輪變成 `↑`／`↓`。
+- 編輯才有：`[ n resume ]`、`[ + assign ]`（`<profile> <name> <brief 檔>`）、`[ t tell ]`、`[ i interrupt ]`、`[ x stop ]`（按兩次）、`[ - cancel ]`（按兩次；episode 關掉，pane 不動）、`[ U unlock ]`（按兩次；只在持有者確定已死時才移除鎖）、`[ c clear ]`（按兩次）。`n` 與 `+` 在 cwd 不明時拒絕。`e` 回到預覽。
+- Esc：先解除二次確認，再關細節，窄畫面從預覽回清單，picker 回預覽，編輯回預覽，清掉選取，最外層離開。
+- 標題顯示 `更新 Ns 前`；列還在讀時後面加 ` …`。清單 2 秒、鏡像 1 秒、stall 10 秒，各自 single-flight。讀失敗保留上一次的時間。`r` 在一輪還在跑時只排隊一次。
+- 同一個 owner 只有一個 ready TUI。再按 `[ ⧉ tui ]` 或再開一次，是把已開的叫到前景，不開第二個。Warp 只把 app 叫到前景，並講出分頁名。
+- project session 沒有 episode，`Enter` 不開細節。不帶 `--session` 的 viewer 在選到 live session 之前是唯讀。
 - 版面（R4.1）：一個函式依高度、寬度、選中列與展開狀態分配各區塊的行數；鏡像抓的
   行數就是它算出的 viewport。縮放時重算，縮放前開始的 capture 結果直接丟掉。
 - 空狀態三種：沒有 outstanding、被篩選掉（按 `a` 看全部）、讀取失敗（附 errno）。
