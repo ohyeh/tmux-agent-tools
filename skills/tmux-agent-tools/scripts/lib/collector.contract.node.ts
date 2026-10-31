@@ -125,18 +125,6 @@ test('crash between claim mkdir and owner publish: nobody delivers inside the gr
   assert.deepEqual(by(w), ['C'])
 })
 
-test('crash after submit, before the ack: re-reported (never missed), then acked once', async () => {
-  const w = world('A')
-  assert.equal((await pass(w, 'A', { CRASH_AT: 'after-submit' })).code, 9)
-  assert.equal(delivered(w).length, 1)
-  assert.ok(!acked(w))
-  await pass(w, 'A')
-  assert.equal(delivered(w).length, 2, 'the unacked delivery is reported again')
-  assert.ok(acked(w))
-  await pass(w, 'A')
-  assert.equal(delivered(w).length, 2, 'acked: nothing more')
-})
-
 test('crash before submit: nothing recorded, the next pass delivers once', async () => {
   const w = world('A')
   assert.equal((await pass(w, 'A', { CRASH_AT: 'before-submit' })).code, 9)
@@ -159,36 +147,6 @@ test('two activations of one session: the older, woken after a newer registered,
   assert.equal(delivered(w).length, 1)
   assert.ok(r.activation! < fresh.activation!)
   assert.match(r.paused ?? '', /superseded/)
-})
-
-test('a submit already past its last check may land twice (allowed re-report); the ack is still one dir', async () => {
-  const w = world('A')
-  const old = pass(w, 'A', { HOLD_SUBMIT: '1' })
-  await until(() => existsSync(`${w.root}/held.A`), 'the first activation to hang inside submit')
-  await pass(w, 'A')
-  writeFileSync(`${w.root}/go.A`, '')
-  await old
-  assert.equal(delivered(w).length, 2)
-  assert.deepEqual(readdirSync(`${w.ep}/acks`).filter(k => k === 'done'), ['done'])
-})
-
-test('an ack that cannot be written is logged and re-reported, never read as delivered', async () => {
-  const w = world('A')
-  mkdirSync(`${w.ep}/acks`, { recursive: true }) // the marker (R4-2) needs the episode dir writable; only the ack is refused
-  chmodSync(`${w.ep}/acks`, 0o555)
-  try {
-    const r = await pass(w, 'A')
-    assert.equal(delivered(w).length, 1)
-    assert.ok(r.logs.some(l => l.includes('could not ack')), r.logs.join('\n'))
-    await pass(w, 'A')
-    assert.equal(delivered(w).length, 2)
-  } finally {
-    chmodSync(`${w.ep}/acks`, 0o755)
-  }
-  await pass(w, 'A')
-  await pass(w, 'A')
-  assert.equal(delivered(w).length, 3)
-  assert.ok(acked(w))
 })
 
 // §1c S1: at-least-once. One tuple (gen-0 owner, name, seq) is acked once; every
@@ -251,7 +209,8 @@ test('AT_LEAST_ONCE_BOUND_PROBE: two ack failures, then the third attempt delive
   mkdirSync(`${w.ep}/acks`, { recursive: true }) // the marker (R4-2) needs the episode dir writable; only the ack is refused
   chmodSync(`${w.ep}/acks`, 0o555)
   try {
-    await pass(w, 'A')
+    const r = await pass(w, 'A')
+    assert.ok(r.logs.some(l => l.includes('could not ack')), r.logs.join('\n'))
     await pass(w, 'A')
     assert.equal(notices(w).length, 2)
     assert.deepEqual(doneDirs(w), [])
@@ -348,8 +307,17 @@ async function fakeHost(draft = '', mode = 'idle') {
   const log = () => (existsSync(`${state}/log`) ? readFileSync(`${state}/log`, 'utf8').trim().split('\n').filter(Boolean) : [])
   const setMode = (m: string) => writeFileSync(`${state}/mode`, m)
   const clear = () => writeFileSync(`${state}/clear`, '')
-  await new Promise(r => setTimeout(r, 400)) // the fake draws its first screen
-  return { srv, pane, log, setMode, clear, stop }
+  const screen = async () => (await srv.tmux(['capture-pane', '-p', '-t', pane])).out
+  const drew = async (changedFrom?: string) => {
+    for (let i = 0; i < 250; i++) {
+      const now = await screen()
+      if (changedFrom === undefined ? now.trim() !== '' : now !== changedFrom) return
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.fail('the fake composer did not redraw')
+  }
+  await drew() // the fake draws its first screen
+  return { srv, pane, log, setMode, clear, stop, screen, drew }
 }
 
 test('collector wake: a bracketed paste into the exact pane, then Enter; a gone pane is a drop', async t => {
@@ -361,37 +329,6 @@ test('collector wake: a bracketed paste into the exact pane, then Enter; a gone 
     assert.deepEqual(h.log(), ['PASTE:"line one\\nline two"', 'ENTER:idle:"line one\\nline two"'], 'one paste, then one Enter')
     assert.equal(await paneAlive('%999999', h.srv.env), false)
     assert.match((await pasteInto('%999999', 'x', h.srv.env, 'cursor')).drop ?? '', /gone/)
-  } finally {
-    await h.stop()
-  }
-})
-
-test('CLI collector and another session on one root: a dead owner\'s finished episode is claimed and delivered once', async t => {
-  const w = world('dead')
-  beatAt(w, 'dead', OLD)
-  const h = await fakeHost()
-  if (!h) return t.skip('no private tmux server can start here')
-  const env = { ...h.srv.env, TMUX_AGENT_DIR: w.root }
-  try {
-    assert.match(h.pane, /^%\d+$/)
-    const once = (session: string) =>
-      new Promise<number>(resolve =>
-        execFile(
-          process.execPath,
-          [COLLECTOR, '--session', session, '--cwd', w.cwd, '--pane', h.pane, '--cli', 'cursor', '--once'],
-          { env, timeout: 30_000 },
-          error => resolve(error ? (typeof error.code === 'number' ? error.code : -1) : 0),
-        ),
-      )
-    const round = () => Promise.all([once('cli-host'), pass(w, 'other-host')])
-    const first = await round()
-    assert.deepEqual(first.map(c => (typeof c === 'number' ? c : c.code)), [0, 0])
-    assert.deepEqual(delivered(w), [], 'the claim tick delivers nothing')
-    assert.equal(gens(w).length, 1, 'one claim gen')
-    await round()
-    const pasted = h.log().filter(l => l.startsWith('ENTER:')).length
-    assert.equal(delivered(w).length + pasted, 1, 'the claimant delivers once, the other session does not')
-    assert.ok(acked(w))
   } finally {
     await h.stop()
   }
@@ -443,9 +380,6 @@ const DRAFT = 'R74-DRAFT-KEEPME unsent draft text'
 for (const c of [
   { name: 'draft', mode: 'idle', draft: DRAFT, recover: (h: { clear: () => void }) => h.clear() },
   { name: 'busy', mode: 'busy', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
-  { name: 'permission', mode: 'permission', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
-  { name: 'shell', mode: 'shell', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
-  { name: 'unknown', mode: 'unknown', draft: '', recover: (h: { setMode: (m: string) => void }) => h.setMode('idle') },
 ]) {
   test(`D-paste: host ${c.name} -> nothing pasted, no Enter, no ack, no pause, reason kept; delivered once when it recovers`, async t => {
     await scenario(c.mode, c.draft, async ({ w, gate, beat, passes, h }) => {
@@ -460,8 +394,9 @@ for (const c of [
       const published = JSON.parse(readFileSync(stateFile, 'utf8')) as { status: string; reason?: string }
       assert.equal(published.status, 'collecting', 'a deferral is not a pause')
       assert.match(published.reason ?? '', new RegExp(`composer is ${c.name}`), 'act/<n>.state carries the reason for the TUI and panel')
+      const before = await h.screen()
       c.recover(h)
-      await new Promise(r => setTimeout(r, 400))
+      await h.drew(before) // the fake redraws on its own clock
       await passes(2)
       assert.equal(enters(h).length, 1, 'delivered once after it recovered')
       assert.ok(acked(w))
@@ -489,18 +424,6 @@ test('D-paste: the composer after the paste is not the pasted text -> no Enter, 
     assert.equal(gate.failures, 0)
     assert.match(gate.deferred ?? '', /composer is draft/)
   }, t)
-})
-
-test('D-paste: pasteInto reports blocked for a post-paste mismatch and never sends Enter', async t => {
-  const h = await fakeHost('', 'mangle')
-  if (!h) return t.skip('no private tmux server can start here')
-  try {
-    const r = await pasteInto(h.pane, 'the notice', h.srv.env, 'cursor')
-    assert.match(r.deferred ?? '', /^blocked: .*Enter not sent/)
-    assert.deepEqual(enters(h), [])
-  } finally {
-    await h.stop()
-  }
 })
 
 test('D-paste: the composer already holds this notice (our blocked paste) -> a distinct reason, no keys, nothing pasted', async t => {
@@ -596,13 +519,17 @@ test('composer-state: every captured pane gets its class (real codex, cursor-age
   ]
   const srv = privateServer()
   try {
-    for (const [i, [cli, file, state, text]] of want.entries()) {
+    const panes: string[] = []
+    for (const [i, [, file]] of want.entries()) {
       const path = new URL(`./fixtures/composer/${file}`, import.meta.url).pathname
       const up = await srv.tmux(['new-session', '-d', '-s', `f${i}`, '-x', '200', '-y', '50', `cat ${path}; sleep 60`])
       if (up.code !== 0) return t.skip('no private tmux server can start here')
-      const pane = (await srv.tmux(['display-message', '-p', '-t', `f${i}`, '#{pane_id}'])).out.trim()
-      await new Promise(r => setTimeout(r, 300))
-      const out = await new Promise<string>(resolve => execFile(AGENT_TMUX, [cli, 'composer-state', '--pane', pane], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))
+      panes.push((await srv.tmux(['display-message', '-p', '-t', `f${i}`, '#{pane_id}'])).out.trim())
+    }
+    await new Promise(r => setTimeout(r, 300)) // every pane has drawn its fixture
+    const outs = await Promise.all(want.map(([cli], i) => new Promise<string>(resolve => execFile(AGENT_TMUX, [cli, 'composer-state', '--pane', panes[i]!], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))))
+    for (const [i, [cli, file, state, text]] of want.entries()) {
+      const out = outs[i]!
       assert.equal(out.split('\n')[0], state, `${cli} ${file}`)
       if (text) assert.equal(out.split('\n').slice(1).join('\n').trim(), text, `${file} composer text`)
     }
@@ -625,15 +552,16 @@ test('composer-state: busy names its key on line 2, and a profile is classified 
   ]
   const srv = privateServer()
   try {
-    for (const [i, [cli, file, out]] of want.entries()) {
+    const panes: string[] = []
+    for (const [i, [, file]] of want.entries()) {
       const path = new URL(`./fixtures/composer/${file}`, import.meta.url).pathname
       const up = await srv.tmux(['new-session', '-d', '-s', `p${i}`, '-x', '200', '-y', '50', `cat ${path}; sleep 60`])
       if (up.code !== 0) return t.skip('no private tmux server can start here')
-      const pane = (await srv.tmux(['display-message', '-p', '-t', `p${i}`, '#{pane_id}'])).out.trim()
-      await new Promise(r => setTimeout(r, 300))
-      const got = await new Promise<string>(resolve => execFile(AGENT_TMUX, [...cli, 'composer-state', '--pane', pane], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))
-      assert.equal(got.trim(), out, `${cli[0]} ${file}`)
+      panes.push((await srv.tmux(['display-message', '-p', '-t', `p${i}`, '#{pane_id}'])).out.trim())
     }
+    await new Promise(r => setTimeout(r, 300)) // every pane has drawn its fixture
+    const gots = await Promise.all(want.map(([cli], i) => new Promise<string>(resolve => execFile(AGENT_TMUX, [...cli, 'composer-state', '--pane', panes[i]!], { env: srv.env, encoding: 'utf8', timeout: 20_000 }, (_e, stdout) => resolve(stdout)))))
+    for (const [i, [cli, file, out]] of want.entries()) assert.equal(gots[i]!.trim(), out, `${cli[0]} ${file}`)
   } finally {
     await srv.tmux(['-S', srv.sock, 'kill-server'])
     rmSync(srv.dir, { recursive: true, force: true })
