@@ -1493,10 +1493,19 @@ export const register: Register = on => {
     // never skips the rows. Each is single-flight on its own.
     panel.timer = every(MIRROR_MS, async () => {
       if (!panel.open || panel.generation !== mine) return
-      const rowsJob = refresh().catch(error => {
-        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
-        return false
-      })
+      const paint = () => {
+        if (panel.open && panel.generation === mine) redraw()
+      }
+      // Each job paints when its own result lands. Waiting for both held a finished mirror behind a slow rows read, and the reverse.
+      const rowsJob = refresh()
+        .then(fresh => {
+          if (fresh) paint()
+          return fresh
+        })
+        .catch(error => {
+          bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
+          return false
+        })
       // Single-flight: a capture slower than the 2s tick must not start a second
       // subprocess on top of itself, and two in-flight captures could land out of
       // order and show older output than what is already on screen.
@@ -1523,13 +1532,13 @@ export const register: Register = on => {
         } else {
           panel.mirror = undefined
         }
+        paint()
         return true
       }
-      const [fresh, mirrored] = await Promise.all([rowsJob, mirrorJob().catch(error => {
+      await Promise.all([rowsJob, mirrorJob().catch(error => {
         bound.log(`tmux-agent: panel mirror failed: ${String(error)}`)
         return false
       })])
-      if ((fresh || mirrored) && panel.open && panel.generation === mine) redraw()
     })
     return undefined
   }

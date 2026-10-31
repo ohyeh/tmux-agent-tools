@@ -2119,7 +2119,7 @@ function mockPanel(
   refuseWake = false,
   /** What `$.agent.list()` answers while the panel is open. `'reject'` throws. */
   agents: 'reject' | readonly { id: string; description: string; type: string; status: string }[] = [],
-): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[]; toasts: string[] } {
+): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[]; toasts: string[]; counts: { invalidates: number } } {
   const argv: (readonly string[])[] = []
   const statuses: unknown[] = []
   const toasts: string[] = []
@@ -2147,7 +2147,11 @@ function mockPanel(
     closed.push(e.id)
     return { value: undefined }
   })
-  on('ui.invalidate', () => ({ value: undefined }))
+  const counts = { invalidates: 0 }
+  on('ui.invalidate', () => {
+    counts.invalidates += 1
+    return { value: undefined }
+  })
   // The band's floor, as core answers it: its own (empty) drawing. The mod's
   // `next(e)` resolves to this and nests it under its rows.
   on('ui.render', () => ({ type: 'engine', ref: 0 }))
@@ -2210,7 +2214,7 @@ function mockPanel(
         stderr: '', isStdoutTruncated: (isLs || isList) && probe.truncated === true, isStderrTruncated: false },
     }
   })
-  return { argv, open, closed, logs, statuses, toasts }
+  return { argv, open, closed, logs, statuses, toasts, counts }
 }
 
 const captures = (argv: (readonly string[])[]) => argv.filter(a => a.includes('capture'))
@@ -2274,6 +2278,51 @@ describe('panel', () => {
 
     expect(captures(panel.argv).length, 'the rows job is busy; the mirror job still ticked and captured').toEqual(afterPress + 1)
     release()
+  })
+
+  test('a finished mirror redraws while the rows read is still pending (FR-05)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const probe: Record<string, unknown> = { running: true, idle_seconds: 60 }
+    const panel = mockPanel(on, probe, 'NEW OUTPUT')
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+    let release = () => {}
+    probe.holdRows = new Promise<void>(resolve => { release = resolve })
+    const before = panel.counts.invalidates
+    const captured = captures(panel.argv).length
+    await clock.advance(2_000)
+    await settle()
+    expect(captures(panel.argv).length, 'the mirror finished').toBeGreaterThan(captured)
+    expect(panel.counts.invalidates, 'redraw while rows are pending').toBeGreaterThan(before)
+    release()
+    await settle()
+  })
+
+  test('finished rows redraw while the mirror capture is still pending (FR-05)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const gate = { pending: 0 }
+    const panel = mockPanel(on, { running: true, idle_seconds: 60 }, 'NEW OUTPUT', false, gate)
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+    const before = panel.counts.invalidates
+    await clock.advance(2_000)
+    await settle()
+    expect(gate.pending, 'the mirror is still in flight').toEqual(1)
+    expect(panel.counts.invalidates, 'redraw while the mirror is pending').toBeGreaterThan(before)
+    gate.release?.()
+    await settle()
   })
 
   test('the header says how old the rows are, and the age keeps moving while a rows read is stuck (BD7)', WITH_DRIVER, async ($, on) => {
