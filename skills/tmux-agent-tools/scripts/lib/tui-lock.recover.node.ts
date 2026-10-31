@@ -151,7 +151,6 @@ test('T2 recover: a second recoverer does not delete a live holder or overwrite 
         liveRemoved = sawLive && !existsSync(holderPath)
         return result
       }
-      if (argv[0] === 'sleep') return { exitCode: 0, stdout: '', stderr: '' }
       return base.run(argv, cwd, ms)
     },
   }

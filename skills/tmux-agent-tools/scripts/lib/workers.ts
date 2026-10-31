@@ -3538,7 +3538,7 @@ async function withTuiLock<T>(
         recovered = true
         if (await recoverTuiLock(host, lock, me)) continue
       }
-      if (i + 1 < TUI_LOCK_TRIES) await host.run(['sleep', String(TUI_LOCK_WAIT_MS / 1000)], '/', 1_000).catch(() => undefined)
+      if (i + 1 < TUI_LOCK_TRIES) await new Promise<void>(resolve => { setTimeout(resolve, TUI_LOCK_WAIT_MS) })
       continue
     }
     let value: T | undefined
