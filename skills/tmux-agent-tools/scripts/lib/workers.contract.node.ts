@@ -2485,7 +2485,34 @@ test('zshRun: a path runs as zsh <path>; a bare name is found by the child\'s PA
   }
 })
 
+// One queue: these tests write process.env, and node:test runs them in parallel.
+let termEnv: Promise<void> = Promise.resolve()
+function holdTermEnv<T>(body: () => Promise<T>): Promise<T> {
+  const prev = termEnv
+  let release!: () => void
+  termEnv = new Promise<void>(r => { release = r })
+  return prev.then(body).finally(release)
+}
+function withTermEnv(term: string | undefined, ssh: string | undefined, body: () => Promise<void>): Promise<void> {
+  return holdTermEnv(async () => {
+    const saved = { term: process.env.TERM_PROGRAM, ssh: process.env.SSH_TTY }
+    if (term === undefined) delete process.env.TERM_PROGRAM
+    else process.env.TERM_PROGRAM = term
+    if (ssh === undefined) delete process.env.SSH_TTY
+    else process.env.SSH_TTY = ssh
+    try {
+      await body()
+    } finally {
+      if (saved.term === undefined) delete process.env.TERM_PROGRAM
+      else process.env.TERM_PROGRAM = saved.term
+      if (saved.ssh === undefined) delete process.env.SSH_TTY
+      else process.env.SSH_TTY = saved.ssh
+    }
+  })
+}
+
 test('C02: envTermProgram and envSshTty come from the host', async () => {
+  await holdTermEnv(async () => {
   const saved = { term: process.env.TERM_PROGRAM, ssh: process.env.SSH_TTY }
   process.env.TERM_PROGRAM = 'from-process-env'
   process.env.SSH_TTY = '/dev/pts/process'
@@ -2510,6 +2537,7 @@ test('C02: envTermProgram and envSshTty come from the host', async () => {
     if (saved.ssh === undefined) delete process.env.SSH_TTY
     else process.env.SSH_TTY = saved.ssh
   }
+  })
 })
 
 test('C13: observeRows records no pane probe; sweepStalls probes with wakes off', async () => {
@@ -2776,8 +2804,10 @@ test('T3: Warp writes one launch file and opens it through the host', async () =
   const core = await import('./workers.ts')
   const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
   const sentinel = '/abs/' + 'p'.repeat(220) + '/tmux-agent-tui'
+  await withTermEnv('Apple_Terminal', undefined, async () => {
   try {
     assert.notEqual(process.env.TERM_PROGRAM, 'WarpTerminal')
+    assert.equal(process.env.SSH_TTY, undefined)
     const { host, calls, writes } = terminalHost({ term: 'WarpTerminal' })
     const ctx = tuiCtx(dir, { argv: [sentinel, '--session', 'abcdefgh-one'] })
     const opened = await core.openInTerminal(host, ctx, 'Band', true)
@@ -2796,12 +2826,15 @@ test('T3: Warp writes one launch file and opens it through the host', async () =
     assert.equal(open[1], `warp://launch/${encodeURIComponent(`tmux-agent-tui-${key}-tokA`)}`)
     assert.equal(calls.some(a => a[0] === 'osascript' || a.includes('split-window')), false)
   } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
 })
 
 test('T3: sessions that share an 8-character prefix get different Warp files', async () => {
   const core = await import('./workers.ts')
   const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
+  await withTermEnv('Apple_Terminal', undefined, async () => {
   try {
+    assert.notEqual(process.env.TERM_PROGRAM, 'WarpTerminal')
     const { host } = terminalHost({ term: 'WarpTerminal' })
     await core.openInTerminal(host, tuiCtx(dir, { session: 'abcdefgh-one', launchToken: 'tok1' }), 'A', false)
     await core.openInTerminal(host, tuiCtx(dir, { session: 'abcdefgh-two', launchToken: 'tok2' }), 'B', false)
@@ -2812,11 +2845,14 @@ test('T3: sessions that share an 8-character prefix get different Warp files', a
     assert.equal(names[0]!.includes(sessionKey('abcdefgh-one')), true)
     assert.equal(names[1]!.includes(sessionKey('abcdefgh-two')), true)
   } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
 })
 
 test('T3: iTerm2 passes the command as an osascript argument', async () => {
   const core = await import('./workers.ts')
   const sentinel = 'SENTINEL-not-in-the-script'
+  await withTermEnv('WarpTerminal', undefined, async () => {
+  assert.notEqual(process.env.TERM_PROGRAM, 'iTerm.app')
   const { host, calls, writes } = terminalHost({ term: 'iTerm.app' })
   const opened = await core.openInTerminal(host, tuiCtx('/no/write', { argv: ['/abs/bin/tmux-agent-tui', sentinel], launchDir: undefined }), 'Band', false)
   assert.equal(opened.kind, 'sent')
@@ -2830,11 +2866,14 @@ test('T3: iTerm2 passes the command as an osascript argument', async () => {
   assert.equal(script.includes(sentinel), false)
   assert.ok(argv.some(a => a.includes(sentinel)))
   assert.equal(calls.some(a => a[0] === 'open'), false)
+  })
 })
 
 test('T3: Terminal.app passes the command as an osascript argument', async () => {
   const core = await import('./workers.ts')
   const sentinel = 'SENTINEL-terminal-argv'
+  await withTermEnv('WarpTerminal', undefined, async () => {
+  assert.notEqual(process.env.TERM_PROGRAM, 'Apple_Terminal')
   const { host, calls } = terminalHost({ term: 'Apple_Terminal' })
   const opened = await core.openInTerminal(host, tuiCtx('/no/write', { argv: ['/abs/bin/tmux-agent-tui', sentinel], launchDir: undefined }), 'Band', false)
   assert.equal(opened.kind, 'sent')
@@ -2847,10 +2886,12 @@ test('T3: Terminal.app passes the command as an osascript argument', async () =>
   assert.match(script, /do script/)
   assert.equal(script.includes(sentinel), false)
   assert.ok(argv.some(a => a.includes(sentinel)))
+  })
 })
 
 test('T3: an unknown terminal opens Terminal.app and says so', async () => {
   const core = await import('./workers.ts')
+  await withTermEnv('WarpTerminal', undefined, async () => {
   assert.notEqual(process.env.TERM_PROGRAM, 'Zed')
   const { host, calls } = terminalHost({ term: 'Zed' })
   const opened = await core.openInTerminal(host, tuiCtx('/no/write', { launchDir: undefined }), 'Band', false)
@@ -2861,12 +2902,15 @@ test('T3: an unknown terminal opens Terminal.app and says so', async () => {
   const argv = calls.find(a => a[0] === 'osascript')
   assert.ok(argv)
   assert.match(argv[argv.indexOf('-e') + 1] ?? '', /tell application "Terminal"/)
+  })
 })
 
 test('T3: SSH without a tmux pane fails and runs nothing', async () => {
   const core = await import('./workers.ts')
   const long = '/abs/' + 'q'.repeat(240) + '/tmux-agent-tui'
+  await withTermEnv('Apple_Terminal', undefined, async () => {
   assert.notEqual(process.env.SSH_TTY, '/dev/pts/t3-host')
+  assert.equal(process.env.SSH_TTY, undefined)
   const { host, calls, writes } = terminalHost({ term: 'WarpTerminal', ssh: '/dev/pts/t3-host' })
   const opened = await core.openInTerminal(host, tuiCtx('/no/write', { argv: [long], launchDir: undefined }), 'Band', false)
   assert.equal(opened.kind, 'failed')
@@ -2880,21 +2924,28 @@ test('T3: SSH without a tmux pane fails and runs nothing', async () => {
   assert.equal(blocked.kind, 'failed')
   assert.match(blocked.error, /cannot open a window on your machine over SSH/)
   assert.equal(beside.calls.some(a => a.includes('split-window') || a[0] === 'open'), false)
+  })
 })
 
 test('T3: allowSplit false never splits', async () => {
   const core = await import('./workers.ts')
   const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
+  await withTermEnv('Apple_Terminal', undefined, async () => {
   try {
+    assert.notEqual(process.env.TERM_PROGRAM, 'WarpTerminal')
     const { host, calls } = terminalHost({ term: 'WarpTerminal' })
     const opened = await core.openInTerminal(host, tuiCtx(dir, { pane: '%3' }), 'Band', false)
     assert.equal(opened.kind, 'sent')
     assert.equal(calls.some(a => a.includes('split-window')), false)
   } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
 })
 
 test('T3: a tmux pane with allowSplit splits on that socket', async () => {
   const core = await import('./workers.ts')
+  await withTermEnv('Apple_Terminal', '/dev/ttys000', async () => {
+  assert.notEqual(process.env.TERM_PROGRAM, 'WarpTerminal')
+  assert.notEqual(process.env.SSH_TTY, '/dev/pts/t3-host')
   const { host, calls, writes } = terminalHost({ term: 'WarpTerminal', ssh: '/dev/pts/t3-host', paneId: '%12' })
   const opened = await core.openInTerminal(host, tuiCtx('/no/write', { pane: '%3', launchDir: undefined }), 'Band', true)
   assert.equal(opened.kind, 'split')
@@ -2907,13 +2958,16 @@ test('T3: a tmux pane with allowSplit splits on that socket', async () => {
   assert.ok(argv.some(a => a.includes('/abs/state')) && argv.some(a => a.includes('/abs/sock')))
   assert.equal(calls.some(a => a[0] === 'open' || a[0] === 'osascript'), false)
   assert.deepEqual(writes, [])
+  })
 })
 
 test('T3: a failed open deletes only that launch file', async () => {
   const core = await import('./workers.ts')
   const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
   const long = '/abs/' + 'r'.repeat(240) + '/tmux-agent-tui'
+  await withTermEnv('Apple_Terminal', undefined, async () => {
   try {
+    assert.notEqual(process.env.TERM_PROGRAM, 'WarpTerminal')
     const key = sessionKey('abcdefgh-one')
     const other = join(dir, `tmux-agent-tui-${key}-tokOther.yaml`)
     const foreign = join(dir, 'tmux-agent-tui-someone-else.yaml')
@@ -2931,4 +2985,5 @@ test('T3: a failed open deletes only that launch file', async () => {
     assert.equal(readFileSync(other, 'utf8'), 'keep\n')
     assert.equal(readFileSync(foreign, 'utf8'), 'keep\n')
   } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
 })
