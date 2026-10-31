@@ -31,6 +31,7 @@ import {
   sameProject,
   claimTui,
   processId,
+  ageText,
   type Health,
 } from './workers.ts'
 import { sessionKey } from './ledger.ts'
@@ -390,7 +391,7 @@ test('picker: four liveness kinds, cwd order, claim ready, occupied stays viewer
   const unknownCwd = rebindHost(host, { session: 'dead-one' })
   assert.equal(unknownCwd.cwd(), undefined)
 
-  const warpHost = { ...host, envTermProgram: async () => 'WarpTerminal' }
+  const warpHost = { ...host, envTermProgram: async () => 'WarpTerminal', envTmuxPane: async () => undefined }
   const viewer: TuiState = { ...ownerState(), mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 }
   const liveIndex = listed.findIndex(e => e.session === 'live-one')
   const got = await applyPick(warpHost, root, viewer, liveIndex)
@@ -531,10 +532,6 @@ test('ownLocator: a real PTY tty is the iTerm and Terminal locator, and a pipe d
 })
 
 test('launch claims before the alt screen; occupied and stale stay out (T8)', async () => {
-  const prevPane = process.env.TMUX_PANE
-  const prevTmux = process.env.TMUX
-  delete process.env.TMUX_PANE
-  delete process.env.TMUX
   const err: string[] = []
   const stderrWrite = process.stderr.write.bind(process.stderr)
   process.stderr.write = ((chunk: string | Uint8Array) => {
@@ -568,6 +565,8 @@ test('launch claims before the alt screen; occupied and stale stay out (T8)', as
   const stdout = new Out()
   const base = nodeHost({ cwd: repo })
   base.envTmuxAgentDir = async () => root
+  base.envTmuxPane = async () => undefined
+  base.envTmuxSocket = async () => undefined
   const realRun = base.run.bind(base)
   const calls: string[][] = []
   base.run = async (argv, cwd, ms) => {
@@ -670,10 +669,6 @@ test('launch claims before the alt screen; occupied and stale stay out (T8)', as
     process.emit('SIGHUP')
     await first.catch(() => undefined)
     process.stderr.write = stderrWrite
-    if (prevPane === undefined) delete process.env.TMUX_PANE
-    else process.env.TMUX_PANE = prevPane
-    if (prevTmux === undefined) delete process.env.TMUX
-    else process.env.TMUX = prevTmux
   }
 })
 
@@ -702,7 +697,7 @@ test('jobs: slow rows do not delay the mirror; age grows in flight; r queues one
   })
   assert.equal(mirrorRan, true)
   assert.equal(rows.running, true)
-  assert.equal(mod.ageText(2_500, { running: true, queued: false, lastOk: 0 }), '更新 2s 前 …')
+  assert.equal(ageText(2_500, { running: true, queued: false, lastOk: 0 }), '更新 2s 前 …')
   mod.kickJob(rows, () => 0, async () => {
     rowRuns += 1
     return true
@@ -719,7 +714,7 @@ test('jobs: slow rows do not delay the mirror; age grows in flight; r queues one
   const failed = { running: false, queued: false, lastOk: 1_000 }
   await mod.kickJob(failed, () => 5_000, async () => false)
   assert.equal(failed.lastOk, 1_000)
-  assert.equal(mod.ageText(5_000, failed), '更新 4s 前')
+  assert.equal(ageText(5_000, failed), '更新 4s 前')
 })
 
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {
@@ -3177,7 +3172,7 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
   }
 })
 
-test('health on screen: observeView → the status line for collecting, paused, stale (C-health through runTui)', async () => {
+test('health on screen: observeRows → the status line for collecting, paused, stale (C-health through runTui)', async () => {
   const cases: [Parameters<typeof writeAct>[2], RegExp][] = [
     [{ beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }, /收件：collecting（mod）/],
     [{ beatAgoMs: 1_000, state: { channel: 'node', mode: 'auto', status: 'collecting', reason: 'host composer is busy; nothing pasted, retrying' } }, /收件：collecting（node） · host composer is busy/],

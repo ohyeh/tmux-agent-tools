@@ -74,7 +74,7 @@ import { parseArgs } from 'node:util'
 import { paneAlive, readCollectorRecord, serverSocket, type CollectorRecord } from './collector.node.ts'
 import { nodeHost } from './host.node.ts'
 import { acquireLock, maintainLock, probeHolder, switchChannel, underLock, unlinkHeld, type Holder } from './ledger.ts'
-import { holderProvablyAlive, maintainedOutcome, processId, randomBase36, rootOf, sessionDirOf, v3Of, type Host } from './workers.ts'
+import { holderProvablyAlive, isPaneId, maintainedOutcome, processId, randomBase36, rootOf, sessionDirOf, v3Of, type Host } from './workers.ts'
 
 const NODE_FLOOR = [22, 18, 0]
 /** How long a launcher waits for a lock whose holder provably runs (the holder's check-and-spawn). */
@@ -545,7 +545,7 @@ async function splitTui(hostPane: string, cwd: string, command: string[], sessio
   const r = await tmux([...args, ...command], socket)
   if (r.code !== 0) die(`could not open the TUI pane: ${r.err.trim().slice(-400) || `tmux exit ${r.code}`}`)
   const id = r.out.trim()
-  if (!/^%\d+$/.test(id)) die(`split did not name a pane id (got ${JSON.stringify(id)})`)
+  if (!isPaneId(id)) die(`split did not name a pane id (got ${JSON.stringify(id)})`)
   return id
 }
 
@@ -602,7 +602,7 @@ async function main(): Promise<void> {
   if (!session) usage('--session is required')
   if (!cwd || !cwd.startsWith('/')) usage('--cwd must be an absolute path')
   if (positionals.length === 0) usage('a TUI command is required after --')
-  if (!pane || !/^%\d+$/.test(pane)) usage(`--pane must be a tmux pane id like %3 (got ${pane ?? 'nothing'})`)
+  if (!pane || !isPaneId(pane)) usage(`--pane must be a tmux pane id like %3 (got ${pane ?? 'nothing'})`)
   if (socket && !socket.startsWith('/')) usage('--socket must be an absolute path')
   if (socket) {
     process.env.TMUX_AGENT_TMUX_SOCKET = socket

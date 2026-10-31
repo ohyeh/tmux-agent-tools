@@ -355,6 +355,10 @@ export type Host = {
   envPath: () => Promise<string | undefined>
   /** Which terminal app this process is in (C02). Core must not read process.env for this. */
   envTermProgram: () => Promise<string | undefined>
+  /** The tmux pane this process is in, if any (`TMUX_PANE`). Core must not read process.env for this. */
+  envTmuxPane: () => Promise<string | undefined>
+  /** The tmux server socket this process talks to: `TMUX_AGENT_TMUX_SOCKET`, else the first field of `TMUX`. */
+  envTmuxSocket: () => Promise<string | undefined>
   /** Set when this process is on an SSH tty (C02). Core must not read process.env for this. */
   envSshTty: () => Promise<string | undefined>
   read: (path: string) => Promise<string>
@@ -2050,12 +2054,13 @@ export async function holderOf(host: Host, v3: string | undefined, d: TmuxDispat
   return beats.get(d.owner) ? d.owner.slice(0, 8) : 'unknown'
 }
 
-export async function panelRows(host: Host, gate: Gate, root: string | undefined): Promise<PanelRow[]> {
+/** `known`: a scan the caller just made (`observeRows`), so the ledger is not read twice. */
+export async function panelRows(host: Host, gate: Gate, root: string | undefined, known?: Scan): Promise<PanelRow[]> {
   const now = await host.now()
   const beats = new Map<string, boolean>()
   const v3 = root && v3Of(root)
   // Every teammate of this repo, whoever dispatched it: see `Scan.visible`.
-  const scanned = await scan(host, { claim: false })
+  const scanned = known ?? await scan(host, { claim: false })
   const { visible: dispatches, reported, withheld } = scanned
   // A teammate whose result was already delivered is still a teammate: while
   // its pane is alive you can tell it more or stop it, so it stays listed as
@@ -2500,15 +2505,15 @@ export async function recoverUnsent(host: Host, dirs: readonly string[]): Promis
  * and beat (C-health); a view without a session has no collector (`none`).
  *
  * `observeRows` is health, scan and projects. It never probes panes (C13).
- * `sweepStalls` is that probe. `observeView` still runs both, for the TUI.
+ * `sweepStalls` is that probe. It returns its scan, so a rows job reads the ledger once.
  */
-export async function observeRows(host: Host, gate: Gate, root: string): Promise<readonly TmuxDispatch[]> {
+export async function observeRows(host: Host, gate: Gate, root: string): Promise<Scan> {
   const me = host.owner()
   gate.viewHealth = me ? await readActHealth(host, v3Of(root), me, await host.now()) : { kind: 'none' }
   const scanned = await scan(host, { claim: false })
   gate.viewError = scanned.error ?? (scanned.complete ? undefined : 'some worker records could not be read (see the log)')
   await refreshProjects(host, gate, scanned.visible)
-  return scanned.visible
+  return scanned
 }
 
 /** View stall sweep: `flagStalls` with wakes off. A rows job must not call this (C13). */
@@ -2516,10 +2521,6 @@ export async function sweepStalls(host: Host, gate: Gate, root: string, live: re
   // `live` is the set `panelRows` draws. Probing only `dispatches` would
   // leave another session's row as `running` when its pane is waiting.
   await flagStalls(host, gate, v3Of(root), live, live, false)
-}
-
-export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
-  await sweepStalls(host, gate, root, await observeRows(host, gate, root))
 }
 
 // ── collector health (plan §1b C-health) ───────────────────────────────────────
@@ -3470,6 +3471,17 @@ export function tuiLaunchPath(dir: string, session: string, token: string): stri
   return `${dir}/${tuiLaunchStem(session, token)}.yaml`
 }
 
+/**
+ * Where Warp leaves this TUI's launch file: outside tmux and in Warp only. Inside a pane,
+ * never touch ~/.warp. The mod's band does not use this guard: it reclaims the file anywhere.
+ */
+export async function tuiLaunchDir(host: Host): Promise<string | undefined> {
+  if (await host.envTmuxPane()) return undefined
+  if (!/warp/i.test((await host.envTermProgram()) ?? '')) return undefined
+  const home = await host.envHome()
+  return home ? `${home}/.warp/launch_configurations` : undefined
+}
+
 async function dropStaging(host: Host, staging: string): Promise<void> {
   await host.run(['rm', '-rf', staging], '/', 5_000).catch(() => undefined)
 }
@@ -3557,6 +3569,14 @@ async function recoverTuiLock(host: Host, lock: string, me: ProcessId): Promise<
   return true
 }
 
+/** A stub `run` can report mkdir success without creating the directory. Do not go on then: `host.write` would still create files. Returns the dir, or undefined. */
+export async function ensureSessionDir(host: Host, root: string, session: string): Promise<string | undefined> {
+  const dir = sessionDirOf(v3Of(root), session)
+  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
+  if (!made || made.exitCode !== 0) return undefined
+  return (await host.exists(dir).catch(() => false)) ? dir : undefined
+}
+
 async function withTuiLock<T>(
   host: Host,
   root: string,
@@ -3564,10 +3584,9 @@ async function withTuiLock<T>(
   me: ProcessId,
   body: (dir: string) => Promise<T>,
 ): Promise<{ ok: true; value: T } | { ok: false; reason: string }> {
-  const dir = sessionDirOf(v3Of(root), session)
+  const dir = await ensureSessionDir(host, root, session)
+  if (!dir) return { ok: false, reason: 'session dir' }
   const lock = `${dir}/tui.owner.lock`
-  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
-  if (!made || made.exitCode !== 0) return { ok: false, reason: 'session dir' }
   let recovered = false
   for (let i = 0; i < TUI_LOCK_TRIES; i++) {
     const pub = await publishTuiLock(host, dir, me)
@@ -3610,11 +3629,6 @@ async function readTuiOwner(host: Host, dir: string): Promise<TuiOwner | undefin
   const path = `${dir}/tui.owner`
   try {
     if (!(await host.exists(path))) return undefined
-  } catch (error) {
-    host.log(`tmux-agent: could not read ${path}: ${errorClass(error)} ${String(error)}`)
-    return 'bad'
-  }
-  try {
     const parsed = parseJson(await host.read(path))
     return tuiOwnerOk(parsed) ? parsed : 'bad'
   } catch (error) {
@@ -3668,12 +3682,9 @@ export async function claimTui(host: Host, root: string, session: string, me: Pr
       if (slot === 'occupied-unknown') return { kind: slot, claim: cur }
       if (cur.state === 'pending' && opts.launchDir) {
         const target = tuiLaunchPath(opts.launchDir, session, cur.token)
-        const fail = await dropLaunchFile(host, target, '/')
-        if (fail) {
-          const detail = 'error' in fail
-            ? `${errorClass(fail.error)} ${String(fail.error)}`
-            : `exit ${fail.exitCode} ${fail.stderr.trim()}`
-          host.log(`tmux-agent: could not remove ${target}: ${detail}`)
+        const left = await dropLaunchFile(host, target, '/')
+        if (left) {
+          host.log(`tmux-agent: could not remove ${target}: ${left}`)
           return { kind: 'occupied-unknown' as const, claim: cur }
         }
       }
@@ -3838,26 +3849,15 @@ function warpYaml(configName: string, title: string, cwd: string, exec: string):
   ].join('\n')
 }
 
-// Callers disagree: a claim aborts, the TUI only logs, the band ignores a non-zero exit, Warp puts the note in stderr.
-export async function dropLaunchFile(
-  host: Host,
-  file: string,
-  cwd: string,
-): Promise<{ exitCode: number; stderr: string } | { error: unknown } | undefined> {
+/** Remove one launch file. Returns the failure detail, or undefined when the file is gone. Callers disagree on what a failure means: a claim aborts, the TUI and the band log, Warp puts it in stderr. */
+export async function dropLaunchFile(host: Host, file: string, cwd: string): Promise<string | undefined> {
   try {
     const rm = await host.run(['rm', '-f', file], cwd, 5_000)
-    if (rm.exitCode !== 0) return { exitCode: rm.exitCode, stderr: rm.stderr }
+    if (rm.exitCode !== 0) return `exit ${rm.exitCode} ${rm.stderr.trim()}`
   } catch (error) {
-    return { error }
+    return `${errorClass(error)} ${String(error)}`
   }
   return undefined
-}
-
-function launchLeft(file: string, fail: { exitCode: number; stderr: string } | { error: unknown } | undefined): string | undefined {
-  if (!fail) return undefined
-  return 'error' in fail
-    ? `${file} remains: ${errorClass(fail.error)} ${String(fail.error)}`
-    : `${file} remains: exit ${fail.exitCode} ${fail.stderr.trim()}`
 }
 
 async function openWarp(host: Host, ctx: LaunchContext, name: string, line: string): Promise<OpenResult> {
@@ -3865,11 +3865,15 @@ async function openWarp(host: Host, ctx: LaunchContext, name: string, line: stri
   if (!ctx.launchDir) return { kind: 'failed', error: 'no launch directory', stderr: '', command: line }
   const configName = tuiLaunchStem(ctx.session, ctx.launchToken)
   const file = tuiLaunchPath(ctx.launchDir, ctx.session, ctx.launchToken)
+  const launchDir = ctx.launchDir
+  const fail = async (error: string, stderr: string, command: string): Promise<OpenResult> => {
+    const left = await dropLaunchFile(host, file, launchDir)
+    return { kind: 'failed', error, stderr: left ? `${stderr}; ${file} remains: ${left}` : stderr, command }
+  }
   try {
     await host.write(file, warpYaml(configName, name, ctx.cwd, line))
   } catch (error) {
-    const left = launchLeft(file, await dropLaunchFile(host, file, ctx.launchDir))
-    return { kind: 'failed', error: errorClass(error), stderr: left ? `${String(error)}; ${left}` : String(error), command: line }
+    return fail(errorClass(error), String(error), line)
   }
   const argv = ['open', `warp://launch/${encodeURIComponent(configName)}`]
   // The file is removed on failure, so the launch line has to travel with the open command.
@@ -3878,13 +3882,9 @@ async function openWarp(host: Host, ctx: LaunchContext, name: string, line: stri
   try {
     run = await host.run(argv, ctx.cwd, 5_000)
   } catch (error) {
-    const left = launchLeft(file, await dropLaunchFile(host, file, ctx.launchDir))
-    return { kind: 'failed', error: errorClass(error), stderr: left ? `${String(error)}; ${left}` : String(error), command }
+    return fail(errorClass(error), String(error), command)
   }
-  if (run.exitCode !== 0) {
-    const left = launchLeft(file, await dropLaunchFile(host, file, ctx.launchDir))
-    return { kind: 'failed', error: 'open', stderr: left ? `${run.stderr}; ${left}` : run.stderr, command }
-  }
+  if (run.exitCode !== 0) return fail('open', run.stderr, command)
   return { kind: 'sent', terminal: 'warp' }
 }
 
@@ -3899,6 +3899,29 @@ async function openAppleScript(host: Host, ctx: LaunchContext, script: string, l
   }
   if (run.exitCode !== 0) return { kind: 'failed', error: 'osascript', stderr: run.stderr, command }
   return notice ? { kind: 'sent', terminal, notice } : { kind: 'sent', terminal }
+}
+
+/** Point a `tmux` call at one server: `-S socket` after the binary, unless the call already names a server. */
+export function withTmuxSocket(argv: readonly string[], socket: string | undefined): string[] {
+  const cmd = [...argv]
+  const bin = cmd[0] ?? ''
+  if (socket && (bin === 'tmux' || bin.endsWith('/tmux')) && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', socket)
+  return cmd
+}
+
+/** One job's run state, for `ageText`. */
+export type Flight = { running: boolean; queued: boolean; lastOk?: number }
+
+/** `更新 Ns 前`, plus ` …` while that job is still in flight. A failed run leaves `lastOk` alone. */
+export function ageText(now: number, flight: Flight): string {
+  const base = flight.lastOk ?? now
+  const n = Math.max(0, Math.floor((now - base) / 1000))
+  return `更新 ${n}s 前${flight.running ? ' …' : ''}`
+}
+
+/** A tmux pane id: `%` and digits. */
+export function isPaneId(s: string): boolean {
+  return /^%\d+$/.test(s)
 }
 
 /** Display name for a terminal locator. An absent or tmux locator is Terminal.app, matching the ready-focus fallback. */
@@ -3916,7 +3939,7 @@ export function appLabel(kind: string | undefined): string {
  */
 export async function openInTerminal(host: Host, ctx: LaunchContext, name: string, allowSplit: boolean): Promise<OpenResult> {
   const line = launchLine(ctx)
-  if (allowSplit && ctx.pane && /^%\d+$/.test(ctx.pane)) {
+  if (allowSplit && ctx.pane && isPaneId(ctx.pane)) {
     const socket = ctx.env.TMUX_AGENT_TMUX_SOCKET
     const argv = [
       'tmux',
@@ -3934,7 +3957,7 @@ export async function openInTerminal(host: Host, ctx: LaunchContext, name: strin
       return { kind: 'failed', error: errorClass(error), stderr: String(error), command }
     }
     const pane = run.stdout.trim()
-    if (run.exitCode !== 0 || !/^%\d+$/.test(pane)) return { kind: 'failed', error: 'tmux', stderr: run.stderr, command }
+    if (run.exitCode !== 0 || !isPaneId(pane)) return { kind: 'failed', error: 'tmux', stderr: run.stderr, command }
     return { kind: 'split', locator: { kind: 'tmux', ...(socket ? { socket } : {}), pane } }
   }
   let ssh: string | undefined

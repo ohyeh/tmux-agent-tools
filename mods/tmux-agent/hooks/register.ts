@@ -77,6 +77,7 @@ import {
   focusTui,
   openInTerminal,
   dropLaunchFile,
+  isPaneId,
   tuiLaunchPath,
   appLabel,
   processId,
@@ -533,6 +534,8 @@ export const register: Register = on => {
       envHome: () => beneath.env.get('HOME'),
       envPath: () => beneath.env.get('PATH'),
       envTermProgram: () => beneath.env.get('TERM_PROGRAM'),
+      envTmuxPane: () => beneath.env.get('TMUX_PANE'),
+      envTmuxSocket: async () => (await beneath.env.get('TMUX_AGENT_TMUX_SOCKET')) || (await beneath.env.get('TMUX'))?.split(',')[0],
       envSshTty: () => beneath.env.get('SSH_TTY'),
       read: path => beneath.fs.read(path),
       write: (path, text) => beneath.fs.write(path, text),
@@ -606,6 +609,8 @@ export const register: Register = on => {
       envHome: () => $.env.get('HOME'),
       envPath: () => $.env.get('PATH'),
       envTermProgram: () => $.env.get('TERM_PROGRAM'),
+      envTmuxPane: () => $.env.get('TMUX_PANE'),
+      envTmuxSocket: async () => (await $.env.get('TMUX_AGENT_TMUX_SOCKET')) || (await $.env.get('TMUX'))?.split(',')[0],
       envSshTty: () => $.env.get('SSH_TTY'),
       read: path => $.fs.read(path),
       write: (path, text) => $.fs.write(path, text),
@@ -889,7 +894,7 @@ export const register: Register = on => {
           session,
           launchToken: token,
           ...(launchDir ? { launchDir } : {}),
-          ...(pane && /^%\d+$/.test(pane) ? { pane } : {}),
+          ...(pane && isPaneId(pane) ? { pane } : {}),
         },
         'tmux-agent tui',
         true,
@@ -908,8 +913,8 @@ export const register: Register = on => {
         })
         if (!released) return
         if (launchFile) {
-          const fail = await dropLaunchFile(host, launchFile, '/')
-          if (fail && 'error' in fail) host.log(`tmux-agent: tui launch file ${launchFile} remains: ${String(fail.error)}`)
+          const left = await dropLaunchFile(host, launchFile, '/')
+          if (left) host.log(`tmux-agent: tui launch file ${launchFile} remains: ${left}`)
         }
         host.toast('tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手，已取消這次開啟；再按 [ ⧉ tui ] 重試')
       })

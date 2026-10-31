@@ -2547,9 +2547,11 @@ test('C13: observeRows records no pane probe; sweepStalls probes with wakes off'
     const duringSweep = w.calls.slice(marked).filter(c => statusSweep(c.argv))
     assert.ok(duringSweep.length > 0, `sweep argv: ${JSON.stringify(w.calls.slice(marked).map(c => c.argv))}`)
     const atView = w.calls.length
-    await core.observeView(w.host, newGate(), w.root)
+    const viewGate = newGate()
+    const scanned = await observeRows(w.host, viewGate, w.root)
+    await sweepStalls(w.host, viewGate, w.root, scanned.visible)
     const viewProbes = w.calls.slice(atView).filter(c => statusSweep(c.argv))
-    assert.ok(viewProbes.length > 0, `observeView argv: ${JSON.stringify(w.calls.slice(atView).map(c => c.argv))}`)
+    assert.ok(viewProbes.length > 0, `rows then sweep argv: ${JSON.stringify(w.calls.slice(atView).map(c => c.argv))}`)
   } finally {
     rmSync(w.root, { recursive: true, force: true })
     rmSync(w.repo, { recursive: true, force: true })

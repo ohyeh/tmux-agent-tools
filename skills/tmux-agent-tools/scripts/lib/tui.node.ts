@@ -73,12 +73,18 @@ import {
   releaseTui,
   focusTui,
   dropLaunchFile,
+  ensureSessionDir,
+  tuiLaunchDir,
   tuiLaunchPath,
+  withTmuxSocket,
+  ageText,
+  type Flight,
   processId,
   readActHealth,
   sessionDirOf,
   v3Of,
   type ProcessId,
+  type Scan,
   type TuiClaimResult,
   type TuiFocus,
   type TuiLocator,
@@ -1383,12 +1389,7 @@ export function rebindHost(base: Host, identity: TuiBind): Host {
     ...base,
     owner: () => identity.session,
     cwd: () => identity.cwd,
-    run: async (argv, cwd, ms) => {
-      const cmd = [...argv]
-      const bin = cmd[0] ?? ''
-      if (identity.socket && (bin === 'tmux' || bin.endsWith('/tmux')) && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', identity.socket)
-      return base.run(cmd, cwd, ms)
-    },
+    run: (argv, cwd, ms) => base.run(withTmuxSocket(argv, identity.socket), cwd, ms),
   }
 }
 
@@ -1497,9 +1498,9 @@ function ownStdoutTty(): { tty: string } | { error: string } {
 export async function ownLocator(host: Host, session: string): Promise<TuiLocator | undefined> {
   const term = (await host.envTermProgram()) ?? ''
   const title = `tmux-agent-tui ${session.slice(0, 8)}`
-  const pane = process.env.TMUX_PANE
+  const pane = await host.envTmuxPane()
   if (pane) {
-    const socket = process.env.TMUX_AGENT_TMUX_SOCKET || process.env.TMUX?.split(',')[0]
+    const socket = await host.envTmuxSocket()
     return { kind: 'tmux', pane, ...(socket ? { socket } : {}) }
   }
   if (/warp/i.test(term)) return { kind: 'warp', tabTitle: title }
@@ -1556,14 +1557,6 @@ function focusLine(focus: TuiFocus): string {
   return `已有 TUI（ready），raised: app${focus.tabTitle ? ` ${focus.tabTitle}` : ''}`
 }
 
-/** A stub `run` can report mkdir success without creating the directory. Do not claim then: `host.write` would still create files. */
-async function sessionDirReady(host: Host, root: string, session: string): Promise<boolean> {
-  const dir = sessionDirOf(v3Of(root), session)
-  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
-  if (!made || made.exitCode !== 0) return false
-  return host.exists(dir).catch(() => false)
-}
-
 type LaunchClaim =
   | { kind: 'skip' }
   | { kind: 'stop'; code: number }
@@ -1571,7 +1564,7 @@ type LaunchClaim =
 
 /** Identity claims before the terminal is touched. No identity, or a mkdir that did not stick, skips the claim. */
 async function claimLaunch(host: Host, root: string, session: string, opts: { claim?: string; launchDir?: string }): Promise<LaunchClaim> {
-  if (!(await sessionDirReady(host, root, session))) return { kind: 'skip' }
+  if (!(await ensureSessionDir(host, root, session))) return { kind: 'skip' }
   const me = await processId(host)
   if (!(me.pid > 0 && me.pidStart)) return { kind: 'skip' }
   const locator = await ownLocator(host, session)
@@ -1596,8 +1589,7 @@ async function claimLaunch(host: Host, root: string, session: string, opts: { cl
   }
   if (opts.launchDir) {
     const target = tuiLaunchPath(opts.launchDir, session, result.claim.token)
-    const fail = await dropLaunchFile(host, target, '/')
-    if (fail) host.log(`tmux-agent: could not remove ${target}`)
+    if (await dropLaunchFile(host, target, '/')) host.log(`tmux-agent: could not remove ${target}`)
   }
   return { kind: 'held', held: { session, token: result.claim.token, me } }
 }
@@ -1605,15 +1597,6 @@ async function claimLaunch(host: Host, root: string, session: string, opts: { cl
 export const ROWS_MS = 2_000
 export const SWEEP_MS = 10_000
 export const MIRROR_TICK_MS = 1_000
-
-export type Flight = { running: boolean; queued: boolean; lastOk?: number }
-
-/** `更新 Ns 前`, plus ` …` while that job is still in flight. A failed run leaves `lastOk` alone. */
-export function ageText(now: number, flight: Flight): string {
-  const base = flight.lastOk ?? now
-  const n = Math.max(0, Math.floor((now - base) / 1000))
-  return `更新 ${n}s 前${flight.running ? ' …' : ''}`
-}
 
 /** One run at a time. A kick during a run queues one more, and a second kick does not add another. */
 export async function kickJob(flight: Flight, now: () => number, run: () => Promise<boolean>): Promise<void> {
@@ -1687,11 +1670,12 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
 
   const rowsFlight: Flight = { running: false, queued: false }
   const sweepFlight: Flight = { running: false, queued: false }
-  let live: Awaited<ReturnType<typeof observeRows>> = []
+  let live: Scan['visible'] = []
   const runRows = async (): Promise<boolean> => {
-    if (root) live = await observeRows(host, gate, root)
+    const scanned = root ? await observeRows(host, gate, root) : undefined
+    if (scanned) live = scanned.visible
     state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
-    const rows = await panelRows(host, gate, root)
+    const rows = await panelRows(host, gate, root, scanned)
     state = { ...applyRowsTick(state, rows), loadError: state.loadError }
     return true
   }
@@ -2144,11 +2128,8 @@ async function main(): Promise<void> {
     process.stderr.write(`tui: ${(error as Error).message}\n`)
     process.exit(2)
   }
-  // Outside tmux, Warp's own launch file is removed at ready. Inside a pane, never touch ~/.warp.
-  let launchDir: string | undefined
-  if (!process.env.TMUX_PANE && /warp/i.test(process.env.TERM_PROGRAM ?? '') && process.env.HOME) {
-    launchDir = `${process.env.HOME}/.warp/launch_configurations`
-  }
+  // Outside tmux, Warp's own launch file is removed at ready.
+  const launchDir = await tuiLaunchDir(nodeHost())
   const code = await runTui({ session: values.session, cwd: values.cwd, claim: values.claim, launchDir })
   // Terminal already restored. A signal can arrive while an action's child still
   // runs; exit now instead of waiting for it (the old SIGINT/SIGTERM handler did too).
