@@ -2484,3 +2484,30 @@ test('zshRun: a path runs as zsh <path>; a bare name is found by the child\'s PA
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('C02: envTermProgram and envSshTty come from the host', async () => {
+  const saved = { term: process.env.TERM_PROGRAM, ssh: process.env.SSH_TTY }
+  process.env.TERM_PROGRAM = 'from-process-env'
+  process.env.SSH_TTY = '/dev/pts/process'
+  try {
+    const node = nodeHost({})
+    assert.equal(await node.envTermProgram(), 'from-process-env')
+    assert.equal(await node.envSshTty(), '/dev/pts/process')
+    delete process.env.TERM_PROGRAM
+    delete process.env.SSH_TTY
+    assert.equal(await node.envTermProgram(), undefined)
+    assert.equal(await node.envSshTty(), undefined)
+    const fake: Host = {
+      ...node,
+      envTermProgram: async () => 'from-fake-host',
+      envSshTty: async () => '/dev/fake-ssh',
+    }
+    assert.equal(await fake.envTermProgram(), 'from-fake-host')
+    assert.equal(await fake.envSshTty(), '/dev/fake-ssh')
+  } finally {
+    if (saved.term === undefined) delete process.env.TERM_PROGRAM
+    else process.env.TERM_PROGRAM = saved.term
+    if (saved.ssh === undefined) delete process.env.SSH_TTY
+    else process.env.SSH_TTY = saved.ssh
+  }
+})

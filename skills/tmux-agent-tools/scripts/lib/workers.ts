@@ -353,6 +353,10 @@ export type Host = {
   envXdgStateHome: () => Promise<string | undefined>
   envHome: () => Promise<string | undefined>
   envPath: () => Promise<string | undefined>
+  /** Which terminal app this process is in (C02). Core must not read process.env for this. */
+  envTermProgram: () => Promise<string | undefined>
+  /** Set when this process is on an SSH tty (C02). Core must not read process.env for this. */
+  envSshTty: () => Promise<string | undefined>
   read: (path: string) => Promise<string>
   write: (path: string, text: string) => Promise<void>
   stat: (path: string) => Promise<{ mtimeMs: number; size: number }>
