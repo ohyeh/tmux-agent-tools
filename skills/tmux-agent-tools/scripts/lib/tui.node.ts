@@ -80,7 +80,6 @@ import {
   ageText,
   type Flight,
   processId,
-  readActHealth,
   sessionDirOf,
   v3Of,
   type ProcessId,
@@ -149,11 +148,16 @@ export function graphemeWidth(g: string, ambiguous: number = ambiguousWidth()): 
   return widthOf(g, ambiguous)
 }
 
+/** Printable ASCII is one cell per character at any ambiguous width, and never joins into a longer grapheme. */
+const PRINTABLE_ASCII_RE = /^[\x20-\x7e]*$/
+
 /** Terminal cells of `text`. SGR escapes count 0. The TUI's one width function. */
 export function cellWidth(text: string): number {
+  const plain = stripAnsi(text)
+  if (PRINTABLE_ASCII_RE.test(plain)) return plain.length
   const amb = ambiguousWidth()
   let n = 0
-  for (const g of graphemes(stripAnsi(text))) n += graphemeWidth(g, amb)
+  for (const g of graphemes(plain)) n += graphemeWidth(g, amb)
   return n
 }
 
@@ -254,9 +258,15 @@ export function wrapCells(text: string, width: number): string[] {
   const amb = ambiguousWidth()
   const out: string[] = []
   for (const para of text.split('\n')) {
+    const plain = stripAnsi(sanitizeAnsi(para))
+    if (PRINTABLE_ASCII_RE.test(plain)) {
+      for (let i = 0; i < plain.length; i += width) out.push(plain.slice(i, i + width))
+      if (!plain.length) out.push('')
+      continue
+    }
     let line = ''
     let cur = 0
-    for (const g of graphemes(stripAnsi(sanitizeAnsi(para)))) {
+    for (const g of graphemes(plain)) {
       const w = graphemeWidth(g, amb)
       if (w > width) continue // a 2-cell grapheme in a 1-cell window
       if (cur + w > width) {
@@ -685,10 +695,10 @@ export function nextKeyState(
   // The one read-only gate: no key a viewer presses reaches an action (D-viewer).
   if (state.viewer && MUTATING_KEYS.has(key)) return say(state, READ_ONLY, now)
   // I3: 預覽 names the reason. 編輯 without an owner session does too.
-  if (MUTATING_KEYS.has(key) && (state.mode ?? 'preview') !== 'edit') return say(state, PREVIEW_ONLY, now)
+  if (MUTATING_KEYS.has(key) && state.mode !== 'edit') return say(state, PREVIEW_ONLY, now)
 
   if (key === 'e' || key === 'E') {
-    if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
+    if (state.mode === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
     if (state.viewer || !state.owner) return { state: { ...state, mode: 'picker', pickerIndex: 0 }, action: { type: 'openPicker' } }
     return { state: { ...state, mode: 'edit' } }
   }
@@ -828,7 +838,7 @@ export function nextKeyState(
     if (narrowScreen(screen) && (state.narrowView ?? 'list') === 'preview') {
       return { state: { ...state, narrowView: 'list' } }
     }
-    if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
+    if (state.mode === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
     if (state.selected) return { state: reselect(state, undefined) }
     return { state: { ...state, quit: true }, action: { type: 'quit' } }
   }
@@ -860,7 +870,7 @@ const hint = (key: string, label: string, words: boolean) => (words ? `[ ${key} 
 /** Header key hints, longest first; the renderer takes the first that fits (R4.6). */
 export function headerHints(state: TuiState, now: number): string[] {
   const clearArmed = state.armedStop?.id === CLEAR_ID && now < state.armedStop.until
-  const editing = (state.mode ?? 'preview') === 'edit' && !state.viewer
+  const editing = state.mode === 'edit' && !state.viewer
   const keys: [string, string][] = !editing
     ? [['e', '編輯'], ['r', 'refresh'], ['q', 'quit']]
     : [
@@ -880,7 +890,7 @@ export function headerHints(state: TuiState, now: number): string[] {
 export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
   if (r.project) return ['project session · read-only  b/f scroll', 'read-only']
   if (state.viewer) return [`${READ_ONLY}  Enter detail`, '唯讀']
-  if ((state.mode ?? 'preview') !== 'edit') return ['e 編輯 · ↑↓ 捲動 · Enter detail', 'e 編輯']
+  if (state.mode !== 'edit') return ['e 編輯 · ↑↓ 捲動 · Enter detail', 'e 編輯']
   const armed = (id: string) => state.armedStop?.id === id && now < state.armedStop.until
   const keys: [string, string][] = [['t', 'tell']]
   if (r.incomplete) return [`${hint('-', armed(`cancel:${r.id}`) ? 'clear unfinished reservation? press again' : 'clear', true)}  no worker.json`, hint('-', 'clear', true), hint('-', 'clear', false)]
@@ -932,18 +942,10 @@ export function detailText(r: PanelRow, det: EpisodeDetail): string[] {
 const BODY_CHROME = 2
 
 export type TuiLayout = {
-  status: number
-  /** Index of the first row shown, how many are shown, how many are not. */
-  first: number
-  list: number
-  hidden: number
-  /** The `+N more` line. */
-  more: number
-  /** Lines under the selected row before the body (summary, key hints). */
-  selExtra: number
-  /** Mirror or detail content rows: the preview rectangle's pane (I4). */
-  body: number
-  footer: number
+  frame: Frame
+  sections: Sections
+  /** The open detail wrapped once to the preview width (drawn, paged and measured from this); undefined unless the selected row's detail is expanded. */
+  detail?: string[]
 }
 
 export type Rect = { x: number; y: number; cols: number; rows: number }
@@ -1155,25 +1157,12 @@ function chromeLines(s: Sections): number {
 }
 
 /** The layout runTui sizes the capture and the detail page with: the same one render draws. */
-export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number; frame: Frame; sections: Sections } {
-  const s = sectionsOf(state, width, now, gate, height)
-  const frame = frameOf(width, height, state.rows.length, s.sel, chromeLines(s), state.narrowView ?? 'list')
+export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout {
+  const sections = sectionsOf(state, width, now, gate, height)
+  const frame = frameOf(width, height, state.rows.length, sections.sel, chromeLines(sections), state.narrowView ?? 'list')
   const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
-  const detailTotal = state.expanded && state.detail && state.detail.id === state.selected ? wrapCells(state.detail.lines.join('\n'), wrapW).length : 0
-  const shown = Math.max(0, state.rows.length - frame.hidden)
-  return {
-    status: s.status.length,
-    first: frame.list.first,
-    list: shown,
-    hidden: frame.hidden,
-    more: frame.more,
-    selExtra: s.sel >= 0 ? s.selExtra.length : 0,
-    body: frame.preview.rows,
-    footer: s.footer.length,
-    detailTotal,
-    frame,
-    sections: s,
-  }
+  const open = state.expanded && state.detail && state.detail.id === state.selected
+  return { frame, sections, ...(open ? { detail: wrapCells(state.detail!.lines.join('\n'), wrapW) } : {}) }
 }
 
 function rowLine(state: TuiState, index: number, selected: number): string {
@@ -1184,12 +1173,12 @@ function rowLine(state: TuiState, index: number, selected: number): string {
 }
 
 /** Detail slice or mirror slice for one preview. The standard painter keeps its own tail line. */
-function previewLines(state: TuiState, cols: number, bodyRows: number): string[] {
+function previewLines(state: TuiState, bodyRows: number, detail: string[] | undefined): string[] {
   const r = state.rows.find(row => row.id === state.selected)
   if (!r || bodyRows <= 0) return []
   const out: string[] = []
   if (state.expanded) {
-    const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), cols) : ['loading…']
+    const all = detail ?? ['loading…']
     const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyRows))
     for (const l of all.slice(top, top + bodyRows)) out.push(l || ' ')
     return out
@@ -1205,8 +1194,8 @@ function previewLines(state: TuiState, cols: number, bodyRows: number): string[]
 }
 
 /** Wide: list on the left, preview on the right, both as tall as the content band. */
-function renderWide(state: TuiState, width: number, height: number, s: Sections, lay: TuiLayout & { frame: Frame }): string[] {
-  const frame = lay.frame
+function renderWide(state: TuiState, width: number, height: number, lay: TuiLayout): string[] {
+  const { frame, sections: s } = lay
   const fit = (line: string, cols: number) => padCells(truncateAnsi(line, cols), cols)
   const lines: string[] = [s.title, ...s.status.map(l => truncateAnsi(l, width))]
   if (s.sel >= 0) lines.push(...s.selExtra.map(l => truncateAnsi(l, width)))
@@ -1216,7 +1205,7 @@ function renderWide(state: TuiState, width: number, height: number, s: Sections,
   if (frame.more) left.push(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`)
   const right: string[] = []
   const r = s.sel >= 0 ? state.rows[s.sel] : undefined
-  if (r && frame.preview.rows > 0) right.push(...previewLines(state, frame.preview.cols, frame.preview.rows))
+  if (r && frame.preview.rows > 0) right.push(...previewLines(state, frame.preview.rows, lay.detail))
   for (let i = 0; i < frame.list.rows; i++) {
     lines.push(fit(left[i] ?? '', frame.list.cols) + fit(right[i] ?? '', frame.preview.cols))
   }
@@ -1225,56 +1214,52 @@ function renderWide(state: TuiState, width: number, height: number, s: Sections,
   return lines.slice(0, height)
 }
 
-function linesFromLayout(
-  state: TuiState,
-  width: number,
-  height: number,
-  lay: TuiLayout & { frame: Frame; sections: Sections },
-  gate?: Gate,
-): string[] {
-  const s = lay.sections
+function linesFromLayout(state: TuiState, width: number, height: number, lay: TuiLayout, gate?: Gate): string[] {
+  const { frame, sections: s } = lay
   if (height <= 2) {
     const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
     return [s.title, truncateAnsi(compact, width)].slice(0, height)
   }
-  if (lay.frame.mode === 'wide') return renderWide(state, width, height, s, lay)
+  if (frame.mode === 'wide') return renderWide(state, width, height, lay)
   const fit = (line: string) => truncateAnsi(line, width)
-  const lines: string[] = [s.title, ...s.status.slice(0, lay.status).map(fit)]
+  const lines: string[] = [s.title, ...s.status.map(fit)]
 
-  for (let i = lay.first; i < lay.first + lay.list; i++) lines.push(fit(rowLine(state, i, s.sel)))
-  if (lay.more) lines.push(fit(`\x1b[2m  +${lay.hidden} more — j/k moves the selection\x1b[0m`))
+  const shown = Math.max(0, state.rows.length - frame.hidden)
+  for (let i = frame.list.first; i < frame.list.first + shown; i++) lines.push(fit(rowLine(state, i, s.sel)))
+  if (frame.more) lines.push(fit(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`))
 
   // The row list stays put above; the selected row's hints and preview come after it.
   const r = s.sel >= 0 ? state.rows[s.sel] : undefined
-  if (r) lines.push(...s.selExtra.slice(s.selExtra.length - lay.selExtra).map(fit))
-  if (r && lay.body > 0) {
-    // The preview owns its rule, `lay.body` rows and a tail line in every state, so
+  const bodyRows = frame.preview.rows
+  if (r) lines.push(...s.selExtra.map(fit))
+  if (r && bodyRows > 0) {
+    // The preview owns its rule, `bodyRows` rows and a tail line in every state, so
     // the frame is `height` rows and the footer stays at the bottom (T1 C1).
     const rule = `\x1b[2m${'─'.repeat(Math.max(0, Math.min(width, 60) - 1))}\x1b[0m`
-    const body = previewLines(state, width, lay.body)
+    const body = previewLines(state, bodyRows, lay.detail)
     let tail: string
     if (state.expanded) {
-      const all = state.detail?.id === r.id ? wrapCells(state.detail.lines.join('\n'), width) : ['loading…']
-      const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - lay.body))
-      const end = Math.min(all.length, top + lay.body)
+      const all = lay.detail ?? ['loading…']
+      const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyRows))
+      const end = Math.min(all.length, top + bodyRows)
       tail = `\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · b/f scroll · Enter mirror\x1b[0m`
     } else {
       const m = state.mirror?.id === r.id ? state.mirror : undefined
       const total = m?.lines.length ?? 0
-      const end = total - Math.min(state.back ?? 0, Math.max(0, total - lay.body))
+      const end = total - Math.min(state.back ?? 0, Math.max(0, total - bodyRows))
       tail =
         end < total
-          ? `\x1b[2mscrollback ${Math.max(1, end - lay.body + 1)}–${end} of ${total} · b/f scroll · f to the end follows live\x1b[0m`
+          ? `\x1b[2mscrollback ${Math.max(1, end - bodyRows + 1)}–${end} of ${total} · b/f scroll · f to the end follows live\x1b[0m`
           : r.project
             ? `\x1b[2mSee it whole: tmux attach -t ${exactSessionTarget(r.d.name)} · b scrollback\x1b[0m`
             : `\x1b[2mSee it whole: agent-tmux ${r.d.profile} attach ${r.d.name} · b scrollback\x1b[0m`
     }
     lines.push(fit(rule))
     for (const l of body) lines.push(fit(l))
-    for (let k = body.length; k < lay.body; k++) lines.push(' ')
+    for (let k = body.length; k < bodyRows; k++) lines.push(' ')
     lines.push(fit(tail))
   }
-  const footer = s.footer.slice(s.footer.length - lay.footer).map(fit)
+  const footer = s.footer.map(fit)
   // Every frame is `height` rows with the footer on the last ones, also when there is
   // no preview (no selection, or a window too short for one) (T1 C1/C5).
   while (lines.length + footer.length < height) lines.push(' ')
@@ -1366,6 +1351,7 @@ export interface TuiOptions {
   stdout?: NodeJS.WriteStream
   pollMs?: number
   mirrorMs?: number
+  rowsMs?: number
   /** Adopt this pending token (`--claim`). Any other current record is stale. */
   claim?: string
   /** Delete `tmux-agent-tui-<sessionKey>-<token>.yaml` here once the claim is ready. */
@@ -1375,7 +1361,6 @@ export interface TuiOptions {
 export type PickerEntry = {
   session: string
   liveness: Liveness
-  health: string
   cwd?: string
   cwdFrom: 'collector' | 'workers' | 'unknown'
   socket?: string
@@ -1412,36 +1397,34 @@ async function collectorBits(host: Host, dir: string, session: string): Promise<
   }
 }
 
-/** Workers of this owner that agree on one ownerCwd. `/` and disagreement are unknown. */
-async function agreedCwd(host: Host, v3: string, session: string): Promise<string | undefined> {
+/** Each owner's ownerCwd set across all workers: one worker.json read apiece. `/` and empty are unknown. */
+async function ownerCwds(host: Host, v3: string): Promise<Map<string, Set<string>>> {
+  const byOwner = new Map<string, Set<string>>()
   let names: readonly { name: string; kind: string }[]
   try {
     names = await host.list(v3)
   } catch {
-    return undefined
+    return byOwner
   }
-  const cwds = new Set<string>()
-  for (const e of names) {
-    if (e.kind !== 'dir' || e.name.startsWith('.')) continue
-    let text: string
-    try {
-      text = await host.read(`${v3}/${e.name}/worker.json`)
-    } catch {
-      continue
-    }
-    let rec: { owner?: unknown; ownerCwd?: unknown }
-    try {
-      rec = JSON.parse(text) as { owner?: unknown; ownerCwd?: unknown }
-    } catch {
-      continue
-    }
-    if (rec.owner !== session || typeof rec.ownerCwd !== 'string' || !rec.ownerCwd || rec.ownerCwd === '/') continue
-    cwds.add(rec.ownerCwd)
+  const recs = await Promise.all(
+    names
+      .filter(e => e.kind === 'dir' && !e.name.startsWith('.'))
+      .map(async e => {
+        try {
+          return JSON.parse(await host.read(`${v3}/${e.name}/worker.json`)) as { owner?: unknown; ownerCwd?: unknown } | null
+        } catch {
+          return undefined
+        }
+      }),
+  )
+  for (const rec of recs) {
+    if (typeof rec?.owner !== 'string' || typeof rec.ownerCwd !== 'string' || !rec.ownerCwd || rec.ownerCwd === '/') continue
+    byOwner.set(rec.owner, (byOwner.get(rec.owner) ?? new Set()).add(rec.ownerCwd))
   }
-  return cwds.size === 1 ? [...cwds][0] : undefined
+  return byOwner
 }
 
-/** `.v3/.sessions` + liveness + act health. Four liveness kinds stay distinct. */
+/** `.v3/.sessions` + liveness. Four liveness kinds stay distinct. Workers that agree on one ownerCwd supply it when the collector has none. */
 export async function listSessions(host: Host, root: string, now: number): Promise<PickerEntry[]> {
   const v3 = v3Of(root)
   const dir = `${v3}/.sessions`
@@ -1452,32 +1435,27 @@ export async function listSessions(host: Host, root: string, now: number): Promi
   } catch {
     return []
   }
-  const out: PickerEntry[] = []
-  for (const e of names) {
-    if (e.kind !== 'dir') continue
-    const session = sessionIdFromKey(e.name)
-    if (!session) continue
-    const sd = sessionDirOf(v3, session)
-    const liveness = await sessionLiveness(host, sd, now)
-    let health = 'unknown'
-    try {
-      health = healthText(await readActHealth(host, v3, session, now))
-    } catch {
-      health = 'unknown'
-    }
-    const col = await collectorBits(host, sd, session)
-    let cwd = col?.cwd
-    let cwdFrom: PickerEntry['cwdFrom'] = cwd ? 'collector' : 'unknown'
-    if (!cwd) {
-      const agreed = await agreedCwd(host, v3, session)
-      if (agreed) {
-        cwd = agreed
-        cwdFrom = 'workers'
+  let owners: Promise<Map<string, Set<string>>> | undefined
+  const sessions = names.flatMap(e => {
+    const session = e.kind === 'dir' ? sessionIdFromKey(e.name) : undefined
+    return session ? [session] : []
+  })
+  return Promise.all(
+    sessions.map(async (session): Promise<PickerEntry> => {
+      const sd = sessionDirOf(v3, session)
+      const [liveness, col] = await Promise.all([sessionLiveness(host, sd, now), collectorBits(host, sd, session)])
+      let cwd = col?.cwd
+      let cwdFrom: PickerEntry['cwdFrom'] = cwd ? 'collector' : 'unknown'
+      if (!cwd) {
+        const set = (await (owners ??= ownerCwds(host, v3))).get(session)
+        if (set?.size === 1) {
+          cwd = [...set][0]
+          cwdFrom = 'workers'
+        }
       }
-    }
-    out.push({ session, liveness, health, ...(cwd ? { cwd } : {}), cwdFrom, ...(col?.socket ? { socket: col.socket } : {}) })
-  }
-  return out
+      return { session, liveness, ...(cwd ? { cwd } : {}), cwdFrom, ...(col?.socket ? { socket: col.socket } : {}) }
+    }),
+  )
 }
 
 /** This process's stdout tty. macOS `/dev/fd/1` is not a symlink (`readlink` returns EINVAL); `tty` on that fd is the query that works. */
@@ -1529,7 +1507,7 @@ export async function applyPick(host: Host, root: string, state: TuiState, index
   const entry = state.pickerEntries?.[index]
   const back = (text: string): { host: Host; state: TuiState } => ({
     host,
-    state: { ...state, mode: 'preview', statusMessage: text, statusUntil: Date.now() + 5_000 },
+    state: say({ ...state, mode: 'preview' }, text, Date.now()).state,
   })
   if (!entry || entry.liveness !== 'live') return back(entry ? '只有 live 的 session 可以接手' : '沒有這個 session')
   const me = await processId(host)
@@ -1662,8 +1640,8 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     state.rowsAge = { running: rowsFlight.running, queued: rowsFlight.queued, lastOk: rowsFlight.lastOk }
     const now = Date.now()
     const lay = tuiLayout(state, width, height, now, gate)
-    state.page = lay.body
-    state.scrollMax = Math.max(0, lay.detailTotal - lay.body)
+    state.page = lay.frame.preview.rows
+    state.scrollMax = Math.max(0, (lay.detail?.length ?? 0) - lay.frame.preview.rows)
     const lines = linesFromLayout(state, width, height, lay, gate)
     stdout.write(ANSI_CLEAR_HOME + lines.join('\r\n'))
   }
@@ -1671,20 +1649,21 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   const rowsFlight: Flight = { running: false, queued: false }
   const sweepFlight: Flight = { running: false, queued: false }
   let live: Scan['visible'] = []
+  const applyRows = async (scanned?: Scan): Promise<void> => {
+    state = applyRowsTick(state, await panelRows(host, gate, root, scanned))
+  }
   const runRows = async (): Promise<boolean> => {
     const scanned = root ? await observeRows(host, gate, root) : undefined
     if (scanned) live = scanned.visible
     state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
-    const rows = await panelRows(host, gate, root, scanned)
-    state = { ...applyRowsTick(state, rows), loadError: state.loadError }
+    await applyRows(scanned)
     return true
   }
   const refreshRows = () => kickJob(rowsFlight, () => Date.now(), runRows)
   const runSweep = async (): Promise<boolean> => {
     if (!root) return false
     await sweepStalls(host, gate, root, live)
-    const rows = await panelRows(host, gate, root)
-    state = { ...applyRowsTick(state, rows), loadError: state.loadError }
+    await applyRows()
     return true
   }
 
@@ -1880,6 +1859,16 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     return { session: id ? id : null, holder: holder ?? null }
   }
 
+  /** The selected row's detail (expanded) or mirror (preview). True when a mirror capture landed. */
+  const refreshView = async (): Promise<boolean> => {
+    if (!state.selected || stopped) return false
+    if (state.expanded) {
+      await loadDetail()
+      return false
+    }
+    return captureSelected()
+  }
+
   const handleAction = async (action: TuiAction) => {
     if (action.type === 'quit') {
       state.quit = true
@@ -1889,8 +1878,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
       state.pickerEntries = root ? await listSessions(host, root, Date.now()) : []
       if (!state.pickerEntries.some(e => e.liveness === 'live')) {
         state.mode = 'preview'
-        state.statusMessage = '沒有 live 的 session'
-        state.statusUntil = Date.now() + 5_000
+        say('沒有 live 的 session')
       }
       render()
       return
@@ -1898,8 +1886,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     if (action.type === 'pick') {
       if (!root) {
         state.mode = 'preview'
-        state.statusMessage = '沒有 state root'
-        state.statusUntil = Date.now() + 5_000
+        say('沒有 state root')
         render()
         return
       }
@@ -1912,17 +1899,13 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     }
     if (action.type === 'refresh') {
       await refreshRows()
-      if (state.selected && !stopped) {
-        if (state.expanded) await loadDetail()
-        else await captureSelected()
-      }
+      await refreshView()
       render()
       return
     }
     if (action.type === 'stop') {
       const out = await stopWorker(host, gate, action.row.d, undefined, auditOf(action.row.holder))
-      state.statusMessage = `stop ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-      state.statusUntil = Date.now() + 5000
+      say(`stop ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`)
       await refreshRows()
       render()
       return
@@ -1932,16 +1915,14 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
         const row = state.all.find(r => r.d.name === name) ?? state.rows.find(r => r.d.name === name)
         return auditOf(row?.holder)
       })
-      state.statusMessage = `clear — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-      state.statusUntil = Date.now() + 5000
+      say(`clear — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`)
       await refreshRows()
       render()
       return
     }
     if (action.type === 'interrupt') {
       const out = await interruptWorker(host, action.row.d)
-      state.statusMessage = `interrupt ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
-      state.statusUntil = Date.now() + 5000
+      say(`interrupt ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`)
       await refreshRows()
       render()
       return
@@ -2044,18 +2025,13 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   process.on('SIGTERM', stop)
   process.on('SIGHUP', stop)
 
-  let exitCode = 0
   try {
-    let launchStop = false
     if (session && root) {
       const claimed = await claimLaunch(host, root, session, { claim: options.claim, launchDir: options.launchDir })
       if (claimed.kind === 'held') state.heldClaim = claimed.held
-      if (claimed.kind === 'stop') {
-        exitCode = claimed.code
-        launchStop = true
-      }
+      if (claimed.kind === 'stop') return claimed.code
     }
-    if (!stopped && !launchStop) {
+    if (!stopped) {
     entry = enterTerminal(stdin, stdout, `tmux-agent-tui ${sid8}`)
     // `q` during a slow first load quits at once; it does not wait for the load.
     const first = (async () => {
@@ -2068,16 +2044,11 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     await Promise.race([first, done])
     if (!stopped) {
       const mirrorTick = async () => {
-        let landed = false
-        if (state.selected && !stopped) {
-          if (state.expanded) await loadDetail()
-          else landed = await captureSelected()
-        }
-        if (landed) render()
+        if (await refreshView()) render()
       }
       rowsTimer = setInterval(() => {
         if (!stopped) refreshRows().then(() => { if (!stopped) render() }).catch(fail)
-      }, ROWS_MS)
+      }, options.rowsMs ?? ROWS_MS)
       mirrorTimer = setInterval(() => {
         if (!stopped) mirrorTick().catch(fail)
       }, options.mirrorMs ?? MIRROR_TICK_MS)
@@ -2101,7 +2072,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   }
   // A quit that left the tty broken is not a success: main exits 1, so a wrapper sees it.
   if (restoreErrors.length) throw new Error(`terminal restore failed: ${restoreErrors.map(e => e.message).join('; ')}`)
-  return exitCode
+  return 0
 }
 
 async function main(): Promise<void> {

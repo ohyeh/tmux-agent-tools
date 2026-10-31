@@ -452,7 +452,6 @@ test('picker: the highlight scrolls into a one-page window (FR-04)', () => {
   const entries = Array.from({ length: 30 }, (_, i) => ({
     session: `session-${i}`,
     liveness: i === 29 ? ('live' as const) : ('non-live' as const),
-    health: 'unknown',
     cwdFrom: 'unknown' as const,
   }))
   let state: TuiState = {
@@ -2471,10 +2470,10 @@ test('preview fills the frame in every state: height rows, footer last, rule and
       assert.equal(frame.at(-1), 'tmux-agent: note', `${at}: footer on the last line`)
       assert.ok(frame.every(l => cellWidth(l) <= 100), `${at}: no line wider than the screen`)
       const rule = frame.findIndex(l => l.startsWith('─'))
-      assert.ok(rule > 0 && lay.body > 0, `${at}: the rule is drawn`)
-      assert.ok(frame.slice(rule + 1, rule + 1 + lay.body).some(l => marker.test(l)), `${at}: ${marker} in the body`)
-      assert.match(frame[rule + 1 + lay.body]!, s.expanded ? /^detail / : /^See it whole: /, `${at}: tail right after the body`)
-      if (lay.list >= 3) for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
+      assert.ok(rule > 0 && lay.frame.preview.rows > 0, `${at}: the rule is drawn`)
+      assert.ok(frame.slice(rule + 1, rule + 1 + lay.frame.preview.rows).some(l => marker.test(l)), `${at}: ${marker} in the body`)
+      assert.match(frame[rule + 1 + lay.frame.preview.rows]!, s.expanded ? /^detail / : /^See it whole: /, `${at}: tail right after the body`)
+      if (s.rows.length - lay.frame.hidden >= 3) for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
       else assert.ok(frame.some(l => l.includes(' a')), `${at}: the selected row is listed`)
       assert.ok(!frame.some(l => l.includes('B-ONLY')), `${at}: never another row's content`)
     }
@@ -2486,7 +2485,7 @@ test('preview fills the frame in every state: height rows, footer last, rule and
     ['h=8', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 8],
   ] as [string, TuiState, number][]) {
     const frame = renderTuiLines(s, 100, height, NOW).map(stripAnsi)
-    if (name === 'no selection') assert.equal(tuiLayout(s, 100, height, NOW).body, 0, `${name}: no preview`)
+    if (name === 'no selection') assert.equal(tuiLayout(s, 100, height, NOW).frame.preview.rows, 0, `${name}: no preview`)
     assert.equal(frame.length, height, `${name}: frame is the full height`)
     assert.equal(frame.at(-1), 'tmux-agent: note', `${name}: footer on the last line`)
   }
@@ -2527,7 +2526,7 @@ test('narrow: Enter follows frameMode on a <40-col pane and on 60x8', () => {
     assert.notEqual(r.state.expanded, true, `${at}: expanding while the list view is up hides the preview`)
     const lay = tuiLayout(r.state, screen.width, screen.height, 1)
     assert.equal(lay.frame.mode, 'narrow', at)
-    assert.ok(lay.body > 0, `${at}: preview rows ${lay.body}`)
+    assert.ok(lay.frame.preview.rows > 0, `${at}: preview rows ${lay.frame.preview.rows}`)
     const back = nextKeyState(r.state, '\x1b', 1, screen)
     assert.equal(back.state.narrowView, 'list', at)
   }
@@ -2540,7 +2539,7 @@ test('narrow: Enter on a project row reaches the preview', () => {
   const opened = nextKeyState(ps, '\r', 1, screen)
   assert.equal(opened.state.narrowView, 'preview')
   assert.notEqual(opened.state.expanded, true)
-  assert.ok(tuiLayout(opened.state, screen.width, screen.height, 1).body > 0)
+  assert.ok(tuiLayout(opened.state, screen.width, screen.height, 1).frame.preview.rows > 0)
   const again = nextKeyState(opened.state, '\r', 1, screen)
   assert.notEqual(again.state.expanded, true, 'a project session has no episode detail')
   assert.equal(again.action, undefined)
@@ -2819,7 +2818,7 @@ test('mirror: PgUp scrolls back through the scrollback, PgDn to the end follows 
   const rows = [mockRow('a')]
   const lines = Array.from({ length: 300 }, (_, i) => `m${i}`)
   let s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a', mirror: { id: 'a', lines } }
-  const body = tuiLayout(s, 100, 24, NOW).body
+  const body = tuiLayout(s, 100, 24, NOW).frame.preview.rows
   s = { ...s, page: body }
   const frame = (st: TuiState) => renderTuiLines(st, 100, 24, NOW).map(stripAnsi)
   assert.ok(frame(s).includes('m299'), 'live: the newest line')
@@ -2874,6 +2873,19 @@ test('wrap: CJK and emoji wrap by cells and never split a grapheme', () => {
   assert.deepEqual(wrapCells('中文字ab👨‍👩‍👧c', 4), ['中文', '字ab', '👨‍👩‍👧c'])
   assert.deepEqual(wrapCells('x\x1b]0;t\x07y\nz', 5), ['xy', 'z'])
   assert.deepEqual(wrapCells('中', 1), [''])
+})
+
+test('width: the printable-ASCII fast path equals the per-grapheme count and wrap', () => {
+  const ascii = Array.from({ length: 95 }, (_, i) => String.fromCharCode(0x20 + i)).join('')
+  for (const amb of ['1', '2'])
+    withAmbiguous(amb, () => {
+      for (const text of [ascii, `\x1b[1m${ascii}\x1b[0m`, '', 'a'])
+        assert.equal(cellWidth(text), [...graphemes(stripAnsi(text))].reduce((n, g) => n + graphemeWidth(g, Number(amb)), 0))
+    })
+  assert.deepEqual(wrapCells('abcdefg', 3), ['abc', 'def', 'g'])
+  assert.deepEqual(wrapCells('abcdef', 3), ['abc', 'def'])
+  assert.deepEqual(wrapCells('\n', 3), ['', ''])
+  assert.deepEqual(wrapCells(ascii, 20).join(''), ascii)
 })
 
 /** A state with one running worker that has an episode, selected; owner mode. */
