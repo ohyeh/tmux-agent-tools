@@ -29,6 +29,7 @@ import {
   exactSessionTarget,
   projectSessionsOf,
   sameProject,
+  claimTui,
   type Health,
 } from './workers.ts'
 import {
@@ -62,6 +63,9 @@ import {
   MUTATING_KEYS,
   READ_ONLY,
   rowHints,
+  listSessions,
+  rebindHost,
+  applyPick,
   PAGE_DOWN,
   PAGE_UP,
   MIRROR_HISTORY,
@@ -300,6 +304,113 @@ test('terminal: SIGHUP restores ?1007l once (T6b)', async () => {
     stdin.emit('data', 'q')
     await run
   }
+})
+
+test('picker: four liveness kinds, cwd order, claim ready, occupied stays viewer (T7)', async () => {
+  const s: TuiState = { ...ownerState(), cwdFrom: 'unknown' }
+  const n = nextKeyState(s, 'n', 1)
+  assert.equal(n.state.adding, false)
+  assert.match(n.state.statusMessage ?? '', /cwd unknown/)
+  assert.equal(nextKeyState(s, '+', 1).state.adding, false)
+  assert.equal(nextKeyState(s, 'N', 1).action, undefined)
+
+  const root = mkdtempSync(join(tmpdir(), 'tui-pick-'))
+  const v3 = v3Of(root)
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  const sock = join(root, 'priv.sock')
+  const put = (id: string, kind: 'live' | 'initializing' | 'non-live' | 'unknown') => {
+    const sd = sessionDirOf(v3, id)
+    mkdirSync(sd, { recursive: true })
+    if (kind === 'unknown') {
+      writeFileSync(join(sd, 'act'), 'not-a-dir')
+      return
+    }
+    mkdirSync(join(sd, 'act', '1'), { recursive: true })
+    if (kind === 'initializing') return
+    writeFileSync(join(sd, 'act', '1.beat'), '')
+    writeFileSync(join(sd, 'act', '1.json'), JSON.stringify({ token: 'tok' }))
+    writeFileSync(join(sd, 'act', '1.state'), JSON.stringify({ channel: 'node', status: 'collecting', token: 'tok', mode: 'auto' }))
+    if (kind === 'non-live') {
+      const old = (Date.now() - 200_000) / 1000
+      utimesSync(join(sd, 'act', '1.beat'), old, old)
+    }
+  }
+  put('live-one', 'live')
+  put('init-one', 'initializing')
+  put('dead-one', 'non-live')
+  put('unk-one', 'unknown')
+  writeFileSync(join(sessionDirOf(v3, 'live-one'), 'collector.json'), JSON.stringify({ session: 'live-one', cwd: repo, socket: sock }))
+  writeFileSync(join(sessionDirOf(v3, 'dead-one'), 'collector.json'), JSON.stringify({ session: 'dead-one', cwd: '/' }))
+  const worker = (name: string, owner: string, ownerCwd: string) => {
+    mkdirSync(join(v3, name), { recursive: true })
+    writeFileSync(join(v3, name, 'worker.json'), JSON.stringify({ owner, ownerCwd }))
+  }
+  worker('agreed', 'init-one', repo)
+  worker('slash', 'dead-one', '/')
+  worker('split-a', 'unk-one', join(root, 'a'))
+  worker('split-b', 'unk-one', join(root, 'b'))
+
+  const host = nodeHost({ cwd: root })
+  const listed = await listSessions(host, root, Date.now())
+  const by = (id: string) => listed.find(e => e.session === id)
+  assert.equal(by('live-one')?.liveness, 'live')
+  assert.equal(by('init-one')?.liveness, 'initializing')
+  assert.equal(by('dead-one')?.liveness, 'non-live')
+  assert.equal(by('unk-one')?.liveness, 'unknown')
+  assert.equal(by('live-one')?.cwdFrom, 'collector')
+  assert.equal(by('live-one')?.cwd, repo)
+  assert.equal(by('live-one')?.socket, sock)
+  assert.equal(by('init-one')?.cwdFrom, 'workers')
+  assert.equal(by('init-one')?.cwd, repo)
+  assert.equal(by('dead-one')?.cwd, undefined)
+  assert.equal(by('dead-one')?.cwdFrom, 'unknown')
+  assert.equal(by('unk-one')?.cwdFrom, 'unknown')
+  assert.equal(listed.some(e => e.cwd === '/'), false)
+
+  const drawn = renderTuiLines({ ...ownerState(), mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 }, 120, 30, 1)
+    .map(stripAnsi)
+    .join('\n')
+  assert.match(drawn, /\[live\]/)
+  assert.match(drawn, /\[initializing\]/)
+  assert.match(drawn, /\[non-live\]/)
+  assert.match(drawn, /\[unknown\]/)
+
+  const calls: string[][] = []
+  const bound = rebindHost(
+    { ...host, run: async argv => { calls.push([...argv]); return { exitCode: 0, stdout: '', stderr: '' } } },
+    { session: 'live-one', cwd: repo, socket: sock },
+  )
+  assert.equal(bound.owner(), 'live-one')
+  assert.equal(bound.cwd(), repo)
+  await bound.run(['tmux', 'list-sessions'], repo, 1000)
+  assert.deepEqual(calls[0]?.slice(0, 3), ['tmux', '-S', sock])
+  const unknownCwd = rebindHost(host, { session: 'dead-one' })
+  assert.equal(unknownCwd.cwd(), undefined)
+
+  const warpHost = { ...host, envTermProgram: async () => 'WarpTerminal' }
+  const viewer: TuiState = { ...ownerState(), mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 }
+  const liveIndex = listed.findIndex(e => e.session === 'live-one')
+  const got = await applyPick(warpHost, root, viewer, liveIndex)
+  assert.equal(got.state.mode, 'edit')
+  assert.equal(got.state.viewer, false)
+  assert.equal(got.state.owner, 'live-one')
+  assert.equal(got.state.cwdFrom, 'collector')
+  assert.equal(got.host.owner(), 'live-one')
+  assert.equal(got.host.cwd(), repo)
+  const rec = JSON.parse(readFileSync(join(sessionDirOf(v3, 'live-one'), 'tui.owner'), 'utf8')) as { state: string; locator: { kind: string; tabTitle?: string } }
+  assert.equal(rec.state, 'ready')
+  assert.equal(rec.locator.kind, 'warp')
+  assert.match(rec.locator.tabTitle ?? '', /^tmux-agent-tui live-one/)
+  const second = await claimTui(warpHost, root, 'live-one', { host: 'other-host', pid: 1, pidStart: 'not-this-process' }, { state: 'ready', locator: { kind: 'warp', tabTitle: 'other' } })
+  assert.equal(second.kind, 'occupied-ready')
+  assert.equal(second.kind === 'occupied-ready' ? second.locator?.kind : '', 'warp')
+  const again = await applyPick(warpHost, root, viewer, liveIndex)
+  assert.equal(again.state.viewer, true)
+  assert.equal(again.state.owner, undefined)
+  assert.equal(again.state.mode, 'preview')
+  assert.equal(again.host, warpHost)
+  assert.match(again.state.statusMessage ?? '', /ready/)
 })
 
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {

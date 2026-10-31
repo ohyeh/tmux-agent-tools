@@ -207,7 +207,37 @@ check "SIGHUP exited 0" wait_for "$HP" 'TUI_EXIT=0' 50
 for _ in {1..100}; do [[ -s "$WORK/stty-a.hup.after" ]] && break; /bin/sleep 0.05; done
 check "stty -a after SIGHUP is sane" sh -c "grep -q 'icanon' '$WORK/stty-a.hup.after' && grep -q ' echo' '$WORK/stty-a.hup.after' && ! grep -q -- '-icanon' '$WORK/stty-a.hup.after'"
 
-(( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; }
+echo "case: viewer picks a live session, then x stops a worker"
+key="$("$NODE_BIN" -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("hex"))' "$SESSION")"
+sd="$TMUX_AGENT_DIR/.v3/.sessions/$key"
+mkdir -p "$sd/act/1"
+printf '%s\n' '{"token":"e2etoken0001"}' > "$sd/act/1.json"
+printf '%s\n' '{"channel":"node","status":"collecting","token":"e2etoken0001","mode":"auto"}' > "$sd/act/1.state"
+: > "$sd/act/1.beat"
+printf '%s\n' "{\"session\":\"$SESSION\",\"cwd\":\"$WORK/repo\",\"socket\":\"$TMUX_AGENT_TMUX_SOCKET\"}" > "$sd/collector.json"
+T new-session -d -s pick -x 120 -y 40 "$RUN pick"
+PK="=pick:"
+check "picker launch drew" wait_for "$PK" 'workers' 25
+keys "$PK" e
+check "picker lists the live session" wait_for "$PK" '\[live\]' 25
+keys "$PK" 1
+check "pick entered 編輯" wait_for "$PK" '\[ n resume \]' 25
+keys "$PK" "$(screen "$PK" | sed -nE "s/^([1-9]): .*${B}.*/\\1/p" | head -1)"
+check "B is selected" wait_for "$PK" "› $B" 25
+keys "$PK" x
+check "x arms the stop on B" wait_for "$PK" "stop $B\\? press again" 25
+/bin/sleep 0.5
+keys "$PK" x
+check "the stop on B ran" wait_for "$PK" "stop $B — ok" 100
+bstopped=no
+for _ in {1..50}; do
+  left
+  agent-tmux e2ecli status --json "$B" 2>/dev/null | grep -q '"exists": *true' || { bstopped=yes; break; }
+  /bin/sleep 0.2
+done
+check "B's tmux session is gone" test "$bstopped" = yes
+
+(( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; echo "--- pick pane"; screen "${PK:-}" || true; }
 echo
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

@@ -24,7 +24,7 @@
 //   Esc     disarm, close detail, 編輯 → 預覽, then deselect. 預覽 with nothing selected quits (T6b).
 
 import { parseArgs } from 'node:util'
-import { realpathSync } from 'node:fs'
+import { readlinkSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -66,7 +66,17 @@ import {
   fitWorker,
   exactSessionTarget,
   observeView,
+  claimTui,
+  releaseTui,
+  processId,
+  readActHealth,
+  sessionDirOf,
+  v3Of,
+  type ProcessId,
+  type TuiClaimResult,
+  type TuiLocator,
 } from './workers.ts'
+import { sessionLiveness, type Liveness } from './ledger.ts'
 import { nodeHost } from './host.node.ts'
 import { coreVersion } from './collector.node.ts'
 import { graphemes, graphemeWidth as widthOf } from './width.ts'
@@ -289,6 +299,10 @@ export interface TuiState {
   mode?: 'preview' | 'edit' | 'picker'
   /** SessionPicker highlight (T2a). */
   pickerIndex?: number
+  pickerEntries?: PickerEntry[]
+  /** Set after a pick. `unknown` refuses n, +, and resume (C03). Absent means the launch cwd is known. */
+  cwdFrom?: 'collector' | 'workers' | 'unknown'
+  heldClaim?: { session: string; token: string; me: ProcessId }
   /** Why the ledger could not be read (the third empty state). */
   loadError?: string
   quit: boolean
@@ -308,6 +322,8 @@ export type TuiAction =
   | { type: 'clear'; row: PanelRow }
   | { type: 'detail' }
   | { type: 'mouseOff' }
+  | { type: 'openPicker' }
+  | { type: 'pick'; index: number }
 
 const PASTE_START = '\x1b[200~'
 const PASTE_END = '\x1b[201~'
@@ -637,6 +653,21 @@ export function nextKeyState(
     return { state: { ...state, quit: true }, action: { type: 'quit' } }
   }
 
+  if (state.mode === 'picker') {
+    const n = state.pickerEntries?.length ?? 0
+    const i = n ? Math.min(state.pickerIndex ?? 0, n - 1) : 0
+    if (key === '\x1b') return say({ ...state, mode: 'preview' }, '仍是預覽', now)
+    if (key === 'j' || key === '\x1b[B' || key === '\x1bOB') return { state: { ...state, pickerIndex: n ? (i + 1) % n : 0 } }
+    if (key === 'k' || key === '\x1b[A' || key === '\x1bOA') return { state: { ...state, pickerIndex: n ? (i + n - 1) % n : 0 } }
+    if (/^[1-9]$/.test(key)) {
+      const idx = Number(key) - 1
+      if (idx >= n) return { state }
+      return { state: { ...state, pickerIndex: idx }, action: { type: 'pick', index: idx } }
+    }
+    if ((key === '\r' || key === '\n') && n) return { state, action: { type: 'pick', index: i } }
+    return { state }
+  }
+
   // The one read-only gate: no key a viewer presses reaches an action (D-viewer).
   if (state.viewer && MUTATING_KEYS.has(key)) return say(state, READ_ONLY, now)
   // I3: 預覽 names the reason. 編輯 without an owner session does too.
@@ -644,7 +675,7 @@ export function nextKeyState(
 
   if (key === 'e' || key === 'E') {
     if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
-    if (state.viewer || !state.owner) return { state: { ...state, mode: 'picker', pickerIndex: 0 } }
+    if (state.viewer || !state.owner) return { state: { ...state, mode: 'picker', pickerIndex: 0 }, action: { type: 'openPicker' } }
     return { state: { ...state, mode: 'edit' } }
   }
 
@@ -657,6 +688,10 @@ export function nextKeyState(
   // A dir with no worker.json is not a worker yet: only `-` (clear) acts on it.
   if (row?.incomplete && ['x', 'X', 't', 'T', 'i', 'I', 'U'].includes(key)) {
     return say(state, `${row.d.name} — no worker.json yet; press - to clear it once it is old enough`, now)
+  }
+
+  if ((key === 'n' || key === 'N' || key === '+') && state.cwdFrom === 'unknown') {
+    return say(state, 'cwd unknown；不能 resume 或 assign', now)
   }
 
   if (key === 'n' || key === 'N') {
@@ -1044,7 +1079,16 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): S
 
   const status: string[] = []
   const health = healthText(gate?.viewHealth)
-  if (state.viewer) status.push(`\x1b[2mviewer — no session; ${READ_ONLY} · ${health}\x1b[0m`)
+  if (state.mode === 'picker') {
+    status.push('選擇 session：數字或 Enter 接手，Esc 返回')
+    const entries = state.pickerEntries ?? []
+    if (!entries.length) status.push('（沒有 session）')
+    entries.forEach((e, i) => {
+      const mark = i === (state.pickerIndex ?? 0) ? '› ' : '  '
+      const cwd = e.cwdFrom === 'unknown' || !e.cwd ? 'cwd unknown' : e.cwd
+      status.push(`${mark}${i + 1} [${e.liveness}] ${e.session} ${cwd}`)
+    })
+  } else if (state.viewer) status.push(`\x1b[2mviewer — no session; ${READ_ONLY} · ${health}\x1b[0m`)
   else {
     const ok = gate?.viewHealth?.kind === 'collecting' && !gate.viewHealth.reason // a deferral shows in yellow
     status.push(`${ok ? '\x1b[2m' : '\x1b[33m'}${sanitizeAnsi(health)}\x1b[0m`)
@@ -1299,6 +1343,177 @@ export interface TuiOptions {
   mirrorMs?: number
 }
 
+export type PickerEntry = {
+  session: string
+  liveness: Liveness
+  health: string
+  cwd?: string
+  cwdFrom: 'collector' | 'workers' | 'unknown'
+  socket?: string
+}
+
+export type TuiBind = { session: string; cwd?: string; socket?: string }
+
+/** A picked session's owner, cwd, and tmux socket. cwd stays undefined when it is unknown — never `/`. */
+export function rebindHost(base: Host, identity: TuiBind): Host {
+  return {
+    ...base,
+    owner: () => identity.session,
+    cwd: () => identity.cwd,
+    run: async (argv, cwd, ms) => {
+      const cmd = [...argv]
+      const bin = cmd[0] ?? ''
+      if (identity.socket && (bin === 'tmux' || bin.endsWith('/tmux')) && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', identity.socket)
+      return base.run(cmd, cwd, ms)
+    },
+  }
+}
+
+function sessionIdFromKey(hex: string): string | undefined {
+  if (!hex || hex.length % 2 || !/^[0-9a-f]+$/.test(hex)) return undefined
+  const bytes = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return new TextDecoder().decode(bytes)
+}
+
+async function collectorBits(host: Host, dir: string, session: string): Promise<{ cwd?: string; socket?: string } | undefined> {
+  try {
+    const parsed = JSON.parse(await host.read(`${dir}/collector.json`)) as { session?: unknown; cwd?: unknown; socket?: unknown }
+    if (parsed.session !== session) return undefined
+    const cwd = typeof parsed.cwd === 'string' && parsed.cwd && parsed.cwd !== '/' ? parsed.cwd : undefined
+    const socket = typeof parsed.socket === 'string' && parsed.socket ? parsed.socket : undefined
+    return { cwd, socket }
+  } catch {
+    return undefined
+  }
+}
+
+/** Workers of this owner that agree on one ownerCwd. `/` and disagreement are unknown. */
+async function agreedCwd(host: Host, v3: string, session: string): Promise<string | undefined> {
+  let names: readonly { name: string; kind: string }[]
+  try {
+    names = await host.list(v3)
+  } catch {
+    return undefined
+  }
+  const cwds = new Set<string>()
+  for (const e of names) {
+    if (e.kind !== 'dir' || e.name.startsWith('.')) continue
+    let text: string
+    try {
+      text = await host.read(`${v3}/${e.name}/worker.json`)
+    } catch {
+      continue
+    }
+    let rec: { owner?: unknown; ownerCwd?: unknown }
+    try {
+      rec = JSON.parse(text) as { owner?: unknown; ownerCwd?: unknown }
+    } catch {
+      continue
+    }
+    if (rec.owner !== session || typeof rec.ownerCwd !== 'string' || !rec.ownerCwd || rec.ownerCwd === '/') continue
+    cwds.add(rec.ownerCwd)
+  }
+  return cwds.size === 1 ? [...cwds][0] : undefined
+}
+
+/** `.v3/.sessions` + liveness + act health. Four liveness kinds stay distinct. */
+export async function listSessions(host: Host, root: string, now: number): Promise<PickerEntry[]> {
+  const v3 = v3Of(root)
+  const dir = `${v3}/.sessions`
+  let names: readonly { name: string; kind: string }[]
+  try {
+    if (!(await host.exists(dir))) return []
+    names = await host.list(dir)
+  } catch {
+    return []
+  }
+  const out: PickerEntry[] = []
+  for (const e of names) {
+    if (e.kind !== 'dir') continue
+    const session = sessionIdFromKey(e.name)
+    if (!session) continue
+    const sd = sessionDirOf(v3, session)
+    const liveness = await sessionLiveness(host, sd, now)
+    let health = 'unknown'
+    try {
+      health = healthText(await readActHealth(host, v3, session, now))
+    } catch {
+      health = 'unknown'
+    }
+    const col = await collectorBits(host, sd, session)
+    let cwd = col?.cwd
+    let cwdFrom: PickerEntry['cwdFrom'] = cwd ? 'collector' : 'unknown'
+    if (!cwd) {
+      const agreed = await agreedCwd(host, v3, session)
+      if (agreed) {
+        cwd = agreed
+        cwdFrom = 'workers'
+      }
+    }
+    out.push({ session, liveness, health, ...(cwd ? { cwd } : {}), cwdFrom, ...(col?.socket ? { socket: col.socket } : {}) })
+  }
+  return out
+}
+
+/** The locator this process writes at ready. Warp wins when the host says so, so a test does not record the owner's pane. */
+export async function ownLocator(host: Host, session: string): Promise<TuiLocator> {
+  const term = (await host.envTermProgram()) ?? ''
+  const title = `tmux-agent-tui ${session.slice(0, 8)}`
+  if (/warp/i.test(term)) return { kind: 'warp', tabTitle: title }
+  const pane = process.env.TMUX_PANE
+  if (pane) {
+    const socket = process.env.TMUX_AGENT_TMUX_SOCKET || process.env.TMUX?.split(',')[0]
+    return { kind: 'tmux', pane, ...(socket ? { socket } : {}) }
+  }
+  let tty = 'unknown'
+  try {
+    tty = readlinkSync('/dev/fd/1')
+  } catch {
+    /* not a path */
+  }
+  if (/iterm/i.test(term)) return { kind: 'iterm', tty }
+  return { kind: 'terminal', tty }
+}
+
+function occupiedWhere(result: TuiClaimResult): string {
+  if (result.kind === 'occupied-ready') {
+    const loc = result.locator
+    const where = !loc ? 'no locator' : loc.kind === 'warp' ? loc.tabTitle : loc.kind === 'tmux' ? loc.pane : loc.tty
+    return `已有 TUI（ready）${where}`
+  }
+  if (result.kind === 'occupied-pending') return `已有 TUI（pending）pid ${result.claim.pid}`
+  if (result.kind === 'occupied-unknown') return `已有 TUI（unknown）${result.reason ?? result.claim?.pid ?? ''}`
+  return result.kind
+}
+
+/** T2b/T2c: claim ready in this process, then rebind. Occupied leaves the viewer identity as it was. */
+export async function applyPick(host: Host, root: string, state: TuiState, index: number): Promise<{ host: Host; state: TuiState }> {
+  const entry = state.pickerEntries?.[index]
+  const back = (text: string): { host: Host; state: TuiState } => ({
+    host,
+    state: { ...state, mode: 'preview', statusMessage: text, statusUntil: Date.now() + 5_000 },
+  })
+  if (!entry || entry.liveness !== 'live') return back(entry ? '只有 live 的 session 可以接手' : '沒有這個 session')
+  const me = await processId(host)
+  if (!(me.pid > 0 && me.pidStart)) return back('無法確認這個行程')
+  const locator = await ownLocator(host, entry.session)
+  const result = await claimTui(host, root, entry.session, me, { state: 'ready', locator })
+  if (result.kind !== 'won' && result.kind !== 'adopted') return back(occupiedWhere(result))
+  return {
+    host: rebindHost(host, { session: entry.session, cwd: entry.cwd, socket: entry.socket }),
+    state: {
+      ...state,
+      mode: 'edit',
+      viewer: false,
+      owner: entry.session,
+      cwdFrom: entry.cwdFrom,
+      statusMessage: undefined,
+      heldClaim: { session: entry.session, token: result.claim.token, me },
+    },
+  }
+}
+
 export async function runTui(options: TuiOptions = {}): Promise<void> {
   const stdin = options.stdin ?? process.stdin
   const stdout = options.stdout ?? process.stdout
@@ -1307,7 +1522,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   // A viewer is the whole machine (D-viewer): `/` lists every project's rows; --cwd narrows it.
   const cwd = options.cwd ?? (session ? process.cwd() : '/')
   const base = options.host ?? nodeHost({ owner: session, cwd })
-  const host: Host = options.root ? { ...base, envTmuxAgentDir: async () => options.root as string } : base
+  let host: Host = options.root ? { ...base, envTmuxAgentDir: async () => options.root as string } : base
   const root = options.root ?? (await rootOf(host))
   const gate = newGate()
 
@@ -1549,6 +1764,31 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       state.quit = true
       return
     }
+    if (action.type === 'openPicker') {
+      state.pickerEntries = root ? await listSessions(host, root, Date.now()) : []
+      if (!state.pickerEntries.some(e => e.liveness === 'live')) {
+        state.mode = 'preview'
+        state.statusMessage = '沒有 live 的 session'
+        state.statusUntil = Date.now() + 5_000
+      }
+      render()
+      return
+    }
+    if (action.type === 'pick') {
+      if (!root) {
+        state.mode = 'preview'
+        state.statusMessage = '沒有 state root'
+        state.statusUntil = Date.now() + 5_000
+        render()
+        return
+      }
+      const got = await applyPick(host, root, state, action.index)
+      host = got.host
+      state = got.state
+      if (state.mode === 'edit') await refreshRows()
+      render()
+      return
+    }
     if (action.type === 'refresh') {
       await refreshRows()
       render()
@@ -1579,6 +1819,11 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       return
     }
     if (action.type === 'resume') {
+      if (state.cwdFrom === 'unknown' || !host.cwd()) {
+        say('cwd unknown；不能 resume 或 assign')
+        render()
+        return
+      }
       const out = await resumeWorker(host, action.value)
       say(`resume — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       if (out.ok) await refreshRows()
@@ -1600,7 +1845,13 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
         render()
         return
       }
-      const path = resolve(cwd, file.join(' '))
+      const dir = host.cwd()
+      if (state.cwdFrom === 'unknown' || !dir) {
+        say('cwd unknown；不能 resume 或 assign')
+        render()
+        return
+      }
+      const path = resolve(dir, file.join(' '))
       const brief = await readFile(path, 'utf8').catch((error: Error) => error)
       if (brief instanceof Error) {
         say(`assign — FAILED: cannot read the brief ${path}: ${brief.message}`)
@@ -1608,9 +1859,9 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
         return
       }
       const h = gate.viewHealth
-      const got = await assignWorker(host, { profile, name, dir: cwd, brief }, {
-        owner: session ?? '',
-        ownerCwd: cwd,
+      const got = await assignWorker(host, { profile, name, dir, brief }, {
+        owner: host.owner() ?? session ?? '',
+        ownerCwd: dir,
         down: () => (h && h.kind !== 'collecting' && h.kind !== 'initializing' ? healthText(h) : undefined),
       })
       say('deny' in got ? `assign — FAILED: ${got.deny}` : `assign — ok: ${got.receipt}`)
@@ -1688,6 +1939,14 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   } finally {
     stopped = true
     cleanup()
+    const held = state.heldClaim
+    if (held && root) {
+      try {
+        await releaseTui(host, root, held.session, held.token, 'tui', held.me)
+      } catch (error) {
+        process.stderr.write(`tui: release failed: ${error instanceof Error ? error.message : String(error)}\n`)
+      }
+    }
   }
   // A quit that left the tty broken is not a success: main exits 1, so a wrapper sees it.
   if (restoreErrors.length) throw new Error(`terminal restore failed: ${restoreErrors.map(e => e.message).join('; ')}`)
