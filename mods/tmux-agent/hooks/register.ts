@@ -76,6 +76,8 @@ import {
   releaseTui,
   focusTui,
   openInTerminal,
+  dropLaunchFile,
+  tuiLaunchPath,
   processId,
   TUI_PENDING_MS,
   rememberPanel,
@@ -99,7 +101,6 @@ import {
   type TmuxDispatch as CoreDispatch,
   type TmuxStalled as CoreStalled,
 } from './lib/workers.ts'
-import { sessionKey } from './lib/ledger.ts'
 import type { TmuxDispatch, TmuxStalled } from '../types'
 
 /**
@@ -863,7 +864,7 @@ export const register: Register = on => {
         if ('refused' in raised) return { ok: false, text: `TUI 已在執行，但無法切過去：${raised.refused}` }
         if (raised.raised === 'pane') return { ok: true, text: `TUI 已在執行，已切到 tmux pane ${claim.locator?.kind === 'tmux' ? claim.locator.pane : ''}`.trim() }
         const loc = claim.locator
-        const app = loc?.kind === 'warp' ? 'Warp' : loc?.kind === 'iterm' ? 'iTerm2' : 'Terminal.app'
+        const app = loc?.kind === 'warp' || loc?.kind === 'iterm' || loc?.kind === 'terminal' ? appName[loc.kind] : 'Terminal.app'
         return { ok: true, text: `TUI 已在執行，已把 ${app} 帶到前景${raised.tabTitle ? `，請找分頁「${raised.tabTitle}」` : ''}` }
       }
       case 'occupied-pending':
@@ -877,7 +878,7 @@ export const register: Register = on => {
     }
     const token = claim.claim.token
     const dir = await host.envTmuxAgentDir()
-    const launchFile = `${launchDir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
+    const launchFile = launchDir ? tuiLaunchPath(launchDir, session, token) : undefined
     const release = () => releaseTui(host, root, session, token, 'launcher', me)
     try {
       const opened = await openInTerminal(
@@ -907,7 +908,10 @@ export const register: Register = on => {
           return false
         })
         if (!released) return
-        if (launchDir) await host.run(['rm', '-f', launchFile], '/', 5_000).catch(error => host.log(`tmux-agent: tui launch file ${launchFile} remains: ${String(error)}`))
+        if (launchFile) {
+          const fail = await dropLaunchFile(host, launchFile, '/')
+          if (fail && 'error' in fail) host.log(`tmux-agent: tui launch file ${launchFile} remains: ${String(fail.error)}`)
+        }
         host.toast('tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手，已取消這次開啟；再按 [ ⧉ tui ] 重試')
       })
       if (opened.kind === 'split') return { ok: true, text: `TUI 已開在 ${opened.locator.pane}，在 ${pane} 旁` }
