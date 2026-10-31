@@ -980,51 +980,6 @@ export const register: Register = on => {
       panel.armedStop = { id, from: at, until: at + STOP_CONFIRM_MS }
       $.ui.invalidate('ui.render')
     }
-    // Every row the tree draws is counted here, so it stays inside `maxRows`: a
-    // taller tree scrolls, and a scrolling band arms none of its digit hotkeys.
-    // Goals show only in the overview (no row selected); a selected row adds its
-    // tell line and a one-line summary. A fleet longer than the band is cut, the
-    // selected row kept, with a "+N more" line.
-    const others = othersLine(panel.all)
-    const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
-    const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
-    const layout = (sel: PanelRow | undefined) => {
-      // Selected: its tell line, its summary, and one row for the mirror's rule
-      // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
-      // A selection is for watching that worker: the list gives way to the
-      // mirror's floor (and its hint line) before it gives way to nothing.
-      const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
-      const fitsAt = (perRow: number, n: number) =>
-        fixed + n * perRow + (n < panel.rows.length ? 1 : 0) + reserve <= e.props.maxRows
-      // Each goal line costs a worker row: goals are drawn only when every
-      // worker fits with its goal, so they never push a worker off the band.
-      const goals = !sel && fitsAt(2, panel.rows.length)
-      const perRow = goals ? 2 : 1
-      let shown = panel.rows.length
-      while (shown > 1 && !fitsAt(perRow, shown)) shown -= 1
-      return { shown, goals, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
-    }
-    const { shown: shownRows, goals, used } = layout(selected)
-    const first = selected ? Math.max(0, Math.min(selIndex - shownRows + 1, panel.rows.length - shownRows)) : 0
-    const hidden = panel.rows.length - shownRows
-    // The mirror is sized for the layout a selection draws — before the press
-    // too, since the clock captures on the height the last render allowed. It
-    // takes what is left after its "see it whole" line.
-    const room = e.props.maxRows - (selected ? used : layout(panel.rows[0]).used) - 1
-    // 0 means "do not mirror", which is the honest answer for a surface that
-    // cannot fit even one line of work under the target's own chrome.
-    panel.rows_available = room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
-    const children: RenderElement[] = []
-    // Smaller than the least full layout (one row and its controls): only the
-    // title bar and, room permitting, what still works — the typed commands.
-    // Overflowing would scroll the band and disarm the digits (astra, 34e2a1e:
-    // maxRows 3 drew 4).
-    const compact = used > e.props.maxRows
-    if (compact) panel.rows_available = 0
-
-    // A stall is a warning, not a footnote: it keeps its colour (never dim-only).
-    if (down && !compact) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `⚠ ${down}` }))
     // The header names the keys: this is the only place a person learns them.
     // `r`/`x`/`q` press only while the band is focused; digits from an empty
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
@@ -1053,7 +1008,10 @@ export const register: Register = on => {
       displayCells('[ hide ]') +
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
-    const words = displayCells(full) + cellsOf(true) <= width
+    const ageText = rowsAt === undefined ? '' : `更新 ${Math.max(0, Math.floor((now - rowsAt) / 1000))}s 前`
+    const age = ageText ? ` · ${ageText}` : ''
+    // The age takes part in the choice: the button words go before the age does.
+    const words = displayCells(`${full.trimEnd()}${age} `) + cellsOf(true) <= width
     const addLabel = words ? '+ new' : '+'
     const refreshLabel = words ? '↻ refresh' : '↻'
     const tuiLabel = words ? '⧉ tui' : '⧉'
@@ -1064,12 +1022,64 @@ export const register: Register = on => {
     // The name and version always stay (mods/README.md rule 11): the session id goes first, then the counts.
     const name = ` workers v${MOD_VERSION} `
     // The age of the rows read (BD7): a stuck read shows as a growing number, not a frozen list.
-    // It gives way before the session id does, and it never decides whether the buttons carry words.
-    const age = rowsAt === undefined ? '' : ` · 更新 ${Math.max(0, Math.floor((now - rowsAt) / 1000))}s 前`
+    // Inline the button words go before it, then the session id; when it still does not fit
+    // it gets its own row below the bar, so it is visible at every width.
     const short = ` workers v${MOD_VERSION} · ${tally}`
     const titleText = (age ? [`${full.trimEnd()}${age} `, full, `${short}${age} `] : [full]).concat(`${short} `, name).find(t => displayCells(t) + buttonCells <= width) ?? name
     const titleCells = displayCells(titleText) + buttonCells
     const hintRoom = Math.max(0, width - titleCells)
+    // Drawn only when the bar left the age out and a row is spare: a taller tree scrolls and
+    // disarms the digits, and the mirror keeps its floor (set below, once the layout is known).
+    let ageRow = false
+    // Every row the tree draws is counted here, so it stays inside `maxRows`: a
+    // taller tree scrolls, and a scrolling band arms none of its digit hotkeys.
+    // Goals show only in the overview (no row selected); a selected row adds its
+    // tell line and a one-line summary. A fleet longer than the band is cut, the
+    // selected row kept, with a "+N more" line.
+    const others = othersLine(panel.all)
+    const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
+    const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
+    const layout = (sel: PanelRow | undefined) => {
+      // Selected: its tell line, its summary, and one row for the mirror's rule
+      // or the "too short to mirror" line, whichever is drawn.
+      const fixed = 1 + (ageRow ? 1 : 0) + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
+      // A selection is for watching that worker: the list gives way to the
+      // mirror's floor (and its hint line) before it gives way to nothing.
+      const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
+      const fitsAt = (perRow: number, n: number) =>
+        fixed + n * perRow + (n < panel.rows.length ? 1 : 0) + reserve <= e.props.maxRows
+      // Each goal line costs a worker row: goals are drawn only when every
+      // worker fits with its goal, so they never push a worker off the band.
+      const goals = !sel && fitsAt(2, panel.rows.length)
+      const perRow = goals ? 2 : 1
+      let shown = panel.rows.length
+      while (shown > 1 && !fitsAt(perRow, shown)) shown -= 1
+      return { shown, goals, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
+    }
+    if (ageText !== '' && !panel.folded && !titleText.includes('更新')) {
+      const base = (selected ? layout(selected) : layout(panel.rows[0])).used
+      ageRow = e.props.maxRows - base - 1 >= MIRROR_MIN_ROWS + 1
+    }
+    const { shown: shownRows, goals, used } = layout(selected)
+    const first = selected ? Math.max(0, Math.min(selIndex - shownRows + 1, panel.rows.length - shownRows)) : 0
+    const hidden = panel.rows.length - shownRows
+    // The mirror is sized for the layout a selection draws — before the press
+    // too, since the clock captures on the height the last render allowed. It
+    // takes what is left after its "see it whole" line.
+    const room = e.props.maxRows - (selected ? used : layout(panel.rows[0]).used) - 1
+    // 0 means "do not mirror", which is the honest answer for a surface that
+    // cannot fit even one line of work under the target's own chrome.
+    panel.rows_available = room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
+    const children: RenderElement[] = []
+    // Smaller than the least full layout (one row and its controls): only the
+    // title bar and, room permitting, what still works — the typed commands.
+    // Overflowing would scroll the band and disarm the digits (astra, 34e2a1e:
+    // maxRows 3 drew 4).
+    const compact = used > e.props.maxRows
+    if (compact) panel.rows_available = 0
+
+    // A stall is a warning, not a footnote: it keeps its colour (never dim-only).
+    if (down && !compact) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `⚠ ${down}` }))
     // A coloured title bar marks where the panel starts, so its rows do not read
     // as the session's own output. Background, not a border: a border costs two
     // of the band's few rows, and the mirror needs them.
@@ -1146,6 +1156,7 @@ export const register: Register = on => {
         ],
       }),
     )
+    if (ageRow) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: ` ${ageText}` }))
 
     if (panel.folded) {
       panel.rows_available = 0

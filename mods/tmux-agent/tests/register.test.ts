@@ -300,6 +300,19 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
       }
       return ok()
     }
+    // rename(2) of a staged directory onto the TUI lock: it fails when the lock exists (the holder file keeps it non-empty).
+    case 'perl': {
+      const [src, dst] = a.slice(-2) as [string, string]
+      if (files[`${src}/`] === undefined) return fail(`No such file or directory`)
+      if (files[`${dst}/`] !== undefined) return fail('Directory not empty')
+      for (const k of Object.keys(files)) {
+        if (k !== `${src}/` && !k.startsWith(`${src}/`)) continue
+        files[`${dst}${k.slice(src.length)}`] = files[k]!
+        delete files[k]
+      }
+      mtimes.set(dst, clockNow())
+      return ok()
+    }
     case 'rmdir': {
       const dir = a[0]!
       if (files[`${dir}/`] === undefined) return fail(`rmdir: ${dir}: No such file or directory`)
@@ -2284,6 +2297,22 @@ describe('panel', () => {
     release()
     await settle()
     expect(textOf(await $.ui.render(bandRender(40, 39, 160))), 'a finished read resets the age').toContain('更新 0s 前')
+  })
+
+  test('the age shows at every width the header draws buttons: inline when it fits, else on its own row (BD7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 60 })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    for (const width of [60, 80, 113, 120, 130, 200]) {
+      const text = textOf(await $.ui.render(bandRender(40, 39, width)))
+      expect(text, `${width} columns`).toContain('更新 0s 前')
+      expect(text, `${width} columns: the name and version stay`).toMatch(/workers v\d+\.\d+\.\d+/)
+    }
   })
 
   test('closing the panel stops the mirror clock', WITH_DRIVER, async ($, on) => {
