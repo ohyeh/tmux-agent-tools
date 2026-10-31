@@ -45,7 +45,6 @@ import {
   CLEAR_ID,
   STOP_CONFIRM_MS,
   STOP_REPEAT_MS,
-  MIRROR_MS,
   UNLOCK_WORD,
   type EpisodeDetail,
   type Health,
@@ -65,7 +64,8 @@ import {
   mirrorProject,
   fitWorker,
   exactSessionTarget,
-  observeView,
+  observeRows,
+  sweepStalls,
   claimTui,
   releaseTui,
   focusTui,
@@ -307,6 +307,8 @@ export interface TuiState {
   heldClaim?: { session: string; token: string; me: ProcessId }
   /** Why the ledger could not be read (the third empty state). */
   loadError?: string
+  /** Last successful rows read, and whether that job is in flight (T9). */
+  rowsAge?: Flight
   quit: boolean
 }
 
@@ -1062,7 +1064,8 @@ type Sections = { title: string; status: string[]; selExtra: string[]; footer: s
 function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate): Sections {
   const tmuxRunning = state.rows.filter(r => !r.project && !r.terminal).length
   const me = state.owner
-  const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning}`
+  const age = state.rowsAge ? ` · ${ageText(now, state.rowsAge)}` : ''
+  const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning}${age}`
   const hints = headerHints(state, now)
   let title = ''
   // As the band: the hint words go first, then the session id, then the counts; the name and version never
@@ -1578,6 +1581,39 @@ async function claimLaunch(host: Host, root: string, session: string, opts: { cl
   return { kind: 'held', held: { session, token: result.claim.token, me } }
 }
 
+export const ROWS_MS = 2_000
+export const SWEEP_MS = 10_000
+export const MIRROR_TICK_MS = 1_000
+
+export type Flight = { running: boolean; queued: boolean; lastOk?: number }
+
+/** `更新 Ns 前`, plus ` …` while that job is still in flight. A failed run leaves `lastOk` alone. */
+export function ageText(now: number, flight: Flight): string {
+  const base = flight.lastOk ?? now
+  const n = Math.max(0, Math.floor((now - base) / 1000))
+  return `更新 ${n}s 前${flight.running ? ' …' : ''}`
+}
+
+/** One run at a time. A kick during a run queues one more, and a second kick does not add another. */
+export async function kickJob(flight: Flight, now: () => number, run: () => Promise<boolean>): Promise<void> {
+  if (flight.running) {
+    flight.queued = true
+    return
+  }
+  flight.running = true
+  let ok = false
+  try {
+    ok = await run()
+  } finally {
+    flight.running = false
+    if (ok) flight.lastOk = now()
+    if (flight.queued) {
+      flight.queued = false
+      await kickJob(flight, now, run)
+    }
+  }
+}
+
 export async function runTui(options: TuiOptions = {}): Promise<number> {
   const stdin = options.stdin ?? process.stdin
   const stdout = options.stdout ?? process.stdout
@@ -1606,9 +1642,10 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     mode: 'preview',
   }
 
-  let refreshing = false
   let capturing = false
-  let timer: NodeJS.Timeout | undefined
+  let rowsTimer: NodeJS.Timeout | undefined
+  let mirrorTimer: NodeJS.Timeout | undefined
+  let sweepTimer: NodeJS.Timeout | undefined
   // Bumped on every resize: a capture started before it was sized for the old
   // layout and is dropped when it lands (R4.1).
   let generation = 0
@@ -1618,6 +1655,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   // After quit (or any stop) nothing more is drawn, even by an action still in flight.
   const render = () => {
     if (stopped) return
+    state.rowsAge = { running: rowsFlight.running, queued: rowsFlight.queued, lastOk: rowsFlight.lastOk }
     const lay = layout()
     state.page = lay.body
     state.scrollMax = Math.max(0, lay.detailTotal - lay.body)
@@ -1625,18 +1663,23 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     stdout.write(ANSI_CLEAR_HOME + lines.join('\r\n'))
   }
 
-  const refreshRows = async (): Promise<boolean> => {
-    if (refreshing) return false
-    refreshing = true
-    try {
-      if (root) await observeView(host, gate, root)
-      state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
-      const rows = await panelRows(host, gate, root)
-      state = { ...applyRowsTick(state, rows), loadError: state.loadError }
-      return true
-    } finally {
-      refreshing = false
-    }
+  const rowsFlight: Flight = { running: false, queued: false }
+  const sweepFlight: Flight = { running: false, queued: false }
+  let live: Awaited<ReturnType<typeof observeRows>> = []
+  const runRows = async (): Promise<boolean> => {
+    if (root) live = await observeRows(host, gate, root)
+    state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
+    const rows = await panelRows(host, gate, root)
+    state = { ...applyRowsTick(state, rows), loadError: state.loadError }
+    return true
+  }
+  const refreshRows = () => kickJob(rowsFlight, () => Date.now(), runRows)
+  const runSweep = async (): Promise<boolean> => {
+    if (!root) return false
+    await sweepStalls(host, gate, root, live)
+    const rows = await panelRows(host, gate, root)
+    state = { ...applyRowsTick(state, rows), loadError: state.loadError }
+    return true
   }
 
   // A capture asked for while one runs is not dropped: it runs when that one ends,
@@ -1696,7 +1739,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   }
 
   // A selection or size change shows the pending preview at once and captures now,
-  // not at the next tick (MIRROR_MS) (T1 C2).
+  // not at the next tick (MIRROR_TICK_MS) (T1 C2).
   const captureNow = () => {
     if (stopped || !state.selected || state.expanded || (state.mirror?.id === state.selected && !resized)) return
     resized = false
@@ -1767,7 +1810,9 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   const cleanup = () => {
     if (cleanedUp) return
     cleanedUp = true
-    if (timer) clearInterval(timer)
+    if (rowsTimer) clearInterval(rowsTimer)
+    if (mirrorTimer) clearInterval(mirrorTimer)
+    if (sweepTimer) clearInterval(sweepTimer)
     if (escTimer) clearTimeout(escTimer)
     stdin.off('data', onData)
     stdin.off('end', onEnd)
@@ -1856,6 +1901,10 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     }
     if (action.type === 'refresh') {
       await refreshRows()
+      if (state.selected && !stopped) {
+        if (state.expanded) await loadDetail()
+        else await captureSelected()
+      }
       render()
       return
     }
@@ -1993,24 +2042,32 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     if (!stopped && !launchStop) {
     entry = enterTerminal(stdin, stdout, `tmux-agent-tui ${sid8}`)
     // `q` during a slow first load quits at once; it does not wait for the load.
-    const first = refreshRows().then(() => {
+    const first = (async () => {
+      await refreshRows()
+      // One sweep so the first frame has stall state. Later sweeps stay on their own 10s clock.
+      if (!stopped) await kickJob(sweepFlight, () => Date.now(), runSweep)
       if (!stopped) render()
-    })
+    })()
     first.catch(() => {})
     await Promise.race([first, done])
     if (!stopped) {
-      const tick = async () => {
-        const fresh = await refreshRows()
+      const mirrorTick = async () => {
         let landed = false
         if (state.selected && !stopped) {
           if (state.expanded) await loadDetail()
           else landed = await captureSelected()
         }
-        if (fresh || landed) render()
+        if (landed) render()
       }
-      timer = setInterval(() => {
-        if (!stopped) tick().catch(fail)
-      }, options.mirrorMs ?? MIRROR_MS)
+      rowsTimer = setInterval(() => {
+        if (!stopped) refreshRows().then(() => { if (!stopped) render() }).catch(fail)
+      }, ROWS_MS)
+      mirrorTimer = setInterval(() => {
+        if (!stopped) mirrorTick().catch(fail)
+      }, options.mirrorMs ?? MIRROR_TICK_MS)
+      sweepTimer = setInterval(() => {
+        if (!stopped) kickJob(sweepFlight, () => Date.now(), runSweep).then(() => { if (!stopped) render() }).catch(fail)
+      }, SWEEP_MS)
       await done
     }
     }

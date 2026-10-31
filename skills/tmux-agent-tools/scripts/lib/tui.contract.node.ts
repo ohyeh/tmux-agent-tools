@@ -562,6 +562,51 @@ test('launch claims before the alt screen; occupied and stale stay out (T8)', as
   }
 })
 
+test('jobs: slow rows do not delay the mirror; age grows in flight; r queues one (T9)', async () => {
+  const mod = await import('./tui.node.ts')
+  assert.equal(typeof mod.kickJob, 'function')
+  assert.equal(mod.ROWS_MS, 2_000)
+  assert.equal(mod.SWEEP_MS, 10_000)
+  assert.equal(mod.MIRROR_TICK_MS, 1_000)
+  const rows: { running: boolean; queued: boolean; lastOk?: number } = { running: false, queued: false }
+  let releaseRows: () => void = () => {}
+  const rowsGate = new Promise<void>(r => {
+    releaseRows = r
+  })
+  let rowRuns = 0
+  const rowsTask = mod.kickJob(rows, () => 0, async () => {
+    rowRuns += 1
+    await rowsGate
+    return true
+  })
+  const mirror = { running: false, queued: false }
+  let mirrorRan = false
+  await mod.kickJob(mirror, () => 0, async () => {
+    mirrorRan = true
+    return true
+  })
+  assert.equal(mirrorRan, true)
+  assert.equal(rows.running, true)
+  assert.equal(mod.ageText(2_500, { running: true, queued: false, lastOk: 0 }), '更新 2s 前 …')
+  mod.kickJob(rows, () => 0, async () => {
+    rowRuns += 1
+    return true
+  })
+  mod.kickJob(rows, () => 0, async () => {
+    rowRuns += 1
+    return true
+  })
+  assert.equal(rows.queued, true)
+  assert.equal(rowRuns, 1)
+  releaseRows()
+  await rowsTask
+  assert.equal(rowRuns, 2)
+  const failed = { running: false, queued: false, lastOk: 1_000 }
+  await mod.kickJob(failed, () => 5_000, async () => false)
+  assert.equal(failed.lastOk, 1_000)
+  assert.equal(mod.ageText(5_000, failed), '更新 4s 前')
+})
+
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {
   const base: TuiState = {
     rows: [],
