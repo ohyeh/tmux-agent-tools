@@ -535,8 +535,9 @@ export const register: Register = on => {
       envHome: () => beneath.env.get('HOME'),
       envPath: () => beneath.env.get('PATH'),
       envTermProgram: () => beneath.env.get('TERM_PROGRAM'),
-      envTmuxPane: () => beneath.env.get('TMUX_PANE'),
-      envTmuxSocket: async () => (await beneath.env.get('TMUX_AGENT_TMUX_SOCKET')) || (await beneath.env.get('TMUX'))?.split(',')[0],
+      // The band never asks for the pane or socket here; keep the permission surface narrow.
+      envTmuxPane: async () => undefined,
+      envTmuxSocket: async () => undefined,
       envSshTty: () => beneath.env.get('SSH_TTY'),
       read: path => beneath.fs.read(path),
       write: (path, text) => beneath.fs.write(path, text),
@@ -610,8 +611,9 @@ export const register: Register = on => {
       envHome: () => $.env.get('HOME'),
       envPath: () => $.env.get('PATH'),
       envTermProgram: () => $.env.get('TERM_PROGRAM'),
-      envTmuxPane: () => $.env.get('TMUX_PANE'),
-      envTmuxSocket: async () => (await $.env.get('TMUX_AGENT_TMUX_SOCKET')) || (await $.env.get('TMUX'))?.split(',')[0],
+      // The band never asks for the pane or socket here; keep the permission surface narrow.
+      envTmuxPane: async () => undefined,
+      envTmuxSocket: async () => undefined,
       envSshTty: () => $.env.get('SSH_TTY'),
       read: path => $.fs.read(path),
       write: (path, text) => $.fs.write(path, text),
