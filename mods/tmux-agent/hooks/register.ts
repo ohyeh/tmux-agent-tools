@@ -74,6 +74,7 @@ import {
   agentTmuxBin,
   claimTui,
   releaseTui,
+  ageText,
   focusTui,
   openInTerminal,
   dropLaunchFile,
@@ -883,7 +884,11 @@ export const register: Register = on => {
     const token = claim.claim.token
     const dir = await host.envTmuxAgentDir()
     const launchFile = launchDir ? tuiLaunchPath(launchDir, session, token) : undefined
-    const release = () => releaseTui(host, root, session, token, 'launcher', me)
+    const release = () =>
+      releaseTui(host, root, session, token, 'launcher', me).catch(error => {
+        host.log(`tmux-agent: tui claim release failed: ${String(error)}`)
+        return false
+      })
     try {
       const opened = await openInTerminal(
         host,
@@ -907,11 +912,7 @@ export const register: Register = on => {
       // The TUI turns the pending claim ready when it starts. If it never does, this
       // releases only the record this press made (still pending); a ready record stays.
       after(TUI_PENDING_MS, async () => {
-        const released = await release().catch(error => {
-          host.log(`tmux-agent: tui claim release failed: ${String(error)}`)
-          return false
-        })
-        if (!released) return
+        if (!(await release())) return
         if (launchFile) {
           const left = await dropLaunchFile(host, launchFile, '/')
           if (left) host.log(`tmux-agent: tui launch file ${launchFile} remains: ${left}`)
@@ -921,7 +922,7 @@ export const register: Register = on => {
       if (opened.kind === 'split') return { ok: true, text: `TUI 已開在 ${opened.locator.pane}，在 ${pane} 旁` }
       return { ok: true, text: `已送出 ${appLabel(opened.terminal)} 開啟 TUI 的要求，TUI 接手後才算就緒${opened.notice ? `；${opened.notice}` : ''}` }
     } catch (error) {
-      await release().catch(err => host.log(`tmux-agent: tui claim release failed: ${String(err)}`))
+      await release()
       throw error
     }
   }
@@ -1016,8 +1017,8 @@ export const register: Register = on => {
       displayCells('[ hide ]') +
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
-    const ageText = rowsAt === undefined ? '' : `更新 ${Math.max(0, Math.floor((now - rowsAt) / 1000))}s 前`
-    const age = ageText ? ` · ${ageText}` : ''
+    const rowsAge = rowsAt === undefined ? '' : ageText(now, { running: false, queued: false, lastOk: rowsAt })
+    const age = rowsAge ? ` · ${rowsAge}` : ''
     // The age takes part in the choice: the button words go before the age does.
     const words = displayCells(`${full.trimEnd()}${age} `) + cellsOf(true) <= width
     const addLabel = words ? '+ new' : '+'
@@ -1047,10 +1048,10 @@ export const register: Register = on => {
     const others = othersLine(panel.all)
     const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
     const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
-    const layout = (sel: PanelRow | undefined) => {
+    const layout = (sel: PanelRow | undefined, withAgeRow: boolean) => {
       // Selected: its tell line, its summary, and one row for the mirror's rule
       // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (ageRow ? 1 : 0) + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
+      const fixed = 1 + (withAgeRow ? 1 : 0) + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
       // A selection is for watching that worker: the list gives way to the
       // mirror's floor (and its hint line) before it gives way to nothing.
       const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
@@ -1064,17 +1065,17 @@ export const register: Register = on => {
       while (shown > 1 && !fitsAt(perRow, shown)) shown -= 1
       return { shown, goals, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
     }
-    if (ageText !== '' && !panel.folded && !titleText.includes('更新')) {
-      const base = (selected ? layout(selected) : layout(panel.rows[0])).used
+    if (rowsAge !== '' && !panel.folded && !titleText.includes('更新')) {
+      const base = (selected ? layout(selected, false) : layout(panel.rows[0], false)).used
       ageRow = e.props.maxRows - base - 1 >= MIRROR_MIN_ROWS + 1
     }
-    const { shown: shownRows, goals, used } = layout(selected)
+    const { shown: shownRows, goals, used } = layout(selected, ageRow)
     const first = selected ? Math.max(0, Math.min(selIndex - shownRows + 1, panel.rows.length - shownRows)) : 0
     const hidden = panel.rows.length - shownRows
     // The mirror is sized for the layout a selection draws — before the press
     // too, since the clock captures on the height the last render allowed. It
     // takes what is left after its "see it whole" line.
-    const room = e.props.maxRows - (selected ? used : layout(panel.rows[0]).used) - 1
+    const room = e.props.maxRows - (selected ? used : layout(panel.rows[0], ageRow).used) - 1
     // 0 means "do not mirror", which is the honest answer for a surface that
     // cannot fit even one line of work under the target's own chrome.
     panel.rows_available = room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
@@ -1164,7 +1165,7 @@ export const register: Register = on => {
         ],
       }),
     )
-    if (ageRow) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: ` ${ageText}` }))
+    if (ageRow) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: ` ${rowsAge}` }))
 
     if (panel.folded) {
       panel.rows_available = 0
