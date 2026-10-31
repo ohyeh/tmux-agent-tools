@@ -3,7 +3,7 @@
 // the contenders append to; the ledger is read straight off disk.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -308,10 +308,26 @@ test('collector entry: missing identity or a pane that is not %N is refused with
   assert.equal(await run(['--session', 's', '--cwd', '/x', '--pane', 'main']), 2)
 })
 
-/** A private tmux server. `$TMUX` is not copied onto the child, and every call carries `-S`. */
+/** Sockets this file started. A timeout SIGKILLs the file before `finally`; the parent smoke
+ * reaps sockets under its TMPDIR. SIGTERM still runs here, before that. */
+const privateSocks = new Set<string>()
+function reapPrivateServers() {
+  for (const sock of privateSocks) spawnSync('tmux', ['-S', sock, 'kill-server'], { stdio: 'ignore' })
+  privateSocks.clear()
+}
+process.on('exit', reapPrivateServers)
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+  process.on(sig, () => {
+    reapPrivateServers()
+    process.exit(128 + (sig === 'SIGINT' ? 2 : sig === 'SIGHUP' ? 1 : 15))
+  })
+}
+
+/** A private tmux server under tmpdir(), so a smoke that owns TMPDIR kills it on every exit. `$TMUX` is not copied onto the child, and every call carries `-S`. */
 function privateServer(): { dir: string; sock: string; env: NodeJS.ProcessEnv; tmux: (args: string[]) => Promise<{ code: number; out: string }> } {
-  const dir = mkdtempSync('/tmp/p3t-')
+  const dir = mkdtempSync(join(tmpdir(), 'p3t-'))
   const sock = join(dir, 's')
+  privateSocks.add(sock)
   const env: NodeJS.ProcessEnv = { ...process.env, TMUX_AGENT_TMUX_SOCKET: sock, TMUX_TMPDIR: dir }
   delete env.TMUX
   delete env.TMUX_PANE
@@ -336,6 +352,7 @@ async function fakeHost(draft = '', mode = 'idle') {
   const name = `tac-fake-${process.pid}-${Math.random().toString(36).slice(2, 6)}`
   const up = await srv.tmux(['new-session', '-d', '-s', name, '-x', '160', '-y', '30', `${process.execPath} ${FAKE} ${state}`])
   const stop = async () => {
+    privateSocks.delete(srv.sock)
     await srv.tmux(['-S', srv.sock, 'kill-server'])
     rmSync(srv.dir, { recursive: true, force: true })
     rmSync(state, { recursive: true, force: true })
