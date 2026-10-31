@@ -20,11 +20,13 @@ usage() {
 tmux-agent-tui - full-screen TUI for the tmux-agent workers of one session.
 
 Usage:
-  tmux-agent-tui [--session <id>] [--cwd <dir>]
+  tmux-agent-tui [--session <id>] [--cwd <dir>] [--claim <token>]
 
   --session <id>   Owner mode: act on this session's workers (tell, stop,
                    resume, clear). Default: $TMUX_AGENT_SESSION.
   --cwd <dir>      The session's directory. Default: the current directory.
+  --claim <token>  Adopt that pending claim and become ready. A token that is
+                   no longer current exits; it does not take a new claim.
 
 Without a session id the TUI is a viewer: it lists every worker, labeled,
 and is read-only.
@@ -88,10 +90,10 @@ args=()
 while (( $# )); do
   case "$1" in
     -h|--help|help) usage; exit 0 ;;
-    --session|--cwd)
+    --session|--cwd|--claim)
       (( $# >= 2 )) || { echo "tmux-agent-tui: $1 needs a value" >&2; exit 2; }
       args+=("$1" "$2"); shift 2 ;;
-    --session=*|--cwd=*) args+=("$1"); shift ;;
+    --session=*|--cwd=*|--claim=*) args+=("$1"); shift ;;
     *) echo "tmux-agent-tui: unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done

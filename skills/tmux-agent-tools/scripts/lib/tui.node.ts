@@ -68,15 +68,17 @@ import {
   observeView,
   claimTui,
   releaseTui,
+  focusTui,
   processId,
   readActHealth,
   sessionDirOf,
   v3Of,
   type ProcessId,
   type TuiClaimResult,
+  type TuiFocus,
   type TuiLocator,
 } from './workers.ts'
-import { sessionLiveness, type Liveness } from './ledger.ts'
+import { sessionKey, sessionLiveness, type Liveness } from './ledger.ts'
 import { nodeHost } from './host.node.ts'
 import { coreVersion } from './collector.node.ts'
 import { graphemes, graphemeWidth as widthOf } from './width.ts'
@@ -1341,6 +1343,10 @@ export interface TuiOptions {
   stdout?: NodeJS.WriteStream
   pollMs?: number
   mirrorMs?: number
+  /** Adopt this pending token (`--claim`). Any other current record is stale. */
+  claim?: string
+  /** Delete `tmux-agent-tui-<sessionKey>-<token>.yaml` here once the claim is ready. */
+  launchDir?: string
 }
 
 export type PickerEntry = {
@@ -1456,16 +1462,16 @@ export async function listSessions(host: Host, root: string, now: number): Promi
   return out
 }
 
-/** The locator this process writes at ready. Warp wins when the host says so, so a test does not record the owner's pane. */
+/** The locator this process writes at ready. A tmux pane wins, so a second launch selects that pane instead of opening an app. */
 export async function ownLocator(host: Host, session: string): Promise<TuiLocator> {
   const term = (await host.envTermProgram()) ?? ''
   const title = `tmux-agent-tui ${session.slice(0, 8)}`
-  if (/warp/i.test(term)) return { kind: 'warp', tabTitle: title }
   const pane = process.env.TMUX_PANE
   if (pane) {
     const socket = process.env.TMUX_AGENT_TMUX_SOCKET || process.env.TMUX?.split(',')[0]
     return { kind: 'tmux', pane, ...(socket ? { socket } : {}) }
   }
+  if (/warp/i.test(term)) return { kind: 'warp', tabTitle: title }
   let tty = 'unknown'
   try {
     tty = readlinkSync('/dev/fd/1')
@@ -1514,7 +1520,65 @@ export async function applyPick(host: Host, root: string, state: TuiState, index
   }
 }
 
-export async function runTui(options: TuiOptions = {}): Promise<void> {
+function focusLine(focus: TuiFocus): string {
+  if ('refused' in focus) return `無法把既有 TUI 拉到前面：${focus.refused}`
+  if (focus.raised === 'pane') return '已有 TUI（ready），已切到那個 pane'
+  return `已有 TUI（ready），raised: app${focus.tabTitle ? ` ${focus.tabTitle}` : ''}`
+}
+
+/** A stub `run` can report mkdir success without creating the directory. Do not claim then: `host.write` would still create files. */
+async function sessionDirReady(host: Host, root: string, session: string): Promise<boolean> {
+  const dir = sessionDirOf(v3Of(root), session)
+  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
+  if (!made || made.exitCode !== 0) return false
+  return host.exists(dir).catch(() => false)
+}
+
+async function dropLaunchFile(host: Host, launchDir: string, session: string, token: string): Promise<void> {
+  const target = `${launchDir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
+  const rm = await host.run(['rm', '-f', target], '/', 5_000).catch(() => undefined)
+  if (!rm || rm.exitCode !== 0) host.log(`tmux-agent: could not remove ${target}`)
+}
+
+type LaunchClaim =
+  | { kind: 'skip' }
+  | { kind: 'stop'; code: number }
+  | { kind: 'held'; held: { session: string; token: string; me: ProcessId } }
+
+/** Identity claims before the terminal is touched. No identity, or a mkdir that did not stick, skips the claim. */
+async function claimLaunch(host: Host, root: string, session: string, opts: { claim?: string; launchDir?: string }): Promise<LaunchClaim> {
+  if (!(await sessionDirReady(host, root, session))) return { kind: 'skip' }
+  const me = await processId(host)
+  if (!(me.pid > 0 && me.pidStart)) return { kind: 'skip' }
+  const locator = await ownLocator(host, session)
+  const result = await claimTui(host, root, session, me, {
+    state: 'ready',
+    locator,
+    ...(opts.claim ? { adopt: opts.claim } : {}),
+    ...(opts.launchDir ? { launchDir: opts.launchDir } : {}),
+  })
+  if (result.kind === 'stale') {
+    process.stderr.write('這個視窗已失效，另一個 TUI 已接手\n')
+    return { kind: 'stop', code: 1 }
+  }
+  if (result.kind === 'occupied-ready') {
+    const focus = await focusTui(host, result)
+    process.stderr.write(`${focusLine(focus)}\n`)
+    return { kind: 'stop', code: 0 }
+  }
+  if (result.kind === 'occupied-pending' || result.kind === 'occupied-unknown') {
+    process.stderr.write(`${occupiedWhere(result)}\n`)
+    return { kind: 'stop', code: 0 }
+  }
+  if (result.kind !== 'won' && result.kind !== 'adopted') {
+    process.stderr.write(`${occupiedWhere(result)}\n`)
+    return { kind: 'stop', code: 0 }
+  }
+  if (opts.launchDir) await dropLaunchFile(host, opts.launchDir, session, result.claim.token)
+  return { kind: 'held', held: { session, token: result.claim.token, me } }
+}
+
+export async function runTui(options: TuiOptions = {}): Promise<number> {
   const stdin = options.stdin ?? process.stdin
   const stdout = options.stdout ?? process.stdout
   // No invented owner. A missing id is a viewer (every row, labeled), never `tui-<pid>`.
@@ -1715,7 +1779,8 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     process.off('SIGTERM', stop)
     process.off('SIGHUP', stop)
     // Printed after the alt screen is left (the last restore step), so it stays readable.
-    restoreErrors = restoreTerminal(stdin, stdout, entry)
+    // No entry: this exit never touched the terminal (occupied, stale, or a signal during claim).
+    restoreErrors = entry ? restoreTerminal(stdin, stdout, entry) : []
     for (const err of restoreErrors) process.stderr.write(`tui: terminal restore failed: ${err.message}\n`)
   }
 
@@ -1903,7 +1968,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   }
 
   const sid8 = (session && session.length ? session : 'viewer').slice(0, 8)
-  entry = enterTerminal(stdin, stdout, `tmux-agent-tui ${sid8}`)
+  // Listeners before the first await, so a SIGTERM emitted as runTui yields is ours.
   stdin.on('data', onData)
   stdin.on('end', onEnd)
   stdin.on('error', onError)
@@ -1914,7 +1979,19 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   process.on('SIGTERM', stop)
   process.on('SIGHUP', stop)
 
+  let exitCode = 0
   try {
+    let launchStop = false
+    if (session && root) {
+      const claimed = await claimLaunch(host, root, session, { claim: options.claim, launchDir: options.launchDir })
+      if (claimed.kind === 'held') state.heldClaim = claimed.held
+      if (claimed.kind === 'stop') {
+        exitCode = claimed.code
+        launchStop = true
+      }
+    }
+    if (!stopped && !launchStop) {
+    entry = enterTerminal(stdin, stdout, `tmux-agent-tui ${sid8}`)
     // `q` during a slow first load quits at once; it does not wait for the load.
     const first = refreshRows().then(() => {
       if (!stopped) render()
@@ -1936,6 +2013,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       }, options.mirrorMs ?? MIRROR_MS)
       await done
     }
+    }
   } finally {
     stopped = true
     cleanup()
@@ -1950,6 +2028,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   }
   // A quit that left the tty broken is not a success: main exits 1, so a wrapper sees it.
   if (restoreErrors.length) throw new Error(`terminal restore failed: ${restoreErrors.map(e => e.message).join('; ')}`)
+  return exitCode
 }
 
 async function main(): Promise<void> {
@@ -1969,17 +2048,22 @@ async function main(): Promise<void> {
     process.stderr.write(`tui: TMUX_AGENT_AMBIGUOUS_WIDTH must be 1 or 2, not ${JSON.stringify(amb)}\n`)
     process.exit(2)
   }
-  let values: { session?: string; cwd?: string }
+  let values: { session?: string; cwd?: string; claim?: string }
   try {
-    ;({ values } = parseArgs({ options: { session: { type: 'string' }, cwd: { type: 'string' } } }))
+    ;({ values } = parseArgs({ options: { session: { type: 'string' }, cwd: { type: 'string' }, claim: { type: 'string' } } }))
   } catch (error) {
     process.stderr.write(`tui: ${(error as Error).message}\n`)
     process.exit(2)
   }
-  await runTui({ session: values.session, cwd: values.cwd })
+  // Outside tmux, Warp's own launch file is removed at ready. Inside a pane, never touch ~/.warp.
+  let launchDir: string | undefined
+  if (!process.env.TMUX_PANE && /warp/i.test(process.env.TERM_PROGRAM ?? '') && process.env.HOME) {
+    launchDir = `${process.env.HOME}/.warp/launch_configurations`
+  }
+  const code = await runTui({ session: values.session, cwd: values.cwd, claim: values.claim, launchDir })
   // Terminal already restored. A signal can arrive while an action's child still
   // runs; exit now instead of waiting for it (the old SIGINT/SIGTERM handler did too).
-  process.exit(0)
+  process.exit(code)
 }
 
 /** Run as a script (not imported)? argv[1] may hold spaces, `%`, `#`, or a symlink. */

@@ -30,8 +30,10 @@ import {
   projectSessionsOf,
   sameProject,
   claimTui,
+  processId,
   type Health,
 } from './workers.ts'
+import { sessionKey } from './ledger.ts'
 import {
   nextKeyState,
   applyRowsTick,
@@ -411,6 +413,153 @@ test('picker: four liveness kinds, cwd order, claim ready, occupied stays viewer
   assert.equal(again.state.mode, 'preview')
   assert.equal(again.host, warpHost)
   assert.match(again.state.statusMessage ?? '', /ready/)
+})
+
+test('launch claims before the alt screen; occupied and stale stay out (T8)', async () => {
+  const prevPane = process.env.TMUX_PANE
+  const prevTmux = process.env.TMUX
+  delete process.env.TMUX_PANE
+  delete process.env.TMUX
+  const err: string[] = []
+  const stderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    err.push(String(chunk))
+    return true
+  }) as typeof process.stderr.write
+  const root = mkdtempSync(join(tmpdir(), 'tui-claim-'))
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  const ownerPath = join(sessionDirOf(v3Of(root), 'owned'), 'tui.owner')
+  let claimBeforeEnter = false
+  class In extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    resume() {}
+    pause() {}
+  }
+  class Out extends EventEmitter {
+    columns = 80
+    rows = 24
+    written = ''
+    write(t: string) {
+      if (!claimBeforeEnter && t.includes('\x1b[?1049h')) {
+        claimBeforeEnter = existsSync(ownerPath) && JSON.parse(readFileSync(ownerPath, 'utf8')).state === 'ready'
+      }
+      this.written += t
+      return true
+    }
+  }
+  const stdin = new In()
+  const stdout = new Out()
+  const base = nodeHost({ cwd: repo })
+  base.envTmuxAgentDir = async () => root
+  const realRun = base.run.bind(base)
+  const calls: string[][] = []
+  base.run = async (argv, cwd, ms) => {
+    const bin = argv[0] ?? ''
+    if (bin === 'open' || bin === 'osascript' || bin === 'tmux' || bin === 'agent-tmux' || bin === 'git') {
+      calls.push([...argv])
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    return realRun(argv, cwd, ms)
+  }
+  const host = { ...base, envTermProgram: async () => 'WarpTerminal' }
+  const first = runTui({ host, root, cwd: repo, session: 'owned', stdin: stdin as never, stdout: stdout as never, mirrorMs: 60_000 })
+  try {
+    await until(() => stdout.written.includes('\x1b[?1049h'), 5_000, 'alt screen')
+    assert.equal(claimBeforeEnter, true)
+    const rec = JSON.parse(readFileSync(ownerPath, 'utf8')) as { state: string; locator: { kind: string; tabTitle?: string } }
+    assert.equal(rec.state, 'ready')
+    assert.equal(rec.locator.kind, 'warp')
+    const secondOut = new Out()
+    const code = await runTui({ host, root, cwd: repo, session: 'owned', stdin: new In() as never, stdout: secondOut as never, mirrorMs: 60_000 })
+    assert.equal(code, 0)
+    assert.equal(secondOut.written.includes('\x1b[?1049h'), false)
+    assert.ok(calls.some(a => a[0] === 'open' && a[1] === '-a' && a[2] === 'Warp'))
+    assert.match(err.join(''), /raised: app/)
+    assert.match(err.join(''), /tmux-agent-tui owned/)
+    assert.doesNotMatch(err.join(''), /window focused/)
+    process.emit('SIGHUP')
+    await first
+    assert.equal(existsSync(ownerPath), false)
+
+    const qRoot = mkdtempSync(join(tmpdir(), 'tui-claim-q-'))
+    const qIn = new In()
+    const qOut = new Out()
+    const qPath = join(sessionDirOf(v3Of(qRoot), 'q-one'), 'tui.owner')
+    const qRun = runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'q-one', stdin: qIn as never, stdout: qOut as never, mirrorMs: 60_000 })
+    await until(() => qOut.written.includes('\x1b[?1049h'), 5_000, 'q entered')
+    assert.equal(existsSync(qPath), true)
+    qIn.emit('data', 'q')
+    await qRun
+    assert.equal(existsSync(qPath), false)
+
+    const cIn = new In()
+    const cOut = new Out()
+    const cPath = join(sessionDirOf(v3Of(qRoot), 'c-one'), 'tui.owner')
+    const cRun = runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'c-one', stdin: cIn as never, stdout: cOut as never, mirrorMs: 60_000 })
+    await until(() => cOut.written.includes('\x1b[?1049h'), 5_000, 'ctrl-c entered')
+    assert.equal(existsSync(cPath), true)
+    cIn.emit('data', '\x03')
+    await cRun
+    assert.equal(existsSync(cPath), false)
+
+    err.length = 0
+    calls.length = 0
+    const me = await processId(host)
+    const pend = await claimTui(host, qRoot, 'pend-one', me, { state: 'pending' })
+    assert.equal(pend.kind, 'won')
+    const pOut = new Out()
+    const pCode = await runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'pend-one', stdin: new In() as never, stdout: pOut as never, mirrorMs: 60_000 })
+    assert.equal(pCode, 0)
+    assert.equal(pOut.written.includes('\x1b[?1049h'), false)
+    assert.match(err.join(''), /pending/)
+    assert.equal(calls.some(a => a[0] === 'open' || a[0] === 'osascript'), false)
+
+    err.length = 0
+    const sOut = new Out()
+    const sCode = await runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'stale-one', stdin: new In() as never, stdout: sOut as never, mirrorMs: 60_000, claim: 'zzzzzzzzzzzz' })
+    assert.equal(sCode, 1)
+    assert.match(err.join(''), /這個視窗已失效，另一個 TUI 已接手/)
+    assert.equal(sOut.written.includes('\x1b[?1049h'), false)
+
+    const launchDir = mkdtempSync(join(tmpdir(), 'tui-launch-'))
+    const token = pend.kind === 'won' ? pend.claim.token : ''
+    const adopt = await claimTui(host, qRoot, 'adopt-one', me, { state: 'pending' })
+    assert.equal(adopt.kind, 'won')
+    const adoptToken = adopt.kind === 'won' ? adopt.claim.token : token
+    const yaml = join(launchDir, `tmux-agent-tui-${sessionKey('adopt-one')}-${adoptToken}.yaml`)
+    writeFileSync(yaml, 'commands: []\n')
+    const aIn = new In()
+    const aOut = new Out()
+    const aRun = runTui({
+      host: { ...host, envTmuxAgentDir: async () => qRoot },
+      root: qRoot,
+      cwd: repo,
+      session: 'adopt-one',
+      stdin: aIn as never,
+      stdout: aOut as never,
+      mirrorMs: 60_000,
+      claim: adoptToken,
+      launchDir,
+    })
+    await until(() => aOut.written.includes('\x1b[?1049h'), 5_000, 'adopt entered')
+    assert.equal(existsSync(yaml), false)
+    const ready = JSON.parse(readFileSync(join(sessionDirOf(v3Of(qRoot), 'adopt-one'), 'tui.owner'), 'utf8')) as { state: string }
+    assert.equal(ready.state, 'ready')
+    aIn.emit('data', 'q')
+    await aRun
+    assert.equal(existsSync(join(sessionDirOf(v3Of(qRoot), 'adopt-one'), 'tui.owner')), false)
+  } finally {
+    stdin.emit('data', 'q')
+    process.emit('SIGHUP')
+    await first.catch(() => undefined)
+    process.stderr.write = stderrWrite
+    if (prevPane === undefined) delete process.env.TMUX_PANE
+    else process.env.TMUX_PANE = prevPane
+    if (prevTmux === undefined) delete process.env.TMUX
+    else process.env.TMUX = prevTmux
+  }
 })
 
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {
@@ -1047,6 +1196,7 @@ test('terminal: after a stop, an in-flight refresh does not render', async () =>
     return realNow()
   }
   const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('\x1b[?1049h'), 5_000, 'entered before SIGTERM')
   process.emit('SIGTERM')
   await run
   const after = stdout.written
@@ -1825,8 +1975,13 @@ test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', {
     assert.match(screen, new RegExp(name))
     assert.match(liveStatus, /"exists":\s*true/, liveStatus)
     const after = treeSnap(root)
-    assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
-    for (const [path, body] of before) assert.equal(after.get(path), body, `mutated ${path}`)
+    const claimPath = (p: string) => p.includes('/.sessions') || /\/\.v3\/$/.test(p)
+    assert.deepEqual([...after.keys()].filter(p => !claimPath(p)).sort(), [...before.keys()].filter(p => !claimPath(p)).sort())
+    for (const [path, body] of before) {
+      if (claimPath(path)) continue
+      assert.equal(after.get(path), body, `mutated ${path}`)
+    }
+    assert.equal([...after.keys()].some(p => p.endsWith('/tui.owner')), false)
   } finally {
     await tmuxS(['kill-server'])
     rmSync(parent, { recursive: true, force: true })

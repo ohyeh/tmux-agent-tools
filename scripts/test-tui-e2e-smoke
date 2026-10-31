@@ -126,7 +126,7 @@ cat > "$RUN" <<EOF
 #!/bin/zsh -f
 stty -g > ${(q)WORK}/stty.\$1.before
 stty -a > ${(q)WORK}/stty-a.\$1.before
-if [[ "\$1" == owner || "\$1" == hup ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
+if [[ "\$1" == owner || "\$1" == hup || "\$1" == second || "\$1" == cc ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
 else tmux-agent-tui --cwd ${(q)WORK}/repo; fi
 echo "TUI_EXIT=\$?"
 stty -a > ${(q)WORK}/stty-a.\$1.after
@@ -189,16 +189,31 @@ for _ in {1..50}; do
 done
 check "A's tmux session is gone" test "$stopped" = yes
 
+key="$("$NODE_BIN" -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("hex"))' "$SESSION")"
+sd="$TMUX_AGENT_DIR/.v3/.sessions/$key"
+claim="$sd/tui.owner"
+
+echo "case: second launch exits 0 without taking the terminal"
+check "first TUI holds a ready claim" grep -q '"state":"ready"' "$claim"
+T new-session -d -s second -x 80 -y 24 "$RUN second"
+SP="=second:"
+check "second launch exited 0" wait_for "$SP" 'TUI_EXIT=0' 50
+for _ in {1..100}; do [[ -s "$WORK/stty.second.after" ]] && break; /bin/sleep 0.05; done
+check "second launch left stty unchanged" cmp -s "$WORK/stty.second.before" "$WORK/stty.second.after"
+check "first TUI still drawn" wait_for "$P" 'workers' 10
+
 echo "case: q exits and the pane's stty is unchanged"
 keys "$P" q
 check "the TUI exited 0" wait_for "$P" 'TUI_EXIT=0' 50
 for _ in {1..100}; do [[ -s "$WORK/stty.owner.after" ]] && break; /bin/sleep 0.05; done
 check "stty after == stty before" cmp -s "$WORK/stty.owner.before" "$WORK/stty.owner.after"
+check "claim file gone after q" test ! -e "$claim"
 
 echo "case: SIGHUP restores the tty once"
 T new-session -d -s hup -x 80 -y 24 "$RUN hup"
 HP="=hup:"
 check "hup TUI drew" wait_for "$HP" 'workers' 25
+check "hup holds a ready claim" grep -q '"state":"ready"' "$claim"
 pane_pid="$(T display-message -p -t "$HP" '#{pane_pid}')"
 child="$(pgrep -P "$pane_pid" | head -1)"
 check "hup child exists" test -n "$child"
@@ -206,10 +221,18 @@ kill -HUP "$child"
 check "SIGHUP exited 0" wait_for "$HP" 'TUI_EXIT=0' 50
 for _ in {1..100}; do [[ -s "$WORK/stty-a.hup.after" ]] && break; /bin/sleep 0.05; done
 check "stty -a after SIGHUP is sane" sh -c "grep -q 'icanon' '$WORK/stty-a.hup.after' && grep -q ' echo' '$WORK/stty-a.hup.after' && ! grep -q -- '-icanon' '$WORK/stty-a.hup.after'"
+check "claim file gone after SIGHUP" test ! -e "$claim"
+
+echo "case: Ctrl-C releases the claim"
+T new-session -d -s cc -x 80 -y 24 "$RUN cc"
+CP="=cc:"
+check "cc TUI drew" wait_for "$CP" 'workers' 25
+check "cc holds a ready claim" grep -q '"state":"ready"' "$claim"
+keys "$CP" C-c
+check "Ctrl-C exited 0" wait_for "$CP" 'TUI_EXIT=0' 50
+check "claim file gone after Ctrl-C" test ! -e "$claim"
 
 echo "case: viewer picks a live session, then x stops a worker"
-key="$("$NODE_BIN" -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("hex"))' "$SESSION")"
-sd="$TMUX_AGENT_DIR/.v3/.sessions/$key"
 mkdir -p "$sd/act/1"
 printf '%s\n' '{"token":"e2etoken0001"}' > "$sd/act/1.json"
 printf '%s\n' '{"channel":"node","status":"collecting","token":"e2etoken0001","mode":"auto"}' > "$sd/act/1.state"
