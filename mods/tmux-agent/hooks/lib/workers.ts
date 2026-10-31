@@ -3612,6 +3612,137 @@ export async function focusTui(host: Host, result: TuiClaimResult): Promise<TuiF
   return loc.kind === 'warp' ? { raised: 'app', tabTitle: loc.tabTitle } : { raised: 'app' }
 }
 
+/** What one TUI launch needs. Paths are absolute. The Warp directory is the caller's; this never picks ~/.warp. */
+export interface LaunchContext {
+  argv: readonly string[]
+  cwd: string
+  env: { TMUX_AGENT_DIR?: string; TMUX_AGENT_TMUX_SOCKET?: string }
+  session: string
+  launchToken: string
+  /** Directory for this launch's Warp file. Absent: do not write one. */
+  launchDir?: string
+  /** Host pane (`%N`) when the caller is inside tmux. */
+  pane?: string
+}
+
+export type OpenResult =
+  | { kind: 'split'; locator: { kind: 'tmux'; socket?: string; pane: string } }
+  | { kind: 'sent'; terminal: 'warp' | 'iterm' | 'terminal'; notice?: string }
+  | { kind: 'failed'; error: string; stderr: string; command: string }
+
+// Scripts stay constant: the command is an argv element after `--`, never spliced in.
+const ITERM_SCRIPT = `on run argv
+  set cmd to item 1 of argv
+  tell application "iTerm2" to create window with default profile command "/bin/sh -lc " & quoted form of cmd
+end run`
+const TERMINAL_SCRIPT = `on run argv
+  set cmd to item 1 of argv
+  tell application "Terminal" to do script cmd
+end run`
+
+function launchLine(ctx: LaunchContext): string {
+  const prefix = [
+    ctx.env.TMUX_AGENT_DIR ? `TMUX_AGENT_DIR=${shq(ctx.env.TMUX_AGENT_DIR)}` : '',
+    ctx.env.TMUX_AGENT_TMUX_SOCKET ? `TMUX_AGENT_TMUX_SOCKET=${shq(ctx.env.TMUX_AGENT_TMUX_SOCKET)}` : '',
+  ].filter(a => a.length > 0)
+  return [...prefix, ...ctx.argv.map(a => shq(a))].join(' ')
+}
+
+const showArgv = (argv: readonly string[]) => argv.map(a => shq(a)).join(' ')
+
+function warpYaml(configName: string, title: string, cwd: string, exec: string): string {
+  return [
+    '---',
+    `name: ${configName}`,
+    'windows:',
+    '  - tabs:',
+    '      - title: ' + JSON.stringify(title),
+    '        layout:',
+    `          cwd: ${JSON.stringify(cwd)}`,
+    '          commands:',
+    `            - exec: ${JSON.stringify(exec)}`,
+    '',
+  ].join('\n')
+}
+
+async function openWarp(host: Host, ctx: LaunchContext, name: string, line: string): Promise<OpenResult> {
+  if (!ctx.launchDir) return { kind: 'failed', error: 'no launch directory', stderr: '', command: line }
+  const configName = `tmux-agent-tui-${sessionKey(ctx.session)}-${ctx.launchToken}`
+  const file = `${ctx.launchDir}/${configName}.yaml`
+  try {
+    await host.write(file, warpYaml(configName, name, ctx.cwd, line))
+  } catch (error) {
+    return { kind: 'failed', error: 'write', stderr: String(error), command: line }
+  }
+  const argv = ['open', `warp://launch/${encodeURIComponent(configName)}`]
+  // The file is removed on failure, so the launch line has to travel with the open command.
+  const command = `${showArgv(argv)}\n${line}`
+  let run: { exitCode: number; stderr: string }
+  try {
+    run = await host.run(argv, ctx.cwd, 5_000)
+  } catch (error) {
+    await host.run(['rm', '-f', file], ctx.launchDir, 5_000).catch(() => undefined)
+    return { kind: 'failed', error: 'open', stderr: String(error), command }
+  }
+  if (run.exitCode !== 0) {
+    await host.run(['rm', '-f', file], ctx.launchDir, 5_000).catch(() => undefined)
+    return { kind: 'failed', error: 'open', stderr: run.stderr, command }
+  }
+  return { kind: 'sent', terminal: 'warp' }
+}
+
+async function openAppleScript(host: Host, ctx: LaunchContext, script: string, line: string, terminal: 'iterm' | 'terminal', notice?: string): Promise<OpenResult> {
+  const argv = ['osascript', '-e', script, '--', line]
+  const command = showArgv(argv)
+  let run: { exitCode: number; stderr: string }
+  try {
+    run = await host.run(argv, ctx.cwd, 5_000)
+  } catch (error) {
+    return { kind: 'failed', error: 'osascript', stderr: String(error), command }
+  }
+  if (run.exitCode !== 0) return { kind: 'failed', error: 'osascript', stderr: run.stderr, command }
+  return notice ? { kind: 'sent', terminal, notice } : { kind: 'sent', terminal }
+}
+
+/**
+ * Open the TUI in the caller's terminal. tmux splits when allowed (B1). Warp, iTerm2 and
+ * Terminal.app are the adapters (B2). Anything else is Terminal.app, and the result says so.
+ * SSH with no split cannot open a window on the remote machine. Every process and file
+ * goes through `host`; a failed Warp open deletes only that launch's file.
+ */
+export async function openInTerminal(host: Host, ctx: LaunchContext, name: string, allowSplit: boolean): Promise<OpenResult> {
+  const line = launchLine(ctx)
+  if (allowSplit && ctx.pane && /^%\d+$/.test(ctx.pane)) {
+    const socket = ctx.env.TMUX_AGENT_TMUX_SOCKET
+    const argv = [
+      'tmux',
+      ...(socket ? ['-S', socket] as const : []),
+      'split-window', '-t', ctx.pane, '-h', '-f', '-d', '-c', ctx.cwd, '-P', '-F', '#{pane_id}',
+      ...(ctx.env.TMUX_AGENT_DIR ? ['-e', `TMUX_AGENT_DIR=${ctx.env.TMUX_AGENT_DIR}`] : []),
+      ...(socket ? ['-e', `TMUX_AGENT_TMUX_SOCKET=${socket}`] : []),
+      ...ctx.argv,
+    ]
+    const command = showArgv(argv)
+    let run: { exitCode: number; stdout: string; stderr: string }
+    try {
+      run = await host.run(argv, ctx.cwd, 5_000)
+    } catch (error) {
+      return { kind: 'failed', error: 'tmux', stderr: String(error), command }
+    }
+    const pane = run.stdout.trim()
+    if (run.exitCode !== 0 || !/^%\d+$/.test(pane)) return { kind: 'failed', error: 'tmux', stderr: run.stderr, command }
+    return { kind: 'split', locator: { kind: 'tmux', ...(socket ? { socket } : {}), pane } }
+  }
+  const ssh = await host.envSshTty()
+  if (ssh) return { kind: 'failed', error: 'cannot open a window on your machine over SSH', stderr: '', command: line }
+  const term = await host.envTermProgram()
+  if (term === 'WarpTerminal') return openWarp(host, ctx, name, line)
+  if (term === 'iTerm.app' || term === 'iTerm2') return openAppleScript(host, ctx, ITERM_SCRIPT, line, 'iterm')
+  if (term === 'Apple_Terminal' || term === 'Terminal') return openAppleScript(host, ctx, TERMINAL_SCRIPT, line, 'terminal')
+  const seen = term && term.length > 0 ? term : 'unset'
+  return openAppleScript(host, ctx, TERMINAL_SCRIPT, line, 'terminal', `${seen} has no adapter; opening Terminal.app`)
+}
+
 /**
  * This activation's liveness (§4): register once (`act/<n>`), then beat `act/<n>.beat`
  * every reconcile. A higher registration of the same session (a reload) fences this
