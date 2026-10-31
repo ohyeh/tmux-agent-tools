@@ -1234,14 +1234,7 @@ export function renderTuiLines(
   const fit = (line: string) => truncateAnsi(line, width)
   const lines: string[] = [s.title, ...s.status.slice(0, lay.status).map(fit)]
 
-  for (let i = lay.first; i < lay.first + lay.list; i++) {
-    const r = state.rows[i]!
-    const isSelected = i === s.sel
-    const digitPrefix = i < 9 ? `${i + 1}: ` : '   '
-    const color = r.project ? ANSI_COLOR_MAP['blue'] : (ANSI_COLOR_MAP[STATE_COLOR[r.state]] ?? '')
-    const glyphStr = `${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}`
-    lines.push(fit(`${digitPrefix}${glyphStr}${sanitizeAnsi(rowLabel(r, isSelected))}`))
-  }
+  for (let i = lay.first; i < lay.first + lay.list; i++) lines.push(fit(rowLine(state, i, s.sel)))
   if (lay.more) lines.push(fit(`\x1b[2m  +${lay.hidden} more — j/k moves the selection\x1b[0m`))
 
   // The row list stays put above; the selected row's hints and preview come after it.
