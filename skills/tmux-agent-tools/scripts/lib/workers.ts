@@ -3435,18 +3435,16 @@ async function dropStaging(host: Host, staging: string): Promise<void> {
   await host.run(['rm', '-rf', staging], '/', 5_000).catch(() => undefined)
 }
 
-const TUI_FENCE_PUBLISH = `use Fcntl qw(LOCK_EX);
-my ($fence, $staging, $lock) = @ARGV;
-open my $fh, '>>', $fence or die "fence: $!";
+const TUI_FLOCK = `use Fcntl qw(LOCK_EX);
+open my $fh, '>>', $ARGV[0] or die "fence: $!";
 flock($fh, LOCK_EX) or die "flock: $!";
+`
+const TUI_FENCE_PUBLISH = `${TUI_FLOCK}my ($fence, $staging, $lock) = @ARGV;
 exit 2 if -e $lock;
 rename($staging, $lock) or die "rename: $!";
 `
-const TUI_FENCE_RECOVER = `use Fcntl qw(LOCK_EX);
-use JSON::PP qw(decode_json);
+const TUI_FENCE_RECOVER = `${TUI_FLOCK}use JSON::PP qw(decode_json);
 my ($fence, $holder, $lock, $host, $pid, $start) = @ARGV;
-open my $fh, '>>', $fence or die "fence: $!";
-flock($fh, LOCK_EX) or die "flock: $!";
 open my $hf, '<', $holder or exit 2;
 local $/;
 my $raw = <$hf>;
