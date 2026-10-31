@@ -3436,14 +3436,16 @@ export type TuiClaimResult =
   | { kind: 'stale' }
   | { kind: 'occupied-ready'; claim: TuiOwner; locator: TuiLocator | undefined }
   | { kind: 'occupied-pending'; claim: TuiOwner }
-  | { kind: 'occupied-unknown'; claim?: TuiOwner }
+  | { kind: 'occupied-unknown'; claim?: TuiOwner; reason?: string }
 
 export type TuiFocus = { raised: 'app'; tabTitle?: string } | { raised: 'pane' } | { refused: string }
 
 const TUI_LOCK_TRIES = 40
 const TUI_LOCK_WAIT_MS = 50
-/** A lock older than the whole wait is a leftover, not a live section. It is not removed: its mv/rm child may still be running. */
-const TUI_LOCK_STALE_MS = TUI_LOCK_TRIES * TUI_LOCK_WAIT_MS
+/** Contention budget for a live publisher. Older than this wait is not proof the holder is dead. */
+const TUI_LOCK_WAIT_BUDGET_MS = TUI_LOCK_TRIES * TUI_LOCK_WAIT_MS
+/** `host.run` cap (5s) plus margin. A dead holder younger than this may still have a child in that call. */
+export const TUI_LOCK_RECOVER_MS = 6_000
 
 function tuiLockNote(lock: string, why: string): string {
   return `tmux-agent: tui lock ${lock} ${why}; rmdir it by hand only when no claim section is still running`
@@ -3483,55 +3485,105 @@ function tuiLaunchPath(dir: string, session: string, token: string): string {
   return `${dir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
 }
 
-async function tuiLockStale(host: Host, lock: string): Promise<boolean> {
+async function dropStaging(host: Host, staging: string): Promise<void> {
+  await host.run(['rm', '-rf', staging], '/', 5_000).catch(() => undefined)
+}
+
+/** Publish `tui.owner.lock.<pid>.<rand>/holder`, then rename(2) onto the lock. `mv` would nest into an existing directory. */
+async function publishTuiLock(host: Host, dir: string, me: ProcessId): Promise<'won' | 'busy' | 'fail'> {
+  const lock = `${dir}/tui.owner.lock`
   try {
-    const st = await host.stat(lock)
-    return (await host.now()) - st.mtimeMs > TUI_LOCK_STALE_MS
+    if (await host.exists(lock)) return 'busy'
   } catch {
-    return false
+    return 'fail'
+  }
+  const staging = `${dir}/tui.owner.lock.${me.pid}.${randomBase36(6)}`
+  if ((await mkdirExclusive(host, staging)) !== 'won') return 'fail'
+  try {
+    await host.write(`${staging}/holder`, JSON.stringify({ host: me.host, pid: me.pid, pidStart: me.pidStart, at: await host.now() }))
+    const renamed = await host.run(['perl', '-e', 'rename($ARGV[0], $ARGV[1]) or die $!', staging, lock], '/', 5_000)
+    if (renamed.exitCode === 0) return 'won'
+    if (renamed.exitCode === 127 || /ENOENT|not found/i.test(`${renamed.stderr}${renamed.stdout}`)) return 'fail'
+    return 'busy'
+  } catch {
+    return 'fail'
+  } finally {
+    await dropStaging(host, staging)
   }
 }
 
-async function withTuiLock<T>(host: Host, root: string, session: string, body: (dir: string) => Promise<T>): Promise<T | undefined> {
+/** Remove a same-host holder that is proven dead and older than TUI_LOCK_RECOVER_MS. Anything else stays. */
+async function recoverTuiLock(host: Host, lock: string, me: ProcessId): Promise<boolean> {
+  const holderPath = `${lock}/holder`
+  let raw: string
+  try {
+    if (!(await host.exists(holderPath))) return false
+    raw = await host.read(holderPath)
+  } catch {
+    return false
+  }
+  const parsed = parseJson(raw) as { host?: unknown; pid?: unknown; pidStart?: unknown } | undefined
+  if (!parsed || parsed.host !== me.host || typeof parsed.pid !== 'number' || !(parsed.pid > 0) || typeof parsed.pidStart !== 'string' || !parsed.pidStart) return false
+  if ((await holderProvablyAlive(host, { host: parsed.host, pid: parsed.pid, pidStart: parsed.pidStart })) !== false) return false
+  try {
+    if ((await host.now()) - (await host.stat(lock)).mtimeMs <= TUI_LOCK_RECOVER_MS) return false
+  } catch {
+    return false
+  }
+  host.log(`tmux-agent: tui lock ${lock} recovered from dead holder pid ${parsed.pid} pidStart ${parsed.pidStart}`)
+  const rm = await host.run(['rm', '-f', holderPath], '/', 5_000).catch(() => undefined)
+  if (!rm || rm.exitCode !== 0) return false
+  const rd = await host.run(['rmdir', lock], '/', 5_000).catch(() => undefined)
+  return !!rd && rd.exitCode === 0
+}
+
+async function withTuiLock<T>(
+  host: Host,
+  root: string,
+  session: string,
+  me: ProcessId,
+  body: (dir: string) => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; reason: string }> {
   const dir = sessionDirOf(v3Of(root), session)
-  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
-  if (!made || made.exitCode !== 0) return undefined
   const lock = `${dir}/tui.owner.lock`
+  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
+  if (!made || made.exitCode !== 0) return { ok: false, reason: 'session dir' }
+  let recovered = false
   for (let i = 0; i < TUI_LOCK_TRIES; i++) {
-    const got = await mkdirExclusive(host, lock)
-    if (got === 'unknown') {
+    const pub = await publishTuiLock(host, dir, me)
+    if (pub === 'fail') {
       host.log(tuiLockNote(lock, 'could not be created'))
-      return undefined
+      return { ok: false, reason: 'could not be created' }
     }
-    if (got === 'lost') {
-      if (await tuiLockStale(host, lock)) {
-        host.log(tuiLockNote(lock, `is older than ${TUI_LOCK_STALE_MS}ms`))
-        return undefined
+    if (pub === 'busy') {
+      if (!recovered) {
+        recovered = true
+        if (await recoverTuiLock(host, lock, me)) continue
       }
-      await host.run(['sleep', '0.05'], '/', 1_000).catch(() => undefined)
+      if (i + 1 < TUI_LOCK_TRIES) await host.run(['sleep', String(TUI_LOCK_WAIT_MS / 1000)], '/', 1_000).catch(() => undefined)
       continue
     }
-    let value: T
-    let leftover = false
+    let value: T | undefined
+    let leftover = ''
     try {
       value = await body(dir)
     } finally {
+      await host.run(['rm', '-f', `${lock}/holder`], '/', 5_000).catch(() => undefined)
       try {
         const rm = await host.run(['rmdir', lock], '/', 5_000)
-        if (rm.exitCode !== 0) {
-          leftover = true
-          host.log(tuiLockNote(lock, `remains after the section (${rm.stderr.trim() || `exit ${rm.exitCode}`})`))
-        }
+        if (rm.exitCode !== 0) leftover = rm.stderr.trim() || `exit ${rm.exitCode}`
       } catch (error) {
-        leftover = true
-        host.log(tuiLockNote(lock, `remains after the section (${errorClass(error)} ${String(error)})`))
+        leftover = `${errorClass(error)} ${String(error)}`
       }
     }
-    if (leftover) return undefined
-    return value
+    if (leftover) {
+      host.log(tuiLockNote(lock, `remains after the section (${leftover})`))
+      return { ok: false, reason: leftover }
+    }
+    return { ok: true, value: value as T }
   }
-  host.log(tuiLockNote(lock, 'stayed busy'))
-  return undefined
+  host.log(tuiLockNote(lock, `stayed busy through ${TUI_LOCK_WAIT_BUDGET_MS}ms`))
+  return { ok: false, reason: 'stayed busy' }
 }
 
 async function readTuiOwner(host: Host, dir: string): Promise<TuiOwner | undefined | 'bad'> {
@@ -3577,7 +3629,7 @@ async function tuiSlot(host: Host, cur: TuiOwner, now: number): Promise<'reclaim
  * `--claim <token>` passes `adopt` and becomes `ready` only for that unexpired pending token.
  */
 export async function claimTui(host: Host, root: string, session: string, me: ProcessId, opts: TuiClaimOpts): Promise<TuiClaimResult> {
-  const out = await withTuiLock(host, root, session, async dir => {
+  const out = await withTuiLock(host, root, session, me, async dir => {
     const now = await host.now()
     const cur = await readTuiOwner(host, dir)
     if (cur === 'bad') return { kind: 'occupied-unknown' as const }
@@ -3628,7 +3680,8 @@ export async function claimTui(host: Host, root: string, session: string, me: Pr
     if (!(await writeTuiOwner(host, dir, next))) return { kind: 'occupied-unknown' as const }
     return { kind: 'won' as const, claim: next }
   })
-  return out ?? { kind: 'occupied-unknown' }
+  if (!out.ok) return { kind: 'occupied-unknown', reason: out.reason }
+  return out.value
 }
 
 /** Launcher: own pending only. TUI: own ready only. Token and process identity, under the lock. */
@@ -3640,14 +3693,14 @@ export async function releaseTui(
   role: 'launcher' | 'tui',
   me: ProcessId,
 ): Promise<boolean> {
-  const out = await withTuiLock(host, root, session, async dir => {
+  const out = await withTuiLock(host, root, session, me, async dir => {
     const cur = await readTuiOwner(host, dir)
     if (!cur || cur === 'bad' || cur.token !== token || !sameProc(cur, me)) return false
     if (role === 'launcher' ? cur.state !== 'pending' : cur.state !== 'ready') return false
     const rm = await host.run(['rm', '-f', `${dir}/tui.owner`], '/', 5_000).catch(() => undefined)
     return !!rm && rm.exitCode === 0
   })
-  return out === true
+  return out.ok && out.value === true
 }
 
 /**

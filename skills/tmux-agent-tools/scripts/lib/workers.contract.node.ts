@@ -2804,7 +2804,7 @@ test('T2: an exists error does not overwrite a ready claim', async () => {
     const next = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
     assert.equal(next.kind, 'occupied-unknown')
     assert.equal(readFileSync(d.ownerPath, 'utf8'), before)
-    assert.deepEqual(writes, [])
+    assert.deepEqual(writes.filter(p => !p.includes('/tui.owner.lock.')), [], 'the owner file is not written when it cannot be read')
   } finally { d.rm() }
 })
 
@@ -2915,6 +2915,55 @@ test('T2: a leftover lock is reported and a live lock is not removed', async () 
     assert.equal(rmdirs.includes(liveLock), false)
     assert.ok(logs.some(l => l.includes(liveLock) && /rmdir/.test(l)), logs.join('\n'))
   } finally { oldDir.rm(); liveDir.rm() }
+})
+
+test('T2: a dead holder older than the run cap is recovered; a live, foreign, young, or empty lock is not', async () => {
+  const core = await tuiCore()
+  const base = nodeHost({ log: () => {} })
+  const me = await processId(base)
+  const host: Host = {
+    ...base,
+    log: () => {},
+    run: async (argv, cwd, ms) => (argv[0] === 'sleep' ? { exitCode: 0, stdout: '', stderr: '' } : base.run(argv, cwd, ms)),
+  }
+  const lockOf = (ownerPath: string) => `${ownerPath.slice(0, ownerPath.lastIndexOf('/'))}/tui.owner.lock`
+  const plant = (dir: ReturnType<typeof tuiDirs>, holder: { host: string; pid: number; pidStart: string } | undefined, ageMs: number) => {
+    const lock = lockOf(dir.ownerPath)
+    mkdirSync(lock, { recursive: true })
+    if (holder) writeFileSync(join(lock, 'holder'), JSON.stringify({ ...holder, at: 1 }))
+    if (ageMs > 0) {
+      const at = new Date(Date.now() - ageMs)
+      utimesSync(lock, at, at)
+    }
+    return lock
+  }
+  const dead = { host: me.host, pid: 2147483646, pidStart: 'no-such-start' }
+  const cases = [
+    tuiDirs(),
+    tuiDirs(),
+    tuiDirs(),
+    tuiDirs(),
+  ]
+  try {
+    const oldDead = plant(cases[0]!, dead, 60_000)
+    const won = await core.claimTui(host, cases[0]!.root, cases[0]!.session, me, { state: 'pending' })
+    assert.equal(won.kind, 'won')
+    assert.equal(existsSync(oldDead), false, 'a proven-dead holder older than the run cap is removed')
+    const oldLive = plant(cases[1]!, me, 60_000)
+    const live = await core.claimTui(host, cases[1]!.root, cases[1]!.session, me, { state: 'pending' })
+    assert.equal(live.kind, 'occupied-unknown')
+    assert.equal(existsSync(oldLive), true, 'a live holder is never removed')
+    const foreign = plant(cases[2]!, { host: `${me.host}.other`, pid: dead.pid, pidStart: dead.pidStart }, 60_000)
+    const other = await core.claimTui(host, cases[2]!.root, cases[2]!.session, me, { state: 'pending' })
+    assert.equal(other.kind, 'occupied-unknown')
+    assert.equal(existsSync(foreign), true, 'another host is not proof')
+    const young = plant(cases[3]!, dead, 0)
+    const tooSoon = await core.claimTui(host, cases[3]!.root, cases[3]!.session, me, { state: 'pending' })
+    assert.equal(tooSoon.kind, 'occupied-unknown')
+    assert.equal(existsSync(young), true, 'a dead holder younger than the run cap may still have a child in flight')
+  } finally {
+    for (const d of cases) d.rm()
+  }
 })
 
 test('T2: rmdir failure is not a plain won', async () => {
@@ -3113,21 +3162,27 @@ test('T2: overlapping claims yield one won and one occupied-pending', async () =
   const host: Host = {
     ...base,
     run: async (argv, cwd, ms) => {
-      if (argv[0] === 'mkdir' && String(argv[1]).endsWith('/tui.owner.lock')) {
+      // The lock is published by rename(2). Hold the winner until the other claim has also reached it.
+      if (argv[0] === 'perl' && argv.some(a => String(a).endsWith('/tui.owner.lock'))) {
+        const result = await base.run(argv, cwd, ms)
         entered++
-        if (entered === 1) {
-          const result = await base.run(argv, cwd, ms)
+        if (result.exitCode === 0 && entered === 1) {
           await Promise.race([
             secondArrived,
             new Promise((_, rej) => setTimeout(() => rej(new Error('second claim did not reach the lock')), 3_000)),
           ])
-          return result
-        }
-        const result = await base.run(argv, cwd, ms)
-        if (entered === 2) releaseSecond()
+        } else releaseSecond()
         return result
       }
       return base.run(argv, cwd, ms)
+    },
+    exists: async path => {
+      const result = await base.exists(path)
+      if (result && path.endsWith('/tui.owner.lock')) {
+        entered++
+        releaseSecond()
+      }
+      return result
     },
   }
   const me = await processId(host)
