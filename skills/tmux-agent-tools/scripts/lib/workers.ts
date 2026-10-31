@@ -2946,8 +2946,42 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
  * Stop every worker of this project that still has a pane. Only this project's
  * dispatches: `stop` is scoped to what this mod started, never to whatever else
  * lives in tmux (a shell-started row stays).
+ * `auditFor` is the TUI (I2): each stop's argv carries the acting session and
+ * that row's holder, and the wrapper writes them on `wrapper.stop`.
  */
-export async function stopAll(host: Host, gate: Gate): Promise<Outcome> {
+export type TuiAudit = { session: string | null; holder: string | null }
+
+/** Cancel and unlock do not go through `agent-tmux stop`. Same audit log, same chain. */
+export async function writeTuiAudit(
+  host: Host,
+  event: 'cancel' | 'unlock',
+  fields: { tool: string; name: string; ok: boolean } & TuiAudit,
+): Promise<void> {
+  const { bin, missing } = await agentTmuxBin(host)
+  if (missing) {
+    host.log(`tmux-agent: tui audit not written: ${missing}`)
+    return
+  }
+  const payload = JSON.stringify({
+    event,
+    tool: fields.tool,
+    name: fields.name,
+    session: fields.session,
+    holder: fields.holder,
+    caller: 'tmux-agent-tui',
+    ok: fields.ok,
+  })
+  const run = await host
+    .run(
+      ['zsh', '-f', '-c', `set -- claude; TMUX_AGENT_TOOLS_SOURCE_ONLY=1 . ${shq(bin)} && audit_log_append ${shq(payload)}`],
+      '/',
+      5_000,
+    )
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  if (run.exitCode !== 0) host.log(`tmux-agent: tui audit ${event} for ${fields.name} failed: ${(run.stderr || run.stdout).trim().slice(0, 200)}`)
+}
+
+export async function stopAll(host: Host, gate: Gate, auditFor?: (name: string) => TuiAudit): Promise<Outcome> {
   const { dispatches } = await scan(host, { claim: false })
   // One per worker: its latest episode (a worker has many).
   const latest = [...new Map(dispatches.map(d => [d.name, d])).values()]
@@ -2955,7 +2989,7 @@ export async function stopAll(host: Host, gate: Gate): Promise<Outcome> {
   const live = latest.filter(d => hasSession(alive, d))
   if (!live.length) return { ok: true, text: 'nothing to stop: no worker of this project has a tmux session' }
   const outs = [] as Outcome[]
-  for (const d of live) outs.push(await stopWorker(host, gate, d))
+  for (const d of live) outs.push(await stopWorker(host, gate, d, undefined, auditFor?.(d.name)))
   return { ok: outs.every(o => o.ok), text: outs.map(o => o.text).join('\n') }
 }
 
@@ -2965,7 +2999,7 @@ export async function stopAll(host: Host, gate: Gate): Promise<Outcome> {
  * claims to affect only one seq. `expectSeq` re-validates an autoStop: a tell that
  * opened a newer episode since the scan keeps the pane.
  */
-export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expectSeq?: number): Promise<Outcome> {
+export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expectSeq?: number, audit?: TuiAudit): Promise<Outcome> {
   const root = await rootOf(host)
   if (!root) return { ok: false, text: 'no state root' }
   const w = `${v3Of(root)}/${d.name}`
@@ -2985,7 +3019,9 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
       if (!names || aborted === undefined) return { ok: false, text: `not stopping "${d.name}": episode ${seq} could not be read (see the log)` }
       if (!names.some(n => CLOSED_ACKS.includes(n)) && !aborted) open.push(seq)
     }
-    const run = await host.run(['agent-tmux', d.profile, 'stop', d.name], d.dir, 8_000).catch(
+    const argv = ['agent-tmux', d.profile, 'stop', d.name]
+    if (audit) argv.push('--tui-audit', JSON.stringify({ session: audit.session, holder: audit.holder }))
+    const run = await host.run(argv, d.dir, 8_000).catch(
       (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }),
     )
     const missed: number[] = []
@@ -3383,6 +3419,9 @@ export type TuiClaimResult =
 export type TuiFocus = { raised: 'app'; tabTitle?: string } | { raised: 'pane' } | { refused: string }
 
 const TUI_LOCK_TRIES = 40
+// shortcut: es2023 has no setTimeout, drop this when the mod lib includes a timer.
+declare function setTimeout(fn: () => void, ms: number): unknown
+
 const TUI_LOCK_WAIT_MS = 50
 /** Contention budget for a live publisher. Older than this wait is not proof the holder is dead. */
 const TUI_LOCK_WAIT_BUDGET_MS = TUI_LOCK_TRIES * TUI_LOCK_WAIT_MS

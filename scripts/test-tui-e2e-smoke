@@ -188,6 +188,11 @@ for _ in {1..50}; do
   /bin/sleep 0.2
 done
 check "A's tmux session is gone" test "$stopped" = yes
+audit_row="$(jq -c --arg name "$A" 'select(.event=="wrapper.stop" and .name==$name)' "$TMUX_AGENT_TOOLS_AUDIT_LOG" | tail -1)"
+print -r -- "audit-row $audit_row"
+check "audit caller is tmux-agent-tui" test "$(jq -r .caller <<<"$audit_row")" = "tmux-agent-tui"
+check "audit session is the acting owner" test "$(jq -r .session <<<"$audit_row")" = "$SESSION"
+check "audit row has holder" jq -e 'has("holder")' <<<"$audit_row" >/dev/null
 
 key="$("$NODE_BIN" -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("hex"))' "$SESSION")"
 sd="$TMUX_AGENT_DIR/.v3/.sessions/$key"

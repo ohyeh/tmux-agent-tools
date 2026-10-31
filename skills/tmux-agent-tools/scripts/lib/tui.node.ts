@@ -53,6 +53,8 @@ import {
   rootOf,
   stopWorker,
   stopAll,
+  writeTuiAudit,
+  type TuiAudit,
   interruptWorker,
   resumeWorker,
   tellWorker,
@@ -1889,6 +1891,11 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     }
   }
 
+  const auditOf = (holder: string | undefined): TuiAudit => {
+    const id = host.owner()
+    return { session: id ? id : null, holder: holder ?? null }
+  }
+
   const handleAction = async (action: TuiAction) => {
     if (action.type === 'quit') {
       state.quit = true
@@ -1929,7 +1936,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
       return
     }
     if (action.type === 'stop') {
-      const out = await stopWorker(host, gate, action.row.d)
+      const out = await stopWorker(host, gate, action.row.d, undefined, auditOf(action.row.holder))
       state.statusMessage = `stop ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
       state.statusUntil = Date.now() + 5000
       await refreshRows()
@@ -1937,7 +1944,10 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
       return
     }
     if (action.type === 'stopAll') {
-      const out = await stopAll(host, gate)
+      const out = await stopAll(host, gate, name => {
+        const row = state.all.find(r => r.d.name === name) ?? state.rows.find(r => r.d.name === name)
+        return auditOf(row?.holder)
+      })
       state.statusMessage = `clear — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`
       state.statusUntil = Date.now() + 5000
       await refreshRows()
@@ -2006,6 +2016,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     // Same core calls as `workers.cli.node.ts cancel|unlock`; the second press is the confirm.
     if (action.type === 'cancel') {
       const out = await cancelEpisode(host, action.row.d.name, action.row.d.seq ?? 0, { force: action.force === true })
+      await writeTuiAudit(host, 'cancel', { tool: action.row.d.profile, name: action.row.d.name, ok: out.ok, ...auditOf(action.row.holder) })
       say(`cancel ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       await refreshRows()
       render()
@@ -2020,6 +2031,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     }
     if (action.type === 'unlock') {
       const out = await unlockWorker(host, action.row.d.name, UNLOCK_WORD)
+      await writeTuiAudit(host, 'unlock', { tool: action.row.d.profile, name: action.row.d.name, ok: out.ok, ...auditOf(action.row.holder) })
       say(`unlock ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       render()
       return
