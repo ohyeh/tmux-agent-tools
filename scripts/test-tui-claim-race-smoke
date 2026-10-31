@@ -1,0 +1,53 @@
+#!/usr/bin/env zsh
+. "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
+# Two OS processes claim one TUI owner. Kept out of test-core-contract-smoke
+# (that lane's 90s cap already trips under load). Lane: scripts/run-all-smokes
+# (it globs scripts/test-*-smoke).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RACE="$REPO_ROOT/skills/tmux-agent-tools/scripts/lib/tui-claim.race.node.ts"
+timeout_bin="$(command -v timeout || command -v gtimeout || true)"
+if [[ -z "$timeout_bin" ]]; then
+  echo "  FAIL timeout or gtimeout is required" >&2
+  echo "0 passed, 1 failed" >&2
+  exit 1
+fi
+
+root="$(mktemp -d)"
+launch="$(mktemp -d)"
+trap 'rm -rf "$root" "$launch"' EXIT
+
+set +e
+"$timeout_bin" --kill-after=2s 8s zsh -c '
+  node "$1" "$2" sess "$3" &
+  node "$1" "$2" sess "$3" &
+  for i in {1..40}; do
+    n=( "$2"/result-*.json(N) )
+    (( ${#n} >= 2 )) && break
+    sleep 0.1
+  done
+  touch "$2/race-done"
+  wait
+' _ "$RACE" "$root" "$launch"
+code=$?
+set -e
+if (( code != 0 )); then
+  echo "  FAIL two-process claim timed out or exited $code" >&2
+  echo "0 passed, 1 failed" >&2
+  exit 1
+fi
+
+node --input-type=module -e '
+import { readdirSync, readFileSync } from "node:fs"
+const dir = process.argv[1]
+const files = readdirSync(dir).filter(n => n.startsWith("result-"))
+if (files.length !== 2) { console.error("expected 2 results, got " + files.length); process.exit(1) }
+const kinds = files.map(n => JSON.parse(readFileSync(dir + "/" + n, "utf8")).kind)
+const won = kinds.filter(k => k === "won").length
+if (won !== 1) { console.error("expected one won, got " + JSON.stringify(kinds)); process.exit(1) }
+console.log("ok   two-process TUI claim: one won (" + kinds.join(", ") + ")")
+' "$root"
+
+echo "1 passed, 0 failed"

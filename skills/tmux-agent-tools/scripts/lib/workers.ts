@@ -3406,6 +3406,212 @@ export function randomBase36(n: number): string {
   return [...bytes].map(b => (b % 36).toString(36)).join('')
 }
 
+/** A pending TUI claim older than this may be taken by the next claimer (I12). */
+export const TUI_PENDING_MS = 30_000
+
+export type TuiLocator =
+  | { kind: 'tmux'; socket?: string; pane: string }
+  | { kind: 'iterm' | 'terminal'; tty: string }
+  | { kind: 'warp'; tabTitle: string }
+
+export type TuiOwner = ProcessId & {
+  token: string
+  state: 'pending' | 'ready'
+  locator?: TuiLocator
+  at: number
+}
+
+export type TuiClaimOpts = {
+  state: 'pending' | 'ready'
+  /** Adopt this pending token. Any other current record is `stale` (no new claim). */
+  adopt?: string
+  locator?: TuiLocator
+  /** Directory of `tmux-agent-tui-<sessionKey>-<token>.yaml`. Absent: reclaim deletes nothing. */
+  launchDir?: string
+}
+
+export type TuiClaimResult =
+  | { kind: 'won'; claim: TuiOwner }
+  | { kind: 'adopted'; claim: TuiOwner }
+  | { kind: 'stale' }
+  | { kind: 'occupied-ready'; claim: TuiOwner; locator: TuiLocator | undefined }
+  | { kind: 'occupied-pending'; claim: TuiOwner }
+  | { kind: 'occupied-unknown'; claim?: TuiOwner }
+
+export type TuiFocus = { raised: 'app'; tabTitle?: string } | { raised: 'pane' } | { refused: string }
+
+const TUI_LOCK_TRIES = 40
+
+function tuiLocatorOk(v: unknown): v is TuiLocator {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as { kind?: unknown; pane?: unknown; tty?: unknown; tabTitle?: unknown; socket?: unknown }
+  if (o.socket !== undefined && typeof o.socket !== 'string') return false
+  if (o.kind === 'tmux') return typeof o.pane === 'string'
+  if (o.kind === 'iterm' || o.kind === 'terminal') return typeof o.tty === 'string'
+  if (o.kind === 'warp') return typeof o.tabTitle === 'string'
+  return false
+}
+
+function tuiOwnerOk(v: unknown): v is TuiOwner {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as TuiOwner
+  if (typeof o.host !== 'string' || !(o.pid > 0) || typeof o.pidStart !== 'string' || !o.pidStart) return false
+  if (typeof o.token !== 'string' || !o.token || typeof o.at !== 'number') return false
+  if (o.state !== 'pending' && o.state !== 'ready') return false
+  if (o.locator !== undefined && !tuiLocatorOk(o.locator)) return false
+  return true
+}
+
+function sameProc(a: ProcessId, b: ProcessId): boolean {
+  return a.host === b.host && a.pid === b.pid && a.pidStart === b.pidStart && a.pid > 0 && a.pidStart !== ''
+}
+
+function tuiLaunchPath(dir: string, session: string, token: string): string {
+  return `${dir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
+}
+
+async function withTuiLock<T>(host: Host, root: string, session: string, body: (dir: string) => Promise<T>): Promise<T | undefined> {
+  const dir = sessionDirOf(v3Of(root), session)
+  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
+  if (!made || made.exitCode !== 0) return undefined
+  const lock = `${dir}/tui.owner.lock`
+  for (let i = 0; i < TUI_LOCK_TRIES; i++) {
+    const got = await mkdirExclusive(host, lock)
+    if (got === 'unknown') return undefined
+    if (got === 'lost') {
+      await host.run(['sleep', '0.05'], '/', 1_000).catch(() => undefined)
+      continue
+    }
+    try {
+      return await body(dir)
+    } finally {
+      await host.run(['rmdir', lock], '/', 5_000).catch(() => undefined)
+    }
+  }
+  return undefined
+}
+
+async function readTuiOwner(host: Host, dir: string): Promise<TuiOwner | undefined | 'bad'> {
+  const path = `${dir}/tui.owner`
+  if (!(await host.exists(path).catch(() => false))) return undefined
+  try {
+    const parsed = parseJson(await host.read(path))
+    return tuiOwnerOk(parsed) ? parsed : 'bad'
+  } catch {
+    return 'bad'
+  }
+}
+
+async function writeTuiOwner(host: Host, dir: string, claim: TuiOwner): Promise<boolean> {
+  const path = `${dir}/tui.owner`
+  const tmp = `${path}.${claim.token}.tmp`
+  try {
+    await host.write(tmp, JSON.stringify(claim))
+    const mv = await host.run(['mv', tmp, path], '/', 5_000)
+    return mv.exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+/** Pending past 30s is reclaimed even if its launcher is still alive. Other records need a proven-dead holder; unknown stays occupied. */
+async function tuiSlot(host: Host, cur: TuiOwner, now: number): Promise<'reclaim' | 'occupied-ready' | 'occupied-pending' | 'occupied-unknown'> {
+  if (cur.state === 'pending' && now - cur.at > TUI_PENDING_MS) return 'reclaim'
+  const alive = await holderProvablyAlive(host, cur)
+  if (alive === false) return 'reclaim'
+  if (alive !== true) return 'occupied-unknown'
+  return cur.state === 'ready' ? 'occupied-ready' : 'occupied-pending'
+}
+
+/**
+ * One TUI claim for this owner session (I12). Fresh callers pass `state`.
+ * `--claim <token>` passes `adopt` and becomes `ready` only for that unexpired pending token.
+ */
+export async function claimTui(host: Host, root: string, session: string, me: ProcessId, opts: TuiClaimOpts): Promise<TuiClaimResult> {
+  const out = await withTuiLock(host, root, session, async dir => {
+    const now = await host.now()
+    const cur = await readTuiOwner(host, dir)
+    if (opts.adopt !== undefined) {
+      if (cur && cur !== 'bad' && cur.state === 'pending' && cur.token === opts.adopt && now - cur.at <= TUI_PENDING_MS) {
+        const next: TuiOwner = {
+          host: me.host,
+          pid: me.pid,
+          pidStart: me.pidStart,
+          token: cur.token,
+          state: 'ready',
+          at: now,
+          ...(opts.locator ? { locator: opts.locator } : {}),
+        }
+        if (!(await writeTuiOwner(host, dir, next))) return { kind: 'occupied-unknown' as const }
+        return { kind: 'adopted' as const, claim: next }
+      }
+      return { kind: 'stale' as const }
+    }
+    if (cur === 'bad') return { kind: 'occupied-unknown' as const }
+    if (cur) {
+      const slot = await tuiSlot(host, cur, now)
+      if (slot === 'occupied-ready') return { kind: slot, claim: cur, locator: cur.locator }
+      if (slot === 'occupied-pending') return { kind: slot, claim: cur }
+      if (slot === 'occupied-unknown') return { kind: slot, claim: cur }
+      if (cur.state === 'pending' && opts.launchDir) {
+        await host.run(['rm', '-f', tuiLaunchPath(opts.launchDir, session, cur.token)], '/', 5_000).catch(() => undefined)
+      }
+    }
+    const next: TuiOwner = {
+      host: me.host,
+      pid: me.pid,
+      pidStart: me.pidStart,
+      token: randomBase36(12),
+      state: opts.state,
+      at: now,
+      ...(opts.locator ? { locator: opts.locator } : {}),
+    }
+    if (!(await writeTuiOwner(host, dir, next))) return { kind: 'occupied-unknown' as const }
+    return { kind: 'won' as const, claim: next }
+  })
+  return out ?? { kind: 'occupied-unknown' }
+}
+
+/** Launcher: own pending only. TUI: own ready only. Token and process identity, under the lock. */
+export async function releaseTui(
+  host: Host,
+  root: string,
+  session: string,
+  token: string,
+  role: 'launcher' | 'tui',
+  me: ProcessId,
+): Promise<boolean> {
+  const out = await withTuiLock(host, root, session, async dir => {
+    const cur = await readTuiOwner(host, dir)
+    if (!cur || cur === 'bad' || cur.token !== token || !sameProc(cur, me)) return false
+    if (role === 'launcher' ? cur.state !== 'pending' : cur.state !== 'ready') return false
+    const rm = await host.run(['rm', '-f', `${dir}/tui.owner`], '/', 5_000).catch(() => undefined)
+    return !!rm && rm.exitCode === 0
+  })
+  return out === true
+}
+
+/**
+ * Focus only an occupied-ready claim. Warp and other GUI apps return `raised: 'app'`
+ * (the app was activated). A tmux pane returns `raised: 'pane'` when select-pane exits 0.
+ * This never reports a focused window.
+ */
+export async function focusTui(host: Host, result: TuiClaimResult): Promise<TuiFocus> {
+  if (result.kind !== 'occupied-ready') return { refused: result.kind }
+  const loc = result.locator
+  if (!loc) return { refused: 'no locator' }
+  if (loc.kind === 'tmux') {
+    const argv = ['tmux', ...(loc.socket ? ['-S', loc.socket] : []), 'select-pane', '-t', loc.pane]
+    const run = await host.run(argv, '/', 5_000).catch(() => undefined)
+    if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'select-pane failed' }
+    return { raised: 'pane' }
+  }
+  const app = loc.kind === 'warp' ? 'Warp' : loc.kind === 'iterm' ? 'iTerm' : 'Terminal'
+  const run = await host.run(['open', '-a', app], '/', 5_000).catch(() => undefined)
+  if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'open failed' }
+  return loc.kind === 'warp' ? { raised: 'app', tabTitle: loc.tabTitle } : { raised: 'app' }
+}
+
 /**
  * This activation's liveness (§4): register once (`act/<n>`), then beat `act/<n>.beat`
  * every reconcile. A higher registration of the same session (a reload) fences this

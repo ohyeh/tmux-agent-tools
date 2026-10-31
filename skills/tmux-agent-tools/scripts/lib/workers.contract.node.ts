@@ -2542,3 +2542,196 @@ test('C13: observeRows records no pane probe; sweepStalls probes with wakes off'
     rmSync(w.repo, { recursive: true, force: true })
   }
 })
+
+async function tuiCore() {
+  return import('./workers.ts')
+}
+
+function tuiDirs() {
+  const root = mkdtempSync(join(tmpdir(), 'tui-claim-'))
+  const launch = mkdtempSync(join(tmpdir(), 'tui-launch-'))
+  const session = 'sess-1'
+  const ownerPath = `${sessionDirOf(v3Of(root), session)}/tui.owner`
+  const readOwner = () => JSON.parse(readFileSync(ownerPath, 'utf8')) as { token: string; state: string; pid: number }
+  const rm = () => { rmSync(root, { recursive: true, force: true }); rmSync(launch, { recursive: true, force: true }) }
+  return { root, launch, session, ownerPath, readOwner, rm }
+}
+
+test('T2: stale adopt returns stale and does not take the record', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  let now = 1_000_000
+  const host: Host = { ...nodeHost({ log: () => {} }), now: async () => now }
+  const me = await processId(host)
+  try {
+    const won = await core.claimTui(host, d.root, d.session, me, { state: 'pending', launchDir: d.launch })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const wrong = await core.claimTui(host, d.root, d.session, me, { state: 'ready', adopt: 'not-the-token', launchDir: d.launch })
+    assert.equal(wrong.kind, 'stale')
+    assert.equal(d.readOwner().token, won.claim.token)
+    now += 30_001
+    const late = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1 }, { state: 'ready', adopt: won.claim.token, launchDir: d.launch })
+    assert.equal(late.kind, 'stale')
+    assert.equal(d.readOwner().token, won.claim.token, 'an expired adopt does not reclaim')
+    assert.equal(d.readOwner().state, 'pending')
+  } finally { d.rm() }
+})
+
+test('T2: expired pending is reclaimed and only that launch file is removed', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  let now = 1_000_000
+  const host: Host = { ...nodeHost({ log: () => {} }), now: async () => now }
+  const me = await processId(host)
+  try {
+    const won = await core.claimTui(host, d.root, d.session, me, { state: 'pending', launchDir: d.launch })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const mine = join(d.launch, `tmux-agent-tui-${sessionKey(d.session)}-${won.claim.token}.yaml`)
+    const otherToken = join(d.launch, `tmux-agent-tui-${sessionKey(d.session)}-other.yaml`)
+    const otherOwner = join(d.launch, `tmux-agent-tui-${sessionKey('other-session')}-${won.claim.token}.yaml`)
+    writeFileSync(mine, 'launch\n')
+    writeFileSync(otherToken, 'keep\n')
+    writeFileSync(otherOwner, 'keep\n')
+    now += 30_001
+    const next = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1, pidStart: 'next' }, { state: 'pending', launchDir: d.launch })
+    assert.equal(next.kind, 'won')
+    if (next.kind !== 'won') return
+    assert.notEqual(next.claim.token, won.claim.token)
+    assert.equal(existsSync(mine), false, 'the expired token file is gone')
+    assert.equal(readFileSync(otherToken, 'utf8'), 'keep\n')
+    assert.equal(readFileSync(otherOwner, 'utf8'), 'keep\n')
+  } finally { d.rm() }
+})
+
+test('T2: unknown liveness is occupied and is not reclaimed', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const host = nodeHost({ log: () => {} })
+  const me = await processId(host)
+  const ghost = { host: `${me.host}-other`, pid: me.pid, pidStart: me.pidStart }
+  try {
+    const won = await core.claimTui(host, d.root, d.session, ghost, { state: 'ready' })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const next = await core.claimTui(host, d.root, d.session, me, { state: 'pending' })
+    assert.equal(next.kind, 'occupied-unknown')
+    assert.equal(d.readOwner().token, won.claim.token)
+  } finally { d.rm() }
+})
+
+test('T2: a foreign token release leaves the record', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const host = nodeHost({ log: () => {} })
+  const me = await processId(host)
+  try {
+    const won = await core.claimTui(host, d.root, d.session, me, { state: 'pending' })
+    assert.equal(won.kind, 'won')
+    if (won.kind !== 'won') return
+    const released = await core.releaseTui(host, d.root, d.session, 'other-token', 'launcher', me)
+    assert.equal(released, false)
+    assert.equal(d.readOwner().token, won.claim.token)
+    assert.equal(d.readOwner().state, 'pending')
+  } finally { d.rm() }
+})
+
+test('T2: launcher release after adopt leaves ready; the child release removes it', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const host = nodeHost({ log: () => {} })
+  const launcher = await processId(host)
+  const child = { host: launcher.host, pid: launcher.pid + 1, pidStart: 'child-start' }
+  try {
+    const pending = await core.claimTui(host, d.root, d.session, launcher, { state: 'pending' })
+    assert.equal(pending.kind, 'won')
+    if (pending.kind !== 'won') return
+    const adopted = await core.claimTui(host, d.root, d.session, child, {
+      state: 'ready',
+      adopt: pending.claim.token,
+      locator: { kind: 'warp', tabTitle: 'tab' },
+    })
+    assert.equal(adopted.kind, 'adopted')
+    assert.equal(d.readOwner().state, 'ready')
+    assert.equal(d.readOwner().pid, child.pid)
+    const late = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'launcher', launcher)
+    assert.equal(late, false)
+    assert.equal(d.readOwner().state, 'ready', 'the launcher must not drop the child ready record')
+    const own = await core.releaseTui(host, d.root, d.session, pending.claim.token, 'tui', child)
+    assert.equal(own, true)
+    assert.equal(existsSync(d.ownerPath), false)
+  } finally { d.rm() }
+})
+
+test('T2: occupied-ready, occupied-pending and occupied-unknown stay apart', async () => {
+  const core = await tuiCore()
+  const host = nodeHost({ log: () => {} })
+  const me = await processId(host)
+  const loc = { kind: 'warp' as const, tabTitle: 'tmux-agent-tui sess' }
+  const pending = tuiDirs()
+  const ready = tuiDirs()
+  const unknown = tuiDirs()
+  try {
+    assert.equal((await core.claimTui(host, pending.root, pending.session, me, { state: 'pending' })).kind, 'won')
+    const occupiedPending = await core.claimTui(host, pending.root, pending.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+    assert.equal(occupiedPending.kind, 'occupied-pending')
+
+    assert.equal((await core.claimTui(host, ready.root, ready.session, me, { state: 'ready', locator: loc })).kind, 'won')
+    const occupiedReady = await core.claimTui(host, ready.root, ready.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+    assert.equal(occupiedReady.kind, 'occupied-ready')
+    if (occupiedReady.kind === 'occupied-ready') assert.deepEqual(occupiedReady.locator, loc)
+
+    const ghost = { host: `${me.host}-other`, pid: me.pid, pidStart: me.pidStart }
+    assert.equal((await core.claimTui(host, unknown.root, unknown.session, ghost, { state: 'ready', locator: loc })).kind, 'won')
+    const occupiedUnknown = await core.claimTui(host, unknown.root, unknown.session, me, { state: 'pending' })
+    assert.equal(occupiedUnknown.kind, 'occupied-unknown')
+  } finally {
+    pending.rm(); ready.rm(); unknown.rm()
+  }
+})
+
+test('T2: focusTui acts only on occupied-ready; Warp raises the app', async () => {
+  const d = tuiDirs()
+  const core = await tuiCore()
+  const calls: string[][] = []
+  const base = nodeHost({ log: () => {} })
+  const host: Host = {
+    ...base,
+    run: async (argv, cwd, ms) => {
+      calls.push([...argv])
+      if (argv[0] === 'open' || argv[0] === 'osascript' || argv[0] === 'tmux') return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const me = await processId(host)
+  const loc = { kind: 'warp' as const, tabTitle: 'tmux-agent-tui sess' }
+  try {
+    assert.equal((await core.claimTui(host, d.root, d.session, me, { state: 'pending' })).kind, 'won')
+    const pending = await core.claimTui(host, d.root, d.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+    assert.equal(pending.kind, 'occupied-pending')
+    calls.length = 0
+    const skipped = await core.focusTui(host, pending)
+    assert.equal('raised' in skipped, false)
+    assert.deepEqual(calls.filter(a => a[0] === 'open' || a[0] === 'tmux' || a[0] === 'osascript'), [])
+
+    const readyDir = tuiDirs()
+    try {
+      assert.equal((await core.claimTui(host, readyDir.root, readyDir.session, me, { state: 'ready', locator: loc })).kind, 'won')
+      const occupied = await core.claimTui(host, readyDir.root, readyDir.session, { ...me, pid: me.pid + 1, pidStart: 'other' }, { state: 'pending' })
+      assert.equal(occupied.kind, 'occupied-ready')
+      calls.length = 0
+      const raised = await core.focusTui(host, occupied)
+      assert.deepEqual(raised, { raised: 'app', tabTitle: loc.tabTitle })
+      assert.equal(JSON.stringify(raised).includes('window'), false)
+      assert.ok(calls.some(a => a[0] === 'open' && a[1] === '-a' && a[2] === 'Warp' && !a.some(x => x.includes('warp://'))))
+      const pane = await core.focusTui(host, {
+        kind: 'occupied-ready',
+        locator: { kind: 'tmux', socket: '/tmp/tui-claim-not-a-server', pane: '%9' },
+        claim: { host: me.host, pid: me.pid, pidStart: me.pidStart, token: 't', state: 'ready', at: 0 },
+      })
+      assert.deepEqual(pane, { raised: 'pane' })
+      assert.ok(calls.some(a => a[0] === 'tmux' && a[1] === '-S' && a[2] === '/tmp/tui-claim-not-a-server'))
+    } finally { readyDir.rm() }
+  } finally { d.rm() }
+})
