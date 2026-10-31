@@ -126,7 +126,7 @@ cat > "$RUN" <<EOF
 #!/bin/zsh -f
 stty -g > ${(q)WORK}/stty.\$1.before
 stty -a > ${(q)WORK}/stty-a.\$1.before
-if [[ "\$1" == owner ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
+if [[ "\$1" == owner || "\$1" == hup ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
 else tmux-agent-tui --cwd ${(q)WORK}/repo; fi
 echo "TUI_EXIT=\$?"
 stty -a > ${(q)WORK}/stty-a.\$1.after
@@ -194,6 +194,18 @@ keys "$P" q
 check "the TUI exited 0" wait_for "$P" 'TUI_EXIT=0' 50
 for _ in {1..100}; do [[ -s "$WORK/stty.owner.after" ]] && break; /bin/sleep 0.05; done
 check "stty after == stty before" cmp -s "$WORK/stty.owner.before" "$WORK/stty.owner.after"
+
+echo "case: SIGHUP restores the tty once"
+T new-session -d -s hup -x 80 -y 24 "$RUN hup"
+HP="=hup:"
+check "hup TUI drew" wait_for "$HP" 'workers' 25
+pane_pid="$(T display-message -p -t "$HP" '#{pane_pid}')"
+child="$(pgrep -P "$pane_pid" | head -1)"
+check "hup child exists" test -n "$child"
+kill -HUP "$child"
+check "SIGHUP exited 0" wait_for "$HP" 'TUI_EXIT=0' 50
+for _ in {1..100}; do [[ -s "$WORK/stty-a.hup.after" ]] && break; /bin/sleep 0.05; done
+check "stty -a after SIGHUP is sane" sh -c "grep -q 'icanon' '$WORK/stty-a.hup.after' && grep -q ' echo' '$WORK/stty-a.hup.after' && ! grep -q -- '-icanon' '$WORK/stty-a.hup.after'"
 
 (( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; }
 echo

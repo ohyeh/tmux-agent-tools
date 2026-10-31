@@ -265,6 +265,43 @@ test('tick: an armed x survives a rows tick on the same row (I14)', () => {
   assert.deepEqual(applyRowsTick(s, [{ ...row }]).armedStop, armed)
 })
 
+test('key-state: Esc at the top of 預覽 quits (T6b)', () => {
+  const top: TuiState = { rows: [mockRow('w1')], all: [], showAll: false, adding: false, resumeInput: '', quit: false, mode: 'preview' }
+  const q = nextKeyState(top, '\x1b', 1)
+  assert.equal(q.state.quit, true)
+  assert.equal(q.action?.type, 'quit')
+})
+
+test('terminal: entry is mouse-off, ?1007h, paste, alt screen, and the window title (T6b)', () => {
+  let output = ''
+  const stdin = { isTTY: true, isRaw: false, readableFlowing: false, setRawMode() {}, resume() {} }
+  const stdout = { write(s: string) { output += s; return true } }
+  enterTerminal(stdin as any, stdout as any, 'tmux-agent-tui abcdefgh')
+  assert.match(output, /\x1b\[\?1007h/)
+  assert.doesNotMatch(output, /\x1b\[\?1000h/)
+  assert.match(output, /\x1b\[\?2004h/)
+  assert.match(output, /\x1b\[\?1049h/)
+  assert.match(output, /\x1b\]0;tmux-agent-tui abcdefgh\x07/)
+})
+
+test('terminal: SIGHUP restores ?1007l once (T6b)', async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-hup-'))
+  const run = runTui({ stdin, stdout, host: quietHost('hup', root, root), session: 'hup-session', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('workers'), 5_000, 'first render')
+  process.emit('SIGHUP')
+  try {
+    await until(() => stdout.written.includes('\x1b[?1007l'), 800, 'SIGHUP restore')
+    process.emit('SIGHUP')
+    await new Promise(r => setTimeout(r, 30))
+    const leaves = stdout.written.split('\x1b[?1007l').length - 1
+    assert.equal(leaves, 1, 'restore once')
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {
   const base: TuiState = {
     rows: [],

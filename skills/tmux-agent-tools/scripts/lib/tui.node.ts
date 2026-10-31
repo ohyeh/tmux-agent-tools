@@ -75,11 +75,16 @@ export const NODE_FLOOR = [22, 18, 0]
 
 // `?2004h` turns on bracketed paste: the terminal wraps a paste in ESC[200~ … ESC[201~,
 // so a pasted `q` or `x` is text, not a key (KeyParser). `?2004l` turns it off again.
-// Mouse reporting (1000 + SGR 1006): the wheel scrolls the preview; without it a terminal
-// turns the wheel into ↑/↓, which only move the selection. Shift-drag still selects text.
-export const ANSI_ENTER_ALT = '\x1b[?1049h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[2J\x1b[H'
+// Phase 1 keeps mouse reporting OFF (I7) and sets `?1007h`, so drag-select is the
+// terminal's and the wheel arrives as ↑/↓. `?1007l` clears that on the way out.
 export const ANSI_MOUSE_OFF = '\x1b[?1006l\x1b[?1000l'
-export const ANSI_LEAVE_ALT = `${ANSI_MOUSE_OFF}\x1b[?2004l\x1b[?25h\x1b[?1049l`
+export const ANSI_LEAVE_ALT = `${ANSI_MOUSE_OFF}\x1b[?1007l\x1b[?2004l\x1b[?25h\x1b[?1049l\x1b]0;\x07`
+/** Alt screen, paste, alternate scroll, hidden cursor, window title, clear. No mouse reporting. */
+export function altEnter(title: string): string {
+  const safe = title.replace(/[\x00-\x1f\x7f]/g, '')
+  return `\x1b[?1049h\x1b[?2004h\x1b[?1007h\x1b[?25l\x1b]0;${safe}\x07\x1b[2J\x1b[H`
+}
+export const ANSI_ENTER_ALT = altEnter('tmux-agent-tui')
 /** Lines one wheel notch scrolls. */
 const WHEEL_LINES = 3
 export const ANSI_HIDE_CURSOR = '\x1b[?25l'
@@ -774,8 +779,10 @@ export function nextKeyState(
     if (narrowScreen(screen) && (state.narrowView ?? 'list') === 'preview') {
       return { state: { ...state, narrowView: 'list' } }
     }
+    if (state.mode === 'picker') return { state: { ...state, mode: 'preview' } }
     if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
     if (state.selected) return { state: reselect(state, undefined) }
+    return { state: { ...state, quit: true }, action: { type: 'quit' } }
   }
 
   return { state }
@@ -1263,12 +1270,13 @@ export function restoreTerminal(
 export function enterTerminal(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WriteStream,
+  title = 'tmux-agent-tui',
 ): TerminalEntry {
   const entry = { raw: stdin.isRaw === true, flowing: stdin.readableFlowing === true }
   const steps: [string, () => unknown][] = [
     ['setRawMode(true)', () => stdin.isTTY && typeof stdin.setRawMode === 'function' && stdin.setRawMode(true)],
     ['resume stdin', () => typeof stdin.resume === 'function' && stdin.resume()],
-    ['enter alt screen', () => stdout.write(ANSI_ENTER_ALT)],
+    ['enter alt screen', () => stdout.write(altEnter(title))],
   ]
   for (const [k, [name, fn]] of steps.entries()) {
     const err = termStep(name, fn)
@@ -1490,6 +1498,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     process.off('exit', onExit)
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
+    process.off('SIGHUP', stop)
     // Printed after the alt screen is left (the last restore step), so it stays readable.
     restoreErrors = restoreTerminal(stdin, stdout, entry)
     for (const err of restoreErrors) process.stderr.write(`tui: terminal restore failed: ${err.message}\n`)
@@ -1642,7 +1651,8 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     }
   }
 
-  entry = enterTerminal(stdin, stdout)
+  const sid8 = (session && session.length ? session : 'viewer').slice(0, 8)
+  entry = enterTerminal(stdin, stdout, `tmux-agent-tui ${sid8}`)
   stdin.on('data', onData)
   stdin.on('end', onEnd)
   stdin.on('error', onError)
@@ -1651,6 +1661,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   process.on('exit', onExit)
   process.on('SIGINT', stop)
   process.on('SIGTERM', stop)
+  process.on('SIGHUP', stop)
 
   try {
     // `q` during a slow first load quits at once; it does not wait for the load.
