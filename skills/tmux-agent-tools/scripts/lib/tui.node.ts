@@ -70,6 +70,8 @@ import {
   claimTui,
   releaseTui,
   focusTui,
+  dropLaunchFile,
+  tuiLaunchPath,
   processId,
   readActHealth,
   sessionDirOf,
@@ -79,7 +81,7 @@ import {
   type TuiFocus,
   type TuiLocator,
 } from './workers.ts'
-import { sessionKey, sessionLiveness, type Liveness } from './ledger.ts'
+import { sessionLiveness, type Liveness } from './ledger.ts'
 import { nodeHost } from './host.node.ts'
 import { coreVersion } from './collector.node.ts'
 import { graphemes, graphemeWidth as widthOf } from './width.ts'
@@ -97,7 +99,6 @@ export function altEnter(title: string): string {
   const safe = title.replace(/[\x00-\x1f\x7f]/g, '')
   return `\x1b[?1049h\x1b[?2004h\x1b[?1007h\x1b[?25l\x1b]0;${safe}\x07\x1b[2J\x1b[H`
 }
-export const ANSI_ENTER_ALT = altEnter('tmux-agent-tui')
 /** Lines one wheel notch scrolls. */
 const WHEEL_LINES = 3
 export const ANSI_HIDE_CURSOR = '\x1b[?25l'
@@ -1558,12 +1559,6 @@ async function sessionDirReady(host: Host, root: string, session: string): Promi
   return host.exists(dir).catch(() => false)
 }
 
-async function dropLaunchFile(host: Host, launchDir: string, session: string, token: string): Promise<void> {
-  const target = `${launchDir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
-  const rm = await host.run(['rm', '-f', target], '/', 5_000).catch(() => undefined)
-  if (!rm || rm.exitCode !== 0) host.log(`tmux-agent: could not remove ${target}`)
-}
-
 type LaunchClaim =
   | { kind: 'skip' }
   | { kind: 'stop'; code: number }
@@ -1598,7 +1593,11 @@ async function claimLaunch(host: Host, root: string, session: string, opts: { cl
     process.stderr.write(`${occupiedWhere(result)}\n`)
     return { kind: 'stop', code: 0 }
   }
-  if (opts.launchDir) await dropLaunchFile(host, opts.launchDir, session, result.claim.token)
+  if (opts.launchDir) {
+    const target = tuiLaunchPath(opts.launchDir, session, result.claim.token)
+    const fail = await dropLaunchFile(host, target, '/')
+    if (fail) host.log(`tmux-agent: could not remove ${target}`)
+  }
   return { kind: 'held', held: { session, token: result.claim.token, me } }
 }
 
