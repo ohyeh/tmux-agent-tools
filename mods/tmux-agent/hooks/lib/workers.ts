@@ -3459,12 +3459,17 @@ function tuiLocatorOk(v: unknown): v is TuiLocator {
   return false
 }
 
+/** Launch and owner tokens are 12 base36 characters, so they are one path segment. */
+function tuiTokenOk(token: string): boolean {
+  return /^[0-9a-z]{12}$/.test(token)
+}
+
 function tuiOwnerOk(v: unknown): v is TuiOwner {
   if (typeof v !== 'object' || v === null) return false
   const o = v as TuiOwner
   if (typeof o.host !== 'string' || !(o.pid > 0) || typeof o.pidStart !== 'string' || !o.pidStart) return false
   // randomBase36(12). A slash or dot-segment would leave launchDir when the token is a path.
-  if (typeof o.token !== 'string' || !/^[0-9a-z]{12}$/.test(o.token) || typeof o.at !== 'number') return false
+  if (typeof o.token !== 'string' || !tuiTokenOk(o.token) || typeof o.at !== 'number') return false
   if (o.state !== 'pending' && o.state !== 'ready') return false
   if (o.locator !== undefined && !tuiLocatorOk(o.locator)) return false
   return true
@@ -3744,11 +3749,12 @@ const TERMINAL_SCRIPT = `on run argv
 end run`
 
 function launchLine(ctx: LaunchContext): string {
-  const prefix = [
+  const env = [
     ctx.env.TMUX_AGENT_DIR ? `TMUX_AGENT_DIR=${shq(ctx.env.TMUX_AGENT_DIR)}` : '',
     ctx.env.TMUX_AGENT_TMUX_SOCKET ? `TMUX_AGENT_TMUX_SOCKET=${shq(ctx.env.TMUX_AGENT_TMUX_SOCKET)}` : '',
   ].filter(a => a.length > 0)
-  return [...prefix, ...ctx.argv.map(a => shq(a))].join(' ')
+  // cd fails closed: the argv does not run when the directory cannot be entered.
+  return [`cd ${shq(ctx.cwd)}`, [...env, ...ctx.argv.map(a => shq(a))].join(' ')].filter(a => a.length > 0).join(' && ')
 }
 
 const showArgv = (argv: readonly string[]) => argv.map(a => shq(a)).join(' ')
@@ -3768,14 +3774,26 @@ function warpYaml(configName: string, title: string, cwd: string, exec: string):
   ].join('\n')
 }
 
+async function dropLaunchFile(host: Host, file: string, cwd: string): Promise<string | undefined> {
+  try {
+    const rm = await host.run(['rm', '-f', file], cwd, 5_000)
+    if (rm.exitCode !== 0) return `${file} remains: exit ${rm.exitCode} ${rm.stderr.trim()}`
+  } catch (error) {
+    return `${file} remains: ${errorClass(error)} ${String(error)}`
+  }
+  return undefined
+}
+
 async function openWarp(host: Host, ctx: LaunchContext, name: string, line: string): Promise<OpenResult> {
+  if (!tuiTokenOk(ctx.launchToken)) return { kind: 'failed', error: 'token', stderr: 'launch token is not a 12-character base36 id', command: line }
   if (!ctx.launchDir) return { kind: 'failed', error: 'no launch directory', stderr: '', command: line }
   const configName = `tmux-agent-tui-${sessionKey(ctx.session)}-${ctx.launchToken}`
   const file = `${ctx.launchDir}/${configName}.yaml`
   try {
     await host.write(file, warpYaml(configName, name, ctx.cwd, line))
   } catch (error) {
-    return { kind: 'failed', error: 'write', stderr: String(error), command: line }
+    const left = await dropLaunchFile(host, file, ctx.launchDir)
+    return { kind: 'failed', error: errorClass(error), stderr: left ? `${String(error)}; ${left}` : String(error), command: line }
   }
   const argv = ['open', `warp://launch/${encodeURIComponent(configName)}`]
   // The file is removed on failure, so the launch line has to travel with the open command.
@@ -3784,12 +3802,12 @@ async function openWarp(host: Host, ctx: LaunchContext, name: string, line: stri
   try {
     run = await host.run(argv, ctx.cwd, 5_000)
   } catch (error) {
-    await host.run(['rm', '-f', file], ctx.launchDir, 5_000).catch(() => undefined)
-    return { kind: 'failed', error: 'open', stderr: String(error), command }
+    const left = await dropLaunchFile(host, file, ctx.launchDir)
+    return { kind: 'failed', error: errorClass(error), stderr: left ? `${String(error)}; ${left}` : String(error), command }
   }
   if (run.exitCode !== 0) {
-    await host.run(['rm', '-f', file], ctx.launchDir, 5_000).catch(() => undefined)
-    return { kind: 'failed', error: 'open', stderr: run.stderr, command }
+    const left = await dropLaunchFile(host, file, ctx.launchDir)
+    return { kind: 'failed', error: 'open', stderr: left ? `${run.stderr}; ${left}` : run.stderr, command }
   }
   return { kind: 'sent', terminal: 'warp' }
 }
@@ -3801,7 +3819,7 @@ async function openAppleScript(host: Host, ctx: LaunchContext, script: string, l
   try {
     run = await host.run(argv, ctx.cwd, 5_000)
   } catch (error) {
-    return { kind: 'failed', error: 'osascript', stderr: String(error), command }
+    return { kind: 'failed', error: errorClass(error), stderr: String(error), command }
   }
   if (run.exitCode !== 0) return { kind: 'failed', error: 'osascript', stderr: run.stderr, command }
   return notice ? { kind: 'sent', terminal, notice } : { kind: 'sent', terminal }
@@ -3830,15 +3848,25 @@ export async function openInTerminal(host: Host, ctx: LaunchContext, name: strin
     try {
       run = await host.run(argv, ctx.cwd, 5_000)
     } catch (error) {
-      return { kind: 'failed', error: 'tmux', stderr: String(error), command }
+      return { kind: 'failed', error: errorClass(error), stderr: String(error), command }
     }
     const pane = run.stdout.trim()
     if (run.exitCode !== 0 || !/^%\d+$/.test(pane)) return { kind: 'failed', error: 'tmux', stderr: run.stderr, command }
     return { kind: 'split', locator: { kind: 'tmux', ...(socket ? { socket } : {}), pane } }
   }
-  const ssh = await host.envSshTty()
+  let ssh: string | undefined
+  try {
+    ssh = await host.envSshTty()
+  } catch (error) {
+    return { kind: 'failed', error: errorClass(error), stderr: String(error), command: line }
+  }
   if (ssh) return { kind: 'failed', error: 'cannot open a window on your machine over SSH', stderr: '', command: line }
-  const term = await host.envTermProgram()
+  let term: string | undefined
+  try {
+    term = await host.envTermProgram()
+  } catch (error) {
+    return { kind: 'failed', error: errorClass(error), stderr: String(error), command: line }
+  }
   if (term === 'WarpTerminal') return openWarp(host, ctx, name, line)
   if (term === 'iTerm.app' || term === 'iTerm2') return openAppleScript(host, ctx, ITERM_SCRIPT, line, 'iterm')
   if (term === 'Apple_Terminal' || term === 'Terminal') return openAppleScript(host, ctx, TERMINAL_SCRIPT, line, 'terminal')

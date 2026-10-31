@@ -5,7 +5,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
@@ -3169,13 +3169,32 @@ function terminalHost(opts: { term?: string; ssh?: string; openExit?: number; op
   return { host, calls, writes }
 }
 
+function commandsUnderLayout(yaml: string): boolean {
+  let inLayout = false
+  let layoutIndent = 0
+  for (const line of yaml.split('\n')) {
+    const indent = line.match(/^ */)?.[0].length ?? 0
+    const body = line.trim()
+    if (body.startsWith('layout:')) { inLayout = true; layoutIndent = indent; continue }
+    if (inLayout && body && indent <= layoutIndent) inLayout = false
+    if (body.startsWith('commands:')) return inLayout
+  }
+  return false
+}
+
+function yamlJson(yaml: string, label: string): string {
+  const line = yaml.split('\n').find(l => l.includes(label))
+  if (!line) throw new Error(`missing ${label}`)
+  return JSON.parse(line.slice(line.indexOf(label) + label.length).trim()) as string
+}
+
 function tuiCtx(launchDir: string, over: Record<string, unknown> = {}) {
   return {
     argv: ['/abs/bin/tmux-agent-tui', '--session', 'abcdefgh-one'],
     cwd: '/abs/work',
     env: { TMUX_AGENT_DIR: '/abs/state', TMUX_AGENT_TMUX_SOCKET: '/abs/sock' },
     session: 'abcdefgh-one',
-    launchToken: 'tokA',
+    launchToken: 'aaaaaaaaaaaa',
     launchDir,
     ...over,
   }
@@ -3195,16 +3214,19 @@ test('T3: Warp writes one launch file and opens it through the host', async () =
     assert.equal(opened.kind, 'sent')
     assert.equal(opened.terminal, 'warp')
     const key = sessionKey('abcdefgh-one')
-    const file = join(dir, `tmux-agent-tui-${key}-tokA.yaml`)
+    const file = join(dir, `tmux-agent-tui-${key}-aaaaaaaaaaaa.yaml`)
     assert.deepEqual(writes, [file])
     assert.equal(existsSync(file), true)
     const yaml = readFileSync(file, 'utf8')
-    assert.match(yaml, new RegExp(`^name: tmux-agent-tui-${key}-tokA$`, 'm'))
+    assert.match(yaml, new RegExp(`^name: tmux-agent-tui-${key}-aaaaaaaaaaaa$`, 'm'))
+    assert.equal(commandsUnderLayout(yaml), true, yaml)
+    assert.equal(yamlJson(yaml, 'cwd: '), '/abs/work')
+    assert.ok(yamlJson(yaml, 'exec: ').includes(sentinel), 'decoded exec keeps the argv')
     assert.ok(yaml.includes(sentinel), 'absolute argv is in the launch file')
     assert.ok(yaml.includes('/abs/state') && yaml.includes('/abs/sock'))
     const open = calls.find(a => a[0] === 'open')
     assert.ok(open, `argv: ${JSON.stringify(calls)}`)
-    assert.equal(open[1], `warp://launch/${encodeURIComponent(`tmux-agent-tui-${key}-tokA`)}`)
+    assert.equal(open[1], `warp://launch/${encodeURIComponent(`tmux-agent-tui-${key}-aaaaaaaaaaaa`)}`)
     assert.equal(calls.some(a => a[0] === 'osascript' || a.includes('split-window')), false)
   } finally { rmSync(dir, { recursive: true, force: true }) }
   })
@@ -3217,8 +3239,9 @@ test('T3: sessions that share an 8-character prefix get different Warp files', a
   try {
     assert.notEqual(process.env.TERM_PROGRAM, 'WarpTerminal')
     const { host } = terminalHost({ term: 'WarpTerminal' })
-    await core.openInTerminal(host, tuiCtx(dir, { session: 'abcdefgh-one', launchToken: 'tok1' }), 'A', false)
-    await core.openInTerminal(host, tuiCtx(dir, { session: 'abcdefgh-two', launchToken: 'tok2' }), 'B', false)
+    const token = 'bbbbbbbbbbbb'
+    await core.openInTerminal(host, tuiCtx(dir, { session: 'abcdefgh-one', launchToken: token }), 'A', false)
+    await core.openInTerminal(host, tuiCtx(dir, { session: 'abcdefgh-two', launchToken: token }), 'B', false)
     const names = readdirSync(dir).sort()
     assert.equal(names.length, 2)
     assert.notEqual(names[0], names[1])
@@ -3243,6 +3266,8 @@ test('T3: iTerm2 passes the command as an osascript argument', async () => {
   assert.ok(argv, `argv: ${JSON.stringify(calls)}`)
   const script = argv[argv.indexOf('-e') + 1] ?? ''
   assert.match(script, /on run argv/)
+  assert.match(script, /set cmd to item 1 of argv/)
+  assert.match(script, /quoted form of cmd/)
   assert.match(script, /create window with default profile/)
   assert.equal(script.includes(sentinel), false)
   assert.ok(argv.some(a => a.includes(sentinel)))
@@ -3264,7 +3289,8 @@ test('T3: Terminal.app passes the command as an osascript argument', async () =>
   assert.ok(argv)
   const script = argv[argv.indexOf('-e') + 1] ?? ''
   assert.match(script, /on run argv/)
-  assert.match(script, /do script/)
+  assert.match(script, /set cmd to item 1 of argv/)
+  assert.match(script, /do script cmd/)
   assert.equal(script.includes(sentinel), false)
   assert.ok(argv.some(a => a.includes(sentinel)))
   })
@@ -3360,11 +3386,222 @@ test('T3: a failed open deletes only that launch file', async () => {
     assert.equal(opened.stderr, 'open failed: boom')
     assert.ok(opened.command.includes(long) && opened.command.includes('warp://launch/'), 'full command, not a slice')
     assert.equal(opened.command.includes('…'), false)
-    const own = join(dir, `tmux-agent-tui-${key}-tokA.yaml`)
+    const own = join(dir, `tmux-agent-tui-${key}-aaaaaaaaaaaa.yaml`)
     assert.deepEqual(writes, [own])
     assert.equal(existsSync(own), false)
     assert.equal(readFileSync(other, 'utf8'), 'keep\n')
     assert.equal(readFileSync(foreign, 'utf8'), 'keep\n')
   } finally { rmSync(dir, { recursive: true, force: true }) }
   })
+})
+
+test('T3: a new shell starts in ctx.cwd', async () => {
+  const core = await import('./workers.ts')
+  const parent = mkdtempSync(join(tmpdir(), 'tui-cwd-'))
+  const dirs = [join(parent, 'a b', "c'd"), join(parent, 'nl\nx')]
+  for (const dir of dirs) mkdirSync(dir, { recursive: true })
+  try {
+    await withTermEnv('WarpTerminal', undefined, async () => {
+      for (const term of ['iTerm.app', 'Apple_Terminal', 'Zed'] as const) {
+        for (const cwd of dirs) {
+          const { host, calls } = terminalHost({ term })
+          const opened = await core.openInTerminal(host, tuiCtx('/no/write', { cwd, argv: ['/bin/pwd'], launchDir: undefined, env: {} }), 'Band', false)
+          assert.equal(opened.kind, 'sent', term)
+          const argv = calls.find(a => a[0] === 'osascript')
+          assert.ok(argv, term)
+          const line = argv[argv.length - 1] ?? ''
+          assert.match(argv[argv.indexOf('-e') + 1] ?? '', /set cmd to item 1 of argv/)
+          const ran = spawnSync('/bin/sh', ['-c', line], { cwd: '/', encoding: 'utf8' })
+          assert.equal(ran.status, 0, `${term} ${ran.stderr}`)
+          assert.equal(ran.stdout.trim(), cwd, term)
+        }
+      }
+    })
+  } finally { rmSync(parent, { recursive: true, force: true }) }
+})
+
+test('T3: launch quoting round-trips spaces, quotes, and newlines', async () => {
+  const core = await import('./workers.ts')
+  const parent = mkdtempSync(join(tmpdir(), 'tui-q-'))
+  const cwd = join(parent, 'a b', "c'd")
+  mkdirSync(cwd, { recursive: true })
+  const dirEnv = join(parent, "d r\no'h\"i")
+  const arg = "a b\nc'd\"e"
+  const title = "ti tle\n'\"x"
+  const probe = `process.stdout.write(JSON.stringify({pwd:process.cwd(),argv:process.argv.slice(1),dir:process.env.TMUX_AGENT_DIR}))`
+  const argv = [process.execPath, '-e', probe, arg]
+  try {
+    await withTermEnv('Apple_Terminal', undefined, async () => {
+      const { host, calls } = terminalHost({ term: 'iTerm.app' })
+      const ctx = tuiCtx('/no/write', { cwd, argv, launchDir: undefined, env: { TMUX_AGENT_DIR: dirEnv } })
+      const opened = await core.openInTerminal(host, ctx, title, false)
+      assert.equal(opened.kind, 'sent')
+      const osa = calls.find(a => a[0] === 'osascript')
+      assert.ok(osa)
+      const line = osa[osa.length - 1] ?? ''
+      assert.equal(osa.filter(a => a === line).length, 1)
+      const ran = spawnSync('/bin/sh', ['-c', line], { cwd: '/', encoding: 'utf8' })
+      assert.equal(ran.status, 0, ran.stderr)
+      assert.deepEqual(JSON.parse(ran.stdout), { pwd: realpathSync(cwd), argv: [arg], dir: dirEnv })
+      const warpDir = mkdtempSync(join(parent, 'warp-'))
+      const warp = terminalHost({ term: 'WarpTerminal' })
+      const sent = await core.openInTerminal(warp.host, tuiCtx(warpDir, { cwd, argv, env: { TMUX_AGENT_DIR: dirEnv } }), title, false)
+      assert.equal(sent.kind, 'sent')
+      const yaml = readFileSync(readdirSync(warpDir).map(n => join(warpDir, n))[0]!, 'utf8')
+      assert.equal(commandsUnderLayout(yaml), true)
+      assert.equal(yamlJson(yaml, 'title: '), title)
+      assert.equal(yamlJson(yaml, 'cwd: '), cwd)
+      const exec = yamlJson(yaml, 'exec: ')
+      const again = spawnSync('/bin/sh', ['-c', exec], { cwd: '/', encoding: 'utf8' })
+      assert.equal(again.status, 0, again.stderr)
+      assert.deepEqual(JSON.parse(again.stdout), { pwd: realpathSync(cwd), argv: [arg], dir: dirEnv })
+      const failed = terminalHost({ term: 'WarpTerminal', openExit: 1, openStderr: 'boom' })
+      const bad = await core.openInTerminal(failed.host, tuiCtx(warpDir, { cwd, argv, env: { TMUX_AGENT_DIR: dirEnv }, launchToken: 'cccccccccccc' }), title, false)
+      assert.equal(bad.kind, 'failed')
+      const quoted = bad.command.slice(bad.command.indexOf('\n') + 1)
+      const shown = spawnSync('/bin/sh', ['-c', quoted], { cwd: '/', encoding: 'utf8' })
+      assert.equal(shown.status, 0, shown.stderr)
+      assert.deepEqual(JSON.parse(shown.stdout), { pwd: realpathSync(cwd), argv: [arg], dir: dirEnv })
+    })
+  } finally { rmSync(parent, { recursive: true, force: true }) }
+})
+
+test('T3: a partial write and a failed cleanup name the leftover file', async () => {
+  const core = await import('./workers.ts')
+  const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
+  const key = sessionKey('abcdefgh-one')
+  const own = join(dir, `tmux-agent-tui-${key}-aaaaaaaaaaaa.yaml`)
+  const other = join(dir, `tmux-agent-tui-${key}-bbbbbbbbbbbb.yaml`)
+  writeFileSync(other, 'keep\n')
+  const base = nodeHost({ log: () => {} })
+  const make = (mode: 'write' | 'open-throw' | 'open-exit' | 'rm-exit' | 'rm-throw') => {
+    const calls: string[][] = []
+    const host: Host = {
+      ...base,
+      envTermProgram: async () => 'WarpTerminal',
+      envSshTty: async () => undefined,
+      write: async (path, text) => {
+        await base.write(path, text)
+        if (mode === 'write') throw Object.assign(new Error('EIO short write'), { code: 'EIO' })
+      },
+      run: async (argv, cwd, ms) => {
+        calls.push([...argv])
+        if (argv[0] === 'rm') {
+          if (mode === 'rm-throw') throw Object.assign(new Error('EPERM rm'), { code: 'EPERM' })
+          if (mode === 'rm-exit' || mode === 'open-exit') return { exitCode: 1, stdout: '', stderr: 'rm: Permission denied' }
+          return base.run(argv, cwd, ms)
+        }
+        if (argv[0] === 'open') {
+          if (mode === 'open-throw' || mode === 'rm-throw') throw Object.assign(new Error('EIO open'), { code: 'EIO' })
+          return { exitCode: 1, stdout: '', stderr: 'open failed: boom' }
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    return { host, calls }
+  }
+  try {
+    await withTermEnv('Apple_Terminal', undefined, async () => {
+      const wrote = make('write')
+      const partial = await core.openInTerminal(wrote.host, tuiCtx(dir), 'Band', false)
+      assert.equal(partial.kind, 'failed')
+      assert.equal(partial.error, 'EIO')
+      assert.equal(existsSync(own), false)
+      assert.equal(readFileSync(other, 'utf8'), 'keep\n')
+      const stuck = make('rm-exit')
+      const left = await core.openInTerminal(stuck.host, tuiCtx(dir), 'Band', false)
+      assert.equal(left.kind, 'failed')
+      assert.equal(existsSync(own), true)
+      assert.match(left.stderr, /open failed: boom/)
+      assert.match(left.stderr, /Permission denied/)
+      assert.ok(left.stderr.includes(own), left.stderr)
+      assert.equal(readFileSync(other, 'utf8'), 'keep\n')
+      rmSync(own, { force: true })
+      const thrown = make('rm-throw')
+      const boom = await core.openInTerminal(thrown.host, tuiCtx(dir), 'Band', false)
+      assert.equal(boom.kind, 'failed')
+      assert.equal(boom.error, 'EIO')
+      assert.equal(existsSync(own), true)
+      assert.match(boom.stderr, /EPERM/)
+      assert.ok(boom.stderr.includes(own))
+      rmSync(own, { force: true })
+      const opened = make('open-throw')
+      const gone = await core.openInTerminal(opened.host, tuiCtx(dir), 'Band', false)
+      assert.equal(gone.kind, 'failed')
+      assert.equal(existsSync(own), false)
+      assert.equal(gone.stderr.includes(own), false)
+    })
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('T3: an env getter error is a failed result', async () => {
+  const core = await import('./workers.ts')
+  const boom = (code: string) => Object.assign(new Error(`${code} injected`), { code })
+  await withTermEnv('Apple_Terminal', undefined, async () => {
+    const ssh = terminalHost({ term: 'WarpTerminal' })
+    ssh.host.envSshTty = async () => { throw boom('EPERM') }
+    const sshOut = await core.openInTerminal(ssh.host, tuiCtx('/no/write', { launchDir: undefined }), 'Band', false)
+    assert.equal(sshOut.kind, 'failed')
+    assert.equal(sshOut.error, 'EPERM')
+    assert.match(sshOut.stderr, /EPERM/)
+    assert.ok(sshOut.command.includes('/abs/bin/tmux-agent-tui'))
+    assert.equal(ssh.calls.length, 0)
+    assert.deepEqual(ssh.writes, [])
+    const term = terminalHost({ term: 'WarpTerminal' })
+    term.host.envTermProgram = async () => { throw boom('EIO') }
+    const termOut = await core.openInTerminal(term.host, tuiCtx('/no/write', { launchDir: undefined }), 'Band', false)
+    assert.equal(termOut.kind, 'failed')
+    assert.equal(termOut.error, 'EIO')
+    assert.match(termOut.stderr, /EIO/)
+    assert.equal(term.calls.length, 0)
+    assert.deepEqual(term.writes, [])
+  })
+})
+
+test('T3: the same owner keeps one Warp file per launch token', async () => {
+  const core = await import('./workers.ts')
+  const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
+  try {
+    await withTermEnv('Apple_Terminal', undefined, async () => {
+      const { host, calls } = terminalHost({ term: 'WarpTerminal' })
+      const key = sessionKey('abcdefgh-one')
+      const a = 'cccccccccccc'
+      const b = 'dddddddddddd'
+      await core.openInTerminal(host, tuiCtx(dir, { launchToken: a }), 'A', false)
+      await core.openInTerminal(host, tuiCtx(dir, { launchToken: b }), 'B', false)
+      const names = readdirSync(dir).sort()
+      assert.deepEqual(names, [`tmux-agent-tui-${key}-${a}.yaml`, `tmux-agent-tui-${key}-${b}.yaml`].sort())
+      for (const token of [a, b]) {
+        const yaml = readFileSync(join(dir, `tmux-agent-tui-${key}-${token}.yaml`), 'utf8')
+        assert.match(yaml, new RegExp(`^name: tmux-agent-tui-${key}-${token}$`, 'm'))
+      }
+      const urls = calls.filter(c => c[0] === 'open').map(c => c[1])
+      assert.deepEqual(urls, [a, b].map(token => `warp://launch/${encodeURIComponent(`tmux-agent-tui-${key}-${token}`)}`))
+    })
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('T3: an unsafe launch token is not a path', async () => {
+  const core = await import('./workers.ts')
+  const dir = mkdtempSync(join(tmpdir(), 'tui-warp-'))
+  const writes: string[] = []
+  const base = nodeHost({ log: () => {} })
+  const host: Host = {
+    ...base,
+    envTermProgram: async () => 'WarpTerminal',
+    envSshTty: async () => undefined,
+    write: async path => { writes.push(path) },
+    run: async argv => {
+      if (argv[0] === 'open' || argv[0] === 'rm') return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, '/', 5_000)
+    },
+  }
+  try {
+    await withTermEnv('Apple_Terminal', undefined, async () => {
+      const opened = await core.openInTerminal(host, tuiCtx(dir, { launchToken: 'x/../../outside' }), 'Band', false)
+      assert.equal(opened.kind, 'failed')
+      assert.equal(writes.some(p => p.includes('..') || p.includes('/outside')), false, JSON.stringify(writes))
+      assert.equal(writes.length, 0)
+    })
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })
