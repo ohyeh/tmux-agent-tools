@@ -2851,64 +2851,6 @@ export function stopButtonLabel(name: string, armed: boolean): string {
   return armed ? `stop ${name}? press again` : 'stop'
 }
 
-/**
- * `[ ⧉ tui ]`: the full-screen TUI in a tmux split beside the host pane, bound
- * to this session. No launcher: in Claude Code the mod is the collector, and the
- * launcher's second collector would deliver one result twice. The TUI is the
- * `lib/tui.node.ts` beside the `agent-tmux` this mod already runs (PATH, the
- * marketplace checkout, or an `npx skills` folder; a symlink is resolved), so it
- * follows however the wrapper was installed. Not in tmux: `ok`, with the
- * `tmux-agent-tui` command to run in another terminal (plan D-q2: no terminal app
- * is opened), every argument shell-quoted; over 200 chars the full line goes to
- * the log. The mod's tmux calls use the default socket, so the line names none.
- */
-export async function openTuiBeside(host: Host, pane: string | undefined): Promise<Outcome> {
-  const session = host.owner()
-  const cwd = host.cwd()
-  if (!session || !cwd) return { ok: false, text: 'no session id or cwd yet' }
-  const { bin, missing } = await agentTmuxBin(host)
-  if (missing) return { ok: false, text: missing }
-  const found = await host.run(
-    [
-      '/bin/sh',
-      '-c',
-      'w=$(command -v "$1") && w=$(realpath "$w") && t="${w%/*}/lib/tui.node.ts" && e="${w%/*}/tmux-agent-tui" && [ -f "$t" ] && [ -x "$e" ] && n=$(command -v node) && printf "%s\\n%s\\n%s\\n" "$n" "$t" "$e"',
-      'sh',
-      bin,
-    ],
-    cwd,
-    5_000,
-  )
-  const [node, tui, entry] = found.stdout.trim().split('\n')
-  if (found.exitCode !== 0 || !node || !tui || !entry) {
-    return { ok: false, text: `no node, lib/tui.node.ts or tmux-agent-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}; an older skill install? update it and re-run its install-bin` }
-  }
-  if (!pane || !/^%\d+$/.test(pane)) {
-    // The root is named only when this host overrides it; the other terminal derives the default itself.
-    const dir = await host.envTmuxAgentDir()
-    const line = `${dir ? `TMUX_AGENT_DIR=${shq(dir)} ` : ''}${shq(entry)} --session ${shq(session)} --cwd ${shq(cwd)}`
-    const head = '不在 tmux 內，已提供開啟指令，請在另一個終端機執行'
-    if (`${head}：${line}`.length <= 200) return { ok: true, text: `${head}：${line}` }
-    host.log(`tmux-agent: tui open command: ${line}`)
-    const cut = `${head}（完整指令見 log）：`
-    return { ok: true, text: `${cut}${line.slice(0, 199 - cut.length)}…` }
-  }
-  const root = await rootOf(host)
-  const split = await host.run(
-    [
-      // `-f`: the TUI takes the full window height even when `pane` is the top half of a vertical split (T1 C4).
-      'tmux', 'split-window', '-t', pane, '-h', '-f', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
-      '-e', `TMUX_AGENT_SESSION=${session}`,
-      ...(root ? ['-e', `TMUX_AGENT_DIR=${root}`] : []),
-      node, tui, '--session', session, '--cwd', cwd,
-    ],
-    cwd,
-    5_000,
-  )
-  if (split.exitCode !== 0) return { ok: false, text: `tmux split-window: ${split.stderr.trim() || `exit ${split.exitCode}`}` }
-  return { ok: true, text: `TUI in ${split.stdout.trim()} beside ${pane}` }
-}
-
 export async function rememberPanel(host: Host, open: boolean): Promise<void> {
   const id = host.owner()
   if (!id) return
@@ -3481,8 +3423,12 @@ function sameProc(a: ProcessId, b: ProcessId): boolean {
   return a.host === b.host && a.pid === b.pid && a.pidStart === b.pidStart && a.pid > 0 && a.pidStart !== ''
 }
 
-function tuiLaunchPath(dir: string, session: string, token: string): string {
-  return `${dir}/tmux-agent-tui-${sessionKey(session)}-${token}.yaml`
+export function tuiLaunchStem(session: string, token: string): string {
+  return `tmux-agent-tui-${sessionKey(session)}-${token}`
+}
+
+export function tuiLaunchPath(dir: string, session: string, token: string): string {
+  return `${dir}/${tuiLaunchStem(session, token)}.yaml`
 }
 
 async function dropStaging(host: Host, staging: string): Promise<void> {
@@ -3636,15 +3582,7 @@ async function readTuiOwner(host: Host, dir: string): Promise<TuiOwner | undefin
 }
 
 async function writeTuiOwner(host: Host, dir: string, claim: TuiOwner): Promise<boolean> {
-  const path = `${dir}/tui.owner`
-  const tmp = `${path}.${claim.token}.tmp`
-  try {
-    await host.write(tmp, JSON.stringify(claim))
-    const mv = await host.run(['mv', tmp, path], '/', 5_000)
-    return mv.exitCode === 0
-  } catch {
-    return false
-  }
+  return publish(host, `${dir}/tui.owner`, JSON.stringify(claim), claim.token).catch(() => false)
 }
 
 /** Pending past 30s is reclaimed even if its launcher is still alive. Other records need a proven-dead holder; unknown stays occupied. */
@@ -3688,14 +3626,12 @@ export async function claimTui(host: Host, root: string, session: string, me: Pr
       if (slot === 'occupied-unknown') return { kind: slot, claim: cur }
       if (cur.state === 'pending' && opts.launchDir) {
         const target = tuiLaunchPath(opts.launchDir, session, cur.token)
-        try {
-          const rm = await host.run(['rm', '-f', target], '/', 5_000)
-          if (rm.exitCode !== 0) {
-            host.log(`tmux-agent: could not remove ${target}: exit ${rm.exitCode} ${rm.stderr.trim()}`)
-            return { kind: 'occupied-unknown' as const, claim: cur }
-          }
-        } catch (error) {
-          host.log(`tmux-agent: could not remove ${target}: ${errorClass(error)} ${String(error)}`)
+        const fail = await dropLaunchFile(host, target, '/')
+        if (fail) {
+          const detail = 'error' in fail
+            ? `${errorClass(fail.error)} ${String(fail.error)}`
+            : `exit ${fail.exitCode} ${fail.stderr.trim()}`
+          host.log(`tmux-agent: could not remove ${target}: ${detail}`)
           return { kind: 'occupied-unknown' as const, claim: cur }
         }
       }
@@ -3833,16 +3769,17 @@ const TERMINAL_SCRIPT = `on run argv
   tell application "Terminal" to do script cmd
 end run`
 
+const showArgv = (argv: readonly string[]) => argv.map(a => shq(a)).join(' ')
+
 function launchLine(ctx: LaunchContext): string {
   const env = [
     ctx.env.TMUX_AGENT_DIR ? `TMUX_AGENT_DIR=${shq(ctx.env.TMUX_AGENT_DIR)}` : '',
     ctx.env.TMUX_AGENT_TMUX_SOCKET ? `TMUX_AGENT_TMUX_SOCKET=${shq(ctx.env.TMUX_AGENT_TMUX_SOCKET)}` : '',
   ].filter(a => a.length > 0)
+  const quoted = showArgv(ctx.argv)
   // cd fails closed: the argv does not run when the directory cannot be entered.
-  return [`cd ${shq(ctx.cwd)}`, [...env, ...ctx.argv.map(a => shq(a))].join(' ')].filter(a => a.length > 0).join(' && ')
+  return [`cd ${shq(ctx.cwd)}`, [...env, ...(quoted ? [quoted] : [])].join(' ')].filter(a => a.length > 0).join(' && ')
 }
-
-const showArgv = (argv: readonly string[]) => argv.map(a => shq(a)).join(' ')
 
 function warpYaml(configName: string, title: string, cwd: string, exec: string): string {
   return [
@@ -3859,25 +3796,37 @@ function warpYaml(configName: string, title: string, cwd: string, exec: string):
   ].join('\n')
 }
 
-async function dropLaunchFile(host: Host, file: string, cwd: string): Promise<string | undefined> {
+// Callers disagree: a claim aborts, the TUI only logs, the band ignores a non-zero exit, Warp puts the note in stderr.
+export async function dropLaunchFile(
+  host: Host,
+  file: string,
+  cwd: string,
+): Promise<{ exitCode: number; stderr: string } | { error: unknown } | undefined> {
   try {
     const rm = await host.run(['rm', '-f', file], cwd, 5_000)
-    if (rm.exitCode !== 0) return `${file} remains: exit ${rm.exitCode} ${rm.stderr.trim()}`
+    if (rm.exitCode !== 0) return { exitCode: rm.exitCode, stderr: rm.stderr }
   } catch (error) {
-    return `${file} remains: ${errorClass(error)} ${String(error)}`
+    return { error }
   }
   return undefined
+}
+
+function launchLeft(file: string, fail: { exitCode: number; stderr: string } | { error: unknown } | undefined): string | undefined {
+  if (!fail) return undefined
+  return 'error' in fail
+    ? `${file} remains: ${errorClass(fail.error)} ${String(fail.error)}`
+    : `${file} remains: exit ${fail.exitCode} ${fail.stderr.trim()}`
 }
 
 async function openWarp(host: Host, ctx: LaunchContext, name: string, line: string): Promise<OpenResult> {
   if (!tuiTokenOk(ctx.launchToken)) return { kind: 'failed', error: 'token', stderr: 'launch token is not a 12-character base36 id', command: line }
   if (!ctx.launchDir) return { kind: 'failed', error: 'no launch directory', stderr: '', command: line }
-  const configName = `tmux-agent-tui-${sessionKey(ctx.session)}-${ctx.launchToken}`
-  const file = `${ctx.launchDir}/${configName}.yaml`
+  const configName = tuiLaunchStem(ctx.session, ctx.launchToken)
+  const file = tuiLaunchPath(ctx.launchDir, ctx.session, ctx.launchToken)
   try {
     await host.write(file, warpYaml(configName, name, ctx.cwd, line))
   } catch (error) {
-    const left = await dropLaunchFile(host, file, ctx.launchDir)
+    const left = launchLeft(file, await dropLaunchFile(host, file, ctx.launchDir))
     return { kind: 'failed', error: errorClass(error), stderr: left ? `${String(error)}; ${left}` : String(error), command: line }
   }
   const argv = ['open', `warp://launch/${encodeURIComponent(configName)}`]
@@ -3887,11 +3836,11 @@ async function openWarp(host: Host, ctx: LaunchContext, name: string, line: stri
   try {
     run = await host.run(argv, ctx.cwd, 5_000)
   } catch (error) {
-    const left = await dropLaunchFile(host, file, ctx.launchDir)
+    const left = launchLeft(file, await dropLaunchFile(host, file, ctx.launchDir))
     return { kind: 'failed', error: errorClass(error), stderr: left ? `${String(error)}; ${left}` : String(error), command }
   }
   if (run.exitCode !== 0) {
-    const left = await dropLaunchFile(host, file, ctx.launchDir)
+    const left = launchLeft(file, await dropLaunchFile(host, file, ctx.launchDir))
     return { kind: 'failed', error: 'open', stderr: left ? `${run.stderr}; ${left}` : run.stderr, command }
   }
   return { kind: 'sent', terminal: 'warp' }
