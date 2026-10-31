@@ -1327,7 +1327,7 @@ test('terminal: an async rejection inside the refresh timer rejects and restores
   let bomb = false
   const realNow = host.now
   host.now = () => (bomb ? Promise.reject(new Error('BOMB_IN_TIMER')) : realNow())
-  const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 20 })
+  const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 20, rowsMs: 50 })
   await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
   bomb = true
   const ended = await Promise.race([run.then(() => 'resolved', () => 'rejected'), new Promise(r => setTimeout(() => r('hung'), 3_000))])
@@ -2555,7 +2555,7 @@ test('narrow: a gone selected row returns the list', async () => {
   stdout.columns = 70
   stdout.rows = 24
   const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf('\x1b[H')))
-  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 40 })
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 40, rowsMs: 100 })
   try {
     await until(() => last().includes('drop.abcde') && last().includes('keep.abcde'), 5_000, 'both rows')
     const arm = async () => {
@@ -3089,14 +3089,18 @@ test('empty states: none outstanding, filtered out, read failure — hard-coded 
 })
 
 test('pty sizes: 120x60, 80x24, 40x10, 2 rows — last row selected, CJK summaries, no line past the width, resize re-lays out', { timeout: 120_000 }, async () => {
-  const root = mkdtempSync(join(tmpdir(), 'tui-ptysz-'))
-  const repo = mkdtempSync(join(tmpdir(), 'tui-ptysz-repo-'))
-  const home = mkdtempSync(join(tmpdir(), 'tui-ptysz-home-'))
-  for (const [i, name] of ['a.abcde', 'b.abcde', 'c.abcde'].entries()) {
-    writeWorker(root, repo, 'owner', name, { status: 'success', summary: `完成第${i + 1}項：繁體中文摘要，寬度測試 👨‍👩‍👧 🇹🇼 結果${'很長'.repeat(30)}` })
+  // One root/repo/home per scenario: the scenarios run in parallel and a shared TUI claim would raise the first one instead of starting.
+  const fixture = () => {
+    const root = mkdtempSync(join(tmpdir(), 'tui-ptysz-'))
+    const repo = mkdtempSync(join(tmpdir(), 'tui-ptysz-repo-'))
+    const home = mkdtempSync(join(tmpdir(), 'tui-ptysz-home-'))
+    for (const [i, name] of ['a.abcde', 'b.abcde', 'c.abcde'].entries()) {
+      writeWorker(root, repo, 'owner', name, { status: 'success', summary: `完成第${i + 1}項：繁體中文摘要，寬度測試 👨‍👩‍👧 🇹🇼 結果${'很長'.repeat(30)}` })
+    }
+    return { root, repo, home }
   }
   const py = `
-import pty, os, select, sys, time, subprocess, termios, struct, fcntl, signal, base64
+import pty, os, select, sys, time, subprocess, termios, struct, fcntl, signal, base64, re
 cols, rows, cols2, rows2 = (int(x) for x in sys.argv[4:8])
 master, slave = pty.openpty()
 def size(c, r):
@@ -3106,29 +3110,34 @@ env = {'PATH': os.path.dirname(sys.argv[1]) + ':/usr/bin:/bin', 'HOME': sys.argv
 pre = termios.tcgetattr(slave)
 p = subprocess.Popen([sys.argv[1], sys.argv[2], '--session', 'owner', '--cwd', sys.argv[9]], stdin=slave, stdout=slave, stderr=slave, env=env)
 out = bytearray()
+CLR = b'\\x1b[2J\\x1b[H'
+def frames(): return out.count(CLR)
+def last(): return re.sub(rb'\\x1b\\[[0-9;?]*[ -/]*[@-~]|\\x1b\\][^\\x07]*\\x07', b'', bytes(out[out.rfind(CLR):]))
 def pump(seconds, until=None):
     end = time.time() + seconds
-    while time.time() < end and (until is None or until not in out):
+    while time.time() < end and not (until and until()):
         r, _, _ = select.select([master], [], [], max(0, end - time.time()))
         if not r: break
         try: chunk = os.read(master, 65536)
         except OSError: break
         if not chunk: break
         out.extend(chunk)
-pump(8, b'c.abcde' if rows > 2 else b'3 worker(s)')
-pump(0.3)
+pump(8, lambda: (b'c.abcde' if rows > 2 else b'3 worker(s)') in out)
+n = frames()
 os.write(master, b'k')
-pump(0.8)
+pump(8, lambda: re.search(rb'\\xe2\\x80\\xba c\\.abcde', last()) if rows > 2 else frames() > n)
 mark = len(out)
 if cols2:
+    n = frames()
     size(cols2, rows2)
     p.send_signal(signal.SIGWINCH)
-    pump(0.8)
+    pump(8, lambda: frames() > n)
+    n = frames()
     os.write(master, b'k')
-    pump(0.8)
+    pump(8, lambda: frames() > n)
 os.write(master, b'q')
-try: p.wait(timeout=5)
-except subprocess.TimeoutExpired: p.kill(); p.wait()
+pump(5, lambda: p.poll() is not None)
+if p.poll() is None: p.kill(); p.wait()
 pump(0.2)
 post = termios.tcgetattr(slave)
 print('EXIT=%d' % p.returncode)
@@ -3149,16 +3158,24 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
     [40, 10, 0, 0],
     [80, 2, 0, 0],
   ]
-  for (const [cols, rows, cols2, rows2] of scenarios) {
+  const results = await Promise.all(
+    scenarios.map(
+      ([cols, rows, cols2, rows2]) => {
+        const { root, repo, home } = fixture()
+        return new Promise<{ code: number; out: string; err: string }>(resolve => {
+          execFile(
+            'python3',
+            ['-c', py, process.execPath, join(import.meta.dirname, 'tui.node.ts'), root, String(cols), String(rows), String(cols2), String(rows2), home, repo],
+            { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+            (error, stdout, stderr) => resolve({ code: error ? -1 : 0, out: stdout, err: stderr }),
+          )
+        })
+      },
+    ),
+  )
+  for (const [i, [cols, rows, cols2, rows2]] of scenarios.entries()) {
     const what = `${cols}x${rows}${cols2 ? `→${cols2}x${rows2}` : ''}`
-    const res = await new Promise<{ code: number; out: string; err: string }>(resolve => {
-      execFile(
-        'python3',
-        ['-c', py, process.execPath, join(import.meta.dirname, 'tui.node.ts'), root, String(cols), String(rows), String(cols2), String(rows2), home, repo],
-        { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
-        (error, stdout, stderr) => resolve({ code: error ? -1 : 0, out: stdout, err: stderr }),
-      )
-    })
+    const res = results[i]!
     assert.equal(res.code, 0, `${what}: ${res.err}`)
     assert.match(res.out, /EXIT=0\n/, `${what}\n${res.out.slice(0, 400)}`)
     assert.match(res.out, /SAME_TTY=True\n/, what)

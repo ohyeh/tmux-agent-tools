@@ -36,11 +36,7 @@ timeout_ms=75000
 # (assertions), timeout (a test, a file, or the whole run ran out of time), and
 # error (nonzero exit with neither — a crash, a loader error, no TAP summary).
 run_timeout_s=90
-timeout_bin="$(command -v timeout || command -v gtimeout || true)"
-if [[ -z "$timeout_bin" ]]; then
-  echo "  FAIL timeout or gtimeout is required for the run bound" >&2
-  exit 1
-fi
+. "$SCRIPT_DIR/lib/smoke-timeout.sh"
 set +e
 out="$("$timeout_bin" --kill-after=15s "${run_timeout_s}s" \
   node --test --test-timeout="$timeout_ms" --test-reporter=tap ./*.contract.node.ts </dev/null 2>&1)"

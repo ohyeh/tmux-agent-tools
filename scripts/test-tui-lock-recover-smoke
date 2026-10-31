@@ -8,12 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FILE="$REPO_ROOT/skills/tmux-agent-tools/scripts/lib/tui-lock.recover.node.ts"
-timeout_bin="$(command -v timeout || command -v gtimeout || true)"
-if [[ -z "$timeout_bin" ]]; then
-  echo "  FAIL timeout or gtimeout is required" >&2
-  echo "0 passed, 1 failed" >&2
-  exit 1
-fi
+. "$SCRIPT_DIR/lib/smoke-timeout.sh"
 
 set +e
 out="$("$timeout_bin" --kill-after=5s 30s node --test --test-timeout=25000 "$FILE" 2>&1)"
