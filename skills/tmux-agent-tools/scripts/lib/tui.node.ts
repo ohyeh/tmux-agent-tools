@@ -819,7 +819,6 @@ export function nextKeyState(
     if (narrowScreen(screen) && (state.narrowView ?? 'list') === 'preview') {
       return { state: { ...state, narrowView: 'list' } }
     }
-    if (state.mode === 'picker') return { state: { ...state, mode: 'preview' } }
     if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
     if (state.selected) return { state: reselect(state, undefined) }
     return { state: { ...state, quit: true }, action: { type: 'quit' } }

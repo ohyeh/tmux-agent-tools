@@ -450,7 +450,7 @@ test('picker: cwd and session escapes are stripped before draw (FR-01)', async (
 test('picker: the highlight scrolls into a one-page window (FR-04)', () => {
   const entries = Array.from({ length: 30 }, (_, i) => ({
     session: `session-${i}`,
-    liveness: (i === 29 ? 'live' : 'non-live') as const,
+    liveness: i === 29 ? ('live' as const) : ('non-live' as const),
     health: 'unknown',
     cwdFrom: 'unknown' as const,
   }))
@@ -1402,7 +1402,7 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
   const mockStdout = new MockStdout() as any
   const root = mkdtempSync(join(tmpdir(), 'tui-root-'))
 
-  let tuiPromise: Promise<void> | undefined
+  let tuiPromise: Promise<number> | undefined
   try {
     tuiPromise = runTui({
       stdin: mockStdin,

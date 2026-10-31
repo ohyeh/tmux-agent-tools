@@ -2309,7 +2309,7 @@ describe('panel', () => {
     mockStore(on)
     const clock = mockClock(on)
     mockFs(on, { ...worker('w1', 0) })
-    const gate = { pending: 0 }
+    const gate: { release?: () => void; pending: number } = { pending: 0 }
     const panel = mockPanel(on, { running: true, idle_seconds: 60 }, 'NEW OUTPUT', false, gate)
 
     await $.session.start(session())
