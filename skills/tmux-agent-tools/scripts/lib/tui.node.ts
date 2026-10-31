@@ -1147,7 +1147,7 @@ function chromeLines(s: Sections): number {
 }
 
 /** The layout runTui sizes the capture and the detail page with: the same one render draws. */
-export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number; frame: Frame } {
+export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout & { detailTotal: number; frame: Frame; sections: Sections } {
   const s = sectionsOf(state, width, now, gate, height)
   const frame = frameOf(width, height, state.rows.length, s.sel, chromeLines(s), state.narrowView ?? 'list')
   const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
@@ -1164,6 +1164,7 @@ export function tuiLayout(state: TuiState, width: number, height: number, now: n
     footer: s.footer.length,
     detailTotal,
     frame,
+    sections: s,
   }
 }
 
@@ -1216,20 +1217,18 @@ function renderWide(state: TuiState, width: number, height: number, s: Sections,
   return lines.slice(0, height)
 }
 
-export function renderTuiLines(
+function linesFromLayout(
   state: TuiState,
   width: number,
   height: number,
-  now: number,
+  lay: TuiLayout & { frame: Frame; sections: Sections },
   gate?: Gate,
 ): string[] {
-  if (width < 1 || height < 1) return []
-  const s = sectionsOf(state, width, now, gate, height)
+  const s = lay.sections
   if (height <= 2) {
     const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
     return [s.title, truncateAnsi(compact, width)].slice(0, height)
   }
-  const lay = tuiLayout(state, width, height, now, gate)
   if (lay.frame.mode === 'wide') return renderWide(state, width, height, s, lay)
   const fit = (line: string) => truncateAnsi(line, width)
   const lines: string[] = [s.title, ...s.status.slice(0, lay.status).map(fit)]
@@ -1273,6 +1272,17 @@ export function renderTuiLines(
   while (lines.length + footer.length < height) lines.push(' ')
   lines.push(...footer)
   return lines.slice(0, height)
+}
+
+export function renderTuiLines(
+  state: TuiState,
+  width: number,
+  height: number,
+  now: number,
+  gate?: Gate,
+): string[] {
+  if (width < 1 || height < 1) return []
+  return linesFromLayout(state, width, height, tuiLayout(state, width, height, now, gate), gate)
 }
 
 /** stdin as the TUI found it. `restoreTerminal` puts it back. */
@@ -1665,10 +1675,11 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   const render = () => {
     if (stopped) return
     state.rowsAge = { running: rowsFlight.running, queued: rowsFlight.queued, lastOk: rowsFlight.lastOk }
-    const lay = layout()
+    const now = Date.now()
+    const lay = tuiLayout(state, width, height, now, gate)
     state.page = lay.body
     state.scrollMax = Math.max(0, lay.detailTotal - lay.body)
-    const lines = renderTuiLines(state, width, height, Date.now(), gate)
+    const lines = linesFromLayout(state, width, height, lay, gate)
     stdout.write(ANSI_CLEAR_HOME + lines.join('\r\n'))
   }
 
