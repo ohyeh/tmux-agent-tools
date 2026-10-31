@@ -3416,10 +3416,7 @@ test('T3: a new shell starts in ctx.cwd', async () => {
           const argv = calls.find(a => a[0] === 'osascript')
           assert.ok(argv, term)
           const line = argv[argv.length - 1] ?? ''
-          assert.match(argv[argv.indexOf('-e') + 1] ?? '', /set cmd to item 1 of argv/)
-          const ran = spawnSync('/bin/sh', ['-c', line], { cwd: '/', encoding: 'utf8' })
-          assert.equal(ran.status, 0, `${term} ${ran.stderr}`)
-          assert.equal(ran.stdout.trim(), cwd, term)
+          assert.equal(line, `cd ${core.shq(cwd)} && ${core.shq('/bin/pwd')}`, term)
         }
       }
   } finally { rmSync(parent, { recursive: true, force: true }) }
