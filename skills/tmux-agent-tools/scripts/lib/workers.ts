@@ -3471,17 +3471,22 @@ async function publishTuiLock(host: Host, dir: string, me: ProcessId): Promise<'
   }
   const staging = `${dir}/tui.owner.lock.${me.pid}.${randomBase36(6)}`
   if ((await mkdirExclusive(host, staging)) !== 'won') return 'fail'
+  let moved = false
   try {
     await host.write(`${staging}/holder`, JSON.stringify({ host: me.host, pid: me.pid, pidStart: me.pidStart, at: await host.now() }))
     const renamed = await host.run(['perl', '-e', TUI_FENCE_PUBLISH, tuiFence(dir), staging, lock], '/', 5_000)
-    if (renamed.exitCode === 0) return 'won'
+    if (renamed.exitCode === 0) {
+      moved = true
+      return 'won'
+    }
     if (renamed.exitCode === 2) return 'busy'
     if (renamed.exitCode === 127 || /ENOENT|not found/i.test(`${renamed.stderr}${renamed.stdout}`)) return 'fail'
     return 'busy'
   } catch {
     return 'fail'
   } finally {
-    await dropStaging(host, staging)
+    // Exit 0 is the rename onto the lock. Every other exit, and a throw before perl, leaves the staging dir.
+    if (!moved) await dropStaging(host, staging)
   }
 }
 
