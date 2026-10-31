@@ -447,6 +447,61 @@ test('picker: cwd and session escapes are stripped before draw (FR-01)', async (
   assert.match(stripAnsi(drawn), /\[live\] badname /)
 })
 
+test('ownLocator: a real PTY tty is the iTerm and Terminal locator, and a pipe does not publish unknown (FR-03)', async () => {
+  const script = fileURLToPath(new URL('./tui-own-tty.node.ts', import.meta.url))
+  const read = (child: ReturnType<typeof spawn>) =>
+    new Promise<string>((resolve, reject) => {
+      let out = ''
+      let err = ''
+      child.stdout?.on('data', c => { out += String(c) })
+      child.stderr?.on('data', c => { err += String(c) })
+      child.on('error', reject)
+      child.on('exit', code => {
+        if (code !== 0) reject(new Error(`locator child exit ${code}: ${err || out}`))
+        else resolve(out)
+      })
+    })
+  const parse = (text: string) => {
+    const line = text.split('\n').find(l => l.startsWith('{') && l.includes('"actual"'))
+    assert.ok(line, text)
+    return JSON.parse(line) as { loc: { kind?: string; tty?: string } | null; actual: string; focus: string; argv0: string; argvTty: string; log: string }
+  }
+  const py = [
+    'import os, pty, sys',
+    'term, node, script = sys.argv[1], sys.argv[2], sys.argv[3]',
+    'pid, fd = pty.fork()',
+    'if pid == 0:',
+    '    os.environ.pop("TMUX", None)',
+    '    os.environ.pop("TMUX_PANE", None)',
+    '    os.execv(node, [node, script, term])',
+    'out = b""',
+    'while True:',
+    '    try:',
+    '        chunk = os.read(fd, 4096)',
+    '    except OSError:',
+    '        break',
+    '    if not chunk:',
+    '        break',
+    '    out += chunk',
+    'os.waitpid(pid, 0)',
+    'sys.stdout.buffer.write(out)',
+  ].join('\n')
+  for (const [term, kind] of [['iTerm.app', 'iterm'], ['Apple_Terminal', 'terminal']] as const) {
+    const got = parse(await read(spawn('python3', ['-c', py, term, process.execPath, script], { stdio: ['ignore', 'pipe', 'pipe'] })))
+    assert.equal(got.loc?.kind, kind)
+    assert.equal(got.loc?.tty, got.actual)
+    assert.equal(got.focus, 'app')
+    assert.equal(got.argv0, 'osascript')
+    assert.equal(got.argvTty, got.actual)
+  }
+  const piped = parse(await read(spawn(process.execPath, [script, 'iTerm.app'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, TMUX: '', TMUX_PANE: '' },
+  })))
+  assert.equal(piped.loc, null)
+  assert.match(piped.log, /own tty unavailable/)
+})
+
 test('launch claims before the alt screen; occupied and stale stay out (T8)', async () => {
   const prevPane = process.env.TMUX_PANE
   const prevTmux = process.env.TMUX

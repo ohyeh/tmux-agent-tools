@@ -24,6 +24,7 @@
 //   Esc     disarm, close detail, 編輯 → 預覽, then deselect. 預覽 with nothing selected quits (T6b).
 
 import { parseArgs } from 'node:util'
+import { spawnSync } from 'node:child_process'
 import { readlinkSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
@@ -1465,8 +1466,22 @@ export async function listSessions(host: Host, root: string, now: number): Promi
   return out
 }
 
+/** This process's stdout tty. macOS `/dev/fd/1` is not a symlink (`readlink` returns EINVAL); `tty` on that fd is the query that works. */
+function ownStdoutTty(): { tty: string } | { error: string } {
+  try {
+    const linked = readlinkSync('/dev/fd/1')
+    if (linked.startsWith('/dev/')) return { tty: linked }
+  } catch {
+    // macOS: /dev/fd/1 is not a symlink.
+  }
+  const run = spawnSync('/usr/bin/tty', [], { stdio: [1, 'pipe', 'pipe'], encoding: 'utf8' })
+  const name = (run.stdout ?? '').trim()
+  if (run.status === 0 && name.startsWith('/dev/')) return { tty: name }
+  return { error: (run.stderr ?? '').trim() || name || `exit ${run.status}` }
+}
+
 /** The locator this process writes at ready. A tmux pane wins, so a second launch selects that pane instead of opening an app. */
-export async function ownLocator(host: Host, session: string): Promise<TuiLocator> {
+export async function ownLocator(host: Host, session: string): Promise<TuiLocator | undefined> {
   const term = (await host.envTermProgram()) ?? ''
   const title = `tmux-agent-tui ${session.slice(0, 8)}`
   const pane = process.env.TMUX_PANE
@@ -1475,14 +1490,13 @@ export async function ownLocator(host: Host, session: string): Promise<TuiLocato
     return { kind: 'tmux', pane, ...(socket ? { socket } : {}) }
   }
   if (/warp/i.test(term)) return { kind: 'warp', tabTitle: title }
-  let tty = 'unknown'
-  try {
-    tty = readlinkSync('/dev/fd/1')
-  } catch {
-    /* not a path */
+  const tty = ownStdoutTty()
+  if ('error' in tty) {
+    host.log(`tmux-agent: own tty unavailable (${term || 'terminal'}): ${tty.error}`)
+    return undefined
   }
-  if (/iterm/i.test(term)) return { kind: 'iterm', tty }
-  return { kind: 'terminal', tty }
+  if (/iterm/i.test(term)) return { kind: 'iterm', tty: tty.tty }
+  return { kind: 'terminal', tty: tty.tty }
 }
 
 function occupiedWhere(result: TuiClaimResult): string {
@@ -1507,7 +1521,7 @@ export async function applyPick(host: Host, root: string, state: TuiState, index
   const me = await processId(host)
   if (!(me.pid > 0 && me.pidStart)) return back('無法確認這個行程')
   const locator = await ownLocator(host, entry.session)
-  const result = await claimTui(host, root, entry.session, me, { state: 'ready', locator })
+  const result = await claimTui(host, root, entry.session, me, { state: 'ready', ...(locator ? { locator } : {}) })
   if (result.kind !== 'won' && result.kind !== 'adopted') return back(occupiedWhere(result))
   return {
     host: rebindHost(host, { session: entry.session, cwd: entry.cwd, socket: entry.socket }),
@@ -1556,7 +1570,7 @@ async function claimLaunch(host: Host, root: string, session: string, opts: { cl
   const locator = await ownLocator(host, session)
   const result = await claimTui(host, root, session, me, {
     state: 'ready',
-    locator,
+    ...(locator ? { locator } : {}),
     ...(opts.claim ? { adopt: opts.claim } : {}),
     ...(opts.launchDir ? { launchDir: opts.launchDir } : {}),
   })
