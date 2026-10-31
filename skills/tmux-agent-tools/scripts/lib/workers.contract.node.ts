@@ -2511,3 +2511,34 @@ test('C02: envTermProgram and envSshTty come from the host', async () => {
     else process.env.SSH_TTY = saved.ssh
   }
 })
+
+test('C13: observeRows records no pane probe; sweepStalls probes with wakes off', async () => {
+  const w = world()
+  try {
+    await assigned(w)
+    const core = await import('./workers.ts')
+    const observeRows = core.observeRows
+    const sweepStalls = core.sweepStalls
+    assert.equal(typeof observeRows, 'function', 'observeRows is not exported')
+    assert.equal(typeof sweepStalls, 'function', 'sweepStalls is not exported')
+    const d = (await scan(w.host, { claim: false })).visible[0]
+    assert.ok(d, 'fixture has a visible worker')
+    const paneProbe = (argv: readonly string[]) => argv[0] === 'agent-tmux' && argv.includes('status')
+    const gate = newGate()
+    const before = w.calls.length
+    await observeRows(w.host, gate, w.root)
+    const duringRows = w.calls.slice(before).filter(c => paneProbe(c.argv))
+    assert.deepEqual(duringRows, [], `rows part probed a pane: ${JSON.stringify(duringRows.map(c => c.argv))}`)
+    const marked = w.calls.length
+    await sweepStalls(w.host, gate, w.root, [d])
+    const duringSweep = w.calls.slice(marked).filter(c => paneProbe(c.argv))
+    assert.ok(duringSweep.some(c => c.argv.includes('--no-write')), `sweep argv: ${JSON.stringify(duringSweep.map(c => c.argv))}`)
+    const atView = w.calls.length
+    await core.observeView(w.host, newGate(), w.root)
+    const viewProbes = w.calls.slice(atView).filter(c => paneProbe(c.argv))
+    assert.ok(viewProbes.some(c => c.argv.includes('--no-write')), `observeView argv: ${JSON.stringify(viewProbes.map(c => c.argv))}`)
+  } finally {
+    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.repo, { recursive: true, force: true })
+  }
+})

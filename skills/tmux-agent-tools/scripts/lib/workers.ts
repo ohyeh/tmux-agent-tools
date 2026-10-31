@@ -2498,16 +2498,28 @@ export async function recoverUnsent(host: Host, dirs: readonly string[]): Promis
  * submit, no toast). Legacy count and project rows are the reads `reconcile`
  * already does. Collector health is read from this session's `act/<n>.state`
  * and beat (C-health); a view without a session has no collector (`none`).
+ *
+ * `observeRows` is health, scan and projects. It never probes panes (C13).
+ * `sweepStalls` is that probe. `observeView` still runs both, for the TUI.
  */
-export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
+export async function observeRows(host: Host, gate: Gate, root: string): Promise<readonly TmuxDispatch[]> {
   const me = host.owner()
   gate.viewHealth = me ? await readActHealth(host, v3Of(root), me, await host.now()) : { kind: 'none' }
   const scanned = await scan(host, { claim: false })
   gate.viewError = scanned.error ?? (scanned.complete ? undefined : 'some worker records could not be read (see the log)')
   await refreshProjects(host, gate, scanned.visible)
-  // `visible` is the set `panelRows` draws. Probing only `dispatches` would
+  return scanned.visible
+}
+
+/** View stall sweep: `flagStalls` with wakes off. A rows job must not call this (C13). */
+export async function sweepStalls(host: Host, gate: Gate, root: string, live: readonly TmuxDispatch[]): Promise<void> {
+  // `live` is the set `panelRows` draws. Probing only `dispatches` would
   // leave another session's row as `running` when its pane is waiting.
-  await flagStalls(host, gate, v3Of(root), scanned.visible, scanned.visible, false)
+  await flagStalls(host, gate, v3Of(root), live, live, false)
+}
+
+export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
+  await sweepStalls(host, gate, root, await observeRows(host, gate, root))
 }
 
 // ── collector health (plan §1b C-health) ───────────────────────────────────────
