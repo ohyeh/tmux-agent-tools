@@ -3489,7 +3489,33 @@ async function dropStaging(host: Host, staging: string): Promise<void> {
   await host.run(['rm', '-rf', staging], '/', 5_000).catch(() => undefined)
 }
 
-/** Publish `tui.owner.lock.<pid>.<rand>/holder`, then rename(2) onto the lock. `mv` would nest into an existing directory. */
+const TUI_FENCE_PUBLISH = `use Fcntl qw(LOCK_EX);
+my ($fence, $staging, $lock) = @ARGV;
+open my $fh, '>>', $fence or die "fence: $!";
+flock($fh, LOCK_EX) or die "flock: $!";
+exit 2 if -e $lock;
+rename($staging, $lock) or die "rename: $!";
+`
+const TUI_FENCE_RECOVER = `use Fcntl qw(LOCK_EX);
+use JSON::PP qw(decode_json);
+my ($fence, $holder, $lock, $host, $pid, $start) = @ARGV;
+open my $fh, '>>', $fence or die "fence: $!";
+flock($fh, LOCK_EX) or die "flock: $!";
+open my $hf, '<', $holder or exit 2;
+local $/;
+my $raw = <$hf>;
+close $hf;
+my $j = eval { decode_json($raw) };
+exit 3 if !$j || !defined $j->{host} || $j->{host} ne $host || $j->{pid} != $pid || !defined $j->{pidStart} || $j->{pidStart} ne $start;
+unlink $holder or exit 4;
+rmdir $lock or exit 5;
+`
+
+function tuiFence(dir: string): string {
+  return `${dir}/tui.owner.fence`
+}
+
+/** Publish `tui.owner.lock.<pid>.<rand>/holder`, then rename(2) onto the lock under the same fence as recovery. `mv` would nest into an existing directory. */
 async function publishTuiLock(host: Host, dir: string, me: ProcessId): Promise<'won' | 'busy' | 'fail'> {
   const lock = `${dir}/tui.owner.lock`
   try {
@@ -3501,8 +3527,9 @@ async function publishTuiLock(host: Host, dir: string, me: ProcessId): Promise<'
   if ((await mkdirExclusive(host, staging)) !== 'won') return 'fail'
   try {
     await host.write(`${staging}/holder`, JSON.stringify({ host: me.host, pid: me.pid, pidStart: me.pidStart, at: await host.now() }))
-    const renamed = await host.run(['perl', '-e', 'rename($ARGV[0], $ARGV[1]) or die $!', staging, lock], '/', 5_000)
+    const renamed = await host.run(['perl', '-e', TUI_FENCE_PUBLISH, tuiFence(dir), staging, lock], '/', 5_000)
     if (renamed.exitCode === 0) return 'won'
+    if (renamed.exitCode === 2) return 'busy'
     if (renamed.exitCode === 127 || /ENOENT|not found/i.test(`${renamed.stderr}${renamed.stdout}`)) return 'fail'
     return 'busy'
   } catch {
@@ -3530,11 +3557,16 @@ async function recoverTuiLock(host: Host, lock: string, me: ProcessId): Promise<
   } catch {
     return false
   }
+  // One perl holds the publish fence across the re-read and the unlink. Two awaits (re-read, then rm of the pathname) delete the next holder's lock.
+  const dir = lock.slice(0, lock.lastIndexOf('/'))
+  const removed = await host.run(
+    ['perl', '-e', TUI_FENCE_RECOVER, tuiFence(dir), holderPath, lock, parsed.host, String(parsed.pid), parsed.pidStart],
+    '/',
+    5_000,
+  ).catch(() => undefined)
+  if (!removed || removed.exitCode !== 0) return false
   host.log(`tmux-agent: tui lock ${lock} recovered from dead holder pid ${parsed.pid} pidStart ${parsed.pidStart}`)
-  const rm = await host.run(['rm', '-f', holderPath], '/', 5_000).catch(() => undefined)
-  if (!rm || rm.exitCode !== 0) return false
-  const rd = await host.run(['rmdir', lock], '/', 5_000).catch(() => undefined)
-  return !!rd && rd.exitCode === 0
+  return true
 }
 
 async function withTuiLock<T>(

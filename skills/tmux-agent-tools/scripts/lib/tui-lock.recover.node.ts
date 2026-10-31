@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { nodeHost } from './host.node.ts'
@@ -104,6 +104,91 @@ test('T2 recover: kill after the lock, before tui.owner, and the next claim wins
 
 test('T2 recover: kill after tui.owner, before the lock is released, and the next claim wins', async () => {
   await killed('b', true)
+})
+
+function gate(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {}
+  const promise = new Promise<void>(r => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+test('T2 recover: a second recoverer does not delete a live holder or overwrite its ready claim (FR-02)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-recover-race-'))
+  const session = 'race'
+  const base = nodeHost({ log: () => {} })
+  const me = await processId(base)
+  const dir = sessionDirOf(v3Of(root), session)
+  const lock = `${dir}/tui.owner.lock`
+  const holderPath = `${lock}/holder`
+  const ownerPath = `${dir}/tui.owner`
+  mkdirSync(lock, { recursive: true })
+  writeFileSync(holderPath, JSON.stringify({ host: me.host, pid: 2147483646, pidStart: 'dead', at: 1 }))
+  const old = new Date(Date.now() - 60_000)
+  utimesSync(lock, old, old)
+  const bReached = gate()
+  const aInBody = gate()
+  const bFinished = gate()
+  let bFirst = true
+  let aFirst = true
+  let sawLive = false
+  let liveRemoved = false
+  const touchesHolder = (argv: readonly string[]) =>
+    (argv[0] === 'rm' && argv.includes(holderPath)) || (argv[0] === 'perl' && argv.includes(holderPath))
+  const bHost = {
+    ...base,
+    run: async (argv: readonly string[], cwd: string, ms: number) => {
+      if (bFirst && touchesHolder(argv)) {
+        bFirst = false
+        bReached.resolve()
+        await aInBody.promise
+        if (existsSync(holderPath)) {
+          const holder = JSON.parse(readFileSync(holderPath, 'utf8')) as { pid?: number; pidStart?: string }
+          sawLive = holder.pid === me.pid && holder.pidStart === me.pidStart
+        }
+        const result = await base.run(argv, cwd, ms)
+        liveRemoved = sawLive && !existsSync(holderPath)
+        return result
+      }
+      if (argv[0] === 'sleep') return { exitCode: 0, stdout: '', stderr: '' }
+      return base.run(argv, cwd, ms)
+    },
+  }
+  const aHost = {
+    ...base,
+    exists: async (path: string) => {
+      const got = await base.exists(path)
+      if (aFirst && path === ownerPath) {
+        aFirst = false
+        aInBody.resolve()
+        await bFinished.promise
+      }
+      return got
+    },
+  }
+  try {
+    const bRun = claimTui(bHost, root, session, me, { state: 'ready', locator: { kind: 'warp', tabTitle: 'B' } })
+    await bReached.promise
+    const aRun = claimTui(aHost, root, session, me, { state: 'ready', locator: { kind: 'warp', tabTitle: 'A' } })
+    const bResult = await bRun
+    bFinished.resolve()
+    const aResult = await aRun
+    assert.equal(sawLive, true, 'A was holding the lock when B reached the delete')
+    assert.equal(liveRemoved, false, 'B deleted the live holder')
+    const wins = [aResult, bResult].filter(r => r.kind === 'won')
+    assert.equal(wins.length, 1, `${aResult.kind} + ${bResult.kind}`)
+    const won = wins[0]
+    if (won?.kind !== 'won') throw new Error('no winner')
+    const persisted = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token: string; pid: number; pidStart: string }
+    assert.equal(persisted.token, won.claim.token)
+    assert.equal(persisted.pid, won.claim.pid)
+    assert.equal(persisted.pidStart, won.claim.pidStart)
+  } finally {
+    bFinished.resolve()
+    aInBody.resolve()
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('T2 recover: a live holder is not removed', async () => {
