@@ -647,20 +647,20 @@ export function nextKeyState(
   }
 
   if (key === '\r' || key === '\n') {
-    // A project session has no episode to show: Enter keeps the mirror.
-    if (!row || row.project) return { state }
-    // Narrow is one pane: Enter walks list → preview → Detail. Wider widths keep the mirror/detail toggle.
-    if (screen && screen.width < 80 && screen.width >= 40 && screen.height >= 10) {
+    // Narrow is one pane (frameMode, including a 38-col or 60x8 pane): Enter walks list → preview → Detail.
+    // A project row has a mirror and no episode, so it stops on the preview.
+    if (narrowScreen(screen)) {
+      if (!row) return { state }
       const view = state.narrowView ?? 'list'
       if (view !== 'preview') return { state: { ...state, narrowView: 'preview', expanded: false, detail: undefined, scroll: 0 } }
-      if (!state.expanded) {
-        return {
-          state: { ...state, narrowView: 'preview', expanded: true, scroll: 0, armedStop: undefined },
-          action: { type: 'detail' },
-        }
+      if (row.project || state.expanded) return { state }
+      return {
+        state: { ...state, narrowView: 'preview', expanded: true, scroll: 0, armedStop: undefined },
+        action: { type: 'detail' },
       }
-      return { state }
     }
+    // A project session has no episode to show: Enter keeps the mirror.
+    if (!row || row.project) return { state }
     const expanded = !state.expanded
     return {
       state: { ...state, expanded, scroll: 0, armedStop: undefined, ...(expanded ? {} : { detail: undefined }) },
@@ -718,7 +718,7 @@ export function nextKeyState(
   if (key === '\x1b') {
     if (state.armedStop) return { state: { ...state, armedStop: undefined } }
     if (state.expanded) return { state: { ...state, expanded: false, detail: undefined, scroll: 0 } }
-    if (screen && screen.width < 80 && screen.width >= 40 && screen.height >= 10 && (state.narrowView ?? 'list') === 'preview') {
+    if (narrowScreen(screen) && (state.narrowView ?? 'list') === 'preview') {
       return { state: { ...state, narrowView: 'list' } }
     }
     if (state.selected) return { state: reselect(state, undefined) }
@@ -854,6 +854,11 @@ export function frameMode(width: number, height: number): Frame['mode'] {
   if (width >= 120) return 'wide'
   if (width >= 80) return 'standard'
   return 'narrow'
+}
+
+/** Keys and frameOf share this. Width alone, or a short 60x8 pane, is still narrow. */
+function narrowScreen(screen: { width: number; height: number } | undefined): boolean {
+  return screen !== undefined && frameMode(screen.width, screen.height) === 'narrow'
 }
 
 const firstShown = (selected: number, shown: number, rows: number) =>
@@ -1288,7 +1293,9 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       setRows(panelLike as any, rows)
       // A row id carries its episode (`name#seq`): after a tell the selection follows the worker.
       if (was && !panelLike.selected) panelLike.selected = panelLike.rows.find(r => r.project === was.project && r.d.name === was.d.name)?.id
-      if (panelLike.selected !== state.selected) state = { ...state, expanded: false, detail: undefined, scroll: 0, mirror: undefined }
+      if (panelLike.selected !== state.selected) {
+        state = { ...state, expanded: false, detail: undefined, scroll: 0, mirror: undefined, narrowView: undefined }
+      }
       state.rows = panelLike.rows
       state.selected = panelLike.selected
       return true

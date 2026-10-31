@@ -1990,6 +1990,72 @@ test('narrow: Enter walks list, then preview, then Detail; Esc steps back', () =
   assert.equal(wide.state.narrowView, undefined)
 })
 
+test('narrow: Enter follows frameMode on a <40-col pane and on 60x8', () => {
+  const row = mockRow('a')
+  const base: TuiState = { rows: [row], all: [row], showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a' }
+  for (const screen of [
+    { width: 38, height: 24 },
+    { width: 60, height: 8 },
+  ]) {
+    const at = `${screen.width}x${screen.height}`
+    const r = nextKeyState(base, '\r', 1, screen)
+    assert.equal(r.state.narrowView, 'preview', at)
+    assert.notEqual(r.state.expanded, true, `${at}: expanding while the list view is up hides the preview`)
+    const lay = tuiLayout(r.state, screen.width, screen.height, 1)
+    assert.equal(lay.frame.mode, 'narrow', at)
+    assert.ok(lay.body > 0, `${at}: preview rows ${lay.body}`)
+    const back = nextKeyState(r.state, '\x1b', 1, screen)
+    assert.equal(back.state.narrowView, 'list', at)
+  }
+})
+
+test('narrow: Enter on a project row reaches the preview', () => {
+  const proj = mockRow('p', { project: true })
+  const ps: TuiState = { rows: [proj], all: [proj], showAll: false, adding: false, resumeInput: '', quit: false, selected: 'p' }
+  const screen = { width: 38, height: 24 }
+  const opened = nextKeyState(ps, '\r', 1, screen)
+  assert.equal(opened.state.narrowView, 'preview')
+  assert.notEqual(opened.state.expanded, true)
+  assert.ok(tuiLayout(opened.state, screen.width, screen.height, 1).body > 0)
+  const again = nextKeyState(opened.state, '\r', 1, screen)
+  assert.notEqual(again.state.expanded, true, 'a project session has no episode detail')
+  assert.equal(again.action, undefined)
+})
+
+test('narrow: a gone selected row returns the list', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-narrow-gone-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-narrow-gone-repo-'))
+  writeWorker(root, repo, 'S', 'drop.abcde')
+  writeWorker(root, repo, 'S', 'keep.abcde')
+  const host = quietHost('S', repo, root)
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 70
+  stdout.rows = 24
+  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf('\x1b[H')))
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 40 })
+  try {
+    await until(() => last().includes('drop.abcde') && last().includes('keep.abcde'), 5_000, 'both rows')
+    const arm = async () => {
+      if (/› drop\.abcde/.test(last())) return
+      stdin.emit('data', 'j')
+      await new Promise(r => setTimeout(r, 80))
+    }
+    for (let i = 0; i < 8 && !/› drop\.abcde/.test(last()); i++) await arm()
+    await until(() => /› drop\.abcde/.test(last()), 5_000, 'drop selected')
+    stdin.emit('data', '\r')
+    await until(() => /capturing the pane|the pane is empty|See it whole/.test(last()), 5_000, 'the preview')
+    rmSync(join(root, '.v3', 'drop.abcde'), { recursive: true, force: true })
+    const end = Date.now() + 2_000
+    while (Date.now() < end && !/keep\.abcde/.test(last())) await new Promise(r => setTimeout(r, 40))
+    assert.match(last(), /keep\.abcde/, last())
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+    rmSync(root, { recursive: true, force: true })
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
 test('mirror: capture failure reaches the preview as an error, not an empty pane (T1 C2b)', async () => {
   const host = quietHost('S', '/tmp', '/tmp')
   host.run = async () => ({ exitCode: 1, stdout: '', stderr: "\ncan't find session: x\n" })
