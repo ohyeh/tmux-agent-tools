@@ -77,7 +77,7 @@ assert "list --json path matches" \
 # --- Case 3: prune --dry-run reports cleanup --------------------------------
 echo "case: prune --dry-run reports removal of clean dead worktree"
 dry_out="$("$WT_CLI" prune --dry-run)"
-echo "$dry_out" | grep -q "would remove: wt-a" && r=ok || r=missing
+grep -q -- "would remove: wt-a" <<<"$dry_out" && r=ok || r=missing
 assert "dry-run marks wt-a for removal" "$r" "ok"
 assert "wt-a still exists after dry-run" \
   "$(test -d "$wt_path_a" && echo yes)" "yes"
