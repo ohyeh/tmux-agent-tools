@@ -11,16 +11,17 @@
 //   c       clear all workers (press twice)
 //   q       quit (the terminal is restored)
 //   a       toggle all / only this session's workers
-//   1-9, j / k, Up / Down   select a row
-// Keys (selected row):
+//   預覽 is the default. e enters 編輯 when this TUI holds an owner; otherwise the session picker.
+//   1-9, j / k     select a row
+//   ↑ / ↓, b / f   scroll (PgUp / PgDn and the wheel too). ↑/↓ do not move the selection.
+// Keys (編輯, selected row):
 //   t       tell: send the worker a follow-up (input line)
 //   i       interrupt a running or stalled worker
 //   x       stop the worker (press twice)
 //   -       cancel its episode (press twice; the pane is untouched)
 //   U       unlock its action lock, maintenance (press twice; only a provably gone holder)
-//   b / f   scroll the mirror's scrollback (f to the bottom follows live again); PgUp / PgDn and the mouse wheel too
 //   Enter   detail view of a worker; b / f scroll it
-//   Esc     cancel a confirmation, close the detail, or deselect
+//   Esc     disarm, close detail, 編輯 → 預覽, then deselect. 預覽 with nothing selected quits (T6b).
 
 import { parseArgs } from 'node:util'
 import { realpathSync } from 'node:fs'
@@ -279,6 +280,10 @@ export interface TuiState {
   version?: string
   /** No --session and no TMUX_AGENT_SESSION: every row, read-only (D-viewer). */
   viewer?: boolean
+  /** 預覽 is the default. Mutating keys act only in 編輯 (I3). */
+  mode?: 'preview' | 'edit' | 'picker'
+  /** SessionPicker highlight (T2a). */
+  pickerIndex?: number
   /** Why the ledger could not be read (the third empty state). */
   loadError?: string
   quit: boolean
@@ -306,6 +311,8 @@ export const MIRROR_HISTORY = 2000
 export const PAGE_UP = '\x1b[5~'
 export const PAGE_DOWN = '\x1b[6~'
 export const READ_ONLY = '唯讀；帶 --session 才能操作'
+/** I3: a mutating key in 預覽 names this reason and does not act. */
+export const PREVIEW_ONLY = '預覽；按 e 進入編輯'
 /** Keys that act on the ledger or a pane. A viewer gets READ_ONLY for each (D-viewer). */
 export const MUTATING_KEYS: ReadonlySet<string> = new Set(['x', 'X', 'c', 'C', 'i', 'I', 'n', 'N', 't', 'T', '+', '-', 'U'])
 const STATUS_MS = 5_000
@@ -532,6 +539,50 @@ const say = (state: TuiState, text: string, now: number): { state: TuiState } =>
 })
 
 /** Selection moved: the mirror, the detail and any confirmation belong to the old row. */
+/**
+ * One rows tick (I14). An armed confirm stays when the selection and its target
+ * row stay. It clears when the selection changes or that row is gone.
+ */
+export function applyRowsTick(state: TuiState, rows: PanelRow[]): TuiState {
+  const panelLike = { rows: state.rows, all: rows, showAll: state.showAll, selected: state.selected }
+  const was = state.rows.find(r => r.id === state.selected)
+  setRows(panelLike as any, rows)
+  if (was && !panelLike.selected) {
+    panelLike.selected = panelLike.rows.find(r => r.project === was.project && r.d.name === was.d.name)?.id
+  }
+  const selChanged = panelLike.selected !== state.selected
+  let armed = state.armedStop
+  if (armed && armed.id !== CLEAR_ID) {
+    const rowId = armed.id.startsWith('cancel:') || armed.id.startsWith('unlock:') ? armed.id.slice(armed.id.indexOf(':') + 1) : armed.id
+    if (!panelLike.rows.some(r => r.id === rowId)) armed = undefined
+  }
+  if (selChanged) armed = undefined
+  return {
+    ...state,
+    all: rows,
+    rows: panelLike.rows,
+    selected: panelLike.selected,
+    armedStop: armed,
+    ...(selChanged ? { expanded: false, detail: undefined, scroll: 0, mirror: undefined, narrowView: undefined } : {}),
+  }
+}
+
+function scrollView(state: TuiState, dir: 'up' | 'down', step: number): { state: TuiState } {
+  if (!state.expanded) {
+    const m = state.mirror?.id === state.selected ? state.mirror : undefined
+    if (!m) return { state }
+    const page = Math.max(1, state.page ?? 1)
+    const max = Math.max(0, m.lines.length - page)
+    const cur = Math.min(state.back ?? 0, max)
+    const back = dir === 'up' ? Math.min(max, cur + step) : Math.max(0, cur - step)
+    return { state: { ...state, back } }
+  }
+  const max = state.scrollMax ?? Number.MAX_SAFE_INTEGER
+  const cur = Math.min(state.scroll ?? 0, max)
+  const scroll = dir === 'up' ? Math.max(0, cur - step) : Math.min(max, cur + step)
+  return { state: { ...state, scroll } }
+}
+
 const reselect = (state: TuiState, selected: string | undefined): TuiState => ({
   ...state,
   selected,
@@ -583,6 +634,14 @@ export function nextKeyState(
 
   // The one read-only gate: no key a viewer presses reaches an action (D-viewer).
   if (state.viewer && MUTATING_KEYS.has(key)) return say(state, READ_ONLY, now)
+  // I3: 預覽 names the reason. 編輯 without an owner session does too.
+  if (MUTATING_KEYS.has(key) && (state.mode ?? 'preview') !== 'edit') return say(state, PREVIEW_ONLY, now)
+
+  if (key === 'e' || key === 'E') {
+    if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
+    if (state.viewer || !state.owner) return { state: { ...state, mode: 'picker', pickerIndex: 0 } }
+    return { state: { ...state, mode: 'edit' } }
+  }
 
   if (key === 'r' || key === 'R') {
     return { state: reselect(state, undefined), action: { type: 'refresh' } }
@@ -668,6 +727,10 @@ export function nextKeyState(
     }
   }
 
+  // ↑/↓ scroll one line (CSI and SS3). Wheel-as-arrow from ?1007 lands here. Left/right are accepted and do nothing.
+  if (key === '\x1b[A' || key === '\x1bOA') return scrollView(state, 'up', 1)
+  if (key === '\x1b[B' || key === '\x1bOB') return scrollView(state, 'down', 1)
+  if (key === '\x1b[C' || key === '\x1b[D' || key === '\x1bOC' || key === '\x1bOD') return { state }
   // b/f too: a Mac laptop has no PgUp/PgDn key, and some terminals keep them for their own window.
   if (key === 'b' || key === 'f') key = key === 'b' ? PAGE_UP : PAGE_DOWN
   // SGR mouse report (ESC [ < b ; x ; y M): button 64/65 is the wheel up/down; clicks are ignored.
@@ -679,17 +742,7 @@ export function nextKeyState(
     // The viewport bounds the scroll; the wheel steps WHEEL_LINES, a key a viewport.
     const page = Math.max(1, state.page ?? 1)
     const step = mouse ? WHEEL_LINES : page
-    if (!state.expanded) {
-      const m = state.mirror?.id === state.selected ? state.mirror : undefined
-      if (!m) return { state }
-      const max = Math.max(0, m.lines.length - page)
-      const cur = Math.min(state.back ?? 0, max)
-      return { state: { ...state, back: key === PAGE_UP ? Math.min(max, cur + step) : Math.max(0, cur - step) } }
-    }
-    const max = state.scrollMax ?? Number.MAX_SAFE_INTEGER
-    const cur = Math.min(state.scroll ?? 0, max)
-    const scroll = key === PAGE_UP ? Math.max(0, cur - step) : Math.min(max, cur + step)
-    return { state: { ...state, scroll } }
+    return scrollView(state, key === PAGE_UP ? 'up' : 'down', step)
   }
 
   if (/^[1-9]$/.test(key)) {
@@ -701,14 +754,14 @@ export function nextKeyState(
     return { state }
   }
 
-  if (key === '\x1b[A' || key === 'k') {
+  if (key === 'k') {
     if (state.rows.length === 0) return { state }
     const curIdx = state.selected ? state.rows.findIndex(r => r.id === state.selected) : -1
     const nextIdx = curIdx <= 0 ? state.rows.length - 1 : curIdx - 1
     return { state: reselect(state, state.rows[nextIdx]!.id) }
   }
 
-  if (key === '\x1b[B' || key === 'j') {
+  if (key === 'j') {
     if (state.rows.length === 0) return { state }
     const curIdx = state.selected ? state.rows.findIndex(r => r.id === state.selected) : -1
     const nextIdx = curIdx < 0 || curIdx >= state.rows.length - 1 ? 0 : curIdx + 1
@@ -721,6 +774,7 @@ export function nextKeyState(
     if (narrowScreen(screen) && (state.narrowView ?? 'list') === 'preview') {
       return { state: { ...state, narrowView: 'list' } }
     }
+    if ((state.mode ?? 'preview') === 'edit') return { state: { ...state, mode: 'preview', armedStop: undefined } }
     if (state.selected) return { state: reselect(state, undefined) }
   }
 
@@ -751,8 +805,9 @@ const hint = (key: string, label: string, words: boolean) => (words ? `[ ${key} 
 /** Header key hints, longest first; the renderer takes the first that fits (R4.6). */
 export function headerHints(state: TuiState, now: number): string[] {
   const clearArmed = state.armedStop?.id === CLEAR_ID && now < state.armedStop.until
-  const keys: [string, string][] = state.viewer
-    ? [['r', 'refresh'], ['q', 'quit']]
+  const editing = (state.mode ?? 'preview') === 'edit' && !state.viewer
+  const keys: [string, string][] = !editing
+    ? [['e', '編輯'], ['r', 'refresh'], ['q', 'quit']]
     : [
         ['n', 'resume'],
         ['+', 'assign'],
@@ -762,13 +817,15 @@ export function headerHints(state: TuiState, now: number): string[] {
       ]
   const words = keys.map(([k, l]) => hint(k, l, true)).join(' ')
   const short = keys.map(([k, l]) => hint(k, l, false)).join(' ')
-  return [`${words}  a all · j/k select`, words, short, hint('q', 'quit', false)]
+  const tail = editing ? '  a all · j/k select' : '  a all · j/k 選 · ↑↓ 捲動'
+  return [`${words}${tail}`, words, short, hint('q', 'quit', false)]
 }
 
 /** The selected row's key hints, longest first. */
 export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
   if (r.project) return ['project session · read-only  b/f scroll', 'read-only']
   if (state.viewer) return [`${READ_ONLY}  Enter detail`, '唯讀']
+  if ((state.mode ?? 'preview') !== 'edit') return ['e 編輯 · ↑↓ 捲動 · Enter detail', 'e 編輯']
   const armed = (id: string) => state.armedStop?.id === id && now < state.armedStop.until
   const keys: [string, string][] = [['t', 'tell']]
   if (r.incomplete) return [`${hint('-', armed(`cancel:${r.id}`) ? 'clear unfinished reservation? press again' : 'clear', true)}  no worker.json`, hint('-', 'clear', true), hint('-', 'clear', false)]
@@ -1259,6 +1316,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
     owner: host.owner(),
     version: coreVersion(),
     viewer: !session,
+    mode: 'preview',
   }
 
   let refreshing = false
@@ -1287,17 +1345,7 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
       if (root) await observeView(host, gate, root)
       state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
       const rows = await panelRows(host, gate, root)
-      state.all = rows
-      const panelLike = { rows: state.rows, all: state.all, showAll: state.showAll, selected: state.selected }
-      const was = state.rows.find(r => r.id === state.selected)
-      setRows(panelLike as any, rows)
-      // A row id carries its episode (`name#seq`): after a tell the selection follows the worker.
-      if (was && !panelLike.selected) panelLike.selected = panelLike.rows.find(r => r.project === was.project && r.d.name === was.d.name)?.id
-      if (panelLike.selected !== state.selected) {
-        state = { ...state, expanded: false, detail: undefined, scroll: 0, mirror: undefined, narrowView: undefined }
-      }
-      state.rows = panelLike.rows
-      state.selected = panelLike.selected
+      state = { ...applyRowsTick(state, rows), loadError: state.loadError }
       return true
     } finally {
       refreshing = false

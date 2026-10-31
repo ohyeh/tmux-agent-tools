@@ -33,6 +33,7 @@ import {
 } from './workers.ts'
 import {
   nextKeyState,
+  applyRowsTick,
   renderTuiLines,
   restoreTerminal,
   enterTerminal,
@@ -187,7 +188,7 @@ test('key-state: 1-9 selects row, and pressing same digit deselects', () => {
   assert.equal(s3.state.selected, undefined)
 })
 
-test('key-state: j/k and Up/Down arrows navigate selection', () => {
+test('key-state: j/k navigate selection', () => {
   const rows = [mockRow('w1'), mockRow('w2')]
   const base: TuiState = {
     rows,
@@ -200,14 +201,68 @@ test('key-state: j/k and Up/Down arrows navigate selection', () => {
   const d1 = nextKeyState(base, 'j', 1000)
   assert.equal(d1.state.selected, 'w1')
 
-  const d2 = nextKeyState(d1.state, '\x1b[B', 1000) // Down
+  const d2 = nextKeyState(d1.state, 'j', 1000)
   assert.equal(d2.state.selected, 'w2')
 
   const u1 = nextKeyState(d2.state, 'k', 1000)
   assert.equal(u1.state.selected, 'w1')
 
-  const u2 = nextKeyState(u1.state, '\x1b[A', 1000) // Up wraps to last
+  const u2 = nextKeyState(u1.state, 'k', 1000) // wraps to last
   assert.equal(u2.state.selected, 'w2')
+})
+
+test('key-state: ↑/↓ and SS3 scroll the mirror; j/k still select (T6a)', () => {
+  const rows = [mockRow('w1'), mockRow('w2')]
+  const base: TuiState = {
+    rows,
+    all: rows,
+    showAll: false,
+    selected: 'w1',
+    adding: false,
+    resumeInput: '',
+    quit: false,
+    mirror: { id: 'w1', lines: ['a', 'b', 'c', 'd'] },
+    back: 0,
+    page: 2,
+  }
+  const up = nextKeyState(base, '\x1b[A', 1000)
+  assert.equal(up.state.selected, 'w1', 'up does not change selection')
+  assert.equal(up.state.back, 1, 'up scrolls one line')
+  const ss3 = nextKeyState(base, '\x1bOA', 1000)
+  assert.equal(ss3.state.back, 1, 'SS3 up scrolls')
+  const down = nextKeyState(up.state, '\x1b[B', 1000)
+  assert.equal(down.state.back, 0, 'down scrolls back toward live')
+  const j = nextKeyState(base, 'j', 1000)
+  assert.equal(j.state.selected, 'w2', 'j still selects')
+})
+
+test('key-state: preview x does not arm; e enters 編輯 (T6a)', () => {
+  const s: TuiState = { ...ownerState(), mode: 'preview' }
+  const x = nextKeyState(s, 'x', 1000)
+  assert.equal(x.action, undefined)
+  assert.match(x.state.statusMessage ?? '', /預覽/)
+  const e = nextKeyState(s, 'e', 1000)
+  assert.equal(e.state.mode, 'edit')
+  const armed = nextKeyState(e.state, 'x', 1000)
+  assert.equal(armed.state.armedStop?.id, 'w1')
+})
+
+test('tick: an armed x survives a rows tick on the same row (I14)', () => {
+  const row = mockRow('w1')
+  const armed = { id: 'w1', from: 1000, until: 6000 }
+  const s: TuiState = {
+    rows: [row],
+    all: [row],
+    showAll: false,
+    selected: 'w1',
+    adding: false,
+    resumeInput: '',
+    quit: false,
+    armedStop: armed,
+    mode: 'edit',
+    owner: 'S',
+  }
+  assert.deepEqual(applyRowsTick(s, [{ ...row }]).armedStop, armed)
 })
 
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {
@@ -218,6 +273,8 @@ test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape c
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   const n = nextKeyState(base, 'n', 1000)
   assert.equal(n.state.adding, true)
@@ -261,6 +318,8 @@ test('key-state: i interrupts running or stalled worker only', () => {
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   assert.deepEqual(nextKeyState(stateRun, 'i', 1000).action, { type: 'interrupt', row: rRun })
 
@@ -284,6 +343,8 @@ test('key-state: x on selected worker arms stop; second press within 400ms debou
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
 
   // 1st press at t=1000: arm stop
@@ -313,6 +374,8 @@ test('key-state: x expired confirm re-arms instead of firing', () => {
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   // Press at t=7000 (> 6000ms): expired! Re-arms until 12000.
   const expired = nextKeyState(armed, 'x', 7000)
@@ -329,6 +392,8 @@ test('key-state: c arms clear all; second press confirms stopAll', () => {
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   const press1 = nextKeyState(base, 'c', 1000)
   assert.equal(press1.action, undefined)
@@ -685,6 +750,7 @@ test('input: a lone ESC in runTui resolves after the wait and cancels the prompt
   const root = mkdtempSync(join(tmpdir(), 'tui-esc-'))
   const run = runTui({ stdin, stdout, host: quietHost('e', root, root), session: 'e', cwd: root, root, mirrorMs: 60_000 })
   await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', 'e')
   stdin.emit('data', 'n')
   await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
   stdout.written = ''
@@ -715,7 +781,7 @@ test('input: a UTF-8 character split across chunks arrives whole', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-utf8-'))
   const run = runTui({ stdin, stdout, host: quietHost('u', root, root), session: 'u', cwd: root, root, mirrorMs: 60_000 })
   await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
-  stdin.emit('data', Buffer.from('n'))
+  stdin.emit('data', Buffer.from('en'))
   const bytes = Buffer.from('中👍')
   for (const cut of [[0, 1], [1, 3], [3, 5], [5, 7]]) stdin.emit('data', bytes.subarray(cut[0], cut[1]))
   await until(() => stdout.written.includes(': 中👍█'), 5_000, 'the decoded text in the prompt')
@@ -1239,7 +1305,7 @@ elif scenario == 'rq':
 elif scenario == 'ctrl-c':
     os.write(master, b'\\x03')  # raw mode: Ctrl-C arrives as a key
 elif scenario == 'ctrl-c-prompt':
-    os.write(master, b'n')  # open the resume prompt
+    os.write(master, b'en')  # 編輯, then open the resume prompt
     output.extend(read_some(master, 2, b'<session-id>'))
     os.write(master, b'\\x03')
 elif scenario == 'sigterm':
@@ -1477,7 +1543,7 @@ test('resume paste: a pasted session UUID fills the resume field', async () => {
   assert.equal(nextKeyState(base, `\x1b[200~${uuid}\x1b[201~`, 1).state.resumeInput, uuid)
   const root = mkdtempSync(join(tmpdir(), 'tui-paste-'))
   const host = quietHost('s', root, root)
-  const { screen } = await framed({ host, root, cwd: root, session: 's', keys: ['n', uuid, '\x1b'] })
+  const { screen } = await framed({ host, root, cwd: root, session: 's', keys: ['e', 'n', uuid, '\x1b'] })
   assert.match(screen, new RegExp(uuid))
 })
 
@@ -2356,7 +2422,7 @@ test('wrap: CJK and emoji wrap by cells and never split a grapheme', () => {
 function ownerState(): TuiState {
   const r = mockRow('w1', { state: 'running', d: { profile: 'codex', name: 'w1', dir: '/tmp/r', since: 1 } })
   r.d.seq = 1
-  return { rows: [r], all: [r], showAll: false, selected: 'w1', adding: false, resumeInput: '', quit: false, owner: 'S' }
+  return { rows: [r], all: [r], showAll: false, selected: 'w1', adding: false, resumeInput: '', quit: false, owner: 'S', mode: 'edit' }
 }
 
 test('viewer: every mutating key is read-only in the key layer (D-viewer)', () => {
@@ -2510,6 +2576,7 @@ test('cancel and unlock: the TUI keys run the same core calls as workers.cli.nod
   try {
     await until(() => shown().includes(r.name), 5_000, 'the row')
     stdin.emit('data', 'j')
+    stdin.emit('data', 'e')
     stdin.emit('data', 'U')
     await pause(STOP_REPEAT_MS + 50)
     stdin.emit('data', 'U')
@@ -2726,6 +2793,7 @@ test('Sol#8 split sequence: the ESC timer lets go only a lone ESC; a CSI, SS3 or
   let ended = false
   run.then(() => (ended = true), () => (ended = true))
   await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', 'e')
   stdin.emit('data', 'n')
   await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
   stdin.emit('data', '\x1b[20')
@@ -2864,6 +2932,7 @@ test('Sol#10 Ctrl-C quits from every mode: list, prompt (n, t, +), confirm', asy
   let ended = false
   run.then(() => (ended = true), () => (ended = true))
   await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  stdin.emit('data', 'e')
   stdin.emit('data', 'n')
   await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
   stdin.emit('data', '\x03')
@@ -3038,6 +3107,7 @@ test('R8.5: a stale delivery reservation shows "unknown: 可能已送達" and - 
       await pause(150)
     }
     await until(() => shown().includes('unknown: 可能已送達'), 5_000, 'the honest wording')
+    stdin.emit('data', 'e')
     await until(() => /- force-close/.test(shown()), 5_000, 'the force-close hint')
 
     stdin.emit('data', '-')
