@@ -1141,6 +1141,21 @@ test('escape: CJK mixed with escapes, through the renderer', () => {
   assert.ok(!/\x1b(?!\[[0-9;]*m)/.test(screen), JSON.stringify(screen))
 })
 
+test('render: a mirror line that leaves its SGR open does not color the next row (wide and narrow)', () => {
+  // tmux capture-pane -e ends a background line without a reset: the reset opens the next line.
+  const row = mockRow('w-bg', { state: 'running' })
+  const state: TuiState = {
+    rows: [row], all: [row], showAll: false, selected: 'w-bg', adding: false, resumeInput: '', quit: false,
+    mirror: { id: 'w-bg', lines: ['\x1b[42m+ added', 'plain'] },
+  }
+  for (const width of [200, 80]) {
+    for (const line of renderTuiLines(state, width, 24, Date.now())) {
+      const sgr = line.match(/\x1b\[[0-9;]*m/g)
+      if (sgr) assert.equal(sgr.at(-1), '\x1b[0m', `width ${width}: ${JSON.stringify(line)}`)
+    }
+  }
+})
+
 // -----------------------------------------------------------------------------
 // 2d. Streaming input
 // -----------------------------------------------------------------------------
@@ -3525,7 +3540,7 @@ test('Sol#12 colon SGR: one grammar for sanitize, strip, width, pad, truncate an
     quit: false,
   }
   const lines = renderTuiLines(state, 80, 24, Date.now())
-  assert.ok(lines.includes(sgr), `the mirror line is drawn unchanged: ${JSON.stringify(lines)}`)
+  assert.ok(lines.includes(sgr + '\x1b[0m'), `the mirror line is drawn unchanged, then the row-end reset: ${JSON.stringify(lines)}`)
 })
 
 test('Sol#13 SGR inside a grapheme: truncation cuts only at whole visible graphemes', () => {

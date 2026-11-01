@@ -1207,7 +1207,8 @@ function renderWide(state: TuiState, width: number, height: number, lay: TuiLayo
   const r = s.sel >= 0 ? state.rows[s.sel] : undefined
   if (r && frame.preview.rows > 0) right.push(...previewLines(state, frame.preview.rows, lay.detail))
   for (let i = 0; i < frame.list.rows; i++) {
-    lines.push(fit(left[i] ?? '', frame.list.cols) + fit(right[i] ?? '', frame.preview.cols))
+    // Reset at the row end: a tmux capture line can leave its SGR (a diff background) open, which bled into the next row's list column.
+    lines.push(fit(left[i] ?? '', frame.list.cols) + fit(right[i] ?? '', frame.preview.cols) + ANSI_RESET)
   }
   for (const f of s.footer) lines.push(truncateAnsi(f, width))
   while (lines.length < height) lines.push(' ')
@@ -1255,7 +1256,7 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
             : `\x1b[2mSee it whole: agent-tmux ${r.d.profile} attach ${r.d.name} · b scrollback\x1b[0m`
     }
     lines.push(fit(rule))
-    for (const l of body) lines.push(fit(l))
+    for (const l of body) lines.push(fit(l) + ANSI_RESET) // a capture line can leave its SGR open
     for (let k = body.length; k < bodyRows; k++) lines.push(' ')
     lines.push(fit(tail))
   }
