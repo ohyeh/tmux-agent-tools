@@ -32,6 +32,8 @@ import {
   claimTui,
   processId,
   ageText,
+  deleteWorker,
+  scan,
   type Health,
 } from './workers.ts'
 import { sessionKey } from './ledger.ts'
@@ -73,6 +75,7 @@ import {
   PAGE_UP,
   MIRROR_HISTORY,
   ANSI_CLEAR_HOME,
+  ANSI_SYNC_START,
   padCells,
 } from './tui.node.ts'
 import { eawOf, EAW_UNICODE_VERSION } from './eaw-table.ts'
@@ -2664,7 +2667,7 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
   const { stdin, stdout } = mockTty()
   // 60 s tick: every capture below comes from the key or the resize, not the clock.
   const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000 })
-  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START)))
   try {
     await until(() => stdout.written.includes('bbb.abcde'), 5_000, 'the rows')
     stdin.emit('data', 'j')
@@ -2808,20 +2811,20 @@ test('detail: the whole result, past SUMMARY_MAX, with row and result state apar
     stdin.emit('data', 'j')
     stdin.emit('data', '\r')
     // The last frame: a capture started by `j` may draw the `loading…` detail (1 of 1) first.
-    const lastFrame = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+    const lastFrame = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START)))
     await until(() => Number(/detail 1–\d+ of (\d+)/.exec(lastFrame())?.[1] ?? 0) > 1, 5_000, 'the loaded detail view')
     const total = Number(/detail 1–\d+ of (\d+)/.exec(lastFrame())![1])
     assert.ok(total > 300, `a long summary wraps to many lines: ${total}`)
-    for (let i = 0; i < Math.ceil(total / 10) && !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'); i++) {
+    for (let i = 0; i < Math.ceil(total / 10) && !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START))).includes('END-MARKER'); i++) {
       stdin.emit('data', PAGE_DOWN)
       await new Promise(r => setTimeout(r, 2))
     }
-    await until(() => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'), 5_000, 'the end of the summary')
-    const last = stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+    await until(() => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START))).includes('END-MARKER'), 5_000, 'the end of the summary')
+    const last = stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START)))
     assert.match(last, new RegExp(`detail \\d+–${total} of ${total}`))
     stdin.emit('data', PAGE_UP)
     stdin.emit('data', '\r')
-    await until(() => !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('detail '), 5_000, 'collapse')
+    await until(() => !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START))).includes('detail '), 5_000, 'collapse')
   } finally {
     stdin.emit('data', 'q')
     await run
@@ -2973,7 +2976,7 @@ test('hints: every key the header and the row show has a handler; no /workers co
   const header = stripAnsi(renderTuiLines(owner, 200, 30, 1_000)[0]!)
   assert.match(header, /\[ n resume \] \[ \+ assign \] \[ r refresh \] \[ c clear \] \[ q quit \]  a all · j\/k select/)
   const row = renderTuiLines(owner, 200, 30, 1_000).map(stripAnsi).find(l => l.includes('[ t tell ]'))!
-  assert.match(row, /\[ t tell \] \[ i interrupt \] \[ x stop \] \[ - cancel \] \[ U unlock \]  Enter detail/)
+  assert.match(row, /\[ t tell \] \[ i interrupt \] \[ x stop \] \[ - cancel \] \[ U unlock \] \[ d delete \]  Enter detail/)
   // Narrow: hints shorten in order (words, then keys only), never past the width.
   assert.match(stripAnsi(renderTuiLines(owner, 60, 30, 1_000)[0]!), /\[ n \] \[ \+ \] \[ r \] \[ c \] \[ q \]/)
   // No `/workers …` command anywhere in the TUI source (the import path is not one).
@@ -3125,9 +3128,9 @@ env = {'PATH': os.path.dirname(sys.argv[1]) + ':/usr/bin:/bin', 'HOME': sys.argv
 pre = termios.tcgetattr(slave)
 p = subprocess.Popen([sys.argv[1], sys.argv[2], '--session', 'owner', '--cwd', sys.argv[9]], stdin=slave, stdout=slave, stderr=slave, env=env)
 out = bytearray()
-CLR = b'\\x1b[2J\\x1b[H'
-def frames(): return out.count(CLR)
-def last(): return re.sub(rb'\\x1b\\[[0-9;?]*[ -/]*[@-~]|\\x1b\\][^\\x07]*\\x07', b'', bytes(out[out.rfind(CLR):]))
+FRAME = b'\\x1b[?2026h'
+def frames(): return out.count(FRAME)
+def last(): return re.sub(rb'\\x1b\\[[0-9;?]*[ -/]*[@-~]|\\x1b\\][^\\x07]*\\x07', b'', bytes(out[out.rfind(FRAME):]))
 def pump(seconds, until=None):
     end = time.time() + seconds
     while time.time() < end and not (until and until()):
@@ -3160,7 +3163,7 @@ print('SAME_TTY=%s' % (pre == post))
 print('MARK=%d' % mark)
 print('OUT=' + base64.b64encode(bytes(out)).decode())
 `
-  const frames = (bytes: Buffer) => bytes.toString('utf8').split(ANSI_CLEAR_HOME).slice(1).map(f => f.replace(ANSI_LEAVE_ALT, ''))
+  const frames = (bytes: Buffer) => bytes.toString('utf8').split(ANSI_SYNC_START).slice(1).map(f => f.replace(ANSI_LEAVE_ALT, '').replace('\x1b[?2026l', ''))
   const check = (frame: string, cols: number, rows: number, what: string) => {
     // The pty's ONLCR turns the TUI's \r\n into \r\r\n.
     const lines = frame.split(/\r*\n/)
@@ -3666,4 +3669,127 @@ test('layout: the row list stays at the top; the preview follows the last row', 
   const first = frame('a')
   assert.deepEqual(at(first), at(frame('c')), 'rows do not move when the selection does')
   assert.ok(first.findIndex(l => l.includes('m49')) > at(first)[3]!, 'the preview is below row 4')
+})
+
+test('delete key-state: d arms then confirms a delete in the viewer (預覽); the arm survives a rows tick', () => {
+  const s: TuiState = { ...ownerState(), viewer: true, owner: undefined, mode: 'preview' }
+  const row = s.rows[0]!
+  assert.match(rowHints(s, row, 1_000)[0]!, /\[ d delete \]/)
+  const one = nextKeyState(s, 'd', 1_000)
+  assert.equal(one.action, undefined)
+  assert.deepEqual(one.state.armedStop, { id: `delete:${row.id}`, from: 1_000, until: 1_000 + STOP_CONFIRM_MS })
+  assert.match(rowHints(one.state, row, 1_000)[0]!, /\[ d delete w1\? press again \]/)
+  const ticked = applyRowsTick(one.state, [{ ...row }])
+  assert.deepEqual(ticked.armedStop, one.state.armedStop, 'a 2s rows tick must not disarm the 5s confirm')
+  const two = nextKeyState(ticked, 'd', 1_000 + STOP_REPEAT_MS)
+  assert.equal(two.state.armedStop, undefined)
+  assert.deepEqual(two.action, { type: 'delete', row })
+})
+
+test('delete key-state: a project row ignores d', () => {
+  const p = mockRow('p1', { project: true })
+  const s: TuiState = { ...ownerState(), viewer: true, rows: [p], all: [p], selected: 'p1', mode: 'preview' }
+  const r = nextKeyState(s, 'd', 1_000)
+  assert.equal(r.action, undefined)
+  assert.equal(r.state.armedStop, undefined)
+})
+
+test('delete key-state: an incomplete row routes d to clear (keeps the ORPHAN_MS grace)', () => {
+  const s = ownerState()
+  const row = { ...s.rows[0]!, state: 'unknown' as const, incomplete: true as const, d: { ...s.rows[0]!.d, seq: 0 } }
+  const t: TuiState = { ...s, rows: [row], all: [row], selected: row.id, viewer: true, owner: undefined, mode: 'preview' }
+  const one = nextKeyState(t, 'd', 1_000)
+  assert.equal(one.action, undefined)
+  assert.deepEqual(nextKeyState(one.state, 'd', 1_000 + STOP_REPEAT_MS).action, { type: 'clear', row })
+})
+
+test('delete core: a dead worker moves to .v3/.removed and leaves the scan; a live or unknown session is refused', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-delete-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-delete-repo-'))
+  writeWorker(root, repo, 'owner', 'dead.abcde')
+  const w = join(root, '.v3', 'dead.abcde')
+  // A viewer host (no owner): mkdir, mv and the lock's ln/rm run for real; only tmux is faked.
+  const host = nodeHost({ owner: undefined, cwd: repo })
+  host.envTmuxAgentDir = async () => root
+  const real = host.run.bind(host)
+  let tmux = { exitCode: 0, stdout: 'codex-dead.abcde\n', stderr: '' }
+  host.run = async (argv, cwd, ms) => (argv[0] === 'tmux' ? tmux : real(argv, cwd, ms))
+  const names = async () => (await scan(host, { claim: false })).visible.map(d => d.name)
+  assert.deepEqual(await names(), ['dead.abcde'])
+
+  const live = await deleteWorker(host, 'dead.abcde')
+  assert.ok(!live.ok && /stop it first with x/.test(live.text), live.text)
+  tmux = { exitCode: -1, stdout: '', stderr: 'timeout' }
+  const unknown = await deleteWorker(host, 'dead.abcde')
+  assert.ok(!unknown.ok && /liveness unknown/.test(unknown.text), unknown.text)
+  assert.ok(existsSync(join(w, 'worker.json')), 'a refused delete leaves the dir')
+
+  tmux = { exitCode: 1, stdout: '', stderr: 'no server running' }
+  // A launch in flight holds launch.lock (an OS flock, as agent-tmux takes it): refused.
+  const launch = spawn('zsh', ['-c', 'zmodload zsh/system; : >> "$1"; zsystem flock -f fd "$1"; print held; sleep 30', 'zsh', join(w, 'launch.lock')])
+  try {
+    await new Promise(r => launch.stdout.once('data', r))
+    const busy = await deleteWorker(host, 'dead.abcde')
+    assert.ok(!busy.ok && /launch is in flight/.test(busy.text), busy.text)
+    assert.ok(existsSync(join(w, 'worker.json')) && !existsSync(join(w, '.action')), 'refused under its own lock, which is released')
+  } finally {
+    launch.kill()
+  }
+  await new Promise(r => launch.once('exit', r))
+  // The launch.lock file stays after its holder exits: only a held flock refuses.
+  const done = await deleteWorker(host, 'dead.abcde')
+  assert.ok(done.ok, done.text)
+  assert.ok(!existsSync(w))
+  const removed = readdirSync(join(root, '.v3', '.removed'))
+  assert.equal(removed.length, 1)
+  assert.match(removed[0]!, /^dead\.abcde-\d+$/)
+  assert.ok(done.text.endsWith(join(root, '.v3', '.removed', removed[0]!)), done.text)
+  assert.ok(existsSync(join(root, '.v3', '.removed', removed[0]!, 'worker.json')), 'moved whole, not removed')
+  assert.ok(!existsSync(join(root, '.v3', '.removed', removed[0]!, '.action')), 'the moved lock is released')
+  assert.deepEqual(await names(), [], '.removed is never scanned as a worker')
+})
+
+test('render: a repaint overwrites in place, an identical frame writes nothing, and only the first draw and a resize clear (閃屏)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-flicker-'))
+  const { stdin, stdout } = mockTty()
+  const run = runTui({ stdin, stdout, host: quietHost('S', root, root), session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000 })
+  const settle = () => new Promise(r => setTimeout(r, 100))
+  try {
+    await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+    await settle()
+    assert.ok(stdout.written.includes('\x1b[2J'), 'the first draw clears')
+    // Two no-op keys back to back: each renders; the second frame equals the first.
+    // The clock is frozen so the header's 更新 Ns 前 cannot cross a second boundary between them.
+    const realNow = Date.now
+    const frozen = realNow()
+    Date.now = () => frozen
+    try {
+      stdout.written = ''
+      stdin.emit('data', 'z')
+      stdin.emit('data', 'z')
+      await settle()
+      assert.ok(stdout.written.split(ANSI_SYNC_START).length - 1 <= 1, `the second identical render writes nothing: ${JSON.stringify(stdout.written)}`)
+      stdout.written = ''
+      stdin.emit('data', 'z')
+      await settle()
+      assert.equal(stdout.written, '', 'an identical frame writes nothing')
+    } finally {
+      Date.now = realNow
+    }
+    // A changed frame: overwritten in place inside synchronized output, no full clear.
+    stdin.emit('data', 'n')
+    await until(() => stdout.written.length > 0, 5_000, 'the repaint')
+    assert.ok(stdout.written.startsWith(`${ANSI_SYNC_START}\x1b[H`), JSON.stringify(stdout.written.slice(0, 20)))
+    assert.ok(stdout.written.endsWith('\x1b[?2026l'))
+    assert.equal(stdout.written.includes('\x1b[2J'), false, 'a normal repaint does not clear the screen')
+    // A resize clears once.
+    stdout.written = ''
+    stdout.columns = 100
+    process.emit('SIGWINCH')
+    await until(() => stdout.written.includes('workers'), 5_000, 'the resize render')
+    assert.ok(stdout.written.includes(`${ANSI_SYNC_START}${ANSI_CLEAR_HOME}`), 'a resize clears')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+  }
 })

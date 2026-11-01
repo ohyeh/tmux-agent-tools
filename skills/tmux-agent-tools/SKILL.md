@@ -113,7 +113,7 @@ Codex, Cursor, and agy do not load the Claude function-hook mod. They use the sa
 
 `tmux-agent-tui` opens in 預覽. `e` enters 編輯 when this process holds the session. With no session, `e` opens the picker: `j`/`k` or `1`–`9` move, Enter claims that live session in this process. One ready TUI per owner. A second launch focuses the first and does not draw. Quit with `q`, Ctrl-C, or Esc at the top of 預覽.
 
-預覽: `j`/`k` and `1`–`9` select a row. `↑`/`↓` scroll one line. `b`/`f` and PgUp/PgDn scroll a page. Enter opens detail. `a` toggles all workers and this session. `r` re-reads the rows and clears the selection. Mouse reporting stays off, so the terminal's own drag-select is free. `?1007h` turns the wheel into `↑`/`↓`.
+預覽: `j`/`k` and `1`–`9` select a row. `↑`/`↓` scroll one line. `b`/`f` and PgUp/PgDn scroll a page. Enter opens detail. `a` toggles all workers and this session. `r` re-reads the rows and clears the selection. `d` (ask twice; in a viewer too) deletes the selected worker's row: with no live tmux session its state dir moves to `.v3/.removed/<name>-<ms>`; a live or unknown session is refused (stop it with `x` in 編輯 first). Mouse reporting stays off, so the terminal's own drag-select is free. `?1007h` turns the wheel into `↑`/`↓`.
 
 編輯 adds `n` (resume), `+` (assign), `t` (tell), `i` (interrupt), `x` (stop), `-` (cancel), `U` (unlock), and `c` (clear all). `x`, `-`, `U`, and `c` ask twice. `n` and `+` refuse when the cwd is unknown. `e` returns to 預覽. Esc disarms a confirm, closes detail, leaves a narrow preview, leaves the picker, leaves 編輯, clears the selection, then quits.
 

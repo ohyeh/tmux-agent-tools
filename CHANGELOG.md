@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix (TUI render): each row ends with an SGR reset. `tmux capture-pane -e` leaves a background open at a line end (the reset opens the next line), so a Codex diff band in the mirror colored the next row's list column. Owner: 「盤版有點詭異」.
+- TUI `d` (press twice) deletes the selected worker's row in 預覽, 編輯 and the viewer: with no live tmux session, inside its action lock, `<v3>/<name>` moves to `<v3>/.removed/<name>-<ms>` (scan skips dot-dirs; nothing is rm'ed) and a `delete` TUI audit entry is written. A live session, or a `tmux ls` with no answer, is refused; project rows ignore `d`. Owner: 「我需要刪除功能啊 這種 xx 又刪不了 我需要外層列表就能刪」.
+- Fix (TUI flicker): a repaint no longer clears the screen. It homes the cursor, erases and redraws each line inside synchronized output (`?2026`), and erases below a shorter frame; a frame equal to the last one is not written. Only the first draw and a resize clear. Owner: 閃屏.
+
 ## v0.48.0 - 2026-10-31
 
 - TUI: 預覽 is the default. `e` enters 編輯 when this TUI holds the owner; with no session it opens the picker (`j`/`k` or `1`–`9`, Enter claims that live session in this process; `j`/`k` keep the highlighted session on screen). Picker session and cwd text is sanitized; OSC and other non-SGR controls in those fields are not drawn. Owner: 「預覽跟編輯雙模式 預設是預覽我覺得ＯＫ啊 只是就不能複製很不方便」「誰會沒事記一堆指令 你還不如支援可以按鈕去編輯之類的 開新視窗之類的啊」「tui 或是預覽的更新頻率又很謎」.

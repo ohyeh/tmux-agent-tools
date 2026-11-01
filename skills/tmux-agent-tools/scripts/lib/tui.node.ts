@@ -8,6 +8,8 @@
 //   n       resume a CLI session by id (input line)
 //   +       assign a new worker: <profile> <name> <brief-file> (input line)
 //   r       refresh rows and clear the selection
+//   d       delete the selected row (press twice; 預覽, 編輯 and viewer): a worker with no live
+//           tmux session moves to .v3/.removed/<name>-<ms>. A live or unknown session is refused.
 //   c       clear all workers (press twice)
 //   q       quit (the terminal is restored)
 //   a       toggle all / only this session's workers
@@ -61,6 +63,7 @@ import {
   assignWorker,
   cancelEpisode,
   clearIncomplete,
+  deleteWorker,
   unlockWorker,
   episodeDetail,
   mirrorOf,
@@ -111,6 +114,9 @@ const WHEEL_LINES = 3
 export const ANSI_HIDE_CURSOR = '\x1b[?25l'
 export const ANSI_SHOW_CURSOR = '\x1b[?25h'
 export const ANSI_CLEAR_HOME = '\x1b[2J\x1b[H'
+/** Synchronized output (DEC 2026): the terminal shows the frame whole. Every frame starts with it. */
+export const ANSI_SYNC_START = '\x1b[?2026h'
+const ANSI_SYNC_END = '\x1b[?2026l'
 export const ANSI_RESET = '\x1b[0m'
 export const ANSI_BOLD = '\x1b[1m'
 export const ANSI_DIM = '\x1b[2m'
@@ -290,7 +296,7 @@ export interface TuiState {
   all: PanelRow[]
   showAll: boolean
   selected?: string
-  /** One press-twice confirmation: a row id (stop), CLEAR_ID, `cancel:<id>` or `unlock:<id>`. */
+  /** One press-twice confirmation: a row id (stop), CLEAR_ID, `cancel:<id>`, `unlock:<id>` or `delete:<id>`. */
   armedStop?: { id: string; from: number; until: number }
   adding: boolean
   resumeInput: string
@@ -344,6 +350,7 @@ export type TuiAction =
   | { type: 'cancel'; row: PanelRow; force?: boolean }
   | { type: 'unlock'; row: PanelRow }
   | { type: 'clear'; row: PanelRow }
+  | { type: 'delete'; row: PanelRow }
   | { type: 'detail' }
   | { type: 'mouseOff' }
   | { type: 'openPicker' }
@@ -598,7 +605,7 @@ export function applyRowsTick(state: TuiState, rows: PanelRow[]): TuiState {
   const selChanged = panelLike.selected !== state.selected
   let armed = state.armedStop
   if (armed && armed.id !== CLEAR_ID) {
-    const rowId = armed.id.startsWith('cancel:') || armed.id.startsWith('unlock:') ? armed.id.slice(armed.id.indexOf(':') + 1) : armed.id
+    const rowId = /^(cancel|unlock|delete):/.test(armed.id) ? armed.id.slice(armed.id.indexOf(':') + 1) : armed.id
     if (!panelLike.rows.some(r => r.id === rowId)) armed = undefined
   }
   if (selChanged) armed = undefined
@@ -757,6 +764,13 @@ export function nextKeyState(
     return pressTwice(state, `cancel:${row.id}`, now, { type: 'cancel', row, ...(row.reservation === 'stale' ? { force: true } : {}) })
   }
 
+  // Not a MUTATING_KEY: a dead row is removable from the viewer and 預覽 too (owner ask).
+  if (key === 'd') {
+    if (!row || row.project) return { state }
+    // No worker.json: a writer may still publish it; clearIncomplete keeps the ORPHAN_MS grace.
+    return pressTwice(state, `delete:${row.id}`, now, row.incomplete ? { type: 'clear', row } : { type: 'delete', row })
+  }
+
   if (key === 'U') {
     if (!row || row.project) return { state }
     return pressTwice(state, `unlock:${row.id}`, now, { type: 'unlock', row })
@@ -889,9 +903,10 @@ export function headerHints(state: TuiState, now: number): string[] {
 /** The selected row's key hints, longest first. */
 export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
   if (r.project) return ['project session · read-only  b/f scroll', 'read-only']
-  if (state.viewer) return [`${READ_ONLY}  Enter detail`, '唯讀']
-  if (state.mode !== 'edit') return ['e 編輯 · ↑↓ 捲動 · Enter detail', 'e 編輯']
   const armed = (id: string) => state.armedStop?.id === id && now < state.armedStop.until
+  const del = hint('d', armed(`delete:${r.id}`) ? `delete ${r.d.name}? press again` : 'delete', true)
+  if (state.viewer) return [`${del}  ${READ_ONLY}  Enter detail`, `${del}  唯讀`, del]
+  if (state.mode !== 'edit') return [`${del}  e 編輯 · ↑↓ 捲動 · Enter detail`, `${del}  e 編輯`, del]
   const keys: [string, string][] = [['t', 'tell']]
   if (r.incomplete) return [`${hint('-', armed(`cancel:${r.id}`) ? 'clear unfinished reservation? press again' : 'clear', true)}  no worker.json`, hint('-', 'clear', true), hint('-', 'clear', false)]
   if (r.state === 'running' || r.state === 'stalled') keys.push(['i', 'interrupt'])
@@ -901,6 +916,7 @@ export function rowHints(state: TuiState, r: PanelRow, now: number): string[] {
     keys.push(['-', armed(`cancel:${r.id}`) ? `${force ? 'force-close' : 'cancel'} episode ${r.d.seq}? press again` : force ? 'force-close' : 'cancel'])
   }
   keys.push(['U', armed(`unlock:${r.id}`) ? 'unlock (maintenance)? press again' : 'unlock'])
+  keys.push(['d', armed(`delete:${r.id}`) ? `delete ${r.d.name}? press again` : 'delete'])
   const tail = armed(r.id) ? `  \x1b[31mends its tmux session · ${Math.ceil((state.armedStop!.until - now) / 1000)}s\x1b[0m` : ''
   return [
     `${keys.map(([k, l]) => hint(k, l, true)).join(' ')}  Enter ${state.expanded ? 'mirror' : 'detail'}${tail}`,
@@ -1635,6 +1651,10 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
 
   const layout = () => tuiLayout(state, width, height, Date.now(), gate)
 
+  // A full clear blanks the screen (閃屏): only the first draw and a resize clear; a repaint
+  // overwrites in place, and a frame equal to the last one is not written.
+  let clearNext = true
+  let lastBody = ''
   // After quit (or any stop) nothing more is drawn, even by an action still in flight.
   const render = () => {
     if (stopped) return
@@ -1644,7 +1664,14 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     state.page = lay.frame.preview.rows
     state.scrollMax = Math.max(0, (lay.detail?.length ?? 0) - lay.frame.preview.rows)
     const lines = linesFromLayout(state, width, height, lay, gate)
-    stdout.write(ANSI_CLEAR_HOME + lines.join('\r\n'))
+    const body = lines.join('\r\n')
+    if (!clearNext && body === lastBody) return
+    // Erase each line before it is drawn, not after: `\x1b[K` behind a full-width line
+    // erases its last cell (pending wrap). Then erase what an older, taller frame left below.
+    const drawn = lines.map(l => `\x1b[2K${l}`).join('\r\n') + (lines.length < height ? '\r\n\x1b[J' : '')
+    stdout.write(ANSI_SYNC_START + (clearNext ? ANSI_CLEAR_HOME : '\x1b[H') + drawn + ANSI_SYNC_END)
+    clearNext = false
+    lastBody = body
   }
 
   const rowsFlight: Flight = { running: false, queued: false }
@@ -1777,6 +1804,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     // for the new layout lands; a capture already in flight is dropped (R4.1).
     generation += 1
     resized = true
+    clearNext = true
     try {
       render()
       captureNow()
@@ -1991,6 +2019,14 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     if (action.type === 'clear') {
       const out = await clearIncomplete(host, action.row.d.name)
       say(`clear ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'delete') {
+      const out = await deleteWorker(host, action.row.d.name)
+      await writeTuiAudit(host, 'delete', { tool: action.row.d.profile, name: action.row.d.name, ok: out.ok, ...auditOf(action.row.holder) })
+      say(`delete ${action.row.d.name} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text}`)
       await refreshRows()
       render()
       return

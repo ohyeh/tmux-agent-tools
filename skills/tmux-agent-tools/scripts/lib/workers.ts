@@ -30,6 +30,9 @@ import {
   readWorker,
   recoverEpisodes,
   registerOnChannel,
+  movedLock,
+  releaseLock,
+  releasedText,
   releaseSettledActions,
   settledAction,
   underLock,
@@ -2952,10 +2955,10 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
  */
 export type TuiAudit = { session: string | null; holder: string | null }
 
-/** Cancel and unlock do not go through `agent-tmux stop`. Same audit log, same chain. */
+/** Cancel, unlock and delete do not go through `agent-tmux stop`. Same audit log, same chain. */
 export async function writeTuiAudit(
   host: Host,
-  event: 'cancel' | 'unlock',
+  event: 'cancel' | 'unlock' | 'delete',
   fields: { tool: string; name: string; ok: boolean } & TuiAudit,
 ): Promise<void> {
   const { bin, missing } = await agentTmuxBin(host)
@@ -4315,6 +4318,49 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
   const rm = await run(['rm', '-rf', box])
   if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${box}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }
   return { ok: true, text: `cleared the unfinished reservation "${name}"` }
+}
+
+/**
+ * Delete a dead worker's row (TUI `d`, viewer too): inside its action lock, move
+ * `<v3>/<name>` to `<v3>/.removed/<name>-<ms>` (scan skips dot-dirs). Refused while its
+ * tmux session is alive, when liveness is unknown, and while a launch of the name holds its
+ * launch.lock. Nothing is removed: a human can mv it back.
+ */
+export async function deleteWorker(host: Host, name: string): Promise<Outcome> {
+  if (!NAME_RE.test(name)) return { ok: false, text: 'delete takes <name>' }
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const v3 = v3Of(root)
+  const w = `${v3}/${name}`
+  if (!(await host.exists(w))) return { ok: false, text: `"${name}" is already gone` }
+  const lock = await takeLock(host, w)
+  if (!lock.ok) return { ok: false, text: busyText(name, lock.busy) }
+  const run = (argv: string[]) => host.run(argv, '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  const dest = `${v3}/.removed/${name}-${await host.now()}`
+  // `/`: a removed worktree as cwd would fail the probe and read as unknown forever.
+  const g = newGate()
+  const alive = await liveSessions(host, '/', g)
+  const refused = !g.aliveKnown
+    ? `"${name}": tmux liveness unknown; nothing is deleted`
+    : [...alive].some(s => s.endsWith(`-${name}`))
+      ? `"${name}" still has a tmux session: stop it first with x in 編輯`
+      : undefined
+  // agent-tmux holds <name>/launch.lock (an OS flock; the file stays after) from its live-name
+  // check to the pane-id publish, so the move runs under that flock, never waiting for it.
+  // shortcut: a launch that starts and ends between the liveness probe and this flock is missed; probe under the flock if that ever shows up.
+  const MOVE = 'zmodload zsh/system || exit 70; : >> "$1/launch.lock" || exit 71; zsystem flock -t 0 -f fd "$1/launch.lock" 2>/dev/null || exit 75; mv "$1" "$2"'
+  // `mv` into an existing dir nests; refuse instead.
+  const mk = refused ? undefined : await run(['mkdir', '-p', `${v3}/.removed`])
+  const mv = !mk || mk.exitCode !== 0 ? mk : (await host.exists(dest)) ? { exitCode: 1, stdout: '', stderr: `${dest} exists` } : await run(['zsh', '-c', MOVE, 'zsh', w, dest])
+  // The lock symlink moved with the dir: release it where it now is.
+  const held = `${mv?.exitCode === 0 ? dest : w}/.action`
+  if (mv?.exitCode === 0) movedLock(`${w}/.action`, held, lock.token)
+  const released = await releaseLock(host, held, lock.token)
+  const note = released.ok ? '' : `; ${releasedText(held, released)}`
+  if (!mv) return { ok: false, text: `${refused}${note}` }
+  if (mv.exitCode === 75) return { ok: false, text: `"${name}": a launch is in flight (launch.lock is held); wait for it, then retry; nothing is deleted${note}` }
+  if (mv.exitCode !== 0) return { ok: false, text: `could not move ${w}: ${mv.stderr.trim() || `exit ${mv.exitCode}`}; nothing is deleted${note}` }
+  return { ok: true, text: `moved to ${dest}${note}` }
 }
 
 /**

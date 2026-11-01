@@ -487,7 +487,7 @@ TUI 已經 `ready` 的紀錄不動。
 
 TUI 的按鍵（預設是預覽；畫出來的每個鍵都有 handler）：
 
-- 預覽：`j`／`k` 與 `1`–`9` 選列。`↑`／`↓` 捲一行（不再選列）。`b`／`f` 與 PgUp／PgDn 捲一頁。Enter 開細節。`a` 切換全部／只看自己。`r` 重讀列並清掉選取。`q` 離開。`e` 在這個 TUI 持有 session 時進入編輯；沒有 session 就開 picker（`j`／`k` 或 `1`–`9`，Enter 在這個行程裡 claim）。滑鼠回報關著，終端自己的反白可以複製。`?1007h` 讓滾輪變成 `↑`／`↓`。
+- 預覽：`j`／`k` 與 `1`–`9` 選列。`↑`／`↓` 捲一行（不再選列）。`b`／`f` 與 PgUp／PgDn 捲一頁。Enter 開細節。`a` 切換全部／只看自己。`r` 重讀列並清掉選取。`[ d delete ]`（按兩次；viewer 也能用）把沒有 live tmux session 的 worker 搬到 `.v3/.removed/<name>-<ms>`，session 還活著或不明就拒絕（先在編輯用 `x` 停掉）。`q` 離開。`e` 在這個 TUI 持有 session 時進入編輯；沒有 session 就開 picker（`j`／`k` 或 `1`–`9`，Enter 在這個行程裡 claim）。滑鼠回報關著，終端自己的反白可以複製。`?1007h` 讓滾輪變成 `↑`／`↓`。
 - 編輯才有：`[ n resume ]`、`[ + assign ]`（`<profile> <name> <brief 檔>`）、`[ t tell ]`、`[ i interrupt ]`、`[ x stop ]`（按兩次）、`[ - cancel ]`（按兩次；episode 關掉，pane 不動）、`[ U unlock ]`（按兩次；只在持有者確定已死時才移除鎖）、`[ c clear ]`（按兩次）。`n` 與 `+` 在 cwd 不明時拒絕。`e` 回到預覽。
 - Esc：先解除二次確認，再關細節，窄畫面從預覽回清單，picker 回預覽，編輯回預覽，清掉選取，最外層離開。
 - 標題顯示 `更新 Ns 前`；列還在讀時後面加 ` …`。清單 2 秒、鏡像 1 秒、stall 10 秒，各自 single-flight。讀失敗保留上一次的時間。`r` 在一輪還在跑時只排隊一次。

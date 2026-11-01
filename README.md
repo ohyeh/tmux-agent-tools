@@ -223,7 +223,9 @@ tmux-agent-tui                                      # viewer: every worker, labe
 - Opens in 預覽. `e` enters 編輯 when this process holds the owner. 預覽:
   `j`/`k` and `1`–`9` select; `↑`/`↓` scroll one line; `b`/`f` and PgUp/PgDn
   scroll a page; Enter opens detail; `a` toggles all/own; `r` re-reads and
-  clears the selection; `q` quits. 編輯 adds `n`, `+`, `t`, `i`, `x`, `-`, `U`,
+  clears the selection; `d` (ask twice; viewer too) moves a worker with no
+  live tmux session to `.v3/.removed/` (a live or unknown session is refused);
+  `q` quits. 編輯 adds `n`, `+`, `t`, `i`, `x`, `-`, `U`,
   `c` (`x`, `-`, `U`, `c` ask twice). `n` and `+` refuse when the cwd is
   unknown. Esc disarms, closes detail, leaves a narrow preview, leaves the
   picker, leaves 編輯, clears the selection, then quits. Mouse reporting stays
