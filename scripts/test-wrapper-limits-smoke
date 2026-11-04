@@ -365,19 +365,27 @@ assert "j2: self-test exits 0" "$code" 0
 command env -u TMUX "$REAL_TMUX" -S "$SOCK_J2" kill-server 2>/dev/null || true
 
 print -r -- "case k: a start that spawns the default server leaves its global options alone"
+# tmux's defaults move between versions (3.8: mouse on, theme colors): read them from a bare server.
+smoke_socket k0
+SOCK_K0="$REPLY"
+command env -u TMUX "$REAL_TMUX" -S "$SOCK_K0" -f /dev/null new -d -s k0
+k0() { command env -u TMUX "$REAL_TMUX" -S "$SOCK_K0" show "$@" 2>/dev/null; }
+def_mouse="$(k0 -gv mouse)"; def_hist="$(k0 -gv history-limit)"
+def_pass="$(k0 -gwv allow-passthrough)"; def_style="$(k0 -gv status-style)"
+command env -u TMUX "$REAL_TMUX" -S "$SOCK_K0" kill-server 2>/dev/null || true
 tmux_b kill-server 2>/dev/null || true
 "$AGENT_TMUX" fakecli start --exact defopt "$WORK/repo" >/dev/null 2>&1 || true
 assert "k: the worker is on the default server" "$(tmux_b has-session -t '=wlim-defopt' 2>/dev/null && echo yes || echo no)" yes
-assert "k: global mouse is tmux's default" "$(tmux_b show -gv mouse 2>/dev/null)" off
+assert "k: global mouse is tmux's default" "$(tmux_b show -gv mouse 2>/dev/null)" "$def_mouse"
 assert "k: global status-left is not the agent conf's" "$(tmux_b show -gv status-left 2>/dev/null | grep -c Claude || true)" 0
 assert "k: the worker session has mouse on" "$(tmux_b show -t wlim-defopt -v mouse 2>/dev/null)" on
 assert "k: the worker window has vi copy-mode keys" "$(tmux_b show -wv -t '=wlim-defopt:' mode-keys 2>/dev/null)" vi
 assert "k: the worker pane keeps 50000 lines" "$(tmux_b display -p -t '=wlim-defopt:' '#{history_limit}' 2>/dev/null)" 50000
 assert "k: the worker window allows passthrough" "$(tmux_b show -wv -t '=wlim-defopt:' allow-passthrough 2>/dev/null)" on
 assert "k: the worker session has the agent status style" "$(tmux_b show -v -t wlim-defopt status-style 2>/dev/null)" "bg=#020617,fg=#e5e7eb"
-assert "k: global history-limit is tmux's default" "$(tmux_b show -gv history-limit 2>/dev/null)" 2000
-assert "k: global allow-passthrough is tmux's default" "$(tmux_b show -gwv allow-passthrough 2>/dev/null)" off
-assert "k: global status-style is tmux's default" "$(tmux_b show -gv status-style 2>/dev/null)" "bg=green,fg=black"
+assert "k: global history-limit is tmux's default" "$(tmux_b show -gv history-limit 2>/dev/null)" "$def_hist"
+assert "k: global allow-passthrough is tmux's default" "$(tmux_b show -gwv allow-passthrough 2>/dev/null)" "$def_pass"
+assert "k: global status-style is tmux's default" "$(tmux_b show -gv status-style 2>/dev/null)" "$def_style"
 "$AGENT_TMUX" fakecli stop defopt >/dev/null 2>&1 || true
 code=0
 AGENT_TMUX_MOUSE=bogus "$AGENT_TMUX" fakecli start --exact badmouse "$WORK/repo" >/dev/null 2>&1 || code=$?

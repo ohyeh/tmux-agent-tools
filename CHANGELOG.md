@@ -2,9 +2,15 @@
 
 ## Unreleased
 
+## v0.48.1 - 2026-11-04
+
+- Fix (TUI width): an East Asian Width A character (`─`, `·`, `●`, `…`, `↑`) counts 1 cell by default. tmux lays out the mirrored pane with 1, and Warp draws 1; counting 2 cut a worker's `─` input rules at half the preview width and left the header bar short. `TMUX_AGENT_AMBIGUOUS_WIDTH=2` stays as the opt-in. Owner: 「好像又是動態寬度、上下沒處理好」.
+- Fix (mod core): `mods/tmux-agent/hooks/lib/ledger.ts` and `workers.ts` were not re-synced after the `d` delete change; `scripts/sync-mod-core` brings them back to byte-identical.
+- Tests: `test-wrapper-limits-smoke` case k reads tmux's global defaults from a bare `-f /dev/null` server instead of hard-coding them (tmux 3.8 defaults to `mouse on` and theme colors).
 - Fix (TUI render): each row ends with an SGR reset. `tmux capture-pane -e` leaves a background open at a line end (the reset opens the next line), so a Codex diff band in the mirror colored the next row's list column. Owner: 「盤版有點詭異」.
 - TUI `d` (press twice) deletes the selected worker's row in 預覽, 編輯 and the viewer: with no live tmux session, inside its action lock, `<v3>/<name>` moves to `<v3>/.removed/<name>-<ms>` (scan skips dot-dirs; nothing is rm'ed) and a `delete` TUI audit entry is written. A live session, or a `tmux ls` with no answer, is refused; project rows ignore `d`. Owner: 「我需要刪除功能啊 這種 xx 又刪不了 我需要外層列表就能刪」.
 - Fix (TUI flicker): a repaint no longer clears the screen. It homes the cursor, erases and redraws each line inside synchronized output (`?2026`), and erases below a shorter frame; a frame equal to the last one is not written. Only the first draw and a resize clear. Owner: 閃屏.
+- Not verified: a live look at the TUI in a terminal that draws ambiguous characters 2 cells wide; `lib/workers.ts` (the band) still counts them 2. No tag, push of a tag, or GitHub release for this version.
 
 ## v0.48.0 - 2026-10-31
 
