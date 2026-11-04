@@ -1,4 +1,4 @@
-import type { Hook, On } from 'claude-code'
+import type { AgentInfo, Hook, On } from 'claude-code'
 import { describe, expect, mock, test, type Engine, type Plugin } from 'claude-code/testing'
 
 import { driver, run, turn } from './fixtures/driver'
@@ -2118,7 +2118,7 @@ function mockPanel(
   /** Set to refuse every delivery, leaving a terminal result undelivered. */
   refuseWake = false,
   /** What `$.agent.list()` answers while the panel is open. `'reject'` throws. */
-  agents: 'reject' | readonly { id: string; description: string; type: string; status: string }[] = [],
+  agents: 'reject' | readonly AgentInfo[] = [],
 ): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[]; toasts: string[]; counts: { invalidates: number } } {
   const argv: (readonly string[])[] = []
   const statuses: unknown[] = []
