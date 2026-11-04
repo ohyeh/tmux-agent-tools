@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.48.1'
+AGENT_TMUX_VERSION='0.48.2'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -739,6 +739,7 @@ Flags:
   --color                      Keep the pane's colours (SGR escapes; tmux -e).
                                 A secret split by a colour change is still
                                 redacted: then the capture comes without colour.
+  --physical-lines             Keep wrapped rows and blank bottom rows for mirrors.
   --since-marker <text>        Keep only lines after the LAST <text>.
   --tail <N>                   Scan-anywhere alias for [lines]; wins over the
                                 positional form (with a stderr warning).
@@ -4282,6 +4283,7 @@ secret_redact_register() {
 # Honors --secret-redact=false bypass.
 secret_redact_apply() {
   local text="$1"
+  local physical_lines="${2:-0}"
   [[ "${SECRET_REDACT_DISABLE:-0}" == "1" ]] && { printf '%s' "$text"; return 0; }
   local pair skey sval_enc sval
   for pair in "${__secret_redact_pairs[@]:-}"; do
@@ -4290,6 +4292,29 @@ secret_redact_apply() {
     sval_enc="${pair#*$'\t'}"
     sval="$(secret_b64dec "$sval_enc")"
     [[ -z "$sval" ]] && continue
+    if (( physical_lines )); then
+      # Match across wraps/SGR, but keep row breaks; each hidden row segment becomes `*`.
+      text="$(printf '%s' "$text" | REDACT_S="$sval" awk '
+        BEGIN { RS="\034"; ORS=""; s=ENVIRON["REDACT_S"]; gsub(/\n/, "", s) }
+        {
+          plain=$0; gsub(/\033\[[0-9;:]*m/, "", plain)
+          flat=""; n=0
+          for (j=1; j<=length(plain); j++) if (substr(plain,j,1)!="\n") { flat=flat substr(plain,j,1); pos[++n]=j }
+          offset=1; found=0
+          while (length(s) && (at=index(substr(flat,offset),s))) {
+            at+=offset-1; found=1
+            for (j=at; j<at+length(s); j++) hidden[pos[j]]=1
+            offset=at+length(s)
+          }
+          if (!found) { print $0; next }
+          for (j=1; j<=length(plain); j++) {
+            if (!hidden[j]) printf "%s", substr(plain,j,1)
+            else if (!hidden[j-1]) printf "*"
+          }
+        }' && printf '.')" || return $?
+      text="${text%.}"
+      continue
+    fi
     # Trim trailing newlines on the *match* value: stored secrets from
     # files frequently end in \n which won't appear in captured panes.
     # The full value (with newline) is still injected into the agent env.
@@ -6585,6 +6610,7 @@ capture_session() {
 
   local strip_ansi=0
   local color=0
+  local physical_lines=0
   local since_marker=""
   local output_json=0
   while [[ "${1:-}" == --* ]]; do
@@ -6595,6 +6621,10 @@ capture_session() {
         ;;
       --color)
         color=1
+        shift
+        ;;
+      --physical-lines)
+        physical_lines=1
         shift
         ;;
       --since-marker)
@@ -6657,20 +6687,30 @@ capture_session() {
   fi
 
   local raw
-  local pane_flags=-J
-  (( color )) && pane_flags=-Je
-  raw="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane "$pane_flags" -t "$(session_target "$session")" -p -S "-$tail_count")"
+  local -a pane_flags=()
+  (( physical_lines )) || pane_flags+=(-J)
+  (( color )) && pane_flags+=(-e)
+  if (( physical_lines )); then
+    # Keep blank pane rows through command substitution; remove only tmux's final delimiter.
+    raw="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane "${pane_flags[@]}" -t "$(session_target "$session")" -p -S "-$tail_count" && printf '.')" || return $?
+    raw="${raw%$'\n.'}"
+  else
+    raw="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane "${pane_flags[@]}" -t "$(session_target "$session")" -p -S "-$tail_count")"
+  fi
 
   # Redact registered secret values (#189) before any downstream sink.
   secret_redact_load_for "$name"
-  raw="$(secret_redact_apply "$raw")"
+  raw="$(secret_redact_apply "$raw" "$physical_lines" && printf '.')" || return $?
+  raw="${raw%.}"
   if (( color )); then
     # A colour change inside a secret splits it, so the match above misses it.
     # If the text without SGR still holds a secret, give that text, redacted.
     local plain
-    plain="$(printf '%s' "$raw" | sed -E $'s/\x1b\\[[0-9;:]*m//g')"
+    plain="$(printf '%s.' "$raw" | sed -E $'s/\x1b\\[[0-9;:]*m//g')" || return $?
+    plain="${plain%.}"
     local plain_redacted
-    plain_redacted="$(secret_redact_apply "$plain")"
+    plain_redacted="$(secret_redact_apply "$plain" "$physical_lines" && printf '.')" || return $?
+    plain_redacted="${plain_redacted%.}"
     [[ "$plain_redacted" != "$plain" ]] && raw="$plain_redacted"
   fi
 
@@ -6686,7 +6726,7 @@ capture_session() {
     # Note: sed strips per-line, which is fine because tmux capture-pane
     # joins soft-wrapped lines and terminal OSC/DCS payloads do not span
     # logical lines in normal CLI output.
-    raw="$(printf '%s' "$raw" | sed -E $'
+    raw="$(printf '%s.' "$raw" | sed -E $'
       s/\x1b\\[[0-9;?]*[A-Za-z]//g
       s/\x1b\\][^\x07\x1b]*\x07//g
       s/\x1b\\][^\x1b]*\x1b\\\\//g
@@ -6694,7 +6734,8 @@ capture_session() {
       s/\x1b_[^\x1b]*\x1b\\\\//g
       s/\x1b\\^[^\x1b]*\x1b\\\\//g
       s/\x1bX[^\x1b]*\x1b\\\\//g
-    ')"
+    ')" || return $?
+    raw="${raw%.}"
   fi
 
   local marker_found=0
@@ -6705,7 +6746,8 @@ capture_session() {
     last_idx="$(printf '%s\n' "$raw" | { grep -nF "$since_marker" || true; } | tail -1 | cut -d: -f1)"
     if [[ -n "$last_idx" ]]; then
       marker_found=1
-      raw="$(printf '%s\n' "$raw" | tail -n +"$((last_idx + 1))")"
+      raw="$(printf '%s.' "$raw" | tail -n +"$((last_idx + 1))")" || return $?
+      raw="${raw%.}"
     else
       raw=""
     fi

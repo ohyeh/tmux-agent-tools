@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.48.2 - 2026-11-04
+
+- Fix (TUI rule): the dim `─` rule under the list fills the terminal width; it was capped at 59 cells.
+- Fix (TUI frame): `frameOf` counts the bottom footer apart from the top chrome, and the standard preview's `y` includes the list, more line and rule, so the rectangle fitWorker sizes is the one drawn (92x60: rect y 3 vs drawn 5 before, both 5 now).
+- Fix (mirror): the capture's final newline is not a pane row (`TOP\nBOTTOM\n` gave three rows), so the live tail no longer shifts up one row.
+- Fix (mirror): the TUI colour mirror captures physical rows (`--physical-lines`, no `-J`): a soft-wrapped line is no longer joined and cut, and blank bottom rows stay. Secret redaction also masks a secret split across rows. Plain CLI capture keeps joined lines.
+- Fix (band): `lib/workers.ts` measures, pads and clips ambiguous-width characters as 1 cell, like tmux and the TUI.
+- Diagnosis and fix by a Sol worker; reproductions before and after for each. Owner: 「你問 sol 吧」.
+- Not verified: the 92-col title bar that looked short in the owner's screenshot (renders 92 cells before and after); the exact `scrollback 1–93 of 94` state; a live look in Warp.
+
 ## v0.48.1 - 2026-11-04
 
 - Fix (TUI width): an East Asian Width A character (`─`, `·`, `●`, `…`, `↑`) counts 1 cell by default. tmux lays out the mirrored pane with 1, and Warp draws 1; counting 2 cut a worker's `─` input rules at half the preview width and left the header bar short. `TMUX_AGENT_AMBIGUOUS_WIDTH=2` stays as the opt-in. Owner: 「好像又是動態寬度、上下沒處理好」.

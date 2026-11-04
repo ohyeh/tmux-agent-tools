@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { nodeHost } from './host.node.ts'
 import {
   type PanelRow,
@@ -26,6 +26,9 @@ import {
   mirrorOf,
   mirrorProject,
   fitWorker,
+  displayCells,
+  truncateCells,
+  padCells as bandPadCells,
   exactSessionTarget,
   projectSessionsOf,
   sameProject,
@@ -2399,6 +2402,95 @@ test('health writer: heartbeat publishes act/<n>.state for its channel, once per
   assert.deepEqual(act.filter(f => !/^\d+(\.json|\.beat|\.state)?$/.test(f)), [])
 })
 
+test('layout regression: rules fill the standard preview width', () => {
+  const rows = [mockRow('a')]
+  const s: TuiState = { rows, all: rows, selected: 'a', showAll: false, adding: false, resumeInput: '', quit: false }
+  for (const width of [80, 92, 119]) {
+    const rule = renderTuiLines(s, width, 60, 0).find(l => stripAnsi(l).startsWith('─'))!
+    assert.equal(cellWidth(rule), width, `rule at ${width} cols`)
+  }
+})
+
+test('layout regression: preview rectangle matches the painted first and last pane rows', () => {
+  const rows = [mockRow('a')]
+  const s: TuiState = { rows, all: rows, selected: 'a', showAll: false, adding: false, resumeInput: '', quit: false, statusMessage: 'note', statusUntil: 100 }
+  for (const width of [70, 92, 119, 122]) {
+    const state = { ...s, narrowView: 'preview' as const }
+    const rect = tuiLayout(state, width, 60, 0).frame.preview
+    const pane = Array.from({ length: rect.rows }, (_, i) => `PANE-${i}`)
+    const lines = renderTuiLines({ ...state, mirror: { id: 'a', lines: pane } }, width, 60, 0).map(stripAnsi)
+    for (let i = 0; i < rect.rows; i++) assert.equal(lines[rect.y + i]!.slice(rect.x).trim(), pane[i], `${width} row ${i}`)
+    assert.equal(lines.at(-1), 'tmux-agent: note')
+    assert.equal(lines.length, 60)
+  }
+})
+
+test('mirror regression: output terminator is not a pane row', async () => {
+  const row = mockRow('a')
+  const host = quietHost(undefined, '.', '.')
+  host.run = async () => ({ exitCode: 0, stdout: 'TOP\nBOTTOM\n', stderr: '' })
+  const cap = await mirrorOf(host, row.d, 2000, true)
+  assert.deepEqual(cap.lines, ['TOP', 'BOTTOM'])
+  host.run = async () => ({ exitCode: 0, stdout: '', stderr: '' })
+  assert.deepEqual((await mirrorOf(host, row.d, 2000, true)).lines, [])
+})
+
+test('band regression: width and clipping use the same one-cell ambiguous glyphs as tmux', () => {
+  const text = ' workers v0.48.1 · @62dcd839 · tmux 0 · 內部 0 [ + ][ ↻ ][ ⧉ ]    [ ▸ ][ hide ]'
+  assert.equal(displayCells(text), cellWidth(text))
+  assert.equal(truncateCells('─'.repeat(92), 92), '─'.repeat(92))
+  for (const width of [92, 122]) assert.equal(cellWidth(bandPadCells(text, width)), width)
+})
+
+test('mirror regression: real tmux physical rows, wrapped text and trailing blanks survive capture', async () => {
+  const parent = join(process.cwd(), '.workflow')
+  mkdirSync(parent, { recursive: true })
+  const root = mkdtempSync(join(parent, 'tui-rows-'))
+  const socket = join(root, 's')
+  const env = { ...process.env, HOME: root, TMUX_AGENT_DIR: join(root, 'state'), TMUX_AGENT_TMUX_SOCKET: socket, TMUX_AGENT_TOOLS_TENANT: '', AGENT_TMUX_PREFIX: 'test-cli' }
+  const tmux = (...args: string[]) => execFileSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env })
+  const host = quietHost(undefined, root, root)
+  host.run = async argv => {
+    try {
+      const stdout = argv[0] === 'agent-tmux'
+        ? execFileSync(join(import.meta.dirname, '..', 'agent-tmux'), [...argv.slice(1)], { encoding: 'utf8', env })
+        : tmux(...argv.slice(1))
+      return { exitCode: 0, stdout, stderr: '' }
+    } catch (e) { return { exitCode: 1, stdout: '', stderr: String(e) } }
+  }
+  try {
+    for (const width of [92, 122]) {
+      const row = mockRow(`a${width}`)
+      const state: TuiState = { rows: [row], all: [row], selected: row.id, showAll: false, adding: false, resumeInput: '', quit: false }
+      const rect = tuiLayout(state, width, 60, 0).frame.preview
+      const payload = 'W'.repeat(rect.cols * 2 + 7) + 'Z-END'
+      tmux('-f', '/dev/null', 'new-session', '-d', '-x', String(rect.cols), '-y', String(rect.rows), '-s', `test-cli-${row.id}`, `/bin/sh -c "printf '${payload}\\r\\nBOTTOM'; exec sleep 60"`)
+      tmux('set-option', '-g', 'exit-empty', 'off')
+      await until(() => tmux('capture-pane', '-p', '-t', `=test-cli-${row.id}:`).includes('Z-END'), 5000, 'fixture output')
+      const expected = tmux('capture-pane', '-p', '-e', '-t', `=test-cli-${row.id}:`).split('\n').slice(0, -1)
+      const cap = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
+      assert.equal(cap.error, undefined)
+      console.log(`physical ${width}: captured=${cap.lines.length} pane=${expected.length} firstRowCells=${cellWidth(cap.lines[0] ?? '')}`)
+      assert.deepEqual(cap.lines.map(stripAnsi), expected.map(stripAnsi), `${width}: every physical row, including blank bottom rows`)
+      const plain = await host.run(['agent-tmux', 'test', 'capture', '--physical-lines', '--strip-ansi', '--tail', String(MIRROR_HISTORY), row.id], root, 5000)
+      assert.deepEqual(plain.stdout.split('\n').slice(0, -1), expected.map(stripAnsi), 'plain physical capture also preserves rows')
+      const lines = renderTuiLines({ ...state, mirror: { id: row.id, ...cap } }, width, 60, 0).map(stripAnsi)
+      for (let i = 0; i < rect.rows; i++) assert.equal(lines[rect.y + i]!.slice(rect.x).trimEnd(), stripAnsi(expected[i]!), `${width}: drawn pane row ${i}`)
+      const secrets = join(root, 'state', row.id)
+      mkdirSync(secrets, { recursive: true })
+      writeFileSync(join(secrets, 'secrets-redact.list'), `TOKEN\t${Buffer.from(payload).toString('base64')}\n`)
+      const redacted = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
+      assert.equal(redacted.lines.length, rect.rows, 'redaction keeps blank pane rows')
+      assert.ok(!redacted.lines.join('').includes('WWW'), 'a secret split across wrapped rows is masked')
+      assert.ok(redacted.lines.every(l => cellWidth(l) <= rect.cols))
+      tmux('kill-session', '-t', `=test-cli-${row.id}:`)
+    }
+  } finally {
+    try { tmux('kill-server') } catch {}
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('layout: frameOf keeps the preview at ceil(2C/3) for 0..40 rows, and wide uses every content row', () => {
   const ceil2 = (c: number) => Math.ceil((2 * c) / 3)
   for (let rows = 0; rows <= 40; rows++) {
@@ -2609,15 +2701,17 @@ test('mirror: capture failure reaches the preview as an error, not an empty pane
   }
   assert.deepEqual(await mirrorOf(host, d, 10), { lines: [], error: 'spawn agent-tmux ENOENT' })
   host.run = async () => ({ exitCode: 0, stdout: 'a\nb\n', stderr: '' })
-  assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b', ''] })
+  assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b'] })
   assert.deepEqual(await mirrorProject(host, 'x', 10), { lines: ['a', 'b'] })
-  // Colour: SGR is kept (sanitizeAnsi drops the rest when it prints); a row of only SGR is a blank tail.
+  // Colour: physical rows stay, including a bottom row containing only SGR.
   const calls: string[][] = []
   host.run = async (argv: readonly string[]) => (calls.push([...argv]), { exitCode: 0, stdout: '\x1b[31mred\x1b[0m\tx\n\x1b[0m\n', stderr: '' })
-  assert.deepEqual(await mirrorProject(host, 'x', 10, true), { lines: ['\x1b[31mred\x1b[0m x'] })
+  assert.deepEqual(await mirrorProject(host, 'x', 10, true), { lines: ['\x1b[31mred\x1b[0m x', '\x1b[0m'] })
   assert.ok(calls[0]!.includes('-e'))
+  assert.ok(!calls[0]!.includes('-J'), 'the project mirror also keeps physical rows')
   assert.deepEqual((await mirrorOf(host, d, 10, true)).lines[0], '\x1b[31mred\x1b[0m x')
   assert.ok(calls[1]!.includes('--color') && !calls[1]!.includes('--strip-ansi'))
+  assert.ok(calls[1]!.includes('--physical-lines'))
   // Default (the mod panel, which prints lines as they are): no escape reaches a line.
   const plain = [...(await mirrorProject(host, 'x', 10)).lines, ...(await mirrorOf(host, d, 10)).lines]
   assert.ok(plain.every(l => !l.includes('\x1b')))

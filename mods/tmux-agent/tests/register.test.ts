@@ -2407,8 +2407,8 @@ function termCells(text: string): number {
   let n = 0
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0
+    // Ambiguous-width characters such as `·` are 1 cell, as the band counts them (v0.48.2).
     const wide =
-      ch === '·' ||
       (cp >= 0x1100 && cp <= 0x115f) ||
       (cp >= 0x2e80 && cp <= 0xa4cf) ||
       (cp >= 0xac00 && cp <= 0xd7a3) ||

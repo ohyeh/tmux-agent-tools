@@ -389,10 +389,10 @@ export type Host = {
 
 /**
  * Terminal display cells, by the TUI's rules (width.ts, plan §1c S7): graphemes,
- * East Asian Width W = 2, A (`·`, `●`, `─`) = 2 so a hint cannot spill past `[ hide ]`.
+ * East Asian Width W = 2, A (`·`, `●`, `─`) = 1, as in tmux's pane grid.
  */
 export function displayCells(text: string): number {
-  return textCells(text, 2)
+  return textCells(text, 1)
 }
 
 export function padCells(text: string, width: number): string {
@@ -2206,14 +2206,14 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
 export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number, color = false): Promise<MirrorCapture> {
   const probe = await host
     .run(
-      ['agent-tmux', d.profile, 'capture', color ? '--color' : '--strip-ansi', '--tail', String(rows), d.name],
+      ['agent-tmux', d.profile, 'capture', color ? '--color' : '--strip-ansi', ...(color ? ['--physical-lines'] : []), '--tail', String(rows), d.name],
       d.dir,
       MIRROR_PROBE_MS,
     )
     .catch((err: unknown) => err)
   const error = captureError(probe)
   if (error) return { lines: [], error }
-  return { lines: (probe as RunResult).stdout.split('\n').slice(-rows).map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' ')) }
+  return { lines: paneTail((probe as RunResult).stdout, rows, color) }
 }
 
 /** One pane capture: its lines, or why there are none. A failure is not an empty pane. */
@@ -2240,8 +2240,10 @@ function captureError(probe: unknown): string | undefined {
  * output at the top (live 2026-09-26). `agent-tmux capture --tail` trims; this does too.
  */
 export function paneTail(stdout: string, n: number, color = false): string[] {
-  const lines = stdout.split('\n').map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' '))
-  while (lines.length && !lines[lines.length - 1]!.replace(SGR_ONLY_RE, '').trim()) lines.pop()
+  if (!stdout) return []
+  const lines = stdout.replace(/\n$/, '').split('\n').map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' '))
+  // A colour mirror is a physical pane grid: blank bottom rows must stay in place.
+  if (!color) while (lines.length && !lines[lines.length - 1]!.replace(SGR_ONLY_RE, '').trim()) lines.pop()
   return lines.slice(-n)
 }
 
@@ -2258,7 +2260,7 @@ export async function mirrorProject(host: Host, name: string, rows: number, colo
   if (!cwd) return { lines: [], error: 'no session cwd' }
   // -S reaches into scrollback: without it a short pane caps the mirror at one screen.
   const probe = await host
-    .run(['tmux', 'capture-pane', '-p', '-J', ...(color ? ['-e'] : []), '-S', `-${rows}`, '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', ...(color ? ['-e'] : ['-J']), '-S', `-${rows}`, '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
     .catch((err: unknown) => err)
   const error = captureError(probe)
   if (error) return { lines: [], error }
@@ -2789,7 +2791,7 @@ export function truncateCells(text: string, max: number): string {
   let out = ''
   let cur = 0
   for (const g of graphemes(text)) {
-    const w = graphemeWidth(g, 2)
+    const w = graphemeWidth(g, 1)
     if (cur + w > max) break
     out += g
     cur += w

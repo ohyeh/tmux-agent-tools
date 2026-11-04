@@ -1008,11 +1008,13 @@ export function frameOf(
   selected: number,
   headers: number,
   narrowView: NarrowView = 'list',
+  footerRows = 0,
 ): Frame {
   const mode = frameMode(width, height)
   const chrome = Math.min(Math.max(0, headers), Math.max(0, height))
   const title: Rect = { x: 0, y: 0, cols: Math.max(0, width), rows: height > 0 ? 1 : 0 }
-  const footer: Rect = { x: 0, y: Math.max(0, height - 1), cols: Math.max(0, width), rows: 0 }
+  const footer: Rect = { x: 0, y: Math.max(0, height - footerRows), cols: Math.max(0, width), rows: Math.min(footerRows, height) }
+  const contentY = chrome - footer.rows
   const empty = (content: number): Frame => ({
     mode,
     title,
@@ -1034,8 +1036,8 @@ export function frameOf(
     return {
       mode,
       title,
-      list: { x: 0, y: chrome, cols: listCols, rows: C, first: firstShown(selected, shown, rows) },
-      preview: { x: listCols, y: chrome, cols: width - listCols, rows: selected >= 0 ? C : 0 },
+      list: { x: 0, y: contentY, cols: listCols, rows: C, first: firstShown(selected, shown, rows) },
+      preview: { x: listCols, y: contentY, cols: width - listCols, rows: selected >= 0 ? C : 0 },
       footer,
       content: C,
       more,
@@ -1051,7 +1053,7 @@ export function frameOf(
     return {
       mode,
       title,
-      list: { x: 0, y: chrome, cols: width, rows: shown, first: firstShown(selected, shown, rows) },
+      list: { x: 0, y: contentY, cols: width, rows: shown, first: firstShown(selected, shown, rows) },
       preview: { x: 0, y: chrome, cols: width, rows: 0 },
       footer,
       content: C,
@@ -1078,8 +1080,8 @@ export function frameOf(
   return {
     mode,
     title,
-    list: { x: 0, y: chrome, cols: width, rows: shown, first: firstShown(selected, shown, rows) },
-    preview: { x: 0, y: chrome, cols: width, rows: previewRows },
+    list: { x: 0, y: contentY, cols: width, rows: shown, first: firstShown(selected, shown, rows) },
+    preview: { x: 0, y: contentY + shown + more + (selected >= 0 ? 1 : 0), cols: width, rows: previewRows },
     footer,
     content: C,
     more,
@@ -1176,7 +1178,7 @@ function chromeLines(s: Sections): number {
 /** The layout runTui sizes the capture and the detail page with: the same one render draws. */
 export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout {
   const sections = sectionsOf(state, width, now, gate, height)
-  const frame = frameOf(width, height, state.rows.length, sections.sel, chromeLines(sections), state.narrowView ?? 'list')
+  const frame = frameOf(width, height, state.rows.length, sections.sel, chromeLines(sections), state.narrowView ?? 'list', sections.footer.length)
   const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
   const open = state.expanded && state.detail && state.detail.id === state.selected
   return { frame, sections, ...(open ? { detail: wrapCells(state.detail!.lines.join('\n'), wrapW) } : {}) }
@@ -1241,19 +1243,19 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
   if (frame.mode === 'wide') return renderWide(state, width, height, lay)
   const fit = (line: string) => truncateAnsi(line, width)
   const lines: string[] = [s.title, ...s.status.map(fit)]
+  if (s.sel >= 0) lines.push(...s.selExtra.map(fit))
 
   const shown = Math.max(0, state.rows.length - frame.hidden)
   for (let i = frame.list.first; i < frame.list.first + shown; i++) lines.push(fit(rowLine(state, i, s.sel)))
   if (frame.more) lines.push(fit(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`))
 
-  // The row list stays put above; the selected row's hints and preview come after it.
+  // Full-width chrome precedes the list and preview in every frame mode.
   const r = s.sel >= 0 ? state.rows[s.sel] : undefined
   const bodyRows = frame.preview.rows
-  if (r) lines.push(...s.selExtra.map(fit))
   if (r && bodyRows > 0) {
     // The preview owns its rule, `bodyRows` rows and a tail line in every state, so
     // the frame is `height` rows and the footer stays at the bottom (T1 C1).
-    const rule = `\x1b[2m${'─'.repeat(Math.max(0, Math.min(width, 60) - 1))}\x1b[0m`
+    const rule = `\x1b[2m${padCells('─'.repeat(Math.floor(width / cellWidth('─'))), width)}\x1b[0m`
     const body = previewLines(state, bodyRows, lay.detail)
     let tail: string
     if (state.expanded) {
