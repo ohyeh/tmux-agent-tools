@@ -2442,81 +2442,19 @@ test('band regression: width and clipping use the same one-cell ambiguous glyphs
   for (const width of [92, 122]) assert.equal(cellWidth(bandPadCells(text, width)), width)
 })
 
-test('mirror regression: real tmux physical rows, wrapped text and trailing blanks survive capture', async () => {
-  const parent = join(process.cwd(), '.workflow')
-  mkdirSync(parent, { recursive: true })
-  const root = mkdtempSync(join(parent, 'tui-rows-'))
-  const socket = join(root, 's')
-  const env = { ...process.env, HOME: root, TMUX_AGENT_DIR: join(root, 'state'), TMUX_AGENT_TMUX_SOCKET: socket, TMUX_AGENT_TOOLS_TENANT: '', AGENT_TMUX_PREFIX: 'test-cli' }
-  const tmux = (...args: string[]) => execFileSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env })
-  const host = quietHost(undefined, root, root)
-  host.run = async argv => {
-    try {
-      const stdout = argv[0] === 'agent-tmux'
-        ? execFileSync(join(import.meta.dirname, '..', 'agent-tmux'), [...argv.slice(1)], { encoding: 'utf8', env })
-        : tmux(...argv.slice(1))
-      return { exitCode: 0, stdout, stderr: '' }
-    } catch (e) { return { exitCode: 1, stdout: '', stderr: String(e) } }
-  }
-  try {
-    for (const width of [92, 122]) {
-      const row = mockRow(`a${width}`)
-      const state: TuiState = { rows: [row], all: [row], selected: row.id, showAll: false, adding: false, resumeInput: '', quit: false }
-      const rect = tuiLayout(state, width, 60, 0).frame.preview
-      const payload = 'W'.repeat(rect.cols * 2 + 7) + 'Z-END'
-      // A space as the last cell of a wrapped row: tmux trims it unless the capture keeps it (-N).
-      const spaced = 'Q'.repeat(rect.cols - 1) + ' RRRRR'
-      // A multi-line secret on short rows: -N pads each row with spaces up to the pane width.
-      const pem = 'PEMLINEONE\nPEMLINETWO'
-      tmux('-f', '/dev/null', 'new-session', '-d', '-x', String(rect.cols), '-y', String(rect.rows), '-s', `test-cli-${row.id}`, `/bin/sh -c "printf '${payload}\\r\\n${spaced}\\r\\nPEMLINEONE\\r\\nPEMLINETWO\\r\\nBOTTOM'; exec sleep 60"`)
-      tmux('set-option', '-g', 'exit-empty', 'off')
-      await until(() => tmux('capture-pane', '-p', '-t', `=test-cli-${row.id}:`).includes('Z-END'), 5000, 'fixture output')
-      const expected = tmux('capture-pane', '-p', '-e', '-t', `=test-cli-${row.id}:`).split('\n').slice(0, -1)
-      const cap = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
-      assert.equal(cap.error, undefined)
-      console.log(`physical ${width}: captured=${cap.lines.length} pane=${expected.length} firstRowCells=${cellWidth(cap.lines[0] ?? '')}`)
-      const bare = (l: string) => stripAnsi(l).trimEnd()
-      assert.deepEqual(cap.lines.map(bare), expected.map(bare), `${width}: every physical row, including blank bottom rows`)
-      const plain = await host.run(['agent-tmux', 'test', 'capture', '--physical-lines', '--strip-ansi', '--tail', String(MIRROR_HISTORY), row.id], root, 5000)
-      assert.deepEqual(plain.stdout.split('\n').slice(0, -1).map(bare), expected.map(bare), 'plain physical capture also preserves rows')
-      const lines = renderTuiLines({ ...state, mirror: { id: row.id, ...cap } }, width, 60, 0).map(stripAnsi)
-      for (let i = 0; i < rect.rows; i++) assert.equal(lines[rect.y + i]!.slice(rect.x).trimEnd(), stripAnsi(expected[i]!), `${width}: drawn pane row ${i}`)
-      const secrets = join(root, 'state', row.id)
-      mkdirSync(secrets, { recursive: true })
-      // A secret read from a CRLF file ends in \r\n; the pane never shows those bytes.
-      const b64 = (v: string) => Buffer.from(v).toString('base64')
-      writeFileSync(join(secrets, 'secrets-redact.list'), `TOKEN\t${b64(payload + '\r\n')}\nSPACED\t${b64(spaced)}\nPEM\t${b64(pem)}\n`)
-      const redacted = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
-      assert.equal(redacted.lines.length, rect.rows, 'redaction keeps blank pane rows')
-      assert.ok(!redacted.lines.join('').includes('WWW'), 'a secret split across wrapped rows is masked')
-      assert.ok(!redacted.lines.join('').includes('QQQ') && !redacted.lines.join('').includes('RRRRR'), 'a secret with a space at the wrap is masked')
-      assert.ok(!redacted.lines.join('').includes('PEMLINE'), 'a multi-line secret on padded rows is masked')
-      assert.ok(redacted.lines.every(l => cellWidth(l) <= rect.cols))
-      tmux('kill-session', '-t', `=test-cli-${row.id}:`)
-    }
-  } finally {
-    try { tmux('kill-server') } catch {}
-    rmSync(root, { recursive: true, force: true })
-  }
-})
-
-test('layout: frameOf keeps the preview at ceil(2C/3) for 0..40 rows, and wide uses every content row', () => {
+test('layout: frameOf keeps the preview at ceil(2C/3) for 0..40 rows', () => {
   const ceil2 = (c: number) => Math.ceil((2 * c) / 3)
-  for (let rows = 0; rows <= 40; rows++) {
+  for (const width of [100, 120, 123, 160]) for (let rows = 0; rows <= 40; rows++) {
     const headers = 4
-    const frame = frameOf(100, 40, rows, rows > 0 ? 0 : -1, headers, 'list')
+    const frame = frameOf(width, 40, rows, rows > 0 ? 0 : -1, headers, 'list')
     assert.equal(frame.mode, 'standard', `rows ${rows}`)
+    assert.equal(frame.preview.cols, width)
     assert.ok(frame.preview.rows >= ceil2(frame.content), `rows ${rows}: preview ${frame.preview.rows} C ${frame.content}`)
     assert.ok(frame.list.rows <= Math.floor(frame.content / 3), `rows ${rows}: list ${frame.list.rows}`)
     assert.equal(frame.list.rows + frame.preview.rows, frame.content, `rows ${rows}`)
     const used = headers + frame.more + (rows > 0 ? 2 : 0) + frame.list.rows + frame.preview.rows
     assert.ok(used <= 40, `rows ${rows}: ${used} lines`)
   }
-  const wide = frameOf(120, 40, 30, 0, 2, 'list')
-  assert.equal(wide.mode, 'wide')
-  assert.equal(wide.preview.rows, wide.content, 'wide preview is every content row')
-  assert.equal(wide.preview.cols, 72)
-  assert.equal(wide.list.cols, 48)
   const thirty = frameOf(100, 40, 30, 0, 4, 'list')
   assert.equal(thirty.list.rows < 30 && thirty.preview.rows >= Math.ceil((2 * thirty.content) / 3), true)
   const listed = frameOf(70, 24, 3, 0, 4, 'list')
@@ -2712,15 +2650,14 @@ test('mirror: capture failure reaches the preview as an error, not an empty pane
   host.run = async () => ({ exitCode: 0, stdout: 'a\nb\n', stderr: '' })
   assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b'] })
   assert.deepEqual(await mirrorProject(host, 'x', 10), { lines: ['a', 'b'] })
-  // Colour: physical rows stay, including a bottom row containing only SGR.
+  // Colour keeps SGR; empty bottom rows are trimmed.
   const calls: string[][] = []
   host.run = async (argv: readonly string[]) => (calls.push([...argv]), { exitCode: 0, stdout: '\x1b[31mred\x1b[0m\tx\n\x1b[0m\n', stderr: '' })
-  assert.deepEqual(await mirrorProject(host, 'x', 10, true), { lines: ['\x1b[31mred\x1b[0m x', '\x1b[0m'] })
+  assert.deepEqual(await mirrorProject(host, 'x', 10, true), { lines: ['\x1b[31mred\x1b[0m x'] })
   assert.ok(calls[0]!.includes('-e'))
-  assert.ok(!calls[0]!.includes('-J'), 'the project mirror also keeps physical rows')
+  assert.ok(calls[0]!.includes('-J'), 'the project mirror joins wrapped lines')
   assert.deepEqual((await mirrorOf(host, d, 10, true)).lines[0], '\x1b[31mred\x1b[0m x')
   assert.ok(calls[1]!.includes('--color') && !calls[1]!.includes('--strip-ansi'))
-  assert.ok(calls[1]!.includes('--physical-lines'))
   // Default (the mod panel, which prints lines as they are): no escape reaches a line.
   const plain = [...(await mirrorProject(host, 'x', 10)).lines, ...(await mirrorOf(host, d, 10)).lines]
   assert.ok(plain.every(l => !l.includes('\x1b')))
@@ -2852,8 +2789,7 @@ test('fit: a select or a resize fits the worker window once; the tick only captu
     stdout.columns = 120
     stdout.emit('resize')
     await until(() => fits.length === 2, 5_000, 'the resize fits')
-    // Wide list is min(60, floor(120*0.4)) = 48, so the preview (and the worker) is 72.
-    assert.equal(fits[1], '72x21')
+    assert.equal(fits[1], '120x18')
   } finally {
     stdin.emit('data', 'q')
     await run

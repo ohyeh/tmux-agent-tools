@@ -2206,7 +2206,7 @@ export async function panelRows(host: Host, gate: Gate, root: string | undefined
 export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number, color = false): Promise<MirrorCapture> {
   const probe = await host
     .run(
-      ['agent-tmux', d.profile, 'capture', color ? '--color' : '--strip-ansi', ...(color ? ['--physical-lines'] : []), '--tail', String(rows), d.name],
+      ['agent-tmux', d.profile, 'capture', color ? '--color' : '--strip-ansi', '--tail', String(rows), d.name],
       d.dir,
       MIRROR_PROBE_MS,
     )
@@ -2242,8 +2242,7 @@ function captureError(probe: unknown): string | undefined {
 export function paneTail(stdout: string, n: number, color = false): string[] {
   if (!stdout) return []
   const lines = stdout.replace(/\n$/, '').split('\n').map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' '))
-  // A colour mirror is a physical pane grid: blank bottom rows must stay in place.
-  if (!color) while (lines.length && !lines[lines.length - 1]!.replace(SGR_ONLY_RE, '').trim()) lines.pop()
+  while (lines.length && !lines[lines.length - 1]!.replace(SGR_ONLY_RE, '').trim()) lines.pop()
   return lines.slice(-n)
 }
 
@@ -2260,7 +2259,7 @@ export async function mirrorProject(host: Host, name: string, rows: number, colo
   if (!cwd) return { lines: [], error: 'no session cwd' }
   // -S reaches into scrollback: without it a short pane caps the mirror at one screen.
   const probe = await host
-    .run(['tmux', 'capture-pane', '-p', ...(color ? ['-e'] : ['-J']), '-S', `-${rows}`, '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
+    .run(['tmux', 'capture-pane', '-p', '-J', ...(color ? ['-e'] : []), '-S', `-${rows}`, '-t', exactSessionTarget(name)], cwd, MIRROR_PROBE_MS)
     .catch((err: unknown) => err)
   const error = captureError(probe)
   if (error) return { lines: [], error }

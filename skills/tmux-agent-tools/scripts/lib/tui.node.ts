@@ -968,7 +968,7 @@ export type TuiLayout = {
 export type Rect = { x: number; y: number; cols: number; rows: number }
 export type NarrowView = 'list' | 'preview'
 export type Frame = {
-  mode: 'wide' | 'standard' | 'narrow' | 'tiny'
+  mode: 'standard' | 'narrow' | 'tiny'
   title: Rect
   list: Rect & { first: number }
   /** Capture and fitWorker use this rectangle, never the terminal width. */
@@ -982,7 +982,6 @@ export type Frame = {
 
 export function frameMode(width: number, height: number): Frame['mode'] {
   if (width < 40 && height < 10) return 'tiny'
-  if (width >= 120) return 'wide'
   if (width >= 80) return 'standard'
   return 'narrow'
 }
@@ -998,8 +997,7 @@ const firstShown = (selected: number, shown: number, rows: number) =>
 /**
  * One geometry (L1). `headers` is the full-width chrome (title, status, selection
  * extra, footer, group headers). The preview's rule and tail are chrome too, so
- * they are not part of C. Standard: list ≤ ⌊C/3⌋ and preview ≥ ⌈2C/3⌉. Wide:
- * preview rows are all of C, and its width is the right-hand column.
+ * they are not part of C. Standard: list ≤ ⌊C/3⌋ and preview ≥ ⌈2C/3⌉.
  */
 export function frameOf(
   width: number,
@@ -1026,24 +1024,6 @@ export function frameOf(
     hidden: rows,
   })
   if (mode === 'tiny' || width < 1 || height < 1) return empty(0)
-
-  if (mode === 'wide') {
-    const listCols = Math.min(60, Math.floor(width * 0.4))
-    const C = Math.max(0, height - chrome)
-    let shown = Math.min(rows, C)
-    const more = rows > shown ? 1 : 0
-    if (more && shown + more > C) shown = Math.max(0, C - more)
-    return {
-      mode,
-      title,
-      list: { x: 0, y: contentY, cols: listCols, rows: C, first: firstShown(selected, shown, rows) },
-      preview: { x: listCols, y: contentY, cols: width - listCols, rows: selected >= 0 ? C : 0 },
-      footer,
-      content: C,
-      more,
-      hidden: rows - shown,
-    }
-  }
 
   if (mode === 'narrow' && narrowView !== 'preview') {
     let shown = Math.min(rows, Math.max(0, height - chrome))
@@ -1212,35 +1192,12 @@ function previewLines(state: TuiState, bodyRows: number, detail: string[] | unde
   return out
 }
 
-/** Wide: list on the left, preview on the right, both as tall as the content band. */
-function renderWide(state: TuiState, width: number, height: number, lay: TuiLayout): string[] {
-  const { frame, sections: s } = lay
-  const fit = (line: string, cols: number) => padCells(truncateAnsi(line, cols), cols)
-  const lines: string[] = [s.title, ...s.status.map(l => truncateAnsi(l, width))]
-  if (s.sel >= 0) lines.push(...s.selExtra.map(l => truncateAnsi(l, width)))
-  const left: string[] = []
-  const shown = Math.max(0, state.rows.length - frame.hidden)
-  for (let i = frame.list.first; i < frame.list.first + shown; i++) left.push(rowLine(state, i, s.sel))
-  if (frame.more) left.push(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`)
-  const right: string[] = []
-  const r = s.sel >= 0 ? state.rows[s.sel] : undefined
-  if (r && frame.preview.rows > 0) right.push(...previewLines(state, frame.preview.rows, lay.detail))
-  for (let i = 0; i < frame.list.rows; i++) {
-    // Reset at the row end: a tmux capture line can leave its SGR (a diff background) open, which bled into the next row's list column.
-    lines.push(fit(left[i] ?? '', frame.list.cols) + fit(right[i] ?? '', frame.preview.cols) + ANSI_RESET)
-  }
-  for (const f of s.footer) lines.push(truncateAnsi(f, width))
-  while (lines.length < height) lines.push(' ')
-  return lines.slice(0, height)
-}
-
 function linesFromLayout(state: TuiState, width: number, height: number, lay: TuiLayout, gate?: Gate): string[] {
   const { frame, sections: s } = lay
   if (height <= 2) {
     const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
     return [s.title, truncateAnsi(compact, width)].slice(0, height)
   }
-  if (frame.mode === 'wide') return renderWide(state, width, height, lay)
   const fit = (line: string) => truncateAnsi(line, width)
   const lines: string[] = [s.title, ...s.status.map(fit)]
   if (s.sel >= 0) lines.push(...s.selExtra.map(fit))

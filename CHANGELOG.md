@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.48.5 - 2026-11-04
+
+- Removed: `capture --physical-lines` and its awk secret matcher (added in 0.48.2). The TUI mirror is back on the joined `-J` capture and the existing redaction path. This closes the 0.48.4 leak where a multi-line secret whose first line wrapped at a space was shown unmasked. Owner: 「刪啊」.
+- Removed: the wide side-by-side TUI layout (>= 120 cols, added in 0.48.0). Every width >= 80 draws the stacked layout v0.47.0 had: list, full-width rule, full-width preview. At 120+ the list text no longer runs into the preview. Owner: 「以前某個版本都好好的」.
+- Net -154 lines. Done by a Sol worker; checked at 123x105, 160x105 and 92x105 against a live worker, one viewer at a time.
+- Not verified: the 70-col narrow view still shows a blank body after `1` until Enter (not changed); a live look in Warp.
+
 ## v0.48.4 - 2026-11-04
 
 - Fix (security, secret redaction in `capture --physical-lines`): 0.48.3's `-N` pads every unwrapped row with spaces up to the pane width, so a multi-line secret (a PEM key) shown on short rows no longer matched. The matcher now scans the rows twice, with and without each row's trailing spaces, and masks a match from either. Found by the automated commit security review of 4275c7a; the mirror regression test fails on 0.48.3.
