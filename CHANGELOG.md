@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.48.4 - 2026-11-04
+
+- Fix (security, secret redaction in `capture --physical-lines`): 0.48.3's `-N` pads every unwrapped row with spaces up to the pane width, so a multi-line secret (a PEM key) shown on short rows no longer matched. The matcher now scans the rows twice, with and without each row's trailing spaces, and masks a match from either. Found by the automated commit security review of 4275c7a; the mirror regression test fails on 0.48.3.
+- Not verified: the joined (`-J`) capture path was not re-audited for multi-line secrets; a live mirror in Warp.
+
 ## v0.48.3 - 2026-11-04
 
 - Fix (security, secret redaction in `capture --physical-lines`, new in 0.48.2): the match value drops every `\r` and `\n`, so a secret read from a CRLF file is still masked; the physical capture adds `-N`, so a secret with a space as the last cell of a wrapped row is still masked (tmux trimmed that space). Both found by the automated commit security review; the mirror regression test now fails on 0.48.2 for each.

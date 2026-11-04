@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.48.3'
+AGENT_TMUX_VERSION='0.48.4'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -4295,17 +4295,24 @@ secret_redact_apply() {
     if (( physical_lines )); then
       # Match across wraps/SGR, but keep row breaks; each hidden row segment becomes `*`.
       text="$(printf '%s' "$text" | REDACT_S="$sval" awk '
+        # Scan twice: with each row'"'"'s trailing spaces (a space at a wrap, kept by -N) and
+        # without them (-N pads unwrapped rows, which would split a multi-line secret).
+        function scan(keep,   j, c, f, n, at, off) {
+          f=""; n=0
+          for (j=1; j<=L; j++) { c=substr(plain,j,1); if (c=="\n" || (!keep && trail[j])) continue; f=f c; pos[++n]=j }
+          off=1
+          while ((at=index(substr(f,off),s))) {
+            at+=off-1; found=1
+            for (j=at; j<at+length(s); j++) hidden[pos[j]]=1
+            off=at+length(s)
+          }
+        }
         BEGIN { RS="\034"; ORS=""; s=ENVIRON["REDACT_S"]; gsub(/[\r\n]/, "", s) }
         {
           plain=$0; gsub(/\033\[[0-9;:]*m/, "", plain)
-          flat=""; n=0
-          for (j=1; j<=length(plain); j++) if (substr(plain,j,1)!="\n") { flat=flat substr(plain,j,1); pos[++n]=j }
-          offset=1; found=0
-          while (length(s) && (at=index(substr(flat,offset),s))) {
-            at+=offset-1; found=1
-            for (j=at; j<at+length(s); j++) hidden[pos[j]]=1
-            offset=at+length(s)
-          }
+          L=length(plain); found=0; tail=1
+          for (j=L; j>=1; j--) { c=substr(plain,j,1); if (c=="\n") tail=1; else if (c==" " && tail) trail[j]=1; else tail=0 }
+          if (length(s)) { scan(1); scan(0) }
           if (!found) { print $0; next }
           for (j=1; j<=length(plain); j++) {
             if (!hidden[j]) printf "%s", substr(plain,j,1)

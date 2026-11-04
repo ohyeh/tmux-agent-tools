@@ -2466,7 +2466,9 @@ test('mirror regression: real tmux physical rows, wrapped text and trailing blan
       const payload = 'W'.repeat(rect.cols * 2 + 7) + 'Z-END'
       // A space as the last cell of a wrapped row: tmux trims it unless the capture keeps it (-N).
       const spaced = 'Q'.repeat(rect.cols - 1) + ' RRRRR'
-      tmux('-f', '/dev/null', 'new-session', '-d', '-x', String(rect.cols), '-y', String(rect.rows), '-s', `test-cli-${row.id}`, `/bin/sh -c "printf '${payload}\\r\\n${spaced}\\r\\nBOTTOM'; exec sleep 60"`)
+      // A multi-line secret on short rows: -N pads each row with spaces up to the pane width.
+      const pem = 'PEMLINEONE\nPEMLINETWO'
+      tmux('-f', '/dev/null', 'new-session', '-d', '-x', String(rect.cols), '-y', String(rect.rows), '-s', `test-cli-${row.id}`, `/bin/sh -c "printf '${payload}\\r\\n${spaced}\\r\\nPEMLINEONE\\r\\nPEMLINETWO\\r\\nBOTTOM'; exec sleep 60"`)
       tmux('set-option', '-g', 'exit-empty', 'off')
       await until(() => tmux('capture-pane', '-p', '-t', `=test-cli-${row.id}:`).includes('Z-END'), 5000, 'fixture output')
       const expected = tmux('capture-pane', '-p', '-e', '-t', `=test-cli-${row.id}:`).split('\n').slice(0, -1)
@@ -2483,11 +2485,12 @@ test('mirror regression: real tmux physical rows, wrapped text and trailing blan
       mkdirSync(secrets, { recursive: true })
       // A secret read from a CRLF file ends in \r\n; the pane never shows those bytes.
       const b64 = (v: string) => Buffer.from(v).toString('base64')
-      writeFileSync(join(secrets, 'secrets-redact.list'), `TOKEN\t${b64(payload + '\r\n')}\nSPACED\t${b64(spaced)}\n`)
+      writeFileSync(join(secrets, 'secrets-redact.list'), `TOKEN\t${b64(payload + '\r\n')}\nSPACED\t${b64(spaced)}\nPEM\t${b64(pem)}\n`)
       const redacted = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
       assert.equal(redacted.lines.length, rect.rows, 'redaction keeps blank pane rows')
       assert.ok(!redacted.lines.join('').includes('WWW'), 'a secret split across wrapped rows is masked')
       assert.ok(!redacted.lines.join('').includes('QQQ') && !redacted.lines.join('').includes('RRRRR'), 'a secret with a space at the wrap is masked')
+      assert.ok(!redacted.lines.join('').includes('PEMLINE'), 'a multi-line secret on padded rows is masked')
       assert.ok(redacted.lines.every(l => cellWidth(l) <= rect.cols))
       tmux('kill-session', '-t', `=test-cli-${row.id}:`)
     }
