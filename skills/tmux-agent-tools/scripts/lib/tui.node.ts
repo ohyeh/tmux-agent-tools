@@ -143,9 +143,10 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, '')
 }
 
-/** `TMUX_AGENT_AMBIGUOUS_WIDTH` (1 or 2, default 2): cells for an East Asian Width A character. */
+/** `TMUX_AGENT_AMBIGUOUS_WIDTH` (1 or 2, default 1): cells for an East Asian Width A character. */
+// Default 1: tmux lays out the mirrored pane with 1, so 2 cut a worker's `─` rule at half the width.
 export function ambiguousWidth(): 1 | 2 {
-  return process.env.TMUX_AGENT_AMBIGUOUS_WIDTH === '1' ? 1 : 2
+  return process.env.TMUX_AGENT_AMBIGUOUS_WIDTH === '2' ? 2 : 1
 }
 
 export { graphemes } from './width.ts'

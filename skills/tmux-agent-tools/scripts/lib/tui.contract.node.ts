@@ -1045,8 +1045,9 @@ test('width: S7 fixtures with hard-coded cell counts', () => {
       ['text-presentation heart U+2764', '❤', 1],
       ['heart U+2764 + VS16', '❤️', 2],
       ['CJK', '中文字', 6],
-      ['middle dot (ambiguous)', '·', 2],
-      ['plus-minus (ambiguous)', '±', 2],
+      ['middle dot (ambiguous)', '·', 1],
+      ['plus-minus (ambiguous)', '±', 1],
+      ['box rule (ambiguous)', '─'.repeat(74), 74],
       ['leading combining mark', '́', 0],
       ['leading combining mark then a', '́a', 1],
       ['e + combining acute', 'é', 1],
@@ -1057,13 +1058,13 @@ test('width: S7 fixtures with hard-coded cell counts', () => {
   })
 })
 
-test('width: TMUX_AGENT_AMBIGUOUS_WIDTH=1 makes ambiguous characters one cell', () => {
-  withAmbiguous('1', () => {
-    assert.equal(cellWidth('·'), 1)
-    assert.equal(cellWidth('±'), 1)
+test('width: TMUX_AGENT_AMBIGUOUS_WIDTH=2 makes ambiguous characters two cells', () => {
+  withAmbiguous('2', () => {
+    assert.equal(cellWidth('·'), 2)
+    assert.equal(cellWidth('±'), 2)
     assert.equal(cellWidth('中'), 2, 'W stays 2')
   })
-  withAmbiguous('2', () => assert.equal(cellWidth('±'), 2))
+  withAmbiguous('1', () => assert.equal(cellWidth('±'), 1))
 })
 
 test('width: the generated EAW table', () => {
