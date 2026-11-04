@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.48.2'
+AGENT_TMUX_VERSION='0.48.3'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -4295,7 +4295,7 @@ secret_redact_apply() {
     if (( physical_lines )); then
       # Match across wraps/SGR, but keep row breaks; each hidden row segment becomes `*`.
       text="$(printf '%s' "$text" | REDACT_S="$sval" awk '
-        BEGIN { RS="\034"; ORS=""; s=ENVIRON["REDACT_S"]; gsub(/\n/, "", s) }
+        BEGIN { RS="\034"; ORS=""; s=ENVIRON["REDACT_S"]; gsub(/[\r\n]/, "", s) }
         {
           plain=$0; gsub(/\033\[[0-9;:]*m/, "", plain)
           flat=""; n=0
@@ -6688,7 +6688,8 @@ capture_session() {
 
   local raw
   local -a pane_flags=()
-  (( physical_lines )) || pane_flags+=(-J)
+  # -N keeps each row's trailing spaces, so a secret with a space at a wrap still matches.
+  if (( physical_lines )); then pane_flags+=(-N); else pane_flags+=(-J); fi
   (( color )) && pane_flags+=(-e)
   if (( physical_lines )); then
     # Keep blank pane rows through command substitution; remove only tmux's final delimiter.

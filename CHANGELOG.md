@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.48.3 - 2026-11-04
+
+- Fix (security, secret redaction in `capture --physical-lines`, new in 0.48.2): the match value drops every `\r` and `\n`, so a secret read from a CRLF file is still masked; the physical capture adds `-N`, so a secret with a space as the last cell of a wrapped row is still masked (tmux trimmed that space). Both found by the automated commit security review; the mirror regression test now fails on 0.48.2 for each.
+- Not verified: a live mirror in Warp.
+
 ## v0.48.2 - 2026-11-04
 
 - Fix (TUI rule): the dim `─` rule under the list fills the terminal width; it was capped at 59 cells.

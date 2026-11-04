@@ -2464,24 +2464,30 @@ test('mirror regression: real tmux physical rows, wrapped text and trailing blan
       const state: TuiState = { rows: [row], all: [row], selected: row.id, showAll: false, adding: false, resumeInput: '', quit: false }
       const rect = tuiLayout(state, width, 60, 0).frame.preview
       const payload = 'W'.repeat(rect.cols * 2 + 7) + 'Z-END'
-      tmux('-f', '/dev/null', 'new-session', '-d', '-x', String(rect.cols), '-y', String(rect.rows), '-s', `test-cli-${row.id}`, `/bin/sh -c "printf '${payload}\\r\\nBOTTOM'; exec sleep 60"`)
+      // A space as the last cell of a wrapped row: tmux trims it unless the capture keeps it (-N).
+      const spaced = 'Q'.repeat(rect.cols - 1) + ' RRRRR'
+      tmux('-f', '/dev/null', 'new-session', '-d', '-x', String(rect.cols), '-y', String(rect.rows), '-s', `test-cli-${row.id}`, `/bin/sh -c "printf '${payload}\\r\\n${spaced}\\r\\nBOTTOM'; exec sleep 60"`)
       tmux('set-option', '-g', 'exit-empty', 'off')
       await until(() => tmux('capture-pane', '-p', '-t', `=test-cli-${row.id}:`).includes('Z-END'), 5000, 'fixture output')
       const expected = tmux('capture-pane', '-p', '-e', '-t', `=test-cli-${row.id}:`).split('\n').slice(0, -1)
       const cap = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
       assert.equal(cap.error, undefined)
       console.log(`physical ${width}: captured=${cap.lines.length} pane=${expected.length} firstRowCells=${cellWidth(cap.lines[0] ?? '')}`)
-      assert.deepEqual(cap.lines.map(stripAnsi), expected.map(stripAnsi), `${width}: every physical row, including blank bottom rows`)
+      const bare = (l: string) => stripAnsi(l).trimEnd()
+      assert.deepEqual(cap.lines.map(bare), expected.map(bare), `${width}: every physical row, including blank bottom rows`)
       const plain = await host.run(['agent-tmux', 'test', 'capture', '--physical-lines', '--strip-ansi', '--tail', String(MIRROR_HISTORY), row.id], root, 5000)
-      assert.deepEqual(plain.stdout.split('\n').slice(0, -1), expected.map(stripAnsi), 'plain physical capture also preserves rows')
+      assert.deepEqual(plain.stdout.split('\n').slice(0, -1).map(bare), expected.map(bare), 'plain physical capture also preserves rows')
       const lines = renderTuiLines({ ...state, mirror: { id: row.id, ...cap } }, width, 60, 0).map(stripAnsi)
       for (let i = 0; i < rect.rows; i++) assert.equal(lines[rect.y + i]!.slice(rect.x).trimEnd(), stripAnsi(expected[i]!), `${width}: drawn pane row ${i}`)
       const secrets = join(root, 'state', row.id)
       mkdirSync(secrets, { recursive: true })
-      writeFileSync(join(secrets, 'secrets-redact.list'), `TOKEN\t${Buffer.from(payload).toString('base64')}\n`)
+      // A secret read from a CRLF file ends in \r\n; the pane never shows those bytes.
+      const b64 = (v: string) => Buffer.from(v).toString('base64')
+      writeFileSync(join(secrets, 'secrets-redact.list'), `TOKEN\t${b64(payload + '\r\n')}\nSPACED\t${b64(spaced)}\n`)
       const redacted = await mirrorOf(host, row.d, MIRROR_HISTORY, true)
       assert.equal(redacted.lines.length, rect.rows, 'redaction keeps blank pane rows')
       assert.ok(!redacted.lines.join('').includes('WWW'), 'a secret split across wrapped rows is masked')
+      assert.ok(!redacted.lines.join('').includes('QQQ') && !redacted.lines.join('').includes('RRRRR'), 'a secret with a space at the wrap is masked')
       assert.ok(redacted.lines.every(l => cellWidth(l) <= rect.cols))
       tmux('kill-session', '-t', `=test-cli-${row.id}:`)
     }
