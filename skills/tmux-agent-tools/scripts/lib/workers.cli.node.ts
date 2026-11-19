@@ -14,7 +14,9 @@
 //   unlock <name> [confirm]    maintenance: remove a lock whose holder is provably gone
 // --session and --cwd are required (§3). A missing identity is a refusal, never "mine".
 // Exit: 0 ok; 1 refused or failed (the reason is printed); 2 bad arguments.
+import { realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { nodeHost } from './host.node.ts'
 import {
@@ -141,4 +143,6 @@ async function main(): Promise<void> {
   bad(command ? `unknown command "${command}"` : 'a command is required')
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) await main()
+// As collector/launcher/tui do: argv[1] as a file URL, links resolved, so a path with a space,
+// `%`, `#` or non-ASCII still runs main() (a raw `file://` compare skipped it and exited 0).
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) await main()
