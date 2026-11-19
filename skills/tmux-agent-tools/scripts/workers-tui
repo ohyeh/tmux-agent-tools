@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# tmux-agent-tui: the full-screen workers TUI (lib/tui.node.ts) without the
+# workers-tui: the full-screen workers TUI (lib/tui.node.ts) without the
 # long `node …/lib/tui.node.ts` line (plan R2.1, D-entry).
 #
 # Its own dir comes from `${0:A:h}` (symlinks resolved), so it runs the same
@@ -17,33 +17,35 @@ FLOOR_MINOR=18
 
 usage() {
   cat <<'EOF'
-tmux-agent-tui - full-screen TUI for the tmux-agent workers of one session.
+workers-tui - full-screen TUI for the tmux-agent workers of one session.
 
 Usage:
-  tmux-agent-tui [--session <id>] [--cwd <dir>]
+  workers-tui [--session <id>] [--cwd <dir>] [--claim <token>]
 
   --session <id>   Owner mode: act on this session's workers (tell, stop,
                    resume, clear). Default: $TMUX_AGENT_SESSION.
   --cwd <dir>      The session's directory. Default: the current directory.
+  --claim <token>  Adopt that pending claim and become ready. A token that is
+                   no longer current exits; it does not take a new claim.
 
 Without a session id the TUI is a viewer: it lists every worker, labeled,
 and is read-only.
 
 Maintenance of the launcher (lib/launcher.node.ts); no TTY needed. Without
 --yes each prints what it would do and changes nothing:
-  tmux-agent-tui --unlock-launcher <session> [--yes]
+  workers-tui --unlock-launcher <session> [--yes]
                    Remove the session's launcher lock (collector.owner), only
                    when its holder process is provably gone. One unlock runs at
                    a time (collector.owner.unlock); a crashed one stays busy
                    and is removed by hand.
-  tmux-agent-tui --migrate-launcher <session> [--yes]
+  workers-tui --migrate-launcher <session> [--yes]
                    Move the old launcher's collector.lock / collector.pid /
                    collector.log into legacy-<time>/, only when no launcher or
                    collector process for that session runs (this command's own
                    parent included), nor a child of one. The check is one ps
                    snapshot and the old launcher takes no lock: --yes confirms
                    that no old launcher or collector will start meanwhile.
-  tmux-agent-tui --handover-channel <session> <mod|node|mcp> [--yes]
+  workers-tui --handover-channel <session> <mod|node|mcp> [--yes]
                    Switch the session's one delivery channel (channel) to <to>.
                    Takes channel.lock, then collector.owner, and only when one ps
                    snapshot shows no registration caller of the old channel (a
@@ -64,7 +66,7 @@ EOF
 
 require_node() {
   [[ -n "$NODE" && -x "$NODE" ]] || {
-    echo "tmux-agent-tui: node not found; install Node >= $FLOOR_MAJOR.$FLOOR_MINOR or set NODE=/path/to/node" >&2
+    echo "workers-tui: node not found; install Node >= $FLOOR_MAJOR.$FLOOR_MINOR or set NODE=/path/to/node" >&2
     exit 1
   }
   local version major minor
@@ -73,7 +75,7 @@ require_node() {
   major="${version%%.*}"
   minor="${${version#*.}%%.*}"
   if [[ "$major" != <-> || "$minor" != <-> ]] || (( major < FLOOR_MAJOR || (major == FLOOR_MAJOR && minor < FLOOR_MINOR) )); then
-    echo "tmux-agent-tui: node ${version:-<no version>} ($NODE) is below the floor $FLOOR_MAJOR.$FLOOR_MINOR; install a newer Node or set NODE=/path/to/node" >&2
+    echo "workers-tui: node ${version:-<no version>} ($NODE) is below the floor $FLOOR_MAJOR.$FLOOR_MINOR; install a newer Node or set NODE=/path/to/node" >&2
     exit 1
   fi
 }
@@ -88,17 +90,17 @@ args=()
 while (( $# )); do
   case "$1" in
     -h|--help|help) usage; exit 0 ;;
-    --session|--cwd)
-      (( $# >= 2 )) || { echo "tmux-agent-tui: $1 needs a value" >&2; exit 2; }
+    --session|--cwd|--claim)
+      (( $# >= 2 )) || { echo "workers-tui: $1 needs a value" >&2; exit 2; }
       args+=("$1" "$2"); shift 2 ;;
-    --session=*|--cwd=*) args+=("$1"); shift ;;
-    *) echo "tmux-agent-tui: unknown argument: $1 (see --help)" >&2; exit 2 ;;
+    --session=*|--cwd=*|--claim=*) args+=("$1"); shift ;;
+    *) echo "workers-tui: unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
 
 require_node
 if [[ ! -t 0 || ! -t 1 ]]; then
-  echo "tmux-agent-tui: needs a terminal (stdin and stdout must be a TTY); for a JSON snapshot use tmux-agent-dashboard" >&2
+  echo "workers-tui: needs a terminal (stdin and stdout must be a TTY); for a JSON snapshot use tmux-agent-dashboard" >&2
   exit 2
 fi
 exec "$NODE" "$SCRIPT_DIR/lib/tui.node.ts" "${args[@]}"

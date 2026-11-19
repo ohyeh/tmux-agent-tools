@@ -5,11 +5,12 @@ import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { nodeHost } from './host.node.ts'
 import {
   type PanelRow,
   newGate,
+  type HcAgent,
   assignWorker,
   panelRows,
   wrapperCall,
@@ -26,13 +27,25 @@ import {
   mirrorOf,
   mirrorProject,
   fitWorker,
+  displayCells,
+  truncateCells,
+  padCells as bandPadCells,
   exactSessionTarget,
   projectSessionsOf,
   sameProject,
+  claimTui,
+  processId,
+  ageText,
+  deleteWorker,
+  hcFinished,
+  parseHc,
+  scan,
   type Health,
 } from './workers.ts'
+import { sessionKey } from './ledger.ts'
 import {
   nextKeyState,
+  applyRowsTick,
   renderTuiLines,
   restoreTerminal,
   enterTerminal,
@@ -52,7 +65,7 @@ import {
   graphemeWidth,
   graphemes,
   sanitizeAnsi,
-  layoutOf,
+  frameOf,
   tuiLayout,
   healthText,
   emptyText,
@@ -60,12 +73,22 @@ import {
   wrapCells,
   MUTATING_KEYS,
   READ_ONLY,
+  PREVIEW_ONLY,
   rowHints,
+  listSessions,
+  rebindHost,
+  applyPick,
   PAGE_DOWN,
   PAGE_UP,
   MIRROR_HISTORY,
   ANSI_CLEAR_HOME,
+  ANSI_SYNC_START,
   padCells,
+  hcId,
+  applyHerdrTick,
+  hcDetailText,
+  mirrorHc,
+  readHcDetail,
 } from './tui.node.ts'
 import { eawOf, EAW_UNICODE_VERSION } from './eaw-table.ts'
 
@@ -187,7 +210,7 @@ test('key-state: 1-9 selects row, and pressing same digit deselects', () => {
   assert.equal(s3.state.selected, undefined)
 })
 
-test('key-state: j/k and Up/Down arrows navigate selection', () => {
+test('key-state: j/k navigate selection', () => {
   const rows = [mockRow('w1'), mockRow('w2')]
   const base: TuiState = {
     rows,
@@ -200,14 +223,512 @@ test('key-state: j/k and Up/Down arrows navigate selection', () => {
   const d1 = nextKeyState(base, 'j', 1000)
   assert.equal(d1.state.selected, 'w1')
 
-  const d2 = nextKeyState(d1.state, '\x1b[B', 1000) // Down
+  const d2 = nextKeyState(d1.state, 'j', 1000)
   assert.equal(d2.state.selected, 'w2')
 
   const u1 = nextKeyState(d2.state, 'k', 1000)
   assert.equal(u1.state.selected, 'w1')
 
-  const u2 = nextKeyState(u1.state, '\x1b[A', 1000) // Up wraps to last
+  const u2 = nextKeyState(u1.state, 'k', 1000) // wraps to last
   assert.equal(u2.state.selected, 'w2')
+})
+
+test('key-state: ↑/↓ and SS3 scroll the mirror; j/k still select (T6a)', () => {
+  const rows = [mockRow('w1'), mockRow('w2')]
+  const base: TuiState = {
+    rows,
+    all: rows,
+    showAll: false,
+    selected: 'w1',
+    adding: false,
+    resumeInput: '',
+    quit: false,
+    mirror: { id: 'w1', lines: ['a', 'b', 'c', 'd'] },
+    back: 0,
+    page: 2,
+  }
+  const up = nextKeyState(base, '\x1b[A', 1000)
+  assert.equal(up.state.selected, 'w1', 'up does not change selection')
+  assert.equal(up.state.back, 1, 'up scrolls one line')
+  const ss3 = nextKeyState(base, '\x1bOA', 1000)
+  assert.equal(ss3.state.back, 1, 'SS3 up scrolls')
+  const down = nextKeyState(up.state, '\x1b[B', 1000)
+  assert.equal(down.state.back, 0, 'down scrolls back toward live')
+  const j = nextKeyState(base, 'j', 1000)
+  assert.equal(j.state.selected, 'w2', 'j still selects')
+})
+
+test('key-state: preview x does not arm; e enters 編輯 (T6a)', () => {
+  const s: TuiState = { ...ownerState(), mode: 'preview' }
+  const x = nextKeyState(s, 'x', 1000)
+  assert.equal(x.action, undefined)
+  assert.match(x.state.statusMessage ?? '', /預覽/)
+  const e = nextKeyState(s, 'e', 1000)
+  assert.equal(e.state.mode, 'edit')
+  const armed = nextKeyState(e.state, 'x', 1000)
+  assert.equal(armed.state.armedStop?.id, 'w1')
+})
+
+test('tick: an armed x survives a rows tick on the same row (I14)', () => {
+  const row = mockRow('w1')
+  const armed = { id: 'w1', from: 1000, until: 6000 }
+  const s: TuiState = {
+    rows: [row],
+    all: [row],
+    showAll: false,
+    selected: 'w1',
+    adding: false,
+    resumeInput: '',
+    quit: false,
+    armedStop: armed,
+    mode: 'edit',
+    owner: 'S',
+  }
+  assert.deepEqual(applyRowsTick(s, [{ ...row }]).armedStop, armed)
+})
+
+test('key-state: Esc at the top of 預覽 quits (T6b)', () => {
+  const top: TuiState = { rows: [mockRow('w1')], all: [], showAll: false, adding: false, resumeInput: '', quit: false, mode: 'preview' }
+  const q = nextKeyState(top, '\x1b', 1)
+  assert.equal(q.state.quit, true)
+  assert.equal(q.action?.type, 'quit')
+})
+
+test('terminal: entry is mouse-off, ?1007h, paste, alt screen, and the window title (T6b)', () => {
+  let output = ''
+  const stdin = { isTTY: true, isRaw: false, readableFlowing: false, setRawMode() {}, resume() {} }
+  const stdout = { write(s: string) { output += s; return true } }
+  enterTerminal(stdin as any, stdout as any, 'workers-tui abcdefgh')
+  assert.match(output, /\x1b\[\?1007h/)
+  assert.doesNotMatch(output, /\x1b\[\?1000h/)
+  assert.match(output, /\x1b\[\?2004h/)
+  assert.match(output, /\x1b\[\?1049h/)
+  assert.match(output, /\x1b\]0;workers-tui abcdefgh\x07/)
+})
+
+test('terminal: SIGHUP restores ?1007l once (T6b)', async () => {
+  const { stdin, stdout } = mockTty()
+  const root = mkdtempSync(join(tmpdir(), 'tui-hup-'))
+  const run = runTui({ stdin, stdout, host: quietHost('hup', root, root), session: 'hup-session', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes(' workers'), 5_000, 'first render')
+  process.emit('SIGHUP')
+  try {
+    await until(() => stdout.written.includes('\x1b[?1007l'), 800, 'SIGHUP restore')
+    process.emit('SIGHUP')
+    await new Promise(r => setTimeout(r, 30))
+    const leaves = stdout.written.split('\x1b[?1007l').length - 1
+    assert.equal(leaves, 1, 'restore once')
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+  }
+})
+
+test('picker: four liveness kinds, cwd order, claim ready, occupied stays viewer (T7)', async () => {
+  const s: TuiState = { ...ownerState(), cwdFrom: 'unknown' }
+  const n = nextKeyState(s, 'n', 1)
+  assert.equal(n.state.adding, false)
+  assert.match(n.state.statusMessage ?? '', /cwd unknown/)
+  assert.equal(nextKeyState(s, '+', 1).state.adding, false)
+  assert.equal(nextKeyState(s, 'N', 1).action, undefined)
+
+  const root = mkdtempSync(join(tmpdir(), 'tui-pick-'))
+  const v3 = v3Of(root)
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  const sock = join(root, 'priv.sock')
+  const put = (id: string, kind: 'live' | 'initializing' | 'non-live' | 'unknown') => {
+    const sd = sessionDirOf(v3, id)
+    mkdirSync(sd, { recursive: true })
+    if (kind === 'unknown') {
+      writeFileSync(join(sd, 'act'), 'not-a-dir')
+      return
+    }
+    mkdirSync(join(sd, 'act', '1'), { recursive: true })
+    if (kind === 'initializing') return
+    writeFileSync(join(sd, 'act', '1.beat'), '')
+    writeFileSync(join(sd, 'act', '1.json'), JSON.stringify({ token: 'tok' }))
+    writeFileSync(join(sd, 'act', '1.state'), JSON.stringify({ channel: 'node', status: 'collecting', token: 'tok', mode: 'auto' }))
+    if (kind === 'non-live') {
+      const old = (Date.now() - 200_000) / 1000
+      utimesSync(join(sd, 'act', '1.beat'), old, old)
+    }
+  }
+  put('live-one', 'live')
+  put('init-one', 'initializing')
+  put('dead-one', 'non-live')
+  put('unk-one', 'unknown')
+  writeFileSync(join(sessionDirOf(v3, 'live-one'), 'collector.json'), JSON.stringify({ session: 'live-one', cwd: repo, socket: sock }))
+  writeFileSync(join(sessionDirOf(v3, 'dead-one'), 'collector.json'), JSON.stringify({ session: 'dead-one', cwd: '/' }))
+  const worker = (name: string, owner: string, ownerCwd: string) => {
+    mkdirSync(join(v3, name), { recursive: true })
+    writeFileSync(join(v3, name, 'worker.json'), JSON.stringify({ owner, ownerCwd }))
+  }
+  worker('agreed', 'init-one', repo)
+  worker('slash', 'dead-one', '/')
+  worker('split-a', 'unk-one', join(root, 'a'))
+  worker('split-b', 'unk-one', join(root, 'b'))
+
+  const host = nodeHost({ cwd: root })
+  const listed = await listSessions(host, root, Date.now())
+  const by = (id: string) => listed.find(e => e.session === id)
+  assert.equal(by('live-one')?.liveness, 'live')
+  assert.equal(by('init-one')?.liveness, 'initializing')
+  assert.equal(by('dead-one')?.liveness, 'non-live')
+  assert.equal(by('unk-one')?.liveness, 'unknown')
+  assert.equal(by('live-one')?.cwdFrom, 'collector')
+  assert.equal(by('live-one')?.cwd, repo)
+  assert.equal(by('live-one')?.socket, sock)
+  assert.equal(by('init-one')?.cwdFrom, 'workers')
+  assert.equal(by('init-one')?.cwd, repo)
+  assert.equal(by('dead-one')?.cwd, undefined)
+  assert.equal(by('dead-one')?.cwdFrom, 'unknown')
+  assert.equal(by('unk-one')?.cwdFrom, 'unknown')
+  assert.equal(listed.some(e => e.cwd === '/'), false)
+
+  const drawn = renderTuiLines({ ...ownerState(), mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 }, 120, 30, 1)
+    .map(stripAnsi)
+    .join('\n')
+  assert.match(drawn, /\[live\]/)
+  assert.match(drawn, /\[initializing\]/)
+  assert.match(drawn, /\[non-live\]/)
+  assert.match(drawn, /\[unknown\]/)
+
+  const calls: string[][] = []
+  const bound = rebindHost(
+    { ...host, run: async argv => { calls.push([...argv]); return { exitCode: 0, stdout: '', stderr: '' } } },
+    { session: 'live-one', cwd: repo, socket: sock },
+  )
+  assert.equal(bound.owner(), 'live-one')
+  assert.equal(bound.cwd(), repo)
+  await bound.run(['tmux', 'list-sessions'], repo, 1000)
+  assert.deepEqual(calls[0]?.slice(0, 3), ['tmux', '-S', sock])
+  const unknownCwd = rebindHost(host, { session: 'dead-one' })
+  assert.equal(unknownCwd.cwd(), undefined)
+
+  const warpHost = { ...host, envTermProgram: async () => 'WarpTerminal', envTmuxPane: async () => undefined }
+  const viewer: TuiState = { ...ownerState(), mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 }
+  const liveIndex = listed.findIndex(e => e.session === 'live-one')
+  const got = await applyPick(warpHost, root, viewer, liveIndex)
+  assert.equal(got.state.mode, 'edit')
+  assert.equal(got.state.viewer, false)
+  assert.equal(got.state.owner, 'live-one')
+  assert.equal(got.state.cwdFrom, 'collector')
+  assert.equal(got.host.owner(), 'live-one')
+  assert.equal(got.host.cwd(), repo)
+  const rec = JSON.parse(readFileSync(join(sessionDirOf(v3, 'live-one'), 'tui.owner'), 'utf8')) as { state: string; locator: { kind: string; tabTitle?: string } }
+  assert.equal(rec.state, 'ready')
+  assert.equal(rec.locator.kind, 'warp')
+  assert.match(rec.locator.tabTitle ?? '', /^workers-tui live-one/)
+  const second = await claimTui(warpHost, root, 'live-one', { host: 'other-host', pid: 1, pidStart: 'not-this-process' }, { state: 'ready', locator: { kind: 'warp', tabTitle: 'other' } })
+  assert.equal(second.kind, 'occupied-ready')
+  assert.equal(second.kind === 'occupied-ready' ? second.locator?.kind : '', 'warp')
+  const again = await applyPick(warpHost, root, viewer, liveIndex)
+  assert.equal(again.state.viewer, true)
+  assert.equal(again.state.owner, undefined)
+  assert.equal(again.state.mode, 'preview')
+  assert.equal(again.host, warpHost)
+  assert.match(again.state.statusMessage ?? '', /ready/)
+})
+
+test('picker: cwd and session escapes are stripped before draw (FR-01)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-pick-osc-'))
+  const osc = '\x1b]52;c;cmV2aWV3\x07'
+  const unsafe = join(root, `repo-${osc}`)
+  mkdirSync(unsafe, { recursive: true })
+  const v3 = v3Of(root)
+  const live = (id: string) => {
+    const sd = sessionDirOf(v3, id)
+    mkdirSync(join(sd, 'act', '1'), { recursive: true })
+    writeFileSync(join(sd, 'act', '1.json'), JSON.stringify({ token: 'review' }))
+    writeFileSync(join(sd, 'act', '1.state'), JSON.stringify({ channel: 'node', status: 'collecting', token: 'review', mode: 'auto' }))
+    writeFileSync(join(sd, 'act', '1.beat'), '')
+    return sd
+  }
+  const session = 'picker-live'
+  writeFileSync(join(live(session), 'collector.json'), JSON.stringify({ session, cwd: unsafe }))
+  const nasty = 'bad\x1b[2Jname'
+  live(nasty)
+  const listed = await listSessions(nodeHost({ cwd: root }), root, Date.now())
+  assert.equal(listed.some(e => e.liveness === 'live' && e.cwd === unsafe), true)
+  const drawn = renderTuiLines(
+    { ...ownerState(), rows: [], all: [], selected: undefined, mode: 'picker', viewer: true, owner: undefined, pickerEntries: listed, pickerIndex: 0 },
+    200,
+    30,
+    1,
+  ).join('\n')
+  assert.equal(drawn.includes(osc), false)
+  assert.equal(drawn.includes('\x1b[2J'), false)
+  assert.match(stripAnsi(drawn), /\[live\] picker-live /)
+  assert.match(stripAnsi(drawn), /\[live\] badname /)
+})
+
+test('picker: the highlight scrolls into a one-page window (FR-04)', () => {
+  const entries = Array.from({ length: 30 }, (_, i) => ({
+    session: `session-${i}`,
+    liveness: i === 29 ? ('live' as const) : ('non-live' as const),
+    cwdFrom: 'unknown' as const,
+  }))
+  let state: TuiState = {
+    ...ownerState(),
+    rows: [],
+    all: [],
+    selected: undefined,
+    mode: 'picker',
+    viewer: true,
+    owner: undefined,
+    pickerEntries: entries,
+    pickerIndex: 0,
+  }
+  for (let n = 0; n < 29; n++) state = nextKeyState(state, 'j', 1, { width: 120, height: 24 }).state
+  assert.equal(state.pickerIndex, 29)
+  const shown = renderTuiLines(state, 120, 24, 1).join('\n')
+  assert.match(shown, /session-29/)
+  assert.match(shown, /\[live\]/)
+  const top = renderTuiLines({ ...state, pickerIndex: 0 }, 120, 24, 1).join('\n')
+  assert.match(top, /session-0/)
+  assert.doesNotMatch(top, /session-29/)
+})
+
+test('ownLocator: a real PTY tty is the iTerm and Terminal locator, and a pipe does not publish unknown (FR-03)', async () => {
+  const script = fileURLToPath(new URL('./tui-own-tty.node.ts', import.meta.url))
+  const read = (child: ReturnType<typeof spawn>) =>
+    new Promise<string>((resolve, reject) => {
+      let out = ''
+      let err = ''
+      child.stdout?.on('data', c => { out += String(c) })
+      child.stderr?.on('data', c => { err += String(c) })
+      child.on('error', reject)
+      child.on('exit', code => {
+        if (code !== 0) reject(new Error(`locator child exit ${code}: ${err || out}`))
+        else resolve(out)
+      })
+    })
+  const parse = (text: string) => {
+    const line = text.split('\n').find(l => l.startsWith('{') && l.includes('"actual"'))
+    assert.ok(line, text)
+    return JSON.parse(line) as { loc: { kind?: string; tty?: string } | null; actual: string; focus: string; argv0: string; argvTty: string; log: string }
+  }
+  const py = [
+    'import os, pty, sys',
+    'term, node, script = sys.argv[1], sys.argv[2], sys.argv[3]',
+    'pid, fd = pty.fork()',
+    'if pid == 0:',
+    '    os.environ.pop("TMUX", None)',
+    '    os.environ.pop("TMUX_PANE", None)',
+    '    os.execv(node, [node, script, term])',
+    'out = b""',
+    'while True:',
+    '    try:',
+    '        chunk = os.read(fd, 4096)',
+    '    except OSError:',
+    '        break',
+    '    if not chunk:',
+    '        break',
+    '    out += chunk',
+    'os.waitpid(pid, 0)',
+    'sys.stdout.buffer.write(out)',
+  ].join('\n')
+  for (const [term, kind] of [['iTerm.app', 'iterm'], ['Apple_Terminal', 'terminal']] as const) {
+    const got = parse(await read(spawn('python3', ['-c', py, term, process.execPath, script], { stdio: ['ignore', 'pipe', 'pipe'] })))
+    assert.equal(got.loc?.kind, kind)
+    assert.equal(got.loc?.tty, got.actual)
+    assert.equal(got.focus, 'app')
+    assert.equal(got.argv0, 'osascript')
+    assert.equal(got.argvTty, got.actual)
+  }
+  const piped = parse(await read(spawn(process.execPath, [script, 'iTerm.app'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, TMUX: '', TMUX_PANE: '' },
+  })))
+  assert.equal(piped.loc, null)
+  assert.match(piped.log, /own tty unavailable/)
+})
+
+test('launch claims before the alt screen; occupied and stale stay out (T8)', async () => {
+  const err: string[] = []
+  const stderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    err.push(String(chunk))
+    return true
+  }) as typeof process.stderr.write
+  const root = mkdtempSync(join(tmpdir(), 'tui-claim-'))
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  const ownerPath = join(sessionDirOf(v3Of(root), 'owned'), 'tui.owner')
+  let claimBeforeEnter = false
+  class In extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    resume() {}
+    pause() {}
+  }
+  class Out extends EventEmitter {
+    columns = 80
+    rows = 24
+    written = ''
+    write(t: string) {
+      if (!claimBeforeEnter && t.includes('\x1b[?1049h')) {
+        claimBeforeEnter = existsSync(ownerPath) && JSON.parse(readFileSync(ownerPath, 'utf8')).state === 'ready'
+      }
+      this.written += t
+      return true
+    }
+  }
+  const stdin = new In()
+  const stdout = new Out()
+  const base = nodeHost({ cwd: repo })
+  base.envTmuxAgentDir = async () => root
+  base.envTmuxPane = async () => undefined
+  base.envTmuxSocket = async () => undefined
+  const realRun = base.run.bind(base)
+  const calls: string[][] = []
+  base.run = async (argv, cwd, ms) => {
+    const bin = argv[0] ?? ''
+    if (bin === 'open' || bin === 'osascript' || bin === 'tmux' || bin === 'agent-tmux' || bin === 'git') {
+      calls.push([...argv])
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    return realRun(argv, cwd, ms)
+  }
+  const host = { ...base, envTermProgram: async () => 'WarpTerminal' }
+  const first = runTui({ host, root, cwd: repo, session: 'owned', stdin: stdin as never, stdout: stdout as never, mirrorMs: 60_000 })
+  try {
+    await until(() => stdout.written.includes('\x1b[?1049h'), 5_000, 'alt screen')
+    assert.equal(claimBeforeEnter, true)
+    const rec = JSON.parse(readFileSync(ownerPath, 'utf8')) as { state: string; locator: { kind: string; tabTitle?: string } }
+    assert.equal(rec.state, 'ready')
+    assert.equal(rec.locator.kind, 'warp')
+    const secondOut = new Out()
+    const code = await runTui({ host, root, cwd: repo, session: 'owned', stdin: new In() as never, stdout: secondOut as never, mirrorMs: 60_000 })
+    assert.equal(code, 0)
+    assert.equal(secondOut.written.includes('\x1b[?1049h'), false)
+    assert.ok(calls.some(a => a[0] === 'open' && a[1] === '-a' && a[2] === 'Warp'))
+    assert.match(err.join(''), /raised: app/)
+    assert.match(err.join(''), /workers-tui owned/)
+    assert.doesNotMatch(err.join(''), /window focused/)
+    process.emit('SIGHUP')
+    await first
+    assert.equal(existsSync(ownerPath), false)
+
+    const qRoot = mkdtempSync(join(tmpdir(), 'tui-claim-q-'))
+    const qIn = new In()
+    const qOut = new Out()
+    const qPath = join(sessionDirOf(v3Of(qRoot), 'q-one'), 'tui.owner')
+    const qRun = runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'q-one', stdin: qIn as never, stdout: qOut as never, mirrorMs: 60_000 })
+    await until(() => qOut.written.includes('\x1b[?1049h'), 5_000, 'q entered')
+    assert.equal(existsSync(qPath), true)
+    qIn.emit('data', 'q')
+    await qRun
+    assert.equal(existsSync(qPath), false)
+
+    const cIn = new In()
+    const cOut = new Out()
+    const cPath = join(sessionDirOf(v3Of(qRoot), 'c-one'), 'tui.owner')
+    const cRun = runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'c-one', stdin: cIn as never, stdout: cOut as never, mirrorMs: 60_000 })
+    await until(() => cOut.written.includes('\x1b[?1049h'), 5_000, 'ctrl-c entered')
+    assert.equal(existsSync(cPath), true)
+    cIn.emit('data', '\x03')
+    await cRun
+    assert.equal(existsSync(cPath), false)
+
+    err.length = 0
+    calls.length = 0
+    const me = await processId(host)
+    const pend = await claimTui(host, qRoot, 'pend-one', me, { state: 'pending' })
+    assert.equal(pend.kind, 'won')
+    const pOut = new Out()
+    const pCode = await runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'pend-one', stdin: new In() as never, stdout: pOut as never, mirrorMs: 60_000 })
+    assert.equal(pCode, 0)
+    assert.equal(pOut.written.includes('\x1b[?1049h'), false)
+    assert.match(err.join(''), /pending/)
+    assert.equal(calls.some(a => a[0] === 'open' || a[0] === 'osascript'), false)
+
+    err.length = 0
+    const sOut = new Out()
+    const sCode = await runTui({ host: { ...host, envTmuxAgentDir: async () => qRoot }, root: qRoot, cwd: repo, session: 'stale-one', stdin: new In() as never, stdout: sOut as never, mirrorMs: 60_000, claim: 'zzzzzzzzzzzz' })
+    assert.equal(sCode, 1)
+    assert.match(err.join(''), /這個視窗已失效，另一個 TUI 已接手/)
+    assert.equal(sOut.written.includes('\x1b[?1049h'), false)
+
+    const launchDir = mkdtempSync(join(tmpdir(), 'tui-launch-'))
+    const token = pend.kind === 'won' ? pend.claim.token : ''
+    const adopt = await claimTui(host, qRoot, 'adopt-one', me, { state: 'pending' })
+    assert.equal(adopt.kind, 'won')
+    const adoptToken = adopt.kind === 'won' ? adopt.claim.token : token
+    const yaml = join(launchDir, `workers-tui-${sessionKey('adopt-one')}-${adoptToken}.yaml`)
+    writeFileSync(yaml, 'commands: []\n')
+    const aIn = new In()
+    const aOut = new Out()
+    const aRun = runTui({
+      host: { ...host, envTmuxAgentDir: async () => qRoot },
+      root: qRoot,
+      cwd: repo,
+      session: 'adopt-one',
+      stdin: aIn as never,
+      stdout: aOut as never,
+      mirrorMs: 60_000,
+      claim: adoptToken,
+      launchDir,
+    })
+    await until(() => aOut.written.includes('\x1b[?1049h'), 5_000, 'adopt entered')
+    assert.equal(existsSync(yaml), false)
+    const ready = JSON.parse(readFileSync(join(sessionDirOf(v3Of(qRoot), 'adopt-one'), 'tui.owner'), 'utf8')) as { state: string }
+    assert.equal(ready.state, 'ready')
+    aIn.emit('data', 'q')
+    await aRun
+    assert.equal(existsSync(join(sessionDirOf(v3Of(qRoot), 'adopt-one'), 'tui.owner')), false)
+  } finally {
+    stdin.emit('data', 'q')
+    process.emit('SIGHUP')
+    await first.catch(() => undefined)
+    process.stderr.write = stderrWrite
+  }
+})
+
+test('jobs: slow rows do not delay the mirror; age grows in flight; r queues one (T9)', async () => {
+  const mod = await import('./tui.node.ts')
+  assert.equal(typeof mod.kickJob, 'function')
+  assert.equal(mod.ROWS_MS, 2_000)
+  assert.equal(mod.SWEEP_MS, 10_000)
+  assert.equal(mod.MIRROR_TICK_MS, 1_000)
+  const rows: { running: boolean; queued: boolean; lastOk?: number } = { running: false, queued: false }
+  let releaseRows: () => void = () => {}
+  const rowsGate = new Promise<void>(r => {
+    releaseRows = r
+  })
+  let rowRuns = 0
+  const rowsTask = mod.kickJob(rows, () => 0, async () => {
+    rowRuns += 1
+    await rowsGate
+    return true
+  })
+  const mirror = { running: false, queued: false }
+  let mirrorRan = false
+  await mod.kickJob(mirror, () => 0, async () => {
+    mirrorRan = true
+    return true
+  })
+  assert.equal(mirrorRan, true)
+  assert.equal(rows.running, true)
+  assert.equal(ageText(2_500, { running: true, queued: false, lastOk: 0 }), '更新 2s 前 …')
+  mod.kickJob(rows, () => 0, async () => {
+    rowRuns += 1
+    return true
+  })
+  mod.kickJob(rows, () => 0, async () => {
+    rowRuns += 1
+    return true
+  })
+  assert.equal(rows.queued, true)
+  assert.equal(rowRuns, 1)
+  releaseRows()
+  await rowsTask
+  assert.equal(rowRuns, 2)
+  const failed = { running: false, queued: false, lastOk: 1_000 }
+  await mod.kickJob(failed, () => 5_000, async () => false)
+  assert.equal(failed.lastOk, 1_000)
+  assert.equal(ageText(5_000, failed), '更新 4s 前')
 })
 
 test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape cancel', () => {
@@ -218,6 +739,8 @@ test('key-state: n enters adding mode; typing, backspace, Enter submit, Escape c
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   const n = nextKeyState(base, 'n', 1000)
   assert.equal(n.state.adding, true)
@@ -261,6 +784,8 @@ test('key-state: i interrupts running or stalled worker only', () => {
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   assert.deepEqual(nextKeyState(stateRun, 'i', 1000).action, { type: 'interrupt', row: rRun })
 
@@ -284,6 +809,8 @@ test('key-state: x on selected worker arms stop; second press within 400ms debou
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
 
   // 1st press at t=1000: arm stop
@@ -313,6 +840,8 @@ test('key-state: x expired confirm re-arms instead of firing', () => {
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   // Press at t=7000 (> 6000ms): expired! Re-arms until 12000.
   const expired = nextKeyState(armed, 'x', 7000)
@@ -329,6 +858,8 @@ test('key-state: c arms clear all; second press confirms stopAll', () => {
     adding: false,
     resumeInput: '',
     quit: false,
+    mode: 'edit',
+    owner: 'S',
   }
   const press1 = nextKeyState(base, 'c', 1000)
   assert.equal(press1.action, undefined)
@@ -526,8 +1057,9 @@ test('width: S7 fixtures with hard-coded cell counts', () => {
       ['text-presentation heart U+2764', '❤', 1],
       ['heart U+2764 + VS16', '❤️', 2],
       ['CJK', '中文字', 6],
-      ['middle dot (ambiguous)', '·', 2],
-      ['plus-minus (ambiguous)', '±', 2],
+      ['middle dot (ambiguous)', '·', 1],
+      ['plus-minus (ambiguous)', '±', 1],
+      ['box rule (ambiguous)', '─'.repeat(74), 74],
       ['leading combining mark', '́', 0],
       ['leading combining mark then a', '́a', 1],
       ['e + combining acute', 'é', 1],
@@ -538,13 +1070,13 @@ test('width: S7 fixtures with hard-coded cell counts', () => {
   })
 })
 
-test('width: TMUX_AGENT_AMBIGUOUS_WIDTH=1 makes ambiguous characters one cell', () => {
-  withAmbiguous('1', () => {
-    assert.equal(cellWidth('·'), 1)
-    assert.equal(cellWidth('±'), 1)
+test('width: TMUX_AGENT_AMBIGUOUS_WIDTH=2 makes ambiguous characters two cells', () => {
+  withAmbiguous('2', () => {
+    assert.equal(cellWidth('·'), 2)
+    assert.equal(cellWidth('±'), 2)
     assert.equal(cellWidth('中'), 2, 'W stays 2')
   })
-  withAmbiguous('2', () => assert.equal(cellWidth('±'), 2))
+  withAmbiguous('1', () => assert.equal(cellWidth('±'), 1))
 })
 
 test('width: the generated EAW table', () => {
@@ -625,6 +1157,21 @@ test('escape: CJK mixed with escapes, through the renderer', () => {
   assert.ok(!/\x1b(?!\[[0-9;]*m)/.test(screen), JSON.stringify(screen))
 })
 
+test('render: a mirror line that leaves its SGR open does not color the next row (wide and narrow)', () => {
+  // tmux capture-pane -e ends a background line without a reset: the reset opens the next line.
+  const row = mockRow('w-bg', { state: 'running' })
+  const state: TuiState = {
+    rows: [row], all: [row], showAll: false, selected: 'w-bg', adding: false, resumeInput: '', quit: false,
+    mirror: { id: 'w-bg', lines: ['\x1b[42m+ added', 'plain'] },
+  }
+  for (const width of [200, 80]) {
+    for (const line of renderTuiLines(state, width, 24, Date.now())) {
+      const sgr = line.match(/\x1b\[[0-9;]*m/g)
+      if (sgr) assert.equal(sgr.at(-1), '\x1b[0m', `width ${width}: ${JSON.stringify(line)}`)
+    }
+  }
+})
+
 // -----------------------------------------------------------------------------
 // 2d. Streaming input
 // -----------------------------------------------------------------------------
@@ -643,7 +1190,7 @@ test('input: rq in one chunk is refresh, then quit (COALESCED_QUIT)', async () =
     return realNow()
   }
   const run = runTui({ stdin, stdout, host, session: 'rq', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
   counting = true
   stdin.emit('data', 'rq')
   const ended = await Promise.race([run.then(() => 'quit'), new Promise(r => setTimeout(() => r('hung'), 3_000))])
@@ -684,13 +1231,14 @@ test('input: a lone ESC in runTui resolves after the wait and cancels the prompt
   const { stdin, stdout } = mockTty()
   const root = mkdtempSync(join(tmpdir(), 'tui-esc-'))
   const run = runTui({ stdin, stdout, host: quietHost('e', root, root), session: 'e', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
+  stdin.emit('data', 'e')
   stdin.emit('data', 'n')
   await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
   stdout.written = ''
   const sent = Date.now()
   stdin.emit('data', '\x1b')
-  await until(() => stdout.written.includes('workers'), 5_000, 'the render after ESC')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the render after ESC')
   assert.ok(Date.now() - sent >= ESC_WAIT_MS - 5, 'ESC waited for a possible sequence')
   assert.ok(!stdout.written.includes('<session-id>'), 'ESC closed the prompt')
   stdin.emit('data', 'q')
@@ -714,8 +1262,8 @@ test('input: a UTF-8 character split across chunks arrives whole', async () => {
   const { stdin, stdout } = mockTty()
   const root = mkdtempSync(join(tmpdir(), 'tui-utf8-'))
   const run = runTui({ stdin, stdout, host: quietHost('u', root, root), session: 'u', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
-  stdin.emit('data', Buffer.from('n'))
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
+  stdin.emit('data', Buffer.from('en'))
   const bytes = Buffer.from('中👍')
   for (const cut of [[0, 1], [1, 3], [3, 5], [5, 7]]) stdin.emit('data', bytes.subarray(cut[0], cut[1]))
   await until(() => stdout.written.includes(': 中👍█'), 5_000, 'the decoded text in the prompt')
@@ -771,7 +1319,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     const { stdin, stdout } = mockTty()
     const root = mkdtempSync(join(tmpdir(), 'tui-sig-'))
     const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
-    await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+    await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
     process.emit(sig)
     await run
     assert.equal(stdin.isRaw, false)
@@ -785,7 +1333,7 @@ test("terminal: stdin 'end' quits and restores", async () => {
   const { stdin, stdout } = mockTty()
   const root = mkdtempSync(join(tmpdir(), 'tui-end-'))
   const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
   stdin.emit('end')
   await run
   assert.equal(stdin.isRaw, false)
@@ -796,7 +1344,7 @@ test("terminal: stdin 'error' rejects and restores", async () => {
   const { stdin, stdout } = mockTty()
   const root = mkdtempSync(join(tmpdir(), 'tui-err-'))
   const run = runTui({ stdin, stdout, host: quietHost('s', root, root), session: 's', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
   stdin.emit('error', new Error('EIO_STDIN'))
   await assert.rejects(run, /EIO_STDIN/)
   assert.equal(stdin.isRaw, false)
@@ -810,8 +1358,8 @@ test('terminal: an async rejection inside the refresh timer rejects and restores
   let bomb = false
   const realNow = host.now
   host.now = () => (bomb ? Promise.reject(new Error('BOMB_IN_TIMER')) : realNow())
-  const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 20 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 20, rowsMs: 50 })
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
   bomb = true
   const ended = await Promise.race([run.then(() => 'resolved', () => 'rejected'), new Promise(r => setTimeout(() => r('hung'), 3_000))])
   if (ended === 'hung') stdin.emit('data', 'q')
@@ -833,6 +1381,7 @@ test('terminal: after a stop, an in-flight refresh does not render', async () =>
     return realNow()
   }
   const run = runTui({ stdin, stdout, host, session: 's', cwd: root, root, mirrorMs: 60_000 })
+  await until(() => stdout.written.includes('\x1b[?1049h'), 5_000, 'entered before SIGTERM')
   process.emit('SIGTERM')
   await run
   const after = stdout.written
@@ -878,7 +1427,7 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
   const mockStdout = new MockStdout() as any
   const root = mkdtempSync(join(tmpdir(), 'tui-root-'))
 
-  let tuiPromise: Promise<void> | undefined
+  let tuiPromise: Promise<number> | undefined
   try {
     tuiPromise = runTui({
       stdin: mockStdin,
@@ -890,7 +1439,7 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
       mirrorMs: 60_000,
     })
 
-    await until(() => mockStdout.written.includes('workers'), 5_000, 'the first render')
+    await until(() => mockStdout.written.includes(' workers'), 5_000, 'the first render')
 
     // Trigger resize to 120x30
     mockStdout.columns = 120
@@ -898,7 +1447,7 @@ test('resize: SIGWINCH and window resize triggers re-render with new dimensions'
     mockStdout.written = ''
     process.emit('SIGWINCH')
 
-    await until(() => mockStdout.written.includes('workers'), 5_000, 'SIGWINCH to re-render')
+    await until(() => mockStdout.written.includes(' workers'), 5_000, 'SIGWINCH to re-render')
   } finally {
     mockStdin.emit('data', 'q')
     await tuiPromise
@@ -1226,8 +1775,8 @@ def read_some(master, seconds, until=None):
 
 output = bytearray()
 start = time.time()
-while time.time() - start < 3 and b'workers' not in output:
-    output.extend(read_some(master, max(0.0, 3 - (time.time() - start)), b'workers'))
+while time.time() - start < 3 and b' workers' not in output:
+    output.extend(read_some(master, max(0.0, 3 - (time.time() - start)), b' workers'))
 
 time.sleep(0.1)
 if scenario == 'q':
@@ -1239,7 +1788,7 @@ elif scenario == 'rq':
 elif scenario == 'ctrl-c':
     os.write(master, b'\\x03')  # raw mode: Ctrl-C arrives as a key
 elif scenario == 'ctrl-c-prompt':
-    os.write(master, b'n')  # open the resume prompt
+    os.write(master, b'en')  # 編輯, then open the resume prompt
     output.extend(read_some(master, 2, b'<session-id>'))
     os.write(master, b'\\x03')
 elif scenario == 'sigterm':
@@ -1403,7 +1952,7 @@ async function framed(opts: {
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
   const waitMs = opts.waitMs ?? 3_000
   const start = Date.now()
-  while (!stdout.written.includes('workers') && Date.now() - start < waitMs) await sleep(20)
+  while (!stdout.written.includes(' workers') && Date.now() - start < waitMs) await sleep(20)
   for (const key of opts.keys ?? []) {
     stdin.emit('data', key)
     await sleep(20)
@@ -1477,7 +2026,7 @@ test('resume paste: a pasted session UUID fills the resume field', async () => {
   assert.equal(nextKeyState(base, `\x1b[200~${uuid}\x1b[201~`, 1).state.resumeInput, uuid)
   const root = mkdtempSync(join(tmpdir(), 'tui-paste-'))
   const host = quietHost('s', root, root)
-  const { screen } = await framed({ host, root, cwd: root, session: 's', keys: ['n', uuid, '\x1b'] })
+  const { screen } = await framed({ host, root, cwd: root, session: 's', keys: ['e', 'n', uuid, '\x1b'] })
   assert.match(screen, new RegExp(uuid))
 })
 
@@ -1611,8 +2160,13 @@ test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', {
     assert.match(screen, new RegExp(name))
     assert.match(liveStatus, /"exists":\s*true/, liveStatus)
     const after = treeSnap(root)
-    assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort())
-    for (const [path, body] of before) assert.equal(after.get(path), body, `mutated ${path}`)
+    const claimPath = (p: string) => p.includes('/.sessions') || /\/\.v3\/$/.test(p)
+    assert.deepEqual([...after.keys()].filter(p => !claimPath(p)).sort(), [...before.keys()].filter(p => !claimPath(p)).sort())
+    for (const [path, body] of before) {
+      if (claimPath(path)) continue
+      assert.equal(after.get(path), body, `mutated ${path}`)
+    }
+    assert.equal([...after.keys()].some(p => p.endsWith('/tui.owner')), false)
   } finally {
     await tmuxS(['kill-server'])
     rmSync(parent, { recursive: true, force: true })
@@ -1857,25 +2411,67 @@ test('health writer: heartbeat publishes act/<n>.state for its channel, once per
   assert.deepEqual(act.filter(f => !/^\d+(\.json|\.beat|\.state)?$/.test(f)), [])
 })
 
-test('layout: one function sizes every section; hard-coded fixtures (R4.1, R4.2)', () => {
-  // [height, input] → expected. The sum of the sections never exceeds the height.
-  const fixtures: [number, Parameters<typeof layoutOf>[1], ReturnType<typeof layoutOf>][] = [
-    [24, { status: 1, rows: 3, sel: 2, selExtra: 2, footer: 1 }, { status: 1, first: 0, list: 3, hidden: 0, more: 0, selExtra: 2, body: 14, footer: 1 }],
-    [24, { status: 1, rows: 1, sel: 0, selExtra: 1, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 1, body: 18, footer: 0 }],
-    [60, { status: 1, rows: 1, sel: 0, selExtra: 1, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 1, body: 54, footer: 0 }],
-    [60, { status: 1, rows: 3, sel: 0, selExtra: 2, footer: 1 }, { status: 1, first: 0, list: 3, hidden: 0, more: 0, selExtra: 2, body: 50, footer: 1 }],
-    [10, { status: 1, rows: 5, sel: 4, selExtra: 2, footer: 0 }, { status: 1, first: 0, list: 5, hidden: 0, more: 0, selExtra: 2, body: 0, footer: 0 }],
-    [10, { status: 1, rows: 9, sel: 8, selExtra: 2, footer: 1 }, { status: 1, first: 5, list: 4, hidden: 5, more: 1, selExtra: 2, body: 0, footer: 1 }],
-    [10, { status: 1, rows: 1, sel: 0, selExtra: 2, footer: 0 }, { status: 1, first: 0, list: 1, hidden: 0, more: 0, selExtra: 2, body: 3, footer: 0 }],
-    [3, { status: 1, rows: 4, sel: 3, selExtra: 2, footer: 1 }, { status: 1, first: 3, list: 1, hidden: 3, more: 0, selExtra: 0, body: 0, footer: 0 }],
-    [5, { status: 2, rows: 0, sel: -1, selExtra: 0, footer: 3 }, { status: 2, first: 0, list: 0, hidden: 0, more: 0, selExtra: 0, body: 0, footer: 2 }],
-  ]
-  for (const [height, input, want] of fixtures) {
-    const got = layoutOf(height, input)
-    assert.deepEqual(got, want, `height ${height} ${JSON.stringify(input)}`)
-    const used = 1 + got.status + got.list + got.selExtra + (got.body ? got.body + 2 : 0) + got.more + got.footer
-    assert.ok(used <= height, `height ${height}: ${used} lines`)
+test('layout regression: rules fill the standard preview width', () => {
+  const rows = [mockRow('a')]
+  const s: TuiState = { rows, all: rows, selected: 'a', showAll: false, adding: false, resumeInput: '', quit: false }
+  for (const width of [80, 92, 119]) {
+    const rule = renderTuiLines(s, width, 60, 0).find(l => stripAnsi(l).startsWith('─'))!
+    assert.equal(cellWidth(rule), width, `rule at ${width} cols`)
   }
+})
+
+test('layout regression: preview rectangle matches the painted first and last pane rows', () => {
+  const rows = [mockRow('a')]
+  const s: TuiState = { rows, all: rows, selected: 'a', showAll: false, adding: false, resumeInput: '', quit: false, statusMessage: 'note', statusUntil: 100 }
+  for (const width of [70, 92, 119, 122]) {
+    const state = { ...s, narrowView: 'preview' as const }
+    const rect = tuiLayout(state, width, 60, 0).frame.preview
+    const pane = Array.from({ length: rect.rows }, (_, i) => `PANE-${i}`)
+    const lines = renderTuiLines({ ...state, mirror: { id: 'a', lines: pane } }, width, 60, 0).map(stripAnsi)
+    for (let i = 0; i < rect.rows; i++) assert.equal(lines[rect.y + i]!.slice(rect.x).trim(), pane[i], `${width} row ${i}`)
+    assert.equal(lines.at(-1), 'tmux-agent: note')
+    assert.equal(lines.length, 60)
+  }
+})
+
+test('mirror regression: output terminator is not a pane row', async () => {
+  const row = mockRow('a')
+  const host = quietHost(undefined, '.', '.')
+  host.run = async () => ({ exitCode: 0, stdout: 'TOP\nBOTTOM\n', stderr: '' })
+  const cap = await mirrorOf(host, row.d, 2000, true)
+  assert.deepEqual(cap.lines, ['TOP', 'BOTTOM'])
+  host.run = async () => ({ exitCode: 0, stdout: '', stderr: '' })
+  assert.deepEqual((await mirrorOf(host, row.d, 2000, true)).lines, [])
+})
+
+test('band regression: width and clipping use the same one-cell ambiguous glyphs as tmux', () => {
+  const text = ' workers v0.48.1 · @62dcd839 · tmux 0 · 內部 0 [ + ][ ↻ ][ ⧉ ]    [ ▸ ][ hide ]'
+  assert.equal(displayCells(text), cellWidth(text))
+  assert.equal(truncateCells('─'.repeat(92), 92), '─'.repeat(92))
+  for (const width of [92, 122]) assert.equal(cellWidth(bandPadCells(text, width)), width)
+})
+
+test('layout: frameOf keeps the preview at ceil(2C/3) for 0..40 rows', () => {
+  const ceil2 = (c: number) => Math.ceil((2 * c) / 3)
+  for (const width of [100, 120, 123, 160]) for (let rows = 0; rows <= 40; rows++) {
+    const headers = 4
+    const frame = frameOf(width, 40, rows, rows > 0 ? 0 : -1, headers, 'list')
+    assert.equal(frame.mode, 'standard', `rows ${rows}`)
+    assert.equal(frame.preview.cols, width)
+    assert.ok(frame.preview.rows >= ceil2(frame.content), `rows ${rows}: preview ${frame.preview.rows} C ${frame.content}`)
+    assert.ok(frame.list.rows <= Math.floor(frame.content / 3), `rows ${rows}: list ${frame.list.rows}`)
+    assert.equal(frame.list.rows + frame.preview.rows, frame.content, `rows ${rows}`)
+    const used = headers + frame.more + (rows > 0 ? 2 : 0) + frame.list.rows + frame.preview.rows
+    assert.ok(used <= 40, `rows ${rows}: ${used} lines`)
+  }
+  const thirty = frameOf(100, 40, 30, 0, 4, 'list')
+  assert.equal(thirty.list.rows < 30 && thirty.preview.rows >= Math.ceil((2 * thirty.content) / 3), true)
+  const listed = frameOf(70, 24, 3, 0, 4, 'list')
+  const opened = frameOf(70, 24, 3, 0, 4, 'preview')
+  assert.equal(listed.mode, 'narrow')
+  assert.equal(listed.preview.rows, 0)
+  assert.equal(opened.list.rows, 0)
+  assert.ok(opened.preview.rows > 0)
 })
 
 test('mirror: capture asks for the whole scrollback; a resize drops the capture started before it (R4.1, R4.2)', async () => {
@@ -1934,30 +2530,119 @@ test('preview fills the frame in every state: height rows, footer last, rule and
   for (const height of [12, 24, 40, 60]) {
     for (const [name, extra, marker] of states) {
       const s = { ...base, ...extra }
-      const lay = tuiLayout(s, 70, height, NOW)
-      const frame = renderTuiLines(s, 70, height, NOW).map(stripAnsi)
+      const lay = tuiLayout(s, 100, height, NOW)
+      const frame = renderTuiLines(s, 100, height, NOW).map(stripAnsi)
       const at = `${name} h=${height}`
       assert.equal(frame.length, height, `${at}: frame is the full height`)
       assert.equal(frame.at(-1), 'tmux-agent: note', `${at}: footer on the last line`)
-      assert.ok(frame.every(l => cellWidth(l) <= 70), `${at}: no line wider than the screen`)
+      assert.ok(frame.every(l => cellWidth(l) <= 100), `${at}: no line wider than the screen`)
       const rule = frame.findIndex(l => l.startsWith('─'))
-      assert.ok(rule > 0 && lay.body > 0, `${at}: the rule is drawn`)
-      assert.ok(frame.slice(rule + 1, rule + 1 + lay.body).some(l => marker.test(l)), `${at}: ${marker} in the body`)
-      assert.match(frame[rule + 1 + lay.body]!, s.expanded ? /^detail / : /^See it whole: /, `${at}: tail right after the body`)
-      for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
+      assert.ok(rule > 0 && lay.frame.preview.rows > 0, `${at}: the rule is drawn`)
+      assert.ok(frame.slice(rule + 1, rule + 1 + lay.frame.preview.rows).some(l => marker.test(l)), `${at}: ${marker} in the body`)
+      assert.match(frame[rule + 1 + lay.frame.preview.rows]!, s.expanded ? /^detail / : /^See it whole: /, `${at}: tail right after the body`)
+      if (s.rows.length - lay.frame.hidden >= 3) for (const id of ['b', 'c']) assert.ok(frame.some(l => l.includes(` ${id}`)), `${at}: row ${id} is still listed`)
+      else assert.ok(frame.some(l => l.includes(' a')), `${at}: the selected row is listed`)
       assert.ok(!frame.some(l => l.includes('B-ONLY')), `${at}: never another row's content`)
     }
   }
-  // No preview (no selection; or a window too short for one): still full height, footer last (T1 C5).
+  // No selection: no preview. A short window still fills the height with the footer last (T1 C5).
   for (const [name, s, height] of [
     ['no selection', { ...base, selected: undefined }, 24],
-    ['h=9, the status line squeezes the body to 0', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 9],
+    ['h=9', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 9],
     ['h=8', { ...base, rows: [rows[0]!], all: [rows[0]!] }, 8],
   ] as [string, TuiState, number][]) {
-    const frame = renderTuiLines(s, 70, height, NOW).map(stripAnsi)
-    assert.equal(tuiLayout(s, 70, height, NOW).body, 0, `${name}: no preview`)
+    const frame = renderTuiLines(s, 100, height, NOW).map(stripAnsi)
+    if (name === 'no selection') assert.equal(tuiLayout(s, 100, height, NOW).frame.preview.rows, 0, `${name}: no preview`)
     assert.equal(frame.length, height, `${name}: frame is the full height`)
     assert.equal(frame.at(-1), 'tmux-agent: note', `${name}: footer on the last line`)
+  }
+})
+
+test('narrow: Enter walks list, then preview, then Detail; Esc steps back', () => {
+  const rows = [mockRow('a')]
+  const screen = { width: 70, height: 24 }
+  let s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a' }
+  assert.equal(frameOf(70, 24, 1, 0, 4, 'list').preview.rows, 0)
+  let r = nextKeyState(s, '\r', 1, screen)
+  assert.equal(r.state.narrowView, 'preview')
+  assert.notEqual(r.state.expanded, true)
+  assert.equal(r.action, undefined)
+  r = nextKeyState(r.state, '\r', 1, screen)
+  assert.equal(r.state.expanded, true)
+  assert.equal(r.action?.type, 'detail')
+  r = nextKeyState(r.state, '\x1b', 1, screen)
+  assert.notEqual(r.state.expanded, true)
+  assert.equal(r.state.narrowView, 'preview')
+  r = nextKeyState(r.state, '\x1b', 1, screen)
+  assert.equal(r.state.narrowView, 'list')
+  const wide = nextKeyState(s, '\r', 1, { width: 100, height: 24 })
+  assert.equal(wide.action?.type, 'detail')
+  assert.equal(wide.state.narrowView, undefined)
+})
+
+test('narrow: Enter follows frameMode on a <40-col pane and on 60x8', () => {
+  const row = mockRow('a')
+  const base: TuiState = { rows: [row], all: [row], showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a' }
+  for (const screen of [
+    { width: 38, height: 24 },
+    { width: 60, height: 8 },
+  ]) {
+    const at = `${screen.width}x${screen.height}`
+    const r = nextKeyState(base, '\r', 1, screen)
+    assert.equal(r.state.narrowView, 'preview', at)
+    assert.notEqual(r.state.expanded, true, `${at}: expanding while the list view is up hides the preview`)
+    const lay = tuiLayout(r.state, screen.width, screen.height, 1)
+    assert.equal(lay.frame.mode, 'narrow', at)
+    assert.ok(lay.frame.preview.rows > 0, `${at}: preview rows ${lay.frame.preview.rows}`)
+    const back = nextKeyState(r.state, '\x1b', 1, screen)
+    assert.equal(back.state.narrowView, 'list', at)
+  }
+})
+
+test('narrow: Enter on a project row reaches the preview', () => {
+  const proj = mockRow('p', { project: true })
+  const ps: TuiState = { rows: [proj], all: [proj], showAll: false, adding: false, resumeInput: '', quit: false, selected: 'p' }
+  const screen = { width: 38, height: 24 }
+  const opened = nextKeyState(ps, '\r', 1, screen)
+  assert.equal(opened.state.narrowView, 'preview')
+  assert.notEqual(opened.state.expanded, true)
+  assert.ok(tuiLayout(opened.state, screen.width, screen.height, 1).frame.preview.rows > 0)
+  const again = nextKeyState(opened.state, '\r', 1, screen)
+  assert.notEqual(again.state.expanded, true, 'a project session has no episode detail')
+  assert.equal(again.action, undefined)
+})
+
+test('narrow: a gone selected row returns the list', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-narrow-gone-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-narrow-gone-repo-'))
+  writeWorker(root, repo, 'S', 'drop.abcde')
+  writeWorker(root, repo, 'S', 'keep.abcde')
+  const host = quietHost('S', repo, root)
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 70
+  stdout.rows = 24
+  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf('\x1b[H')))
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 40, rowsMs: 100 })
+  try {
+    await until(() => last().includes('drop.abcde') && last().includes('keep.abcde'), 5_000, 'both rows')
+    const arm = async () => {
+      if (/› drop\.abcde/.test(last())) return
+      stdin.emit('data', 'j')
+      await new Promise(r => setTimeout(r, 80))
+    }
+    for (let i = 0; i < 8 && !/› drop\.abcde/.test(last()); i++) await arm()
+    await until(() => /› drop\.abcde/.test(last()), 5_000, 'drop selected')
+    stdin.emit('data', '\r')
+    await until(() => /capturing the pane|the pane is empty|See it whole/.test(last()), 5_000, 'the preview')
+    rmSync(join(root, '.v3', 'drop.abcde'), { recursive: true, force: true })
+    const end = Date.now() + 2_000
+    while (Date.now() < end && !/keep\.abcde/.test(last())) await new Promise(r => setTimeout(r, 40))
+    assert.match(last(), /keep\.abcde/, last())
+  } finally {
+    stdin.emit('data', 'q')
+    await run
+    rmSync(root, { recursive: true, force: true })
+    rmSync(repo, { recursive: true, force: true })
   }
 })
 
@@ -1972,13 +2657,14 @@ test('mirror: capture failure reaches the preview as an error, not an empty pane
   }
   assert.deepEqual(await mirrorOf(host, d, 10), { lines: [], error: 'spawn agent-tmux ENOENT' })
   host.run = async () => ({ exitCode: 0, stdout: 'a\nb\n', stderr: '' })
-  assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b', ''] })
+  assert.deepEqual(await mirrorOf(host, d, 10), { lines: ['a', 'b'] })
   assert.deepEqual(await mirrorProject(host, 'x', 10), { lines: ['a', 'b'] })
-  // Colour: SGR is kept (sanitizeAnsi drops the rest when it prints); a row of only SGR is a blank tail.
+  // Colour keeps SGR; empty bottom rows are trimmed.
   const calls: string[][] = []
   host.run = async (argv: readonly string[]) => (calls.push([...argv]), { exitCode: 0, stdout: '\x1b[31mred\x1b[0m\tx\n\x1b[0m\n', stderr: '' })
   assert.deepEqual(await mirrorProject(host, 'x', 10, true), { lines: ['\x1b[31mred\x1b[0m x'] })
   assert.ok(calls[0]!.includes('-e'))
+  assert.ok(calls[0]!.includes('-J'), 'the project mirror joins wrapped lines')
   assert.deepEqual((await mirrorOf(host, d, 10, true)).lines[0], '\x1b[31mred\x1b[0m x')
   assert.ok(calls[1]!.includes('--color') && !calls[1]!.includes('--strip-ansi'))
   // Default (the mod panel, which prints lines as they are): no escape reaches a line.
@@ -2031,7 +2717,7 @@ test('mirror: select, A→B and resize capture at once, not at the next tick; ne
   const { stdin, stdout } = mockTty()
   // 60 s tick: every capture below comes from the key or the resize, not the clock.
   const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000 })
-  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+  const last = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START)))
   try {
     await until(() => stdout.written.includes('bbb.abcde'), 5_000, 'the rows')
     stdin.emit('data', 'j')
@@ -2108,11 +2794,11 @@ test('fit: a select or a resize fits the worker window once; the tick only captu
     const after = captures
     await until(() => captures >= after + 3, 5_000, 'three tick captures')
     assert.equal(fits.length, 1, 'ticks do not fit')
-    assert.match(fits[0]!, /^80x\d+$/)
+    assert.match(fits[0]!, /^80x\d+$/, 'a standard preview is as wide as the terminal')
     stdout.columns = 120
     stdout.emit('resize')
     await until(() => fits.length === 2, 5_000, 'the resize fits')
-    assert.match(fits[1]!, /^120x\d+$/)
+    assert.equal(fits[1], '120x18')
   } finally {
     stdin.emit('data', 'q')
     await run
@@ -2174,20 +2860,20 @@ test('detail: the whole result, past SUMMARY_MAX, with row and result state apar
     stdin.emit('data', 'j')
     stdin.emit('data', '\r')
     // The last frame: a capture started by `j` may draw the `loading…` detail (1 of 1) first.
-    const lastFrame = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+    const lastFrame = () => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START)))
     await until(() => Number(/detail 1–\d+ of (\d+)/.exec(lastFrame())?.[1] ?? 0) > 1, 5_000, 'the loaded detail view')
     const total = Number(/detail 1–\d+ of (\d+)/.exec(lastFrame())![1])
     assert.ok(total > 300, `a long summary wraps to many lines: ${total}`)
-    for (let i = 0; i < Math.ceil(total / 10) && !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'); i++) {
+    for (let i = 0; i < Math.ceil(total / 10) && !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START))).includes('END-MARKER'); i++) {
       stdin.emit('data', PAGE_DOWN)
       await new Promise(r => setTimeout(r, 2))
     }
-    await until(() => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('END-MARKER'), 5_000, 'the end of the summary')
-    const last = stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME)))
+    await until(() => stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START))).includes('END-MARKER'), 5_000, 'the end of the summary')
+    const last = stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START)))
     assert.match(last, new RegExp(`detail \\d+–${total} of ${total}`))
     stdin.emit('data', PAGE_UP)
     stdin.emit('data', '\r')
-    await until(() => !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_CLEAR_HOME))).includes('detail '), 5_000, 'collapse')
+    await until(() => !stripAnsi(stdout.written.slice(stdout.written.lastIndexOf(ANSI_SYNC_START))).includes('detail '), 5_000, 'collapse')
   } finally {
     stdin.emit('data', 'q')
     await run
@@ -2199,9 +2885,9 @@ test('mirror: PgUp scrolls back through the scrollback, PgDn to the end follows 
   const rows = [mockRow('a')]
   const lines = Array.from({ length: 300 }, (_, i) => `m${i}`)
   let s: TuiState = { rows, all: rows, showAll: false, adding: false, resumeInput: '', quit: false, selected: 'a', mirror: { id: 'a', lines } }
-  const body = tuiLayout(s, 70, 24, NOW).body
+  const body = tuiLayout(s, 100, 24, NOW).frame.preview.rows
   s = { ...s, page: body }
-  const frame = (st: TuiState) => renderTuiLines(st, 70, 24, NOW).map(stripAnsi)
+  const frame = (st: TuiState) => renderTuiLines(st, 100, 24, NOW).map(stripAnsi)
   assert.ok(frame(s).includes('m299'), 'live: the newest line')
   s = nextKeyState(s, PAGE_UP, NOW).state
   assert.equal(s.back, body)
@@ -2256,11 +2942,24 @@ test('wrap: CJK and emoji wrap by cells and never split a grapheme', () => {
   assert.deepEqual(wrapCells('中', 1), [''])
 })
 
+test('width: the printable-ASCII fast path equals the per-grapheme count and wrap', () => {
+  const ascii = Array.from({ length: 95 }, (_, i) => String.fromCharCode(0x20 + i)).join('')
+  for (const amb of ['1', '2'])
+    withAmbiguous(amb, () => {
+      for (const text of [ascii, `\x1b[1m${ascii}\x1b[0m`, '', 'a'])
+        assert.equal(cellWidth(text), [...graphemes(stripAnsi(text))].reduce((n, g) => n + graphemeWidth(g, Number(amb)), 0))
+    })
+  assert.deepEqual(wrapCells('abcdefg', 3), ['abc', 'def', 'g'])
+  assert.deepEqual(wrapCells('abcdef', 3), ['abc', 'def'])
+  assert.deepEqual(wrapCells('\n', 3), ['', ''])
+  assert.deepEqual(wrapCells(ascii, 20).join(''), ascii)
+})
+
 /** A state with one running worker that has an episode, selected; owner mode. */
 function ownerState(): TuiState {
   const r = mockRow('w1', { state: 'running', d: { profile: 'codex', name: 'w1', dir: '/tmp/r', since: 1 } })
   r.d.seq = 1
-  return { rows: [r], all: [r], showAll: false, selected: 'w1', adding: false, resumeInput: '', quit: false, owner: 'S' }
+  return { rows: [r], all: [r], showAll: false, selected: 'w1', adding: false, resumeInput: '', quit: false, owner: 'S', mode: 'edit' }
 }
 
 test('viewer: every mutating key is read-only in the key layer (D-viewer)', () => {
@@ -2326,7 +3025,7 @@ test('hints: every key the header and the row show has a handler; no /workers co
   const header = stripAnsi(renderTuiLines(owner, 200, 30, 1_000)[0]!)
   assert.match(header, /\[ n resume \] \[ \+ assign \] \[ r refresh \] \[ c clear \] \[ q quit \]  a all · j\/k select/)
   const row = renderTuiLines(owner, 200, 30, 1_000).map(stripAnsi).find(l => l.includes('[ t tell ]'))!
-  assert.match(row, /\[ t tell \] \[ i interrupt \] \[ x stop \] \[ - cancel \] \[ U unlock \]  Enter detail/)
+  assert.match(row, /\[ t tell \] \[ i interrupt \] \[ x stop \] \[ - cancel \] \[ U unlock \] \[ d delete \]  Enter detail/)
   // Narrow: hints shorten in order (words, then keys only), never past the width.
   assert.match(stripAnsi(renderTuiLines(owner, 60, 30, 1_000)[0]!), /\[ n \] \[ \+ \] \[ r \] \[ c \] \[ q \]/)
   // No `/workers …` command anywhere in the TUI source (the import path is not one).
@@ -2414,6 +3113,7 @@ test('cancel and unlock: the TUI keys run the same core calls as workers.cli.nod
   try {
     await until(() => shown().includes(r.name), 5_000, 'the row')
     stdin.emit('data', 'j')
+    stdin.emit('data', 'e')
     stdin.emit('data', 'U')
     await pause(STOP_REPEAT_MS + 50)
     stdin.emit('data', 'U')
@@ -2456,14 +3156,18 @@ test('empty states: none outstanding, filtered out, read failure — hard-coded 
 })
 
 test('pty sizes: 120x60, 80x24, 40x10, 2 rows — last row selected, CJK summaries, no line past the width, resize re-lays out', { timeout: 120_000 }, async () => {
-  const root = mkdtempSync(join(tmpdir(), 'tui-ptysz-'))
-  const repo = mkdtempSync(join(tmpdir(), 'tui-ptysz-repo-'))
-  const home = mkdtempSync(join(tmpdir(), 'tui-ptysz-home-'))
-  for (const [i, name] of ['a.abcde', 'b.abcde', 'c.abcde'].entries()) {
-    writeWorker(root, repo, 'owner', name, { status: 'success', summary: `完成第${i + 1}項：繁體中文摘要，寬度測試 👨‍👩‍👧 🇹🇼 結果${'很長'.repeat(30)}` })
+  // One root/repo/home per scenario: the scenarios run in parallel and a shared TUI claim would raise the first one instead of starting.
+  const fixture = () => {
+    const root = mkdtempSync(join(tmpdir(), 'tui-ptysz-'))
+    const repo = mkdtempSync(join(tmpdir(), 'tui-ptysz-repo-'))
+    const home = mkdtempSync(join(tmpdir(), 'tui-ptysz-home-'))
+    for (const [i, name] of ['a.abcde', 'b.abcde', 'c.abcde'].entries()) {
+      writeWorker(root, repo, 'owner', name, { status: 'success', summary: `完成第${i + 1}項：繁體中文摘要，寬度測試 👨‍👩‍👧 🇹🇼 結果${'很長'.repeat(30)}` })
+    }
+    return { root, repo, home }
   }
   const py = `
-import pty, os, select, sys, time, subprocess, termios, struct, fcntl, signal, base64
+import pty, os, select, sys, time, subprocess, termios, struct, fcntl, signal, base64, re
 cols, rows, cols2, rows2 = (int(x) for x in sys.argv[4:8])
 master, slave = pty.openpty()
 def size(c, r):
@@ -2473,29 +3177,34 @@ env = {'PATH': os.path.dirname(sys.argv[1]) + ':/usr/bin:/bin', 'HOME': sys.argv
 pre = termios.tcgetattr(slave)
 p = subprocess.Popen([sys.argv[1], sys.argv[2], '--session', 'owner', '--cwd', sys.argv[9]], stdin=slave, stdout=slave, stderr=slave, env=env)
 out = bytearray()
+FRAME = b'\\x1b[?2026h'
+def frames(): return out.count(FRAME)
+def last(): return re.sub(rb'\\x1b\\[[0-9;?]*[ -/]*[@-~]|\\x1b\\][^\\x07]*\\x07', b'', bytes(out[out.rfind(FRAME):]))
 def pump(seconds, until=None):
     end = time.time() + seconds
-    while time.time() < end and (until is None or until not in out):
+    while time.time() < end and not (until and until()):
         r, _, _ = select.select([master], [], [], max(0, end - time.time()))
         if not r: break
         try: chunk = os.read(master, 65536)
         except OSError: break
         if not chunk: break
         out.extend(chunk)
-pump(8, b'c.abcde' if rows > 2 else b'3 worker(s)')
-pump(0.3)
+pump(8, lambda: (b'c.abcde' if rows > 2 else b'3 worker(s)') in out)
+n = frames()
 os.write(master, b'k')
-pump(0.8)
+pump(8, lambda: re.search(rb'\\xe2\\x80\\xba c\\.abcde', last()) if rows > 2 else frames() > n)
 mark = len(out)
 if cols2:
+    n = frames()
     size(cols2, rows2)
     p.send_signal(signal.SIGWINCH)
-    pump(0.8)
+    pump(8, lambda: frames() > n)
+    n = frames()
     os.write(master, b'k')
-    pump(0.8)
+    pump(8, lambda: frames() > n)
 os.write(master, b'q')
-try: p.wait(timeout=5)
-except subprocess.TimeoutExpired: p.kill(); p.wait()
+pump(5, lambda: p.poll() is not None)
+if p.poll() is None: p.kill(); p.wait()
 pump(0.2)
 post = termios.tcgetattr(slave)
 print('EXIT=%d' % p.returncode)
@@ -2503,7 +3212,7 @@ print('SAME_TTY=%s' % (pre == post))
 print('MARK=%d' % mark)
 print('OUT=' + base64.b64encode(bytes(out)).decode())
 `
-  const frames = (bytes: Buffer) => bytes.toString('utf8').split(ANSI_CLEAR_HOME).slice(1).map(f => f.replace(ANSI_LEAVE_ALT, ''))
+  const frames = (bytes: Buffer) => bytes.toString('utf8').split(ANSI_SYNC_START).slice(1).map(f => f.replace(ANSI_LEAVE_ALT, '').replace('\x1b[?2026l', ''))
   const check = (frame: string, cols: number, rows: number, what: string) => {
     // The pty's ONLCR turns the TUI's \r\n into \r\r\n.
     const lines = frame.split(/\r*\n/)
@@ -2516,16 +3225,24 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
     [40, 10, 0, 0],
     [80, 2, 0, 0],
   ]
-  for (const [cols, rows, cols2, rows2] of scenarios) {
+  const results = await Promise.all(
+    scenarios.map(
+      ([cols, rows, cols2, rows2]) => {
+        const { root, repo, home } = fixture()
+        return new Promise<{ code: number; out: string; err: string }>(resolve => {
+          execFile(
+            'python3',
+            ['-c', py, process.execPath, join(import.meta.dirname, 'tui.node.ts'), root, String(cols), String(rows), String(cols2), String(rows2), home, repo],
+            { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+            (error, stdout, stderr) => resolve({ code: error ? -1 : 0, out: stdout, err: stderr }),
+          )
+        })
+      },
+    ),
+  )
+  for (const [i, [cols, rows, cols2, rows2]] of scenarios.entries()) {
     const what = `${cols}x${rows}${cols2 ? `→${cols2}x${rows2}` : ''}`
-    const res = await new Promise<{ code: number; out: string; err: string }>(resolve => {
-      execFile(
-        'python3',
-        ['-c', py, process.execPath, join(import.meta.dirname, 'tui.node.ts'), root, String(cols), String(rows), String(cols2), String(rows2), home, repo],
-        { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
-        (error, stdout, stderr) => resolve({ code: error ? -1 : 0, out: stdout, err: stderr }),
-      )
-    })
+    const res = results[i]!
     assert.equal(res.code, 0, `${what}: ${res.err}`)
     assert.match(res.out, /EXIT=0\n/, `${what}\n${res.out.slice(0, 400)}`)
     assert.match(res.out, /SAME_TTY=True\n/, what)
@@ -2551,7 +3268,7 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
   }
 })
 
-test('health on screen: observeView → the status line for collecting, paused, stale (C-health through runTui)', async () => {
+test('health on screen: observeRows → the status line for collecting, paused, stale (C-health through runTui)', async () => {
   const cases: [Parameters<typeof writeAct>[2], RegExp][] = [
     [{ beatAgoMs: 1_000, state: { channel: 'mod', mode: 'auto', status: 'collecting' } }, /收件：collecting（mod）/],
     [{ beatAgoMs: 1_000, state: { channel: 'node', mode: 'auto', status: 'collecting', reason: 'host composer is busy; nothing pasted, retrying' } }, /收件：collecting（node） · host composer is busy/],
@@ -2600,7 +3317,7 @@ test('Sol#7 paste mode: entry enables bracketed paste (DECSET 2004), the one cle
   const { stdin, stdout } = mockTty()
   const root = mkdtempSync(join(tmpdir(), 'tui-paste-'))
   const run = runTui({ stdin, stdout, host: quietHost('p', root, root), session: 'p', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
   assert.ok(stdout.written.includes('\x1b[?2004h'), 'runTui enables 2004')
   stdin.emit('data', 'q')
   await run
@@ -2629,7 +3346,8 @@ test('Sol#8 split sequence: the ESC timer lets go only a lone ESC; a CSI, SS3 or
   const run = runTui({ stdin, stdout, host: quietHost('s8', root, root), session: 's8', cwd: root, root, mirrorMs: 60_000 })
   let ended = false
   run.then(() => (ended = true), () => (ended = true))
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
+  stdin.emit('data', 'e')
   stdin.emit('data', 'n')
   await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
   stdin.emit('data', '\x1b[20')
@@ -2715,7 +3433,7 @@ test('Sol-r2#N2 runTui: an unterminated paste then Ctrl-C ends the run and resto
     const run = runTui({ stdin, stdout, host: quietHost('n2', root, root), session: 'n2', cwd: root, root, mirrorMs: 60_000 })
     let ended = false
     run.then(() => (ended = true), () => (ended = true))
-    await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+    await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
     stdin.emit('data', '\x1b[200~abc')
     await tick(ESC_WAIT_MS * 4)
     try {
@@ -2767,7 +3485,8 @@ test('Sol#10 Ctrl-C quits from every mode: list, prompt (n, t, +), confirm', asy
   const run = runTui({ stdin, stdout, host: quietHost('c', root, root), session: 'c', cwd: root, root, mirrorMs: 60_000 })
   let ended = false
   run.then(() => (ended = true), () => (ended = true))
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
+  stdin.emit('data', 'e')
   stdin.emit('data', 'n')
   await until(() => stdout.written.includes('<session-id>'), 5_000, 'the resume prompt')
   stdin.emit('data', '\x03')
@@ -2834,7 +3553,7 @@ test('Sol#11 teardown: setRawMode(false) EIO is reported on stderr after the alt
   let err = ''
   const root = mkdtempSync(join(tmpdir(), 'tui-eio-out-'))
   const run = runTui({ stdin, stdout, host: quietHost('e', root, root), session: 'e', cwd: root, root, mirrorMs: 60_000 })
-  await until(() => stdout.written.includes('workers'), 5_000, 'the first render')
+  await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
   process.stderr.write = ((s: string) => {
     err += s
     order.push('stderr')
@@ -2872,8 +3591,8 @@ test('Sol#12 colon SGR: one grammar for sanitize, strip, width, pad, truncate an
     mirror: { id: 'w-sgr', lines: [sgr] },
     quit: false,
   }
-  const lines = renderTuiLines(state, 12, 24, Date.now())
-  assert.ok(lines.includes(sgr), `the mirror line is drawn unchanged: ${JSON.stringify(lines)}`)
+  const lines = renderTuiLines(state, 80, 24, Date.now())
+  assert.ok(lines.includes(sgr + '\x1b[0m'), `the mirror line is drawn unchanged, then the row-end reset: ${JSON.stringify(lines)}`)
 })
 
 test('Sol#13 SGR inside a grapheme: truncation cuts only at whole visible graphemes', () => {
@@ -2942,6 +3661,7 @@ test('R8.5: a stale delivery reservation shows "unknown: 可能已送達" and - 
       await pause(150)
     }
     await until(() => shown().includes('unknown: 可能已送達'), 5_000, 'the honest wording')
+    stdin.emit('data', 'e')
     await until(() => /- force-close/.test(shown()), 5_000, 'the force-close hint')
 
     stdin.emit('data', '-')
@@ -2998,4 +3718,762 @@ test('layout: the row list stays at the top; the preview follows the last row', 
   const first = frame('a')
   assert.deepEqual(at(first), at(frame('c')), 'rows do not move when the selection does')
   assert.ok(first.findIndex(l => l.includes('m49')) > at(first)[3]!, 'the preview is below row 4')
+})
+
+test('delete key-state: d arms then confirms a delete in the viewer (預覽); the arm survives a rows tick', () => {
+  const s: TuiState = { ...ownerState(), viewer: true, owner: undefined, mode: 'preview' }
+  const row = s.rows[0]!
+  assert.match(rowHints(s, row, 1_000)[0]!, /\[ d delete \]/)
+  const one = nextKeyState(s, 'd', 1_000)
+  assert.equal(one.action, undefined)
+  assert.deepEqual(one.state.armedStop, { id: `delete:${row.id}`, from: 1_000, until: 1_000 + STOP_CONFIRM_MS })
+  assert.match(rowHints(one.state, row, 1_000)[0]!, /\[ d delete w1\? press again \]/)
+  const ticked = applyRowsTick(one.state, [{ ...row }])
+  assert.deepEqual(ticked.armedStop, one.state.armedStop, 'a 2s rows tick must not disarm the 5s confirm')
+  const two = nextKeyState(ticked, 'd', 1_000 + STOP_REPEAT_MS)
+  assert.equal(two.state.armedStop, undefined)
+  assert.deepEqual(two.action, { type: 'delete', row })
+})
+
+test('delete key-state: a project row ignores d', () => {
+  const p = mockRow('p1', { project: true })
+  const s: TuiState = { ...ownerState(), viewer: true, rows: [p], all: [p], selected: 'p1', mode: 'preview' }
+  const r = nextKeyState(s, 'd', 1_000)
+  assert.equal(r.action, undefined)
+  assert.equal(r.state.armedStop, undefined)
+})
+
+test('delete key-state: an incomplete row routes d to clear (keeps the ORPHAN_MS grace)', () => {
+  const s = ownerState()
+  const row = { ...s.rows[0]!, state: 'unknown' as const, incomplete: true as const, d: { ...s.rows[0]!.d, seq: 0 } }
+  const t: TuiState = { ...s, rows: [row], all: [row], selected: row.id, viewer: true, owner: undefined, mode: 'preview' }
+  const one = nextKeyState(t, 'd', 1_000)
+  assert.equal(one.action, undefined)
+  assert.deepEqual(nextKeyState(one.state, 'd', 1_000 + STOP_REPEAT_MS).action, { type: 'clear', row })
+})
+
+test('delete core: a dead worker moves to .v3/.removed and leaves the scan; a live or unknown session is refused', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-delete-'))
+  const repo = mkdtempSync(join(tmpdir(), 'tui-delete-repo-'))
+  writeWorker(root, repo, 'owner', 'dead.abcde')
+  const w = join(root, '.v3', 'dead.abcde')
+  // A viewer host (no owner): mkdir, mv and the lock's ln/rm run for real; only tmux is faked.
+  const host = nodeHost({ owner: undefined, cwd: repo })
+  host.envTmuxAgentDir = async () => root
+  const real = host.run.bind(host)
+  let tmux = { exitCode: 0, stdout: 'codex-dead.abcde\n', stderr: '' }
+  host.run = async (argv, cwd, ms) => (argv[0] === 'tmux' ? tmux : real(argv, cwd, ms))
+  const names = async () => (await scan(host, { claim: false })).visible.map(d => d.name)
+  assert.deepEqual(await names(), ['dead.abcde'])
+
+  const live = await deleteWorker(host, 'dead.abcde')
+  assert.ok(!live.ok && /stop it first with x/.test(live.text), live.text)
+  tmux = { exitCode: -1, stdout: '', stderr: 'timeout' }
+  const unknown = await deleteWorker(host, 'dead.abcde')
+  assert.ok(!unknown.ok && /liveness unknown/.test(unknown.text), unknown.text)
+  assert.ok(existsSync(join(w, 'worker.json')), 'a refused delete leaves the dir')
+
+  tmux = { exitCode: 1, stdout: '', stderr: 'no server running' }
+  // A launch in flight holds launch.lock (an OS flock, as agent-tmux takes it): refused.
+  const launch = spawn('zsh', ['-c', 'zmodload zsh/system; : >> "$1"; zsystem flock -f fd "$1"; print held; sleep 30', 'zsh', join(w, 'launch.lock')])
+  try {
+    await new Promise(r => launch.stdout.once('data', r))
+    const busy = await deleteWorker(host, 'dead.abcde')
+    assert.ok(!busy.ok && /launch is in flight/.test(busy.text), busy.text)
+    assert.ok(existsSync(join(w, 'worker.json')) && !existsSync(join(w, '.action')), 'refused under its own lock, which is released')
+  } finally {
+    launch.kill()
+  }
+  await new Promise(r => launch.once('exit', r))
+  // The launch.lock file stays after its holder exits: only a held flock refuses.
+  const done = await deleteWorker(host, 'dead.abcde')
+  assert.ok(done.ok, done.text)
+  assert.ok(!existsSync(w))
+  const removed = readdirSync(join(root, '.v3', '.removed'))
+  assert.equal(removed.length, 1)
+  assert.match(removed[0]!, /^dead\.abcde-\d+$/)
+  assert.ok(done.text.endsWith(join(root, '.v3', '.removed', removed[0]!)), done.text)
+  assert.ok(existsSync(join(root, '.v3', '.removed', removed[0]!, 'worker.json')), 'moved whole, not removed')
+  assert.ok(!existsSync(join(root, '.v3', '.removed', removed[0]!, '.action')), 'the moved lock is released')
+  assert.deepEqual(await names(), [], '.removed is never scanned as a worker')
+})
+
+test('render: a repaint overwrites in place, an identical frame writes nothing, and only the first draw and a resize clear (閃屏)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-flicker-'))
+  const { stdin, stdout } = mockTty()
+  const run = runTui({ stdin, stdout, host: quietHost('S', root, root), session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000 })
+  const settle = () => new Promise(r => setTimeout(r, 100))
+  try {
+    await until(() => stdout.written.includes(' workers'), 5_000, 'the first render')
+    await settle()
+    assert.ok(stdout.written.includes('\x1b[2J'), 'the first draw clears')
+    // Two no-op keys back to back: each renders; the second frame equals the first.
+    // The clock is frozen so the header's 更新 Ns 前 cannot cross a second boundary between them.
+    const realNow = Date.now
+    const frozen = realNow()
+    Date.now = () => frozen
+    try {
+      stdout.written = ''
+      stdin.emit('data', 'z')
+      stdin.emit('data', 'z')
+      await settle()
+      assert.ok(stdout.written.split(ANSI_SYNC_START).length - 1 <= 1, `the second identical render writes nothing: ${JSON.stringify(stdout.written)}`)
+      stdout.written = ''
+      stdin.emit('data', 'z')
+      await settle()
+      assert.equal(stdout.written, '', 'an identical frame writes nothing')
+    } finally {
+      Date.now = realNow
+    }
+    // A changed frame: overwritten in place inside synchronized output, no full clear.
+    stdin.emit('data', 'n')
+    await until(() => stdout.written.length > 0, 5_000, 'the repaint')
+    assert.ok(stdout.written.startsWith(`${ANSI_SYNC_START}\x1b[H`), JSON.stringify(stdout.written.slice(0, 20)))
+    assert.ok(stdout.written.endsWith('\x1b[?2026l'))
+    assert.equal(stdout.written.includes('\x1b[2J'), false, 'a normal repaint does not clear the screen')
+    // A resize clears once.
+    stdout.written = ''
+    stdout.columns = 100
+    process.emit('SIGWINCH')
+    await until(() => stdout.written.includes(' workers'), 5_000, 'the resize render')
+    assert.ok(stdout.written.includes(`${ANSI_SYNC_START}${ANSI_CLEAR_HOME}`), 'a resize clears')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+  }
+})
+
+test('hc agents: every agent listed with @parent or 未記錄; counted in the title; j/k reach only drawn hc rows', () => {
+  const agents: HcAgent[] = [
+    { address: 't1', agent: 'agy', cwd: '/a', status: 'idle', where: 'a / 1', name: 'agy-crash', parent: 't11' },
+    { address: 'codex-mbpr/t10', agent: 'codex', cwd: '/b', status: 'working', where: 'b / 1' },
+  ]
+  const state: TuiState = { ...ownerState(), selected: undefined, herdr: agents }
+  const drawn = renderTuiLines(state, 160, 24, 1).map(stripAnsi)
+  assert.match(drawn[0]!, /tmux 1 · hc 2/)
+  assert.ok(drawn.some(l => l.includes('hc · t1 agy-crash · agy · idle · read-only · @t11 · /a')), drawn.join('\n'))
+  assert.ok(drawn.some(l => l.includes('hc · codex-mbpr/t10 · codex · working · read-only · 未記錄 · /b')), drawn.join('\n'))
+  // j/k move from worker rows onto drawn hc rows and back.
+  const j1 = nextKeyState(state, 'j', 1).state
+  assert.equal(j1.selected, 'w1')
+  const j2 = nextKeyState(j1, 'j', 1).state
+  assert.equal(j2.selected, hcId('t1'))
+  const j3 = nextKeyState(j2, 'j', 1).state
+  assert.equal(j3.selected, hcId('codex-mbpr/t10'))
+  assert.equal(nextKeyState(j3, 'j', 1).state.selected, 'w1', 'wraps back to first worker')
+  assert.equal(nextKeyState(j1, 'k', 1).state.selected, hcId('codex-mbpr/t10'), 'k from first worker wraps to last drawn hc row')
+  assert.equal(nextKeyState(j2, 'k', 1).state.selected, 'w1', 'k from first hc row returns to last worker row')
+
+  assert.match(renderTuiLines({ ...state, herdr: '?' }, 160, 24, 1)[0]!, /hc \?/)
+  assert.doesNotMatch(renderTuiLines({ ...state, herdr: undefined }, 160, 24, 1)[0]!, /herdr/)
+  // Twenty agents: four lines and a count, so the worker rows keep their room; j/k reach only the 4 drawn hc rows.
+  const many = Array.from({ length: 20 }, (_, i) => ({ ...agents[1]!, address: `h${i}` }))
+  const crowdedState: TuiState = { ...state, herdr: many }
+  const crowded = renderTuiLines(crowdedState, 160, 24, 1).map(stripAnsi)
+  assert.equal(crowded.filter(l => l.includes('hc · h')).length, 4, crowded.join('\n'))
+  assert.match(crowded[0]!, /hc 20/)
+  assert.ok(crowded.some(l => l.includes('+16 more hc agents (hc ls)')), crowded.join('\n'))
+  assert.ok(crowded.some(l => l.includes('w1')), 'the worker still has room')
+  let cur = crowdedState
+  const visited: (string | undefined)[] = []
+  for (let i = 0; i < 6; i++) {
+    cur = nextKeyState(cur, 'j', 1).state
+    visited.push(cur.selected)
+  }
+  assert.deepEqual(visited, ['w1', hcId('h0'), hcId('h1'), hcId('h2'), hcId('h3'), 'w1'])
+
+  const noWorkers = { ...state, rows: [], all: [] }
+  assert.equal(nextKeyState(noWorkers, 'j', 1).state.selected, hcId('t1'))
+  assert.equal(nextKeyState(noWorkers, 'k', 1).state.selected, hcId('codex-mbpr/t10'))
+  for (const key of ['1', 'x', 'i', 't', '-', 'U', 'd', '\r']) {
+    const next = nextKeyState(noWorkers, key, 1)
+    assert.equal(next.state.selected, undefined, key)
+    assert.equal(next.action, undefined, key)
+  }
+})
+
+test('hc key-state: worker-only keys do nothing; d/c work on finished hc; ticks preserve or drop hc selection; Enter walks list -> preview -> Detail -> attach', () => {
+  const agents: HcAgent[] = [
+    { address: 't1', agent: 'agy', cwd: '/a', status: 'idle', where: 'a / 1', name: 'one', parent: 't11' },
+    { address: 't2', agent: 'codex', cwd: '/b', status: 'working', where: 'b / 1' },
+  ]
+  const base: TuiState = { ...ownerState(), selected: hcId('t1'), herdr: agents }
+  // Row worker-only keys do nothing in edit, preview, and viewer modes; d does nothing on live hc; x stays off in preview/viewer.
+  for (const modeState of [base, { ...base, mode: 'preview' as const }, { ...base, mode: 'preview' as const, viewer: true, owner: undefined }]) {
+    for (const key of ['t', 'T', 'i', 'I', '-', 'U', 'd']) {
+      const next = nextKeyState(modeState, key, 1000)
+      assert.equal(next.action, undefined, `${modeState.viewer ? 'viewer' : modeState.mode} ${key} no action`)
+      assert.equal(next.state.armedStop, undefined, `${key} no armedStop`)
+      assert.equal(next.state.adding, false, `${key} no adding`)
+      assert.equal(next.state.statusMessage, undefined, `${key} no statusMessage`)
+    }
+  }
+  // c does nothing in edit mode when there are no workers and no finished hc rows.
+  for (const key of ['c', 'C']) {
+    const noClearable: TuiState = { ...base, rows: [], all: [] }
+    const first = nextKeyState(noClearable, key, 1000)
+    const second = nextKeyState(first.state, key, 1000 + STOP_REPEAT_MS * 2)
+    assert.equal(second.action, undefined, `edit ${key} twice with no workers or finished hc does not trigger stopAll`)
+  }
+  // Finished hc row: d arms delete:hc:<addr> in preview, edit, and viewer; c arms stopAll in edit even with no workers.
+  const doneHc: HcAgent = { address: 't3', agent: 'codex', state: 'finished', status: 'idle', cwd: '/c', where: 'c / 1', name: 'done', parent: 't11' }
+  for (const modeState of [
+    { ...base, rows: [], all: [], herdr: [doneHc], selected: hcId('t3') },
+    { ...base, rows: [], all: [], herdr: [doneHc], selected: hcId('t3'), mode: 'preview' as const },
+    { ...base, rows: [], all: [], herdr: [doneHc], selected: hcId('t3'), mode: 'preview' as const, viewer: true, owner: undefined },
+  ]) {
+    const d1 = nextKeyState(modeState, 'd', 1000)
+    assert.equal(d1.action, undefined)
+    assert.equal(d1.state.armedStop?.id, `delete:${hcId('t3')}`)
+    assert.equal(applyRowsTick(d1.state, []).armedStop?.id, `delete:${hcId('t3')}`, 'delete:hc survives rows tick')
+    assert.equal(applyHerdrTick(d1.state, [doneHc]).armedStop?.id, `delete:${hcId('t3')}`)
+    assert.equal(applyHerdrTick(d1.state, []).armedStop, undefined, 'delete:hc clears when row leaves')
+    const dArmDrawn = renderTuiLines(d1.state, 160, 24, 1500).map(stripAnsi).join('\n')
+    assert.ok(dArmDrawn.includes('delete done? press again'), dArmDrawn)
+    const d2 = nextKeyState(d1.state, 'd', 1000 + STOP_REPEAT_MS * 2)
+    assert.deepEqual(d2.action, { type: 'stopHc', hc: doneHc })
+    assert.equal(d2.state.armedStop, undefined)
+  }
+  const cEditFinished: TuiState = { ...base, rows: [], all: [], herdr: [doneHc], selected: hcId('t3') }
+  const c1 = nextKeyState(cEditFinished, 'c', 1000)
+  assert.equal(c1.state.armedStop?.id, CLEAR_ID)
+  const c2 = nextKeyState(c1.state, 'c', 1000 + STOP_REPEAT_MS * 2)
+  assert.deepEqual(c2.action, { type: 'stopAll' })
+  for (const [modeState, wantMsg] of [
+    [{ ...base, mode: 'preview' as const }, PREVIEW_ONLY],
+    [{ ...base, mode: 'preview' as const, viewer: true, owner: undefined }, READ_ONLY],
+  ] as const) {
+    for (const key of ['x', 'X', 'c', 'C']) {
+      const next = nextKeyState(modeState, key, 1000)
+      assert.equal(next.action, undefined, `${key} blocked outside edit`)
+      assert.equal(next.state.armedStop, undefined, `${key} no armedStop outside edit`)
+      assert.equal(next.state.statusMessage, wantMsg)
+    }
+  }
+  // In edit mode, x arms then confirms stopHc (survives worker rows tick, cleared if hc disappears).
+  const arm1 = nextKeyState(base, 'x', 1000)
+  assert.equal(arm1.action, undefined)
+  assert.equal(arm1.state.armedStop?.id, hcId('t1'))
+  assert.equal(applyRowsTick(arm1.state, []).armedStop?.id, hcId('t1'), 'armed hc stop survives rows tick')
+  assert.equal(applyHerdrTick(arm1.state, agents).armedStop?.id, hcId('t1'), 'armed hc stop survives hc tick while present')
+  assert.equal(applyHerdrTick(arm1.state, [agents[1]!]).armedStop, undefined, 'armed hc stop clears when hc row leaves')
+  const armDrawn = renderTuiLines(arm1.state, 160, 24, 1500).map(stripAnsi).join('\n')
+  assert.ok(armDrawn.includes('stop one? press again'), armDrawn)
+  assert.ok(armDrawn.includes('ends its hc terminal'), armDrawn)
+  const debounce = nextKeyState(arm1.state, 'x', 1000 + STOP_REPEAT_MS - 1)
+  assert.equal(debounce.action, undefined, 'held repeat only debounces')
+  const confirmed = nextKeyState(debounce.state, 'x', 1000 + STOP_REPEAT_MS * 2)
+  assert.deepEqual(confirmed.action, { type: 'stopHc', hc: agents[0] })
+  assert.equal(confirmed.state.armedStop, undefined)
+  // ↑/↓ scroll the hc preview instead of moving selection.
+  const scrollable: TuiState = { ...base, mirror: { id: hcId('t1'), lines: ['l1', 'l2', 'l3', 'l4'] }, back: 0, page: 2 }
+  const scrolled = nextKeyState(scrollable, '\x1b[A', 1000)
+  assert.equal(scrolled.state.selected, hcId('t1'))
+  assert.equal(scrolled.state.back, 1)
+  // Ticks keep hc selection while drawn, and drop it when gone or pushed past HERDR_LINES.
+  const keptRows = applyRowsTick({ ...scrollable, expanded: true, detail: { id: hcId('t1'), lines: ['address: t1'] } }, [])
+  assert.equal(keptRows.selected, hcId('t1'))
+  assert.equal(keptRows.expanded, true)
+  assert.equal(applyHerdrTick(keptRows, [agents[0]!]).selected, hcId('t1'))
+  assert.equal(applyHerdrTick(keptRows, [agents[1]!]).selected, undefined)
+  assert.equal(applyHerdrTick(keptRows, '?').selected, undefined)
+  // Standard: preview -> Enter (detail) -> Enter (attach); works in viewer mode too.
+  for (const start of [base, { ...base, mode: 'preview' as const, viewer: true, owner: undefined }]) {
+    const det = nextKeyState(start, '\r', 1000)
+    assert.equal(det.state.expanded, true)
+    assert.deepEqual(det.action, { type: 'detail' })
+    const att = nextKeyState(det.state, '\r', 1000)
+    assert.deepEqual(att.action, { type: 'attach', address: 't1' })
+    const esc = nextKeyState(det.state, '\x1b', 1000)
+    assert.equal(esc.state.expanded, false)
+  }
+  // Narrow (<80): list -> preview -> Detail -> attach; Esc walks back.
+  const narrow = { width: 70, height: 24 }
+  const nPrev = nextKeyState(base, '\r', 1000, narrow)
+  assert.equal(nPrev.state.narrowView, 'preview')
+  assert.equal(nPrev.state.expanded, false)
+  assert.equal(nPrev.action, undefined)
+  const nDet = nextKeyState(nPrev.state, '\r', 1000, narrow)
+  assert.equal(nDet.state.narrowView, 'preview')
+  assert.equal(nDet.state.expanded, true)
+  assert.deepEqual(nDet.action, { type: 'detail' })
+  const nAtt = nextKeyState(nDet.state, '\r', 1000, narrow)
+  assert.deepEqual(nAtt.action, { type: 'attach', address: 't1' })
+  const nBackPrev = nextKeyState(nDet.state, '\x1b', 1000, narrow)
+  assert.equal(nBackPrev.state.expanded, false)
+  assert.equal(nBackPrev.state.narrowView, 'preview')
+  const nBackList = nextKeyState(nBackPrev.state, '\x1b', 1000, narrow)
+  assert.equal(nBackList.state.narrowView, 'list')
+
+  // hcDetailText shows address, name, agent, status, cwd, parent (or 未記錄), turn, plus preview.
+  const textWithParent = hcDetailText(
+    { address: 't1', name: 'one', agent: 'agy', status: 'idle', cwd: '/a', parent: 't11', turn: 3 },
+    { lines: ['screen line 1', 'screen line 2'] },
+  ).join('\n')
+  for (const want of ['address: t1', 'name: one', 'agent: agy', 'status: idle', 'cwd: /a', 'parent: @t11', 'turn: 3', 'screen line 1', 'screen line 2']) {
+    assert.ok(textWithParent.includes(want), want)
+  }
+  const textNoParent = hcDetailText({ address: 't2', agent: 'codex', status: 'working', cwd: '/b', turn: 0 }).join('\n')
+  assert.ok(textNoParent.includes('parent: 未記錄'))
+  assert.ok(textNoParent.includes('turn: 0'))
+})
+
+test('hc preview, Detail and attach: reads only selected row, restores tty before attach, redraws after, works in viewer mode', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-flow-'))
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  writeWorker(root, repo, 'owner', 'w1.abcde')
+  const host = quietHost(undefined, repo, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const hcCalls: string[][] = []
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    hcCalls.push([...argv])
+    if (argv[1] === 'ls') {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          terminals: [
+            { address: 't1', name: 'agy-one', agent: 'agy', status: 'idle', cwd: '/a', where: 'a / 1', parent: 't11' },
+            { address: 't2', agent: 'codex', status: 'working', cwd: '/b', where: 'b / 1' },
+          ],
+        }),
+        stderr: '',
+      }
+    }
+    if (argv[1] === 'read') {
+      return { exitCode: 0, stdout: 'hc-screen-alpha\nhc-screen-beta\n', stderr: '' }
+    }
+    if (argv[1] === 'get') {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ address: 't1', name: 'agy-one', agent: 'agy', status: 'idle', cwd: '/a', parent: 't11', turn: 7 }),
+        stderr: '',
+      }
+    }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+
+  const { stdin, stdout } = mockTty()
+  const events: string[] = []
+  const run = runTui({
+    stdin,
+    stdout,
+    host,
+    cwd: repo,
+    root,
+    mirrorMs: 60_000,
+    rowsMs: 60_000,
+    attach: async argv => {
+      events.push(`raw=${stdin.isRaw}`)
+      events.push(`leftAlt=${stdout.written.endsWith(ANSI_LEAVE_ALT)}`)
+      events.push(`argv=${argv.join(' ')}`)
+      stdout.written = ''
+      return { status: 0 }
+    },
+  })
+  try {
+    await until(() => stdout.written.includes('hc 2') && stdout.written.includes('w1.abcde'), 5_000, 'initial hc render')
+    assert.deepEqual(hcCalls, [[bin, 'ls', '--all', '--json']], 'unselected hc rows never run hc read/get')
+
+    // First j selects w1.abcde; second j selects hc:t1.
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('› w1.abcde'), 5_000, 'worker selected')
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('hc-screen-beta'), 5_000, 'hc preview rendered')
+    const reads = hcCalls.filter(a => a[1] === 'read')
+    assert.deepEqual(reads, [[bin, 'read', 't1', '--lines', String(MIRROR_HISTORY)]])
+    assert.ok(!hcCalls.some(a => a.includes('t2')), 'unselected hc row t2 is never read')
+    assert.ok(stripAnsi(stdout.written).includes('See it whole: hc attach t1'))
+
+    // Worker-only keys do nothing on the live hc row.
+    stdin.emit('data', 'xt')
+    await new Promise(r => setTimeout(r, 30))
+    assert.equal(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read').length, 0)
+
+    // Enter opens Detail with hc get fields + preview + watch-only hint in viewer mode.
+    stdin.emit('data', '\r')
+    await until(() => stdout.written.includes('turn: 7'), 5_000, 'hc detail rendered')
+    const gets = hcCalls.filter(a => a[1] === 'get')
+    assert.deepEqual(gets, [[bin, 'get', 't1', '--json']])
+    const detailScreen = stripAnsi(stdout.written)
+    for (const want of ['address: t1', 'name: agy-one', 'agent: agy', 'status: idle', 'cwd: /a', 'parent: @t11', 'turn: 7', 'hc-screen-alpha', 'watch-only']) {
+      assert.ok(detailScreen.includes(want), `detail missing ${want}`)
+    }
+
+    // Enter again in Detail (viewer mode) restores tty, runs hc attach --observe, then re-enters and redraws.
+    stdin.emit('data', '\r')
+    await until(() => events.length === 3 && stdout.written.includes('workers') && stdout.written.includes('turn: 7'), 5_000, 'attach and redraw')
+    assert.deepEqual(events, ['raw=false', 'leftAlt=true', `argv=${bin} attach --observe t1`])
+    assert.equal(stdin.isRaw, true, 're-entered raw mode after attach')
+    assert.ok(stdout.written.includes('\x1b[?1049h'), 're-entered alt screen after attach')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc owner attach: with --session, Detail does not mark watch-only and attach omits --observe', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-owner-att-'))
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  const host = quietHost('S', repo, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    if (argv[1] === 'ls') {
+      return { exitCode: 0, stdout: JSON.stringify({ terminals: [{ address: 't1', name: 'agy-one', agent: 'agy', status: 'idle', cwd: '/a', where: 'a / 1', parent: 't11' }] }), stderr: '' }
+    }
+    if (argv[1] === 'read') return { exitCode: 0, stdout: 'hc-screen\n', stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify({ address: 't1', name: 'agy-one', agent: 'agy', status: 'idle', cwd: '/a', parent: 't11', turn: 2 }), stderr: '' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+
+  const { stdin, stdout } = mockTty()
+  const attached: string[][] = []
+  const run = runTui({
+    stdin,
+    stdout,
+    host,
+    session: 'S',
+    cwd: repo,
+    root,
+    mirrorMs: 60_000,
+    rowsMs: 60_000,
+    attach: async argv => {
+      attached.push([...argv])
+      return { status: 0 }
+    },
+  })
+  try {
+    await until(() => stdout.written.includes('hc 1'), 5_000, 'owner hc 1 render')
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('hc-screen'), 5_000, 'owner hc preview')
+    stdout.written = ''
+    stdin.emit('data', '\r')
+    await until(() => stdout.written.includes('turn: 2'), 5_000, 'owner hc detail')
+    assert.ok(!stripAnsi(stdout.written).includes('watch-only'), 'owner detail omits watch-only')
+    stdin.emit('data', '\r')
+    await until(() => attached.length === 1, 5_000, 'owner attach ran')
+    assert.deepEqual(attached, [[bin, 'attach', 't1']])
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc socket probe guard: no hc run of any kind when the socket probe fails', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-guard-'))
+  const host = quietHost(undefined, root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  let sockPresent = true
+  let perlOk = false
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.exists = async path => (path === bin ? true : path === socket ? sockPresent : exists(path))
+  const hcCalls: string[][] = []
+  let attachCalls = 0
+  host.run = async argv => {
+    if (argv[0] === 'perl') return { exitCode: perlOk ? 0 : 1, stdout: '', stderr: '' }
+    if (argv[0] === bin) {
+      hcCalls.push([...argv])
+      if (argv[1] === 'ls') {
+        return { exitCode: 0, stdout: JSON.stringify({ terminals: [{ address: 't1', agent: 'agy', status: 'idle', cwd: '/a', where: 'a / 1' }] }), stderr: '' }
+      }
+      if (argv[1] === 'read') return { exitCode: 0, stdout: 'preview\n', stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify({ address: 't1', agent: 'agy', status: 'idle', cwd: '/a', turn: 1 }), stderr: '' }
+    }
+    return { exitCode: 0, stdout: '', stderr: '' }
+  }
+
+  // Direct helper checks with refusing socket and missing socket.
+  assert.match((await mirrorHc(host, 't1', 2000, true)).error ?? '', /not running/)
+  assert.match((await readHcDetail(host, { address: 't1', agent: 'agy', status: 'idle', cwd: '/a', where: 'a / 1' })).error ?? '', /not running/)
+  assert.deepEqual(hcCalls, [])
+  sockPresent = false
+  assert.match((await mirrorHc(host, 't1', 2000, true)).error ?? '', /not running/)
+  assert.deepEqual(hcCalls, [])
+
+  // In runTui: initially live so t1 can be opened in Detail, then socket refuses before Enter attaches.
+  sockPresent = true
+  perlOk = true
+  const { stdin, stdout } = mockTty()
+  const run = runTui({
+    stdin,
+    stdout,
+    host,
+    cwd: root,
+    root,
+    mirrorMs: 60_000,
+    rowsMs: 60_000,
+    attach: async () => {
+      attachCalls++
+      return { status: 0 }
+    },
+  })
+  try {
+    await until(() => stdout.written.includes('hc 1'), 5_000, 'hc 1 loaded')
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('preview'), 5_000, 'hc preview')
+    stdin.emit('data', '\r')
+    await until(() => stdout.written.includes('turn: 1'), 5_000, 'hc detail')
+    const countBeforeDrop = hcCalls.length
+    perlOk = false
+    stdin.emit('data', '\r')
+    await until(() => stdout.written.includes('hc core is not running'), 5_000, 'attach blocked when socket probe fails')
+    assert.equal(hcCalls.length, countBeforeDrop, 'no hc run when socket probe fails')
+    assert.equal(attachCalls, 0, 'attach runner never called when socket probe fails')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc tick: ls success, rejected read and undefined update the title without failing worker rows', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  let phase: 'success' | 'rejected' | 'undefined' = 'success'
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.exists = async path => path === bin ? true : path === socket ? phase !== 'undefined' : exists(path)
+  let reads = 0
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    assert.deepEqual(argv, [bin, 'ls', '--all', '--json'], 'only the read command is allowed')
+    reads++
+    if (phase === 'rejected') throw new Error('fixture: hc read rejected')
+    return { exitCode: 0, stdout: JSON.stringify({ terminals: [
+      { address: 't1', agent: 'codex', status: 'idle', cwd: '/a', where: 'a / 1' },
+    ] }), stderr: '' }
+  }
+  const { stdin, stdout } = mockTty()
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => stdout.written.includes('hc 1'), 5_000, 'hc success title')
+    phase = 'rejected'
+    stdout.written = ''
+    stdin.emit('data', 'r')
+    await until(() => stdout.written.includes('hc ?'), 5_000, 'hc rejected title')
+    assert.equal(reads, 2)
+    phase = 'undefined'
+    stdout.written = ''
+    stdin.emit('data', 'r')
+    await until(() => stdout.written.includes('workers') && !stdout.written.includes(' · hc '), 5_000, 'rows refresh after undefined hc')
+    assert.doesNotMatch(stripAnsi(stdout.written), / · hc /)
+    assert.equal(reads, 2, 'no socket means no hc command')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc close, delete and clear: x x kills live -> finished, d/c remove own finished via hc rm, live and others untouched', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-close-'))
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  const host = quietHost('S', repo, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  let perlOk = true
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  let terminals = [
+    { address: 't1', name: 'live-one', agent: 'agy', state: 'live', status: 'idle', cwd: '/a', where: 'a / 1', parent: 't11' },
+    { address: 't2', name: 'done-one', agent: 'codex', state: 'finished', status: 'idle', cwd: '/b', where: 'b / 1', parent: 't11' },
+    { address: 't3', name: 'live-two', agent: 'agy', state: 'live', status: 'idle', cwd: '/c', where: 'c / 1', parent: 't11' },
+    { address: 't4', name: 'other-done', agent: 'codex', state: 'finished', status: 'idle', cwd: '/d', where: 'd / 1', parent: 't99' },
+  ]
+  const hcCalls: string[][] = []
+  host.run = async argv => {
+    if (argv[0] === 'perl') return { exitCode: perlOk ? 0 : 1, stdout: '', stderr: '' }
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    hcCalls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals }), stderr: '' }
+    if (argv[1] === 'read') return { exitCode: 0, stdout: 'hc-pane\n', stderr: '' }
+    if (argv[1] === 'kill') {
+      terminals = terminals.map(t => (t.address === argv[2] ? { ...t, state: 'finished' } : t))
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    if (argv[1] === 'rm') {
+      terminals = terminals.filter(t => t.address !== argv[2])
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 140
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    // 2 live (t1, t3), 1 own finished (t2); t4 (other parent) is excluded.
+    await until(() => stdout.written.includes('hc 2') && stdout.written.includes('t2 done-one · codex · finished'), 5_000, 'initial hc 2 with own finished render')
+    assert.ok(!stripAnsi(stdout.written).includes('other-done'), 'other parent finished row is excluded')
+
+    stdin.emit('data', 'e')
+    // Select live t1, ensure t does not call hc, then arm + confirm x x -> hc kill t1 (stays listed as finished; hc count drops to 1).
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('› hc · t1 live-one') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
+    stdin.emit('data', 't')
+    await new Promise(r => setTimeout(r, 30))
+    assert.deepEqual(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read'), [])
+
+    stdin.emit('data', 'x')
+    await until(() => stdout.written.includes('stop live-one? press again'), 5_000, 't1 armed')
+    assert.deepEqual(hcCalls.filter(a => a[1] === 'kill' || a[1] === 'rm'), [])
+    await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
+    stdout.written = ''
+    stdin.emit('data', 'x')
+    await until(() => hcCalls.some(a => a[1] === 'kill' && a[2] === 't1') && stdout.written.includes('hc 1') && stdout.written.includes('t1 live-one · agy · finished'), 5_000, 'hc kill t1 leaves finished row')
+    assert.deepEqual(hcCalls.filter(a => a[1] === 'kill'), [[bin, 'kill', 't1']])
+
+    // Leave edit mode (preview), select finished t2, arm + confirm d d -> hc rm t2.
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('› hc · t2 done-one') && stdout.written.includes('[ d delete ]'), 5_000, 't2 selected in preview')
+    stdin.emit('data', 'd')
+    await until(() => stdout.written.includes('delete done-one? press again'), 5_000, 't2 d armed')
+    await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
+    stdout.written = ''
+    stdin.emit('data', 'd')
+    await until(() => hcCalls.some(a => a[1] === 'rm' && a[2] === 't2') && stdout.written.includes('hc 1'), 5_000, 'hc rm t2 ran via d')
+    assert.deepEqual(hcCalls.filter(a => a[1] === 'rm'), [[bin, 'rm', 't2']])
+    assert.ok(!stripAnsi(stdout.written).includes('t2 done-one'), 't2 removed from list')
+
+    // Re-enter edit mode and press c twice: clears remaining own finished row (t1) via hc rm; live t3 and other parent t4 stay untouched.
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'c')
+    await until(() => stdout.written.includes('clear all? press again'), 5_000, 'c armed')
+    await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
+    stdout.written = ''
+    stdin.emit('data', 'c')
+    await until(() => hcCalls.some(a => a[1] === 'rm' && a[2] === 't1') && stdout.written.includes('hc 1'), 5_000, 'c c ran hc rm t1')
+    assert.deepEqual(hcCalls.filter(a => a[1] === 'rm'), [[bin, 'rm', 't2'], [bin, 'rm', 't1']])
+    assert.ok(terminals.some(t => t.address === 't3'), 'live t3 untouched by c')
+    assert.ok(terminals.some(t => t.address === 't4'), 'other parent t4 untouched by c')
+
+    // When socket probe fails before confirming x x on t3, no hc command is run.
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('› hc · t3 live-two'), 5_000, 't3 selected')
+    stdin.emit('data', 'x')
+    await until(() => stdout.written.includes('stop live-two? press again'), 5_000, 't3 armed')
+    const countBeforeDrop = hcCalls.length
+    perlOk = false
+    await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
+    stdin.emit('data', 'x')
+    await until(() => stdout.written.includes('hc core is not running'), 5_000, 'close blocked when socket probe fails')
+    assert.equal(hcCalls.length, countBeforeDrop, 'no hc run when socket probe fails')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc own terminal: excludes $HC_TERMINAL_ID from tui rows so it cannot be selected or stopped', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-self-'))
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  const host = quietHost('S', repo, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const hcCalls: string[][] = []
+  host.run = async argv => {
+    if (argv[0] === 'perl') return { exitCode: 0, stdout: '', stderr: '' }
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    hcCalls.push([...argv])
+    if (argv[1] === 'ls') {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          terminals: [
+            { address: 't11', name: 'self-term', agent: 'claude', state: 'live', status: 'working', cwd: repo, where: 'a / 1' },
+            { address: 't1', name: 'child-term', agent: 'agy', state: 'live', status: 'idle', cwd: repo, where: 'a / 2', parent: 't11' },
+          ],
+        }),
+        stderr: '',
+      }
+    }
+    if (argv[1] === 'read') return { exitCode: 0, stdout: 'child-pane\n', stderr: '' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 140
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => stdout.written.includes('hc 1') && stdout.written.includes('t1 child-term'), 5_000, 'filtered hc 1 render')
+    const screen = stripAnsi(stdout.written)
+    assert.ok(!screen.includes('hc · t11'), 'own hc terminal is excluded')
+    assert.ok(!screen.includes('self-term'), 'own hc terminal name is excluded')
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'j')
+    await until(() => stdout.written.includes('› hc · t1 child-term'), 5_000, 'only child t1 is selectable')
+    stdin.emit('data', 'j')
+    await new Promise(r => setTimeout(r, 30))
+    assert.ok(!stripAnsi(stdout.written).includes('› hc · t11'), 'second j never selects own terminal')
+    assert.equal(hcCalls.filter(a => a[1] === 'kill' || a[1] === 'rm').length, 0)
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc x x: a live row that finishes inside the arm window re-arms instead of turning kill into rm', () => {
+  const live: HcAgent = { address: 't1', agent: 'agy', cwd: '/a', status: 'working', where: 'a / 1', name: 'one', parent: 't11' }
+  const done: HcAgent = { ...live, state: 'finished', status: 'idle' }
+  const x1 = nextKeyState({ ...ownerState(), selected: hcId('t1'), herdr: [live] }, 'x', 1000)
+  assert.equal(x1.action, undefined)
+  const ticked = applyHerdrTick(x1.state, [done])
+  const x2 = nextKeyState(ticked, 'x', 1500)
+  assert.equal(x2.action, undefined, 'second x on a row that finished meanwhile does not run hc rm')
+  assert.equal(x2.state.armedStop?.id, `delete:${hcId('t1')}`, 'it arms the rm verb instead')
+  const x3 = nextKeyState(x2.state, 'x', 2000)
+  assert.deepEqual(x3.action, { type: 'stopHc', hc: done })
+  const liveTwice = nextKeyState(x1.state, 'x', 1500)
+  assert.deepEqual(liveTwice.action, { type: 'stopHc', hc: live }, 'x x on a row still live runs the kill action')
+})
+
+test('hc x on a finished row shows its arm on x, not only on d', () => {
+  const done: HcAgent = { address: 't3', agent: 'codex', state: 'finished', status: 'idle', cwd: '/c', where: 'c / 1', name: 'done', parent: 't11' }
+  const x1 = nextKeyState({ ...ownerState(), rows: [], all: [], selected: hcId('t3'), herdr: [done] }, 'x', 1000)
+  const drawn = renderTuiLines(x1.state, 160, 24, 1500).map(stripAnsi).join('\n')
+  assert.ok(drawn.includes('stop done? press again'), drawn)
+})
+
+test('parseHc keeps a finished record without status (hc drops it on finish) and still skips live shells', () => {
+  const out = parseHc(JSON.stringify({ hidden_finished: 0, terminals: [
+    { address: 't19', agent: 'agy', parent: 't11', reason: 'killed', signal: 1, state: 'finished', turn: 0 },
+    { address: 't1b', agent: 'zsh', state: 'live', turn: 3 },
+    { address: 't11', agent: 'claude-code', state: 'live', status: 'working' },
+  ] }))
+  assert.deepEqual(out.map(a => a.address), ['t19', 't11'])
+  assert.ok(hcFinished(out[0]!))
 })

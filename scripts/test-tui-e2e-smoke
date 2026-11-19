@@ -1,11 +1,11 @@
 #!/usr/bin/env zsh
 . "$(cd "$(dirname "$0")" && pwd)/lib/smoke-home-guard.sh"  # never the real HOME (2026-10-09 home-deletion incident)
 source "$(cd "$(dirname "${(%):-%x}")" && pwd)/lib/smoke-tmux.sh"
-# End-to-end smoke of the real TUI (plan R4): `tmux-agent-tui` in a pane of a
+# End-to-end smoke of the real TUI (plan R4): `workers-tui` in a pane of a
 # private tmux server, over a real ledger whose two workers are real tmux
 # sessions (a fake CLI, as the assign smokes use), driven with `send-keys` and
 # read back with `capture-pane`. One real PTY pass: j/k selection; the selected
-# worker's window takes the TUI width; resize to 80x24 (no line past the width,
+# worker's window takes the preview width; resize to 80x24 (no line past the width,
 # `capture-pane -J`); x (twice) stops a worker; q exits and the pane's stty is unchanged.
 # Detail, refresh, tell, paste, viewer, Ctrl-C and R8.5 wording are tui.contract's
 # and workers.contract's (real ledgers, pty runs). Bounded polls only.
@@ -36,7 +36,10 @@ for a in "\$@"; do case "\$a" in -S|-L) exec ${(q)REAL_TMUX} "\$@" ;; esac; done
 exec ${(q)REAL_TMUX} -S ${(q)TMUX_AGENT_TMUX_SOCKET} "\$@"
 EOF
 chmod +x "$WORK/bin/tmux"
-export PATH="$WORK/bin:$SCRIPTS:${NODE_BIN:h}:/usr/bin:/bin:/usr/sbin:/sbin"
+# node alone, not its whole folder, and no ~/.local/bin: the host's `hc` (herdr-core) must not
+# be found, or its live terminals would enter the frames and make this smoke depend on the machine.
+ln -sf "$NODE_BIN" "$WORK/bin/node"
+export PATH="$WORK/bin:$SCRIPTS:/usr/bin:/bin:/usr/sbin:/sbin"
 cleanup() {
   rm -rf "$WORK"
 }
@@ -48,6 +51,12 @@ ok() { print -r -- "  ok   $1"; PASS=$((PASS + 1)); }
 bad() { print -r -- "  FAIL $1"; FAIL=$((FAIL + 1)); }
 check() { local label="$1"; shift; if "$@"; then ok "$label"; else bad "$label"; fi; }
 left() { (( SECONDS < DEADLINE )) || { bad "smoke deadline passed"; echo "$PASS passed, $FAIL failed"; exit 1; }; }
+
+if command -v hc >/dev/null 2>&1; then
+  bad "smoke PATH resolves hc"
+  exit 1
+fi
+ok "smoke PATH cannot resolve hc (no ~/.local/bin): $PATH"
 
 # The pane, joined: a wrapped line comes back as one line, so overflow shows.
 screen() { T capture-pane -p -J -t "$1"; }
@@ -126,8 +135,8 @@ cat > "$RUN" <<EOF
 #!/bin/zsh -f
 stty -g > ${(q)WORK}/stty.\$1.before
 stty -a > ${(q)WORK}/stty-a.\$1.before
-if [[ "\$1" == owner ]]; then tmux-agent-tui --session $SESSION --cwd ${(q)WORK}/repo
-else tmux-agent-tui --cwd ${(q)WORK}/repo; fi
+if [[ "\$1" == owner || "\$1" == hup || "\$1" == second || "\$1" == cc ]]; then workers-tui --session $SESSION --cwd ${(q)WORK}/repo
+else workers-tui --cwd ${(q)WORK}/repo; fi
 echo "TUI_EXIT=\$?"
 stty -a > ${(q)WORK}/stty-a.\$1.after
 stty -g > ${(q)WORK}/stty.\$1.after
@@ -148,9 +157,11 @@ keys "$P" j
 check "j moves to the second row" wait_for "$P" '^2: .*› ' 25
 keys "$P" k
 check "k moves back to the first row" wait_for "$P" '^1: .*› ' 25
+keys "$P" e
+check "e enters 編輯" wait_for "$P" '\[ t tell \]' 10
 check "the selected row shows its key hints" wait_for "$P" '\[ t tell \].*\[ x stop \].*\[ - cancel \].*\[ U unlock \]' 10
-# A detached worker starts at default-size 80x24; the preview sizes it to the TUI's width.
-check "the selected worker's window takes the TUI width" sh -c "for i in \$(seq 1 100); do tmux list-panes -a -F '#{session_name} #{pane_width}' | grep -Eq 'w[ab]\\..* 120\$' && exit 0; sleep 0.05; done; exit 1"
+# A detached worker starts at default-size 80x24; the stacked preview takes all 120 columns.
+check "the selected worker's window takes the preview width" sh -c "for i in \$(seq 1 100); do tmux list-panes -a -F '#{session_name} #{pane_width}' | grep -Eq 'w[ab]\\..* 120\$' && exit 0; sleep 0.05; done; exit 1"
 
 echo "case: resize re-lays out"
 # One real SIGWINCH; layout at other sizes is tui.contract's (renderTuiLines).
@@ -168,6 +179,7 @@ keys "$P" Escape
 T resize-window -t "$P" -x 120 -y 40
 
 echo "case: x twice stops a worker (owner)"
+keys "$P" e
 keys "$P" r
 check "r clears the selection" sh -c "for i in \$(seq 1 100); do tmux capture-pane -p -t '$P' | grep -q '›' || exit 0; sleep 0.05; done; exit 1"
 # Select A by its row digit: j presses can outrun a slow redraw and stop on B.
@@ -185,14 +197,84 @@ for _ in {1..50}; do
   /bin/sleep 0.2
 done
 check "A's tmux session is gone" test "$stopped" = yes
+audit_row="$(jq -c --arg name "$A" 'select(.event=="wrapper.stop" and .name==$name)' "$TMUX_AGENT_TOOLS_AUDIT_LOG" | tail -1)"
+print -r -- "audit-row $audit_row"
+check "audit caller is workers-tui" test "$(jq -r .caller <<<"$audit_row")" = "workers-tui"
+check "audit session is the acting owner" test "$(jq -r .session <<<"$audit_row")" = "$SESSION"
+check "audit row has holder" jq -e 'has("holder")' <<<"$audit_row" >/dev/null
+
+key="$("$NODE_BIN" -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("hex"))' "$SESSION")"
+sd="$TMUX_AGENT_DIR/.v3/.sessions/$key"
+claim="$sd/tui.owner"
+
+echo "case: second launch exits 0 without taking the terminal"
+check "first TUI holds a ready claim" grep -q '"state":"ready"' "$claim"
+T new-session -d -s second -x 80 -y 24 "$RUN second"
+SP="=second:"
+check "second launch exited 0" wait_for "$SP" 'TUI_EXIT=0' 50
+for _ in {1..100}; do [[ -s "$WORK/stty.second.after" ]] && break; /bin/sleep 0.05; done
+check "second launch left stty unchanged" cmp -s "$WORK/stty.second.before" "$WORK/stty.second.after"
+check "first TUI still drawn" wait_for "$P" ' workers v' 10
 
 echo "case: q exits and the pane's stty is unchanged"
 keys "$P" q
 check "the TUI exited 0" wait_for "$P" 'TUI_EXIT=0' 50
 for _ in {1..100}; do [[ -s "$WORK/stty.owner.after" ]] && break; /bin/sleep 0.05; done
 check "stty after == stty before" cmp -s "$WORK/stty.owner.before" "$WORK/stty.owner.after"
+check "claim file gone after q" test ! -e "$claim"
 
-(( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; }
+echo "case: SIGHUP restores the tty once"
+T new-session -d -s hup -x 80 -y 24 "$RUN hup"
+HP="=hup:"
+check "hup TUI drew" wait_for "$HP" ' workers v' 25
+check "hup holds a ready claim" grep -q '"state":"ready"' "$claim"
+pane_pid="$(T display-message -p -t "$HP" '#{pane_pid}')"
+child="$(pgrep -P "$pane_pid" | head -1)"
+check "hup child exists" test -n "$child"
+kill -HUP "$child"
+check "SIGHUP exited 0" wait_for "$HP" 'TUI_EXIT=0' 50
+for _ in {1..100}; do [[ -s "$WORK/stty-a.hup.after" ]] && break; /bin/sleep 0.05; done
+check "stty -a after SIGHUP is sane" sh -c "grep -q 'icanon' '$WORK/stty-a.hup.after' && grep -q ' echo' '$WORK/stty-a.hup.after' && ! grep -q -- '-icanon' '$WORK/stty-a.hup.after'"
+check "claim file gone after SIGHUP" test ! -e "$claim"
+
+echo "case: Ctrl-C releases the claim"
+T new-session -d -s cc -x 80 -y 24 "$RUN cc"
+CP="=cc:"
+check "cc TUI drew" wait_for "$CP" ' workers v' 25
+check "cc holds a ready claim" grep -q '"state":"ready"' "$claim"
+keys "$CP" C-c
+check "Ctrl-C exited 0" wait_for "$CP" 'TUI_EXIT=0' 50
+check "claim file gone after Ctrl-C" test ! -e "$claim"
+
+echo "case: viewer picks a live session, then x stops a worker"
+mkdir -p "$sd/act/1"
+printf '%s\n' '{"token":"e2etoken0001"}' > "$sd/act/1.json"
+printf '%s\n' '{"channel":"node","status":"collecting","token":"e2etoken0001","mode":"auto"}' > "$sd/act/1.state"
+: > "$sd/act/1.beat"
+printf '%s\n' "{\"session\":\"$SESSION\",\"cwd\":\"$WORK/repo\",\"socket\":\"$TMUX_AGENT_TMUX_SOCKET\"}" > "$sd/collector.json"
+T new-session -d -s pick -x 120 -y 40 "$RUN pick"
+PK="=pick:"
+check "picker launch drew" wait_for "$PK" ' workers v' 25
+keys "$PK" e
+check "picker lists the live session" wait_for "$PK" '\[live\]' 25
+keys "$PK" 1
+check "pick entered 編輯" wait_for "$PK" '\[ n resume \]' 25
+keys "$PK" "$(screen "$PK" | sed -nE "s/^([1-9]): .*${B}.*/\\1/p" | head -1)"
+check "B is selected" wait_for "$PK" "› $B" 25
+keys "$PK" x
+check "x arms the stop on B" wait_for "$PK" "stop $B\\? press again" 25
+/bin/sleep 0.5
+keys "$PK" x
+check "the stop on B ran" wait_for "$PK" "stop $B — ok" 100
+bstopped=no
+for _ in {1..50}; do
+  left
+  agent-tmux e2ecli status --json "$B" 2>/dev/null | grep -q '"exists": *true' || { bstopped=yes; break; }
+  /bin/sleep 0.2
+done
+check "B's tmux session is gone" test "$bstopped" = yes
+
+(( FAIL == 0 )) || { echo "--- owner pane"; screen "$P" || true; echo "--- pick pane"; screen "${PK:-}" || true; }
 echo
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

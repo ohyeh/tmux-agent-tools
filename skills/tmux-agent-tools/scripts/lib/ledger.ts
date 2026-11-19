@@ -73,6 +73,14 @@ export const settledAction = (lock: string, token: string) => {
   return action?.token === token && action.settled
 }
 
+/** A held lock whose dir was renamed (TUI delete): its entry follows it, so the release at `to` clears it. */
+export function movedLock(from: string, to: string, token: string): void {
+  const action = actions.get(from)
+  if (action?.token !== token) return
+  actions.delete(from)
+  actions.set(to, action)
+}
+
 export async function releaseSettledActions(host: Host): Promise<void> {
   // Maintenance bodies have ended before their guards become settled. Remove
   // those guards first, or they would prevent the outer action from releasing.
