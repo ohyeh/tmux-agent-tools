@@ -63,7 +63,7 @@ check() { # check <name> <expected_exit> <json> [expected_stderr_grep]
   if [ "$rc" != "$want" ]; then
     echo "FAIL [$name] exit=$rc want=$want"; FAILS=$((FAILS+1)); return
   fi
-  if [ -n "$grep_for" ] && ! printf '%s' "$err" | grep -q "$grep_for"; then
+  if [ -n "$grep_for" ] && ! grep -q -- "$grep_for" <<<"$err"; then
     echo "FAIL [$name] stderr missing '$grep_for': $err"; FAILS=$((FAILS+1)); return
   fi
   echo "PASS [$name]"
@@ -163,7 +163,7 @@ mkdir -p "$ST6"
 printf '%s User explicitly authorized direct parent dispatch for this smoke test; GATE 1 is not under test here.\n' "$(date -u +%F)" > "$ST6/gate-receipt-parent-dispatch"
 printf '#!/bin/sh\nexit 1\n' > "$FAKE/sha256sum"; chmod +x "$FAKE/sha256sum"
 rc=0; err="$(printf '{"session_id":"%s","tool_use_id":"x1","tool_name":"Shell","tool_input":{"command":"agent-tmux codex start sol_review_a"}}' "$SID6" | PATH="$FAKE:$PATH" bash "$HOOK" 2>&1 >/dev/null)" || rc=$?
-if [ "$rc" = 2 ] && printf '%s' "$err" | grep -q "no sha256 digest"; then echo "PASS [no-digest-deny]"; else echo "FAIL [no-digest-deny] rc=$rc $err"; FAILS=$((FAILS+1)); fi
+if [ "$rc" = 2 ] && grep -q -- "no sha256 digest" <<<"$err"; then echo "PASS [no-digest-deny]"; else echo "FAIL [no-digest-deny] rc=$rc $err"; FAILS=$((FAILS+1)); fi
 rm -rf "$ST6" "$FAKE"
 
 # 21–23. a count that cannot be trusted is no pass (Sol r11 ep3): unreadable log,

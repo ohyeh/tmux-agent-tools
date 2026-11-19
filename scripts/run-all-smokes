@@ -14,9 +14,10 @@ runner_tmux="$(command -v tmux)"
 kill_job_sockets() {
   local dir="$1" s
   [[ -d "$dir" ]] || return 0
+  # Not under the job HOME: a socket there is not tmux (an hc core's socket hung kill-server).
   while IFS= read -r s; do
     env -u TMUX -u TMUX_PANE "$runner_tmux" -S "$s" kill-server 2>/dev/null || true
-  done < <(find "$dir" -type s)
+  done < <(find "$dir" -path "$dir/home" -prune -o -type s -print)
 }
 runner_cleanup() {
   local p dir
@@ -109,6 +110,8 @@ run_job() {
 
   (
     unset TMUX TMUX_PANE
+    # The developer's herdr-core (hc) identity: no smoke may reach a live core or start a new one.
+    unset HC_TERMINAL_ID HC_SCOPE HC_TERMINAL_SOCKET
     # A developer's own <CLI>_TMUX_(EXTRA_)LAUNCH_FLAGS (e.g. exported in ~/.zshenv) would be added to the
     # profile flags a test asserts on: v0.46.13 put --trust --yolo in cursor.conf and the cursor resume case
     # saw them twice.

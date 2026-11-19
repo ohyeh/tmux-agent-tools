@@ -1,6 +1,8 @@
 # Sourced before a smoke creates files or starts tmux. Works in zsh and bash.
 # A runner owns TAS_JOB_DIR; a direct run owns a short private directory.
 unset TMUX TMUX_PANE
+# The developer's herdr-core (hc) identity: no smoke may reach a live core or start a new one.
+unset HC_TERMINAL_ID HC_SCOPE HC_TERMINAL_SOCKET
 SMOKE_TMUX_BIN="$(command -v tmux)"
 SMOKE_OWN_DIR=0
 if [ -n "${TAS_JOB_DIR:-}" ]; then
@@ -24,11 +26,12 @@ smoke_cleanup() {
   for s in "${SMOKE_SOCKETS[@]}"; do
     env -u TMUX -u TMUX_PANE "$SMOKE_TMUX_BIN" -S "$s" kill-server 2>/dev/null || true
   done
-  # Node contracts can create more sockets in TMPDIR beneath this directory.
+  # Node contracts can create more sockets in TMPDIR beneath this directory. Not under the job
+  # HOME: a socket there is not tmux, and kill-server on an hc core's socket hangs.
   if [ -d "$TMUX_TMPDIR" ]; then
     while IFS= read -r s; do
       env -u TMUX -u TMUX_PANE "$SMOKE_TMUX_BIN" -S "$s" kill-server 2>/dev/null || true
-    done < <(find "$TMUX_TMPDIR" -type s)
+    done < <(find "$TMUX_TMPDIR" -path "$TMUX_TMPDIR/home" -prune -o -type s -print)
   fi
   if [ "$SMOKE_OWN_DIR" = 1 ]; then rm -rf "$TMUX_TMPDIR"; fi
 }

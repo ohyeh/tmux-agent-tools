@@ -58,7 +58,7 @@ printf 'argc=%s\n' "$#"
 i=1
 for arg in "$@"; do printf 'arg%s=%s\n' "$i" "$arg"; i=$((i + 1)); done
 printf 'NO_COLOR_SET=%s\n' "${NO_COLOR+1}"
-for k in NO_COLOR COLORTERM FORCE_COLOR CLICOLOR_FORCE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN; do
+for k in NO_COLOR COLORTERM FORCE_COLOR CLICOLOR_FORCE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN HC_TERMINAL_ID; do
   printf '%s=%s\n' "$k" "${(P)k:-}"
 done
 if [[ "$1" == exec ]]; then
@@ -101,7 +101,7 @@ EOF
 echo "case: oneshot launch: code, marker, result, argv, color env, claude env, on-start"
 probe="$WORK/on-start.probe"
 start_out="$(env NO_COLOR=1 COLORTERM= FORCE_COLOR= CLICOLOR_FORCE= \
-  ANTHROPIC_BASE_URL=http://localhost:8317 ANTHROPIC_AUTH_TOKEN=tok-inherited \
+  ANTHROPIC_BASE_URL=http://localhost:8317 ANTHROPIC_AUTH_TOKEN=tok-inherited HC_TERMINAL_ID=t11 \
   "$AGENT" claude --profile "$WORK/oneshot.conf" start --exact \
   --on-start "printf '%s|%s\n' \"\$TMUX_AGENT_NAME\" \"\$TMUX_AGENT_SESSION\" > $probe" \
   p4-one "$WORK" 'a b "c"')"
@@ -124,6 +124,8 @@ assert "default sets FORCE_COLOR" "$(env_line "$stdout_path" FORCE_COLOR)" "3"
 assert "default sets CLICOLOR_FORCE" "$(env_line "$stdout_path" CLICOLOR_FORCE)" "1"
 assert "caller ANTHROPIC_BASE_URL cleared" "$(env_line "$stdout_path" ANTHROPIC_BASE_URL)" ""
 assert "caller ANTHROPIC_AUTH_TOKEN cleared" "$(env_line "$stdout_path" ANTHROPIC_AUTH_TOKEN)" ""
+# The tmux server keeps the hc identity of the terminal that started it; a worker gets none.
+assert "caller HC_TERMINAL_ID cleared" "$(env_line "$stdout_path" HC_TERMINAL_ID)" ""
 assert "sidecar null with capture off" "$(jq -r '.cli_session_id // "null"' "$TMUX_AGENT_DIR/p4-one/session-meta.json")" "null"
 status_json="$("$AGENT" claude --profile "$WORK/oneshot.conf" status --json p4-one)"
 assert "status running false" "$(printf '%s' "$status_json" | jq -r .running)" "false"
