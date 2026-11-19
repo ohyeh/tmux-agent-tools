@@ -28,7 +28,7 @@ import { readFile, rename, writeFile } from 'node:fs/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { nodeHost } from './host.node.ts'
-import { heartbeat, newGate, POLL_MS, processId, reconcileOnce, rootOf, sessionDirOf, v3Of } from './workers.ts'
+import { heartbeat, isPaneId, newGate, POLL_MS, processId, reconcileOnce, rootOf, sessionDirOf, v3Of } from './workers.ts'
 
 const NODE_FLOOR = [22, 18, 0]
 const TMUX_MS = 5_000
@@ -257,7 +257,7 @@ async function main(): Promise<void> {
   }
   if (!session) usage('--session is required: a collector without a session id would own everything (§3)')
   if (!cwd || !cwd.startsWith('/')) usage('--cwd must be an absolute path')
-  if (!pane || !/^%\d+$/.test(pane)) usage('--pane must be a tmux pane id like %3')
+  if (!pane || !isPaneId(pane)) usage('--pane must be a tmux pane id like %3')
   const log = (text: string) => process.stderr.write(`${new Date().toISOString()} ${text}\n`)
   const host = nodeHost({ owner: session, cwd, log, submit: text => pasteInto(pane, text, process.env, cli) })
   const gate = newGate()

@@ -38,6 +38,11 @@ export function nodeHost(opts: NodeHostOptions = {}): Host {
     envXdgStateHome: async () => process.env.XDG_STATE_HOME,
     envHome: async () => process.env.HOME,
     envPath: async () => process.env.PATH,
+    envTermProgram: async () => process.env.TERM_PROGRAM,
+    envTmuxPane: async () => process.env.TMUX_PANE,
+    envTmuxSocket: async () => process.env.TMUX_AGENT_TMUX_SOCKET || process.env.TMUX?.split(',')[0],
+    envSshTty: async () => process.env.SSH_TTY,
+    envHcTerminal: async () => process.env.HC_TERMINAL_ID,
     read: path => readFile(path, 'utf8'),
     write: async (path, text) => {
       await mkdir(path.slice(0, path.lastIndexOf('/')), { recursive: true })

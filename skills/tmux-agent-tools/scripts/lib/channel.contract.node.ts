@@ -197,7 +197,7 @@ test('handover: a dry run changes nothing; --yes switches under channel.lock the
     const dry = await handoverChannel(w.host, w.root, SESSION, 'node', false, noProcs)
     assert.equal(dry.ok, false)
     assert.match(dry.text, new RegExp(`would switch session ${SESSION} from its mcp channel to node`))
-    assert.match(dry.text, new RegExp(`tmux-agent-tui --handover-channel '${SESSION}' node --yes`))
+    assert.match(dry.text, new RegExp(`workers-tui --handover-channel '${SESSION}' node --yes`))
     assert.equal(channelOf(w), 'mcp')
     w.trace.length = 0
     const out = await handoverChannel(w.host, w.root, SESSION, 'node', true, noProcs)
