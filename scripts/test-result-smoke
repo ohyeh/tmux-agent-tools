@@ -229,7 +229,7 @@ mkw w3 2026-07-02T10:00:00Z  # no launch-meta, no result
 for n in wc-claude codex-smoke wc-fake probe-smoke; do mkw "$n" 2026-07-03T10:00:00Z; done
 legacy=(success ok PASS pass completed complete done APPROVE blocked failed FAIL CONCERN needs-fixes)
 for i in {1..${#legacy}}; do mkw "l$i" 2026-07-18T00:00:00Z '' "${legacy[$i]}"; done
-mkdir -p "$SD/worktrees/junk"; printf x > "$SD/worktrees/junk/note.txt"  # no started_at: ignored
+mkdir -p "$SD/junk-dir/junk"; printf x > "$SD/junk-dir/junk/note.txt"  # no started_at: ignored
 sjson="$(TMUX_AGENT_DIR="$SD" "$AGENT" claude stats --json)"
 # total 20 = w1-w3 + 4 self-test/lookalike + 13 legacy; with_result 15.
 assert "stats totals" "$(printf '%s' "$sjson" | jq -c '[.total, .by_month["2026-06"], .by_month["2026-07"]]')" '[20,2,18]'

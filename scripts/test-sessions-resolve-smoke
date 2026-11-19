@@ -128,9 +128,6 @@ printf '%s\n' "2026-01-01T00:00:00Z" > "$TMUX_AGENT_DIR/trade-pine-c5b475/starte
 printf '%s\n' "2026-01-02T00:00:00Z" > "$TMUX_AGENT_DIR/trade-pine-d9e010/created_at"
 printf '%s\n' "2026-01-03T00:00:00Z" > "$TMUX_AGENT_DIR/build-bot/created_at"
 printf '%s\n' "2026-01-01T00:00:00Z" > "$TMUX_AGENT_DIR/worker1/created_at"
-cat > "$TMUX_AGENT_DIR/trade-pine-c5b475/worktree.json" <<EOF
-{"schema_version":1,"path":"$WORK/repo-a","dirty":true}
-EOF
 
 PASS=0
 FAIL=0
@@ -186,13 +183,9 @@ assert_eq "cwd filters list rows" "$cwd_count" "1"
 diff_count="$(sessions diff --since 2026-01-02T12:00:00Z --json | jq 'length')"
 assert_eq "diff returns sessions since timestamp" "$diff_count" "1"
 
-echo "case: cleanup refuses dirty managed worktree unless forced"
-code=0
-sessions cleanup --execute --name trade-pine-c5b475 >/dev/null 2>"$WORK/dirty.err" || code=$?
-assert_nonzero "dirty cleanup exits non-zero" "$code"
-assert_eq "dirty cleanup does not kill" "$(cat "$FAKE_TMUX_KILLS")" ""
-sessions cleanup --execute --name trade-pine-c5b475 --force >/dev/null
-assert_eq "force cleanup kills session" "$(cat "$FAKE_TMUX_KILLS")" "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475"
+echo "case: cleanup --execute stops the named session"
+sessions cleanup --execute --name trade-pine-c5b475 >/dev/null
+assert_eq "cleanup kills the named session" "$(cat "$FAKE_TMUX_KILLS")" "$CLAUDE_TMUX_PREFIX-trade-pine-c5b475"
 
 echo "case: --tool agy accepted and session recognised"
 code=0

@@ -10,7 +10,7 @@ SELF="${0:A}"
 # Single source of engine version for `doctor`/`--version` (#P1 stale-version
 # guard). Value tracks the latest CHANGELOG.md release; a future release round
 # folds it into test-version-sync-smoke so drift becomes a CI failure.
-AGENT_TMUX_VERSION='0.47.0'
+AGENT_TMUX_VERSION='0.52.1'
 
 # Top-level `agent-tmux --version` (before the <cli> requirement). The
 # per-<cli> form is handled in the command dispatch below.
@@ -858,7 +858,7 @@ agent-tmux doctor          Check binaries + tmux + capture/wait behavior.
                            two machines can eyeball version drift offline.
 agent-tmux setup           Emit combined JSON for doctor --json + self-test.
                            Both name scripts of this bundle that have no
-                           link in ~/.local/bin (e.g. tmux-agent-tui after an
+                           link in ~/.local/bin (e.g. workers-tui after an
                            upgrade): re-run install-bin to add them.
 agent-tmux self-test       End-to-end smoke without launching a real CLI.
 agent-tmux --version       Print the engine version and exit.
@@ -1344,6 +1344,13 @@ apply_cli_env_args() {
     [[ -n "$value" ]] || continue
     session_env_args+=("-e" "$key=$value")
   done < <(cli_provider_env_keys)
+}
+
+# A worker has no hc (herdr-core) terminal of its own: the tmux server keeps the hc identity
+# of the terminal that started it, so without this a worker's `hc run` child would be
+# that terminal's child (wrong owner, and it ends when that terminal ends). Empty = no parent.
+clear_hc_env_args() {
+  session_env_args+=("-e" "HC_TERMINAL_ID=" "-e" "HC_SCOPE=")
 }
 
 apply_color_env_args() {
@@ -1973,81 +1980,6 @@ file_ref_compose() {
   ref_path="$dir/send-$(date +%Y%m%dT%H%M%S)-$$.md"
   printf '%s\n' "$2" > "$ref_path" || { echo "could not write the message to $ref_path" >&2; return 1; }
   file_ref_line "$ref_path"
-}
-
-# --- Managed fresh worktree (issue #187) ----------------------------------
-# Allocate a managed git worktree with:
-#   branch:  tmux-agent/<sanitized-name>-<uuid8>
-#   path:    $XDG_STATE_HOME/tmux-agent-tools/worktrees/<sanitized-name>-<uuid8>
-# Writes <path>/.tmux-agent-worktree/meta.json with schema_version: 1, and
-# records the path under the agent dir (legacy fresh-worktree marker and
-# machine-readable worktree.json). Caller passes: name tool source_repo.
-# Echoes the new worktree path on stdout. Logs a notice on stderr.
-setup_fresh_worktree() {
-  local agent_name="$1" tool="$2" source_repo="$3"
-  local sanitized="${agent_name//[^A-Za-z0-9._-]/_}"
-  local uuid
-  uuid="$(LC_ALL=C /usr/bin/od -An -N4 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
-  local branch="tmux-agent/${sanitized}-${uuid}"
-  local root="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-tools/worktrees"
-  mkdir -p "$root"
-  local wt_path="$root/${sanitized}-${uuid}"
-  local base_ref
-  base_ref="$( cd "$source_repo" && git rev-parse --abbrev-ref HEAD 2>/dev/null )"
-  if [[ -z "$base_ref" || "$base_ref" == "HEAD" ]]; then
-    base_ref="$( cd "$source_repo" && git rev-parse --short HEAD 2>/dev/null )"
-  fi
-  if ! ( cd "$source_repo" && git worktree add -b "$branch" "$wt_path" >/dev/null 2>&1 ); then
-    echo "git worktree add failed" >&2
-    return 1
-  fi
-  local policy="${TMUX_AGENT_WORKTREE_POLICY:-no-change-cleanup}"
-  case "$policy" in
-    no-change-cleanup|has-change-keep|always-keep) ;;
-    *) policy="no-change-cleanup" ;;
-  esac
-  local created_at
-  created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local meta_dir="$wt_path/.tmux-agent-worktree"
-  mkdir -p "$meta_dir"
-  # Exclude our managed metadata from git status so dirty detection reflects
-  # only user-authored changes.
-  local exclude_dir
-  exclude_dir="$( cd "$wt_path" && git rev-parse --git-path info 2>/dev/null )"
-  if [[ -n "$exclude_dir" ]]; then
-    ( cd "$wt_path" && mkdir -p "$exclude_dir" && \
-      printf '%s\n' '/.tmux-agent-worktree/' >> "$exclude_dir/exclude" ) 2>/dev/null || true
-  fi
-  local abs_repo
-  abs_repo="$(cd "$source_repo" && pwd)"
-  "$JQ" -n \
-    --argjson schema_version 1 \
-    --arg source_repo "$abs_repo" \
-    --arg base_ref "$base_ref" \
-    --arg agent_name "$agent_name" \
-    --arg tool "$tool" \
-    --arg created_at "$created_at" \
-    --arg wt_path "$wt_path" \
-    --arg branch "$branch" \
-    --arg cleanup_policy "$policy" \
-    '{schema_version:$schema_version, source_repo:$source_repo, base_ref:$base_ref,
-      agent_name:$agent_name, tool:$tool, created_at:$created_at, path:$wt_path,
-      branch:$branch, cleanup_policy:$cleanup_policy}' > "$meta_dir/meta.json"
-  ensure_agent_dir "$agent_name" >/dev/null
-  local agent_dir
-  agent_dir="$(agent_root_dir)/$agent_name"
-  ( printf '%s\n' "$wt_path" > "$agent_dir/fresh-worktree" ) 2>/dev/null || true
-  "$JQ" -n \
-    --argjson schema_version 1 \
-    --arg wt_path "$wt_path" \
-    --arg branch "$branch" \
-    --arg source_repo "$abs_repo" \
-    --arg cleanup_policy "$policy" \
-    '{schema_version:$schema_version, path:$wt_path, branch:$branch,
-      source_repo:$source_repo, cleanup_policy:$cleanup_policy}' \
-    > "$agent_dir/worktree.json" 2>/dev/null || true
-  echo "fresh worktree: $wt_path" >&2
-  printf '%s' "$wt_path"
 }
 
 # --- Advisory send lock (issue #102) --------------------------------------
@@ -5050,7 +4982,6 @@ start_session() {
   local result_schema_path=""
   local usage_path=""
   local on_exit_allow=""
-  local workdir_fresh=0
   local -a pending_secrets
   pending_secrets=()
   local -a pending_tags
@@ -5058,7 +4989,7 @@ start_session() {
   local model_flag=""
   local effort_flag=""
   local task_shape=""
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" || "${1:-}" == "--model" || "${1:-}" == "--effort" || "${1:-}" == "--task-shape" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--model" || "${1:-}" == "--effort" || "${1:-}" == "--task-shape" ]]; do
     case "$1" in
       --task-shape)
         if (( $# < 2 )); then
@@ -5193,14 +5124,10 @@ start_session() {
         pending_secrets+=("$2")
         shift 2
         ;;
-      --workdir-fresh)
-        workdir_fresh=1
-        shift
-        ;;
     esac
   done
 
-  # Fail fast on missing secret backends BEFORE any tmux/jq/worktree work
+  # Fail fast on missing secret backends BEFORE any tmux/jq work
   # so a missing CLI exits with code 4 in <1s instead of hanging on a
   # downstream timeout (issue #189 reverify).
   secrets_preflight_backends
@@ -5273,15 +5200,6 @@ start_session() {
     name="$requested_name-$(random_suffix)"
   fi
   refuse_live_name "$name"
-  if (( workdir_fresh )); then
-    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
-      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
-      exit 1
-    fi
-    local fresh_workdir
-    fresh_workdir="$(setup_fresh_worktree "$name" "$CLI" "$directory")" || exit 1
-    directory="$fresh_workdir"
-  fi
 
   local session="$(session_for_name "$name")"
   local -a session_env_args
@@ -5293,6 +5211,7 @@ start_session() {
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_cli_env_args
   apply_color_env_args
+  clear_hc_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -5559,12 +5478,11 @@ resume_session() {
   local result_schema_path=""
   local usage_path=""
   local on_exit_allow=""
-  local workdir_fresh=0
   local -a pending_secrets
   pending_secrets=()
   local -a pending_tags
   pending_tags=()
-  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" || "${1:-}" == "--workdir-fresh" ]]; do
+  while [[ "${1:-}" == "--transcript" || "${1:-}" == "--record" || "${1:-}" == "--transcript-text-truncate" || "${1:-}" == "--result-schema" || "${1:-}" == "--tag" || "${1:-}" == "--role" || "${1:-}" == "--usage" || "${1:-}" == "--on-exit-allow" || "${1:-}" == "--secret" || "${1:-}" == "--secret-redact" || "${1:-}" == "--secret-redact=true" || "${1:-}" == "--secret-redact=false" ]]; do
     case "$1" in
       --secret-redact|--secret-redact=true)
         SECRET_REDACT_DISABLE=0
@@ -5663,10 +5581,6 @@ resume_session() {
         pending_secrets+=("$2")
         shift 2
         ;;
-      --workdir-fresh)
-        workdir_fresh=1
-        shift
-        ;;
     esac
   done
 
@@ -5728,15 +5642,6 @@ resume_session() {
     name="$requested_name-$(random_suffix)"
   fi
   refuse_live_name "$name"
-  if (( workdir_fresh )); then
-    if ! ( cd "$directory" && git rev-parse --git-dir >/dev/null 2>&1 ); then
-      echo "--workdir-fresh requires <directory> to be a git repo: $directory" >&2
-      exit 1
-    fi
-    local fresh_workdir
-    fresh_workdir="$(setup_fresh_worktree "$name" "$CLI" "$directory")" || exit 1
-    directory="$fresh_workdir"
-  fi
 
   local session="$(session_for_name "$name")"
   local -a session_env_args
@@ -5748,6 +5653,7 @@ resume_session() {
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_cli_env_args
   apply_color_env_args
+  clear_hc_env_args
   secret_process_pending "$name"
   apply_sentinel_env_args
   apply_result_env_args "$name"
@@ -5957,6 +5863,7 @@ start_ssh_session() {
     append_session_env_entry "$session_env_entry"
   done <<< "${TMUX_AGENT_TOOLS_SESSION_ENV:-}"
   apply_color_env_args
+  clear_hc_env_args
 
   # The remote payload runs under `sh` (remote_sh_command), so every value in it
   # is sh_quote'd. The whole tmux command is built and sized before the probe and
@@ -6657,20 +6564,23 @@ capture_session() {
   fi
 
   local raw
-  local pane_flags=-J
-  (( color )) && pane_flags=-Je
-  raw="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane "$pane_flags" -t "$(session_target "$session")" -p -S "-$tail_count")"
+  local -a pane_flags=(-J)
+  (( color )) && pane_flags+=(-e)
+  raw="$("$TMUX" "${TMUX_SOCKET_ARGS[@]}" capture-pane "${pane_flags[@]}" -t "$(session_target "$session")" -p -S "-$tail_count")"
 
   # Redact registered secret values (#189) before any downstream sink.
   secret_redact_load_for "$name"
-  raw="$(secret_redact_apply "$raw")"
+  raw="$(secret_redact_apply "$raw" && printf '.')" || return $?
+  raw="${raw%.}"
   if (( color )); then
     # A colour change inside a secret splits it, so the match above misses it.
     # If the text without SGR still holds a secret, give that text, redacted.
     local plain
-    plain="$(printf '%s' "$raw" | sed -E $'s/\x1b\\[[0-9;:]*m//g')"
+    plain="$(printf '%s.' "$raw" | sed -E $'s/\x1b\\[[0-9;:]*m//g')" || return $?
+    plain="${plain%.}"
     local plain_redacted
-    plain_redacted="$(secret_redact_apply "$plain")"
+    plain_redacted="$(secret_redact_apply "$plain" && printf '.')" || return $?
+    plain_redacted="${plain_redacted%.}"
     [[ "$plain_redacted" != "$plain" ]] && raw="$plain_redacted"
   fi
 
@@ -6686,7 +6596,7 @@ capture_session() {
     # Note: sed strips per-line, which is fine because tmux capture-pane
     # joins soft-wrapped lines and terminal OSC/DCS payloads do not span
     # logical lines in normal CLI output.
-    raw="$(printf '%s' "$raw" | sed -E $'
+    raw="$(printf '%s.' "$raw" | sed -E $'
       s/\x1b\\[[0-9;?]*[A-Za-z]//g
       s/\x1b\\][^\x07\x1b]*\x07//g
       s/\x1b\\][^\x1b]*\x1b\\\\//g
@@ -6694,7 +6604,8 @@ capture_session() {
       s/\x1b_[^\x1b]*\x1b\\\\//g
       s/\x1b\\^[^\x1b]*\x1b\\\\//g
       s/\x1bX[^\x1b]*\x1b\\\\//g
-    ')"
+    ')" || return $?
+    raw="${raw%.}"
   fi
 
   local marker_found=0
@@ -6705,7 +6616,8 @@ capture_session() {
     last_idx="$(printf '%s\n' "$raw" | { grep -nF "$since_marker" || true; } | tail -1 | cut -d: -f1)"
     if [[ -n "$last_idx" ]]; then
       marker_found=1
-      raw="$(printf '%s\n' "$raw" | tail -n +"$((last_idx + 1))")"
+      raw="$(printf '%s.' "$raw" | tail -n +"$((last_idx + 1))")" || return $?
+      raw="${raw%.}"
     else
       raw=""
     fi
@@ -7661,7 +7573,7 @@ preflight_session() {
 
 # Scripts of this bundle with no link in ~/.local/bin although install-bin put
 # agent-tmux there: install-bin links only what existed when it ran, so a script
-# added by an upgrade (tmux-agent-tui) is missing until it runs again (plan D-upgrade).
+# added by an upgrade (workers-tui) is missing until it runs again (plan D-upgrade).
 missing_bin_links() {
   local dir="$HOME/.local/bin" f out=()
   [[ -e "$dir/agent-tmux" ]] || return 0
@@ -7718,14 +7630,8 @@ doctor_session() {
 
     if git_bin="$(command -v git 2>/dev/null)"; then
       add_doctor_check "git" true "$git_bin"
-      if git worktree --help >/dev/null 2>&1; then
-        add_doctor_check "git_worktree" true "git worktree: ok"
-      else
-        add_doctor_check "git_worktree" false "git worktree: not available"
-      fi
     else
       add_doctor_check "git" false "git: not found"
-      add_doctor_check "git_worktree" false "git worktree: not available (git missing)"
     fi
 
     add_doctor_check "approval" true "$PROFILE_APPROVAL"
@@ -7772,14 +7678,8 @@ doctor_session() {
   echo "clipboard: $(clipboard_description)"
   if command -v git >/dev/null 2>&1; then
     echo "git: $(command -v git)"
-    if git worktree --help >/dev/null 2>&1; then
-      echo "git worktree: ok"
-    else
-      echo "git worktree: not available"
-    fi
   else
     echo "git: not found"
-    echo "git worktree: not available (git missing)"
   fi
 }
 
@@ -9480,6 +9380,11 @@ stop_session() {
     echo "Usage: agent-tmux stop <name>" >&2
     exit 2
   fi
+  # I2: the TUI passes the acting session and the row holder. A CLI stop does not.
+  local tui_json=""
+  if [[ "${2:-}" == --tui-audit ]]; then
+    tui_json="${3:-}"
+  fi
 
   # Same per-name launch lock as start/resume: a replacement cannot be launched
   # between the identity check below and the kill / envelope write (R4-3). The OS
@@ -9541,10 +9446,18 @@ stop_session() {
   # Who closed a worker: without this event a stopped session and one killed
   # from outside looked the same in the audit log (live 2026-09-25). Last, so
   # a failed append (it fails the command, as on start) skips no teardown.
-  audit_log_append "$("$JQ" -c -n --arg event stop --arg tool "$CLI" --arg name "$name" \
-    --arg session "$session" --argjson stopped "$stopped" \
-    --arg caller "$(ps -o command= -p "$PPID" 2>/dev/null | cut -c1-160)" \
-    '{event:$event,tool:$tool,name:$name,session:$session,stopped:($stopped == 1),caller:$caller}')"
+  if [[ -n "$tui_json" ]]; then
+    audit_log_append "$("$JQ" -c -n --arg event stop --arg tool "$CLI" --arg name "$name" \
+      --argjson stopped "$stopped" --argjson audit "$tui_json" \
+      '{event:$event,tool:$tool,name:$name,
+        session:$audit.session,holder:$audit.holder,
+        stopped:($stopped == 1),caller:"workers-tui"}')"
+  else
+    audit_log_append "$("$JQ" -c -n --arg event stop --arg tool "$CLI" --arg name "$name" \
+      --arg session "$session" --argjson stopped "$stopped" \
+      --arg caller "$(ps -o command= -p "$PPID" 2>/dev/null | cut -c1-160)" \
+      '{event:$event,tool:$tool,name:$name,session:$session,stopped:($stopped == 1),caller:$caller}')"
+  fi
 }
 
 # Allow test harnesses (issue #102 smoke) to source the wrapper purely for

@@ -73,7 +73,7 @@ Usage:
   tmux-agent-sessions diff --since <timestamp> --json
   tmux-agent-sessions watch [--count <n>] [--interval <seconds>] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>]
   tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>]
-  tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>) [--force]
+  tmux-agent-sessions cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>)
 
 Behavior:
   - list is read-only;
@@ -81,7 +81,6 @@ Behavior:
   - watch polls inventory and emits one JSONL event per state transition (session_added, session_state_changed, session_removed); bounded by --count (0 = unlimited);
   - cleanup --preview is read-only;
   - cleanup --execute requires --all or a filter before stopping sessions;
-  - cleanup --execute refuses dirty managed worktrees unless --force is passed;
   - cleanup --execute only stops matching sessions owned by agent-tmux claude/codex/agy or tmux-agent-dialogue;
   - sessions outside known tmux-agent-tools prefixes are never stopped.
 EOF
@@ -317,9 +316,6 @@ created_at_for_name() {
       return
     fi
   done
-  if [[ -f "$agent_dir/worktree.json" ]]; then
-    "$JQ" -r '.created_at // empty' "$agent_dir/worktree.json" 2>/dev/null || true
-  fi
 }
 
 result_path_for_name() {
@@ -330,15 +326,6 @@ result_path_for_name() {
 cwd_for_session() {
   local name="$1"
   local session="$2"
-  local agent_dir="$TMUX_AGENT_DIR/$name"
-  if [[ -f "$agent_dir/worktree.json" ]]; then
-    local wt_path
-    wt_path="$("$JQ" -r '.path // empty' "$agent_dir/worktree.json" 2>/dev/null || true)"
-    if [[ -n "$wt_path" ]]; then
-      print -r -- "$wt_path"
-      return
-    fi
-  fi
   "$TMUX" display-message -p -t "$(session_target "$session")" "#{pane_current_path}" 2>/dev/null || true
 }
 
@@ -748,35 +735,10 @@ diff_sessions() {
   inventory_json_array
 }
 
-worktree_dirty_reason() {
-  local name="$1"
-  local agent_dir="$TMUX_AGENT_DIR/$name"
-  local wt_json="$agent_dir/worktree.json"
-  local wt_path=""
-  if [[ -f "$wt_json" ]]; then
-    local dirty
-    dirty="$("$JQ" -r 'if (.dirty == true or .worktree_dirty == true or .status == "dirty" or .clean == false) then "dirty" else "" end' "$wt_json" 2>/dev/null || true)"
-    [[ "$dirty" == "dirty" ]] && { print -r -- "worktree metadata is dirty"; return 0; }
-    wt_path="$("$JQ" -r '.path // empty' "$wt_json" 2>/dev/null || true)"
-  fi
-  if [[ -n "$wt_path" && -f "$wt_path/.tmux-agent-worktree/meta.json" ]]; then
-    local meta_dirty
-    meta_dirty="$("$JQ" -r 'if (.dirty == true or .worktree_dirty == true or .status == "dirty" or .clean == false) then "dirty" else "" end' "$wt_path/.tmux-agent-worktree/meta.json" 2>/dev/null || true)"
-    [[ "$meta_dirty" == "dirty" ]] && { print -r -- "worktree metadata is dirty"; return 0; }
-  fi
-  if [[ -n "$wt_path" && -d "$wt_path/.git" ]] && command -v git >/dev/null 2>&1; then
-    local check_status
-    check_status="$(cd "$wt_path" && git status --porcelain 2>/dev/null || true)"
-    [[ -n "$check_status" ]] && { print -r -- "worktree has uncommitted changes"; return 0; }
-  fi
-  return 1
-}
-
 cleanup_sessions() {
   local mode=""
   local output_json=0
   local all=0
-  local force=0
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --preview)
@@ -790,9 +752,6 @@ cleanup_sessions() {
         ;;
       --all)
         all=1
-        ;;
-      --force)
-        force=1
         ;;
       --tool)
         shift
@@ -822,7 +781,7 @@ cleanup_sessions() {
         [[ -n "$FILTER_CWD" ]] || die "--cwd requires a value"
         ;;
       *)
-        die "Usage: tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] | cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>) [--force]"
+        die "Usage: tmux-agent-sessions cleanup --preview [--json] [--tool <claude|codex|agy|dialogue>] [--name <name>] [--state <running|exited|stopped|missing>] [--created-after <timestamp>] [--cwd <path>] | cleanup --execute (--all | --tool <claude|codex|agy|dialogue> | --name <name> | --state <running|exited|stopped|missing> | --created-after <timestamp> | --cwd <path>)"
         ;;
     esac
     shift
@@ -834,7 +793,7 @@ cleanup_sessions() {
     die "cleanup --execute requires --all, --tool, --name, --state, --created-after, or --cwd"
   fi
 
-  local rows tool name session dirty_reason
+  local rows tool name session
   rows="$(inventory_json_array | "$JQ" -r '.[] | [.tool, .name, .session] | @tsv')"
   while IFS=$'\t' read -r tool name session; do
     [[ -z "$tool" ]] && continue
@@ -845,11 +804,6 @@ cleanup_sessions() {
         print -r -- "would stop: $(emit_inventory_text "$tool" "$name" "$session")"
       fi
       continue
-    fi
-
-    if (( ! force )) && dirty_reason="$(worktree_dirty_reason "$name")"; then
-      print -r -- "$SELF: refusing to stop $session: $dirty_reason (pass --force to override)" >&2
-      return 1
     fi
 
     case "$tool" in
