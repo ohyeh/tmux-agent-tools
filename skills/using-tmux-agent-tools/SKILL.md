@@ -202,6 +202,14 @@ yourself.
   `using-decision-tree` loops branch (`references/loops.md`), not this router.
 - ONE coding CLI as a supervised worker (most common) → `agent-tmux <cli>`
   (claude / codex / agy built in; gemini, cursor, custom via profile).
+- An interactive agent in a Herdr.app (`herdr-core`, `hc`) terminal instead of
+  tmux (so it shows in Herdr.app and this session's `/workers` band, and can
+  be attached live with `hc attach` or `workers-tui`) → start with
+  `hc run --bg --name <n> -- <cmd>` (omit `--no-parent` so `parent` records
+  `$HC_TERMINAL_ID` and the band lists it; add `--outlive-parent` if it should
+  survive this terminal). Drive it with `hc read <t>`, `hc send <t> "<text>"`,
+  `hc keys <t> enter`, `hc wait <t>`, `hc attach [--observe] <t>` (watch-only in `workers-tui` viewer mode; `ctrl+\` detaches), and
+  close live with `hc kill <t>` or `x x` in the band or `workers-tui` (編輯) (leaving the finished record listed until cleared); remove own finished rows with `d d` (`workers-tui`), `c c` / `[ clear ]`, `x x`, `/workers stop <hc address>`, or `hc rm <t>`.
 - Same prompt across MANY workers → `tmux-agent-fanout`; bounded TWO-party
   exchange → `tmux-agent-dialogue`. BOTH require the user's explicit
   authorization for count, tool, model, and effort — never assume it.
@@ -209,8 +217,7 @@ yourself.
   inventory, cleanup) · live overview → `tmux-agent-dashboard`.
 - Dependencies → `tmux-agent-dag`
   · evidence polling → `tmux-agent-monitor`.
-- Records → `tmux-agent-audit` / `tmux-agent-replay`
-  · worktrees → `tmux-agent-worktrees`.
+- Records → `tmux-agent-audit` / `tmux-agent-replay`.
 
 Then read the chosen wrapper's row in the canonical capability table:
 `skills/tmux-agent-tools/references/cheatsheets.md` → **Full script
