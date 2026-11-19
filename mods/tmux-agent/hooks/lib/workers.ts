@@ -30,6 +30,9 @@ import {
   readWorker,
   recoverEpisodes,
   registerOnChannel,
+  movedLock,
+  releaseLock,
+  releasedText,
   releaseSettledActions,
   settledAction,
   underLock,
@@ -291,6 +294,8 @@ export const PANEL_ACCENT = 'cyan'
  * Under this many rows the mirror is off, not small.
  */
 export const MIRROR_MIN_ROWS = 6
+/** At most this many herdr lines in the band (the last a `+N more` line when cut); they yield first. */
+export const HERDR_BAND_LINES = 3
 export const BACKOFF_MS = [10_000, 60_000]
 export const STATE_SUFFIX = '/.local/state/tmux-agent-tools'
 export const REQUIRED_SECTIONS = ['GOAL', 'ACCEPTANCE', 'REPORT', 'MODEL']
@@ -353,6 +358,16 @@ export type Host = {
   envXdgStateHome: () => Promise<string | undefined>
   envHome: () => Promise<string | undefined>
   envPath: () => Promise<string | undefined>
+  /** Which terminal app this process is in (C02). Core must not read process.env for this. */
+  envTermProgram: () => Promise<string | undefined>
+  /** The tmux pane this process is in, if any (`TMUX_PANE`). Core must not read process.env for this. */
+  envTmuxPane: () => Promise<string | undefined>
+  /** The tmux server socket this process talks to: `TMUX_AGENT_TMUX_SOCKET`, else the first field of `TMUX`. */
+  envTmuxSocket: () => Promise<string | undefined>
+  /** Set when this process is on an SSH tty (C02). Core must not read process.env for this. */
+  envSshTty: () => Promise<string | undefined>
+  /** This process's herdr-core terminal (`HC_TERMINAL_ID`): the parent of the hc agents it started. */
+  envHcTerminal: () => Promise<string | undefined>
   read: (path: string) => Promise<string>
   write: (path: string, text: string) => Promise<void>
   stat: (path: string) => Promise<{ mtimeMs: number; size: number }>
@@ -378,10 +393,10 @@ export type Host = {
 
 /**
  * Terminal display cells, by the TUI's rules (width.ts, plan §1c S7): graphemes,
- * East Asian Width W = 2, A (`·`, `●`, `─`) = 2 so a hint cannot spill past `[ hide ]`.
+ * East Asian Width W = 2, A (`·`, `●`, `─`) = 1, as in tmux's pane grid.
  */
 export function displayCells(text: string): number {
-  return textCells(text, 2)
+  return textCells(text, 1)
 }
 
 export function padCells(text: string, width: number): string {
@@ -445,7 +460,123 @@ export async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?:
 }
 
 /**
- * A worker's dir can be gone while its pane lives: a worktree removed after its
+ * One agent terminal herdr-core (`hc`, the server Herdr.app shows) runs. `parent` is the hc
+ * terminal it was started from (`$HC_TERMINAL_ID` at `hc run`).
+ */
+export type HcAgent = { address: string; name?: string; agent: string; status: string; state?: string; cwd: string; where: string; parent?: string }
+
+export const hcId = (address: string): string => `hc:${address}`
+
+export const hcFinished = (a: Pick<HcAgent, 'state' | 'status'>): boolean =>
+  a.state ? a.state !== 'live' : a.status === 'finished'
+
+/** Display status of an hc agent: non-live `state` (e.g. `finished`) overrides the last agent `status`. */
+export const hcStatus = (a: Pick<HcAgent, 'state' | 'status'>): string =>
+  hcFinished(a) ? (a.state && a.state !== 'live' ? a.state : 'finished') : a.status
+
+// shortcut: found once per PATH, absence too; an hc installed later shows after a reload.
+const hcFound = new Map<string, string | undefined>()
+
+/** The `hc` file on PATH, or undefined when there is none (no herdr segment then). */
+export async function hcBin(host: Host): Promise<string | undefined> {
+  const pathVar = await host.envPath()
+  if (pathVar === undefined) return undefined
+  if (hcFound.has(pathVar)) return hcFound.get(pathVar)
+  let bin: string | undefined
+  for (const dir of pathVar.split(':').filter(Boolean)) {
+    if (await host.exists(`${dir}/hc`).catch(() => false)) {
+      bin = `${dir}/hc`
+      break
+    }
+  }
+  hcFound.set(pathVar, bin)
+  return bin
+}
+
+/**
+ * The hc core's socket under HOME, where `hc` itself looks. `hc ls` starts a core when none runs,
+ * so hc runs only when that socket accepts a connection: a stopped core leaves no file, and a
+ * crashed one (kill -9) leaves a file that refuses. Not `$HC_TERMINAL_SOCKET`: with it set to a
+ * live socket, `hc ls` under another HOME still started a core in that HOME.
+ * The probe needs `perl` on PATH; without it the hc segment is not shown (never a started core).
+ */
+const SOCKET_PROBE = 'use Socket; socket(my $s, PF_UNIX, SOCK_STREAM, 0) or exit 2; connect($s, pack_sockaddr_un($ARGV[0])) ? exit 0 : exit 1'
+// shortcut: a socket set in ~/.config/herdr-core/config.toml is not read; read it if someone sets one.
+export async function hcSocketLive(host: Host): Promise<boolean> {
+  const home = await host.envHome()
+  if (!home) return false
+  const sock = `${home}/.local/state/herdr-core/default/default.sock`
+  if (!(await host.exists(sock).catch(() => false))) return false
+  const r = await host.run(['perl', '-e', SOCKET_PROBE, sock], host.cwd() ?? '/', 1_000).catch(() => undefined)
+  return r?.exitCode === 0
+}
+
+/**
+ * `hc ls --all --json` stdout: `{terminals:[…]}`, or `{error:{kind,message}}`, which throws. Live shells (no `status`)
+ * are skipped; a finished record is kept, because hc drops `status` once a terminal finishes.
+ */
+export function parseHc(stdout: string): HcAgent[] {
+  const doc = JSON.parse(stdout) as { error?: { kind?: unknown; message?: unknown }; terminals?: unknown }
+  if (doc.error) throw new Error(`hc: ${String(doc.error.kind)}: ${String(doc.error.message)}`)
+  if (!Array.isArray(doc.terminals)) throw new Error('hc: no terminals in its answer')
+  const s = (v: unknown) => (typeof v === 'string' && v ? v : '?')
+  const opt = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+  return (doc.terminals as Record<string, unknown>[])
+    .filter(t => t && typeof t === 'object' && ('status' in t || t.state === 'finished'))
+    .map(t => {
+      const name = opt(t.name)
+      const parent = opt(t.parent)
+      const state = opt(t.state)
+      return { address: s(t.address), agent: s(t.agent), status: s(t.status), cwd: s(t.cwd), where: s(t.where), ...(state ? { state } : {}), ...(name ? { name } : {}), ...(parent ? { parent } : {}) }
+    })
+}
+
+/**
+ * Every hc agent (live and finished), all machines; undefined when `hc` is not on PATH or its core
+ * is not running (no socket); rejects on a failed run or an answer without a terminal list.
+ */
+export async function readHc(host: Host): Promise<HcAgent[] | undefined> {
+  const bin = await hcBin(host)
+  if (!bin || !(await hcSocketLive(host))) return undefined
+  // Short: it shares a tick with the rows read, and a hung hc must not hold the rows.
+  const r = await host.run([bin, 'ls', '--all', '--json'], host.cwd() ?? '/', 2_000)
+  if (r.exitCode !== 0) throw new Error(`hc ls exited ${r.exitCode}: ${(r.stderr.trim() || r.stdout.trim()).slice(0, 200)}`)
+  // Live rows first: finished ones must not push a live row past the drawn-line cap.
+  return parseHc(r.stdout).sort((x, y) => Number(hcFinished(x)) - Number(hcFinished(y)))
+}
+
+/** An hc agent's row text: address, name, kind, status, marked as herdr and read-only. */
+export const herdrLabel = (a: HcAgent) => `hc · ${a.address}${a.name ? ` ${a.name}` : ''} · ${a.agent} · ${hcStatus(a)} · read-only`
+
+/** Mirror an hc terminal via `hc read <address> --lines <rows>`; never runs `hc` when `hcSocketLive` is false. */
+export async function mirrorHc(host: Host, address: string, rows: number, color = false): Promise<MirrorCapture> {
+  const bin = await hcBin(host)
+  if (!bin) return { lines: [], error: 'hc is not on PATH' }
+  if (!(await hcSocketLive(host))) return { lines: [], error: 'hc core is not running' }
+  const probe = await host
+    .run([bin, 'read', address, '--lines', String(rows)], host.cwd() ?? '/', MIRROR_PROBE_MS)
+    .catch((err: unknown) => err)
+  const error = captureError(probe)
+  if (error) return { lines: [], error }
+  return { lines: paneTail((probe as RunResult).stdout, rows, color) }
+}
+
+/** Close an hc terminal: `hc kill <address>` when live, `hc rm <address>` when finished. */
+export async function stopHc(host: Host, agent: Pick<HcAgent, 'address' | 'name' | 'state' | 'status'>): Promise<Outcome> {
+  const bin = await hcBin(host)
+  if (!bin) return { ok: false, text: 'hc is not on PATH' }
+  if (!(await hcSocketLive(host))) return { ok: false, text: 'hc core is not running' }
+  const sub = hcFinished(agent) ? 'rm' : 'kill'
+  const probe = await host
+    .run([bin, sub, agent.address], host.cwd() ?? '/', 8_000)
+    .catch((err: unknown) => err)
+  const error = captureError(probe)
+  if (error) return { ok: false, text: `hc ${sub} ${agent.address} failed (${error})` }
+  return { ok: true, text: `closed hc ${agent.address}${agent.name ? ` (${agent.name})` : ''} via hc ${sub}` }
+}
+
+/**
+ * A worker's dir can be gone while its pane lives: a checkout removed after its
  * branch merged (live 2026-09-26). spawn then fails ENOENT and every status,
  * capture and stop of that worker failed each tick. agent-tmux and tmux find a
  * worker by name, not by cwd, so a missing cwd runs from `/`, logged once per dir.
@@ -531,6 +662,14 @@ export type Panel = {
   internal: number | '?'
   /** Set once a list() failure is logged, so the 2s clock does not log every tick. */
   internalMissLogged: boolean
+  /** hc agents this session's hc terminal started (display only, never in `rows`); `?` = the read failed; unset = no hc, core or `HC_TERMINAL_ID`. */
+  herdr?: HcAgent[] | '?'
+  /** The slice of `herdr` drawn by the last render, and its start index inside `herdr`. */
+  shownHerdr?: HcAgent[]
+  shownHerdrFirst?: number
+  /** Failed `hc ls` reads in a row; the second one logs, once per session (`herdrMissLogged`). */
+  herdrMisses?: number
+  herdrMissLogged?: boolean
   mirror?: { id: string } & MirrorCapture
   timer?: { cancel: () => void }
   /** The `[ + ]` field is open: one row, `[profile] <session-id> [name]`. */
@@ -718,7 +857,8 @@ export const launchIdOf = (d: TmuxDispatch) => `${idOf(d)}${LAUNCH_ACK}`
 /**
  * The ack of an `exited` notice. Like the launch notice it closes the notice,
  * not the episode: a result written after the pane went (a background writer, a
- * late flush) is still delivered once (astra, 34e2a1e). The row leaves /workers and
+ * late flush) is still delivered once (astra, 34e2a1e), for WINDOW_MS after the exit
+ * notice; then `exitedClose` closes the episode quietly. The row leaves /workers and
  * `outstanding()` as soon as the notice is acked.
  */
 export const EXITED_ACK = '#exited'
@@ -1271,7 +1411,7 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
         // A CLOSED episode has nothing left to deliver: claiming it would only move
         // the owner. It is still ours to stop, unclaimed (autoStop asks for the same
         // idle window the owner would). An open one — an `exited` notice included,
-        // since a late result still closes it — is contested (§3).
+        // since a late result still closes it until `exitedClose` does — is contested (§3).
         if (out.reported.has(idOf(d))) {
           out.dispatches.push(d)
           ours = true
@@ -1295,6 +1435,19 @@ export async function scan(host: Host, opts: { claim: boolean }): Promise<Scan> 
 export async function outstanding(host: Host): Promise<TmuxDispatch[]> {
   const s = await scan(host, { claim: false })
   return s.dispatches.filter(d => !settled(s.reported, d))
+}
+
+/**
+ * An `exited` notice older than WINDOW_MS with still no result: nothing will arrive. Close
+ * the episode quietly (a SUPERSEDED ack, never announced) so it stops passing from session
+ * to session as an orphan (observed 2026-11-17: 13 episodes, up to 44 claims each). Aged
+ * from the exit ack, not `since`; an ack that cannot be stat'd keeps it open (unknown is
+ * not old).
+ */
+async function exitedClose(host: Host, v3: string, d: TmuxDispatch, path: string, now: number): Promise<Finished | undefined> {
+  const at = await host.stat(`${episodeDirOf(v3, d)}/acks/exited`).then(s => s.mtimeMs).catch(() => undefined)
+  if (at === undefined || now - at <= WINDOW_MS) return undefined
+  return { d, path, status: SUPERSEDED, summary: `exited ${elapsed(now - at)} ago and never wrote a result` }
 }
 
 /** A result is in the window by ITS OWN finish time; a long job is not expired by age. */
@@ -1429,8 +1582,11 @@ export async function collect(
           if (!reported.has(launchIdOf(d))) out.push({ d, path: `${dir}/mod-assign.log`, status: LAUNCH_FAILED, summary: failure })
           // After the notice the worker is watched like any other: a pane that is
           // gone closes the episode as `exited`, a live one is probed for a stop.
-          else if (reported.has(exitedIdOf(d))) continue // gone and said so; only a late result is news
-          else if (exited.has(idOf(d))) {
+          else if (reported.has(exitedIdOf(d))) {
+            // gone and said so; only a late result is news, until the window closes it
+            const old = await exitedClose(host, root, d, path, now)
+            if (old) out.push(old)
+          } else if (exited.has(idOf(d))) {
             out.push({ d, path, status: EXITED, summary: 'the launch failed, the tmux session is gone and no terminal result.json was written' })
           } else unfinished.push(d)
           continue
@@ -1450,9 +1606,13 @@ export async function collect(
         // `exited` and acknowledged, so it leaves /workers instead of sitting there
         // until someone presses stop (observed 2026-09-17: two dead fixtures on
         // the panel for hours).
-        // ponytail: an exited episode's result.json is re-read every tick until its
-        // directory goes; one small read each, for a result that may still land.
-        if (reported.has(exitedIdOf(d))) continue
+        // An exited episode's result.json is re-read every tick for WINDOW_MS after the
+        // exit notice; then it closes quietly (exitedClose).
+        if (reported.has(exitedIdOf(d))) {
+          const old = await exitedClose(host, root, d, path, now)
+          if (old) out.push(old)
+          continue
+        }
         if (exited.has(idOf(d))) {
           out.push({ d, path, status: EXITED, summary: 'the tmux session is gone and no terminal result.json was written' })
         } else unfinished.push(d)
@@ -1810,7 +1970,7 @@ export async function flagStalls(
       if (reason === 'hook_trust_prompt') {
         const capture = await host.run(['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', '80', d.name], d.dir, Math.min(STALL_PROBE_MS, Math.max(1, deadline - await host.now())))
           .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
-        const detail = capture.exitCode === 0 ? capture.stdout.replace(CTRL_ALL_RE, ' ').trim().slice(0, 3000) : `hook names unavailable: ${capture.stderr.slice(-200)}; peek at the worker`
+        const detail = capture.exitCode === 0 ? capture.stdout.split('\n').map(line => line.replace(CTRL_ALL_RE, ' ')).join('\n').trim().slice(0, 3000) : `hook names unavailable: ${capture.stderr.slice(-200)}; peek at the worker`
         gate.blockedDetails.set(id, detail)
         if (wake && gate.trustNoticed.get(id) !== detail) woken.push({ id, d, hook: detail, text:
           `- "${d.name}" on ${d.profile}: hook_trust_prompt — ${detail}\n  Changed hooks run code with the owner's permissions. The owner must type /workers trust ${d.name} in the Claude Code prompt after reviewing them. Agent tools cannot trust hooks.` })
@@ -2046,12 +2206,13 @@ export async function holderOf(host: Host, v3: string | undefined, d: TmuxDispat
   return beats.get(d.owner) ? d.owner.slice(0, 8) : 'unknown'
 }
 
-export async function panelRows(host: Host, gate: Gate, root: string | undefined): Promise<PanelRow[]> {
+/** `known`: a scan the caller just made (`observeRows`), so the ledger is not read twice. */
+export async function panelRows(host: Host, gate: Gate, root: string | undefined, known?: Scan): Promise<PanelRow[]> {
   const now = await host.now()
   const beats = new Map<string, boolean>()
   const v3 = root && v3Of(root)
   // Every teammate of this repo, whoever dispatched it: see `Scan.visible`.
-  const scanned = await scan(host, { claim: false })
+  const scanned = known ?? await scan(host, { claim: false })
   const { visible: dispatches, reported, withheld } = scanned
   // A teammate whose result was already delivered is still a teammate: while
   // its pane is alive you can tell it more or stop it, so it stays listed as
@@ -2201,7 +2362,7 @@ export async function mirrorOf(host: Host, d: TmuxDispatch, rows: number, color 
     .catch((err: unknown) => err)
   const error = captureError(probe)
   if (error) return { lines: [], error }
-  return { lines: (probe as RunResult).stdout.split('\n').slice(-rows).map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' ')) }
+  return { lines: paneTail((probe as RunResult).stdout, rows, color) }
 }
 
 /** One pane capture: its lines, or why there are none. A failure is not an empty pane. */
@@ -2212,8 +2373,8 @@ export interface MirrorCapture {
 
 type RunResult = Awaited<ReturnType<Host['run']>>
 
-/** Why a capture run failed, one line; undefined when it succeeded. */
-function captureError(probe: unknown): string | undefined {
+/** Why a capture or hc run failed, one line; undefined when it succeeded. */
+export function captureError(probe: unknown): string | undefined {
   if (probe instanceof Error) return probe.message.split('\n')[0]!
   const r = probe as RunResult | undefined
   if (!r) return 'no result'
@@ -2228,7 +2389,8 @@ function captureError(probe: unknown): string | undefined {
  * output at the top (live 2026-09-26). `agent-tmux capture --tail` trims; this does too.
  */
 export function paneTail(stdout: string, n: number, color = false): string[] {
-  const lines = stdout.split('\n').map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' '))
+  if (!stdout) return []
+  const lines = stdout.replace(/\n$/, '').split('\n').map(l => l.replace(color ? CTRL_BUT_ESC_RE : CTRL_ALL_RE, ' '))
   while (lines.length && !lines[lines.length - 1]!.replace(SGR_ONLY_RE, '').trim()) lines.pop()
   return lines.slice(-n)
 }
@@ -2494,16 +2656,24 @@ export async function recoverUnsent(host: Host, dirs: readonly string[]): Promis
  * submit, no toast). Legacy count and project rows are the reads `reconcile`
  * already does. Collector health is read from this session's `act/<n>.state`
  * and beat (C-health); a view without a session has no collector (`none`).
+ *
+ * `observeRows` is health, scan and projects. It never probes panes (C13).
+ * `sweepStalls` is that probe. It returns its scan, so a rows job reads the ledger once.
  */
-export async function observeView(host: Host, gate: Gate, root: string): Promise<void> {
+export async function observeRows(host: Host, gate: Gate, root: string): Promise<Scan> {
   const me = host.owner()
   gate.viewHealth = me ? await readActHealth(host, v3Of(root), me, await host.now()) : { kind: 'none' }
   const scanned = await scan(host, { claim: false })
   gate.viewError = scanned.error ?? (scanned.complete ? undefined : 'some worker records could not be read (see the log)')
   await refreshProjects(host, gate, scanned.visible)
-  // `visible` is the set `panelRows` draws. Probing only `dispatches` would
+  return scanned
+}
+
+/** View stall sweep: `flagStalls` with wakes off. A rows job must not call this (C13). */
+export async function sweepStalls(host: Host, gate: Gate, root: string, live: readonly TmuxDispatch[]): Promise<void> {
+  // `live` is the set `panelRows` draws. Probing only `dispatches` would
   // leave another session's row as `running` when its pane is waiting.
-  await flagStalls(host, gate, v3Of(root), scanned.visible, scanned.visible, false)
+  await flagStalls(host, gate, v3Of(root), live, live, false)
 }
 
 // ── collector health (plan §1b C-health) ───────────────────────────────────────
@@ -2744,7 +2914,8 @@ export type Outcome = { ok: true; text: string } | { ok: false; text: string }
 export function setRows(panel: Panel, rows: PanelRow[]): void {
   panel.all = rows
   panel.rows = panel.showAll ? rows : rows.filter(r => !r.holder)
-  if (panel.selected && !panel.rows.some(r => r.id === panel.selected)) panel.selected = undefined
+  const herdrHit = panel.selected?.startsWith('hc:') && Array.isArray(panel.herdr) && panel.herdr.some(a => hcId(a.address) === panel.selected)
+  if (panel.selected && !panel.rows.some(r => r.id === panel.selected) && !herdrHit) panel.selected = undefined
 }
 
 /** `其他 session 運行中 1/共 6：@a 5 · @unknown 1` (per-holder counts are all rows), or undefined when no other session holds a row here. */
@@ -2769,7 +2940,7 @@ export function truncateCells(text: string, max: number): string {
   let out = ''
   let cur = 0
   for (const g of graphemes(text)) {
-    const w = graphemeWidth(g, 2)
+    const w = graphemeWidth(g, 1)
     if (cur + w > max) break
     out += g
     cur += w
@@ -2833,64 +3004,6 @@ export function clearButtonLabel(armed: boolean): string {
 
 export function stopButtonLabel(name: string, armed: boolean): string {
   return armed ? `stop ${name}? press again` : 'stop'
-}
-
-/**
- * `[ ⧉ tui ]`: the full-screen TUI in a tmux split beside the host pane, bound
- * to this session. No launcher: in Claude Code the mod is the collector, and the
- * launcher's second collector would deliver one result twice. The TUI is the
- * `lib/tui.node.ts` beside the `agent-tmux` this mod already runs (PATH, the
- * marketplace checkout, or an `npx skills` folder; a symlink is resolved), so it
- * follows however the wrapper was installed. Not in tmux: `ok`, with the
- * `tmux-agent-tui` command to run in another terminal (plan D-q2: no terminal app
- * is opened), every argument shell-quoted; over 200 chars the full line goes to
- * the log. The mod's tmux calls use the default socket, so the line names none.
- */
-export async function openTuiBeside(host: Host, pane: string | undefined): Promise<Outcome> {
-  const session = host.owner()
-  const cwd = host.cwd()
-  if (!session || !cwd) return { ok: false, text: 'no session id or cwd yet' }
-  const { bin, missing } = await agentTmuxBin(host)
-  if (missing) return { ok: false, text: missing }
-  const found = await host.run(
-    [
-      '/bin/sh',
-      '-c',
-      'w=$(command -v "$1") && w=$(realpath "$w") && t="${w%/*}/lib/tui.node.ts" && e="${w%/*}/tmux-agent-tui" && [ -f "$t" ] && [ -x "$e" ] && n=$(command -v node) && printf "%s\\n%s\\n%s\\n" "$n" "$t" "$e"',
-      'sh',
-      bin,
-    ],
-    cwd,
-    5_000,
-  )
-  const [node, tui, entry] = found.stdout.trim().split('\n')
-  if (found.exitCode !== 0 || !node || !tui || !entry) {
-    return { ok: false, text: `no node, lib/tui.node.ts or tmux-agent-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}; an older skill install? update it and re-run its install-bin` }
-  }
-  if (!pane || !/^%\d+$/.test(pane)) {
-    // The root is named only when this host overrides it; the other terminal derives the default itself.
-    const dir = await host.envTmuxAgentDir()
-    const line = `${dir ? `TMUX_AGENT_DIR=${shq(dir)} ` : ''}${shq(entry)} --session ${shq(session)} --cwd ${shq(cwd)}`
-    const head = '不在 tmux 內，已提供開啟指令，請在另一個終端機執行'
-    if (`${head}：${line}`.length <= 200) return { ok: true, text: `${head}：${line}` }
-    host.log(`tmux-agent: tui open command: ${line}`)
-    const cut = `${head}（完整指令見 log）：`
-    return { ok: true, text: `${cut}${line.slice(0, 199 - cut.length)}…` }
-  }
-  const root = await rootOf(host)
-  const split = await host.run(
-    [
-      // `-f`: the TUI takes the full window height even when `pane` is the top half of a vertical split (T1 C4).
-      'tmux', 'split-window', '-t', pane, '-h', '-f', '-d', '-c', cwd, '-P', '-F', '#{pane_id}',
-      '-e', `TMUX_AGENT_SESSION=${session}`,
-      ...(root ? ['-e', `TMUX_AGENT_DIR=${root}`] : []),
-      node, tui, '--session', session, '--cwd', cwd,
-    ],
-    cwd,
-    5_000,
-  )
-  if (split.exitCode !== 0) return { ok: false, text: `tmux split-window: ${split.stderr.trim() || `exit ${split.exitCode}`}` }
-  return { ok: true, text: `TUI in ${split.stdout.trim()} beside ${pane}` }
 }
 
 export async function rememberPanel(host: Host, open: boolean): Promise<void> {
@@ -2988,16 +3101,59 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
  * Stop every worker of this project that still has a pane. Only this project's
  * dispatches: `stop` is scoped to what this mod started, never to whatever else
  * lives in tmux (a shell-started row stays).
+ * `auditFor` is the TUI (I2): each stop's argv carries the acting session and
+ * that row's holder, and the wrapper writes them on `wrapper.stop`.
  */
-export async function stopAll(host: Host, gate: Gate): Promise<Outcome> {
+export type TuiAudit = { session: string | null; holder: string | null }
+
+/** Cancel, unlock and delete do not go through `agent-tmux stop`. Same audit log, same chain. */
+export async function writeTuiAudit(
+  host: Host,
+  event: 'cancel' | 'unlock' | 'delete',
+  fields: { tool: string; name: string; ok: boolean } & TuiAudit,
+): Promise<void> {
+  const { bin, missing } = await agentTmuxBin(host)
+  if (missing) {
+    host.log(`tmux-agent: tui audit not written: ${missing}`)
+    return
+  }
+  const payload = JSON.stringify({
+    event,
+    tool: fields.tool,
+    name: fields.name,
+    session: fields.session,
+    holder: fields.holder,
+    caller: 'workers-tui',
+    ok: fields.ok,
+  })
+  const run = await host
+    .run(
+      ['zsh', '-f', '-c', `set -- claude; TMUX_AGENT_TOOLS_SOURCE_ONLY=1 . ${shq(bin)} && audit_log_append ${shq(payload)}`],
+      '/',
+      5_000,
+    )
+    .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  if (run.exitCode !== 0) host.log(`tmux-agent: tui audit ${event} for ${fields.name} failed: ${(run.stderr || run.stdout).trim().slice(0, 200)}`)
+}
+
+export async function stopAll(host: Host, gate: Gate, auditFor?: (name: string) => TuiAudit): Promise<Outcome> {
   const { dispatches } = await scan(host, { claim: false })
   // One per worker: its latest episode (a worker has many).
   const latest = [...new Map(dispatches.map(d => [d.name, d])).values()]
   const alive = latest.length ? await liveSessions(host, latest[0]!.dir) : new Set<string>()
   const live = latest.filter(d => hasSession(alive, d))
-  if (!live.length) return { ok: true, text: 'nothing to stop: no worker of this project has a tmux session' }
   const outs = [] as Outcome[]
-  for (const d of live) outs.push(await stopWorker(host, gate, d))
+  for (const d of live) outs.push(await stopWorker(host, gate, d, undefined, auditFor?.(d.name)))
+  const me = await host.envHcTerminal()
+  if (me) {
+    try {
+      const finishedHc = ((await readHc(host)) ?? []).filter(a => a.parent === me && a.address !== me && hcFinished(a))
+      for (const a of finishedHc) outs.push(await stopHc(host, a))
+    } catch (error) {
+      outs.push({ ok: false, text: `hc ls failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}` })
+    }
+  }
+  if (!outs.length) return { ok: true, text: 'nothing to stop: no worker of this project has a tmux session' }
   return { ok: outs.every(o => o.ok), text: outs.map(o => o.text).join('\n') }
 }
 
@@ -3007,7 +3163,7 @@ export async function stopAll(host: Host, gate: Gate): Promise<Outcome> {
  * claims to affect only one seq. `expectSeq` re-validates an autoStop: a tell that
  * opened a newer episode since the scan keeps the pane.
  */
-export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expectSeq?: number): Promise<Outcome> {
+export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expectSeq?: number, audit?: TuiAudit): Promise<Outcome> {
   const root = await rootOf(host)
   if (!root) return { ok: false, text: 'no state root' }
   const w = `${v3Of(root)}/${d.name}`
@@ -3027,7 +3183,9 @@ export async function stopWorker(host: Host, gate: Gate, d: TmuxDispatch, expect
       if (!names || aborted === undefined) return { ok: false, text: `not stopping "${d.name}": episode ${seq} could not be read (see the log)` }
       if (!names.some(n => CLOSED_ACKS.includes(n)) && !aborted) open.push(seq)
     }
-    const run = await host.run(['agent-tmux', d.profile, 'stop', d.name], d.dir, 8_000).catch(
+    const argv = ['agent-tmux', d.profile, 'stop', d.name]
+    if (audit) argv.push('--tui-audit', JSON.stringify({ session: audit.session, holder: audit.holder }))
+    const run = await host.run(argv, d.dir, 8_000).catch(
       (error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }),
     )
     const missed: number[] = []
@@ -3209,8 +3367,17 @@ async function workerDialog(host: Host, d: TmuxDispatch): Promise<{ blocked_reas
   return status && typeof status === 'object' && !Array.isArray(status) ? status : undefined
 }
 
+function hookTrustDialog(text: string): string | undefined {
+  const lines = text.trim().split('\n').map(line => line.replace(CTRL_ALL_RE, ' ').trimEnd())
+  if (!/^Press t to trust\b[^\n]*$/i.test(lines.at(-1) ?? '')) return undefined
+  const start = lines.findLastIndex(line => /^\d+ hooks? (?:modified|needs? review)\b/i.test(line))
+  return start >= 0 ? lines.slice(start).join('\n') : undefined
+}
+
 /** Called only by the mod's composer-origin command, never by a tool or a CLI verb. */
-export async function trustWorkerHooks(host: Host, d: TmuxDispatch): Promise<Outcome> {
+export async function trustWorkerHooks(host: Host, d: TmuxDispatch, reviewed: string | undefined): Promise<Outcome> {
+  const expected = reviewed === undefined ? undefined : hookTrustDialog(reviewed)
+  if (!expected) return { ok: false, text: 'no reviewed hook dialog in the owner notice; no key pressed' }
   const root = await rootOf(host)
   if (!root) return { ok: false, text: 'no state root' }
   const w = `${v3Of(root)}/${d.name}`
@@ -3222,8 +3389,9 @@ export async function trustWorkerHooks(host: Host, d: TmuxDispatch): Promise<Out
     if (!session) return { ok: false, text: `no tmux session for "${d.name}"` }
     const status = await workerDialog(host, d)
     if (status?.blocked_reason !== 'hook_trust_prompt') return { ok: false, text: 'not at a hook_trust_prompt; no key pressed' }
-    const pane = await host.run(['agent-tmux', d.profile, 'capture', '--strip-ansi', '--tail', '80', d.name], d.dir, MIRROR_PROBE_MS)
-    if (pane.exitCode !== 0 || !/press\s+t\s+to\s+trust/i.test(pane.stdout)) return { ok: false, text: 'the current pane does not offer Press t to trust; no key pressed' }
+    // Read the visible screen, excluding scrollback, immediately before sending.
+    const pane = await host.run(['tmux', 'capture-pane', '-p', '-J', '-t', exactSessionTarget(session)], d.dir, MIRROR_PROBE_MS)
+    if (pane.exitCode !== 0 || hookTrustDialog(pane.stdout) !== expected) return { ok: false, text: 'the current hook dialog differs from the owner notice or is no longer the prompt; no key pressed' }
     const sent = await host.run(['tmux', 'send-keys', '-t', exactSessionTarget(session), 't'], d.dir, LIVE_PROBE_MS)
     return sent.exitCode === 0
       ? { ok: true, text: `trusted changed hooks for "${d.name}" at the owner's request; peek to check the next screen` }
@@ -3378,6 +3546,601 @@ async function interruptBeforeTell(host: Host, d: TmuxDispatch, w: string): Prom
 export function randomBase36(n: number): string {
   const bytes = crypto.getRandomValues(new Uint8Array(n))
   return [...bytes].map(b => (b % 36).toString(36)).join('')
+}
+
+/** A pending TUI claim older than this may be taken by the next claimer (I12). */
+export const TUI_PENDING_MS = 30_000
+
+export type TuiLocator =
+  | { kind: 'tmux'; socket?: string; pane: string }
+  | { kind: 'iterm' | 'terminal'; tty: string }
+  | { kind: 'warp'; tabTitle: string }
+
+export type TuiOwner = ProcessId & {
+  token: string
+  state: 'pending' | 'ready'
+  locator?: TuiLocator
+  at: number
+}
+
+export type TuiClaimOpts = {
+  state: 'pending' | 'ready'
+  /** Adopt this pending token. Any other current record is `stale` (no new claim). */
+  adopt?: string
+  locator?: TuiLocator
+  /** Directory of `workers-tui-<sessionKey>-<token>.yaml`. Absent: reclaim deletes nothing. */
+  launchDir?: string
+}
+
+export type TuiClaimResult =
+  | { kind: 'won'; claim: TuiOwner }
+  | { kind: 'adopted'; claim: TuiOwner }
+  | { kind: 'stale' }
+  | { kind: 'occupied-ready'; claim: TuiOwner; locator: TuiLocator | undefined }
+  | { kind: 'occupied-pending'; claim: TuiOwner }
+  | { kind: 'occupied-unknown'; claim?: TuiOwner; reason?: string }
+
+export type TuiFocus = { raised: 'app'; tabTitle?: string } | { raised: 'pane' } | { refused: string }
+
+const TUI_LOCK_TRIES = 40
+// shortcut: es2023 has no setTimeout, drop this when the mod lib includes a timer.
+declare function setTimeout(fn: () => void, ms: number): unknown
+
+const TUI_LOCK_WAIT_MS = 50
+/** Contention budget for a live publisher. Older than this wait is not proof the holder is dead. */
+const TUI_LOCK_WAIT_BUDGET_MS = TUI_LOCK_TRIES * TUI_LOCK_WAIT_MS
+/** `host.run` cap (5s) plus margin. A dead holder younger than this may still have a child in that call. */
+export const TUI_LOCK_RECOVER_MS = 6_000
+
+function tuiLockNote(lock: string, why: string): string {
+  return `tmux-agent: tui lock ${lock} ${why}; rmdir it by hand only when no claim section is still running`
+}
+
+function tuiLocatorOk(v: unknown): v is TuiLocator {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as { kind?: unknown; pane?: unknown; tty?: unknown; tabTitle?: unknown; socket?: unknown }
+  if (o.socket !== undefined && typeof o.socket !== 'string') return false
+  if (o.kind === 'tmux') return typeof o.pane === 'string'
+  if (o.kind === 'iterm' || o.kind === 'terminal') return typeof o.tty === 'string'
+  if (o.kind === 'warp') return typeof o.tabTitle === 'string'
+  return false
+}
+
+/** Launch and owner tokens are 12 base36 characters, so they are one path segment. */
+function tuiTokenOk(token: string): boolean {
+  return /^[0-9a-z]{12}$/.test(token)
+}
+
+function tuiOwnerOk(v: unknown): v is TuiOwner {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as TuiOwner
+  if (typeof o.host !== 'string' || !(o.pid > 0) || typeof o.pidStart !== 'string' || !o.pidStart) return false
+  // randomBase36(12). A slash or dot-segment would leave launchDir when the token is a path.
+  if (typeof o.token !== 'string' || !tuiTokenOk(o.token) || typeof o.at !== 'number') return false
+  if (o.state !== 'pending' && o.state !== 'ready') return false
+  if (o.locator !== undefined && !tuiLocatorOk(o.locator)) return false
+  return true
+}
+
+function sameProc(a: ProcessId, b: ProcessId): boolean {
+  return a.host === b.host && a.pid === b.pid && a.pidStart === b.pidStart && a.pid > 0 && a.pidStart !== ''
+}
+
+export function tuiLaunchStem(session: string, token: string): string {
+  return `workers-tui-${sessionKey(session)}-${token}`
+}
+
+export function tuiLaunchPath(dir: string, session: string, token: string): string {
+  return `${dir}/${tuiLaunchStem(session, token)}.yaml`
+}
+
+/**
+ * Where Warp leaves this TUI's launch file: outside tmux and in Warp only. Inside a pane,
+ * never touch ~/.warp. The mod's band does not use this guard: it reclaims the file anywhere.
+ */
+export async function tuiLaunchDir(host: Host): Promise<string | undefined> {
+  if (await host.envTmuxPane()) return undefined
+  if (!/warp/i.test((await host.envTermProgram()) ?? '')) return undefined
+  const home = await host.envHome()
+  return home ? `${home}/.warp/launch_configurations` : undefined
+}
+
+async function dropStaging(host: Host, staging: string): Promise<void> {
+  await host.run(['rm', '-rf', staging], '/', 5_000).catch(() => undefined)
+}
+
+const TUI_FLOCK = `use Fcntl qw(LOCK_EX);
+open my $fh, '>>', $ARGV[0] or die "fence: $!";
+flock($fh, LOCK_EX) or die "flock: $!";
+`
+const TUI_FENCE_PUBLISH = `${TUI_FLOCK}my ($fence, $staging, $lock) = @ARGV;
+exit 2 if -e $lock;
+rename($staging, $lock) or die "rename: $!";
+`
+const TUI_FENCE_RECOVER = `${TUI_FLOCK}use JSON::PP qw(decode_json);
+my ($fence, $holder, $lock, $host, $pid, $start) = @ARGV;
+open my $hf, '<', $holder or exit 2;
+local $/;
+my $raw = <$hf>;
+close $hf;
+my $j = eval { decode_json($raw) };
+exit 3 if !$j || !defined $j->{host} || $j->{host} ne $host || $j->{pid} != $pid || !defined $j->{pidStart} || $j->{pidStart} ne $start;
+unlink $holder or exit 4;
+rmdir $lock or exit 5;
+`
+
+function tuiFence(dir: string): string {
+  return `${dir}/tui.owner.fence`
+}
+
+/** Publish `tui.owner.lock.<pid>.<rand>/holder`, then rename(2) onto the lock under the same fence as recovery. `mv` would nest into an existing directory. */
+async function publishTuiLock(host: Host, dir: string, me: ProcessId): Promise<'won' | 'busy' | 'fail'> {
+  const lock = `${dir}/tui.owner.lock`
+  try {
+    if (await host.exists(lock)) return 'busy'
+  } catch {
+    return 'fail'
+  }
+  const staging = `${dir}/tui.owner.lock.${me.pid}.${randomBase36(6)}`
+  if ((await mkdirExclusive(host, staging)) !== 'won') return 'fail'
+  let moved = false
+  try {
+    await host.write(`${staging}/holder`, JSON.stringify({ host: me.host, pid: me.pid, pidStart: me.pidStart, at: await host.now() }))
+    const renamed = await host.run(['perl', '-e', TUI_FENCE_PUBLISH, tuiFence(dir), staging, lock], '/', 5_000)
+    if (renamed.exitCode === 0) {
+      moved = true
+      return 'won'
+    }
+    if (renamed.exitCode === 2) return 'busy'
+    if (renamed.exitCode === 127 || /ENOENT|not found/i.test(`${renamed.stderr}${renamed.stdout}`)) return 'fail'
+    return 'busy'
+  } catch {
+    return 'fail'
+  } finally {
+    // Exit 0 is the rename onto the lock. Every other exit, and a throw before perl, leaves the staging dir.
+    if (!moved) await dropStaging(host, staging)
+  }
+}
+
+/** Remove a same-host holder that is proven dead and older than TUI_LOCK_RECOVER_MS. Anything else stays. */
+async function recoverTuiLock(host: Host, lock: string, me: ProcessId): Promise<boolean> {
+  const holderPath = `${lock}/holder`
+  let raw: string
+  try {
+    if (!(await host.exists(holderPath))) return false
+    raw = await host.read(holderPath)
+  } catch {
+    return false
+  }
+  const parsed = parseJson(raw) as { host?: unknown; pid?: unknown; pidStart?: unknown } | undefined
+  if (!parsed || parsed.host !== me.host || typeof parsed.pid !== 'number' || !(parsed.pid > 0) || typeof parsed.pidStart !== 'string' || !parsed.pidStart) return false
+  if ((await holderProvablyAlive(host, { host: parsed.host, pid: parsed.pid, pidStart: parsed.pidStart })) !== false) return false
+  try {
+    if ((await host.now()) - (await host.stat(lock)).mtimeMs <= TUI_LOCK_RECOVER_MS) return false
+  } catch {
+    return false
+  }
+  // One perl holds the publish fence across the re-read and the unlink. Two awaits (re-read, then rm of the pathname) delete the next holder's lock.
+  const dir = lock.slice(0, lock.lastIndexOf('/'))
+  const removed = await host.run(
+    ['perl', '-e', TUI_FENCE_RECOVER, tuiFence(dir), holderPath, lock, parsed.host, String(parsed.pid), parsed.pidStart],
+    '/',
+    5_000,
+  ).catch(() => undefined)
+  if (!removed || removed.exitCode !== 0) return false
+  host.log(`tmux-agent: tui lock ${lock} recovered from dead holder pid ${parsed.pid} pidStart ${parsed.pidStart}`)
+  return true
+}
+
+/** A stub `run` can report mkdir success without creating the directory. Do not go on then: `host.write` would still create files. Returns the dir, or undefined. */
+export async function ensureSessionDir(host: Host, root: string, session: string): Promise<string | undefined> {
+  const dir = sessionDirOf(v3Of(root), session)
+  const made = await host.run(['mkdir', '-p', dir], '/', 5_000).catch(() => undefined)
+  if (!made || made.exitCode !== 0) return undefined
+  return (await host.exists(dir).catch(() => false)) ? dir : undefined
+}
+
+async function withTuiLock<T>(
+  host: Host,
+  root: string,
+  session: string,
+  me: ProcessId,
+  body: (dir: string) => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; reason: string }> {
+  const dir = await ensureSessionDir(host, root, session)
+  if (!dir) return { ok: false, reason: 'session dir' }
+  const lock = `${dir}/tui.owner.lock`
+  let recovered = false
+  for (let i = 0; i < TUI_LOCK_TRIES; i++) {
+    const pub = await publishTuiLock(host, dir, me)
+    if (pub === 'fail') {
+      host.log(tuiLockNote(lock, 'could not be created'))
+      return { ok: false, reason: 'could not be created' }
+    }
+    if (pub === 'busy') {
+      if (!recovered) {
+        recovered = true
+        if (await recoverTuiLock(host, lock, me)) continue
+      }
+      if (i + 1 < TUI_LOCK_TRIES) await new Promise<void>(resolve => { setTimeout(resolve, TUI_LOCK_WAIT_MS) })
+      continue
+    }
+    let value: T | undefined
+    let leftover = ''
+    try {
+      value = await body(dir)
+    } finally {
+      await host.run(['rm', '-f', `${lock}/holder`], '/', 5_000).catch(() => undefined)
+      try {
+        const rm = await host.run(['rmdir', lock], '/', 5_000)
+        if (rm.exitCode !== 0) leftover = rm.stderr.trim() || `exit ${rm.exitCode}`
+      } catch (error) {
+        leftover = `${errorClass(error)} ${String(error)}`
+      }
+    }
+    if (leftover) {
+      host.log(tuiLockNote(lock, `remains after the section (${leftover})`))
+      return { ok: false, reason: leftover }
+    }
+    return { ok: true, value: value as T }
+  }
+  host.log(tuiLockNote(lock, `stayed busy through ${TUI_LOCK_WAIT_BUDGET_MS}ms`))
+  return { ok: false, reason: 'stayed busy' }
+}
+
+async function readTuiOwner(host: Host, dir: string): Promise<TuiOwner | undefined | 'bad'> {
+  const path = `${dir}/tui.owner`
+  try {
+    if (!(await host.exists(path))) return undefined
+    const parsed = parseJson(await host.read(path))
+    return tuiOwnerOk(parsed) ? parsed : 'bad'
+  } catch (error) {
+    host.log(`tmux-agent: could not read ${path}: ${errorClass(error)} ${String(error)}`)
+    return 'bad'
+  }
+}
+
+async function writeTuiOwner(host: Host, dir: string, claim: TuiOwner): Promise<boolean> {
+  return publish(host, `${dir}/tui.owner`, JSON.stringify(claim), claim.token).catch(() => false)
+}
+
+/** Pending past 30s is reclaimed even if its launcher is still alive. Other records need a proven-dead holder; unknown stays occupied. */
+async function tuiSlot(host: Host, cur: TuiOwner, now: number): Promise<'reclaim' | 'occupied-ready' | 'occupied-pending' | 'occupied-unknown'> {
+  if (cur.state === 'pending' && now - cur.at > TUI_PENDING_MS) return 'reclaim'
+  const alive = await holderProvablyAlive(host, cur)
+  if (alive === false) return 'reclaim'
+  if (alive !== true) return 'occupied-unknown'
+  return cur.state === 'ready' ? 'occupied-ready' : 'occupied-pending'
+}
+
+/**
+ * One TUI claim for this owner session (I12). Fresh callers pass `state`.
+ * `--claim <token>` passes `adopt` and becomes `ready` only for that unexpired pending token.
+ */
+export async function claimTui(host: Host, root: string, session: string, me: ProcessId, opts: TuiClaimOpts): Promise<TuiClaimResult> {
+  const out = await withTuiLock(host, root, session, me, async dir => {
+    const now = await host.now()
+    const cur = await readTuiOwner(host, dir)
+    if (cur === 'bad') return { kind: 'occupied-unknown' as const }
+    if (opts.adopt !== undefined) {
+      if (cur && cur.state === 'pending' && cur.token === opts.adopt && now - cur.at <= TUI_PENDING_MS) {
+        const next: TuiOwner = {
+          host: me.host,
+          pid: me.pid,
+          pidStart: me.pidStart,
+          token: cur.token,
+          state: 'ready',
+          at: now,
+          ...(opts.locator ? { locator: opts.locator } : {}),
+        }
+        if (!(await writeTuiOwner(host, dir, next))) return { kind: 'occupied-unknown' as const }
+        return { kind: 'adopted' as const, claim: next }
+      }
+      return { kind: 'stale' as const }
+    }
+    if (cur) {
+      const slot = await tuiSlot(host, cur, now)
+      if (slot === 'occupied-ready') return { kind: slot, claim: cur, locator: cur.locator }
+      if (slot === 'occupied-pending') return { kind: slot, claim: cur }
+      if (slot === 'occupied-unknown') return { kind: slot, claim: cur }
+      if (cur.state === 'pending' && opts.launchDir) {
+        const target = tuiLaunchPath(opts.launchDir, session, cur.token)
+        const left = await dropLaunchFile(host, target, '/')
+        if (left) {
+          host.log(`tmux-agent: could not remove ${target}: ${left}`)
+          return { kind: 'occupied-unknown' as const, claim: cur }
+        }
+      }
+    }
+    const next: TuiOwner = {
+      host: me.host,
+      pid: me.pid,
+      pidStart: me.pidStart,
+      token: randomBase36(12),
+      state: opts.state,
+      at: now,
+      ...(opts.locator ? { locator: opts.locator } : {}),
+    }
+    if (!(await writeTuiOwner(host, dir, next))) return { kind: 'occupied-unknown' as const }
+    return { kind: 'won' as const, claim: next }
+  })
+  if (!out.ok) return { kind: 'occupied-unknown', reason: out.reason }
+  return out.value
+}
+
+/** Launcher: own pending only. TUI: own ready only. Token and process identity, under the lock. */
+export async function releaseTui(
+  host: Host,
+  root: string,
+  session: string,
+  token: string,
+  role: 'launcher' | 'tui',
+  me: ProcessId,
+): Promise<boolean> {
+  const out = await withTuiLock(host, root, session, me, async dir => {
+    const cur = await readTuiOwner(host, dir)
+    if (!cur || cur === 'bad' || cur.token !== token || !sameProc(cur, me)) return false
+    if (role === 'launcher' ? cur.state !== 'pending' : cur.state !== 'ready') return false
+    const rm = await host.run(['rm', '-f', `${dir}/tui.owner`], '/', 5_000).catch(() => undefined)
+    return !!rm && rm.exitCode === 0
+  })
+  return out.ok && out.value === true
+}
+
+/**
+ * Focus only an occupied-ready claim. Warp and other GUI apps return `raised: 'app'`
+ * (the app was activated). A tmux pane returns `raised: 'pane'` when select-pane exits 0.
+ * This never reports a focused window.
+ */
+export async function focusTui(host: Host, result: TuiClaimResult): Promise<TuiFocus> {
+  if (result.kind !== 'occupied-ready') return { refused: result.kind }
+  const loc = result.locator
+  if (!loc) return { refused: 'no locator' }
+  if (loc.kind === 'tmux') {
+    const argv = ['tmux', ...(loc.socket ? ['-S', loc.socket] : []), 'select-pane', '-t', loc.pane]
+    const run = await host.run(argv, '/', 5_000).catch(() => undefined)
+    if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'select-pane failed' }
+    return { raised: 'pane' }
+  }
+  if (loc.kind === 'warp') {
+    const run = await host.run(['open', '-a', 'Warp'], '/', 5_000).catch(() => undefined)
+    if (!run || run.exitCode !== 0) return { refused: run?.stderr?.trim() || 'open failed' }
+    return { raised: 'app', tabTitle: loc.tabTitle }
+  }
+  if (!loc.tty) return { refused: 'no tty' }
+  const argv = ['osascript', '-e', loc.kind === 'iterm' ? ITERM_FOCUS : TERMINAL_FOCUS, '--', loc.tty]
+  let run: { exitCode: number; stderr: string }
+  try {
+    run = await host.run(argv, '/', 5_000)
+  } catch (error) {
+    return { refused: `${errorClass(error)} ${String(error)}` }
+  }
+  if (run.exitCode !== 0) return { refused: run.stderr.trim() || 'osascript failed' }
+  return { raised: 'app' }
+}
+
+// tty is an argv element. Nothing from the locator is spliced into the script.
+const ITERM_FOCUS = `on run argv
+  set want to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            select w
+            select t
+            select s
+            activate
+            return
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "no iTerm2 session for " & want
+end run`
+const TERMINAL_FOCUS = `on run argv
+  set want to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is want then
+          set selected of t to true
+          set index of w to 1
+          set frontmost of w to true
+          activate
+          return
+        end if
+      end repeat
+    end repeat
+  end tell
+  error "no Terminal tab for " & want
+end run`
+
+/** What one TUI launch needs. Paths are absolute. The Warp directory is the caller's; this never picks ~/.warp. */
+export interface LaunchContext {
+  argv: readonly string[]
+  cwd: string
+  env: { TMUX_AGENT_DIR?: string; TMUX_AGENT_TMUX_SOCKET?: string }
+  session: string
+  launchToken: string
+  /** Directory for this launch's Warp file. Absent: do not write one. */
+  launchDir?: string
+  /** Host pane (`%N`) when the caller is inside tmux. */
+  pane?: string
+}
+
+export type OpenResult =
+  | { kind: 'split'; locator: { kind: 'tmux'; socket?: string; pane: string } }
+  | { kind: 'sent'; terminal: 'warp' | 'iterm' | 'terminal'; notice?: string }
+  | { kind: 'failed'; error: string; stderr: string; command: string }
+
+// Scripts stay constant: the command is an argv element after `--`, never spliced in.
+const ITERM_SCRIPT = `on run argv
+  set cmd to item 1 of argv
+  tell application "iTerm2" to create window with default profile command "/bin/sh -lc " & quoted form of cmd
+end run`
+const TERMINAL_SCRIPT = `on run argv
+  set cmd to item 1 of argv
+  tell application "Terminal" to do script cmd
+end run`
+
+const showArgv = (argv: readonly string[]) => argv.map(a => shq(a)).join(' ')
+
+function launchLine(ctx: LaunchContext): string {
+  const env = [
+    ctx.env.TMUX_AGENT_DIR ? `TMUX_AGENT_DIR=${shq(ctx.env.TMUX_AGENT_DIR)}` : '',
+    ctx.env.TMUX_AGENT_TMUX_SOCKET ? `TMUX_AGENT_TMUX_SOCKET=${shq(ctx.env.TMUX_AGENT_TMUX_SOCKET)}` : '',
+  ].filter(a => a.length > 0)
+  const quoted = showArgv(ctx.argv)
+  // cd fails closed: the argv does not run when the directory cannot be entered.
+  return [`cd ${shq(ctx.cwd)}`, [...env, ...(quoted ? [quoted] : [])].join(' ')].filter(a => a.length > 0).join(' && ')
+}
+
+function warpYaml(configName: string, title: string, cwd: string, exec: string): string {
+  return [
+    '---',
+    `name: ${configName}`,
+    'windows:',
+    '  - tabs:',
+    '      - title: ' + JSON.stringify(title),
+    '        layout:',
+    `          cwd: ${JSON.stringify(cwd)}`,
+    '          commands:',
+    `            - exec: ${JSON.stringify(exec)}`,
+    '',
+  ].join('\n')
+}
+
+/** Remove one launch file. Returns the failure detail, or undefined when the file is gone. Callers disagree on what a failure means: a claim aborts, the TUI and the band log, Warp puts it in stderr. */
+export async function dropLaunchFile(host: Host, file: string, cwd: string): Promise<string | undefined> {
+  try {
+    const rm = await host.run(['rm', '-f', file], cwd, 5_000)
+    if (rm.exitCode !== 0) return `exit ${rm.exitCode} ${rm.stderr.trim()}`
+  } catch (error) {
+    return `${errorClass(error)} ${String(error)}`
+  }
+  return undefined
+}
+
+async function openWarp(host: Host, ctx: LaunchContext, name: string, line: string): Promise<OpenResult> {
+  if (!tuiTokenOk(ctx.launchToken)) return { kind: 'failed', error: 'token', stderr: 'launch token is not a 12-character base36 id', command: line }
+  if (!ctx.launchDir) return { kind: 'failed', error: 'no launch directory', stderr: '', command: line }
+  const configName = tuiLaunchStem(ctx.session, ctx.launchToken)
+  const file = tuiLaunchPath(ctx.launchDir, ctx.session, ctx.launchToken)
+  const launchDir = ctx.launchDir
+  const fail = async (error: string, stderr: string, command: string): Promise<OpenResult> => {
+    const left = await dropLaunchFile(host, file, launchDir)
+    return { kind: 'failed', error, stderr: left ? `${stderr}; ${file} remains: ${left}` : stderr, command }
+  }
+  try {
+    await host.write(file, warpYaml(configName, name, ctx.cwd, line))
+  } catch (error) {
+    return fail(errorClass(error), String(error), line)
+  }
+  const argv = ['open', `warp://launch/${encodeURIComponent(configName)}`]
+  // The file is removed on failure, so the launch line has to travel with the open command.
+  const command = `${showArgv(argv)}\n${line}`
+  let run: { exitCode: number; stderr: string }
+  try {
+    run = await host.run(argv, ctx.cwd, 5_000)
+  } catch (error) {
+    return fail(errorClass(error), String(error), command)
+  }
+  if (run.exitCode !== 0) return fail('open', run.stderr, command)
+  return { kind: 'sent', terminal: 'warp' }
+}
+
+async function openAppleScript(host: Host, ctx: LaunchContext, script: string, line: string, terminal: 'iterm' | 'terminal', notice?: string): Promise<OpenResult> {
+  const argv = ['osascript', '-e', script, '--', line]
+  const command = showArgv(argv)
+  let run: { exitCode: number; stderr: string }
+  try {
+    run = await host.run(argv, ctx.cwd, 5_000)
+  } catch (error) {
+    return { kind: 'failed', error: errorClass(error), stderr: String(error), command }
+  }
+  if (run.exitCode !== 0) return { kind: 'failed', error: 'osascript', stderr: run.stderr, command }
+  return notice ? { kind: 'sent', terminal, notice } : { kind: 'sent', terminal }
+}
+
+/** Point a `tmux` call at one server: `-S socket` after the binary, unless the call already names a server. */
+export function withTmuxSocket(argv: readonly string[], socket: string | undefined): string[] {
+  const cmd = [...argv]
+  const bin = cmd[0] ?? ''
+  if (socket && (bin === 'tmux' || bin.endsWith('/tmux')) && cmd[1] !== '-S' && cmd[1] !== '-L') cmd.splice(1, 0, '-S', socket)
+  return cmd
+}
+
+/** One job's run state, for `ageText`. */
+export type Flight = { running: boolean; queued: boolean; lastOk?: number }
+
+/** `更新 Ns 前`, plus ` …` while that job is still in flight. A failed run leaves `lastOk` alone. */
+export function ageText(now: number, flight: Flight): string {
+  const base = flight.lastOk ?? now
+  const n = Math.max(0, Math.floor((now - base) / 1000))
+  return `更新 ${n}s 前${flight.running ? ' …' : ''}`
+}
+
+/** A tmux pane id: `%` and digits. */
+export function isPaneId(s: string): boolean {
+  return /^%\d+$/.test(s)
+}
+
+/** Display name for a terminal locator. An absent or tmux locator is Terminal.app, matching the ready-focus fallback. */
+export function appLabel(kind: string | undefined): string {
+  if (kind === 'warp') return 'Warp'
+  if (kind === 'iterm') return 'iTerm2'
+  return 'Terminal.app'
+}
+
+/**
+ * Open the TUI in the caller's terminal. tmux splits when allowed (B1). Warp, iTerm2 and
+ * Terminal.app are the adapters (B2). Anything else is Terminal.app, and the result says so.
+ * SSH with no split cannot open a window on the remote machine. Every process and file
+ * goes through `host`; a failed Warp open deletes only that launch's file.
+ */
+export async function openInTerminal(host: Host, ctx: LaunchContext, name: string, allowSplit: boolean): Promise<OpenResult> {
+  const line = launchLine(ctx)
+  if (allowSplit && ctx.pane && isPaneId(ctx.pane)) {
+    const socket = ctx.env.TMUX_AGENT_TMUX_SOCKET
+    const argv = [
+      'tmux',
+      ...(socket ? ['-S', socket] as const : []),
+      'split-window', '-t', ctx.pane, '-h', '-f', '-d', '-c', ctx.cwd, '-P', '-F', '#{pane_id}',
+      ...(ctx.env.TMUX_AGENT_DIR ? ['-e', `TMUX_AGENT_DIR=${ctx.env.TMUX_AGENT_DIR}`] : []),
+      ...(socket ? ['-e', `TMUX_AGENT_TMUX_SOCKET=${socket}`] : []),
+      ...ctx.argv,
+    ]
+    const command = showArgv(argv)
+    let run: { exitCode: number; stdout: string; stderr: string }
+    try {
+      run = await host.run(argv, ctx.cwd, 5_000)
+    } catch (error) {
+      return { kind: 'failed', error: errorClass(error), stderr: String(error), command }
+    }
+    const pane = run.stdout.trim()
+    if (run.exitCode !== 0 || !isPaneId(pane)) return { kind: 'failed', error: 'tmux', stderr: run.stderr, command }
+    return { kind: 'split', locator: { kind: 'tmux', ...(socket ? { socket } : {}), pane } }
+  }
+  let ssh: string | undefined
+  try {
+    ssh = await host.envSshTty()
+  } catch (error) {
+    return { kind: 'failed', error: errorClass(error), stderr: String(error), command: line }
+  }
+  if (ssh) return { kind: 'failed', error: 'cannot open a window on your machine over SSH', stderr: '', command: line }
+  let term: string | undefined
+  try {
+    term = await host.envTermProgram()
+  } catch (error) {
+    return { kind: 'failed', error: errorClass(error), stderr: String(error), command: line }
+  }
+  if (term === 'WarpTerminal') return openWarp(host, ctx, name, line)
+  if (term === 'iTerm.app' || term === 'iTerm2') return openAppleScript(host, ctx, ITERM_SCRIPT, line, 'iterm')
+  if (term === 'Apple_Terminal' || term === 'Terminal') return openAppleScript(host, ctx, TERMINAL_SCRIPT, line, 'terminal')
+  const seen = term && term.length > 0 ? term : 'unset'
+  return openAppleScript(host, ctx, TERMINAL_SCRIPT, line, 'terminal', `${seen} has no adapter; opening Terminal.app`)
 }
 
 /**
@@ -3715,6 +4478,49 @@ export async function clearIncomplete(host: Host, name: string): Promise<Outcome
   const rm = await run(['rm', '-rf', box])
   if (rm.exitCode !== 0) return { ok: false, text: `could not remove ${box}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}` }
   return { ok: true, text: `cleared the unfinished reservation "${name}"` }
+}
+
+/**
+ * Delete a dead worker's row (TUI `d`, viewer too): inside its action lock, move
+ * `<v3>/<name>` to `<v3>/.removed/<name>-<ms>` (scan skips dot-dirs). Refused while its
+ * tmux session is alive, when liveness is unknown, and while a launch of the name holds its
+ * launch.lock. Nothing is removed: a human can mv it back.
+ */
+export async function deleteWorker(host: Host, name: string): Promise<Outcome> {
+  if (!NAME_RE.test(name)) return { ok: false, text: 'delete takes <name>' }
+  const root = await rootOf(host)
+  if (!root) return { ok: false, text: 'no state root' }
+  const v3 = v3Of(root)
+  const w = `${v3}/${name}`
+  if (!(await host.exists(w))) return { ok: false, text: `"${name}" is already gone` }
+  const lock = await takeLock(host, w)
+  if (!lock.ok) return { ok: false, text: busyText(name, lock.busy) }
+  const run = (argv: string[]) => host.run(argv, '/', 5_000).catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+  const dest = `${v3}/.removed/${name}-${await host.now()}`
+  // `/`: a removed checkout as cwd would fail the probe and read as unknown forever.
+  const g = newGate()
+  const alive = await liveSessions(host, '/', g)
+  const refused = !g.aliveKnown
+    ? `"${name}": tmux liveness unknown; nothing is deleted`
+    : [...alive].some(s => s.endsWith(`-${name}`))
+      ? `"${name}" still has a tmux session: stop it first with x in 編輯`
+      : undefined
+  // agent-tmux holds <name>/launch.lock (an OS flock; the file stays after) from its live-name
+  // check to the pane-id publish, so the move runs under that flock, never waiting for it.
+  // shortcut: a launch that starts and ends between the liveness probe and this flock is missed; probe under the flock if that ever shows up.
+  const MOVE = 'zmodload zsh/system || exit 70; : >> "$1/launch.lock" || exit 71; zsystem flock -t 0 -f fd "$1/launch.lock" 2>/dev/null || exit 75; mv "$1" "$2"'
+  // `mv` into an existing dir nests; refuse instead.
+  const mk = refused ? undefined : await run(['mkdir', '-p', `${v3}/.removed`])
+  const mv = !mk || mk.exitCode !== 0 ? mk : (await host.exists(dest)) ? { exitCode: 1, stdout: '', stderr: `${dest} exists` } : await run(['zsh', '-c', MOVE, 'zsh', w, dest])
+  // The lock symlink moved with the dir: release it where it now is.
+  const held = `${mv?.exitCode === 0 ? dest : w}/.action`
+  if (mv?.exitCode === 0) movedLock(`${w}/.action`, held, lock.token)
+  const released = await releaseLock(host, held, lock.token)
+  const note = released.ok ? '' : `; ${releasedText(held, released)}`
+  if (!mv) return { ok: false, text: `${refused}${note}` }
+  if (mv.exitCode === 75) return { ok: false, text: `"${name}": a launch is in flight (launch.lock is held); wait for it, then retry; nothing is deleted${note}` }
+  if (mv.exitCode !== 0) return { ok: false, text: `could not move ${w}: ${mv.stderr.trim() || `exit ${mv.exitCode}`}; nothing is deleted${note}` }
+  return { ok: true, text: `moved to ${dest}${note}` }
 }
 
 /**

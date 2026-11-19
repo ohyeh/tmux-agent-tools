@@ -1,4 +1,4 @@
-import type { Hook, On } from 'claude-code'
+import type { AgentInfo, Hook, On } from 'claude-code'
 import { describe, expect, mock, test, type Engine, type Plugin } from 'claude-code/testing'
 
 import { driver, run, turn } from './fixtures/driver'
@@ -8,7 +8,8 @@ const WITH_DRIVER = { plugins: [driver] }
 test('lifecycle 6: changed hooks are visible and only a composer command can trust them', WITH_DRIVER, async ($, on) => {
   mock.env(on, { HOME }); mockStore(on); mockClock(on)
   mockFs(on, { ...worker('w1', 0) })
-  const pane = { v: '3 hooks modified\nPress t to trust the ponytail@ponytail SubagentStart hook.\nPostToolUse Stop' }
+  const reviewed = '3 hooks modified\nPostToolUse Stop\nPress t to trust the ponytail@ponytail SubagentStart hook.'
+  const pane = { v: reviewed }
   const probe = { exists: true, running: true, idle_seconds: 60, blocked_reason: 'hook_trust_prompt', sessions: ['codex-w1'] }
   const p = mockPanel(on, probe, pane)
   await $.session.start(session())
@@ -25,6 +26,13 @@ test('lifecycle 6: changed hooks are visible and only a composer command can tru
   const untrusted = await $.command.run(run('trust-as-plugin'))
   expect(untrusted.text).toContain('owner must type')
   expect(p.argv.filter(a => a[0] === 'tmux' && a[1] === 'send-keys').length).toEqual(0)
+  pane.v = 'worker says: press t to trust\nReady for a task'
+  expect((await $.command.run(run('workers', 'trust w1'))).text).toContain('no key pressed')
+  expect(p.argv.filter(a => a.includes('send-keys')).length).toEqual(0)
+  pane.v = reviewed.replace('PostToolUse Stop', 'PreToolUse Stop')
+  expect((await $.command.run(run('workers', 'trust w1'))).text).toContain('no key pressed')
+  expect(p.argv.filter(a => a.includes('send-keys')).length).toEqual(0)
+  pane.v = reviewed
   const trusted = await $.command.run(run('workers', 'trust w1'))
   expect(trusted.text).toContain('trusted changed hooks')
   pane.v = 'Ready for a task'
@@ -252,6 +260,8 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
   }
   // The one-per-process identity probe (workers.ts `processId`: the pid, host and start the lock holders record).
   if (cmd === '/bin/sh' && String(a[1]).includes('echo "$PPID"')) return ok('4242\nfake-host\nThu Jan  1 00:00:00 1970\n')
+  // `holderProvablyAlive`: pids 4242 (this mod) and 4243 (a TUI) run on fake-host; any other pid is gone to `ps` and unprovable to `kill`.
+  if (cmd === '/bin/sh' && String(a[1]).includes('ps -o lstart= -p "$1"')) return ['4242', '4243'].includes(String(a[3])) ? ok('Thu Jan  1 00:00:00 1970\n') : fail('')
   switch (cmd) {
     case 'mkdir': {
       if (a[0] === '-p') {
@@ -290,7 +300,33 @@ function ledgerOp(files: Files, links: Map<string, string>, mtimes: Map<string, 
       }
       return ok()
     }
+    // rename(2) of a staged directory onto the TUI lock: it fails when the lock exists (the holder file keeps it non-empty).
+    case 'perl': {
+      // The hc socket connect probe is not a rename: the test's own process.run answers it.
+      if (a.some(x => x.includes('pack_sockaddr_un'))) return undefined
+      const [src, dst] = a.slice(-2) as [string, string]
+      if (files[`${src}/`] === undefined) return fail(`No such file or directory`)
+      if (files[`${dst}/`] !== undefined) return fail('Directory not empty')
+      for (const k of Object.keys(files)) {
+        if (k !== `${src}/` && !k.startsWith(`${src}/`)) continue
+        files[`${dst}${k.slice(src.length)}`] = files[k]!
+        delete files[k]
+      }
+      mtimes.set(dst, clockNow())
+      return ok()
+    }
+    case 'rmdir': {
+      const dir = a[0]!
+      if (files[`${dir}/`] === undefined) return fail(`rmdir: ${dir}: No such file or directory`)
+      if (Object.keys(files).some(k => k.startsWith(`${dir}/`) && k !== `${dir}/`)) return fail(`rmdir: ${dir}: Directory not empty`)
+      delete files[`${dir}/`]
+      return ok()
+    }
     case 'rm': {
+      if (a[0] === '-f') {
+        delete files[a[1]!]
+        return ok()
+      }
       if (a[0] === '-rf') {
         for (const k of Object.keys(files)) if (k === a[1] || k.startsWith(`${a[1]}/`)) delete files[k]
         for (const k of [...links.keys()]) if (k.startsWith(`${a[1]}/`)) links.delete(k)
@@ -703,7 +739,7 @@ describe('ownership', () => {
     mockStore(on)
     mockClock(on)
     setSessionId(on, 'sess-A')
-    // A worktree removed after its branch merged: the record names a dir that is no more.
+    // A checkout removed after its branch merged: the record names a dir that is no more.
     mockFs(on, { ...worker('w1', 0, { owner: 'sess-A', ownerCwd: '/work', dir: '/gone/wt' }) })
     mockSessionStart(on)
     on('ui.status', () => ({ value: undefined }))
@@ -1974,6 +2010,13 @@ describe('stall detection', () => {
     }
     expect(woken.length, 'exited is said once').toEqual(1)
     expect(namesIn((await $.command.run(run('outstanding'))).text)).toEqual([])
+    // Past the window with still no result: closed quietly, so no session re-claims it.
+    await clock.advance(24 * 60 * 60_000)
+    await $.turn.complete(turn())
+    await clock.advance(10_000)
+    await $.turn.complete(turn())
+    expect(woken.length, 'the quiet close is never announced').toEqual(1)
+    expect(store.acked().sort()).toEqual(['w1#1', 'w1#1#exited'])
   })
 
   test('a gone pane reports only its latest episode; earlier ones with no result close quietly as superseded', WITH_DRIVER, async ($, on) => {
@@ -2084,8 +2127,8 @@ function mockPanel(
   /** Set to refuse every delivery, leaving a terminal result undelivered. */
   refuseWake = false,
   /** What `$.agent.list()` answers while the panel is open. `'reject'` throws. */
-  agents: 'reject' | readonly { id: string; description: string; type: string; status: string }[] = [],
-): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[]; toasts: string[] } {
+  agents: 'reject' | readonly AgentInfo[] = [],
+): { argv: (readonly string[])[]; open: string[]; closed: string[]; logs: string[]; statuses: unknown[]; toasts: string[]; counts: { invalidates: number } } {
   const argv: (readonly string[])[] = []
   const statuses: unknown[] = []
   const toasts: string[] = []
@@ -2113,7 +2156,11 @@ function mockPanel(
     closed.push(e.id)
     return { value: undefined }
   })
-  on('ui.invalidate', () => ({ value: undefined }))
+  const counts = { invalidates: 0 }
+  on('ui.invalidate', () => {
+    counts.invalidates += 1
+    return { value: undefined }
+  })
   // The band's floor, as core answers it: its own (empty) drawing. The mod's
   // `next(e)` resolves to this and nests it under its rows.
   on('ui.render', () => ({ type: 'engine', ref: 0 }))
@@ -2121,7 +2168,9 @@ function mockPanel(
     logs.push(e.text)
     return { value: undefined }
   })
-  on('agent.list', () => {
+  on('agent.list', async () => {
+    // `probe.holdRows`: a promise that keeps every rows read (it counts the in-process agents) in flight until it settles.
+    if (probe.holdRows instanceof Promise) await probe.holdRows
     if (agents === 'reject') throw new Error('agent.list refused')
     return { value: [...agents] }
   })
@@ -2137,6 +2186,22 @@ function mockPanel(
   onRun(on, async ($, e) => {
     argv.push(e.argv)
     // grep over a session log (resume's cwd lookup): `probe.grep` is its stdout.
+    // `hc ls --json`: `probe.herdr` is its answer ({ exitCode?, stdout }).
+    // The hc socket connect probe: `probe.hcSocketDead` makes it refuse (a crashed core's file).
+    if (e.argv[0] === 'perl') return { value: { exitCode: probe.hcSocketDead ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0]?.endsWith('/hc')) {
+      if (e.argv[1] === 'read') {
+        const r = probe.hcRead
+        const res = typeof r === 'string' ? { stdout: r } : ((r ?? {}) as { exitCode?: number; stdout?: string; stderr?: string })
+        return { value: { exitCode: res.exitCode ?? 0, stdout: res.stdout ?? '', stderr: res.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (e.argv[1] === 'kill' || e.argv[1] === 'rm') {
+        const c = (probe.hcClose ?? {}) as { exitCode?: number; stdout?: string; stderr?: string }
+        return { value: { exitCode: c.exitCode ?? 0, stdout: c.stdout ?? '', stderr: c.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      const h = (probe.herdr ?? {}) as { exitCode?: number; stdout?: string }
+      return { value: { exitCode: h.exitCode ?? 0, stdout: h.stdout ?? '', stderr: h.exitCode ? 'hc: core not running' : '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (e.argv[0] === 'grep') return { value: { exitCode: typeof probe.grep === 'string' ? 0 : 1, stdout: typeof probe.grep === 'string' ? probe.grep : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     // `[ ⧉ ]`: the node + tui.node.ts lookup is `probe.sh`; the split names a pane.
     if (e.argv[0] === '/bin/sh' && typeof probe.sh === 'string') return { value: { exitCode: 0, stdout: probe.sh, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -2174,7 +2239,7 @@ function mockPanel(
         stderr: '', isStdoutTruncated: (isLs || isList) && probe.truncated === true, isStderrTruncated: false },
     }
   })
-  return { argv, open, closed, logs, statuses, toasts }
+  return { argv, open, closed, logs, statuses, toasts, counts }
 }
 
 const captures = (argv: (readonly string[])[]) => argv.filter(a => a.includes('capture'))
@@ -2213,6 +2278,115 @@ describe('panel', () => {
     await clock.advance(2_000)
 
     expect(captures(panel.argv), 'the mirror needs a selected row').toEqual([])
+  })
+
+  test('busy rows do not skip the mirror: a rows read in flight leaves the mirror job running (BD7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const probe: Record<string, unknown> = { running: true, idle_seconds: 60 }
+    const panel = mockPanel(on, probe, 'MIRRORED')
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    // [refresh] starts a rows read that does not return; it also closes any open row, so select after it.
+    let release = () => {}
+    probe.holdRows = new Promise<void>(resolve => { release = resolve })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'refresh', requestId: 'above-prompt' })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+
+    const afterPress = captures(panel.argv).length
+    await clock.advance(2_000)
+    await settle()
+
+    expect(captures(panel.argv).length, 'the rows job is busy; the mirror job still ticked and captured').toEqual(afterPress + 1)
+    release()
+  })
+
+  test('a finished mirror redraws while the rows read is still pending (FR-05)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const probe: Record<string, unknown> = { running: true, idle_seconds: 60 }
+    const panel = mockPanel(on, probe, 'NEW OUTPUT')
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+    let release = () => {}
+    probe.holdRows = new Promise<void>(resolve => { release = resolve })
+    const before = panel.counts.invalidates
+    const captured = captures(panel.argv).length
+    await clock.advance(2_000)
+    await settle()
+    expect(captures(panel.argv).length, 'the mirror finished').toBeGreaterThan(captured)
+    expect(panel.counts.invalidates, 'redraw while rows are pending').toBeGreaterThan(before)
+    release()
+    await settle()
+  })
+
+  test('finished rows redraw while the mirror capture is still pending (FR-05)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const gate: { release?: () => void; pending: number } = { pending: 0 }
+    const panel = mockPanel(on, { running: true, idle_seconds: 60 }, 'NEW OUTPUT', false, gate)
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+    const before = panel.counts.invalidates
+    await clock.advance(2_000)
+    await settle()
+    expect(gate.pending, 'the mirror is still in flight').toEqual(1)
+    expect(panel.counts.invalidates, 'redraw while the mirror is pending').toBeGreaterThan(before)
+    gate.release?.()
+    await settle()
+  })
+
+  test('the header says how old the rows are, and the age keeps moving while a rows read is stuck (BD7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    const clock = mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    const probe: Record<string, unknown> = { running: true, idle_seconds: 60 }
+    mockPanel(on, probe)
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    expect(textOf(await $.ui.render(bandRender(40, 39, 160)))).toContain('更新 0s 前')
+    let release = () => {}
+    probe.holdRows = new Promise<void>(resolve => { release = resolve })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'refresh', requestId: 'above-prompt' })
+    await clock.advance(2_000)
+    await clock.advance(2_000)
+    await clock.advance(2_000)
+    expect(textOf(await $.ui.render(bandRender(40, 39, 160)))).toContain('更新 6s 前')
+    release()
+    await settle()
+    expect(textOf(await $.ui.render(bandRender(40, 39, 160))), 'a finished read resets the age').toContain('更新 0s 前')
+  })
+
+  test('the age shows at every width the header draws buttons: inline when it fits, else on its own row (BD7)', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME })
+    mockStore(on)
+    mockClock(on)
+    mockFs(on, { ...worker('w1', 0) })
+    mockPanel(on, { running: true, idle_seconds: 60 })
+
+    await $.session.start(session())
+    await $.command.run(run('workers'))
+    for (const width of [60, 80, 113, 120, 130, 200]) {
+      const text = textOf(await $.ui.render(bandRender(40, 39, width)))
+      expect(text, `${width} columns`).toContain('更新 0s 前')
+      expect(text, `${width} columns: the name and version stay`).toMatch(/workers v\d+\.\d+\.\d+/)
+    }
   })
 
   test('closing the panel stops the mirror clock', WITH_DRIVER, async ($, on) => {
@@ -2258,8 +2432,8 @@ function termCells(text: string): number {
   let n = 0
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0
+    // Ambiguous-width characters such as `·` are 1 cell, as the band counts them (v0.48.2).
     const wide =
-      ch === '·' ||
       (cp >= 0x1100 && cp <= 0x115f) ||
       (cp >= 0x2e80 && cp <= 0xa4cf) ||
       (cp >= 0xac00 && cp <= 0xd7a3) ||
@@ -3174,6 +3348,563 @@ describe('teammates', () => {
     await clock.advance(2_000)
     await clock.advance(2_000)
     expect(panel.logs.filter(line => line.includes('agent.list failed')).length).toBe(1)
+  })
+
+  describe('hc agents (read-only, from hc ls, owned by parent)', () => {
+    const SOCK = `${HOME}/.local/state/herdr-core/default/default.sock`
+    const hcAgent = (address: string, parent?: string, over: Record<string, unknown> = {}) =>
+      ({ address, agent: 'agy', cwd: '/work', state: 'live', status: 'idle', turn: 1, where: 'w / 1', ...(parent ? { parent } : {}), ...over })
+    const hcList = (...terminals: object[]) => ({ stdout: JSON.stringify({ hidden_finished: 0, machines: [], terminals }) })
+    const hcRuns = (argv: (readonly string[])[]) => argv.filter(a => a[0]?.endsWith('/hc'))
+    // One top-level child is one row (every band line truncates), the title bar excluded.
+    const rowsOf = (tree: unknown) => ((tree as { children?: unknown[] }).children ?? []).slice(1).length
+    const herdrLinesOf = (tree: unknown) =>
+      ((tree as { children?: unknown[] }).children ?? []).map(textOf).filter(t => /^ {2}(hc · |\+\d+ more hc agents)/.test(t))
+    const workerKeys = (tree: unknown) => keysOf(tree).filter(k => /^w\d+#\d+$/.test(k))
+
+    test('lists only agents whose parent is this hc terminal; another parent, no parent, itself and shells stay off', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'mine' }),
+          hcAgent('t21', 't99', { name: 'theirs' }),
+          hcAgent('t22', undefined, { name: 'loose' }),
+          hcAgent('t11', 't11', { name: 'self' }),
+          { address: 't23', agent: 'zsh', cwd: '/work', state: 'live', where: 'w / 2', parent: 't11', name: 'shell' },
+        ),
+      })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const tree = await $.ui.render(bandRender(40, 39, 120))
+      const drawn = textOf(tree)
+      expect(drawn).toMatch(/tmux 0 · 內部 0 · hc 1 /)
+      expect(hcRuns(panel.argv)).toContainEqual(['/hb/hc', 'ls', '--all', '--json'])
+      expect(drawn).toContain('hc · t20 mine · agy · idle · read-only')
+      expect(drawn, 'another parent').not.toContain('theirs')
+      expect(drawn, 'no parent').not.toContain('loose')
+      expect(drawn, 'this session\'s own terminal').not.toContain('self')
+      expect(drawn, 'a shell has no status').not.toContain('shell')
+      expect(keysOf(tree).filter(k => /t20|herdr/.test(k)), 't20 is selectable; unselected shows no stop/tell').toEqual(['hc:t20'])
+      expect(hotkeysOf(tree)).toContain('1')
+      expect(keysOf(tree), '[ clear ] does not count hc agents').not.toContain('clear')
+    })
+
+    test('selecting an hc row mirrors hc read on the 2s clock; send, tell, interrupt and clear stay off', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '', ...worker('w1', 0) })
+      const panel = mockPanel(on, {
+        running: true,
+        idle_seconds: 5,
+        herdr: hcList(hcAgent('t20', 't11', { name: 'mine' }), hcAgent('t21', 't11', { name: 'other' })),
+        hcRead: 'hc-band-line-1\nhc-band-line-2\n',
+      })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const before = await $.ui.render(bandRender(40, 39, 120))
+      // Worker w1 gets hotkey '1'; first hc row t20 gets hotkey '2'.
+      expect(hotkeysOf(before)).toEqual(expect.arrayContaining(['1', '2', '3']))
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'read')).toEqual([])
+
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t20', requestId: 'above-prompt' })
+      await clock.advance(2_000)
+      const tree = await $.ui.render(bandRender(40, 39, 120))
+      const drawn = textOf(tree)
+      expect(drawn).toContain('› hc · t20 mine · agy · idle')
+      expect(drawn).toContain('hc-band-line-1')
+      expect(drawn).toContain('hc-band-line-2')
+      expect(drawn).toContain('See it whole: hc attach t20')
+      expect(keysOf(tree)).toContain('stop:hc:t20')
+      expect(keysOf(tree).filter(k => /^(tell|interrupt):/.test(k))).toEqual([])
+      const reads = hcRuns(panel.argv).filter(a => a[1] === 'read')
+      expect(reads.length).toBeGreaterThan(0)
+      expect(reads[0]!.slice(0, 4)).toEqual(['/hb/hc', 'read', 't20', '--lines'])
+    })
+
+    test('x x closes a live hc row with hc kill and a finished hc row with hc rm after arm-then-confirm', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'live-one', state: 'live' }),
+          hcAgent('t21', 't11', { name: 'done-one', state: 'finished', status: 'idle' }),
+        ),
+      }
+      const panel = mockPanel(on, probe)
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRender(40, 39, 120))
+      // Select via /workers 1 (live t20), arm x, repeat inside STOP_REPEAT_MS, then confirm after 500ms.
+      expect((await $.command.run(run('workers', '1'))).text).toContain('row 1 "live-one" selected')
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm')).toEqual([])
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120)))).toContain('stop live-one? press again')
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm'), 'held repeat does not confirm').toEqual([])
+      await clock.advance(500)
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill')).toEqual([['/hb/hc', 'kill', 't20']])
+
+      // Select finished t21 and confirm x x -> hc rm t21.
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t21', requestId: 'above-prompt' })
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t21', requestId: 'above-prompt' })
+      await clock.advance(500)
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t21', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'rm')).toEqual([['/hb/hc', 'rm', 't21']])
+    })
+
+    test('x x on a live hc row that finishes inside the arm window re-arms instead of running hc rm; live rows list before finished', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = {
+        running: true,
+        herdr: hcList(
+          hcAgent('t21', 't11', { name: 'done-a', state: 'finished', status: 'idle' }),
+          hcAgent('t22', 't11', { name: 'done-b', state: 'finished', status: 'idle' }),
+          hcAgent('t23', 't11', { name: 'done-c', state: 'finished', status: 'idle' }),
+          hcAgent('t20', 't11', { name: 'live-one', state: 'live' }),
+        ),
+      }
+      const panel = mockPanel(on, probe)
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120))), 'the live row is drawn ahead of finished ones').toContain('live-one')
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t20', requestId: 'above-prompt' })
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      // t20 finishes on its own before the confirm press.
+      probe.herdr = hcList(hcAgent('t20', 't11', { name: 'live-one', state: 'finished', status: 'idle' }))
+      // Inside the 5s confirm window: the 2s band tick re-reads hc (the refresh button would drop the arm).
+      await clock.advance(2_000)
+      await settle()
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120))), 'the row now reads finished').toContain('finished')
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm'), 'the confirm re-arms for rm').toEqual([])
+      await clock.advance(500)
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'rm')).toEqual([['/hb/hc', 'rm', 't20']])
+    })
+
+    test('finished hc rows: own listed as finished, others excluded, hc K unchanged, and [ clear ] runs hc rm on own finished only', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'mine-live', state: 'live', status: 'idle' }),
+          // The real shape of a finished record (hc ls --all, 2026-11-16): no status key at all.
+          { address: 't21', agent: 'agy', cwd: '/work', name: 'mine-done-1', parent: 't11', reason: 'killed', signal: 1, state: 'finished', turn: 1, where: 'w / 1' },
+          hcAgent('t22', 't11', { name: 'mine-done-2', state: 'finished', status: 'working' }),
+          hcAgent('t23', 't99', { name: 'theirs-live', state: 'live', status: 'idle' }),
+          hcAgent('t24', 't99', { name: 'theirs-done', state: 'finished', status: 'idle' }),
+          hcAgent('t25', undefined, { name: 'loose-done', state: 'finished', status: 'idle' }),
+        ),
+      }
+      const panel = mockPanel(on, probe)
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const tree = await $.ui.render(bandRender(40, 39, 120))
+      const drawn = textOf(tree)
+      expect(drawn, 'hc K counts live own agents only').toMatch(/tmux 0 · 內部 0 · hc 1 /)
+      expect(drawn).toContain('hc · t20 mine-live · agy · idle · read-only')
+      expect(drawn).toContain('hc · t21 mine-done-1 · agy · finished · read-only')
+      expect(drawn).toContain('hc · t22 mine-done-2 · agy · finished · read-only')
+      expect(drawn, 'other parent live').not.toContain('theirs-live')
+      expect(drawn, 'other parent finished').not.toContain('theirs-done')
+      expect(drawn, 'unparented finished').not.toContain('loose-done')
+      expect(keysOf(tree)).toContain('clear')
+      expect(hotkeysOf(tree)).toContain('c')
+
+      // Arm [ clear ], confirm after 500ms -> hc rm only on own finished (t21, t22); live t20 and others untouched.
+      await $.ui.press({ plugin: 'tmux-agent', key: 'clear', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'rm' || a[1] === 'kill')).toEqual([])
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120)))).toContain('clear all? press again')
+      await clock.advance(500)
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'clear', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill')).toEqual([])
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'rm')).toEqual([
+        ['/hb/hc', 'rm', 't21'],
+        ['/hb/hc', 'rm', 't22'],
+      ])
+    })
+
+    test('/workers stop <hc address> closes live with hc kill and finished with hc rm', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'live-one', state: 'live' }),
+          hcAgent('t21', 't11', { name: 'done-one', state: 'finished', status: 'idle' }),
+          hcAgent('t22', 't99', { name: 'theirs-done', state: 'finished', status: 'idle' }),
+        ),
+      })
+
+      await $.session.start(session())
+      // Works even before opening the panel.
+      const r1 = await $.command.run(run('workers', 'stop t20'))
+      expect(r1.text).toContain('stop "t20" — ok')
+      expect(r1.text).toContain('hc kill')
+      const r2 = await $.command.run(run('workers', 'stop t21'))
+      expect(r2.text).toContain('stop "t21" — ok')
+      expect(r2.text).toContain('hc rm')
+      const r3 = await $.command.run(run('workers', 'stop t22'))
+      expect(r3.text).toContain('refusing to stop "t22"')
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm')).toEqual([
+        ['/hb/hc', 'kill', 't20'],
+        ['/hb/hc', 'rm', 't21'],
+      ])
+    })
+
+    test('no hc run of any kind during mirror, stop button, clear, or /workers stop when the socket probe fails', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'mine', state: 'live' }),
+          hcAgent('t21', 't11', { name: 'mine-done', state: 'finished', status: 'idle' }),
+        ),
+      }
+      const panel = mockPanel(on, probe)
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRender(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t20', requestId: 'above-prompt' })
+      await $.ui.render(bandRender(40, 39, 120))
+      const countBeforeDead = hcRuns(panel.argv).length
+
+      probe.hcSocketDead = true
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await clock.advance(500)
+      await $.ui.press({ plugin: 'tmux-agent', key: 'stop:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      await $.ui.press({ plugin: 'tmux-agent', key: 'clear', requestId: 'above-prompt' })
+      await clock.advance(500)
+      await $.ui.press({ plugin: 'tmux-agent', key: 'clear', requestId: 'above-prompt' })
+      await settle()
+      await clock.advance(2_000)
+      const stopCmd = await $.command.run(run('workers', 'stop t20'))
+      expect(stopCmd.text).toContain('no worker "t20"')
+      expect(hcRuns(panel.argv).length).toBe(countBeforeDead)
+    })
+
+    test('a failed hc ls shows hc ?, logs once, and the band still renders', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, { running: true, herdr: { exitCode: 1, stdout: '{"error":{"kind":"x","message":"y"}}' } })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const drawn = textOf(await $.ui.render(bandRender(40, 39, 120)))
+      expect(drawn).toContain('hc ?')
+      expect(drawn).toContain('No workers outstanding')
+      await clock.advance(2_000)
+      await clock.advance(2_000)
+      expect(panel.logs.filter(line => line.includes('hc ls failed')).length).toBe(1)
+    })
+
+    test('a flapping hc ls (miss, miss, hit, miss, miss) logs once per session', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const bad = { exitCode: 1, stdout: '{"error":{"kind":"x","message":"y"}}' }
+      const probe: Record<string, unknown> = { running: true, herdr: bad }
+      const panel = mockPanel(on, probe)
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await clock.advance(2_000)
+      expect(panel.logs.filter(line => line.includes('hc ls failed')).length).toBe(1)
+      probe.herdr = hcList(hcAgent('t20', 't11'))
+      await clock.advance(2_000)
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120)))).not.toContain('hc ?')
+      probe.herdr = bad
+      await clock.advance(2_000)
+      await clock.advance(2_000)
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120)))).toContain('hc ?')
+      expect(panel.logs.filter(line => line.includes('hc ls failed')).length).toBe(1)
+    })
+
+    test('one failed hc ls followed by a good one logs nothing', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = { running: true, herdr: { exitCode: 1, stdout: '{"error":{"kind":"x","message":"y"}}' } }
+      const panel = mockPanel(on, probe)
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120)))).toContain('hc ?')
+      probe.herdr = hcList(hcAgent('t20', 't11'))
+      await clock.advance(2_000)
+      expect(textOf(await $.ui.render(bandRender(40, 39, 120)))).not.toContain('hc ?')
+      expect(panel.logs.filter(line => line.includes('hc ls failed')).length).toBe(0)
+    })
+
+    test('no socket under HOME: no segment, and hc is never run (hc ls would start a core), even with a live $HC_TERMINAL_SOCKET', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11', HC_TERMINAL_SOCKET: '/live.sock' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', '/live.sock': '' })
+      const panel = mockPanel(on, { running: true, herdr: hcList(hcAgent('t20', 't11')) })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await clock.advance(2_000)
+      const drawn = textOf(await $.ui.render(bandRender(40, 39, 120)))
+      expect(drawn).toMatch(/tmux 0 · 內部 0 /)
+      expect(drawn).not.toMatch(/ · hc /)
+      expect(hcRuns(panel.argv)).toEqual([])
+    })
+
+    test('a socket file that refuses (a crashed core): no segment, and hc is never run', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, { running: true, hcSocketDead: true, herdr: hcList(hcAgent('t20', 't11')) })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await clock.advance(2_000)
+      const drawn = textOf(await $.ui.render(bandRender(40, 39, 120)))
+      expect(drawn).not.toMatch(/ · hc /)
+      expect(panel.argv.some(a => a[0] === 'perl')).toBe(true)
+      expect(hcRuns(panel.argv)).toEqual([])
+    })
+
+    test('no HC_TERMINAL_ID or no hc on PATH: no segment, and hc is never run', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, { running: true, herdr: hcList(hcAgent('t20', 't11')) })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const drawn = textOf(await $.ui.render(bandRender(40, 39, 120)))
+      expect(drawn).not.toMatch(/ · hc /)
+      expect(hcRuns(panel.argv)).toEqual([])
+    })
+
+    test('no hc on PATH omits the segment', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/nobin', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { [SOCK]: '' })
+      const panel = mockPanel(on, { running: true })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const drawn = textOf(await $.ui.render(bandRender(40, 39, 120)))
+      expect(drawn).toMatch(/tmux 0 · 內部 0 /)
+      expect(drawn).not.toMatch(/ · hc /)
+    })
+
+    // sol F3: twenty own agents never cost a worker row, a goal line or the mirror's floor.
+    const own20 = hcList(...Array.from({ length: 20 }, (_, i) => hcAgent(`t${100 + i}`, 't11')))
+    for (const maxRows of [10, 24, 39]) {
+      for (const [label, workers, select] of [['one worker', 1, false], ['more workers than fit', 45, false], ['a selected worker', 1, true]] as const) {
+        test(`20 own agents, maxRows ${maxRows}, ${label}: inside maxRows, worker rows unchanged, herdr yields first`, WITH_DRIVER, async ($, on) => {
+          mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+          mockStore(on)
+          const clock = mockClock(on)
+          const files: Files = { '/hb/hc': '', [SOCK]: '' }
+          for (let i = 1; i <= workers; i += 1) Object.assign(files, worker(`w${i}`, 0, { goal: `goal ${i}` }))
+          mockFs(on, files)
+          const probe: Record<string, unknown> = { running: true, idle_seconds: 5, herdr: hcList() }
+          mockPanel(on, probe, Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'))
+
+          await $.session.start(session())
+          await $.command.run(run('workers'))
+          await $.ui.render(bandRender(maxRows, maxRows - 1, 120))
+          if (select) {
+            await $.ui.press({ plugin: 'tmux-agent', key: 'w1#1', requestId: 'above-prompt' })
+            await clock.advance(2_000)
+          }
+          const zero = await $.ui.render(bandRender(maxRows, maxRows - 1, 120))
+          probe.herdr = own20
+          await clock.advance(2_000)
+          const tree = await $.ui.render(bandRender(maxRows, maxRows - 1, 120))
+          const lines = herdrLinesOf(tree)
+          expect(textOf(tree)).toContain('hc 20')
+          expect(rowsOf(tree), 'drawn rows').toBeLessThanOrEqual(maxRows)
+          expect(workerKeys(tree), 'worker rows as with 0 agents').toEqual(workerKeys(zero))
+          expect(textOf(tree).includes('goal 1'), 'goal lines as with 0 agents').toBe(textOf(zero).includes('goal 1'))
+          expect(textOf(tree).includes('too short to mirror'), 'the mirror floor as with 0 agents').toBe(textOf(zero).includes('too short to mirror'))
+          expect(lines.length).toBeLessThanOrEqual(3)
+          if (lines.length) expect(lines.at(-1)).toBe(`  +${20 - (lines.length - 1)} more hc agents (hc ls)`)
+          // Room allows at 24 and 39 rows with one worker, selected or not.
+          if (workers === 1 && maxRows >= 24) expect(lines.length, lines.join('\n')).toBe(3)
+        })
+      }
+    }
+
+    test('m1: band hc digit hotkeys and /workers N share worker absolute base and never collide when cut', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      const files: Files = { '/hb/hc': '', [SOCK]: '' }
+      for (let i = 1; i <= 12; i += 1) Object.assign(files, worker(`w${i}`, 0))
+      mockFs(on, files)
+      const panel = mockPanel(on, { running: true, idle_seconds: 5, herdr: hcList(hcAgent('t20', 't11', { name: 'mine' })) })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRender(40, 39, 120))
+      expect((await $.command.run(run('workers', '13'))).text).toContain('row 13 "mine" selected')
+      // At maxRows 19 with t20 selected: shownRows=8 (w1..w8 -> hotkeys 1..8), w9..w12 cut (+4 more), t20 drawn.
+      // t20 must sit at absolute index 13 (past 9, so no hotkey '9'), matching /workers 13.
+      const cut = await $.ui.render(bandRender(19, 18, 120))
+      expect(textOf(cut)).toContain('› hc · t20 mine')
+      expect(hotkeysOf(cut)).not.toContain('9')
+      expect((await $.command.run(run('workers', '9'))).text).toContain('row 9 "w9" selected')
+    })
+
+    test('m1: band hc hotkey and /workers N agree on absolute index when workers are cut below 9', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      const files: Files = { '/hb/hc': '', [SOCK]: '' }
+      for (let i = 1; i <= 6; i += 1) Object.assign(files, worker(`w${i}`, 0))
+      mockFs(on, files)
+      const panel = mockPanel(on, { running: true, idle_seconds: 5, herdr: hcList(hcAgent('t20', 't11', { name: 'mine' })) })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRender(40, 39, 120))
+      expect((await $.command.run(run('workers', '7'))).text).toContain('row 7 "mine" selected')
+      // maxRows=15 with t20 selected draws 4 workers (w1..w4, hotkeys 1..4) + '+2 more' + t20.
+      // Absolute base for t20 is 7 (6 workers + 1), matching /workers 7 while /workers 5 selects w5.
+      const tree = await $.ui.render(bandRender(15, 14, 120))
+      expect(textOf(tree)).toContain('› hc · t20 mine')
+      expect(hotkeysOf(tree)).toContain('7')
+      expect(hotkeysOf(tree)).not.toContain('5')
+      expect((await $.command.run(run('workers', '5'))).text).toContain('row 5 "w5" selected')
+      expect((await $.command.run(run('workers', '7'))).text).toContain('row 7 "mine" selected')
+    })
+
+    test('m3: selected hc row stays visible in tight band and shows too-short hint when mirror or row cannot fit', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'one' }),
+          hcAgent('t21', 't11', { name: 'two' }),
+          hcAgent('t22', 't11', { name: 'three' }),
+        ),
+      })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRender(12, 11, 120))
+      // Select row 2 (t21) on a 12-row band: t21 must stay drawn with stop button and too-short hint.
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t21', requestId: 'above-prompt' })
+      const tight = await $.ui.render(bandRender(12, 11, 120))
+      expect(rowsOf(tight), 'maxRows 12').toBeLessThanOrEqual(12)
+      expect(textOf(tight)).toContain('› hc · t21 two')
+      expect(keysOf(tight)).toContain('stop:hc:t21')
+      expect(textOf(tight)).toContain('Band too short to mirror')
+
+      // Too tight to draw the selected row at all (maxRows 4): stays within maxRows and still explains why.
+      const tiny = await $.ui.render(bandRender(4, 3, 120))
+      expect(rowsOf(tiny), 'maxRows 4').toBeLessThanOrEqual(4)
+      expect(textOf(tiny)).toContain('Band too short to mirror')
+    })
+
+    test('m4: /workers N selects only drawn hc rows (shownHerdr), never undrawn ones', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, { running: true, herdr: own20 })
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      // At maxRows 24 with 0 workers, HERDR_BAND_LINES=3 draws 2 hc rows + '+18 more'.
+      await $.ui.render(bandRender(24, 23, 120))
+      expect((await $.command.run(run('workers', '2'))).text).toContain('row 2 "t101" selected')
+      const outOfBounds = await $.command.run(run('workers', '5'))
+      expect(outOfBounds.text).toContain('no row 5')
+      expect(textOf(await $.ui.render(bandRender(24, 23, 120)))).toContain('› hc · t101')
+    })
+
+    test('m5: /workers stop <address> refuses hc terminals not owned by this session with no hc kill/rm', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'mine', state: 'live' }),
+          hcAgent('t21', 't99', { name: 'theirs', state: 'live' }),
+          hcAgent('t22', undefined, { name: 'loose', state: 'live' }),
+          hcAgent('t11', 't11', { name: 'self', state: 'live' }),
+        ),
+      })
+
+      await $.session.start(session())
+      const rOther = await $.command.run(run('workers', 'stop t21'))
+      const rLoose = await $.command.run(run('workers', 'stop t22'))
+      const rSelf = await $.command.run(run('workers', 'stop t11'))
+      expect(rOther.text).toMatch(/refusing|no worker/)
+      expect(rLoose.text).toMatch(/refusing|no worker/)
+      expect(rSelf.text).toMatch(/refusing|no worker/)
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm')).toEqual([])
+
+      // Also refused when panel is open.
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRender(40, 39, 120))
+      expect((await $.command.run(run('workers', 'stop t21'))).text).toMatch(/refusing|no worker/)
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm')).toEqual([])
+    })
   })
 
   test('the title and hint stay within 80 and 60 columns', WITH_DRIVER, async ($, on) => {
@@ -4639,88 +5370,175 @@ describe('cursor review of 34e2a1e', () => {
     expect(textOf(await $.ui.render(bandRender()))).toContain('w1')
   })
 
-  const TUI_SH = '/opt/node/bin/node\n/skills/tmux-agent-tools/scripts/lib/tui.node.ts\n/skills/tmux-agent-tools/scripts/tmux-agent-tui\n'
+  const TUI_ENTRY = '/skills/tmux-agent-tools/scripts/workers-tui'
+  const TUI_SH = `${TUI_ENTRY}\n`
   const wait50 = () => new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
-
-  test('[ ⧉ ] splits the host pane with the TUI bound to this session (P7)', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME, TMUX_PANE: '%5' })
+  const T0 = 1_000_000
+  const OWNER = `${V3}/.sessions/${hex('sess-test')}/tui.owner`
+  /** A TUI claim record held by fake-host pid 4243 (alive to the fake `ps`); `host: 'other-host'` is unprovable. */
+  const claimed = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ host: 'fake-host', pid: 4243, pidStart: 'Thu Jan  1 00:00:00 1970', token: 'abcdefghij12', state: 'ready', at: T0, ...over })
+  /** What opens a new TUI somewhere: a split, a Warp launch, or an AppleScript window. */
+  const opens = (argv: (readonly string[])[]) =>
+    argv.filter(a => a[1] === 'split-window' || a[1]?.startsWith('warp://') || (a[0] === 'osascript' && /create window|do script/.test(a[2] ?? '')))
+  /** What moves focus to a TUI that already runs. */
+  const focuses = (argv: (readonly string[])[]) =>
+    argv.filter(a => a[1] === 'select-pane' || (a[0] === 'open' && a[1] === '-a') || (a[0] === 'osascript' && /tty of/.test(a[2] ?? '')))
+  const pressTui = async ($: Engine) => {
+    await $.command.run(run('workers'))
+    await $.ui.render(bandRender())
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+  }
+  const band = (on: On, env: Record<string, string>, files: Files, probe: Record<string, unknown> = { running: true, idle_seconds: 5, sh: TUI_SH }) => {
+    mock.env(on, { HOME, ...env })
     mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+    const clock = mockClock(on, { now: T0 })
+    mockFs(on, files)
+    return { clock, p: mockPanel(on, probe) }
+  }
+
+  test('[ ⧉ ] in tmux claims pending, then splits the host pane with the TUI bound to that claim (B1)', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TMUX_PANE: '%5' }, files)
     await $.session.start(session())
     await $.command.run(run('workers'))
     expect(keysOf(await $.ui.render(bandRender()))).toContain('tui')
     await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => unknown }).setTimeout(() => resolve(undefined), 50))
-    const split = p.argv.find(a => a[0] === 'tmux' && a[1] === 'split-window')
-    expect(split, 'one split-window, no launcher (the mod is the collector)').toBeDefined()
+    await wait50()
+    const split = opens(p.argv)
+    expect(split, 'one split-window, no launcher (the mod is the collector)').toHaveLength(1)
     expect(p.argv.some(a => a.some(x => x.includes('launcher.node.ts')))).toBe(false)
-    const s = split ?? []
+    const s = split[0] ?? []
     expect(s.slice(2, 6), '-f: full window height beside a half-height pane').toEqual(['-t', '%5', '-h', '-f'])
-    expect(s).toContain(`TMUX_AGENT_SESSION=${s[s.indexOf('--session') + 1]}`)
-    expect(s.slice(s.indexOf('/opt/node/bin/node'), s.indexOf('/opt/node/bin/node') + 2)).toEqual([
-      '/opt/node/bin/node',
-      '/skills/tmux-agent-tools/scripts/lib/tui.node.ts',
-    ])
-    expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI in %9 beside %5'])
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { state?: string; token?: string }
+    expect(rec.state, 'the claim is written before the window opens').toEqual('pending')
+    expect(s.slice(s.indexOf(TUI_ENTRY))).toEqual([TUI_ENTRY, '--session', 'sess-test', '--cwd', '/work', '--claim', rec.token ?? ''])
+    expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI 已開在 %9，在 %5 旁'])
   })
 
-  test('[ ⧉ ] outside tmux splits nothing and hands over the full tmux-agent-tui command (ok, D-q2)', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME })
-    mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
+  test('[ ⧉ ] outside tmux in Warp opens through openInTerminal and never reports a cut command as success (B2)', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
     await $.session.start(session())
-    await $.command.run(run('workers'))
-    await $.ui.render(bandRender())
-    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await wait50()
-    expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
-    expect(p.toasts).toEqual([
-      "tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行：'/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'",
-    ])
-    expect(p.logs.join('\n'), 'a short command needs no log line').not.toContain('tui open command')
-  })
-
-  test('[ ⧉ ] outside tmux: a command over 200 chars goes whole to the log, quoted, and the toast says so', WITH_DRIVER, async ($, on) => {
-    // A state root with a space and a single quote: the quoting must survive both.
-    const dir = `/state/it's here/${'d'.repeat(160)}`
-    mock.env(on, { HOME, TMUX_AGENT_DIR: dir })
-    mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: TUI_SH })
-    await $.session.start(session())
-    await $.command.run(run('workers'))
-    await $.ui.render(bandRender())
-    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await wait50()
-    const full = `TMUX_AGENT_DIR='/state/it'\\''s here/${'d'.repeat(160)}' '/skills/tmux-agent-tools/scripts/tmux-agent-tui' --session 'sess-test' --cwd '/work'`
-    expect(p.logs, 'the whole command, runnable as logged').toContain(`tui open command: ${full}`)
-    expect(p.toasts).toHaveLength(1)
-    const toast = p.toasts[0]!
-    expect(toast.startsWith('tmux-agent: tui — ok: 不在 tmux 內，已提供開啟指令，請在另一個終端機執行（完整指令見 log）：TMUX_AGENT_DIR=')).toBe(true)
-    expect(toast.endsWith('…'), 'the toast keeps a cut that act() does not cut again').toBe(true)
-    expect(toast.split('tmux-agent:').length - 1, 'prefix exactly once').toEqual(1)
-  })
-
-  test('[ ⧉ ] with no node or no tmux-agent-tui beside agent-tmux fails and splits nothing', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME, TMUX_PANE: '%5' })
-    mockStore(on)
-    mockClock(on)
-    mockFs(on, { ...worker('w1', 0) })
-    const p = mockPanel(on, { running: true, idle_seconds: 5, sh: false })
-    await $.session.start(session())
-    await $.command.run(run('workers'))
-    await $.ui.render(bandRender())
-    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
-    await wait50()
+    await pressTui($)
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { state?: string; token?: string }
+    expect(rec.state).toEqual('pending')
+    const launch = `${HOME}/.warp/launch_configurations/workers-tui-${hex('sess-test')}-${rec.token}.yaml`
+    expect(files[launch], 'the launch file carries this claim token').toContain(`'--claim' '${rec.token}'`)
+    expect(opens(p.argv).map(a => a.slice(0, 2))).toEqual([['open', `warp://launch/${encodeURIComponent(`workers-tui-${hex('sess-test')}-${rec.token}`)}`]])
     expect(p.argv.some(a => a[1] === 'split-window')).toBe(false)
     expect(p.toasts).toHaveLength(1)
-    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: no node, lib\/tui\.node\.ts or tmux-agent-tui beside /)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — ok: 已送出 Warp 開啟 TUI 的要求/)
+    expect(p.toasts[0], 'no command to copy, cut or whole').not.toMatch(/請在另一個終端機執行|workers-tui'|…$/)
+  })
+
+  for (const [term, label, script, notice] of [
+    ['iTerm.app', 'iTerm2', 'create window', ''],
+    ['Apple_Terminal', 'Terminal.app', 'do script', ''],
+    ['ghostty', 'Terminal.app', 'do script', 'ghostty has no adapter; opening Terminal.app'],
+  ] as const) {
+    test(`[ ⧉ ] outside tmux in ${term} opens a window through ${label} (any terminal app, not only Warp)`, WITH_DRIVER, async ($, on) => {
+      const files: Files = { ...worker('w1', 0) }
+      const { p } = band(on, { TERM_PROGRAM: term }, files)
+      await $.session.start(session())
+      await pressTui($)
+      expect(opens(p.argv).map(a => a[0])).toEqual(['osascript'])
+      expect(opens(p.argv)[0]?.[2]).toContain(script)
+      expect(p.toasts).toEqual([`tmux-agent: tui — ok: 已送出 ${label} 開啟 TUI 的要求，TUI 接手後才算就緒${notice ? `；${notice}` : ''}`])
+    })
+  }
+
+  test('[ ⧉ ] where the open fails says FAILED with the reason, keeps the command in the log, and releases its own pending claim', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal', SSH_TTY: '/dev/ttys001' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts).toHaveLength(1)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: 無法開啟 TUI：cannot open a window on your machine over SSH/)
+    expect(p.logs.join('\n'), 'the launch line is diagnostic text in the log').toContain(`'${TUI_ENTRY}' '--session' 'sess-test'`)
+    expect(files[OWNER], 'the failed open released its own pending claim').toBeUndefined()
+  })
+
+  test('[ ⧉ ] with no workers-tui beside agent-tmux fails and opens nothing', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TMUX_PANE: '%5' }, files, { running: true, idle_seconds: 5, sh: false })
+    await $.session.start(session())
+    await pressTui($)
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts).toHaveLength(1)
+    expect(p.toasts[0]).toMatch(/^tmux-agent: tui — FAILED: no workers-tui beside /)
     expect(p.toasts[0], 'names the remedy for an older skill install').toContain('re-run its install-bin')
+    expect(files[OWNER], 'nothing was claimed').toBeUndefined()
+  })
+
+  test('[ ⧉ ] with a TUI already ready focuses it by its locator and opens no second window', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0), [OWNER]: claimed({ locator: { kind: 'tmux', pane: '%3' } }) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    expect(focuses(p.argv).map(a => a.join(' '))).toEqual(['tmux select-pane -t %3'])
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts).toEqual(['tmux-agent: tui — ok: TUI 已在執行，已切到 tmux pane %3'])
+    files[OWNER] = claimed({ locator: { kind: 'warp', tabTitle: 'workers-tui sess-tes' } })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+    expect(focuses(p.argv).at(-1)).toEqual(['open', '-a', 'Warp'])
+    expect(opens(p.argv)).toEqual([])
+    expect(p.toasts.at(-1), 'the app was raised and the tab is named; no window is claimed focused').toEqual(
+      'tmux-agent: tui — ok: TUI 已在執行，已把 Warp 帶到前景，請找分頁「workers-tui sess-tes」',
+    )
+  })
+
+  test('[ ⧉ ] with a TUI still starting, or an owner it cannot prove, says so: no focus, no new window', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0), [OWNER]: claimed({ state: 'pending' }) }
+    const { p } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    expect(p.toasts.at(-1)).toMatch(/^tmux-agent: tui — ok: TUI 正在啟動/)
+    const pending = files[OWNER]
+    files[OWNER] = claimed({ host: 'other-host', locator: { kind: 'tmux', pane: '%3' } })
+    await $.ui.press({ plugin: 'tmux-agent', key: 'tui', requestId: 'above-prompt' })
+    await wait50()
+    expect(p.toasts.at(-1)).toMatch(/^tmux-agent: tui — FAILED: 無法確認 TUI 是否已在執行/)
+    expect(p.toasts).toHaveLength(2)
+    expect(focuses(p.argv), 'unknown and pending are never focused').toEqual([])
+    expect(opens(p.argv), 'and never open a second window').toEqual([])
+    expect(pending, 'the pending record was left as it was').toEqual(claimed({ state: 'pending' }))
+    expect(files[OWNER]).toEqual(claimed({ host: 'other-host', locator: { kind: 'tmux', pane: '%3' } }))
+  })
+
+  test('the band late cleanup leaves a record the TUI has made ready', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p, clock } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { token: string; state: string }
+    expect(rec.state, 'the band claimed pending first').toEqual('pending')
+    // The TUI adopts its claim with its own process identity (pid 4243, not the band's 4242).
+    files[OWNER] = claimed({ token: rec.token, state: 'ready', locator: { kind: 'warp', tabTitle: 't' } })
+    await clock.advance(31_000)
+    await settle()
+    expect(JSON.parse(files[OWNER] ?? '{}').state, 'the late cleanup did not release a ready record').toEqual('ready')
+    expect(p.toasts, 'and says nothing about a failed start').toHaveLength(1)
+  })
+
+  test('the band timeout releases its own claim that is still pending, and says the TUI did not start', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p, clock } = band(on, { TERM_PROGRAM: 'WarpTerminal' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { token: string }
+    const launch = `${HOME}/.warp/launch_configurations/workers-tui-${hex('sess-test')}-${rec.token}.yaml`
+    expect(files[launch]).toBeDefined()
+    await clock.advance(29_000)
+    expect(files[OWNER], 'not before the 30 s the claim lives').toBeDefined()
+    await clock.advance(2_000)
+    await settle()
+    expect(files[OWNER], 'released').toBeUndefined()
+    expect(files[launch], 'its own launch file goes with it').toBeUndefined()
+    expect(p.toasts.at(-1)).toMatch(/^tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手/)
   })
 })
 

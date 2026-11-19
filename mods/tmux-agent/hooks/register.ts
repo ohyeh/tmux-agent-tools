@@ -30,6 +30,7 @@ import {
   CLEAR_ID,
   PANEL_ACCENT,
   MIRROR_MIN_ROWS,
+  HERDR_BAND_LINES,
   TERMINAL,
   NAME_RE,
   shq,
@@ -71,7 +72,25 @@ import {
   rowLabel,
   clearButtonLabel,
   stopButtonLabel,
-  openTuiBeside,
+  agentTmuxBin,
+  readHc,
+  herdrLabel,
+  hcId,
+  hcFinished,
+  mirrorHc,
+  stopHc,
+  type HcAgent,
+  claimTui,
+  releaseTui,
+  ageText,
+  focusTui,
+  openInTerminal,
+  dropLaunchFile,
+  isPaneId,
+  tuiLaunchPath,
+  appLabel,
+  processId,
+  TUI_PENDING_MS,
   rememberPanel,
   tellWorker,
   stopAll,
@@ -82,6 +101,7 @@ import {
   peekProject,
   pressKeys,
   trustWorkerHooks,
+  idOf,
   interruptWorker,
   heartbeat,
   handoffOwner,
@@ -101,7 +121,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.47.0'
+const MOD_VERSION = '0.52.1'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -212,6 +232,8 @@ function waiterPrompt(stateDir: string, name: string): string {
 }
 export const register: Register = on => {
   // Per activation, shared by every entry point below.
+  /** When the rows were last read (ms). The header prints its age; a stuck read makes it grow (BD7). */
+  let rowsAt: number | undefined
   const panel: Panel = { open: false, rows: [], all: [], showAll: false, generation: 0, internal: 0, internalMissLogged: false }
   /**
    * The bound world, kept at activation scope because the panel's command hook
@@ -520,6 +542,12 @@ export const register: Register = on => {
       envXdgStateHome: () => beneath.env.get('XDG_STATE_HOME'),
       envHome: () => beneath.env.get('HOME'),
       envPath: () => beneath.env.get('PATH'),
+      envTermProgram: () => beneath.env.get('TERM_PROGRAM'),
+      // The band never asks for the pane or socket here; keep the permission surface narrow.
+      envTmuxPane: async () => undefined,
+      envTmuxSocket: async () => undefined,
+      envSshTty: () => beneath.env.get('SSH_TTY'),
+      envHcTerminal: () => beneath.env.get('HC_TERMINAL_ID'),
       read: path => beneath.fs.read(path),
       write: (path, text) => beneath.fs.write(path, text),
       stat: path => beneath.fs.stat(path),
@@ -591,6 +619,12 @@ export const register: Register = on => {
       envXdgStateHome: () => $.env.get('XDG_STATE_HOME'),
       envHome: () => $.env.get('HOME'),
       envPath: () => $.env.get('PATH'),
+      envTermProgram: () => $.env.get('TERM_PROGRAM'),
+      // The band never asks for the pane or socket here; keep the permission surface narrow.
+      envTmuxPane: async () => undefined,
+      envTmuxSocket: async () => undefined,
+      envSshTty: () => $.env.get('SSH_TTY'),
+      envHcTerminal: () => $.env.get('HC_TERMINAL_ID'),
       read: path => $.fs.read(path),
       write: (path, text) => $.fs.write(path, text),
       stat: path => $.fs.stat(path),
@@ -664,7 +698,8 @@ export const register: Register = on => {
       description:
         'Stop a worker this session dispatched and drop it from the panel. Nothing further will be ' +
         "delivered for it; read its result.json first if you still need it. `all: true` stops every worker " +
-        'of this project that still has a tmux session — the ones you forgot to close.',
+        'of this project that still has a tmux session — the ones you forgot to close — and removes this ' +
+        'session\'s own finished hc terminals (`hc rm`).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -814,6 +849,97 @@ export const register: Register = on => {
     panel.mirror = undefined
   }
 
+  /**
+   * `[ ⧉ tui ]`: claim the session's TUI slot (pending), then open it where the
+   * person is: a tmux split (B1) or a new window in their terminal app (B2). A TUI
+   * that already runs is focused by its locator; one that is starting, or whose
+   * owner cannot be proven, is reported and nothing else is opened. A command to
+   * copy is never the result. `after` is the render hook's `$.clock.after`.
+   */
+  const openTuiBand = async (host: Host, pane: string | undefined, after: (ms: number, fn: () => Promise<void>) => unknown): Promise<Outcome> => {
+    const session = host.owner()
+    const cwd = host.cwd()
+    if (!session || !cwd) return { ok: false, text: 'no session id or cwd yet' }
+    const { bin, missing } = await agentTmuxBin(host)
+    if (missing) return { ok: false, text: missing }
+    const found = await host.run(
+      ['/bin/sh', '-c', 'w=$(command -v "$1") && w=$(realpath "$w") && e="${w%/*}/workers-tui" && [ -x "$e" ] && printf "%s\\n" "$e"', 'sh', bin],
+      cwd,
+      5_000,
+    )
+    const entry = found.stdout.trim().split('\n')[0]
+    if (found.exitCode !== 0 || !entry) {
+      return { ok: false, text: `no workers-tui beside ${bin}${found.stderr.trim() ? `: ${found.stderr.trim()}` : ''}; an older skill install? update it and re-run its install-bin` }
+    }
+    const root = await rootOf(host)
+    if (!root) return { ok: false, text: 'no state root: TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset' }
+    const home = await host.envHome()
+    const launchDir = home ? `${home}/.warp/launch_configurations` : undefined
+    const me = await processId(host)
+    const claim = await claimTui(host, root, session, me, { state: 'pending', ...(launchDir ? { launchDir } : {}) })
+    switch (claim.kind) {
+      case 'occupied-ready': {
+        const raised = await focusTui(host, claim)
+        if ('refused' in raised) return { ok: false, text: `TUI 已在執行，但無法切過去：${raised.refused}` }
+        if (raised.raised === 'pane') return { ok: true, text: `TUI 已在執行，已切到 tmux pane ${claim.locator?.kind === 'tmux' ? claim.locator.pane : ''}`.trim() }
+        const app = appLabel(claim.locator?.kind)
+        return { ok: true, text: `TUI 已在執行，已把 ${app} 帶到前景${raised.tabTitle ? `，請找分頁「${raised.tabTitle}」` : ''}` }
+      }
+      case 'occupied-pending':
+        return { ok: true, text: 'TUI 正在啟動（另一次開啟尚未接手），沒有開新視窗；稍後再按' }
+      case 'occupied-unknown':
+        return { ok: false, text: '無法確認 TUI 是否已在執行（佔用者狀態不明），沒有開新視窗也沒有切換；稍後再按' }
+      case 'stale':
+        return { ok: false, text: 'TUI 的佔用紀錄剛被別人改過，沒有開新視窗；再按一次' }
+      default:
+        break
+    }
+    const token = claim.claim.token
+    const dir = await host.envTmuxAgentDir()
+    const launchFile = launchDir ? tuiLaunchPath(launchDir, session, token) : undefined
+    const release = () =>
+      releaseTui(host, root, session, token, 'launcher', me).catch(error => {
+        host.log(`tmux-agent: tui claim release failed: ${String(error)}`)
+        return false
+      })
+    try {
+      const opened = await openInTerminal(
+        host,
+        {
+          argv: [entry, '--session', session, '--cwd', cwd, '--claim', token],
+          cwd,
+          env: dir ? { TMUX_AGENT_DIR: dir } : {},
+          session,
+          launchToken: token,
+          ...(launchDir ? { launchDir } : {}),
+          ...(pane && isPaneId(pane) ? { pane } : {}),
+        },
+        'tmux-agent tui',
+        true,
+      )
+      if (opened.kind === 'failed') {
+        await release()
+        host.log(`tmux-agent: tui open command: ${opened.command}`)
+        return { ok: false, text: `無法開啟 TUI：${opened.error}${opened.stderr.trim() ? `：${opened.stderr.trim()}` : ''}` }
+      }
+      // The TUI turns the pending claim ready when it starts. If it never does, this
+      // releases only the record this press made (still pending); a ready record stays.
+      after(TUI_PENDING_MS, async () => {
+        if (!(await release())) return
+        if (launchFile) {
+          const left = await dropLaunchFile(host, launchFile, '/')
+          if (left) host.log(`tmux-agent: tui launch file ${launchFile} remains: ${left}`)
+        }
+        host.toast('tmux-agent: tui — FAILED: TUI 沒有在 30 秒內接手，已取消這次開啟；再按 [ ⧉ tui ] 重試')
+      })
+      if (opened.kind === 'split') return { ok: true, text: `TUI 已開在 ${opened.locator.pane}，在 ${pane} 旁` }
+      return { ok: true, text: `已送出 ${appLabel(opened.terminal)} 開啟 TUI 的要求，TUI 接手後才算就緒${opened.notice ? `；${opened.notice}` : ''}` }
+    } catch (error) {
+      await release()
+      throw error
+    }
+  }
+
   // The band above the prompt, NOT a `Pane`. Observed 2026-09-17 on two
   // machines: a Pane docks to the right of the transcript from 110 columns
   // (fullscreen layout) and sits inline under `CLAUDE_CODE_NO_FLICKER=0` or in
@@ -876,51 +1002,6 @@ export const register: Register = on => {
       panel.armedStop = { id, from: at, until: at + STOP_CONFIRM_MS }
       $.ui.invalidate('ui.render')
     }
-    // Every row the tree draws is counted here, so it stays inside `maxRows`: a
-    // taller tree scrolls, and a scrolling band arms none of its digit hotkeys.
-    // Goals show only in the overview (no row selected); a selected row adds its
-    // tell line and a one-line summary. A fleet longer than the band is cut, the
-    // selected row kept, with a "+N more" line.
-    const others = othersLine(panel.all)
-    const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
-    const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
-    const layout = (sel: PanelRow | undefined) => {
-      // Selected: its tell line, its summary, and one row for the mirror's rule
-      // or the "too short to mirror" line, whichever is drawn.
-      const fixed = 1 + (panel.adding ? 1 : 0) + (down ? 1 : 0) + (others ? 1 : 0) + (sel ? 2 + (sel.summary ? 1 : 0) : 0) + (panel.rows.length ? 0 : 1)
-      // A selection is for watching that worker: the list gives way to the
-      // mirror's floor (and its hint line) before it gives way to nothing.
-      const reserve = sel ? 1 + MIRROR_MIN_ROWS : 0
-      const fitsAt = (perRow: number, n: number) =>
-        fixed + n * perRow + (n < panel.rows.length ? 1 : 0) + reserve <= e.props.maxRows
-      // Each goal line costs a worker row: goals are drawn only when every
-      // worker fits with its goal, so they never push a worker off the band.
-      const goals = !sel && fitsAt(2, panel.rows.length)
-      const perRow = goals ? 2 : 1
-      let shown = panel.rows.length
-      while (shown > 1 && !fitsAt(perRow, shown)) shown -= 1
-      return { shown, goals, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
-    }
-    const { shown: shownRows, goals, used } = layout(selected)
-    const first = selected ? Math.max(0, Math.min(selIndex - shownRows + 1, panel.rows.length - shownRows)) : 0
-    const hidden = panel.rows.length - shownRows
-    // The mirror is sized for the layout a selection draws — before the press
-    // too, since the clock captures on the height the last render allowed. It
-    // takes what is left after its "see it whole" line.
-    const room = e.props.maxRows - (selected ? used : layout(panel.rows[0]).used) - 1
-    // 0 means "do not mirror", which is the honest answer for a surface that
-    // cannot fit even one line of work under the target's own chrome.
-    panel.rows_available = room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
-    const children: RenderElement[] = []
-    // Smaller than the least full layout (one row and its controls): only the
-    // title bar and, room permitting, what still works — the typed commands.
-    // Overflowing would scroll the band and disarm the digits (astra, 34e2a1e:
-    // maxRows 3 drew 4).
-    const compact = used > e.props.maxRows
-    if (compact) panel.rows_available = 0
-
-    // A stall is a warning, not a footnote: it keeps its colour (never dim-only).
-    if (down && !compact) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `⚠ ${down}` }))
     // The header names the keys: this is the only place a person learns them.
     // `r`/`x`/`q` press only while the band is focused; digits from an empty
     // prompt. Manual re-read, for when the clock's last answer looks wrong.
@@ -933,10 +1014,13 @@ export const register: Register = on => {
     // (asked 2026-09-26: the 專案 count told less than whose panel it is; the
     // project rows still say 專案 themselves).
     const me = world?.owner()
-    const tally = `tmux ${tmuxRunning} · 內部 ${panel.internal}`
+    // hc agents this session's hc terminal started: counted (live only), listed, selectable, mirrorable, and stoppable.
+    const herdrRows = Array.isArray(panel.herdr) ? panel.herdr : []
+    const herdrCount = panel.herdr === undefined ? '' : ` · hc ${panel.herdr === '?' ? '?' : panel.herdr.filter(a => !hcFinished(a)).length}`
+    const tally = `tmux ${tmuxRunning} · 內部 ${panel.internal}${herdrCount}`
     const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}${tally}`
-    // `[ clear ]` stops every worker this mod started; drawn only when there is one.
-    const clearable = panel.rows.some(r => !r.project)
+    // `[ clear ]` stops every worker this mod started and removes finished own hc rows; drawn only when one exists.
+    const clearable = panel.rows.some(r => !r.project) || herdrRows.some(hcFinished)
     const clearArmed = panel.armedStop?.id === CLEAR_ID && now < panel.armedStop.until
     const clearLabel = `✕ ${clearButtonLabel(clearArmed)}`
     // One glyph per action, every glyph one cell (East Asian Width N, so a CJK
@@ -949,7 +1033,10 @@ export const register: Register = on => {
       displayCells('[ hide ]') +
       displayCells(' [-]')
     const full = ` workers v${MOD_VERSION} · ${counts} `
-    const words = displayCells(full) + cellsOf(true) <= width
+    const rowsAge = rowsAt === undefined ? '' : ageText(now, { running: false, queued: false, lastOk: rowsAt })
+    const age = rowsAge ? ` · ${rowsAge}` : ''
+    // The age takes part in the choice: the button words go before the age does.
+    const words = displayCells(`${full.trimEnd()}${age} `) + cellsOf(true) <= width
     const addLabel = words ? '+ new' : '+'
     const refreshLabel = words ? '↻ refresh' : '↻'
     const tuiLabel = words ? '⧉ tui' : '⧉'
@@ -959,9 +1046,114 @@ export const register: Register = on => {
     const buttonCells = cellsOf(words)
     // The name and version always stay (mods/README.md rule 11): the session id goes first, then the counts.
     const name = ` workers v${MOD_VERSION} `
-    const titleText = [full, ` workers v${MOD_VERSION} · ${tally} `, name].find(t => displayCells(t) + buttonCells <= width) ?? name
+    // The age of the rows read (BD7): a stuck read shows as a growing number, not a frozen list.
+    // Inline the button words go before it, then the session id; when it still does not fit
+    // it gets its own row below the bar, so it is visible at every width.
+    const short = ` workers v${MOD_VERSION} · ${tally}`
+    const titleText = (age ? [`${full.trimEnd()}${age} `, full, `${short}${age} `] : [full]).concat(`${short} `, name).find(t => displayCells(t) + buttonCells <= width) ?? name
     const titleCells = displayCells(titleText) + buttonCells
     const hintRoom = Math.max(0, width - titleCells)
+    // Drawn only when the bar left the age out and a row is spare: a taller tree scrolls and
+    // disarms the digits, and the mirror keeps its floor (set below, once the layout is known).
+    let ageRow = false
+    // Every row the tree draws is counted here, so it stays inside `maxRows`: a
+    // taller tree scrolls, and a scrolling band arms none of its digit hotkeys.
+    // Goals show only in the overview (no row selected); a selected row adds its
+    // tell line and a one-line summary. A fleet longer than the band is cut, the
+    // selected row kept, with a "+N more" line.
+    const others = othersLine(panel.all)
+    const selIndex = panel.rows.findIndex(r => r.id === panel.selected)
+    const selected = selIndex >= 0 ? panel.rows[selIndex] : undefined
+    const hcSelIndex = selected ? -1 : herdrRows.findIndex(a => hcId(a.address) === panel.selected)
+    const selectedHc = hcSelIndex >= 0 ? herdrRows[hcSelIndex] : undefined
+    const layout = (sel: PanelRow | undefined, withAgeRow: boolean, selHc?: HcAgent, reserveHint = false) => {
+      const hasSel = !!(sel || selHc)
+      // Selected: its tell/stop line, its summary (worker only), and one row for the mirror's rule
+      // or the "too short to mirror" line, whichever is drawn.
+      const fixed =
+        1 +
+        (withAgeRow ? 1 : 0) +
+        (panel.adding ? 1 : 0) +
+        (down ? 1 : 0) +
+        (others ? 1 : 0) +
+        (hasSel ? 2 + (sel?.summary ? 1 : 0) : reserveHint ? 1 : 0) +
+        (panel.rows.length ? 0 : 1)
+      // A selection is for watching that row: the list gives way to the
+      // mirror's floor (and its hint line) before it gives way to nothing.
+      const reserve = hasSel ? 1 + MIRROR_MIN_ROWS : 0
+      const fitsAt = (perRow: number, n: number) =>
+        fixed + n * perRow + (n < panel.rows.length ? 1 : 0) + reserve <= e.props.maxRows
+      // Each goal line costs a worker row: goals are drawn only when every
+      // worker fits with its goal, so they never push a worker off the band.
+      const goals = !hasSel && fitsAt(2, panel.rows.length)
+      const perRow = goals ? 2 : 1
+      let shown = panel.rows.length
+      while (shown > 1 && !fitsAt(perRow, shown)) shown -= 1
+      return { shown, goals, used: fixed + shown * perRow + (shown < panel.rows.length ? 1 : 0) }
+    }
+    if (rowsAge !== '' && !panel.folded && !titleText.includes('更新')) {
+      const base = (selected
+        ? layout(selected, false)
+        : selectedHc
+          ? layout(undefined, false, selectedHc)
+          : layout(panel.rows[0], false, panel.rows[0] ? undefined : herdrRows[0])
+      ).used
+      const minHc = !selected && (selectedHc || (!panel.rows[0] && herdrRows.length)) ? (herdrRows.length > 1 ? 2 : 1) : 0
+      ageRow = e.props.maxRows - base - minHc - 1 >= MIRROR_MIN_ROWS + 1
+    }
+    // herdr lines yield before any worker row, goal line and the mirror's floor: the workers are
+    // laid out without them, and they take only what is left (none rather than go compact).
+    const herdrFor = (used: number, reserveMirror: boolean) =>
+      Math.max(0, Math.min(HERDR_BAND_LINES, herdrRows.length, e.props.maxRows - used - (reserveMirror ? 1 + MIRROR_MIN_ROWS : 0)))
+    const hcShownFor = (lines: number, allowSingleSel: boolean) =>
+      lines < herdrRows.length ? (allowSingleSel && lines === 1 ? 1 : Math.max(0, lines - 1)) : lines
+    const sliceHerdr = (shownCount: number) => {
+      const firstHc = selectedHc && shownCount > 0 ? Math.max(0, Math.min(hcSelIndex - shownCount + 1, herdrRows.length - shownCount)) : 0
+      return { firstHc, items: herdrRows.slice(firstHc, firstHc + shownCount) }
+    }
+    let laid = layout(selected, ageRow, selectedHc)
+    let herdrLines = herdrFor(laid.used, !!(selected || selectedHc))
+    let herdrShown = hcShownFor(herdrLines, false)
+    if (selectedHc && herdrShown === 0) {
+      herdrLines = herdrFor(laid.used, false)
+      herdrShown = hcShownFor(herdrLines, true)
+    }
+    let { firstHc: hcFirst, items: shownHerdr } = sliceHerdr(herdrShown)
+    const drawnSelHc = selectedHc && shownHerdr.some(a => a.address === selectedHc.address) ? selectedHc : undefined
+    const selNeeds = laid.used + Math.max(1, herdrLines) + 1 + MIRROR_MIN_ROWS
+    if (selectedHc && !drawnSelHc) {
+      laid = layout(undefined, ageRow, undefined, true)
+      herdrLines = herdrFor(laid.used, false)
+      herdrShown = hcShownFor(herdrLines, false)
+      ;({ firstHc: hcFirst, items: shownHerdr } = sliceHerdr(herdrShown))
+    }
+    const { shown: shownRows, goals } = laid
+    const used = laid.used + herdrLines
+    const first = selected ? Math.max(0, Math.min(selIndex - shownRows + 1, panel.rows.length - shownRows)) : 0
+    const hidden = panel.rows.length - shownRows
+    // The mirror is sized for the layout a selection draws — before the press
+    // too, since the clock captures on the height the last render allowed. It
+    // takes what is left after its "see it whole" line.
+    const firstUsed = layout(panel.rows[0], ageRow, panel.rows[0] ? undefined : herdrRows[0]).used
+    const room =
+      e.props.maxRows -
+      (selected || drawnSelHc
+        ? used
+        : firstUsed + herdrFor(firstUsed, !!(panel.rows[0] || herdrRows[0]))) -
+      1
+    // 0 means "do not mirror", which is the honest answer for a surface that
+    // cannot fit even one line of work under the target's own chrome.
+    panel.rows_available = selectedHc && !drawnSelHc ? 0 : room >= MIRROR_MIN_ROWS ? Math.min(MIRROR_ROWS * 2, room) : 0
+    const children: RenderElement[] = []
+    // Smaller than the least full layout (one row and its controls): only the
+    // title bar and, room permitting, what still works — the typed commands.
+    // Overflowing would scroll the band and disarm the digits (astra, 34e2a1e:
+    // maxRows 3 drew 4).
+    const compact = used > e.props.maxRows
+    if (compact) panel.rows_available = 0
+
+    // A stall is a warning, not a footnote: it keeps its colour (never dim-only).
+    if (down && !compact) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `⚠ ${down}` }))
     // A coloured title bar marks where the panel starts, so its rows do not read
     // as the session's own output. Background, not a border: a border costs two
     // of the band's few rows, and the mirror needs them.
@@ -995,13 +1187,13 @@ export const register: Register = on => {
               void panel.refresh?.()
             },
           }),
-          // The full-screen TUI beside this pane (plan P7); outside tmux the toast
-          // names the command to run in another terminal.
+          // The full-screen TUI: a split beside this pane in tmux, a new window in
+          // the person's terminal app elsewhere (T10).
           Button({
             key: 'tui',
             label: tuiLabel,
             hotkey: 't',
-            onPress: () => void act('tui', async host => openTuiBeside(host, await $.env.get('TMUX_PANE'))),
+            onPress: () => void act('tui', async host => openTuiBand(host, await $.env.get('TMUX_PANE'), (ms, fn) => $.clock.after(ms, fn))),
           }),
           ...(clearable
             ? [
@@ -1038,12 +1230,17 @@ export const register: Register = on => {
         ],
       }),
     )
+    if (ageRow) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: ` ${rowsAge}` }))
 
     if (panel.folded) {
       panel.rows_available = 0
+      panel.shownHerdr = []
+      panel.shownHerdrFirst = 0
       return Box({ flexDirection: 'column', children: [below, ...children] })
     }
     if (compact) {
+      panel.shownHerdr = []
+      panel.shownHerdrFirst = 0
       if (e.props.maxRows >= 2) {
         children.push(
           Text({
@@ -1055,6 +1252,8 @@ export const register: Register = on => {
       }
       return Box({ flexDirection: 'column', children: [below, ...children] })
     }
+    panel.shownHerdr = shownHerdr
+    panel.shownHerdrFirst = hcFirst
     // Enter resumes; a refusal leaves the field open with a toast saying why;
     // Enter on nothing closes it (grok-bot-watch's `[ + ]`).
     if (panel.adding && Input) {
@@ -1203,6 +1402,62 @@ export const register: Register = on => {
       }
     }
 
+    // Selectable hc rows (same digit hotkeys, mirror, arm-then-confirm stop, and clear on finished as worker rows;
+    // send/tell/interrupt stay off). The title keeps the live count; a cut list ends on `+N more`.
+    for (const [idx, a] of shownHerdr.entries()) {
+      const hcTarget = hcId(a.address)
+      const isSel = drawnSelHc?.address === a.address
+      const hcIdx = panel.rows.length + hcFirst + idx
+      children.push(
+        Button({
+          key: hcTarget,
+          label: `${isSel ? '› ' : '  '}${herdrLabel(a)}`.slice(0, Math.max(10, width - 5)),
+          ...(hcIdx < 9 ? { hotkey: String(hcIdx + 1), plain: true as const } : {}),
+          onPress: () => {
+            panel.selected = panel.selected === hcTarget ? undefined : hcTarget
+            panel.mirror = undefined
+            panel.armedStop = undefined
+            $.ui.invalidate('ui.render')
+          },
+        }),
+      )
+      if (!isSel) continue
+      // The verb is in the arm id: a live row that finishes inside the window re-arms instead of turning kill into rm.
+      const hcArm = hcFinished(a) ? `${hcTarget}#rm` : hcTarget
+      const armed = panel.armedStop?.id === hcArm && now < panel.armedStop.until
+      const hcEndHint = hcFinished(a) ? 'removes this finished hc terminal' : 'ends its hc terminal'
+      children.push(
+        Box({
+          flexDirection: 'row',
+          children: [
+            Text({ children: '  ' }),
+            Button({
+              key: `stop:${hcTarget}`,
+              label: `✕ ${stopButtonLabel(a.name ?? a.address, armed)}`,
+              hotkey: 'x',
+              onPress: () =>
+                pressTwice(hcArm, () =>
+                  void act(`stop ${a.address}`, async host => {
+                    const out = await stopHc(host, a)
+                    if (out.ok) {
+                      if (panel.selected === hcTarget) {
+                        panel.selected = undefined
+                        panel.mirror = undefined
+                      }
+                      void panel.refresh?.()
+                    }
+                    return out
+                  }),
+                ),
+            }),
+            ...(armed ? [Text({ color: 'red', children: `  ${hcEndHint} · ${Math.ceil((panel.armedStop!.until - now) / 1000)}s` })] : []),
+          ],
+        }),
+      )
+    }
+    if (herdrLines > 0 && herdrShown < herdrRows.length && !(drawnSelHc && herdrLines === 1)) {
+      children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  +${herdrRows.length - herdrShown} more hc agents (hc ls)`.slice(0, Math.max(10, width)) }))
+    }
     // Every fixed line truncates: a wrapped line is a row the budget above
     // never counted, and one row past maxRows scrolls the band and disarms the digits.
     if (hidden) children.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  +${hidden} more — /workers N selects row N` }))
@@ -1237,22 +1492,24 @@ export const register: Register = on => {
     // `selected`, not `panel.selected`: a worker that left the list (stopped,
     // exited) is no selection, and its stale id drew a "too short" line past
     // maxRows (cursor, 34e2a1e).
-    if (!shown && selected && panel.rows_available === 0) {
+    if (!shown && (selected || selectedHc) && panel.rows_available === 0) {
       // The numbers are the message: "too short" alone cannot be acted on, and
       // the first person to hit this asked whether some cap they never set was
       // the cause. Printing both ends the guessing in one look.
+      const needs = selectedHc && !drawnSelHc ? selNeeds : used + 1 + MIRROR_MIN_ROWS
       children.push(
         Text({
           dimColor: true,
           wrap: 'truncate-end',
           children:
             `Band too short to mirror — enlarge the window. ` +
-            `(band ${e.props.maxRows} rows; needs ${used + 1 + MIRROR_MIN_ROWS})`,
+            `(band ${e.props.maxRows} rows; needs ${needs})`,
         }),
       )
     }
     if (shown) {
       const row = panel.rows.find(r => r.id === shown.id)
+      const hc = row ? undefined : herdrRows.find(a => hcId(a.address) === shown.id)
       children.push(Text({ dimColor: true, children: '─'.repeat(Math.max(3, Math.min(width, 60))) }))
       // A failed capture says so; it is not an empty pane (T1 C2b).
       if (shown.error) children.push(Text({ color: 'yellow', wrap: 'truncate-end', children: `capture failed: ${shown.error}` }))
@@ -1260,15 +1517,17 @@ export const register: Register = on => {
       for (const line of shown.lines.slice(Math.max(0, shown.lines.length - (panel.rows_available ?? 0)))) {
         children.push(Text({ wrap: 'truncate-end', children: line.slice(0, Math.max(10, width)) || ' ' }))
       }
-      if (row) {
+      if (row || hc) {
         children.push(
           Text({
             dimColor: true,
             wrap: 'truncate-end',
             // The binary the mod itself runs: off PATH, a bare name would not resolve.
-            children: row.project
-              ? `See it whole: tmux attach -t ${row.d.name}`
-              : `See it whole: ${agentTmuxShown} ${row.d.profile} attach ${row.d.name}`,
+            children: hc
+              ? `See it whole: hc attach ${hc.address}`
+              : row!.project
+                ? `See it whole: tmux attach -t ${row!.d.name}`
+                : `See it whole: ${agentTmuxShown} ${row!.d.profile} attach ${row!.d.name}`,
           }),
         )
       }
@@ -1290,6 +1549,8 @@ export const register: Register = on => {
     if (w) void rememberPanel(w, false).catch(err => w.log(`tmux-agent: panel state not saved: ${String(err)}`))
     panel.selected = undefined
     panel.mirror = undefined
+    panel.shownHerdr = undefined
+    panel.shownHerdrFirst = undefined
     panel.generation += 1
     panel.timer?.cancel()
     panel.timer = undefined
@@ -1317,6 +1578,41 @@ export const register: Register = on => {
     }
   }
 
+  /**
+   * hc agents whose `parent` is this session's hc terminal (`HC_TERMINAL_ID`), itself excluded,
+   * as readInternal: a failure becomes `hc ?`, and a second failure in a row logs one line, once per
+   * session (one slow `hc ls` at session start is not worth a log); no `HC_TERMINAL_ID`, no `hc` on PATH or
+   * no running core leaves it unset (no segment, and hc is not run).
+   */
+  const readHerdrBand = async (host: Host): Promise<void> => {
+    try {
+      const me = await host.envHcTerminal()
+      panel.herdr = me ? (await readHc(host))?.filter(a => a.parent === me && a.address !== me) : undefined
+      panel.herdrMisses = 0
+    } catch (error) {
+      panel.herdr = '?'
+      panel.herdrMisses = (panel.herdrMisses ?? 0) + 1
+      // Once per session: a flapping remote machine alternates misses and hits, which logged every cycle.
+      if (panel.herdrMisses === 2 && !panel.herdrMissLogged) {
+        panel.herdrMissLogged = true
+        const kind = error instanceof Error ? error.name : typeof error
+        host.log(`tmux-agent: hc ls failed: ${kind}: ${String(error)}`)
+      }
+    }
+    if (!Array.isArray(panel.herdr)) {
+      panel.shownHerdr = undefined
+      panel.shownHerdrFirst = undefined
+    } else if (panel.shownHerdr) {
+      const live = new Set(panel.herdr.map(a => a.address))
+      panel.shownHerdr = panel.shownHerdr.filter(a => live.has(a.address))
+    }
+    if (panel.selected?.startsWith('hc:') && !(Array.isArray(panel.herdr) && panel.herdr.some(a => hcId(a.address) === panel.selected))) {
+      panel.selected = undefined
+      if (panel.mirror?.id.startsWith('hc:')) panel.mirror = undefined
+      if (panel.armedStop?.id.startsWith('hc:')) panel.armedStop = undefined
+    }
+  }
+
   // Opens the panel: the /workers toggle, and session.start after a reload closed it
   // (a plugin's own $.command.run skips its own command hook, so /workers cannot be
   // replayed). `$` stays out, per the static rule above: its two uses come as closures.
@@ -1335,9 +1631,10 @@ export const register: Register = on => {
     void rememberPanel(bound, true).catch(err => bound.log(`tmux-agent: panel state not saved: ${String(err)}`))
     const mine = panel.generation
     const root = await rootOf(bound)
-    const [first] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
+    const [first] = await Promise.all([panelRows(bound, gate, root), readInternal(bound), readHerdrBand(bound)])
     if (panel.generation !== mine || !panel.open) return 'workers panel closed.'
     setRows(panel, first)
+    rowsAt = await bound.now()
     // The pane drew once, empty, while the rows were being read; without this
     // the first real frame waits for the 2s clock and the person sees
     // "No workers outstanding" over a fleet that is there (observed 2026-09-17).
@@ -1349,9 +1646,10 @@ export const register: Register = on => {
       panel.refreshing = true
       try {
         const root = await rootOf(bound)
-        const [rows] = await Promise.all([panelRows(bound, gate, root), readInternal(bound)])
+        const [rows] = await Promise.all([panelRows(bound, gate, root), readInternal(bound), readHerdrBand(bound)])
         if (panel.generation !== mine || !panel.open) return false
         setRows(panel, rows)
+        rowsAt = await bound.now()
         return true
       } finally {
         panel.refreshing = false
@@ -1367,41 +1665,61 @@ export const register: Register = on => {
       }
     }
     if (panel.timer) panel.timer.cancel()
+    // Two independent jobs on one tick (BD7): the rows read and the mirror capture.
+    // A slow or stuck rows read never skips the mirror, and a capture in flight
+    // never skips the rows. Each is single-flight on its own.
     panel.timer = every(MIRROR_MS, async () => {
       if (!panel.open || panel.generation !== mine) return
+      const paint = () => {
+        if (panel.open && panel.generation === mine) redraw()
+      }
+      // Each job paints when its own result lands. Waiting for both held a finished mirror behind a slow rows read, and the reverse.
+      const rowsJob = refresh()
+        .then(fresh => {
+          if (fresh) paint()
+          return fresh
+        })
+        .catch(error => {
+          bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
+          return false
+        })
       // Single-flight: a capture slower than the 2s tick must not start a second
       // subprocess on top of itself, and two in-flight captures could land out of
       // order and show older output than what is already on screen.
-      if (panel.capturing) return
-      let fresh = false
-      try {
-        fresh = await refresh()
-      } catch (error) {
-        bound.log(`tmux-agent: panel refresh failed: ${String(error)}`)
-      }
-      if (!fresh) return
-      const row = panel.rows.find(r => r.id === panel.selected)
-      // No selection, no capture: the mirror is the only thing here that costs a
-      // process, and it costs it for one worker at a time.
-      // A zero here is the render telling us the pane is too short to mirror
-      // usefully; spending a subprocess on it would buy an empty box.
-      if (row && (panel.rows_available ?? MIRROR_ROWS) > 0) {
-        panel.capturing = true
-        try {
-          const cap = row.project
-            ? await mirrorProject(bound, row.d.name, panel.rows_available ?? MIRROR_ROWS)
-            : await mirrorOf(bound, row.d, panel.rows_available ?? MIRROR_ROWS)
-          // The selection may have moved, or the panel closed, while this ran.
-          if (panel.generation === mine && panel.open && panel.selected === row.id) {
-            panel.mirror = { id: row.id, ...cap }
+      const mirrorJob = async (): Promise<boolean> => {
+        if (panel.capturing) return false
+        const row = panel.rows.find(r => r.id === panel.selected)
+        const hc = row ? undefined : (Array.isArray(panel.herdr) ? panel.herdr.find(a => hcId(a.address) === panel.selected) : undefined)
+        // No selection, no capture: the mirror is the only thing here that costs a
+        // process, and it costs it for one worker at a time.
+        // A zero here is the render telling us the pane is too short to mirror
+        // usefully; spending a subprocess on it would buy an empty box.
+        if ((row || hc) && (panel.rows_available ?? MIRROR_ROWS) > 0) {
+          panel.capturing = true
+          try {
+            const cap = hc
+              ? await mirrorHc(bound, hc.address, panel.rows_available ?? MIRROR_ROWS)
+              : row!.project
+                ? await mirrorProject(bound, row!.d.name, panel.rows_available ?? MIRROR_ROWS)
+                : await mirrorOf(bound, row!.d, panel.rows_available ?? MIRROR_ROWS)
+            // The selection may have moved, or the panel closed, while this ran.
+            const targetId = row ? row.id : hcId(hc!.address)
+            if (panel.generation === mine && panel.open && panel.selected === targetId) {
+              panel.mirror = { id: targetId, ...cap }
+            }
+          } finally {
+            panel.capturing = false
           }
-        } finally {
-          panel.capturing = false
+        } else {
+          panel.mirror = undefined
         }
-      } else {
-        panel.mirror = undefined
+        paint()
+        return true
       }
-      redraw()
+      await Promise.all([rowsJob, mirrorJob().catch(error => {
+        bound.log(`tmux-agent: panel mirror failed: ${String(error)}`)
+        return false
+      })])
     })
     return undefined
   }
@@ -1423,9 +1741,10 @@ export const register: Register = on => {
       if (verb === 'trust') {
         if (e.origin.kind !== 'composer') return { text: `the owner must type /workers trust ${target || '<name>'} in the Claude Code prompt; agent and plugin calls cannot trust hooks` }
         if (!NAME_RE.test(target) || message.trim()) return { text: '/workers trust <name>' }
+        const reviewed = new Map(gate.blockedDetails)
         const d = (await scan(bound, { claim: false })).visible.find(w => w.name === target)
         if (!d) return { text: `no worker "${target}" in this project` }
-        const out = await trustWorkerHooks(bound, d)
+        const out = await trustWorkerHooks(bound, d, reviewed.get(idOf(d)))
         if (panel.open) void panel.refresh?.()
         return { text: out.text }
       }
@@ -1493,15 +1812,29 @@ export const register: Register = on => {
       const named = fresh ?? panel.all
 
       if (/^[0-9]+$/.test(verb)) {
-        // Selecting is harmless, so N is simply row N of the current list.
-        const row = rows[Number(verb) - 1]
-        if (!row) return { text: `no row ${verb} (${rows.length} shown).` }
-        panel.selected = row.id
-        panel.mirror = undefined
-        panel.armedStop = undefined
-        if (panel.open) {
-          redraw()
-          return { text: `row ${verb} "${row.d.name}" selected.` }
+        // Selecting is harmless, so N is simply row N of the current list (worker rows, then shown hc rows).
+        const idx = Number(verb) - 1
+        const row = rows[idx]
+        if (row) {
+          panel.selected = row.id
+          panel.mirror = undefined
+          panel.armedStop = undefined
+          if (panel.open) {
+            redraw()
+            return { text: `row ${verb} "${row.d.name}" selected.` }
+          }
+        } else {
+          const hcRows = panel.open && Array.isArray(panel.shownHerdr) ? panel.shownHerdr : []
+          const hcFirst = panel.shownHerdrFirst ?? 0
+          const hc = hcRows[idx - rows.length - hcFirst]
+          if (!hc) return { text: `no row ${verb} (${rows.length + hcRows.length} shown).` }
+          panel.selected = hcId(hc.address)
+          panel.mirror = undefined
+          panel.armedStop = undefined
+          if (panel.open) {
+            redraw()
+            return { text: `row ${verb} "${hc.name ?? hc.address}" selected.` }
+          }
         }
       } else if (verb === 'stop' || verb === 'tell') {
         // Names only. Row numbers move whenever the list refreshes — the engine
@@ -1518,7 +1851,38 @@ export const register: Register = on => {
           }
         }
         const row = named.find(r => r.d.name === target)
-        if (!row) return { text: `no worker "${target}" (${named.map(r => r.d.name).join(', ') || 'none'}).` }
+        if (!row) {
+          if (verb === 'stop' && target) {
+            const me = await bound.envHcTerminal()
+            if (me) {
+              if (target === me) return { text: `refusing to stop "${target}" — this session's own hc terminal.` }
+              let hc = panel.open && Array.isArray(panel.herdr) ? panel.herdr.find(a => a.address === target) : undefined
+              if (!hc) {
+                let listed: HcAgent[] | undefined
+                try {
+                  listed = await readHc(bound)
+                } catch (error) {
+                  return { text: `stop "${target}" — FAILED: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}` }
+                }
+                hc = listed?.find(a => a.address === target && a.parent === me && a.address !== me)
+                if (!hc && listed?.some(a => a.address === target)) {
+                  return { text: `refusing to stop "${target}" — not owned by this session (@${me}).` }
+                }
+              }
+              if (hc) {
+                const out = await stopHc(bound, hc)
+                if (out.ok && panel.selected === hcId(hc.address)) {
+                  panel.selected = undefined
+                  panel.mirror = undefined
+                  panel.armedStop = undefined
+                }
+                if (panel.open) void panel.refresh?.()
+                return { text: `stop "${hc.address}" — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 300)}` }
+              }
+            }
+          }
+          return { text: `no worker "${target}" (${named.map(r => r.d.name).join(', ') || 'none'}).` }
+        }
         if (row.project) return { text: 'read-only project session' }
         let out: Outcome
         if (verb === 'stop') {
