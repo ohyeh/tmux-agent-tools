@@ -140,7 +140,7 @@ The repository is its own marketplace, `tmux-agent-tools`, with two plugins:
 
 | Plugin | Source | Carries | For |
 |---|---|---|---|
-| `tmux-agent-tools` | `./` | skills (incl. the `tmux-agent-tui` TUI), wrappers, the Bash dispatch gate; the MCP server for Codex and Cursor | any CLI |
+| `tmux-agent-tools` | `./` | skills (incl. the `workers-tui` TUI), wrappers, the Bash dispatch gate; the MCP server for Codex and Cursor | any CLI |
 | `tmux-agent` | `./mods/tmux-agent` | the Claude Code function-hook mod only | Claude Code |
 
 | Runtime | Install | Skills and TUI from |
@@ -207,25 +207,49 @@ skills/tmux-agent-tools/scripts/install-bin ~/.local/bin
 
 ## Workers TUI
 
-`tmux-agent-tui` is the full-screen view of the tmux-agent workers. It is a zsh
+`workers-tui` is the full-screen view of the tmux-agent workers. It is a zsh
 entry beside `agent-tmux` that runs `lib/tui.node.ts`; it resolves its own
 directory through symlinks, so an `install-bin` link, an `npx skills` folder and
 a marketplace checkout all work, from any cwd.
 
 ```bash
-tmux-agent-tui --session <session-id> --cwd <dir>   # owner: act on that session's workers
-tmux-agent-tui                                      # viewer: every worker, labeled, read-only
+workers-tui --session <session-id> --cwd <dir>   # owner: act on that session's workers
+workers-tui                                      # viewer: every worker, labeled, read-only
 ```
 
-- Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI acts for
-  that session. Without one it is a viewer that only lists.
+- hc agents: when `hc` (herdr-core, the server Herdr.app shows) is on `PATH` and its core
+  runs, the footer lists up to 4 of its agent terminals (all machines), then `+N more` (`hc ls`
+  has the rest), read-only: address and name, kind, status, owner (`@<parent>`, the hc terminal
+  it was started from, else `未記錄`) and cwd. The title adds `hc N` (`hc ?` when the read
+  fails). No key acts on them. Homebrew `herdr` (`herdr agent list`) is no longer shown.
+
+- Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI holds
+  that session. Without one it is a viewer. `e` in a viewer opens the session
+  picker; picking a live session claims it in this process.
+- Opens in 預覽. `e` enters 編輯 when this process holds the owner. 預覽:
+  `j`/`k` and `1`–`9` select; `↑`/`↓` scroll one line; `b`/`f` and PgUp/PgDn
+  scroll a page; Enter opens detail; `a` toggles all/own; `r` re-reads and
+  clears the selection; `d` (ask twice; viewer too) moves a worker with no
+  live tmux session to `.v3/.removed/` (a live or unknown session is refused);
+  `q` quits. 編輯 adds `n`, `+`, `t`, `i`, `x`, `-`, `U`,
+  `c` (`x`, `-`, `U`, `c` ask twice). `n` and `+` refuse when the cwd is
+  unknown. Esc disarms, closes detail, leaves a narrow preview, leaves the
+  picker, leaves 編輯, clears the selection, then quits. Mouse reporting stays
+  off (`?1007h` turns the wheel into `↑`/`↓`).
+- One ready TUI per owner. A second launch focuses the first and does not draw.
+  Warp focus raises the app (`open -a Warp`) and names the tab. It does not
+  focus a window.
+- The title shows `更新 Ns 前`, and ` …` while the rows read is in flight.
+  Rows every 2s, mirror every 1s, stall sweep every 10s. Each job is
+  single-flight; `r` during a run queues one more.
 - Needs Node >= 22.18 (`NODE=/path/to/node` picks one) and a terminal. With no
   TTY it exits 2; for a JSON snapshot use `tmux-agent-dashboard`.
   `TMUX_AGENT_DIR` and `TMUX_AGENT_TMUX_SOCKET` pass through.
-- In Claude Code, the mod's `[ ⧉ ]` opens it in a tmux split. The split is
-  full window height (`split-window -h -f`), also beside a pane that is the top
-  half of a window. Outside tmux, the toast gives the full command to run in
-  another terminal (over 200 characters, the whole command is in the log).
+- The band `[ ⧉ tui ]` (hotkey `t`) opens it. Inside tmux it splits the pane
+  (B1, `split-window -h -f`). Warp, iTerm2, and Terminal.app open a window
+  (B2). Zed and any other terminal open Terminal.app, and the toast says so.
+  SSH without tmux cannot open a window; the toast has the reason and the full
+  command. A second press focuses the existing TUI.
 - The TUI fills its pane. If the window itself is smaller than your terminal,
   another tmux client on the same session is the cause: with tmux's default
   `window-size latest`, the window takes the size of the client used last.
@@ -234,7 +258,7 @@ tmux-agent-tui                                      # viewer: every worker, labe
   your tmux config.
 
 Upgrade: `install-bin` links only the scripts that exist when it runs, so a new
-script (such as `tmux-agent-tui`) has no link until you run it again. After you
+script (such as `workers-tui`) has no link until you run it again. After you
 update the skill (`npx skills update`, or `claude plugin update`), run
 `install-bin ~/.local/bin` again. `agent-tmux <cli> doctor` and `setup` list the
 bundle scripts that `~/.local/bin` is missing.
@@ -264,7 +288,7 @@ mod, the node collector, or MCP): the first one to register owns it, and
 another channel on the same session id is refused and does not collect. To move
 a session to another channel, stop the old channel's callers (a node collector, the
 MCP server, a Claude Code session with the plugin) and run
-`tmux-agent-tui --handover-channel <session> <mod|node|mcp>`; without `--yes` it
+`workers-tui --handover-channel <session> <mod|node|mcp>`; without `--yes` it
 only prints what it would do, with `--yes` it checks `ps` once and switches. A
 stale heartbeat does not count as "stopped". The launcher starts no node
 collector on a session that another channel owns and says so.

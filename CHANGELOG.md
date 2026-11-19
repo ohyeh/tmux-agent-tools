@@ -1,5 +1,108 @@
 # Changelog
 
+## Unreleased
+
+## v0.52.1 - 2026-11-17
+
+- Band: a failed `hc ls` now logs at most once per session. A remote hc machine that keeps reconnecting made `hc ls` alternate between a 2 s timeout and success, and each cycle logged `tmux-agent: hc ls failed` again in every open session. The row still shows `hc ?` while the read fails.
+- An episode whose pane exited without a result now closes quietly 24 h (`WINDOW_MS`) after its `exited` notice, as `superseded`, with no second notice. Before, it stayed open for a late result forever, so each new session in the same repo re-claimed it as an orphan (`claimed N episode(s) from session … (non-live for 90s)`); 13 such episodes had been claimed up to 44 times. A result that lands inside the 24 h is still delivered once.
+
+## v0.52.0 - 2026-11-16
+
+- TUI (`workers-tui`): viewer attach is now watch-only (`hc attach --observe <address>` when no owner session is held; Detail hints show `watch-only`). Owner attach (`--session`) stays `hc attach <address>`.
+- Finished `hc` rows stay listed and are removed the worker way:
+  - Both the band and `workers-tui` now read `hc ls --all --json`. Finished `hc` rows (`state: "finished"`) stay listed when `parent === $HC_TERMINAL_ID` (shown as `finished`; other parents' finished rows stay excluded; live rows keep their existing rule). `hc K` in the title counts live agents only, so finished rows do not change the count.
+  - In `workers-tui`, `d` twice (預覽, 編輯, and viewer) on an own finished `hc` row runs `hc rm <address>` via the same press-twice arming as worker `d`; `x x` in 編輯 runs `hc kill` on live (leaving the row listed as `finished`) and `hc rm` on finished.
+  - Clear all (`c` twice in `workers-tui` 編輯, `[ ✕ clear ]` twice in the band) now runs `hc rm` on this session's finished `hc` rows via `stopAll`, never touching live `hc` rows or other parents' rows.
+  - `/workers stop <address>` on an own finished `hc` row is now reachable and runs `hc rm <address>`.
+  - The MCP `stop` tool with `all: true` goes through the same `stopAll`, so it also runs `hc rm` on this session's finished `hc` rows. The removal cannot be undone.
+  - hc drops `status` once a terminal finishes (seen in `hc ls --all --json`), so a finished record is kept without it; live shells without `status` stay skipped.
+  - The `x` arm carries its verb: a live row that finishes inside the confirm window re-arms instead of turning `hc kill` into `hc rm`. Live rows are listed before finished ones, so finished rows cannot push a live row past the line cap.
+  - No `hc` command runs when `hcSocketLive` fails.
+- Docs: updated `mods/tmux-agent/README.md`, `skills/tmux-agent-tools/SKILL.md`, and `skills/using-tmux-agent-tools/SKILL.md` for watch-only viewer attach, listed finished `hc` rows, and `d`/`c`/`[ clear ]` removal.
+- Verified live (read-only): finished records in `hc ls --all --json` carry `state: "finished"` and no `status`; `hc kill` then `hc rm` on a throwaway terminal behaved as described. Not verified: live `hc attach --observe`, and `x x`, `d d` and `[ clear ]` in the real band and `workers-tui` (the mod tests and TUI contract tests drive the band and `runTui` with fake `hc` responses and an injected attach runner).
+
+## v0.51.0 - 2026-11-16
+
+- TUI (`workers-tui`): drawn `hc` agent rows in the footer (up to 4) are now selectable with `j`/`k` alongside worker rows.
+  - Selecting an `hc` row previews its screen via `hc read <address> --lines 2000` on the mirror refresh clock (only for the selected row, and only while `hcSocketLive` accepts a connection; never runs `hc` when the socket guard fails). `↑`/`↓`, `b`/`f`, and PgUp/PgDn scroll the preview/detail.
+  - `Enter` walks `list -> preview -> Detail` (in narrow view, and toggles/opens `preview -> Detail` in standard view), displaying `hc get <address> --json` fields (`address`, `name`, `agent`, `status`, `cwd`, `parent` or `未記錄`, `turn`) plus the preview. `Esc` closes Detail back to preview.
+  - Pressing `Enter` again inside `hc` Detail attaches (including in viewer mode): restores the terminal, runs `hc attach <address>` with inherited stdio taking over the terminal until `ctrl+\` detaches, then re-enters the TUI and redraws.
+  - In `編輯` (`e`), pressing `x` twice on a selected `hc` row closes it using the same arm-then-confirm flow with `hc kill <address>`; hc keeps the finished record, hidden from `hc ls` (`hc ls --all` lists it); remove it in a shell with `hc rm <address>`. Worker-only keys (`t`, `i`, `-`, `U`, `d`, `c`) stay off on `hc` rows.
+- Band (`mods/tmux-agent`): this session's own `hc` rows (`parent === $HC_TERMINAL_ID`, up to 3 lines) are now selectable with digit hotkeys (`1`–`9` or `/workers N`).
+  - Selecting an `hc` row mirrors `hc read <address>` on the same 2s clock and room rules (yielding to worker rows and the mirror floor; never goes compact because of `hc`, and never runs `hc` when `hcSocketLive` is false).
+  - The row's stop button (`x x` with the same arm-then-confirm flow) and `/workers stop <hc address>` close it with `hc kill <address>`; hc keeps the finished record, hidden from `hc ls` (`hc ls --all` lists it); remove it in a shell with `hc rm <address>`. Send, keys, tell, interrupt, and `[ clear ]` still ignore `hc` rows.
+- Docs: added `hc` routing and lifecycle commands to `skills/using-tmux-agent-tools/SKILL.md`, updated `skills/tmux-agent-tools/SKILL.md` and `mods/tmux-agent/README.md` with band/TUI selection, mirror, attach, and close behavior.
+- Verified live on a throwaway terminal: `hc kill` leaves a finished record that `hc ls` hides and `hc ls --all` lists, and `hc rm` removes it. Not verified: live `hc attach`, and `x x` in the real band and TUI (the TUI contract and mod tests drive `runTui` and the band with fake `hc` responses and an injected attach runner).
+
+## v0.50.0 - 2026-11-16
+
+- BREAKING (renamed): the TUI entry `tmux-agent-tui` is now `workers-tui`, with no alias. Re-run `install-bin`: it removes the old `~/.local/bin/tmux-agent-tui` link and links `workers-tui`. Names that move with it: the audit `caller` (`workers-tui`), the Warp launch file `workers-tui-<session>-<token>.yaml` (old `tmux-agent-tui-*.yaml` files are no longer reclaimed), the tab title, and the `--unlock-launcher` / `--migrate-launcher` / `--handover-channel` command lines the tools print.
+- New: hc agents, read-only, from herdr-core (`hc`, the server Herdr.app shows): `hc ls --json`, agent terminals only (a shell has no `status`). hc records the owner itself: a terminal started with `hc run` from an hc terminal has that terminal as its `parent`. Read only while the core runs (its socket `~/.local/state/herdr-core/default/default.sock`, where `hc` looks, exists), because `hc ls` starts a core when none runs. Homebrew `herdr` (`herdr agent list`) is a separate server and is not shown.
+- Band (mod 0.50.0): the title adds ` · hc N`, the agents whose `parent` is this session's `$HC_TERMINAL_ID` (its own terminal excluded); up to 3 text rows (`hc · <address>[ <name>] · kind · status · read-only`, the last `+N more hc agents (hc ls)` when cut), no hotkey, not counted by `[ clear ]`. These rows yield first: worker rows, goal lines and the mirror's floor are laid out before them, and with no room only the title count remains (never compact because of them). `hc ?` and one log line when the read fails; no segment, and no `hc` run, without `$HC_TERMINAL_ID`, `hc` on `PATH`, or a running core. hc runs only when its socket accepts a connection (a one-line `perl` probe; without `perl` on PATH the segment is not shown).
+- TUI: the title adds `hc N`; the footer lists up to 4 hc agents (all machines), then `+N more`, each with its owner `@<parent>` or `未記錄`, and its cwd. No key acts on them.
+- agent-tmux: every worker pane starts with `HC_TERMINAL_ID` and `HC_SCOPE` empty (start, resume, start-ssh). The tmux server kept the hc identity of the terminal that started it, so a worker's `hc run` child was that terminal's child.
+- Fixed with it (L1 review): `workers.cli.node.ts` ran nothing and exited 0 from a path with a space or non-ASCII character (its entry guard compared a raw `file://` string); it now uses the guard the other node entries use. The TUI footer shows at most 4 hc agents, then `+N more`, so worker rows keep their room.
+- Not verified: a live band render inside Claude Code (the mod suite drives the band with fakes).
+
+## v0.49.0 - 2026-11-13
+
+- BREAKING (removed): `--workdir-fresh` and `tmux-agent-sessions cleanup --force`. Also removed: the managed git checkout lifecycle. `--workdir-fresh` on `agent-tmux <cli> start` / `oneshot`, the `tmux-agent-worktrees` script (`list`, `prune`), `scripts/test-worktree-lifecycle-smoke`, the `git_worktree` doctor check, and `tmux-agent-sessions cleanup --force` (it only overrode the dirty-checkout refusal) are gone. `cleanup --execute` stops matching sessions without a dirty-checkout check. A worker is launched in the directory the caller names; no script in this repo creates a second checkout. Old `worktree.json` and `fresh-worktree` files in an agent dir are no longer read. Owner ruling 2026-11-13.
+- Not verified: old on-disk metadata files (`worktree.json`, `fresh-worktree`, `.tmux-agent-worktree/`) are not cleaned and not read; no live worker run after the removal (checks: 34 smokes, `tsc` on the mod and node configs, `sync-mod-core --check`).
+
+## v0.48.5 - 2026-11-04
+
+- Removed: `capture --physical-lines` and its awk secret matcher (added in 0.48.2). The TUI mirror is back on the joined `-J` capture and the existing redaction path. This closes the 0.48.4 leak where a multi-line secret whose first line wrapped at a space was shown unmasked. Owner: 「刪啊」.
+- Removed: the wide side-by-side TUI layout (>= 120 cols, added in 0.48.0). Every width >= 80 draws the stacked layout v0.47.0 had: list, full-width rule, full-width preview. At 120+ the list text no longer runs into the preview. Owner: 「以前某個版本都好好的」.
+- Net -154 lines. Done by a Sol worker; checked at 123x105, 160x105 and 92x105 against a live worker, one viewer at a time.
+- Not verified: the 70-col narrow view still shows a blank body after `1` until Enter (not changed); a live look in Warp.
+
+## v0.48.4 - 2026-11-04
+
+- Fix (security, secret redaction in `capture --physical-lines`): 0.48.3's `-N` pads every unwrapped row with spaces up to the pane width, so a multi-line secret (a PEM key) shown on short rows no longer matched. The matcher now scans the rows twice, with and without each row's trailing spaces, and masks a match from either. Found by the automated commit security review of 4275c7a; the mirror regression test fails on 0.48.3.
+- Not verified: the joined (`-J`) capture path was not re-audited for multi-line secrets; a live mirror in Warp.
+
+## v0.48.3 - 2026-11-04
+
+- Fix (security, secret redaction in `capture --physical-lines`, new in 0.48.2): the match value drops every `\r` and `\n`, so a secret read from a CRLF file is still masked; the physical capture adds `-N`, so a secret with a space as the last cell of a wrapped row is still masked (tmux trimmed that space). Both found by the automated commit security review; the mirror regression test now fails on 0.48.2 for each.
+- Not verified: a live mirror in Warp.
+
+## v0.48.2 - 2026-11-04
+
+- Fix (TUI rule): the dim `─` rule under the list fills the terminal width; it was capped at 59 cells.
+- Fix (TUI frame): `frameOf` counts the bottom footer apart from the top chrome, and the standard preview's `y` includes the list, more line and rule, so the rectangle fitWorker sizes is the one drawn (92x60: rect y 3 vs drawn 5 before, both 5 now).
+- Fix (mirror): the capture's final newline is not a pane row (`TOP\nBOTTOM\n` gave three rows), so the live tail no longer shifts up one row.
+- Fix (mirror): the TUI colour mirror captures physical rows (`--physical-lines`, no `-J`): a soft-wrapped line is no longer joined and cut, and blank bottom rows stay. Secret redaction also masks a secret split across rows. Plain CLI capture keeps joined lines.
+- Fix (band): `lib/workers.ts` measures, pads and clips ambiguous-width characters as 1 cell, like tmux and the TUI.
+- Diagnosis and fix by a Sol worker; reproductions before and after for each. Owner: 「你問 sol 吧」.
+- Not verified: the 92-col title bar that looked short in the owner's screenshot (renders 92 cells before and after); the exact `scrollback 1–93 of 94` state; a live look in Warp.
+
+## v0.48.1 - 2026-11-04
+
+- Fix (TUI width): an East Asian Width A character (`─`, `·`, `●`, `…`, `↑`) counts 1 cell by default. tmux lays out the mirrored pane with 1, and Warp draws 1; counting 2 cut a worker's `─` input rules at half the preview width and left the header bar short. `TMUX_AGENT_AMBIGUOUS_WIDTH=2` stays as the opt-in. Owner: 「好像又是動態寬度、上下沒處理好」.
+- Fix (mod core): `mods/tmux-agent/hooks/lib/ledger.ts` and `workers.ts` were not re-synced after the `d` delete change; `scripts/sync-mod-core` brings them back to byte-identical.
+- Tests: `test-wrapper-limits-smoke` case k reads tmux's global defaults from a bare `-f /dev/null` server instead of hard-coding them (tmux 3.8 defaults to `mouse on` and theme colors).
+- Fix (TUI render): each row ends with an SGR reset. `tmux capture-pane -e` leaves a background open at a line end (the reset opens the next line), so a Codex diff band in the mirror colored the next row's list column. Owner: 「盤版有點詭異」.
+- TUI `d` (press twice) deletes the selected worker's row in 預覽, 編輯 and the viewer: with no live tmux session, inside its action lock, `<v3>/<name>` moves to `<v3>/.removed/<name>-<ms>` (scan skips dot-dirs; nothing is rm'ed) and a `delete` TUI audit entry is written. A live session, or a `tmux ls` with no answer, is refused; project rows ignore `d`. Owner: 「我需要刪除功能啊 這種 xx 又刪不了 我需要外層列表就能刪」.
+- Fix (TUI flicker): a repaint no longer clears the screen. It homes the cursor, erases and redraws each line inside synchronized output (`?2026`), and erases below a shorter frame; a frame equal to the last one is not written. Only the first draw and a resize clear. Owner: 閃屏.
+- Not verified: a live look at the TUI in a terminal that draws ambiguous characters 2 cells wide; `lib/workers.ts` (the band) still counts them 2. No tag, push of a tag, or GitHub release for this version.
+
+## v0.48.0 - 2026-10-31
+
+- TUI: 預覽 is the default. `e` enters 編輯 when this TUI holds the owner; with no session it opens the picker (`j`/`k` or `1`–`9`, Enter claims that live session in this process; `j`/`k` keep the highlighted session on screen). Picker session and cwd text is sanitized; OSC and other non-SGR controls in those fields are not drawn. Owner: 「預覽跟編輯雙模式 預設是預覽我覺得ＯＫ啊 只是就不能複製很不方便」「誰會沒事記一堆指令 你還不如支援可以按鈕去編輯之類的 開新視窗之類的啊」「tui 或是預覽的更新頻率又很謎」.
+- Keys: 預覽 uses `j`/`k` and `1`–`9` to select, `↑`/`↓` to scroll one line, `b`/`f` and PgUp/PgDn to scroll a page, Enter for detail, `a` for all/own, `r` to re-read and clear the selection, `q` to quit. 編輯 adds `n`, `+`, `t`, `i`, `x`, `-`, `U`, `c` (`x`, `-`, `U`, `c` ask twice). `n` and `+` refuse when the cwd is unknown. Esc disarms, closes detail, leaves a narrow preview, leaves the picker, leaves 編輯, clears the selection, then quits. Mouse reporting stays off. `?1007h` turns the wheel into `↑`/`↓`.
+- Refresh: rows every 2s, the mirror every 1s, the stall sweep every 10s. Each job is single-flight. A failed read keeps the previous age. `r` during a run queues one more. The title shows `更新 Ns 前`, and ` …` while the rows read is in flight. The band title shows the same age; its rows read and mirror share one 2s tick, and each redraws when it finishes so a slow read does not hold the other's paint.
+- Band `[ ⧉ tui ]` (hotkey `t`): inside tmux, a split (B1). Warp, iTerm2, and Terminal.app open a window (B2). One ready TUI per owner; a second press focuses the first. iTerm2 and Terminal.app record this process's tty (`tty` on stdout when `/dev/fd/1` is not a symlink); a failed lookup is logged and the claim stores no locator, never tty `unknown`. Dead-lock recovery and the next publish share one fence, so a live holder is not removed and a ready record is not overwritten by the caller who lost.
+- Trade-off: `↑`/`↓` now scroll; `j`/`k` select. Zed (and any other `TERM_PROGRAM`) opens Terminal.app, and the toast says so. SSH without tmux cannot open a window (`cannot open a window on your machine over SSH`, full command kept). A second TUI focuses the first. Warp only raises the app and names the tab; it does not focus a window.
+- Not verified: drag-select and the wheel on each terminal (Warp, iTerm2, Terminal.app, Zed); a live window open; the macOS Automation dialog on the first `osascript`. No tag, push, or GitHub release for this version.
+
+## v0.47.1 - 2026-10-30
+
+- Fix (trust): `/workers trust <name>` sends `t` only for the hook dialog the owner notice showed. It needs that dialog text, re-reads the visible screen (no scrollback) right before `send-keys`, and refuses unless the last line is `Press t to trust…` and the dialog equals the reviewed one. A worker's output that quotes the sentence, or a changed hook list, sends nothing. 22896bc searched the 80-line tail for the sentence anywhere.
+- Behavior: after a reload the notice cache is empty, so the command answers `no reviewed hook dialog in the owner notice; no key pressed` until the next stall scan shows the dialog again.
+- Tests: fixtures cover a worker output that quotes the sentence and a changed hook list; both send no key.
+- Not verified: `capture-pane` and `send-keys` are two operations, so a screen change between them is not excluded; live behavior on remote hosts before their next start.
+
 ## v0.47.0 - 2026-10-30
 
 - Change (brief contract): require a non-empty MODEL section in the shared mod/MCP dispatch boundary. Supply current-system Mermaid with transitions/invariants, a system-model.json path, or `none — reason` for read-only/search work. The adapter never invents a MODEL exemption.
