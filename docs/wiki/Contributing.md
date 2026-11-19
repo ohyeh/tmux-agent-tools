@@ -15,7 +15,6 @@ tmux-agent-tools/
 │       ├── tmux-agent-fanout          # parallel run across agents
 │       ├── tmux-agent-dag             # dependency-ordered execution
 │       ├── tmux-agent-audit           # hash-chained audit log surface
-│       ├── tmux-agent-worktrees       # managed git-worktree lifecycle
 │       ├── tmux-agent-replay          # transcript diff / redact
 │       └── install-bin                # symlinks wrappers into ~/.local/bin
 ├── scripts/
@@ -45,7 +44,7 @@ tmux-agent-tools/
    ```bash
    scripts/run-all-smokes test-<name>-smoke
    scripts/run-all-smokes test-fanout-run-smoke   # if you touched L5 fanout/dag
-   scripts/run-all-smokes test-sentinel-smoke test-secret-uri-smoke test-worktree-lifecycle-smoke  # if you touched L6
+   scripts/run-all-smokes test-sentinel-smoke test-secret-uri-smoke  # if you touched L6
    scripts/ci-shellcheck
    scripts/lint-no-path-tied-locals
    ```
@@ -67,7 +66,7 @@ The general test policy (which test owns a case, fixed waits, cut duplicates bef
 
 Many PRs land via a two-agent loop: an implementer writes the code, a partner runs a 7-step checklist against the PR branch:
 
-1. **Re-run the smoke** from the PR branch (not the main checkout). Tests that pass in the author's worktree can fail in a fresh one.
+1. **Re-run the smoke** from the PR branch (not the main checkout). Tests that pass in the author's checkout can fail in a fresh one.
 2. **Contract check**: walk each issue acceptance criterion against the diff. Mark `✅` / `❌` per criterion.
 3. **Mode-switch coverage**: confirm negative paths have tests (missing input, bad input, error path).
 4. **Honest verdict**: APPROVE, REQUEST_CHANGES, COMMENT. HIGH-priority bot findings → REQUEST_CHANGES regardless.

@@ -63,6 +63,7 @@ Before the first worker command:
 | Local working directory | `start` |
 | Repo on another host, tmux stays local | `start-ssh` |
 | Pin a model for one run | `start --model <m> <name> <dir> '<prompt>'` |
+| An agent in a Herdr.app (herdr-core, `hc`) terminal, not tmux | `hc run --bg --name <n> -- <cmd>` from this session's hc terminal; selectable in the band and TUI (mirror + close; attach in TUI) |
 | Continue an existing CLI session UUID | `resume` (opt-in, off by default) |
 | Don't know which wrapper owns a session | `tmux-agent-sessions resolve --name <n> --json` first |
 | Two-party exchange / one-to-many work | `tmux-agent-dialogue` / `tmux-agent-fanout` |
@@ -107,7 +108,38 @@ Full walkthrough: `references/core-workflow.md`.
 
 ## v5 ledger (non-Claude hosts)
 
-Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). The workers TUI is `scripts/tmux-agent-tui [--session <id>] [--cwd <dir>]`: with a session id it is the owner and acts on that session's workers; without one it is a read-only viewer. It needs Node >= 22.18 and a TTY (exit 2 otherwise; `--help` needs neither). After a skill update, re-run `scripts/install-bin`: it links only the scripts that existed when it last ran, and `agent-tmux <cli> doctor` names the missing links. Layout, ownership, and delivery are in the repository document `mods/tmux-agent/README.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only. Across hosts on one tailnet: `scripts/tmux-agent-relay` (`ensure`, `send <host> <worker> <text>`, `roster`) and `start-ssh --sentinel … --notify` (the remote exit lands in `status --json` as `exit_source: "relay"`); trust model and refusals are in the README section "Relay (tailnet)".
+Codex, Cursor, and agy do not load the Claude function-hook mod. They use the same v5 ledger, the `.v3/` tree under the state root. Node entry points in this bundle: `scripts/lib/collector.node.ts` (one collector per host session) and `scripts/lib/workers.cli.node.ts` (`cancel`, `unlock`). The workers TUI is `scripts/workers-tui [--session <id>] [--cwd <dir>]`. Keys, modes, and the band button are in "Workers TUI" below. It needs Node >= 22.18 and a TTY (exit 2 otherwise; `--help` needs neither). After a skill update, re-run `scripts/install-bin`: it links only the scripts that existed when it last ran, and `agent-tmux <cli> doctor` names the missing links. Layout, ownership, and delivery are in the repository document `mods/tmux-agent/README.md` (收集端); this skill does not restate that layout. Bash guard (`tool.call`) is Claude-only. Across hosts on one tailnet: `scripts/tmux-agent-relay` (`ensure`, `send <host> <worker> <text>`, `roster`) and `start-ssh --sentinel … --notify` (the remote exit lands in `status --json` as `exit_source: "relay"`); trust model and refusals are in the README section "Relay (tailnet)".
+
+## Workers TUI
+
+hc agents are the agent terminals of herdr-core (`hc`, the server Herdr.app shows), read with `hc ls --all --json`. hc records the owner itself: a terminal started with `hc run` from another hc terminal has that terminal as its `parent`. The band lists the agents whose parent is this session's `$HC_TERMINAL_ID`; `workers-tui` lists up to 4 agents (every live agent except its own `$HC_TERMINAL_ID`, `@<parent>` or `未記錄`, plus own finished rows where `parent === $HC_TERMINAL_ID`, plus `+N more`). `hc K` counts live own agents only. Neither runs `hc` when its core is not running (`hcSocketLive` fails). Homebrew `herdr` (`herdr agent list`) is a separate server and is not shown. agent-tmux clears `HC_TERMINAL_ID` and `HC_SCOPE` in every worker pane, so a worker is never taken for the hc terminal that started the tmux server.
+
+In both views, hc rows are selectable like worker rows:
+
+- **Band (`/workers`)**: digit hotkeys `1`–`9` (or `/workers N`) select an hc row; the selected row mirrors `hc read <address>` on the same 2s clock and room rules (yielding to worker rows and the mirror floor). Pressing `x` twice on the stop button or `/workers stop <address>` runs `hc kill <address>` on a live row (the finished record stays listed as `finished`) and `hc rm <address>` on an own finished row. `[ clear ]` (`c`, press twice) also runs `hc rm` on this session's finished hc rows, never touching live or other parents' rows. Send, keys, tell, and interrupt stay off for hc rows.
+- **`workers-tui`**: `j`/`k` move between worker rows and drawn hc rows; selecting an hc row mirrors `hc read <address>` (`↑`/`↓`, `b`/`f`, PgUp/PgDn scroll). `Enter` opens Detail (`hc get <address> --json` + preview), and `Enter` in Detail attaches (restores the tty until `ctrl+\`, then re-enters and redraws): `hc attach <address>` with an owner session, and watch-only `hc attach --observe <address>` in viewer mode (the Detail hint notes `watch-only`). In 編輯 (`e`), `x` twice runs `hc kill` on a live row (staying listed as `finished`) and `hc rm` on a finished row; `d` twice (預覽, 編輯, and viewer) removes an own finished hc row with `hc rm`; `c` twice clears own finished hc rows with `hc rm` (leaving live and other parents' rows untouched). `t`, `i`, `-`, and `U` stay off for hc rows.
+
+Start an hc agent so that this session's band shows it (owner-verified syntax):
+
+```sh
+hc run --bg --name agy-crash -- agy --dangerously-skip-permissions --conversation <id> -i "/boost"
+```
+
+- `--bg` returns at once; `--name` lets you use `hc read agy-crash` instead of `t19`.
+- Do not pass `--no-parent`: without a parent the agent is in no band, and the TUI shows it as `未記錄`.
+- With a parent, the agent ends when this session's terminal ends. Add `--outlive-parent` to keep it running.
+- `--label k=v` only tags it. To give it its own app tab: `herdr-app do terminal.keep --terminal <t> --place tab`.
+- Use `hc read <t>`, `hc send <t> "<text>"`, `hc keys <t> enter` and `hc wait <t>` to drive it; never the old `herdr` command.
+
+`workers-tui` opens in 預覽. `e` enters 編輯 when this process holds the session. With no session, `e` opens the picker: `j`/`k` or `1`–`9` move, Enter claims that live session in this process. One ready TUI per owner. A second launch focuses the first and does not draw. Quit with `q`, Ctrl-C, or Esc at the top of 預覽.
+
+預覽: `j`/`k` and `1`–`9` select a row. `↑`/`↓` scroll one line. `b`/`f` and PgUp/PgDn scroll a page. Enter opens detail. `a` toggles all workers and this session. `r` re-reads the rows and clears the selection. `d` (ask twice; in a viewer too) deletes the selected worker's row: with no live tmux session its state dir moves to `.v3/.removed/<name>-<ms>`; a live or unknown session is refused (stop it with `x` in 編輯 first). Mouse reporting stays off, so the terminal's own drag-select is free. `?1007h` turns the wheel into `↑`/`↓`.
+
+編輯 adds `n` (resume), `+` (assign), `t` (tell), `i` (interrupt), `x` (stop), `-` (cancel), `U` (unlock), and `c` (clear all). `x`, `-`, `U`, and `c` ask twice. `n` and `+` refuse when the cwd is unknown. `e` returns to 預覽. Esc disarms a confirm, closes detail, leaves a narrow preview, leaves the picker, leaves 編輯, clears the selection, then quits.
+
+The title shows `更新 Ns 前`, and ` …` while the rows read is still in flight. Rows run every 2s, the mirror every 1s, the stall sweep every 10s. Each job is single-flight. `r` during a run queues one more. A failed read keeps the previous age.
+
+The band button `[ ⧉ tui ]` (hotkey `t`) opens this TUI. Inside tmux it splits the pane (B1). Warp, iTerm2, and Terminal.app open a window (B2). Zed and any other `TERM_PROGRAM` open Terminal.app, and the toast says so. SSH without tmux cannot open a window and prints the full command. A second press focuses the existing TUI. Warp only raises the app and names the tab.
 
 ## result.json completion contract
 

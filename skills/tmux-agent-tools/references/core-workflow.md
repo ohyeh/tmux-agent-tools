@@ -282,7 +282,7 @@ tmux-agent-sessions cleanup --preview --created-after "$since" --json
 tmux-agent-sessions cleanup --execute --created-after "$since"   # only after operator authorization
 ```
 
-Rows include wrapper, short agent name, tmux session, cwd, age, running state, and result path. Combine `--created-after` with `--tool`, `--name`, `--state`, or `--cwd` to narrow cleanup. `cleanup --execute` refuses dirty managed worktrees unless `--force` is passed.
+Rows include wrapper, short agent name, tmux session, cwd, age, running state, and result path. Combine `--created-after` with `--tool`, `--name`, `--state`, or `--cwd` to narrow cleanup.
 
 ## Approval gates
 

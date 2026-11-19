@@ -163,4 +163,4 @@ tmux-agent-sessions cleanup --preview --created-after 2026-01-01T00:00:00Z --jso
 tmux-agent-sessions cleanup --execute --tool claude --state exited   # only with user authorization
 ```
 
-For accidental worker creation, record a timestamp first, inspect `diff --since <timestamp> --json`, preview with `cleanup --preview --created-after <timestamp>`, then execute only the narrowed filter. `cleanup --execute` refuses dirty managed worktrees unless `--force` is passed.
+For accidental worker creation, record a timestamp first, inspect `diff --since <timestamp> --json`, preview with `cleanup --preview --created-after <timestamp>`, then execute only the narrowed filter.

@@ -26,7 +26,6 @@ A set of bash wrappers and helper binaries that turn the agent CLIs into somethi
 | Parallel agents on one prompt | `tmux-agent-fanout` |
 | Dependency-ordered task graph | `tmux-agent-dag` |
 | Hash-chained operator audit log | `tmux-agent-audit` (verify / query / rotate) |
-| Sandboxed `git worktree` lifecycle | `tmux-agent-worktrees` (list / prune) |
 | Replay / diff / redact transcripts | `tmux-agent-replay` |
 | First-class multi-line paste injection | `send --from-file <abs-path>` |
 | CLI-aware progress parsing | `probe --metric <metric> --json` |
@@ -50,7 +49,7 @@ All JSON surfaces carry `schema_version: 1`.
 
 ## Non-goals
 
-This project intentionally does **not** ship: resident daemons, hidden async autonomy, supervisor trees, cross-host non-repudiation, parallel DAG execution, or auto merge-back from worktrees. Every surface is operator-explicit and synchronous.
+This project intentionally does **not** ship: resident daemons, hidden async autonomy, supervisor trees, cross-host non-repudiation, parallel DAG execution. Every surface is operator-explicit and synchronous.
 
 ## Source of truth
 
