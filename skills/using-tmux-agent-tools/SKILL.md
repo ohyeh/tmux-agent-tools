@@ -210,6 +210,10 @@ yourself.
   survive this terminal). Drive it with `hc read <t>`, `hc send <t> "<text>"`,
   `hc keys <t> enter`, `hc wait <t>`, `hc attach [--observe] <t>` (watch-only in `workers-tui` viewer mode; `ctrl+\` detaches), and
   close live with `hc kill <t>` or `x x` in the band or `workers-tui` (編輯) (leaving the finished record listed until cleared); remove own finished rows with `d d` (`workers-tui`), `c c` / `[ clear ]`, `x x`, `/workers stop <hc address>`, or `hc rm <t>`.
+- `TMUX_AGENT_FIRST=hc` in the session's environment makes `mcp__tmux-agent__assign` try hc
+  before tmux for a profile that runs claude, codex, grok or agy. The receipt names the backend.
+  An hc worker has no result.json: it reports with `hc send`, so use the `hc` commands above,
+  not the tell, await, peek or stop tools.
 - Same prompt across MANY workers → `tmux-agent-fanout`; bounded TWO-party
   exchange → `tmux-agent-dialogue`. BOTH require the user's explicit
   authorization for count, tool, model, and effort — never assume it.

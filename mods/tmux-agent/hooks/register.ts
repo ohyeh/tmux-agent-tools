@@ -107,6 +107,8 @@ import {
   handoffOwner,
   reconcileOnce,
   assignWorker,
+  assignHc,
+  hcFirst,
   resumeWorker,
   KEYS_ALLOWED,
   type TmuxDispatch as CoreDispatch,
@@ -657,6 +659,7 @@ export const register: Register = on => {
         '(e.g. a second claude started with its own --settings file through a provider gateway). Returns at once; ' +
         'the collector session reconciles result.json and submits a prompt when the worker finishes. ' +
         'Follow up with mcp__tmux-agent__tell, dismiss with mcp__tmux-agent__stop. ' +
+        'With TMUX_AGENT_FIRST=hc a brief whose profile runs claude, codex, grok or agy may start as an hc agent instead: the receipt says so and names the hc commands to use. ' +
         'brief must contain GOAL, ACCEPTANCE, REPORT and a non-empty MODEL section. MODEL: current-system Mermaid with transitions/invariants, a system-model.json path, or none — reason for read-only/search work.',
       inputSchema: {
         type: 'object',
@@ -1919,13 +1922,23 @@ export const register: Register = on => {
     const owner = await idNow(() => $.session.id())
     const gated = await runDispatchGate($, TOOL, { profile: input.profile, name: input.name, dir: input.dir, brief: input.brief }, { id: owner, cwd: sessionCwd })
     if ('deny' in gated) return gated
+    const note = gated.note ? { context: [gated.note] } : {}
+    // TMUX_AGENT_FIRST picks the backend tried first; the other one takes over only before any launch.
+    const first = hcFirst(await $.env.get('TMUX_AGENT_FIRST'))
+    let fellBack = ''
+    if (first || (await agentTmuxBin(host)).missing) {
+      const hc = await assignHc(host, input)
+      if ('deny' in hc) return hc
+      if ('receipt' in hc) return { result: first ? hc.receipt : `${hc.receipt} (agent-tmux is missing, so hc took it.)`, ...note }
+      if (first) fellBack = ` (TMUX_AGENT_FIRST=hc fell back to tmux: ${hc.skip}.)`
+    }
     const out = await assignWorker(host, input, {
       owner,
       ownerCwd: sessionCwd,
       down: () => collectorDown(gate),
     })
     if ('deny' in out) return { deny: out.deny }
-    return { result: out.receipt, ...(gated.note ? { context: [gated.note] } : {}) }
+    return { result: out.receipt + fellBack, ...note }
   }).catch(($, e, next) => toolFailed(TOOL, next.error))
 
   /**

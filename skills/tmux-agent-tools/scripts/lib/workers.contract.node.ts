@@ -1553,3 +1553,61 @@ test('T3: a failed open deletes only that launch file', async () => {
     assert.equal(readFileSync(foreign, 'utf8'), 'keep\n')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute program and report line on launch', async () => {
+  const { assignHc, hcFirst, HC_SCOPE_GUARD } = await import('./workers.ts')
+  assert.deepEqual(['hc', ' Herdr ', 'tmux', '', undefined].map(hcFirst), [true, true, false, false, false])
+  const root = '/fake-hc-home'
+  const hc = `${root}/bin/hc`
+  const sock = `${root}/.local/state/herdr-core/default/default.sock`
+  const present = new Set([hc, sock, `${root}/bin/claude`])
+  const calls: string[][] = []
+  let parent: string | undefined
+  const confs = new Map<string, string>()
+  const host: Host = {
+    ...nodeHost({ log: () => {} }),
+    envHcTerminal: async () => parent,
+    envPath: async () => `${root}/bin`,
+    envHome: async () => root,
+    exists: async path => present.has(path),
+    read: async path => {
+      const conf = confs.get(/^\/fake-hc-home\/\.config\/agent-tmux\/profiles\/(.+)\.conf$/.exec(path)?.[1] ?? '')
+      if (conf === undefined) throw new Error('ENOENT')
+      return conf
+    },
+    run: async argv => {
+      if (argv[0] === 'perl') return { exitCode: 0, stdout: '', stderr: '' }
+      calls.push([...argv])
+      return { exitCode: 0, stdout: JSON.stringify({ address: 't9' }), stderr: '' }
+    },
+  }
+  const input = { profile: 'claude', name: 'Review.X', dir: '/repo', brief: BRIEF }
+  assert.match(((await assignHc(host, input)) as { skip: string }).skip, /HC_TERMINAL_ID/)
+  parent = 't3'
+  assert.match(((await assignHc(host, { ...input, profile: 'astra' })) as { skip: string }).skip, /no agent-tmux profile file or preset/)
+  confs.set('cur', 'bin=cursor-agent\nlaunch_flags=--trust\n')
+  assert.match(((await assignHc(host, { ...input, profile: 'cur' })) as { skip: string }).skip, /no proven hc task delivery/)
+  confs.set('sol', 'bin=codex\nlaunch_flags=--yolo --model gpt-sol\nheuristic_family=codex\n')
+  assert.match(((await assignHc(host, { ...input, profile: 'sol' })) as { skip: string }).skip, /"codex" is not on PATH/)
+  assert.match(((await assignHc(host, { ...input, brief: 'GOAL: x' })) as { deny: string }).deny, /brief is missing/)
+  assert.deepEqual(calls, [])
+  const got = (await assignHc(host, input)) as { receipt: string }
+  assert.match(got.receipt, /as hc t9 .*backend hc/)
+  const argv = (calls as string[][])[0]!
+  assert.deepEqual(argv.slice(0, 4), [hc, 'run', '--bg', '--json'])
+  assert.match(argv[argv.indexOf('--name') + 1]!, /^review-x-[a-z0-9]{5}$/)
+  assert.deepEqual(argv.slice(-3, -1), [`${root}/bin/claude`, "--dangerously-skip-permissions"])
+  assert.match(argv.at(-1)!, new RegExp(`^Ignore any project-local[\\s\\S]*GOAL: probe[\\s\\S]*${hc} send t3 `))
+  assert.deepEqual(argv.slice(argv.indexOf('--parent'), argv.indexOf('--parent') + 5), ['--parent', 't3', '--', '/usr/bin/env', `PATH=${root}/bin`])
+  // The scope text is agent-tmux's own: a change there must be copied here.
+  assert.ok(readFileSync(new URL('../agent-tmux', import.meta.url), 'utf8').includes(`TASK_SCOPE_GUARD="${HC_SCOPE_GUARD}"`))
+  // agy takes its task after -i.
+  confs.set('neon', 'bin=agy\nlaunch_flags=--model m\n')
+  present.add(`${root}/bin/agy`)
+  await assignHc(host, { ...input, profile: 'neon' })
+  assert.deepEqual((calls as string[][])[1]!.slice(-5, -1), [`${root}/bin/agy`, '--model', 'm', '-i'])
+  // A custom profile runs its own program and flags; a codex family gets --no-daemon.
+  present.add(`${root}/bin/codex`)
+  await assignHc(host, { ...input, profile: 'sol' })
+  assert.deepEqual((calls as string[][])[2]!.slice(-6, -1), [`${root}/bin/codex`, '--yolo', '--model', 'gpt-sol', '--no-daemon'])
+})

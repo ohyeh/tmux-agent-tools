@@ -7020,6 +7020,25 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     expect((out as { context?: string[] }).context).toEqual(['reminder: 2 reviews of this dir today'])
   })
 
+  test('TMUX_AGENT_FIRST=hc outside an hc terminal: tmux takes it and the receipt says why', WITH_DRIVER, async ($, on) => {
+    const t = setup(on, undefined, { HOME, TMUX_AGENT_FIRST: 'hc' })
+    const out = JSON.stringify(await $.tool.call(assign()))
+    expect(out).toContain('launch requested')
+    expect(out).toContain('TMUX_AGENT_FIRST=hc fell back to tmux: this session is not in an hc terminal')
+    expect(t.argvs.some(a => a[1] === 'run' && a[2] === '--bg'), 'no hc run').toBe(false)
+  })
+
+  test('TMUX_AGENT_FIRST=hc with hc usable: hc run gets the absolute program, and a failed hc run never falls back to tmux', WITH_DRIVER, async ($, on) => {
+    const sock = `${HOME}/.local/state/herdr-core/default/default.sock`
+    const t = setup(on, undefined, { HOME, PATH: '/b', HC_TERMINAL_ID: 't3', TMUX_AGENT_FIRST: 'hc' }, { '/b/hc': '', '/b/codex': '', [sock]: '' })
+    const out = JSON.stringify(await $.tool.call(assign()))
+    const run = t.argvs.find(a => a[0] === '/b/hc' && a[1] === 'run')
+    expect(run?.slice(-4, -1)).toEqual(['/b/codex', '--yolo', '--no-daemon'])
+    // The fake hc prints nothing, so the launch has no address: a deny, and no tmux worker.
+    expect(out).toContain('hc run gave no address')
+    expect(t.assigned(), 'no tmux launch after an hc attempt').toBe(false)
+  })
+
   test('another exit code denies: a broken gate does not pass', WITH_DRIVER, async ($, on) => {
     const t = setup(on, { exitCode: 127, stderr: 'jq: not found' })
     const out = await $.tool.call(assign())
