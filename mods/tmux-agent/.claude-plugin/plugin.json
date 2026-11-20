@@ -1,6 +1,6 @@
 {
   "name": "tmux-agent",
-  "version": "0.53.0",
+  "version": "0.53.1",
   "description": "Claude Code function-hook mod for tmux-agent-tools: dispatch an agent-tmux worker from an MCP tool, the /workers panel, and a collector that wakes this session when a worker finishes or fails to launch. Skills come from the tmux-agent-tools plugin or the global npx skills install.",
   "author": {
     "name": "PaulYeh",
@@ -11,5 +11,14 @@
   "keywords": ["tmux", "claude-code", "codex", "agent", "orchestration", "mod", "hooks"],
   "types": "./types/index.d.ts",
   "displayName": "tmux Agent Workers",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "first": {
+      "type": "string",
+      "title": "Assign backend tried first",
+      "description": "Which backend mcp__tmux-agent__assign tries first: tmux (agent-tmux worker) or hc (herdr-core terminal, with a pane in the Herdr window). The other one takes over only before a launch. The TMUX_AGENT_FIRST env of the claude process overrides this.",
+      "options": ["tmux", "hc"],
+      "default": "tmux"
+    }
+  }
 }

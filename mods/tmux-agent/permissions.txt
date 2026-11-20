@@ -12,7 +12,7 @@ types ./types/index.d.ts declares on $: $.tmux
 ./register.ts gating hook with .catch: tool.call{tool=mcp__tmux-agent__reload}
 ./register.ts gating hook with .catch: tool.call{tool=Bash}
 ./register.ts gating hook with .catch: agent.spawn
-./register.ts calls: $.agent.list, $.agent.register, $.clock.after, $.clock.every, $.clock.now, $.command.register, $.command.run, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.fs.write, $.process.run, $.prompt.submit, $.session.cwd, $.session.id, $.store.delete, $.store.get, $.store.keys, $.store.set, $.tool.register, $.ui.invalidate, $.ui.log, $.ui.resolve, $.ui.toast
+./register.ts calls: $.agent.list, $.agent.register, $.clock.after, $.clock.every, $.clock.now, $.command.register, $.command.run, $.config.list, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.fs.write, $.process.run, $.prompt.submit, $.session.cwd, $.session.id, $.store.delete, $.store.get, $.store.keys, $.store.set, $.tool.register, $.ui.invalidate, $.ui.log, $.ui.resolve, $.ui.toast
 ./register.ts env writes: nothing
 ./register.ts env reads: HC_TERMINAL_ID, HOME, PATH, SSH_TTY, TERM_PROGRAM, TMUX_AGENT_DIR, TMUX_AGENT_DISPATCH_GATE, TMUX_AGENT_FIRST, TMUX_PANE, XDG_STATE_HOME
 .claude-plugin/plugin.json icon: No icon (ICON_MISSING). No icon found in the plugin. The validator looked for `icon` in plugin.json and for a file at .claude-plugin/icon.png or .svg, assets/icon.png or .svg, or a similar path.

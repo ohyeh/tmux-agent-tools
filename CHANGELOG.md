@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.53.1 - 2026-11-21
+
+- The assign backend is now a plugin option: `first` (`tmux` or `hc`, default `tmux`), shown in `/config` as "Assign backend tried first". v0.53.0 had only the `TMUX_AGENT_FIRST` env, which `/config` does not show. The env still works and overrides the option. The mod reads the option with `$.config.list` (a new engine call in `permissions.txt`).
+
 ## v0.53.0 - 2026-11-21
 
 - New: `TMUX_AGENT_FIRST` picks the backend the `assign` tool tries first. `hc` (or `herdr`) tries herdr-core first; any other value, or none, keeps tmux first.

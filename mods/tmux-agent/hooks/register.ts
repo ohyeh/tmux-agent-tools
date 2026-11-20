@@ -123,7 +123,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.53.0'
+const MOD_VERSION = '0.53.1'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -659,7 +659,7 @@ export const register: Register = on => {
         '(e.g. a second claude started with its own --settings file through a provider gateway). Returns at once; ' +
         'the collector session reconciles result.json and submits a prompt when the worker finishes. ' +
         'Follow up with mcp__tmux-agent__tell, dismiss with mcp__tmux-agent__stop. ' +
-        'With TMUX_AGENT_FIRST=hc a brief whose profile runs claude, codex, grok or agy may start as an hc agent instead: the receipt says so and names the hc commands to use. ' +
+        'With the plugin option first=hc (or TMUX_AGENT_FIRST=hc) a brief whose profile runs claude, codex, grok or agy may start as an hc agent instead: the receipt says so and names the hc commands to use. ' +
         'brief must contain GOAL, ACCEPTANCE, REPORT and a non-empty MODEL section. MODEL: current-system Mermaid with transitions/invariants, a system-model.json path, or none — reason for read-only/search work.',
       inputSchema: {
         type: 'object',
@@ -1923,14 +1923,16 @@ export const register: Register = on => {
     const gated = await runDispatchGate($, TOOL, { profile: input.profile, name: input.name, dir: input.dir, brief: input.brief }, { id: owner, cwd: sessionCwd })
     if ('deny' in gated) return gated
     const note = gated.note ? { context: [gated.note] } : {}
-    // TMUX_AGENT_FIRST picks the backend tried first; the other one takes over only before any launch.
-    const first = hcFirst(await $.env.get('TMUX_AGENT_FIRST'))
+    // The plugin option `first` (/config) picks the backend tried first, and the TMUX_AGENT_FIRST env overrides it;
+    // the other backend takes over only before any launch.
+    const option = (await $.config.list().catch(() => [])).find(row => row.key === 'tmux-agent.first')?.value
+    const first = hcFirst((await $.env.get('TMUX_AGENT_FIRST')) ?? (typeof option === 'string' ? option : undefined))
     let fellBack = ''
     if (first || (await agentTmuxBin(host)).missing) {
       const hc = await assignHc(host, input)
       if ('deny' in hc) return hc
       if ('receipt' in hc) return { result: first ? hc.receipt : `${hc.receipt} (agent-tmux is missing, so hc took it.)`, ...note }
-      if (first) fellBack = ` (TMUX_AGENT_FIRST=hc fell back to tmux: ${hc.skip}.)`
+      if (first) fellBack = ` (hc first fell back to tmux: ${hc.skip}.)`
     }
     const out = await assignWorker(host, input, {
       owner,

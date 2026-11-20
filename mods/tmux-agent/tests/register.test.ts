@@ -7024,8 +7024,23 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     const t = setup(on, undefined, { HOME, TMUX_AGENT_FIRST: 'hc' })
     const out = JSON.stringify(await $.tool.call(assign()))
     expect(out).toContain('launch requested')
-    expect(out).toContain('TMUX_AGENT_FIRST=hc fell back to tmux: this session is not in an hc terminal')
+    expect(out).toContain('hc first fell back to tmux: this session is not in an hc terminal')
     expect(t.argvs.some(a => a[1] === 'run' && a[2] === '--bg'), 'no hc run').toBe(false)
+  })
+
+  const FIRST_HC = { key: 'tmux-agent.first', label: 'Assign backend tried first', kind: 'choice' as const, value: 'hc', options: ['tmux', 'hc'], provider: { plugin: 'tmux-agent', tier: 'user' as const }, isLocked: false }
+  test('plugin option first=hc, no env: hc is tried first', WITH_DRIVER, async ($, on) => {
+    on('config.list', () => ({ value: [FIRST_HC] }))
+    setup(on, undefined, { HOME })
+    expect(JSON.stringify(await $.tool.call(assign()))).toContain('hc first fell back to tmux')
+  })
+
+  test('the TMUX_AGENT_FIRST env overrides the plugin option', WITH_DRIVER, async ($, on) => {
+    on('config.list', () => ({ value: [FIRST_HC] }))
+    setup(on, undefined, { HOME, TMUX_AGENT_FIRST: 'tmux' })
+    const out = JSON.stringify(await $.tool.call(assign()))
+    expect(out).toContain('launch requested')
+    expect(out).not.toContain('fell back')
   })
 
   test('TMUX_AGENT_FIRST=hc with hc usable: hc run gets the absolute program, and a failed hc run never falls back to tmux', WITH_DRIVER, async ($, on) => {

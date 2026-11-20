@@ -210,7 +210,7 @@ yourself.
   survive this terminal). Drive it with `hc read <t>`, `hc send <t> "<text>"`,
   `hc keys <t> enter`, `hc wait <t>`, `hc attach [--observe] <t>` (watch-only in `workers-tui` viewer mode; `ctrl+\` detaches), and
   close live with `hc kill <t>` or `x x` in the band or `workers-tui` (編輯) (leaving the finished record listed until cleared); remove own finished rows with `d d` (`workers-tui`), `c c` / `[ clear ]`, `x x`, `/workers stop <hc address>`, or `hc rm <t>`.
-- `TMUX_AGENT_FIRST=hc` in the session's environment makes `mcp__tmux-agent__assign` try hc
+- The tmux-agent plugin option `first` set to `hc` (in `/config`; the `TMUX_AGENT_FIRST` env overrides it) makes `mcp__tmux-agent__assign` try hc
   before tmux for a profile that runs claude, codex, grok or agy. The receipt names the backend, and the worker gets a pane in the Herdr window when `herdr-app` is on PATH.
   An hc worker has no result.json: it reports with `hc send`, so use the `hc` commands above,
   not the tell, await, peek or stop tools.
