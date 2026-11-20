@@ -631,13 +631,11 @@ export async function assignHc(host: Host, input: AssignInput): Promise<{ receip
   const path = (await host.envPath()) ?? ''
   // The core's PATH is not this session's (seen live: it ran another, broken `claude`, and a worker found no `hc`),
   // so the path is absolute and the worker gets this session's PATH.
-  let prog: string | undefined
-  for (const dir of path.split(':').filter(Boolean)) {
-    if (await host.exists(`${dir}/${cmd.bin}`).catch(() => false)) {
-      prog = `${dir}/${cmd.bin}`
-      break
-    }
+  const onPath = async (name: string) => {
+    for (const dir of path.split(':').filter(Boolean)) if (await host.exists(`${dir}/${name}`).catch(() => false)) return `${dir}/${name}`
+    return undefined
   }
+  const prog = await onPath(cmd.bin)
   if (!prog) return { skip: `"${cmd.bin}" is not on PATH` }
   const missing = missingSections(input.brief ?? '')
   if (missing.length) return { deny: `tmux-agent: brief is missing ${missing.join(', ')}` }
@@ -658,9 +656,18 @@ export async function assignHc(host: Host, input: AssignInput): Promise<{ receip
     // falls through to the deny below
   }
   if (typeof address !== 'string' || !address) return { deny: `tmux-agent: hc run gave no address: ${(r as RunResult).stdout.trim().slice(0, 200)}; check \`${bin} ls\`` }
+  // Herdr.app lists a child under its parent only; terminal.keep gives it a pane of its own.
+  // The window needs a moment to see a new terminal (seen live: the first call said "no running terminal").
+  const app = await onPath('herdr-app')
+  const kept =
+    app !== undefined &&
+    (await host
+      .run(['sh', '-c', 'for i in 1 2 3 4 5; do "$0" do terminal.keep --terminal "$1" --place right >/dev/null 2>&1 && exit 0; sleep 0.4; done; exit 1', app, address], input.dir, 8_000)
+      .then(k => k.exitCode === 0, () => false))
+  const pane = kept ? 'It has a pane in the Herdr window, right of the focused pane. ' : app ? 'No Herdr pane: herdr-app terminal.keep failed (is the window open?). ' : ''
   return {
     receipt:
-      `launched "${name}" as hc ${address} (${prog}), backend hc: no result.json, no collector. ` +
+      `launched "${name}" as hc ${address} (${prog}), backend hc: no result.json, no collector. ${pane}` +
       `hc types its report into this session as <hc from="${address} ${name}">, and a note when it blocks, errors or exits; end the turn. ` +
       `If no report comes, ${bin} get ${address}: the task is over when turn is 1 or more and status is not working (do not use hc wait right after a launch: it returns at startup idle). ` +
       `Follow up: ${bin} send ${address} "<text>". Screen: ${bin} read ${address}. Close: ${bin} kill ${address}, or its hc row in /workers. ` +

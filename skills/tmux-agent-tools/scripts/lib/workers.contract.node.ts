@@ -1608,6 +1608,9 @@ test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute prog
   assert.deepEqual((calls as string[][])[1]!.slice(-5, -1), [`${root}/bin/agy`, '--model', 'm', '-i'])
   // A custom profile runs its own program and flags; a codex family gets --no-daemon.
   present.add(`${root}/bin/codex`)
-  await assignHc(host, { ...input, profile: 'sol' })
+  // With herdr-app on PATH the new terminal gets a pane, and the receipt says so.
+  present.add(`${root}/bin/herdr-app`)
+  assert.match(((await assignHc(host, { ...input, profile: 'sol' })) as { receipt: string }).receipt, /has a pane in the Herdr window/)
+  assert.deepEqual((calls as string[][])[3]!.slice(-2), [`${root}/bin/herdr-app`, 't9'])
   assert.deepEqual((calls as string[][])[2]!.slice(-6, -1), [`${root}/bin/codex`, '--yolo', '--model', 'gpt-sol', '--no-daemon'])
 })
