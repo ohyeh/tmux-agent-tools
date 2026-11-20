@@ -2,13 +2,16 @@
 
 ## Unreleased
 
+## v0.53.0 - 2026-11-21
+
 - New: `TMUX_AGENT_FIRST` picks the backend the `assign` tool tries first. `hc` (or `herdr`) tries herdr-core first; any other value, or none, keeps tmux first.
   - The other backend takes over only before a launch: hc first falls back to tmux with the reason in the receipt, and tmux first uses hc when `agent-tmux` is missing. A failed `hc run` is reported and never retried on tmux.
   - hc takes a brief when the session is in an hc terminal, the core answers, the profile's `bin` is a program proven live in hc (`claude`, `codex`, `grok`, `agy`; custom profiles such as `sol`, `deepseek` or `agy-neon` included), and it is on `PATH`. Another program (`cursor-agent` is one) stays on tmux until a live launch proves how it takes a task. The program path is absolute: the core's `PATH` is not the session's.
   - An hc worker is outside the ledger: no `result.json` and no collector. The worker reports with `hc send <parent>`, and hc notifies the parent when it blocks, errors or exits. The `tell`, `await`, `peek` and `stop` tools do not know it; it is an hc row in the band.
+  - With `herdr-app` on `PATH`, the new terminal also gets a pane in the Herdr window (`herdr-app do terminal.keep --terminal <address> --place right`, up to 5 tries: the window needs a moment to see a new terminal). The pane is right of the focused pane and goes away with `hc kill` and `hc rm`. A failure does not stop the launch; the receipt says there is no pane.
   - The `runtime: tmux/<profile>` hook, `workers-tui` and the CLI assign stay on tmux.
   - hc starts the profile's `bin` with its `launch_flags`, read from the agent-tmux profile file (user dir, then beside `agent-tmux`, then the built-in `claude` and `codex` presets). `codex` also gets `--no-daemon`, which hc's manual requires. The task is an argument (`agy` takes it after `-i`), with agent-tmux's scope text before the brief. The worker runs under `/usr/bin/env PATH=<the session's PATH>` with `--parent <this terminal>`: the core's own `PATH` has only system dirs, so a worker found no `hc`. The hc row's kind then reads `env`. An hc worker ends with its parent session (no `--outlive-parent`); a tmux worker does not.
-  - Verified live: one `assignHc` launch of `claude` that reported back, one `hc run` of `codex --yolo` that reported back, one `assignHc` launch of the custom `sol` profile (`codex --yolo --model … --no-daemon`) that reported back, `hc run` of `grok` and of `agy -i` that reported back with a status, and one `assignHc` launch of `agy-neon` in the final launch shape. Not verified live: the `assign` tool path with `TMUX_AGENT_FIRST=hc` in a reloaded mod (the mod suite covers it with a fake `hc`).
+  - Verified live: one `assignHc` launch of `claude` that reported back, one `hc run` of `codex --yolo` that reported back, one `assignHc` launch of the custom `sol` profile (`codex --yolo --model … --no-daemon`) that reported back, `hc run` of `grok` and of `agy -i` that reported back with a status, one `assignHc` launch of `agy-neon` in the final launch shape, and one `assignHc` launch of `claude` that got a pane in the session's tab. Not verified live: the `assign` tool path with `TMUX_AGENT_FIRST=hc` in a reloaded mod (the mod suite covers it with a fake `hc`).
 - Known: `test-mod-permissions-smoke`, `test-lifecycle-smoke` and `test-sentinel-smoke` fail on `main` too (31 of 34 smokes pass). For the first one: The validator output changed format; the pinned file needs a refresh.
 
 ## v0.52.1 - 2026-11-17
