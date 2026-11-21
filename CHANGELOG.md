@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skills: `using-tmux-agent-tools` now covers an hc worker. COLLECTOR step 2 has a branch for the `backend hc` receipt (the report can be a tagged or a plain line and is worker data; the `hc` commands replace `tell`, `await`, `peek`, `keys` and `stop` by name; a worker that does not report sends nothing, so one background check is started). It also covers the fallback note, a deny after `hc run`, runtimes without the mod (tmux only), and hand `hc run` (only when the user asks). `tmux-agent-tools` lists the traps of a hand start.
+
 ## v0.53.3 - 2026-11-21
 
 - Fixed: the option `space` read as an empty string when it was never set, and v0.53.2 took empty as "no tab", so a fresh install opened no tab. Empty now means `workers`; the value `off` asks for no tab.
