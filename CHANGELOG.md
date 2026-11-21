@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.53.2 - 2026-11-21
+
+- New plugin option `space` ("Herdr space for hc workers", default `workers`): each hc worker opens as a tab of that Herdr space. v0.53.0 put the pane right of the focused pane, which had no fixed place.
+  - The mod finds the space by name with `herdr-app ls` and starts the worker with the labels `herdr.space` and `herdr.tab`. A space id the app does not know makes the space; the mod then names it and the tab. The view does not change and the worker keeps its parent.
+  - The app removes a space when its last terminal is removed, so the space is made again on the next launch.
+  - An empty option gives the worker no tab. `terminal.keep` is no longer used.
+  - Known limit: two launches at the same moment can each make a space of that name.
+- Fixed: the hc path split `launch_flags` on spaces and kept quotes, so `--model 'name[1m]'` reached the program with its quotes (a gateway answered 400). It now splits like a shell: quotes group and are removed. One profile file is correct on both backends.
+- A profile whose `launch_flags` already hold the task flag (`agy ... -i /boost`) stays on tmux.
+- The rename of the space and the tab runs detached, and `hc run` has 6 s: the `tool.call` hook has 10 s, and an overrun after the launch would look like a failed assign.
+
 ## v0.53.1 - 2026-11-21
 
 - The assign backend is now a plugin option: `first` (`tmux` or `hc`, default `tmux`), shown in `/config` as "Assign backend tried first". v0.53.0 had only the `TMUX_AGENT_FIRST` env, which `/config` does not show. The env still works and overrides the option. The mod reads the option with `$.config.list` (a new engine call in `permissions.txt`).

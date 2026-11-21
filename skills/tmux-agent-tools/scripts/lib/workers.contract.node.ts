@@ -1555,7 +1555,10 @@ test('T3: a failed open deletes only that launch file', async () => {
 })
 
 test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute program and report line on launch', async () => {
-  const { assignHc, hcFirst, HC_SCOPE_GUARD } = await import('./workers.ts')
+  const { assignHc, hcFirst, HC_SCOPE_GUARD, shellWords } = await import('./workers.ts')
+  // Quotes group and are removed, as the shell on the tmux path does.
+  assert.deepEqual(shellWords(`--yolo --model 'deepseek-v4.1-flash[1m]' -c "a b"=c x\\ y  `), ['--yolo', '--model', 'deepseek-v4.1-flash[1m]', '-c', 'a b=c', 'x y'])
+  assert.deepEqual(shellWords(''), [])
   assert.deepEqual(['hc', ' Herdr ', 'tmux', '', undefined].map(hcFirst), [true, true, false, false, false])
   const root = '/fake-hc-home'
   const hc = `${root}/bin/hc`
@@ -1564,6 +1567,7 @@ test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute prog
   const calls: string[][] = []
   let parent: string | undefined
   const confs = new Map<string, string>()
+  let spaces: { id: string; name: string; machine: null }[] = []
   const host: Host = {
     ...nodeHost({ log: () => {} }),
     envHcTerminal: async () => parent,
@@ -1578,6 +1582,7 @@ test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute prog
     run: async argv => {
       if (argv[0] === 'perl') return { exitCode: 0, stdout: '', stderr: '' }
       calls.push([...argv])
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ spaces }), stderr: '' }
       return { exitCode: 0, stdout: JSON.stringify({ address: 't9' }), stderr: '' }
     },
   }
@@ -1606,11 +1611,32 @@ test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute prog
   present.add(`${root}/bin/agy`)
   await assignHc(host, { ...input, profile: 'neon' })
   assert.deepEqual((calls as string[][])[1]!.slice(-5, -1), [`${root}/bin/agy`, '--model', 'm', '-i'])
+  // A profile that already uses -i stays on tmux.
+  confs.set('boost', 'bin=agy\nlaunch_flags=--model m -i /boost\n')
+  assert.match(((await assignHc(host, { ...input, profile: 'boost' })) as { skip: string }).skip, /already passes -i/)
   // A custom profile runs its own program and flags; a codex family gets --no-daemon.
   present.add(`${root}/bin/codex`)
-  // With herdr-app on PATH the new terminal gets a pane, and the receipt says so.
+  assert.deepEqual((await assignHc(host, { ...input, profile: 'sol' }), (calls as string[][])[2]!.slice(-6, -1)), [`${root}/bin/codex`, '--yolo', '--model', 'gpt-sol', '--no-daemon'])
+  // With herdr-app on PATH the worker opens as a tab of the named space: an existing space by its id...
   present.add(`${root}/bin/herdr-app`)
-  assert.match(((await assignHc(host, { ...input, profile: 'sol' })) as { receipt: string }).receipt, /has a pane in the Herdr window/)
-  assert.deepEqual((calls as string[][])[3]!.slice(-2), [`${root}/bin/herdr-app`, 't9'])
-  assert.deepEqual((calls as string[][])[2]!.slice(-6, -1), [`${root}/bin/codex`, '--yolo', '--model', 'gpt-sol', '--no-daemon'])
+  const app = `${root}/bin/herdr-app`
+  const label = (argv: string[], key: string) => argv.find(a => a.startsWith(`${key}=`))?.slice(key.length + 1)
+  spaces = [{ id: 'spOLD', name: 'workers', machine: null }]
+  calls.length = 0
+  assert.match(((await assignHc(host, input)) as { receipt: string }).receipt, /has a tab in the Herdr space "workers"\. /)
+  const [, run1, sh1] = calls as string[][]
+  assert.equal(label(run1!, 'herdr.space'), 'spOLD')
+  assert.match(label(run1!, 'herdr.tab') ?? '', /^tb[a-z0-9]{32}$/)
+  assert.deepEqual(sh1!.slice(3, 7), [app, 'spOLD', label(run1!, 'herdr.tab'), ''])
+  // ...and a missing one under a new id, which the app turns into a space that is then named.
+  calls.length = 0
+  await assignHc(host, input, 'side')
+  const [, run2, sh2] = calls as string[][]
+  assert.match(label(run2!, 'herdr.space') ?? '', /^sp[a-z0-9]{32}$/)
+  assert.deepEqual(sh2!.slice(4, 7).filter((_, i) => i !== 1), [label(run2!, 'herdr.space'), 'side'])
+  // An empty space name asks the app nothing and sets no label.
+  calls.length = 0
+  assert.doesNotMatch(((await assignHc(host, input, '')) as { receipt: string }).receipt, /Herdr/)
+  assert.equal((calls as string[][]).length, 1)
+  assert.equal(label((calls as string[][])[0]!, 'herdr.space'), undefined)
 })

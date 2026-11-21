@@ -575,6 +575,9 @@ export async function stopHc(host: Host, agent: Pick<HcAgent, 'address' | 'name'
   return { ok: true, text: `closed hc ${agent.address}${agent.name ? ` (${agent.name})` : ''} via hc ${sub}` }
 }
 
+/** The Herdr space hc workers open in when the plugin option `space` is not set. */
+export const HC_SPACE = 'workers'
+
 /** `TMUX_AGENT_FIRST`: `hc` or `herdr` makes assign try hc before tmux; anything else is tmux first. */
 export const hcFirst = (v: string | undefined): boolean => /^(hc|herdr)$/i.test((v ?? '').trim())
 
@@ -594,7 +597,21 @@ export const HC_SCOPE_GUARD =
  * What agent-tmux would start for a profile: `<profile>.conf` in the user dir, then beside agent-tmux,
  * then the built-in preset. Both backends then start the same program with the same flags.
  */
-// shortcut: a --profile-dir or AGENT_TMUX_PROFILE_DIR override is not seen, and a quoted flag value is split on its spaces.
+/**
+ * Split a profile's `launch_flags` the way the shell on the tmux path does: quotes group and are removed, a backslash
+ * keeps the next character. hc takes an argv and runs no shell, so a quote left in would reach the program
+ * (seen live: `--model 'name[1m]'` sent the quotes to the gateway, which answered 400).
+ */
+// shortcut: no expansion ($VAR, globs, ~) — a profile that needs one stays correct on tmux only.
+export function shellWords(text: string): string[] {
+  const words: string[] = []
+  for (const m of text.matchAll(/(?:[^\s'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+/g)) {
+    words.push(m[0].replace(/'([^']*)'|"((?:[^"\\]|\\.)*)"|\\(.)/g, (_, single: string | undefined, double: string | undefined, escaped: string | undefined) => single ?? double?.replace(/\\(.)/g, '$1') ?? escaped ?? ''))
+  }
+  return words
+}
+
+// shortcut: a --profile-dir or AGENT_TMUX_PROFILE_DIR override is not seen.
 async function hcCommand(host: Host, profile: string): Promise<HcCommand | undefined> {
   const home = await host.envHome()
   const tool = await agentTmuxBin(host)
@@ -603,7 +620,7 @@ async function hcCommand(host: Host, profile: string): Promise<HcCommand | undef
     const text = await host.read(`${dir}/${profile}.conf`).catch(() => undefined)
     if (typeof text !== 'string') continue
     const get = (key: string) => new RegExp(`^${key}=(.*)$`, 'm').exec(text)?.[1]?.trim() ?? ''
-    return { bin: get('bin'), flags: get('launch_flags').split(/\s+/).filter(Boolean) }
+    return { bin: get('bin'), flags: shellWords(get('launch_flags')) }
   }
   return HC_PRESETS.get(profile)
 }
@@ -613,8 +630,9 @@ async function hcCommand(host: Host, profile: string): Promise<HcCommand | undef
  * report, and a note when it blocks, errors or exits, into the parent terminal. No result.json,
  * no collector. `skip` = hc cannot take this brief and nothing ran, so the caller may use tmux.
  * A failed `hc run` is a deny, never a skip: a second launch could make two workers.
+ * `space` names the Herdr space the worker's tab opens in; an empty name gives it no tab (it shows under its parent only).
  */
-export async function assignHc(host: Host, input: AssignInput): Promise<{ receipt: string } | { skip: string } | { deny: string }> {
+export async function assignHc(host: Host, input: AssignInput, space = HC_SPACE): Promise<{ receipt: string } | { skip: string } | { deny: string }> {
   const parent = await host.envHcTerminal()
   if (!parent) return { skip: 'this session is not in an hc terminal (HC_TERMINAL_ID is unset)' }
   const bin = await hcBin(host)
@@ -626,6 +644,8 @@ export async function assignHc(host: Host, input: AssignInput): Promise<{ receip
   // shortcut: a program with no proven task flag (cursor-agent is one) stays on tmux; add it after a live launch.
   const taskFlags = HC_TASK_FLAGS.get(cmd.bin)
   if (!taskFlags) return { skip: `"${cmd.bin}" (profile "${input.profile}") has no proven hc task delivery yet (proven: ${[...HC_TASK_FLAGS.keys()].join(', ')})` }
+  // A profile that already uses the task flag (agy `-i /boost`) cannot take a second one.
+  if (taskFlags.some(flag => cmd.flags.includes(flag))) return { skip: `profile "${input.profile}" already passes ${taskFlags.join(' ')} in its launch_flags, so hc cannot hand it the task` }
   // hc's manual: without --no-daemon, codex runs its commands outside hc.
   const flags = cmd.bin === 'codex' && !cmd.flags.includes('--no-daemon') ? [...cmd.flags, '--no-daemon'] : cmd.flags
   const path = (await host.envPath()) ?? ''
@@ -644,8 +664,27 @@ export async function assignHc(host: Host, input: AssignInput): Promise<{ receip
   // hc names: 1-32 of a-z 0-9 - _, unique among live terminals.
   const name = `${input.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 26)}-${randomBase36(5)}`
   const task = `${HC_SCOPE_GUARD}\n\n${input.brief}\n\nWhen done or stuck, report to the parent with: ${bin} send ${parent} "<result or blocker>". Write a long answer to a file and send its path.`
+  // Herdr.app places a terminal by its herdr.space and herdr.tab labels: a known space id puts a new tab there, and an
+  // unknown one makes the space (seen live; the view does not change and the parent stays). An empty space goes away,
+  // so each launch looks the name up again.
+  // shortcut: two launches at the same moment can each make a space of that name; close one by hand.
+  const app = space ? await onPath('herdr-app') : undefined
+  let place: { sp: string; tb: string; fresh: boolean } | undefined
+  if (app) {
+    const ls = await host.run([app, 'ls'], input.dir, 2_000).catch(() => undefined)
+    try {
+      const spaces = ls?.exitCode === 0 ? (JSON.parse(ls.stdout) as { spaces?: { id?: unknown; name?: unknown; machine?: unknown }[] }).spaces : undefined
+      if (Array.isArray(spaces)) {
+        const found = spaces.find(s => s.name === space && !s.machine && typeof s.id === 'string')
+        place = { sp: (found?.id as string | undefined) ?? `sp${randomBase36(32)}`, tb: `tb${randomBase36(32)}`, fresh: !found }
+      }
+    } catch {
+      // no window to ask: the worker runs without a tab
+    }
+  }
+  const labels = place ? ['--label', `herdr.space=${place.sp}`, '--label', `herdr.tab=${place.tb}`] : []
   const r = await host
-    .run([bin, 'run', '--bg', '--json', '--name', name, '--cwd', input.dir, '--label', 'tmux-agent=assign', '--parent', parent, '--', '/usr/bin/env', `PATH=${path}`, prog, ...flags, ...taskFlags, task], input.dir, 15_000)
+    .run([bin, 'run', '--bg', '--json', '--name', name, '--cwd', input.dir, '--label', 'tmux-agent=assign', ...labels, '--parent', parent, '--', '/usr/bin/env', `PATH=${path}`, prog, ...flags, ...taskFlags, task], input.dir, 6_000)
     .catch((err: unknown) => err)
   const error = captureError(r)
   if (error) return { deny: `tmux-agent: hc run failed (${error}); check \`${bin} ls\` before assigning again` }
@@ -656,15 +695,19 @@ export async function assignHc(host: Host, input: AssignInput): Promise<{ receip
     // falls through to the deny below
   }
   if (typeof address !== 'string' || !address) return { deny: `tmux-agent: hc run gave no address: ${(r as RunResult).stdout.trim().slice(0, 200)}; check \`${bin} ls\`` }
-  // Herdr.app lists a child under its parent only; terminal.keep gives it a pane of its own.
-  // The window needs a moment to see a new terminal (seen live: the first call said "no running terminal").
-  const app = await onPath('herdr-app')
-  const kept =
-    app !== undefined &&
-    (await host
-      .run(['sh', '-c', 'for i in 1 2 3 4 5; do "$0" do terminal.keep --terminal "$1" --place right >/dev/null 2>&1 && exit 0; sleep 0.4; done; exit 1', app, address], input.dir, 8_000)
-      .then(k => k.exitCode === 0, () => false))
-  const pane = kept ? 'It has a pane in the Herdr window, right of the focused pane. ' : app ? 'No Herdr pane: herdr-app terminal.keep failed (is the window open?). ' : ''
+  // Name the new space and the tab. The window needs a moment to see a new terminal (seen live: "no tab" at once), so
+  // the tries run in a detached shell: the tool.call hook has 10 s, and an overrun after the launch would look like a
+  // failed assign and invite a second one.
+  if (place) {
+    await host
+      .run(
+        ['sh', '-c', '(for i in 1 2 3 4 5 6 7 8; do ok=1; [ -z "$3" ] || "$0" do space.rename --id "$1" --name "$3" || ok=0; "$0" do tab.rename --id "$2" --name "$4" || ok=0; [ $ok = 1 ] && exit 0; sleep 0.5; done) >/dev/null 2>&1 </dev/null &', app!, place.sp, place.tb, place.fresh ? space : '', name],
+        input.dir,
+        2_000,
+      )
+      .catch(() => undefined)
+  }
+  const pane = place ? `It has a tab in the Herdr space "${space}". ` : space ? 'No Herdr tab: herdr-app is not on PATH or its window is not open. ' : ''
   return {
     receipt:
       `launched "${name}" as hc ${address} (${prog}), backend hc: no result.json, no collector. ${pane}` +

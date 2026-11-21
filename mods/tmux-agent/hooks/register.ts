@@ -123,7 +123,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.53.1'
+const MOD_VERSION = '0.53.2'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -1925,11 +1925,13 @@ export const register: Register = on => {
     const note = gated.note ? { context: [gated.note] } : {}
     // The plugin option `first` (/config) picks the backend tried first, and the TMUX_AGENT_FIRST env overrides it;
     // the other backend takes over only before any launch.
-    const option = (await $.config.list().catch(() => [])).find(row => row.key === 'tmux-agent.first')?.value
+    const rows = await $.config.list().catch(() => [])
+    const option = rows.find(row => row.key === 'tmux-agent.first')?.value
+    const space = rows.find(row => row.key === 'tmux-agent.space')?.value
     const first = hcFirst((await $.env.get('TMUX_AGENT_FIRST')) ?? (typeof option === 'string' ? option : undefined))
     let fellBack = ''
     if (first || (await agentTmuxBin(host)).missing) {
-      const hc = await assignHc(host, input)
+      const hc = await assignHc(host, input, typeof space === 'string' ? space.trim() : undefined)
       if ('deny' in hc) return hc
       if ('receipt' in hc) return { result: first ? hc.receipt : `${hc.receipt} (agent-tmux is missing, so hc took it.)`, ...note }
       if (first) fellBack = ` (hc first fell back to tmux: ${hc.skip}.)`

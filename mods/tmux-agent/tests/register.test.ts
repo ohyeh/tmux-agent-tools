@@ -7035,6 +7035,17 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     expect(JSON.stringify(await $.tool.call(assign()))).toContain('hc first fell back to tmux')
   })
 
+  for (const [value, lists] of [['', 0], ['side', 1]] as const) {
+    test(`plugin option space=${JSON.stringify(value)}: ${lists} herdr-app ls call(s) before the hc launch`, WITH_DRIVER, async ($, on) => {
+      on('config.list', () => ({ value: [FIRST_HC, { ...FIRST_HC, key: 'tmux-agent.space', kind: 'text' as const, value, options: undefined }] }))
+      const sock = `${HOME}/.local/state/herdr-core/default/default.sock`
+      const t = setup(on, undefined, { HOME, PATH: '/b', HC_TERMINAL_ID: 't3' }, { '/b/hc': '', '/b/codex': '', '/b/herdr-app': '', [sock]: '' })
+      await $.tool.call(assign())
+      expect(t.argvs.filter(a => a[0] === '/b/herdr-app' && a[1] === 'ls').length).toBe(lists)
+      expect(t.argvs.some(a => a[0] === '/b/hc' && a[1] === 'run')).toBe(true)
+    })
+  }
+
   test('the TMUX_AGENT_FIRST env overrides the plugin option', WITH_DRIVER, async ($, on) => {
     on('config.list', () => ({ value: [FIRST_HC] }))
     setup(on, undefined, { HOME, TMUX_AGENT_FIRST: 'tmux' })
@@ -7049,6 +7060,7 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     const out = JSON.stringify(await $.tool.call(assign()))
     const run = t.argvs.find(a => a[0] === '/b/hc' && a[1] === 'run')
     expect(run?.slice(-4, -1)).toEqual(['/b/codex', '--yolo', '--no-daemon'])
+    expect(run?.some(a => a.startsWith('herdr.space=')), 'no herdr-app on PATH: no space label').toBe(false)
     // The fake hc prints nothing, so the launch has no address: a deny, and no tmux worker.
     expect(out).toContain('hc run gave no address')
     expect(t.assigned(), 'no tmux launch after an hc attempt').toBe(false)
