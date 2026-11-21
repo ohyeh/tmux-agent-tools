@@ -123,7 +123,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.53.2'
+const MOD_VERSION = '0.53.3'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -1931,7 +1931,9 @@ export const register: Register = on => {
     const first = hcFirst((await $.env.get('TMUX_AGENT_FIRST')) ?? (typeof option === 'string' ? option : undefined))
     let fellBack = ''
     if (first || (await agentTmuxBin(host)).missing) {
-      const hc = await assignHc(host, input, typeof space === 'string' ? space.trim() : undefined)
+      // An option never set reads as '' (seen live), so empty means the default name; `off` asks for no tab.
+      const named = typeof space === 'string' ? space.trim() : ''
+      const hc = await assignHc(host, input, named === 'off' ? '' : named || undefined)
       if ('deny' in hc) return hc
       if ('receipt' in hc) return { result: first ? hc.receipt : `${hc.receipt} (agent-tmux is missing, so hc took it.)`, ...note }
       if (first) fellBack = ` (hc first fell back to tmux: ${hc.skip}.)`

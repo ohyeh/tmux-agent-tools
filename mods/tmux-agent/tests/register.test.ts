@@ -7035,7 +7035,7 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     expect(JSON.stringify(await $.tool.call(assign()))).toContain('hc first fell back to tmux')
   })
 
-  for (const [value, lists] of [['', 0], ['side', 1]] as const) {
+  for (const [value, lists] of [['off', 0], ['', 1], ['side', 1]] as const) {
     test(`plugin option space=${JSON.stringify(value)}: ${lists} herdr-app ls call(s) before the hc launch`, WITH_DRIVER, async ($, on) => {
       on('config.list', () => ({ value: [FIRST_HC, { ...FIRST_HC, key: 'tmux-agent.space', kind: 'text' as const, value, options: undefined }] }))
       const sock = `${HOME}/.local/state/herdr-core/default/default.sock`

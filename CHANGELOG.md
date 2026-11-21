@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.53.3 - 2026-11-21
+
+- Fixed: the option `space` read as an empty string when it was never set, and v0.53.2 took empty as "no tab", so a fresh install opened no tab. Empty now means `workers`; the value `off` asks for no tab.
+
 ## v0.53.2 - 2026-11-21
 
 - New plugin option `space` ("Herdr space for hc workers", default `workers`): each hc worker opens as a tab of that Herdr space. v0.53.0 put the pane right of the focused pane, which had no fixed place.
