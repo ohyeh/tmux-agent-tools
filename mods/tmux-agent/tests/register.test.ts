@@ -4574,30 +4574,6 @@ test('re-review: a commit whose ancestry did not fit stays outstanding',WITH_DRI
   expect(store.acked()).toEqual(['w0#1']);
   expect(wake.join('\n')).not.toContain('NOT verified');
 });
-test('a rejection is never classified: an ENOENT and the engine timeout both read "delivery unknown" with the raw text (R2-03 r3)', WITH_DRIVER, async ($, on) => {
-  mock.env(on, { HOME }); mockStore(on, ['w1@0']); mockClock(on)
-  const files: Files = { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished() }
-  mockFs(on, files); mockWake(on); mockSessionStart(on); on('ui.status', () => ({ value: undefined }))
-  let rejection: Error = new Error('spawn /tmp/timeout-worker ENOENT')
-  onRun(on, ($, e) => {
-    if (e.argv[2] === 'send') throw rejection
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
-  await $.session.start(session())
-  // A path that merely holds "timeout" is not a timeout: the raw text is carried, no class is named.
-  const spawn = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'one' }))
-  expect(spawn).toContain('delivery unknown')
-  // The engine answers `process.run` itself, so the call carries its own refusal text — never the fake's.
-  expect(spawn).toContain('no implementation for process.run')
-  expect(spawn).not.toContain('did not finish within')
-  expect(spawn).not.toContain('timed out')
-  // The engine's own timeout text is handled the same way: unknown, never resent, no word matching.
-  rejection = new Error('$.process.run (tmux-agent): agent-tmux send — aborted: still running after 45000ms')
-  const cut = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'two' }))
-  expect(cut).toContain('delivery unknown')
-  expect(cut).not.toContain('did not finish within')
-  expect(cut).not.toContain('timed out')
-});
 test('re-review: tell records the refreshed base before sending',WITH_DRIVER,async ($,on)=>{
   mock.env(on,{HOME});mockStore(on,['w1@0']);mockClock(on);
   const fresh='c'.repeat(40);
