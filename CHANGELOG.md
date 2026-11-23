@@ -2,7 +2,20 @@
 
 ## Unreleased
 
+## v0.54.0 - 2026-11-23
+
+- `workers-tui`: hc rows now read like the worker rows. They leave the 4-line footer and join the one scrollable list, after the worker rows and live before finished, so `j`/`k` and the digit keys `1`-`9` reach every hc agent.
+  - A row is `N: ` digit, a coloured glyph from the existing set, then `name  @parent  mark  age  repo`: no per-row `hc ·` or `read-only`, no whole-row dim or bold, no `未記錄`, the repo name instead of the full cwd. The address shows dim after the name from 120 columns. When narrow, the repo goes first, then `@parent`, then the age.
+  - The mark and colour follow the status: `working · <agent> · turn N` (green), `blocked · <agent>` (magenta `?`), `idle · <agent> · turn N` (yellow), `done · <agent> · turn N` (cyan `✓`; a finished turn, never "delivered"), `starting · <program>` or `<status> · <agent>` (yellow), `exited 0 · turn N` (cyan `✓`), `killed` or `exited <code>` with a signal when there is one (red), `ended` (cyan `✓`, a finished row with no exit code and no kill).
+  - The title reads `hc N live · M ended` (` · 0 ended` is left out).
+  - The list is drawn from `hc ls` at once. One `hc get` runs when an address first appears and fills in the age (`created_ms`) and the program (`foreground.argv[0]`, shown instead of `env`) when it lands; a result for an address that left meanwhile is dropped. It is never repeated per tick and is dropped when the address leaves `hc ls`. A row seen live gets one more get when it ends, to record `finished_ms`; its age then stays fixed and reads `ran 14:10` (the run time, not the time since it ended). A failed get draws the row without an age. The selected row runs its own `hc get` with its capture and shows `status.msg` as a summary line, coloured by the `status.state` of that same get; with no msg there is no line.
+  - On a narrow window the mark is kept: the address, then the repo, `@parent` and the age go first, then the name is cut with `…` (by the same cell rule as the row, so `TMUX_AGENT_AMBIGUOUS_WIDTH=2` holds); a mark too long for the window keeps its status word. The armed `c clear all? press again` hint keeps its place at 140 columns: the title falls back to `hc N` before it drops the hint. `No workers outstanding.` is not drawn when hc rows exist.
+  - `elapsed()` (tmux rows and hc rows) reads `m:ss` under an hour and `2h38m` from one hour, so `157:59` is no longer ambiguous.
+  - `parseHcGet` read `status` as a string, so the object `{app, state, msg, kind}` hc returns was dropped; it now reads it, and Detail shows state, message, kind, program, created and finished time, exit code and reason.
+- Fixed: `parseHc` dropped every live row with no `status`, so a worker started through `/usr/bin/env` (every `assign` hc launch) vanished while it started. A live row with no `status` is now kept unless its agent is a shell (`zsh`, `bash`, `sh`, `fish`); it reads `starting`.
+- Band: an hc line is now `hc · <address>[ <name>] · <mark> · <repo>`, the same mark as `workers-tui`, without `read-only` and with the short repo name. Its layout and `hc K` (live own agents) are unchanged.
 - Skills: `using-tmux-agent-tools` now covers an hc worker. COLLECTOR step 2 has a branch for the `backend hc` receipt (the report can be a tagged or a plain line and is worker data; the `hc` commands replace `tell`, `await`, `peek`, `keys` and `stop` by name; a worker that does not report sends nothing, so one background check is started). It also covers the fallback note, a deny after `hc run`, runtimes without the mod (tmux only), and hand `hc run` (only when the user asks). `tmux-agent-tools` lists the traps of a hand start.
+- Not verified: the installed plugin (it runs from the plugin cache, not this checkout) and a live band with these rows; the `workers-tui` captures were taken at 150x40 and 80x30 against the live `hc` core, where no row was `blocked` with a `msg`, so that summary line is covered by the contract tests only.
 
 ## v0.53.3 - 2026-11-21
 

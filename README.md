@@ -218,10 +218,17 @@ workers-tui                                      # viewer: every worker, labeled
 ```
 
 - hc agents: when `hc` (herdr-core, the server Herdr.app shows) is on `PATH` and its core
-  runs, the footer lists up to 4 of its agent terminals (all machines), then `+N more` (`hc ls`
-  has the rest), read-only: address and name, kind, status, owner (`@<parent>`, the hc terminal
-  it was started from, else `未記錄`) and cwd. The title adds `hc N` (`hc ?` when the read
-  fails). No key acts on them. Homebrew `herdr` (`herdr agent list`) is no longer shown.
+  runs, its agent terminals (all machines) are rows of the one list, after the worker rows
+  and live before finished. A row reads like a worker row: `N: ` digit, a coloured glyph
+  (`●` working or idle or starting, `?` blocked, `✓` done or exited 0, red `●` killed or
+  non-zero exit), then `name  @parent  mark  age  repo`. The mark is `working · <agent> · turn N`,
+  `blocked · <agent>`, `idle · <agent> · turn N`, `done · <agent> · turn N`, `starting · <program>`,
+  `exited 0 · turn N`, `killed`, `exited <code>` or `ended`; `done` is a finished turn, not a
+  delivery. The list is drawn from `hc ls` at once; the age (`m:ss`, `2h38m` from an hour) and the
+  program name come from one `hc get` when an address first appears (never one per tick), and a row
+  that ends gets one more for its finish time, after which its age stays fixed and reads `ran 14:10` (the run time). The selected row shows its `status.msg` as a summary line when it has
+  one. The title adds `hc N live · M ended` (`hc ?` when the read fails). `j`/`k` and `1`–`9`
+  reach every hc row. The viewer stays read-only. Homebrew `herdr` (`herdr agent list`) is not shown.
 
 - Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI holds
   that session. Without one it is a viewer. `e` in a viewer opens the session

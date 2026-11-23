@@ -38,7 +38,9 @@ import {
   ageText,
   deleteWorker,
   hcFinished,
+  elapsed,
   parseHc,
+  herdrLabel,
   scan,
   type Health,
 } from './workers.ts'
@@ -89,6 +91,8 @@ import {
   hcDetailText,
   mirrorHc,
   readHcDetail,
+  parseHcGet,
+  type HcInfo,
 } from './tui.node.ts'
 import { eawOf, EAW_UNICODE_VERSION } from './eaw-table.ts'
 
@@ -2118,6 +2122,8 @@ test('no-mutation tui: a live pane status leaves paths, mtimes, and contents', {
     const host = {
       ...base,
       envTmuxAgentDir: async () => root,
+      // The developer's own hc core must not add rows (and renders) to this count of writes.
+      envHome: async () => root,
       run: async (argv: readonly string[], cwd?: string, timeoutMs?: number) => {
         const call = await wrapperCall(host, argv)
         const cmd = [...call.argv]
@@ -3843,7 +3849,7 @@ test('render: a repaint overwrites in place, an identical frame writes nothing, 
   }
 })
 
-test('hc agents: every agent listed with @parent or 未記錄; counted in the title; j/k reach only drawn hc rows', () => {
+test('hc agents: rows after the tmux rows with @parent when there is one; counted live/ended in the title; j/k and digits reach every hc row', () => {
   const agents: HcAgent[] = [
     { address: 't1', agent: 'agy', cwd: '/a', status: 'idle', where: 'a / 1', name: 'agy-crash', parent: 't11' },
     { address: 'codex-mbpr/t10', agent: 'codex', cwd: '/b', status: 'working', where: 'b / 1' },
@@ -3851,8 +3857,9 @@ test('hc agents: every agent listed with @parent or 未記錄; counted in the ti
   const state: TuiState = { ...ownerState(), selected: undefined, herdr: agents }
   const drawn = renderTuiLines(state, 160, 24, 1).map(stripAnsi)
   assert.match(drawn[0]!, /tmux 1 · hc 2/)
-  assert.ok(drawn.some(l => l.includes('hc · t1 agy-crash · agy · idle · read-only · @t11 · /a')), drawn.join('\n'))
-  assert.ok(drawn.some(l => l.includes('hc · codex-mbpr/t10 · codex · working · read-only · 未記錄 · /b')), drawn.join('\n'))
+  assert.ok(drawn.includes('2: ●   agy-crash t1  @t11  idle · agy  a'), drawn.join('\n'))
+  assert.ok(drawn.includes('3: ●   codex-mbpr/t10  working · codex  b'), drawn.join('\n'))
+  assert.ok(!drawn.join('\n').includes('read-only · @') && !drawn.join('\n').includes('未記錄'), 'no per-row hc · / read-only / 未記錄 text')
   // j/k move from worker rows onto drawn hc rows and back.
   const j1 = nextKeyState(state, 'j', 1).state
   assert.equal(j1.selected, 'w1')
@@ -3866,30 +3873,43 @@ test('hc agents: every agent listed with @parent or 未記錄; counted in the ti
 
   assert.match(renderTuiLines({ ...state, herdr: '?' }, 160, 24, 1)[0]!, /hc \?/)
   assert.doesNotMatch(renderTuiLines({ ...state, herdr: undefined }, 160, 24, 1)[0]!, /herdr/)
-  // Twenty agents: four lines and a count, so the worker rows keep their room; j/k reach only the 4 drawn hc rows.
+  // Twenty agents share the one scrollable list: a cut list ends on `+N more`, and j/k and the digits reach past the 4th.
   const many = Array.from({ length: 20 }, (_, i) => ({ ...agents[1]!, address: `h${i}` }))
   const crowdedState: TuiState = { ...state, herdr: many }
-  const crowded = renderTuiLines(crowdedState, 160, 24, 1).map(stripAnsi)
-  assert.equal(crowded.filter(l => l.includes('hc · h')).length, 4, crowded.join('\n'))
-  assert.match(crowded[0]!, /hc 20/)
-  assert.ok(crowded.some(l => l.includes('+16 more hc agents (hc ls)')), crowded.join('\n'))
+  const crowded = renderTuiLines(crowdedState, 160, 12, 1).map(stripAnsi)
+  assert.match(crowded[0]!, /hc 20 live/)
+  assert.ok(crowded.some(l => /^  \+\d+ more — j\/k moves the selection/.test(l)), crowded.join('\n'))
+  assert.ok(!crowded.some(l => l.includes('more hc agents')), 'no footer count line')
   assert.ok(crowded.some(l => l.includes('w1')), 'the worker still has room')
   let cur = crowdedState
   const visited: (string | undefined)[] = []
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 22; i++) {
     cur = nextKeyState(cur, 'j', 1).state
     visited.push(cur.selected)
   }
-  assert.deepEqual(visited, ['w1', hcId('h0'), hcId('h1'), hcId('h2'), hcId('h3'), 'w1'])
+  assert.deepEqual(visited, ['w1', ...many.map(a => hcId(a.address)), 'w1'])
+  // After the last hc row: the selected row is drawn although the list is cut.
+  const last = nextKeyState(crowdedState, 'k', 1).state
+  assert.equal(last.selected, hcId('h19'))
+  assert.ok(renderTuiLines(last, 160, 12, 1).map(stripAnsi).some(l => l.includes('›') && l.includes('h19')), 'the scrolled list shows the selected hc row')
 
   const noWorkers = { ...state, rows: [], all: [] }
   assert.equal(nextKeyState(noWorkers, 'j', 1).state.selected, hcId('t1'))
   assert.equal(nextKeyState(noWorkers, 'k', 1).state.selected, hcId('codex-mbpr/t10'))
-  for (const key of ['1', 'x', 'i', 't', '-', 'U', 'd', '\r']) {
+  for (const key of ['x', 'i', 't', '-', 'U', 'd', '\r']) {
     const next = nextKeyState(noWorkers, key, 1)
     assert.equal(next.state.selected, undefined, key)
     assert.equal(next.action, undefined, key)
   }
+  // Digits count tmux rows first, then hc rows; a digit past the list does nothing, a second press deselects.
+  assert.equal(nextKeyState(noWorkers, '1', 1).state.selected, hcId('t1'), 'with no tmux rows, 1 is the first hc row')
+  assert.equal(nextKeyState(noWorkers, '2', 1).state.selected, hcId('codex-mbpr/t10'))
+  assert.equal(nextKeyState(noWorkers, '3', 1).state.selected, undefined)
+  assert.equal(nextKeyState(state, '2', 1).state.selected, hcId('t1'), 'one tmux row: 2 is the first hc row')
+  assert.equal(nextKeyState(nextKeyState(state, '2', 1).state, '2', 1).state.selected, undefined)
+  const nine = { ...noWorkers, herdr: Array.from({ length: 12 }, (_, i) => ({ ...agents[1]!, address: `n${i}` })) }
+  assert.equal(nextKeyState(nine, '9', 1).state.selected, hcId('n8'))
+  assert.ok(renderTuiLines(nine, 160, 30, 1).map(stripAnsi).some(l => l.startsWith('   ●   n9 ')), 'rows after the 9th have no digit')
 })
 
 test('hc key-state: worker-only keys do nothing; d/c work on finished hc; ticks preserve or drop hc selection; Enter walks list -> preview -> Detail -> attach', () => {
@@ -4079,7 +4099,8 @@ test('hc preview, Detail and attach: reads only selected row, restores tty befor
   })
   try {
     await until(() => stdout.written.includes('hc 2') && stdout.written.includes('w1.abcde'), 5_000, 'initial hc render')
-    assert.deepEqual(hcCalls, [[bin, 'ls', '--all', '--json']], 'unselected hc rows never run hc read/get')
+    // One ls, then one get per NEW address (the row cache): no read, and nothing for the unselected rows beyond that.
+    assert.deepEqual(hcCalls.map(a => a.slice(1).join(' ')).sort(), ['get t1 --json', 'get t2 --json', 'ls --all --json'], 'unselected hc rows run no read, one cache get each')
 
     // First j selects w1.abcde; second j selects hc:t1.
     stdin.emit('data', 'j')
@@ -4088,19 +4109,20 @@ test('hc preview, Detail and attach: reads only selected row, restores tty befor
     await until(() => stdout.written.includes('hc-screen-beta'), 5_000, 'hc preview rendered')
     const reads = hcCalls.filter(a => a[1] === 'read')
     assert.deepEqual(reads, [[bin, 'read', 't1', '--lines', String(MIRROR_HISTORY)]])
-    assert.ok(!hcCalls.some(a => a.includes('t2')), 'unselected hc row t2 is never read')
+    assert.ok(!hcCalls.some(a => a[1] === 'read' && a.includes('t2')), 'unselected hc row t2 is never read')
     assert.ok(stripAnsi(stdout.written).includes('See it whole: hc attach t1'))
 
     // Worker-only keys do nothing on the live hc row.
     stdin.emit('data', 'xt')
     await new Promise(r => setTimeout(r, 30))
-    assert.equal(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read').length, 0)
+    assert.equal(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read' && a[1] !== 'get').length, 0)
 
     // Enter opens Detail with hc get fields + preview + watch-only hint in viewer mode.
     stdin.emit('data', '\r')
     await until(() => stdout.written.includes('turn: 7'), 5_000, 'hc detail rendered')
     const gets = hcCalls.filter(a => a[1] === 'get')
-    assert.deepEqual(gets, [[bin, 'get', 't1', '--json']])
+    // t1: its cache get, its selection get (the summary), and Detail's own; t2: only its cache get.
+    assert.deepEqual(gets.map(a => a[2]).sort(), ['t1', 't1', 't1', 't2'])
     const detailScreen = stripAnsi(stdout.written)
     for (const want of ['address: t1', 'name: agy-one', 'agent: agy', 'status: idle', 'cwd: /a', 'parent: @t11', 'turn: 7', 'hc-screen-alpha', 'watch-only']) {
       assert.ok(detailScreen.includes(want), `detail missing ${want}`)
@@ -4255,9 +4277,14 @@ test('hc tick: ls success, rejected read and undefined update the title without 
   host.envHome = async () => root
   host.exists = async path => path === bin ? true : path === socket ? phase !== 'undefined' : exists(path)
   let reads = 0
+  let gets = 0
   host.run = async argv => {
     if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
-    assert.deepEqual(argv, [bin, 'ls', '--all', '--json'], 'only the read command is allowed')
+    if (argv[1] === 'get') {
+      gets++
+      return { exitCode: 0, stdout: JSON.stringify({ address: 't1', agent: 'codex', status: { app: 'codex', state: 'idle' }, cwd: '/a' }), stderr: '' }
+    }
+    assert.deepEqual(argv, [bin, 'ls', '--all', '--json'], 'only ls and the one get per new address are allowed')
     reads++
     if (phase === 'rejected') throw new Error('fixture: hc read rejected')
     return { exitCode: 0, stdout: JSON.stringify({ terminals: [
@@ -4273,6 +4300,7 @@ test('hc tick: ls success, rejected read and undefined update the title without 
     stdin.emit('data', 'r')
     await until(() => stdout.written.includes('hc ?'), 5_000, 'hc rejected title')
     assert.equal(reads, 2)
+    assert.equal(gets, 1, 'one get for t1 in all, not one per tick')
     phase = 'undefined'
     stdout.written = ''
     stdin.emit('data', 'r')
@@ -4312,6 +4340,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     hcCalls.push([...argv])
     if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals }), stderr: '' }
     if (argv[1] === 'read') return { exitCode: 0, stdout: 'hc-pane\n', stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify({ address: argv[2], status: null }), stderr: '' }
     if (argv[1] === 'kill') {
       terminals = terminals.map(t => (t.address === argv[2] ? { ...t, state: 'finished' } : t))
       return { exitCode: 0, stdout: '', stderr: '' }
@@ -4324,20 +4353,21 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
   }
 
   const { stdin, stdout } = mockTty()
+  const plain = () => stripAnsi(stdout.written)
   stdout.columns = 140
   const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000, rowsMs: 60_000 })
   try {
     // 2 live (t1, t3), 1 own finished (t2); t4 (other parent) is excluded.
-    await until(() => stdout.written.includes('hc 2') && stdout.written.includes('t2 done-one · codex · finished'), 5_000, 'initial hc 2 with own finished render')
+    await until(() => plain().includes('hc 2 live · 1 ended') && plain().includes('done-one t2'), 5_000, 'initial hc 2 live, 1 ended render')
     assert.ok(!stripAnsi(stdout.written).includes('other-done'), 'other parent finished row is excluded')
 
     stdin.emit('data', 'e')
     // Select live t1, ensure t does not call hc, then arm + confirm x x -> hc kill t1 (stays listed as finished; hc count drops to 1).
     stdin.emit('data', 'j')
-    await until(() => stdout.written.includes('› hc · t1 live-one') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
+    await until(() => plain().includes('› live-one t1') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
     stdin.emit('data', 't')
     await new Promise(r => setTimeout(r, 30))
-    assert.deepEqual(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read'), [])
+    assert.deepEqual(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read' && a[1] !== 'get'), [])
 
     stdin.emit('data', 'x')
     await until(() => stdout.written.includes('stop live-one? press again'), 5_000, 't1 armed')
@@ -4345,13 +4375,13 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
     stdout.written = ''
     stdin.emit('data', 'x')
-    await until(() => hcCalls.some(a => a[1] === 'kill' && a[2] === 't1') && stdout.written.includes('hc 1') && stdout.written.includes('t1 live-one · agy · finished'), 5_000, 'hc kill t1 leaves finished row')
+    await until(() => hcCalls.some(a => a[1] === 'kill' && a[2] === 't1') && plain().includes('hc 1 live · 2 ended') && /live-one t1 .*ended/.test(plain()), 5_000, 'hc kill t1 leaves finished row')
     assert.deepEqual(hcCalls.filter(a => a[1] === 'kill'), [[bin, 'kill', 't1']])
 
     // Leave edit mode (preview), select finished t2, arm + confirm d d -> hc rm t2.
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => stdout.written.includes('› hc · t2 done-one') && stdout.written.includes('[ d delete ]'), 5_000, 't2 selected in preview')
+    await until(() => plain().includes('› done-one t2') && stdout.written.includes('[ d delete ]'), 5_000, 't2 selected in preview')
     stdin.emit('data', 'd')
     await until(() => stdout.written.includes('delete done-one? press again'), 5_000, 't2 d armed')
     await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
@@ -4359,7 +4389,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     stdin.emit('data', 'd')
     await until(() => hcCalls.some(a => a[1] === 'rm' && a[2] === 't2') && stdout.written.includes('hc 1'), 5_000, 'hc rm t2 ran via d')
     assert.deepEqual(hcCalls.filter(a => a[1] === 'rm'), [[bin, 'rm', 't2']])
-    assert.ok(!stripAnsi(stdout.written).includes('t2 done-one'), 't2 removed from list')
+    assert.ok(!plain().includes('done-one t2'), 't2 removed from list (its row text is `done-one t2`)')
 
     // Re-enter edit mode and press c twice: clears remaining own finished row (t1) via hc rm; live t3 and other parent t4 stay untouched.
     stdin.emit('data', 'e')
@@ -4375,7 +4405,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
 
     // When socket probe fails before confirming x x on t3, no hc command is run.
     stdin.emit('data', 'j')
-    await until(() => stdout.written.includes('› hc · t3 live-two'), 5_000, 't3 selected')
+    await until(() => plain().includes('› live-two t3'), 5_000, 't3 selected')
     stdin.emit('data', 'x')
     await until(() => stdout.written.includes('stop live-two? press again'), 5_000, 't3 armed')
     const countBeforeDrop = hcCalls.length
@@ -4421,23 +4451,25 @@ test('hc own terminal: excludes $HC_TERMINAL_ID from tui rows so it cannot be se
       }
     }
     if (argv[1] === 'read') return { exitCode: 0, stdout: 'child-pane\n', stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify({ address: argv[2], status: null }), stderr: '' }
     throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
   }
 
   const { stdin, stdout } = mockTty()
+  const plain = () => stripAnsi(stdout.written)
   stdout.columns = 140
   const run = runTui({ stdin, stdout, host, session: 'S', cwd: repo, root, mirrorMs: 60_000, rowsMs: 60_000 })
   try {
-    await until(() => stdout.written.includes('hc 1') && stdout.written.includes('t1 child-term'), 5_000, 'filtered hc 1 render')
+    await until(() => plain().includes('hc 1 live') && plain().includes('child-term t1'), 5_000, 'filtered hc 1 render')
     const screen = stripAnsi(stdout.written)
-    assert.ok(!screen.includes('hc · t11'), 'own hc terminal is excluded')
+    assert.ok(!screen.includes(' t11 '), 'own hc terminal is excluded')
     assert.ok(!screen.includes('self-term'), 'own hc terminal name is excluded')
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => stdout.written.includes('› hc · t1 child-term'), 5_000, 'only child t1 is selectable')
+    await until(() => plain().includes('› child-term t1'), 5_000, 'only child t1 is selectable')
     stdin.emit('data', 'j')
     await new Promise(r => setTimeout(r, 30))
-    assert.ok(!stripAnsi(stdout.written).includes('› hc · t11'), 'second j never selects own terminal')
+    assert.ok(!stripAnsi(stdout.written).includes('› t11'), 'second j never selects own terminal')
     assert.equal(hcCalls.filter(a => a[1] === 'kill' || a[1] === 'rm').length, 0)
   } finally {
     stdin.emit('data', '\x03')
@@ -4476,4 +4508,539 @@ test('parseHc keeps a finished record without status (hc drops it on finish) and
   ] }))
   assert.deepEqual(out.map(a => a.address), ['t19', 't11'])
   assert.ok(hcFinished(out[0]!))
+})
+
+// --- hc rows reach parity with the tmux rows (Phase 1) ---
+
+const ESC = '\x1b'
+const hcState = (herdr: HcAgent[], hcInfo?: Record<string, HcInfo>, over: Partial<TuiState> = {}): TuiState => ({
+  ...ownerState(), rows: [], all: [], selected: undefined, herdr, ...(hcInfo ? { hcInfo } : {}), ...over,
+})
+const hcAg = (address: string, over: Partial<HcAgent> = {}): HcAgent => ({ address, agent: 'agy', status: 'working', cwd: '/work/proj', where: 'w / 1', ...over })
+
+test('hc row grammar: one case per mapping row, whole-string compare, no null/undefined/NaN', () => {
+  const now = 10_000_000
+  const made = now - 125_000
+  const D = (addr: string) => `${ESC}[2m${addr}${ESC}[0m`
+  const par = { parent: '25006931paul/t1m' }
+  // [agent, info, glyph colour (SGR), glyph, label]. Width 200: the address shows after the name; the age is `elapsed()` like a tmux row.
+  const cases: [HcAgent, HcInfo | undefined, string, string, string][] = [
+    [hcAg('a1', { name: 'nm', agent: 'claude-code', status: 'working', turn: 3, ...par }), { createdMs: made }, '32', '● ', `  nm ${D('a1')}  @t1m  working · claude-code · turn 3  2:05  proj`],
+    [hcAg('a2', { name: 'nm', agent: 'codex', status: 'blocked', turn: 5 }), { createdMs: made }, '35', '? ', `  nm ${D('a2')}  blocked · codex  2:05  proj`],
+    [hcAg('a3', { name: 'nm', status: 'idle', turn: 2 }), { createdMs: made }, '33', '● ', `  nm ${D('a3')}  idle · agy · turn 2  2:05  proj`],
+    [hcAg('a4', { name: 'nm', agent: 'claude-code', status: 'done', turn: 9 }), { createdMs: made }, '36', '✓ ', `  nm ${D('a4')}  done · claude-code · turn 9  2:05  proj`],
+    [hcAg('a5', { name: 'nm', agent: 'env', status: '' }), { createdMs: made, program: 'claude' }, '33', '● ', `  nm ${D('a5')}  starting · claude  2:05  proj`],
+    [hcAg('a6', { name: 'nm', status: 'paused' }), { createdMs: made }, '33', '● ', `  nm ${D('a6')}  paused · agy  2:05  proj`],
+    [hcAg('a7', { name: 'nm', agent: 'env', status: 'working', turn: 1 }), { createdMs: made, program: 'codex' }, '32', '● ', `  nm ${D('a7')}  working · codex · turn 1  2:05  proj`],
+    [hcAg('a8', { name: 'nm', agent: 'env', status: '', state: 'finished', exitCode: 0, reason: 'exited', turn: 4 }), { createdMs: made, finishedMs: made + 61_000 }, '36', '✓ ', `  nm ${D('a8')}  exited 0 · turn 4  ran 1:01  proj`],
+    [hcAg('a9', { name: 'nm', status: '', state: 'finished', exitCode: 0, reason: 'killed', signal: 9 }), { createdMs: made, finishedMs: made + 5_000 }, '31', '● ', `  nm ${D('a9')}  killed · signal 9  ran 0:05  proj`],
+    [hcAg('a10', { name: 'nm', status: '', state: 'finished', exitCode: 3 }), { createdMs: made, finishedMs: made + 5_000 }, '31', '● ', `  nm ${D('a10')}  exited 3  ran 0:05  proj`],
+    [hcAg('a11', { name: 'nm', status: '', state: 'finished', reason: 'lost' }), undefined, '36', '✓ ', `  nm ${D('a11')}  ended  proj`],
+    [hcAg('a12', { name: 'nm', status: 'working' }), {}, '32', '● ', `  nm ${D('a12')}  working · agy  proj`],
+    [hcAg('a13', { status: 'working' }), undefined, '32', '● ', '  a13  working · agy  proj'],
+    [hcAg('a14', { name: 'nm', status: '', state: 'finished', exitCode: 2 }), { createdMs: made }, '31', '● ', `  nm ${D('a14')}  exited 2  proj`],
+  ]
+  const state = hcState(cases.map(c => c[0]), Object.fromEntries(cases.filter(c => c[1]).map(c => [c[0].address, c[1]!])))
+  const lines = renderTuiLines(state, 200, 40, now)
+  const first = lines.findIndex(l => l.startsWith('1: '))
+  assert.ok(first >= 0, lines.join('\n'))
+  const want = cases.map(([, , color, glyph, label], i) => `${i < 9 ? `${i + 1}: ` : '   '}${ESC}[${color}m${ESC}[1m${glyph}${ESC}[0m${label}`)
+  assert.deepEqual(lines.slice(first, first + cases.length), want)
+  assert.ok(!/null|undefined|NaN/.test(lines.join('\n')), 'no null/undefined/NaN on any row')
+})
+
+test('hc row grammar: selected row marker, narrow truncation order (repo, @parent, age), address only from 120 columns', () => {
+  const now = 10_000_000
+  const a = hcAg('a1', { name: 'nm', agent: 'claude-code', status: 'working', turn: 3, parent: 'x/p' })
+  const row = (width: number, selected = false) => {
+    const lines = renderTuiLines(hcState([a], { a1: { createdMs: now - 125_000 } }, selected ? { selected: hcId('a1') } : {}), width, 30, now).map(stripAnsi)
+    return lines.find(l => l.startsWith('1: '))!
+  }
+  const full = '1: ●   nm  @p  working · claude-code · turn 3  2:05  proj'
+  assert.equal(row(57), full)
+  assert.equal(row(56), '1: ●   nm  @p  working · claude-code · turn 3  2:05', 'repo goes first')
+  assert.equal(row(51), '1: ●   nm  @p  working · claude-code · turn 3  2:05')
+  assert.equal(row(50), '1: ●   nm  working · claude-code · turn 3  2:05', 'then @parent')
+  assert.equal(row(47), '1: ●   nm  working · claude-code · turn 3  2:05')
+  assert.equal(row(46), '1: ●   nm  working · claude-code · turn 3', 'then the age')
+  assert.equal(row(41), '1: ●   nm  working · claude-code · turn 3')
+  assert.equal(row(40), '1: ●   …  working · claude-code · turn 3', 'the mark keeps its room; the name takes the cut')
+  assert.equal(row(57, true), '1: ● › nm  @p  working · claude-code · turn 3  2:05  proj')
+  assert.equal(row(120), '1: ●   nm a1  @p  working · claude-code · turn 3  2:05  proj', 'the address shows from 120 columns, after the name')
+  assert.ok(!row(119).includes('a1  @p'), 'and not before')
+})
+
+test('hc rows: header counts live and ended; the footer carries no hc line; the band label shares the mark text', () => {
+  const live = hcAg('a1', { name: 'one', turn: 1 })
+  const ended = hcAg('a2', { name: 'two', status: '', state: 'finished', exitCode: 0, reason: 'exited' })
+  assert.match(renderTuiLines(hcState([live, ended]), 160, 24, 1)[0]!, /hc 1 live · 1 ended/)
+  assert.match(renderTuiLines(hcState([live]), 160, 24, 1)[0]!, /hc 1 live(?! ·)/, 'nothing ended: no ` · 0 ended`')
+  const drawn = renderTuiLines(hcState([live, ended]), 160, 24, 1).map(stripAnsi)
+  assert.ok(!drawn.some(l => l.includes('read-only · ') || l.includes('hc · ')), 'no per-row hc · or read-only text')
+  assert.equal(herdrLabel(hcAg('t20', { name: 'mine', status: 'idle', turn: 1 })), 'hc · t20 mine · idle · agy · turn 1 · proj')
+  assert.equal(herdrLabel(hcAg('t21', { status: '', state: 'finished', reason: 'killed' })), 'hc · t21 · killed · proj')
+})
+
+test('parseHc: a live row with no status is kept unless its agent is a shell; finished rows are kept; turn, exit_code, reason, signal are read', () => {
+  const out = parseHc(JSON.stringify({ terminals: [
+    { address: 'e1', agent: 'env', name: 'assigned', parent: 't11', state: 'live', cwd: '/w', where: 'w', turn: 0 },
+    { address: 'e2', agent: 'env', state: 'live', cwd: '/w', where: 'w' },
+    { address: 'z1', agent: 'zsh', state: 'live', cwd: '/w', where: 'w' },
+    { address: 'z2', agent: 'bash', name: 'named', parent: 't11', state: 'live', status: null, cwd: '/w', where: 'w' },
+    { address: 'z3', agent: 'fish', state: 'live', status: null },
+    { address: 'z4', agent: 'sh', state: 'live' },
+    { address: 'k1', agent: 'zsh', state: 'finished', exit_code: 1, reason: 'killed', signal: 9, turn: 3 },
+    { address: 'w1', agent: 'zsh', state: 'live', status: 'working', turn: 7 },
+  ] }))
+  assert.deepEqual(out.map(a => a.address), ['e1', 'e2', 'k1', 'w1'], 'named env row kept, bare zsh dropped, a named or parented shell with no status still dropped')
+  assert.equal(out[0]!.status, '')
+  assert.deepEqual(out[2], { address: 'k1', agent: 'zsh', status: '', cwd: '?', where: '?', state: 'finished', turn: 3, exitCode: 1, reason: 'killed', signal: 9 })
+  const shown = renderTuiLines(hcState(out.slice(0, 2)), 160, 24, 1).map(stripAnsi)
+  assert.ok(shown.includes('1: ●   assigned e1  @t11  starting · env  w'), shown.join('\n'))
+  assert.ok(shown.some(l => l.startsWith('2: ●   e2  starting · env')), shown.join('\n'))
+})
+
+test('parseHcGet reads the status object (state, msg, kind, app) and the program, created and finished times', () => {
+  const fb = hcAg('t1', { status: 'idle' })
+  const det = parseHcGet(JSON.stringify({
+    address: 't1', agent: 'claude-code', cwd: '/w', turn: 4, created_ms: 1_000, finished_ms: 9_000, exit_code: 0, reason: 'exited',
+    status: { app: 'claude-code', state: 'blocked', kind: 'question', msg: 'Pick a branch' },
+    foreground: { argv: ['/opt/homebrew/bin/claude', '--x'], cwd: '/w' },
+  }), fb)
+  assert.equal(det.status, 'blocked')
+  assert.equal(det.msg, 'Pick a branch')
+  assert.equal(det.kind, 'question')
+  assert.equal(det.app, 'claude-code')
+  assert.equal(det.program, 'claude')
+  assert.deepEqual([det.createdMs, det.finishedMs, det.exitCode, det.reason], [1_000, 9_000, 0, 'exited'])
+  const text = hcDetailText(det).join('\n')
+  for (const want of ['status: blocked (question)', 'message: Pick a branch', 'program: claude', 'created: 1970-01-01T00:00:01Z', 'finished: 1970-01-01T00:00:09Z', 'exit: 0 · exited']) assert.ok(text.includes(want), want)
+  // A plain-string status (older hc) and a null status still read; a missing foreground gives no program.
+  assert.equal(parseHcGet(JSON.stringify({ address: 't1', status: 'working' }), fb).status, 'working')
+  const none = parseHcGet(JSON.stringify({ address: 't1', status: null, argv: ['/usr/bin/env', 'x'] }), fb)
+  assert.equal(none.status, 'idle')
+  assert.equal(none.program, undefined)
+  assert.equal(none.msg, undefined)
+})
+
+test('hc selected row: the summary line is status.msg in the status colour, and no msg means no line', () => {
+  const blocked = hcAg('a1', { name: 'nm', status: 'blocked' })
+  const base = hcState([blocked], undefined, { selected: hcId('a1'), mode: 'preview' })
+  const withMsg = renderTuiLines({ ...base, hcMsg: { address: 'a1', msg: 'Need a decision' } }, 160, 24, 1)
+  const at = withMsg.findIndex(l => l.includes('Need a decision'))
+  assert.equal(withMsg[at], `    ${ESC}[35mNeed a decision${ESC}[0m`, 'magenta: the blocked colour')
+  assert.ok(withMsg[at + 1]!.includes('Enter detail'), 'the hints stay, under the summary')
+  assert.ok(!withMsg.some(l => l.includes('Need a decision') && l !== withMsg[at]))
+  const none = renderTuiLines(base, 160, 24, 1)
+  const stale = renderTuiLines({ ...base, hcMsg: { address: 'other', msg: 'old' } }, 160, 24, 1)
+  assert.ok(!none.some(l => l.includes('Need a decision')) && !stale.some(l => l.includes('old')), 'no msg, no fake summary')
+  assert.equal(none.length, withMsg.length)
+  assert.equal(none.findIndex(l => l.includes('Enter detail')), at, 'with no summary the hints take its place')
+})
+
+test('hc rows past the 4th: j/k and the digit keys reach them, and the drawn list scrolls to the selected row', () => {
+  const agents = Array.from({ length: 7 }, (_, i) => hcAg(`h${i}`, { name: `n${i}` }))
+  const state = hcState(agents, undefined, { rows: ownerState().rows, all: ownerState().all, selected: 'w1' })
+  let cur = state
+  for (let i = 0; i < 6; i++) cur = nextKeyState(cur, 'j', 1).state
+  assert.equal(cur.selected, hcId('h5'), 'j reaches the 6th hc row')
+  assert.equal(nextKeyState(state, '6', 1).state.selected, hcId('h4'), 'digit 6 = tmux row 1 + the 5th hc row')
+  assert.equal(nextKeyState(state, 'k', 1).state.selected, hcId('h6'), 'k from the first row wraps to the last hc row')
+  const short = renderTuiLines(nextKeyState(state, '8', 1).state, 120, 14, 1).map(stripAnsi)
+  assert.ok(short.some(l => l.includes('›') && l.includes('n6')), short.join('\n'))
+  assert.ok(short.some(l => l.includes('more — j/k moves the selection')), short.join('\n'))
+})
+
+test('hc selection survives a tick by address, whatever the order', () => {
+  const a = hcAg('a'), b = hcAg('b', { name: 'bee' }), c = hcAg('c')
+  const sel = hcState([a, b, c], undefined, { selected: hcId('b') })
+  const reordered = applyHerdrTick(sel, [c, b, a])
+  assert.equal(reordered.selected, hcId('b'))
+  assert.ok(renderTuiLines(reordered, 160, 24, 1).map(stripAnsi).some(l => l.startsWith('2: ●') && l.includes('● › bee')), 'the marker follows the address to its new place')
+  assert.equal(applyHerdrTick(reordered, [a, b]).selected, hcId('b'), 'a row gone before it keeps it')
+  assert.equal(applyHerdrTick(reordered, [a, c]).selected, undefined, 'only a gone address clears it')
+  const finished = { ...b, state: 'finished' }
+  assert.equal(applyHerdrTick(reordered, [a, c, finished]).selected, hcId('b'), 'live to finished moves the row, not the selection')
+})
+
+test('hc get call count: one tick runs one ls and a get only for a NEW address; a known address runs none; a leaver is forgotten', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-count-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const names = (xs: string[]) => xs.map(address => ({ address, name: `n-${address}`, agent: 'env', status: 'working', cwd: '/w/proj', where: 'w / 1', parent: 't11', turn: 1 }))
+  let list = names(['t1', 't2', 't3', 't4', 't5'])
+  const calls: string[] = []
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push(argv.slice(1).join(' '))
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: list }), stderr: '' }
+    if (argv[1] === 'get') {
+      if (argv[2] === 't3') return { exitCode: 1, stdout: '', stderr: 'boom' }
+      return { exitCode: 0, stdout: JSON.stringify({ address: argv[2], created_ms: Date.now() - 65_000, foreground: { argv: ['/x/bin/claude'] }, status: { state: 'working' } }), stderr: '' }
+    }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const count = (what: string) => calls.filter(c => c.startsWith(what)).sort()
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => stripAnsi(stdout.written).includes('hc 5 live'), 5_000, 'first tick')
+    await settle()
+    assert.deepEqual(count('ls'), ['ls --all --json'], 'one ls')
+    assert.deepEqual(count('get'), ['get t1 --json', 'get t2 --json', 'get t3 --json', 'get t4 --json', 'get t5 --json'], 'one get per new address')
+    const screen = stripAnsi(stdout.written)
+    assert.ok(/n-t1 t1  @t11  working · claude · turn 1  1:0\d  proj/.test(screen), 'program replaces env, age from created_ms')
+    assert.ok(/n-t3 t3  @t11  working · env · turn 1  proj/.test(screen), 'a failed get: the row is drawn without age and keeps env')
+    assert.ok(!/undefined|NaN|null/.test(screen))
+    // Second tick, same rows: ls once more, no get at all (a failed get is not retried either).
+    calls.length = 0
+    stdin.emit('data', 'r')
+    await until(() => calls.length > 0, 5_000, 'second tick')
+    await settle()
+    assert.deepEqual(calls, ['ls --all --json'])
+    // A new address: one get for it only.
+    calls.length = 0
+    list = [...list, ...names(['t6'])]
+    stdin.emit('data', 'r')
+    await until(() => stripAnsi(stdout.written).includes('hc 6 live'), 5_000, 'third tick')
+    await settle()
+    assert.deepEqual(calls, ['ls --all --json', 'get t6 --json'])
+    // t1 leaves ls and comes back: the cache dropped it, so it is a new address again.
+    list = list.filter(t => t.address !== 't1')
+    calls.length = 0
+    stdin.emit('data', 'r')
+    await until(() => stripAnsi(stdout.written).includes('hc 5 live'), 5_000, 'fourth tick')
+    await settle()
+    assert.deepEqual(calls, ['ls --all --json'])
+    list = [...names(['t1']), ...list]
+    calls.length = 0
+    stdin.emit('data', 'r')
+    await until(() => calls.length >= 2, 5_000, 'fifth tick')
+    await settle()
+    assert.deepEqual(calls, ['ls --all --json', 'get t1 --json'])
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('elapsed: m:ss under an hour, then h and m with their units, so the two never read alike', () => {
+  const t = (sec: number) => elapsed(sec * 1000)
+  assert.deepEqual([0, 3, 65, 2165, 3599].map(t), ['0:00', '0:03', '1:05', '36:05', '59:59'])
+  assert.deepEqual([3600, 3660, 9480, 568_740].map(t), ['1h00m', '1h01m', '2h38m', '157h59m'])
+})
+
+test('hc rows never lose the mark: at 80 and 120 columns a long name and a long address give way, the status text stays', () => {
+  const now = 10_000_000
+  const longName = 'n'.repeat(130)
+  const longAddr = 'mini/' + 'a'.repeat(55)
+  const marks: [Partial<HcAgent>, string][] = [
+    [{ agent: 'claude-code', status: 'working', turn: 3 }, 'working · claude-code · turn 3'],
+    [{ agent: 'codex', status: 'blocked' }, 'blocked · codex'],
+    [{ status: 'idle', turn: 2 }, 'idle · agy · turn 2'],
+    [{ agent: 'claude-code', status: 'done', turn: 9 }, 'done · claude-code · turn 9'],
+    [{ agent: 'env', status: '' }, 'starting · env'],
+    [{ status: 'paused' }, 'paused · agy'],
+    [{ status: '', state: 'finished', exitCode: 0, reason: 'exited', turn: 4 }, 'exited 0 · turn 4'],
+    [{ status: '', state: 'finished', reason: 'killed', signal: 9 }, 'killed · signal 9'],
+    [{ status: '', state: 'finished', exitCode: 3 }, 'exited 3'],
+    [{ status: '', state: 'finished', reason: 'lost' }, 'ended'],
+  ]
+  for (const width of [80, 120]) {
+    for (const [over, mark] of marks) {
+      const a = hcAg(longAddr, { name: longName, parent: 'mini/t1m', ...over })
+      const state = hcState([a], { [a.address]: { createdMs: now - 125_000, finishedMs: now - 1_000 } })
+      const line = renderTuiLines(state, width, 30, now).map(stripAnsi).find(l => l.startsWith('1: '))!
+      assert.ok(line.includes(`  ${mark}`), `${width} cols: ${line}`)
+      assert.ok(cellWidth(line) <= width, `${width} cols, width ${cellWidth(line)}: ${line}`)
+      assert.ok(line.includes('…'), `${width} cols: the long name is cut with an ellipsis: ${line}`)
+    }
+  }
+  // 120 columns, a short name: the address shrinks first (it is dropped), the name and the mark stay whole.
+  const a = hcAg('x/' + 'a'.repeat(100), { name: 'short-name', status: 'working', turn: 1 })
+  const line = renderTuiLines(hcState([a]), 120, 30, now).map(stripAnsi).find(l => l.startsWith('1: '))!
+  assert.ok(line.includes('short-name  working · agy · turn 1') && !line.includes('aaaa'), line)
+})
+
+test('hc armed clear: at 140 columns the header still says what the second press does, and the counts give way', () => {
+  const agents = [hcAg('a1', { name: 'one' }), hcAg('a2', { name: 'two', status: '', state: 'finished', exitCode: 0, reason: 'exited', parent: 't11' })]
+  const armed = { ...hcState(agents), armedStop: { id: CLEAR_ID, from: 0, until: 1e9 }, version: '0.54.0', rowsAge: { running: false, queued: false, lastOk: 0 } as TuiState['rowsAge'] }
+  const head = (width: number) => stripAnsi(renderTuiLines(armed, width, 24, 1)[0]!)
+  assert.ok(head(140).includes('[ c clear all? press again ]'), head(140))
+  assert.match(head(140), /hc 1 /, 'the live count stays')
+  const calm = stripAnsi(renderTuiLines({ ...armed, armedStop: undefined }, 200, 24, 1)[0]!)
+  assert.match(calm, /hc 1 live · 1 ended/, 'unarmed and wide: the full count')
+})
+
+test('hc summary line: its colour is the status of the get that gave the msg, not the older ls status', () => {
+  const blockedLs = hcAg('a1', { name: 'nm', status: 'blocked' })
+  const base = hcState([blockedLs], undefined, { selected: hcId('a1'), mode: 'preview' })
+  const colourOf = (st: TuiState) => renderTuiLines(st, 160, 24, 1).find(l => l.includes('the msg'))
+  assert.equal(colourOf({ ...base, hcMsg: { address: 'a1', msg: 'the msg', status: 'working' } }), `    ${ESC}[32mthe msg${ESC}[0m`, 'ls blocked, get working: green')
+  assert.equal(colourOf({ ...base, hcMsg: { address: 'a1', msg: 'the msg', status: 'blocked' } }), `    ${ESC}[35mthe msg${ESC}[0m`, 'ls and get both blocked: magenta')
+  assert.equal(colourOf({ ...base, hcMsg: { address: 'a1', msg: 'the msg' } }), `    ${ESC}[35mthe msg${ESC}[0m`, 'no get status: the ls status')
+  const ended = hcState([hcAg('a1', { name: 'nm', status: '', state: 'finished', reason: 'killed' })], undefined, { selected: hcId('a1'), mode: 'preview' })
+  assert.equal(colourOf({ ...ended, hcMsg: { address: 'a1', msg: 'the msg', status: 'working' } }), undefined, 'a msg sampled while the row was live is not drawn once it is killed')
+  assert.equal(colourOf({ ...ended, hcMsg: { address: 'a1', msg: 'the msg', status: 'working', finished: true } }), `    ${ESC}[31mthe msg${ESC}[0m`, 'a msg sampled after the end keeps the row\'s terminal colour')
+})
+
+test('hc rows in the list: `No workers outstanding.` is not drawn when hc rows exist, and still is when none do', () => {
+  const none = renderTuiLines({ ...hcState([]), herdr: [] }, 160, 24, 1).map(stripAnsi).join('\n')
+  assert.ok(none.includes('No workers outstanding.'))
+  const some = renderTuiLines(hcState([hcAg('a1')]), 160, 24, 1).map(stripAnsi).join('\n')
+  assert.ok(!some.includes('No workers outstanding.') && some.includes('1: ●'), some)
+})
+
+/** An hc test fixture: a fake `hc` whose `get` can be held back and answered later. */
+function hcLab(prefix: string) {
+  const root = mkdtempSync(join(tmpdir(), prefix))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const lab = {
+    root, host, list: [] as Record<string, unknown>[], calls: [] as string[],
+    /** Answers for `get <address>`: the next waiting resolver, or a function giving the JSON at once. */
+    gets: [] as { address: string; answer: (json: object) => void }[],
+    hold: false,
+    lsFail: false,
+    inFlight: 0,
+    maxInFlight: 0,
+    getJson: (address: string): object => ({ address, status: { state: 'working' } }),
+  }
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    lab.calls.push(argv.slice(1).join(' '))
+    if (argv[1] === 'ls') return lab.lsFail ? { exitCode: 1, stdout: '', stderr: 'boom' } : { exitCode: 0, stdout: JSON.stringify({ terminals: lab.list }), stderr: '' }
+    if (argv[1] === 'get') {
+      const address = argv[2]!
+      if (!lab.hold) return { exitCode: 0, stdout: JSON.stringify(lab.getJson(address)), stderr: '' }
+      lab.maxInFlight = Math.max(lab.maxInFlight, ++lab.inFlight)
+      return new Promise(resolve => lab.gets.push({ address, answer: json => { lab.inFlight--; resolve({ exitCode: 0, stdout: JSON.stringify(json), stderr: '' }) } }))
+    }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  return lab
+}
+const termOf = (address: string, over: Record<string, unknown> = {}) => ({ address, name: `n-${address}`, agent: 'env', status: 'working', cwd: '/w/proj', where: 'w / 1', parent: 't11', turn: 1, ...over })
+
+test('hc rows draw from `hc ls` at once; a slow get fills the age later; a late result for an address that left is not applied', async () => {
+  const lab = hcLab('tui-hc-late-')
+  lab.hold = true
+  lab.list = [termOf('t1')]
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const run = runTui({ stdin, stdout, host: lab.host, session: 'S', cwd: lab.root, root: lab.root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => plain().includes('n-t1 t1  @t11  working · env · turn 1  proj'), 5_000, 'the row is drawn while its get is still pending')
+    assert.equal(lab.gets.length, 1, 'one get, still unanswered')
+    // t1 leaves ls and comes back: the first get is now stale, a second one runs.
+    lab.list = []
+    stdin.emit('data', 'r')
+    await until(() => lab.calls.filter(c => c.startsWith('ls')).length === 2, 5_000, 'tick without t1')
+    await settle()
+    lab.list = [termOf('t1')]
+    stdin.emit('data', 'r')
+    await until(() => lab.gets.length === 2, 5_000, 'a new get for the returned address')
+    // The late answer of the first get: not applied.
+    stdout.written = ''
+    lab.gets[0]!.answer({ address: 't1', created_ms: Date.now() - 600_000, foreground: { argv: ['/x/old-program'] } })
+    await settle()
+    stdin.emit('data', 'q')
+    assert.ok(!plain().includes('old-program'), 'the stale result is dropped')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(lab.root, { recursive: true, force: true })
+  }
+  // The fresh get lands: program and age appear.
+  const lab2 = hcLab('tui-hc-late2-')
+  lab2.hold = true
+  lab2.list = [termOf('t1')]
+  const tty2 = mockTty()
+  tty2.stdout.columns = 160
+  const run2 = runTui({ stdin: tty2.stdin, stdout: tty2.stdout, host: lab2.host, session: 'S', cwd: lab2.root, root: lab2.root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => lab2.gets.length === 1, 5_000, 'get pending')
+    tty2.stdout.written = ''
+    lab2.gets[0]!.answer({ address: 't1', created_ms: Date.now() - 125_000, foreground: { argv: ['/x/claude'] } })
+    await until(() => /n-t1 t1  @t11  working · claude · turn 1  2:0\d  proj/.test(stripAnsi(tty2.stdout.written)), 5_000, 'the late get fills program and age')
+  } finally {
+    tty2.stdin.emit('data', '\x03')
+    await run2
+    rmSync(lab2.root, { recursive: true, force: true })
+  }
+})
+
+test('hc live→finished: one more get records finished_ms and the age freezes; a row first seen finished takes no extra get', async () => {
+  const lab = hcLab('tui-hc-end-')
+  const created = Date.now() - 3_600_000
+  lab.list = [termOf('t1')]
+  lab.getJson = address => ({ address, created_ms: created, status: { state: 'working' } })
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const run = runTui({ stdin, stdout, host: lab.host, session: 'S', cwd: lab.root, root: lab.root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => /n-t1 t1  @t11  working · env · turn 1  1h00m  proj/.test(plain()), 5_000, 'live row with its age')
+    // t1 ends: its get now has finished_ms (125 s after created); t2 is first seen already finished.
+    lab.calls.length = 0
+    lab.getJson = address => ({ address, created_ms: created, finished_ms: created + 125_000, exit_code: 0, reason: 'exited' })
+    lab.list = [termOf('t1', { status: null, state: 'finished', exit_code: 0, reason: 'exited' }), termOf('t2', { status: null, state: 'finished', exit_code: 0, reason: 'exited' })]
+    stdout.written = ''
+    stdin.emit('data', 'r')
+    await until(() => /n-t1 t1  @t11  exited 0 · turn 1  ran 2:05  proj/.test(plain()) && /n-t2 t2  @t11  exited 0 · turn 1  ran 2:05  proj/.test(plain()), 5_000, 'both finished rows show created→finished')
+    assert.deepEqual(lab.calls.filter(c => c.startsWith('get')).sort(), ['get t1 --json', 'get t2 --json'], 'one extra get at the change, one first get for t2')
+    // Later ticks: no get, and the age does not move.
+    lab.calls.length = 0
+    await new Promise(r => setTimeout(r, 1_100))
+    stdin.emit('data', 'r')
+    await until(() => lab.calls.length > 0, 5_000, 'later tick')
+    await settle()
+    assert.deepEqual(lab.calls, ['ls --all --json'])
+    // The screen never showed another age for the ended rows (a frame equal to the last one is not even written again).
+    assert.ok(!/turn 1  ran (2:0[6-9]|2:[1-5]\d|[3-9]:\d\d)/.test(plain()), 'the age is frozen')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(lab.root, { recursive: true, force: true })
+  }
+})
+
+test('hc rows: one cell rule for the budget and the name cut (TMUX_AGENT_AMBIGUOUS_WIDTH=2), and an over-long mark keeps its status word', () => {
+  const now = 10_000_000
+  const line = (amb: string | undefined, a: HcAgent, width = 80) => {
+    const old = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    if (amb === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = amb
+    try {
+      const l = renderTuiLines(hcState([a]), width, 30, now).map(stripAnsi).find(x => x.startsWith('1: '))!
+      return { l, cells: cellWidth(l) }
+    } finally {
+      if (old === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+      else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = old
+    }
+  }
+  const blocked = (over: Partial<HcAgent>) => hcAg('a1', { agent: 'codex', status: 'blocked', ...over })
+  for (const amb of ['1', '2']) {
+    for (const name of ['·'.repeat(130), 'n'.repeat(130)]) {
+      const r = line(amb, blocked({ name }))
+      assert.ok(r.l.includes('blocked · codex') && r.cells <= 80, `amb=${amb} ${name[0]}: ${r.l} (${r.cells} cells)`)
+    }
+    const long = line(amb, blocked({ name: 'nm', agent: 'a'.repeat(100) }))
+    assert.ok(long.l.includes('blocked') && long.cells <= 80, `amb=${amb}, a 100-char agent name: ${long.l} (${long.cells} cells)`)
+    assert.ok(long.l.includes('nm') || long.l.includes('…'), long.l)
+  }
+  const first = line(undefined, blocked({ name: 'nm', agent: 'a'.repeat(100) }))
+  assert.ok(first.l.startsWith('1: ?   …  blocked · aaa'), first.l)
+})
+
+test('hc summary line: a msg sampled while the row was live is not drawn after it turned terminal (the live→killed change)', () => {
+  const live = hcAg('a1', { name: 'nm', status: 'blocked' })
+  const sampled: TuiState = { ...hcState([live], undefined, { selected: hcId('a1'), mode: 'preview' }), hcMsg: { address: 'a1', msg: 'same get message', status: 'blocked' } }
+  const drawn = (st: TuiState) => renderTuiLines(st, 160, 24, 1)
+  assert.ok(drawn(sampled).includes(`    ${ESC}[35msame get message${ESC}[0m`), 'live: drawn, magenta (the get status)')
+  const killed = applyHerdrTick(sampled, [{ ...live, status: '', state: 'finished', reason: 'killed' }])
+  assert.ok(!drawn(killed).some(l => l.includes('same get message')), 'killed: the live msg is gone')
+  assert.ok(drawn(killed).map(stripAnsi).some(l => l.startsWith('1: ●') && l.includes('killed')), 'the row itself shows killed')
+})
+
+test('hc gets: a failed ls keeps the membership, so a get that lands during it is kept and the finish get still runs', async () => {
+  const lab = hcLab('tui-hc-fail-')
+  lab.hold = true
+  lab.list = [termOf('t1')]
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const lss = () => lab.calls.filter(c => c.startsWith('ls')).length
+  const run = runTui({ stdin, stdout, host: lab.host, session: 'S', cwd: lab.root, root: lab.root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => lab.gets.length === 1, 5_000, 'the backfill get is pending')
+    lab.lsFail = true
+    stdin.emit('data', 'r')
+    await until(() => plain().includes('hc ?'), 5_000, 'the failed ls')
+    const created = Date.now() - 125_000
+    lab.gets[0]!.answer({ address: 't1', created_ms: created, status: { state: 'working' } })
+    await settle()
+    lab.lsFail = false
+    stdin.emit('data', 'r')
+    await until(() => /n-t1 t1  @t11  working · env · turn 1  2:0\d  proj/.test(plain()), 5_000, 'recovered: the answer given during the failure shows as the age')
+    assert.equal(lab.calls.filter(c => c.startsWith('get')).length, 1, 'no second backfill get')
+    lab.list = [termOf('t1', { status: null, state: 'finished', exit_code: 0, reason: 'exited' })]
+    stdin.emit('data', 'r')
+    await until(() => lab.gets.length === 2, 5_000, 'the one finish get')
+    lab.gets[1]!.answer({ address: 't1', created_ms: created, finished_ms: created + 125_000, exit_code: 0, reason: 'exited' })
+    await until(() => /n-t1 t1  @t11  exited 0 · turn 1  ran 2:05  proj/.test(plain()), 5_000, 'ended: the age is fixed')
+    const before = lss()
+    stdin.emit('data', 'r')
+    await until(() => lss() === before + 1, 5_000, 'a later tick')
+    await settle()
+    assert.deepEqual(lab.calls.filter(c => c.startsWith('get')), ['get t1 --json', 'get t1 --json'], 'exactly the backfill get and one finish get')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(lab.root, { recursive: true, force: true })
+  }
+})
+
+test('hc gets: at most four in flight across ticks, a queued row that left is never queried, one that left and returned gets one fresh get', async () => {
+  const lab = hcLab('tui-hc-budget-')
+  lab.hold = true
+  lab.list = ['t1', 't2', 't3', 't4', 't5'].map(a => termOf(a))
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const lss = () => lab.calls.filter(c => c.startsWith('ls')).length
+  const tick = async (list: string[]) => {
+    lab.list = list.map(a => termOf(a))
+    const n = lss()
+    stdin.emit('data', 'r')
+    await until(() => lss() === n + 1, 5_000, 'tick')
+    await settle()
+  }
+  const getsOf = (a: string) => lab.calls.filter(c => c === `get ${a} --json`).length
+  const run = runTui({ stdin, stdout, host: lab.host, session: 'S', cwd: lab.root, root: lab.root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => lab.gets.length === 4, 5_000, 'four gets in flight, the fifth queued')
+    assert.equal(getsOf('t5'), 0)
+    // A second batch while those are unanswered: t4 and t5 leave, t6 and t7 arrive. Still four at most.
+    await tick(['t1', 't2', 't3', 't6', 't7'])
+    assert.equal(lab.maxInFlight, 4, 'never more than four')
+    assert.equal(lab.gets.length, 4)
+    // Free one slot: t5 (queued, gone) is skipped, t6 runs.
+    lab.gets.find(g => g.address === 't1')!.answer({ address: 't1' })
+    await until(() => getsOf('t6') === 1, 5_000, 't6 takes the slot')
+    assert.equal(getsOf('t5'), 0, 'a queued row that left is never queried')
+    assert.ok(lab.maxInFlight <= 4)
+    // t7 waits for a slot; t7 leaves and returns while queued: one fresh get, not two.
+    await tick(['t2', 't3', 't6'])
+    await tick(['t2', 't3', 't6', 't7'])
+    lab.gets.find(g => g.address === 't2')!.answer({ address: 't2' })
+    await until(() => getsOf('t7') >= 1, 5_000, 't7 runs')
+    await settle()
+    assert.equal(getsOf('t7'), 1, 'leave and return while queued: one get')
+    assert.ok(lab.maxInFlight <= 4)
+    assert.ok(plain().includes('n-t6'))
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(lab.root, { recursive: true, force: true })
+  }
 })

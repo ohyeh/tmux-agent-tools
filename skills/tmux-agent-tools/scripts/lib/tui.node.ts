@@ -39,7 +39,10 @@ import {
   type Gate,
   newGate,
   readHc,
-  herdrLabel,
+  hcLook,
+  hcMark,
+  elapsed,
+  rowRepo,
   hcBin,
   hcSocketLive,
   hcId,
@@ -121,8 +124,6 @@ export function altEnter(title: string): string {
   const safe = title.replace(/[\x00-\x1f\x7f]/g, '')
   return `\x1b[?1049h\x1b[?2004h\x1b[?1007h\x1b[?25l\x1b]0;${safe}\x07\x1b[2J\x1b[H`
 }
-/** At most this many herdr lines in the footer, then `+N more`. */
-const HERDR_LINES = 4
 /** Lines one wheel notch scrolls. */
 const WHEEL_LINES = 3
 export const ANSI_HIDE_CURSOR = '\x1b[?25l'
@@ -350,8 +351,12 @@ export interface TuiState {
   loadError?: string
   /** Last successful rows read, and whether that job is in flight (T9). */
   rowsAge?: Flight
-  /** Every hc agent, all machines, with its `parent` (selectable in the footer up to HERDR_LINES); `?` = the read failed; unset = no hc on PATH or no running core. */
+  /** Every hc agent, all machines, with its `parent`: rows after the tmux rows in the one list; `?` = the read failed; unset = no hc on PATH or no running core. */
   herdr?: HcAgent[] | '?'
+  /** What one `hc get` told when an address first appeared; never refreshed, dropped when the address leaves `hc ls`. `{}` = the get failed. */
+  hcInfo?: Record<string, HcInfo>
+  /** The selected hc row's own `hc get` (taken with each capture): its `status.msg` is the summary line, coloured by the `status.state` of the same get. */
+  hcMsg?: { address: string; msg?: string; status?: string; finished?: boolean }
   quit: boolean
 }
 
@@ -377,18 +382,19 @@ export type TuiAction =
 
 export { hcId, mirrorHc }
 
-export function drawnHc(state: TuiState): HcAgent[] {
-  return Array.isArray(state.herdr) ? state.herdr.slice(0, HERDR_LINES) : []
+/** The hc rows of the list: they follow the tmux rows, live before finished (`readHc` sorts them). */
+export function hcAgents(state: TuiState): HcAgent[] {
+  return Array.isArray(state.herdr) ? state.herdr : []
 }
 
 export function selectedHc(state: TuiState): HcAgent | undefined {
   if (!state.selected?.startsWith('hc:')) return undefined
   const addr = state.selected.slice(3)
-  return drawnHc(state).find(a => a.address === addr)
+  return hcAgents(state).find(a => a.address === addr)
 }
 
 function navIds(state: TuiState): string[] {
-  return [...state.rows.map(r => r.id), ...drawnHc(state).map(a => hcId(a.address))]
+  return [...state.rows.map(r => r.id), ...hcAgents(state).map(a => hcId(a.address))]
 }
 
 const ROW_WORKER_KEYS: ReadonlySet<string> = new Set(['t', 'T', 'i', 'I', '-', 'U'])
@@ -402,12 +408,32 @@ export type HcGetDetail = {
   address: string
   name?: string
   agent: string
+  /** `status.state` of the status object (or the plain string hc once gave). */
   status: string
   cwd: string
   parent?: string
   turn?: number | string
   foregroundCwd?: string
+  /** The rest of the status object: what the agent said (`msg`), what kind of block (`kind`), who said it (`app`). */
+  msg?: string
+  kind?: string
+  app?: string
+  /** Basename of `foreground.argv[0]`: the program that runs, where `agent` says `env`. */
+  program?: string
+  createdMs?: number
+  finishedMs?: number
+  exitCode?: number
+  reason?: string
   error?: string
+}
+
+/** What the row keeps of its first `hc get`. */
+export type HcInfo = {
+  createdMs?: number
+  finishedMs?: number
+  program?: string
+  /** The get was taken on a finished row (or the one extra get at the live→finished change ran): no get follows. */
+  final?: boolean
 }
 
 export function parseHcGet(stdout: string, fallback: HcAgent): HcGetDetail {
@@ -422,17 +448,33 @@ export function parseHcGet(stdout: string, fallback: HcAgent): HcGetDetail {
       : raw
   const str = (v: unknown, fb: string) => (typeof v === 'string' && v ? v : fb)
   const opt = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
-  const fg = doc.foreground && typeof doc.foreground === 'object' ? (doc.foreground as Record<string, unknown>) : undefined
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+  const obj = (v: unknown) => (v && typeof v === 'object' ? (v as Record<string, unknown>) : undefined)
+  const fg = obj(doc.foreground)
+  const st = obj(doc.status)
   const turn = typeof doc.turn === 'number' || typeof doc.turn === 'string' ? doc.turn : undefined
+  const argv0 = Array.isArray(fg?.argv) ? opt(fg.argv[0]) : undefined
+  const program = argv0?.split('/').filter(Boolean).at(-1)
+  const created = num(doc.created_ms)
+  const finished = num(doc.finished_ms)
+  const exitCode = num(doc.exit_code)
   return {
     address: str(doc.address, fallback.address),
     name: 'name' in doc ? opt(doc.name) : fallback.name,
     agent: str(doc.agent, fallback.agent),
-    status: str(doc.status, fallback.status),
+    status: st ? str(st.state, fallback.status) : str(doc.status, fallback.status),
     cwd: str(doc.cwd, fallback.cwd),
     parent: 'parent' in doc ? opt(doc.parent) : fallback.parent,
     ...(turn !== undefined ? { turn } : {}),
     ...(opt(fg?.cwd) ? { foregroundCwd: opt(fg?.cwd) } : {}),
+    ...(opt(st?.msg) ? { msg: opt(st?.msg) } : {}),
+    ...(opt(st?.kind) ? { kind: opt(st?.kind) } : {}),
+    ...(opt(st?.app) ? { app: opt(st?.app) } : {}),
+    ...(program ? { program } : {}),
+    ...(created !== undefined ? { createdMs: created } : {}),
+    ...(finished !== undefined ? { finishedMs: finished } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(opt(doc.reason) ? { reason: opt(doc.reason) } : {}),
   }
 }
 
@@ -460,15 +502,22 @@ export async function readHcDetail(host: Host, agent: HcAgent): Promise<HcGetDet
   }
 }
 
+const isoSeconds = (ms: number): string => new Date(ms).toISOString().slice(0, 19) + 'Z'
+
 export function hcDetailText(det: HcGetDetail, mirror?: MirrorCapture): string[] {
   const out = [
     `address: ${det.address}`,
     `name: ${det.name ?? '(none)'}`,
     `agent: ${det.agent}`,
-    `status: ${det.status}`,
+    `status: ${det.status || '-'}${det.kind ? ` (${sanitizeAnsi(det.kind)})` : ''}`,
+    ...(det.msg ? [`message: ${sanitizeAnsi(det.msg)}`] : []),
     `cwd: ${det.cwd}${det.foregroundCwd && det.foregroundCwd !== det.cwd ? ` (now: ${det.foregroundCwd})` : ''}`,
     `parent: ${det.parent ? `@${det.parent}` : '未記錄'}`,
     `turn: ${det.turn !== undefined ? String(det.turn) : '-'}`,
+    ...(det.program ? [`program: ${sanitizeAnsi(det.program)}`] : []),
+    ...(det.createdMs !== undefined ? [`created: ${isoSeconds(det.createdMs)}`] : []),
+    ...(det.finishedMs !== undefined ? [`finished: ${isoSeconds(det.finishedMs)}`] : []),
+    ...(det.exitCode !== undefined || det.reason ? [`exit: ${det.exitCode ?? '-'}${det.reason ? ` · ${sanitizeAnsi(det.reason)}` : ''}`] : []),
   ]
   if (det.error) out.push(`get error: ${det.error}`)
   out.push('preview:')
@@ -745,7 +794,10 @@ export function applyRowsTick(state: TuiState, rows: PanelRow[]): TuiState {
 }
 
 export function applyHerdrTick(state: TuiState, herdr: HcAgent[] | '?' | undefined): TuiState {
-  const next: TuiState = { ...state, herdr }
+  // The cache keeps an address only while `hc ls` lists it; a failed read (`?`) says nothing about who left.
+  const listed = Array.isArray(herdr) ? new Set(herdr.map(a => a.address)) : undefined
+  const hcInfo = herdr === undefined ? {} : listed ? Object.fromEntries(Object.entries(state.hcInfo ?? {}).filter(([k]) => listed.has(k))) : state.hcInfo
+  const next: TuiState = { ...state, herdr, ...(hcInfo ? { hcInfo } : {}) }
   if (state.selected?.startsWith('hc:') && !selectedHc(next)) {
     return {
       ...next,
@@ -992,10 +1044,9 @@ export function nextKeyState(
 
   if (/^[1-9]$/.test(key)) {
     const idx = Number(key) - 1
-    if (idx < state.rows.length) {
-      const target = state.rows[idx]!
-      return { state: reselect(state, state.selected === target.id ? undefined : target.id) }
-    }
+    const hc = hcAgents(state)[idx - state.rows.length]
+    const targetId = idx < state.rows.length ? state.rows[idx]!.id : hc && hcId(hc.address)
+    if (targetId) return { state: reselect(state, state.selected === targetId ? undefined : targetId) }
     return { state }
   }
 
@@ -1141,8 +1192,9 @@ function fitFirst(options: string[], width: number): string {
 export function emptyText(state: TuiState): string {
   if (state.loadError) return `Could not read the ledger: ${state.loadError}`
   if (state.all.length) return `No rows shown: ${state.all.length} worker(s) of other sessions are filtered out — press a to show all`
-  return 'No workers outstanding.'
+  return NO_WORKERS
 }
+const NO_WORKERS = 'No workers outstanding.'
 
 /** Lines of the detail view (R4.3): row state and result state are separate lines. */
 export function detailText(r: PanelRow, det: EpisodeDetail): string[] {
@@ -1277,24 +1329,39 @@ export function frameOf(
   }
 }
 
-type Sections = { title: string; status: string[]; selExtra: string[]; footer: string[]; sel: number; hcSel?: HcAgent }
+/** `sel` is the selected tmux row's index, `selIndex` the selected row's place in the whole list (tmux rows, then hc rows); both -1 when none. */
+type Sections = { title: string; status: string[]; selExtra: string[]; footer: string[]; sel: number; selIndex: number; hcSel?: HcAgent }
 
 function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate, height = Number.POSITIVE_INFINITY): Sections {
   const tmuxRunning = state.rows.filter(r => !r.project && !r.terminal).length
   const me = state.owner
   const age = state.rowsAge ? ` · ${ageText(now, state.rowsAge)}` : ''
-  const herdrCount = state.herdr === undefined ? '' : ` · hc ${state.herdr === '?' ? '?' : state.herdr.filter(a => !hcFinished(a)).length}`
+  const herdrEnded = Array.isArray(state.herdr) ? state.herdr.filter(hcFinished).length : 0
+  const herdrCount =
+    state.herdr === undefined ? '' : ` · hc ${state.herdr === '?' ? '?' : `${state.herdr.length - herdrEnded} live${herdrEnded ? ` · ${herdrEnded} ended` : ''}`}`
   const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning}${herdrCount}${age}`
+  // The short count (`hc N`, live agents) the title falls back to before it gives up a hint that names what a second press does.
+  const herdrShort = Array.isArray(state.herdr) ? ` · hc ${state.herdr.length - herdrEnded}` : herdrCount
+  const shortCounts = `${me ? `@${me.slice(0, 8)} · ` : ''}tmux ${tmuxRunning}${herdrShort}${age}`
   const hints = headerHints(state, now)
   let title = ''
   // As the band: the hint words go first, then the session id, then the counts; the name and version never
   // (mods/README.md rule 11 in agent-scripts).
   const name = ` workers${state.version ? ` v${state.version}` : ''}`
-  outer: for (const t of [`${name} · ${counts} `, `${name} · tmux ${tmuxRunning}${herdrCount} `, `${name} `]) {
-    for (const h of hints) {
-      if (cellWidth(t) + cellWidth(h) <= width) {
-        title = `${t}${h}`
-        break outer
+  const clearArmed = state.armedStop?.id === CLEAR_ID && now < state.armedStop.until
+  const heads = [`${name} · ${counts} `, `${name} · ${shortCounts} `, `${name} · tmux ${tmuxRunning}${herdrShort} `, `${name} `]
+  // Armed `c`: the long hint (it says what the second press does) wins over the live/ended detail of the counts.
+  if (clearArmed) {
+    const t = heads.find(t => cellWidth(t) + cellWidth(hints[0]!) <= width)
+    if (t) title = `${t}${hints[0]}`
+  }
+  if (!title) {
+    outer: for (const t of heads) {
+      for (const h of hints) {
+        if (cellWidth(t) + cellWidth(h) <= width) {
+          title = `${t}${h}`
+          break outer
+        }
       }
     }
   }
@@ -1334,7 +1401,8 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate, he
           : 'n resume [profile] <session-id> [name]'
     status.push(`  ${label}: ${state.resumeInput}█`)
   }
-  if (state.rows.length === 0) status.push(`\x1b[2m${sanitizeAnsi(emptyText(state))}\x1b[0m`)
+  // hc rows are in the list: `No workers outstanding.` would be false then (the other empty states still hold).
+  if (state.rows.length === 0 && !(hcAgents(state).length && emptyText(state) === NO_WORKERS)) status.push(`\x1b[2m${sanitizeAnsi(emptyText(state))}\x1b[0m`)
 
   const sel = state.rows.findIndex(r => r.id === state.selected)
   const hcSel = sel < 0 ? selectedHc(state) : undefined
@@ -1347,19 +1415,20 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate, he
     }
     selExtra.push(`    ${fitFirst(rowHints(state, r, now), Math.max(0, width - 4))}`)
   } else if (hcSel) {
+    // No msg, no line: a summary is never made up. The colour is the row's status colour.
+    // The colour is the status of the get that gave the msg (a live row's ls status may be older); a finished row keeps its own.
+    // A msg sampled while the row was live is not drawn once the row has ended (and the reverse never happens).
+    const sample = state.hcMsg?.address === hcSel.address && !!state.hcMsg.finished === hcFinished(hcSel) ? state.hcMsg : undefined
+    if (sample?.msg && !state.expanded) {
+      const look = hcLook(sample.status && !hcFinished(hcSel) ? { ...hcSel, status: sample.status } : hcSel)
+      selExtra.push(`    ${ANSI_COLOR_MAP[STATE_COLOR[look.state]] ?? ''}${sanitizeAnsi(sample.msg)}\x1b[0m`)
+    }
     selExtra.push(`    ${fitFirst(hcHints(state, hcSel, now), Math.max(0, width - 4))}`)
   }
+  const hcIndex = hcSel ? hcAgents(state).findIndex(a => a.address === hcSel.address) : -1
+  const selIndex = sel >= 0 ? sel : hcIndex >= 0 ? state.rows.length + hcIndex : -1
 
   const footer: string[] = []
-  if (Array.isArray(state.herdr)) {
-    // Capped: these lines come out of the worker list's rows, which must stay.
-    for (const a of state.herdr.slice(0, HERDR_LINES)) {
-      const isSel = hcSel?.address === a.address
-      const text = sanitizeAnsi(`${herdrLabel(a)} · ${a.parent ? `@${a.parent}` : '未記錄'} · ${a.cwd}`)
-      footer.push(isSel ? `${ANSI_BOLD}› ${text}${ANSI_RESET}` : `\x1b[2m  ${text}\x1b[0m`)
-    }
-    if (state.herdr.length > HERDR_LINES) footer.push(`\x1b[2m+${state.herdr.length - HERDR_LINES} more hc agents (hc ls)\x1b[0m`)
-  }
   const others = othersLine(state.all)
   if (others) {
     const glyphColor = others.running ? '\x1b[32m' : '\x1b[2m'
@@ -1368,7 +1437,7 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate, he
   if (state.statusMessage && now < (state.statusUntil ?? 0)) {
     footer.push(`\x1b[36mtmux-agent: ${sanitizeAnsi(state.statusMessage)}\x1b[0m`)
   }
-  return { title: titleLine, status, selExtra, footer, sel, ...(hcSel ? { hcSel } : {}) }
+  return { title: titleLine, status, selExtra, footer, sel, selIndex, ...(hcSel ? { hcSel } : {}) }
 }
 
 /** Full-width lines that are not list, more, or the preview pane. */
@@ -1380,7 +1449,7 @@ function chromeLines(s: Sections): number {
 export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout {
   const sections = sectionsOf(state, width, now, gate, height)
   const hasPreview = sections.sel >= 0 || sections.hcSel !== undefined
-  const frame = frameOf(width, height, state.rows.length, sections.sel, chromeLines(sections), state.narrowView ?? 'list', sections.footer.length, hasPreview)
+  const frame = frameOf(width, height, state.rows.length + hcAgents(state).length, sections.selIndex, chromeLines(sections), state.narrowView ?? 'list', sections.footer.length, hasPreview)
   const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
   const open = state.expanded && state.detail && state.detail.id === state.selected
   return { frame, sections, ...(open ? { detail: wrapCells(state.detail!.lines.join('\n'), wrapW) } : {}) }
@@ -1391,6 +1460,57 @@ function rowLine(state: TuiState, index: number, selected: number): string {
   const digitPrefix = index < 9 ? `${index + 1}: ` : '   '
   const color = r.project ? ANSI_COLOR_MAP['blue'] : (ANSI_COLOR_MAP[STATE_COLOR[r.state]] ?? '')
   return `${digitPrefix}${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}${sanitizeAnsi(rowLabel(r, index === selected))}`
+}
+
+/** One hc row, the tmux row's grammar: `N: ` glyph `› name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age. */
+/** `text` cut to `max` cells by the same rule as `cellWidth` (`TMUX_AGENT_AMBIGUOUS_WIDTH`), `…` marking the cut; no `…` when it does not fit. */
+function fitByCells(text: string, max: number): string {
+  if (cellWidth(text) <= max) return text
+  const cut = (limit: string, room: number) => {
+    let out = ''
+    let cur = 0
+    for (const g of graphemes(limit)) {
+      const w = cellWidth(g)
+      if (cur + w > room) break
+      out += g
+      cur += w
+    }
+    return out
+  }
+  const dots = cellWidth('…')
+  return max >= dots ? `${cut(text, max - dots)}…` : cut(text, max)
+}
+
+function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, width: number, now: number): string {
+  const info = state.hcInfo?.[a.address]
+  const look = hcLook(a)
+  const color = ANSI_COLOR_MAP[STATE_COLOR[look.state]] ?? ''
+  const prefix = index < 9 ? `${index + 1}: ` : '   '
+  const plain = (t: string) => stripAnsi(sanitizeAnsi(t))
+  const name = plain(a.name ?? a.address)
+  // The address only on a wide row and when the name is not already the address.
+  const addr = a.name && width >= 120 ? plain(a.address) : ''
+  const marker = `${selected ? '›' : ' '} `
+  const lead = (n: string, withAddr: boolean) => `${marker}${n}${withAddr ? ` ${ANSI_DIM}${addr}${ANSI_RESET}` : ''}`
+  const parent = a.parent ? `  @${plain(a.parent.split('/').pop()!)}` : ''
+  const mark = `  ${plain(hcMark(a, info?.program))}`
+  // A live row's age runs to now; a finished one shows `ran <created→finished>` once finished_ms is known (never a growing number).
+  const end = hcFinished(a) ? info?.finishedMs : now
+  const age = info?.createdMs !== undefined && end !== undefined ? `  ${hcFinished(a) ? 'ran ' : ''}${elapsed(end - info.createdMs)}` : ''
+  const repo = `  ${plain(rowRepo(a.cwd))}`
+  const room = Math.max(0, width - cellWidth(prefix) - cellWidth(look.glyph))
+  // Room goes to the mark first. Out of room: the address, the repo, @parent, the age; then the name takes the cut (`…`), never the mark.
+  const tails = [parent + mark + age + repo, parent + mark + age, mark + age, mark]
+  const fits = [...(addr ? [lead(name, true) + tails[0]!] : []), ...tails.map(t => lead(name, false) + t)].find(l => cellWidth(l) <= room)
+  const nameRoom = room - cellWidth(marker) - cellWidth(mark)
+  const cutMark = (): string => {
+    // The mark alone is too long: one cell of name, then the mark cut from its end, so the status word is the last to go.
+    const nameCut = fitByCells(name, 1)
+    const markRoom = room - cellWidth(marker) - cellWidth(nameCut)
+    return markRoom >= cellWidth(`  ${mark.trim().split(' · ')[0]}`) ? `${marker}${nameCut}${fitByCells(mark, markRoom)}` : `${marker}${fitByCells(mark.trimStart(), Math.max(0, room - cellWidth(marker)))}`
+  }
+  const label = fits ?? (nameRoom >= 1 ? `${marker}${fitByCells(name, nameRoom)}${mark}` : cutMark())
+  return `${prefix}${color}${ANSI_BOLD}${look.glyph}${ANSI_RESET}${label}`
 }
 
 /** Detail slice or mirror slice for one preview. The standard painter keeps its own tail line. */
@@ -1416,7 +1536,7 @@ function previewLines(state: TuiState, bodyRows: number, detail: string[] | unde
   return out
 }
 
-function linesFromLayout(state: TuiState, width: number, height: number, lay: TuiLayout, gate?: Gate): string[] {
+function linesFromLayout(state: TuiState, width: number, height: number, lay: TuiLayout, now: number, gate?: Gate): string[] {
   const { frame, sections: s } = lay
   if (height <= 2) {
     const compact = `${state.rows.length} worker(s) · ${healthText(gate?.viewHealth)} · window too small (${height} rows)`
@@ -1426,8 +1546,11 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
   const lines: string[] = [s.title, ...s.status.map(fit)]
   if (s.sel >= 0 || s.hcSel) lines.push(...s.selExtra.map(fit))
 
-  const shown = Math.max(0, state.rows.length - frame.hidden)
-  for (let i = frame.list.first; i < frame.list.first + shown; i++) lines.push(fit(rowLine(state, i, s.sel)))
+  const hcs = hcAgents(state)
+  const shown = Math.max(0, state.rows.length + hcs.length - frame.hidden)
+  for (let i = frame.list.first; i < frame.list.first + shown; i++) {
+    lines.push(fit(i < state.rows.length ? rowLine(state, i, s.sel) : hcLine(state, hcs[i - state.rows.length]!, i, i === s.selIndex, width, now)))
+  }
   if (frame.more) lines.push(fit(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`))
 
   // Full-width chrome precedes the list and preview in every frame mode.
@@ -1481,7 +1604,7 @@ export function renderTuiLines(
   gate?: Gate,
 ): string[] {
   if (width < 1 || height < 1) return []
-  return linesFromLayout(state, width, height, tuiLayout(state, width, height, now, gate), gate)
+  return linesFromLayout(state, width, height, tuiLayout(state, width, height, now, gate), now, gate)
 }
 
 /** stdin as the TUI found it. `restoreTerminal` puts it back. */
@@ -1860,7 +1983,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     const lay = tuiLayout(state, width, height, now, gate)
     state.page = lay.frame.preview.rows
     state.scrollMax = Math.max(0, (lay.detail?.length ?? 0) - lay.frame.preview.rows)
-    const lines = linesFromLayout(state, width, height, lay, gate)
+    const lines = linesFromLayout(state, width, height, lay, now, gate)
     const body = lines.join('\r\n')
     if (!clearNext && body === lastBody) return
     // Erase each line before it is drawn, not after: `\x1b[K` behind a full-width line
@@ -1875,7 +1998,9 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   const sweepFlight: Flight = { running: false, queued: false }
   let live: Scan['visible'] = []
   const applyRows = async (scanned?: Scan): Promise<void> => {
-    state = applyRowsTick(state, await panelRows(host, gate, root, scanned))
+    // The rows are read first: `state` is taken after the await, so a late hc get that landed meanwhile is not overwritten.
+    const rows = await panelRows(host, gate, root, scanned)
+    state = applyRowsTick(state, rows)
   }
   const runRows = async (): Promise<boolean> => {
     const scanned = root ? await observeRows(host, gate, root) : undefined
@@ -1883,9 +2008,21 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     state.loadError = root ? gate.viewError : 'no state root (TMUX_AGENT_DIR, XDG_STATE_HOME and HOME are all unset)'
     const [, herdr] = await Promise.all([applyRows(scanned), herdrNow()])
     state = applyHerdrTick(state, herdr)
+    fillHcInfo(herdr)
     return true
   }
-  // A failed read is `hc ?`, never a failed rows tick.
+  // A failed read is `hc ?`, never a failed rows tick. The tick draws the `hc ls` list at once; the one `hc get` an address
+  // gets when it first appears (and once more when it ends, for its finish time) runs after, in one queue shared by all
+  // ticks with at most HC_GETS in flight, and fills the row's age and program when it lands. A known address, selected or
+  // not, runs none. A failed get leaves `{ final: true }`, so the row stays without an age and the get is not tried again.
+  // Each get has a token. Only a successful `hc ls` that no longer lists the address removes its token (a failed read says
+  // nothing about who left), and the token is checked before the get is issued, so a queued address that left is never
+  // queried; a result whose token is gone is dropped. Every finished get releases its own token.
+  const HC_GETS = 4
+  const hcPending = new Map<string, symbol>()
+  const hcQueue: { a: HcAgent; token: symbol }[] = []
+  let hcMember = new Set<string>()
+  let hcRunning = 0
   const herdrNow = async (): Promise<HcAgent[] | '?' | undefined> => {
     try {
       const [agents, me] = await Promise.all([readHc(host), host.envHcTerminal()])
@@ -1894,6 +2031,50 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     } catch {
       return '?'
     }
+  }
+  const pumpHc = () => {
+    while (hcRunning < HC_GETS && hcQueue.length && !stopped) {
+      const { a, token } = hcQueue.shift()!
+      if (hcPending.get(a.address) !== token) continue
+      hcRunning++
+      void (async () => {
+        try {
+          const det = await readHcDetail(host, a)
+          if (stopped || hcPending.get(a.address) !== token) return
+          hcPending.delete(a.address)
+          if (!hcMember.has(a.address)) return
+          const old = state.hcInfo?.[a.address]
+          const got: HcInfo = det.error
+            ? { ...old, final: true }
+            : {
+                ...old,
+                ...(det.createdMs !== undefined ? { createdMs: det.createdMs } : {}),
+                ...(det.finishedMs !== undefined ? { finishedMs: det.finishedMs } : {}),
+                ...(det.program ? { program: det.program } : {}),
+                final: hcFinished(a) || det.finishedMs !== undefined,
+              }
+          state = { ...state, hcInfo: { ...state.hcInfo, [a.address]: got } }
+          render()
+        } finally {
+          hcRunning--
+          pumpHc()
+        }
+      })()
+    }
+  }
+  const fillHcInfo = (herdr: HcAgent[] | '?' | undefined) => {
+    if (herdr === '?') return
+    const list = herdr ?? []
+    hcMember = new Set(list.map(a => a.address))
+    for (const k of [...hcPending.keys()]) if (!hcMember.has(k)) hcPending.delete(k)
+    for (const a of list) {
+      const known = state.hcInfo?.[a.address]
+      if (hcPending.has(a.address) || (known && !(hcFinished(a) && !known.final))) continue
+      const token = Symbol(a.address)
+      hcPending.set(a.address, token)
+      hcQueue.push({ a, token })
+    }
+    pumpHc()
   }
   const refreshRows = () => kickJob(rowsFlight, () => Date.now(), runRows)
   const runSweep = async (): Promise<boolean> => {
@@ -1940,11 +2121,10 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
       const fitOut = fit ? await fitWorker(host, row.d, frame.preview.cols, body) : undefined
       // The whole scrollback, like `tmux attach`; the view shows a window of it (PgUp/PgDn).
       // Colour on: every mirror line goes through sanitizeAnsi before it is printed.
-      const cap = hc
-        ? await mirrorHc(host, hc.address, MIRROR_HISTORY, true)
-        : row!.project
-          ? await mirrorProject(host, row!.d.name, MIRROR_HISTORY, true)
-          : await mirrorOf(host, row!.d, MIRROR_HISTORY, true)
+      // An hc row's own `hc get` rides with its capture: its `status.msg` is the summary line.
+      const [cap, hcDet] = hc
+        ? await Promise.all([mirrorHc(host, hc.address, MIRROR_HISTORY, true), readHcDetail(host, hc)])
+        : [row!.project ? await mirrorProject(host, row!.d.name, MIRROR_HISTORY, true) : await mirrorOf(host, row!.d, MIRROR_HISTORY, true), undefined]
       // A gone session is the capture's error to show; a live one that would not resize is said here.
       if (fitOut && !fitOut.ok && !cap.error) say(fitOut.text)
       if (gen === generation && state.selected === targetId && !stopped) {
@@ -1953,6 +2133,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
         const prev = state.mirror?.id === targetId ? state.mirror.lines.length : cap.lines.length
         if (state.back) state.back += Math.max(0, cap.lines.length - prev)
         state.mirror = { id: targetId, ...cap }
+        if (hc) state.hcMsg = { address: hc.address, finished: hcFinished(hc), ...(hcDet && !hcDet.error ? { ...(hcDet.msg ? { msg: hcDet.msg } : {}), ...(hcDet.status ? { status: hcDet.status } : {}) } : {}) }
         landed = true
       }
     } finally {

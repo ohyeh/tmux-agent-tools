@@ -463,16 +463,26 @@ export async function agentTmuxBin(host: Host): Promise<{ bin: string; missing?:
  * One agent terminal herdr-core (`hc`, the server Herdr.app shows) runs. `parent` is the hc
  * terminal it was started from (`$HC_TERMINAL_ID` at `hc run`).
  */
-export type HcAgent = { address: string; name?: string; agent: string; status: string; state?: string; cwd: string; where: string; parent?: string }
+export type HcAgent = {
+  address: string
+  name?: string
+  agent: string
+  /** The agent's last status (`working`, `done`, …); '' when hc reports none (a live row that is still starting). */
+  status: string
+  state?: string
+  cwd: string
+  where: string
+  parent?: string
+  turn?: number
+  exitCode?: number
+  reason?: string
+  signal?: number
+}
 
 export const hcId = (address: string): string => `hc:${address}`
 
 export const hcFinished = (a: Pick<HcAgent, 'state' | 'status'>): boolean =>
   a.state ? a.state !== 'live' : a.status === 'finished'
-
-/** Display status of an hc agent: non-live `state` (e.g. `finished`) overrides the last agent `status`. */
-export const hcStatus = (a: Pick<HcAgent, 'state' | 'status'>): string =>
-  hcFinished(a) ? (a.state && a.state !== 'live' ? a.state : 'finished') : a.status
 
 // shortcut: found once per PATH, absence too; an hc installed later shows after a reload.
 const hcFound = new Map<string, string | undefined>()
@@ -511,9 +521,13 @@ export async function hcSocketLive(host: Host): Promise<boolean> {
   return r?.exitCode === 0
 }
 
+/** Programs that, with no `status`, are a person's shell and not an agent: such a live row is not listed. */
+const HC_SHELLS: ReadonlySet<string> = new Set(['zsh', 'bash', 'sh', 'fish'])
+
 /**
- * `hc ls --all --json` stdout: `{terminals:[…]}`, or `{error:{kind,message}}`, which throws. Live shells (no `status`)
- * are skipped; a finished record is kept, because hc drops `status` once a terminal finishes.
+ * `hc ls --all --json` stdout: `{terminals:[…]}`, or `{error:{kind,message}}`, which throws. A live row with no
+ * `status` is kept unless its agent is a shell (a worker started through `/usr/bin/env` has no status while it
+ * starts); a finished record is kept, because hc drops `status` once a terminal finishes.
  */
 export function parseHc(stdout: string): HcAgent[] {
   const doc = JSON.parse(stdout) as { error?: { kind?: unknown; message?: unknown }; terminals?: unknown }
@@ -521,13 +535,31 @@ export function parseHc(stdout: string): HcAgent[] {
   if (!Array.isArray(doc.terminals)) throw new Error('hc: no terminals in its answer')
   const s = (v: unknown) => (typeof v === 'string' && v ? v : '?')
   const opt = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
   return (doc.terminals as Record<string, unknown>[])
-    .filter(t => t && typeof t === 'object' && ('status' in t || t.state === 'finished'))
+    .filter(t => t && typeof t === 'object' && (opt(t.status) || (opt(t.state) ?? 'live') !== 'live' || !HC_SHELLS.has(String(t.agent))))
     .map(t => {
       const name = opt(t.name)
       const parent = opt(t.parent)
       const state = opt(t.state)
-      return { address: s(t.address), agent: s(t.agent), status: s(t.status), cwd: s(t.cwd), where: s(t.where), ...(state ? { state } : {}), ...(name ? { name } : {}), ...(parent ? { parent } : {}) }
+      const reason = opt(t.reason)
+      const turn = num(t.turn)
+      const exitCode = num(t.exit_code)
+      const signal = num(t.signal)
+      return {
+        address: s(t.address),
+        agent: s(t.agent),
+        status: opt(t.status) ?? '',
+        cwd: s(t.cwd),
+        where: s(t.where),
+        ...(state ? { state } : {}),
+        ...(name ? { name } : {}),
+        ...(parent ? { parent } : {}),
+        ...(turn !== undefined ? { turn } : {}),
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(reason ? { reason } : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      }
     })
 }
 
@@ -545,8 +577,48 @@ export async function readHc(host: Host): Promise<HcAgent[] | undefined> {
   return parseHc(r.stdout).sort((x, y) => Number(hcFinished(x)) - Number(hcFinished(y)))
 }
 
-/** An hc agent's row text: address, name, kind, status, marked as herdr and read-only. */
-export const herdrLabel = (a: HcAgent) => `hc · ${a.address}${a.name ? ` ${a.name}` : ''} · ${a.agent} · ${hcStatus(a)} · read-only`
+/** The hc row's colour key (a `STATE_COLOR` key) and glyph: one mapping for the band and `workers-tui`. */
+export type HcLook = { state: PanelRow['state']; glyph: string }
+
+/** The program a row shows for its agent: `env` (how every `assign` hc launch starts) gives way to the program found by `hc get`. */
+const hcAgentName = (a: HcAgent, program?: string): string => (a.agent === 'env' && program ? program : a.agent)
+
+/** Colour key and glyph of an hc row (`●` `?` `✓`, the tmux rows' set). */
+export function hcLook(a: HcAgent): HcLook {
+  if (hcFinished(a)) return a.reason === 'killed' || (a.exitCode !== undefined && a.exitCode !== 0) ? { state: 'exited', glyph: '● ' } : { state: 'finished', glyph: '✓ ' }
+  switch (a.status) {
+    case 'working':
+      return { state: 'running', glyph: '● ' }
+    case 'blocked':
+      return { state: 'needs-input', glyph: '? ' }
+    case 'idle':
+      return { state: 'stalled', glyph: '● ' }
+    case 'done':
+      return { state: 'delivered', glyph: '✓ ' }
+    default:
+      return { state: 'unknown', glyph: '● ' }
+  }
+}
+
+/** The status mark of an hc row (`working · claude-code · turn 3`); `program` is the program basename from `hc get`. */
+export function hcMark(a: HcAgent, program?: string): string {
+  const turn = a.turn !== undefined ? ` · turn ${a.turn}` : ''
+  const sig = a.signal !== undefined ? ` · signal ${a.signal}` : ''
+  if (hcFinished(a)) {
+    if (a.reason === 'killed') return `killed${sig}`
+    if (a.exitCode === 0) return `exited 0${turn}`
+    if (a.exitCode !== undefined) return `exited ${a.exitCode}${sig}`
+    return 'ended'
+  }
+  const who = hcAgentName(a, program)
+  if (!a.status) return `starting · ${program ?? a.agent}`
+  if (a.status === 'blocked') return `blocked · ${who}`
+  if (a.status === 'working' || a.status === 'idle' || a.status === 'done') return `${a.status} · ${who}${turn}`
+  return `${a.status} · ${who}`
+}
+
+/** An hc agent's band row text: `hc · address name · mark · repo`. The mark is the one `workers-tui` shows. */
+export const herdrLabel = (a: HcAgent) => `hc · ${a.address}${a.name ? ` ${a.name}` : ''} · ${hcMark(a)} · ${rowRepo(a.cwd)}`
 
 /** Mirror an hc terminal via `hc read <address> --lines <rows>`; never runs `hc` when `hcSocketLive` is false. */
 export async function mirrorHc(host: Host, address: string, rows: number, color = false): Promise<MirrorCapture> {
@@ -2300,11 +2372,11 @@ export async function refreshProjects(host: Host, gate: Gate, visible: readonly 
   gate.projects = projects
 }
 
-/** m:ss up to an hour, then h:mm — a row is one line, so the unit is implicit. */
+/** m:ss under an hour, then `2h38m`: the unit tells the two apart (`157:59` read as minutes and seconds). */
 export function elapsed(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000))
-  const [a, b] = total < 3600 ? [Math.floor(total / 60), total % 60] : [Math.floor(total / 3600), Math.floor((total % 3600) / 60)]
-  return `${a}:${String(b).padStart(2, '0')}`
+  if (total >= 3600) return `${Math.floor(total / 3600)}h${String(Math.floor((total % 3600) / 60)).padStart(2, '0')}m`
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
 }
 
 /**
