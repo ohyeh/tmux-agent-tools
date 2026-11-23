@@ -685,17 +685,12 @@ async function hcAct(host: Host, verb: 'send' | 'interrupt', address: string, ar
   // Nothing was written: the caller may keep the draft and let the person press Enter again.
   if ('no' in target) return { fail: { ok: false, text: `hc ${verb} ${address} stopped: ${target.no}`, refusedBeforeWrite: true } }
   // The target is the requested address: the response only proved it is still that row.
-  const done = await hcWrite(host, [target.bin, verb, address, ...args], ms)
-  try {
-    const w = writeClass(done)
-    // No completion result (a cut, a signal) may still have acted: say so, and never resend.
-    if (w.class === 'unknown') return { fail: { ok: false, text: `hc ${verb} ${address} — delivery unknown (${w.text})` } }
-    if (w.class === 'probe') return { fail: { ok: false, text: `hc ${verb} ${address} failed (${w.text})` } }
-    const out = (done as { r: RunResult }).r.stdout
-    return { stdout: typeof out === 'string' ? out : '' }
-  } catch {
-    return { fail: { ok: false, text: `hc ${verb} ${address} — delivery unknown (unreadable result)` } }
-  }
+  const probe = await host.run([target.bin, verb, address, ...args], host.cwd() ?? '/', ms).catch((err: unknown) => err)
+  const w = writeClass(probe)
+  // No completion result (a cut, a signal) may still have acted: say so, and never resend.
+  if (w.class === 'unknown') return { fail: { ok: false, text: `hc ${verb} ${address} — delivery unknown (${w.text})` } }
+  if (w.class === 'probe') return { fail: { ok: false, text: `hc ${verb} ${address} failed (${w.text})` } }
+  return { stdout: (probe as RunResult).stdout }
 }
 
 /** Type into an hc terminal: `hc send <address> <text>`. */
@@ -710,21 +705,6 @@ export async function interruptHc(host: Host, address: string, owner: string | u
   if ('fail' in r) return r.fail
   const said = (r.stdout.trim().split('\n')[0] ?? '').slice(0, 120)
   return { ok: true, text: `interrupted hc ${address}${said ? `: ${said}` : ''}` }
-}
-
-/**
- * Run one hc write and keep whatever happened: a resolved value as { r }, a synchronous throw or any rejection as
- * { e }. The call itself never throws past this. Invariant for the callers: after hcWrite, each Host-supplied field
- * is read once, inside the caller's guard, and every decision uses those locals. A run that never settles is the Host's deadline (it reports timedOut), not this function's:
- * a late exit 0 still reads sent (R2-03).
- */
-async function hcWrite(host: Host, argv: string[], ms: number): Promise<{ r: unknown } | { e: unknown }> {
-  const cwd = host.cwd() ?? '/'
-  try {
-    return { r: await host.run(argv, cwd, ms) }
-  } catch (e) {
-    return { e }
-  }
 }
 
 /** Close an hc terminal: `hc kill <address>` when live, `hc rm <address>` when finished. */
@@ -2686,17 +2666,11 @@ type RunResult = Awaited<ReturnType<Host['run']>>
 
 /**
  * Why a capture or hc run failed, one line; undefined when it succeeded. A timeout is the host's own
- * `timedOut` verdict (an `ETIMEDOUT` Error also names it), never a duration: a slow success is a
+ * `timedOut` verdict, never a duration or a word in the error text: a slow success is a
  * success, and an ordinary refusal keeps its exit code and its own stderr.
  */
 export function captureError(probe: unknown): string | undefined {
-  if (probe instanceof Error) {
-    const code = (probe as { code?: unknown }).code
-    if (code === 'ETIMEDOUT') return 'timed out'
-    const first = probe.message.split('\n')[0]!.trim()
-    if (/timed out|Command failed.*ETIMEDOUT/i.test(first)) return 'timed out'
-    return first
-  }
+  if (probe instanceof Error) return probe.message.split('\n')[0]!.trim()
   const r = probe as RunResult | undefined
   if (!r) return 'no result'
   if (r.timedOut === true) return 'timed out'
@@ -2710,26 +2684,17 @@ export function captureError(probe: unknown): string | undefined {
  * typed), `unknown` (no completion result — timeout, a signal, no exit code — so it may have run),
  * or `probe` with the failure line for a read. Both hosts report these as fields; nothing is parsed.
  */
-function writeClass(done: { r: unknown } | { e: unknown }): { class: 'sent' | 'unknown' | 'probe'; text?: string } {
-  // Allowlist (P2-03): only a resolved result with a whole exit code >= 0, no signal and no timeout is a finished
-  // write. Any rejection — of any type, even one shaped like a result — and anything else may have typed: unknown.
-  if ('e' in done) {
-    const e = done.e
-    const msg = e instanceof Error ? e.message : e
-    const first = typeof msg === 'string' ? msg.split('\n')[0]!.trim() : ''
-    return { class: 'unknown', text: first || 'rejected without a result' }
-  }
-  const r = done.r as Partial<RunResult> | null | undefined
-  if (!r || typeof r !== 'object') return { class: 'unknown', text: 'no result' }
-  // Read each field once: the check, the class and the text must all see the same value (r6).
-  const { timedOut, signal, exitCode, stderr } = r
-  if (timedOut === true) return { class: 'unknown', text: 'timed out' }
-  if (signal) return { class: 'unknown', text: `killed by ${signal}` }
-  // -1 is the node host's code for "never exited"; a missing or non-integer code is no exit status either.
-  if (typeof exitCode !== 'number' || !Number.isInteger(exitCode) || exitCode < 0) return { class: 'unknown', text: 'no completion result' }
-  if (exitCode === 0) return { class: 'sent' }
-  const why = typeof stderr === 'string' ? stderr.split('\n').find(l => l.trim())?.trim().replace(CTRL_ALL_RE, ' ') : undefined
-  return { class: 'probe', text: `exit ${exitCode}${why ? `: ${why}` : ''}` }
+function writeClass(probe: unknown): { class: 'sent' | 'unknown' | 'probe'; text?: string } {
+  // A rejection carries no exit code: the write may have run, so it is unknown with its own text, never
+  // guessed at by matching words.
+  if (probe instanceof Error) return { class: 'unknown', text: probe.message.split('\n')[0]!.trim() }
+  const r = probe as RunResult
+  if (r.timedOut === true) return { class: 'unknown', text: 'timed out' }
+  if (r.signal) return { class: 'unknown', text: `killed by ${r.signal}` }
+  if (r.exitCode === 0) return { class: 'sent' }
+  // -1 is the node host's code for "never exited": no exit status, so not proof the text was typed.
+  if (r.exitCode < 0) return { class: 'unknown', text: 'no completion result' }
+  return { class: 'probe', text: captureError(r) }
 }
 
 /**

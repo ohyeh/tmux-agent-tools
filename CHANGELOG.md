@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `workers-tui` hc writes: the write-result check is back to what the two real hosts can return. `host.run` is an async function in both hosts (`host.node.ts` resolves `{ exitCode: number, stdout, stderr, timedOut?, signal? }`; the mod's `wholeRun` returns the engine's typed result or rejects with an `Error`), so the guards for a synchronous throw, a non-`Error` rejection, a non-object result, a non-integer exit code, a non-string stderr and a re-read getter are gone, and `captureError` no longer names a timeout from an `ETIMEDOUT` code or from words in the error text (the node host reports `timedOut`; the engine's text is passed through). Real outcomes read as before: exit 0 sent, exit N failed, `timedOut` / a signal / exit -1 / a rejection delivery unknown.
+
 ## v0.55.0 - 2026-11-23
 
 - `workers-tui`: in 編輯, `t` on a live own-parent hc row opens the same prompt the worker `t` uses and sends with `hc send <address> <text>`; `i` runs `hc interrupt <address>` (hc presses the program's own stop key; it never kills). Another hc terminal's row, or an ended one, runs nothing and the hint says why. A failed call (hc exit non-zero, no core) shows in the status line and is never retried. `x`/`d` (kill/rm) act on own-parent rows only.
