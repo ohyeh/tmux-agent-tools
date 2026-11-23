@@ -3923,7 +3923,7 @@ test('hc key-state: worker-only keys do nothing; d/c work on finished hc; ticks 
   // t11 is this session's hc terminal: t1 is an own row (x acts on it), t2 is another's.
   const base: TuiState = { ...ownerState(), hcParent: 't11', selected: hcId('t1'), herdr: agents }
   // Row worker-only keys do nothing in edit, preview, and viewer modes; d does nothing on live hc; x stays off in preview/viewer.
-  // Phase 2: base is edit with an OWN live row, so t opens the send prompt and i interrupts there. Every other
+  // Base is edit with an OWN live row, so t opens the send prompt and i interrupts there. Every other
   // case (preview, viewer) never acts: the mode gate names 唯讀 / 預覽 first.
   const editAdds = new Set(['t', 'T'])
   for (const modeState of [base, { ...base, mode: 'preview' as const }, { ...base, mode: 'preview' as const, viewer: true, owner: undefined }]) {
@@ -4379,7 +4379,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     assert.ok(!stripAnsi(stdout.written).includes('other-done'), 'other parent finished row is excluded')
 
     // Select live t1, then arm + confirm x x -> hc kill t1 (stays listed as finished; hc count drops to 1).
-    // (Phase 2's t/i prompt has its own e2e test; the hint line is longer now and this frame is kept small.)
+    // (The t/i prompt has its own e2e test; the hint line is longer now and this frame is kept small.)
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
     await until(() => plain().includes('› live-one t1') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
@@ -4524,7 +4524,7 @@ test('parseHc keeps a finished record without status (hc drops it on finish) and
   assert.ok(hcFinished(out[0]!))
 })
 
-// --- hc rows reach parity with the tmux rows (Phase 1) ---
+// --- hc rows reach parity with the tmux rows ---
 
 const ESC = '\x1b'
 const hcState = (herdr: HcAgent[], hcInfo?: Record<string, HcInfo>, over: Partial<TuiState> = {}): TuiState => ({
@@ -5041,10 +5041,10 @@ test('hc gets: at most four in flight across ticks, a queued row that left is ne
 })
 
 // -----------------------------------------------------------------------------
-// Phase 2 fix round 1: review-sol-p2 findings P2-01..P2-04
+// hc send / interrupt: target, preflight, owner, width
 // -----------------------------------------------------------------------------
 
-test('hc submit: the target is the address the prompt opened on, and a row that ends while it is open keeps the draft (P2-01, P2-03)', () => {
+test('hc submit: the target is the address the prompt opened on, and a row that ends while it is open keeps the draft', () => {
   const live = hcAg('t1', { parent: 't11', name: 'mine', status: 'working' })
   const base: TuiState = { ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId('t1'), herdr: [live] }
   const opened = nextKeyState(base, 't', 1000).state
@@ -5062,7 +5062,7 @@ test('hc submit: the target is the address the prompt opened on, and a row that 
   const o = nextKeyState(other, '\r', 1100)
   assert.equal(o.action, undefined)
   assert.equal(o.state.resumeInput, 'stale')
-  // `hc ?`: still no argv, the draft is kept (P2-03).
+  // `hc ?`: still no argv, the draft is kept.
   const unknown = { ...typed, herdr: '?' as const }
   const u = nextKeyState(unknown, '\r', 1100)
   assert.equal(u.action, undefined, 'hc ? is not proof the row left')
@@ -5076,7 +5076,7 @@ test('hc submit: the target is the address the prompt opened on, and a row that 
   assert.deepEqual(nextKeyState(moved, '\r', 1100).action, { type: 'hcSend', address: 't1', text: 'stale' }, 'inputFor wins over the selection')
 })
 
-test('hc send: a delayed preflight re-read that ends the row runs no hc send (P2-01)', async () => {
+test('hc send: a delayed preflight re-read that ends the row runs no hc send', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-hc-pre-'))
   const host = quietHost('S', root, root)
   const bin = join(root, 'bin', 'hc')
@@ -5137,7 +5137,7 @@ test('hc send: a delayed preflight re-read that ends the row runs no hc send (P2
   }
 })
 
-test('hc owner vs self: --hc-parent t21 with env t99 shows and removes t21 finished rows, never t99 (P2-02)', async () => {
+test('hc owner vs self: --hc-parent t21 with env t99 shows and removes t21 finished rows, never t99', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-hc-owner-'))
   const host = quietHost('S', root, root)
   const bin = join(root, 'bin', 'hc')
@@ -5194,7 +5194,7 @@ test('hc owner vs self: --hc-parent t21 with env t99 shows and removes t21 finis
   }
 })
 
-test('hc a blocked question is still actionable: t and i on an own live row send (P2-06 decision)', () => {
+test('hc a blocked question is still actionable: t and i on an own live row send', () => {
   const q = hcAg('t1', { parent: 't11', name: 'q', status: 'blocked' })
   const st: TuiState = { ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId('t1'), herdr: [q] }
   // Parity with tmux tell: no blocked/question refusal; a manual send is an explicit owner act.
@@ -5204,7 +5204,7 @@ test('hc a blocked question is still actionable: t and i on an own live row send
   assert.deepEqual(nextKeyState(st, 'i', 1000).action, { type: 'interruptHc', address: 't1' }, 'interrupt is available too')
 })
 
-test('hc armed x at 80 columns keeps its confirmation and consequence ahead of the t/i shortcuts (P2-04)', () => {
+test('hc armed x at 80 columns keeps its confirmation and consequence ahead of the t/i shortcuts', () => {
   const own = (over: Partial<HcAgent> = {}) => hcAg('t1', { parent: 't11', name: 'owner', status: 'working', ...over })
   const line = (st: TuiState, amb = '2') => {
     const old = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
@@ -5228,7 +5228,7 @@ test('hc armed x at 80 columns keeps its confirmation and consequence ahead of t
   assert.match(detail, /other hc terminal/, 'the forbidden reason reaches the Detail footer')
 })
 
-test('hc send killed by a signal after the write reports delivery unknown, runs one argv, and is never resent (P2-03 r3)', async () => {
+test('hc send killed by a signal after the write reports delivery unknown, runs one argv, and is never resent', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-hc-signal-'))
   const host = quietHost('S', root, root)
   const bin = join(root, 'bin', 'hc')
@@ -5327,11 +5327,11 @@ test('hc timeout: a cut send ends as delivery unknown and the toast carries the 
 })
 
 // -----------------------------------------------------------------------------
-// Phase 2: hc send / interrupt on own-parent rows; mutation gaps X1, X5
+// hc send / interrupt on own-parent rows
 // -----------------------------------------------------------------------------
 
 
-test('hc get failed is never retried, even when its row then ends: exactly one get (X5)', async () => {
+test('hc get failed is never retried, even when its row then ends: exactly one get', async () => {
   // X5 mutation: drop `final: true` on a failed get (tui.node.ts:2048). Without it, a row that fails its
   // first get and then turns finished is queried again (the finish-get path), so the count rises to two.
   const lab = hcLab('tui-hc-x5-')
@@ -5373,11 +5373,8 @@ test('hc get failed is never retried, even when its row then ends: exactly one g
   }
 })
 
-// -----------------------------------------------------------------------------
-// Phase 2: hc send / interrupt on own-parent rows; mutation gaps X1, X5
-// -----------------------------------------------------------------------------
 
-test('hc order: readHc puts a live row before a finished row whatever the hc ls order (X1)', async () => {
+test('hc order: readHc puts a live row before a finished row whatever the hc ls order', async () => {
   // X1 mutation: drop the live-before-finished sort in readHc (workers.ts:577).
   const lab = hcLab('tui-hc-order-')
   lab.list = [
@@ -5455,7 +5452,7 @@ test('hc t/i hints: shown only where they act, and another parent names the reas
   }
 })
 
-test('hc send e2e: a preflight get that answers {} keeps the prompt and its draft, and the same Enter sends once after it recovers (P2-03)', async () => {
+test('hc send e2e: a preflight get that answers {} keeps the prompt and its draft, and the same Enter sends once after it recovers', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-hc-draft-'))
   const host = quietHost('S', root, root)
   const bin = join(root, 'bin', 'hc')
@@ -5509,7 +5506,7 @@ test('hc send e2e: a preflight get that answers {} keeps the prompt and its draf
   }
 })
 
-test('hc hints offer x only in edit: preview and viewer keep their Phase 1 line, and another parent\'s Detail keeps a whole "Esc mirror" at 80 cols (R2-02)', () => {
+test('hc hints offer x only in edit: preview and viewer keep their read-only line, and another parent\'s Detail keeps a whole "Esc mirror" at 80 cols', () => {
   const old = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
   process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = '2'
   try {

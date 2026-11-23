@@ -874,10 +874,10 @@ export function nextKeyState(
         return { state: closed, action: { type: 'tell', row, text: val } }
       }
       if (state.inputKind === 'hcSend') {
-        // The prompt is for the address it opened on, not whatever is selected now (P2-01).
+        // The prompt is for the address it opened on, not whatever is selected now.
         const address = state.inputFor?.startsWith('hc:') ? state.inputFor.slice(3) : undefined
         const hc = address ? hcAgents(state).find(a => a.address === address) : undefined
-        // `hc ?` or the row missing is not proof it left: keep the draft and let a later tick resolve it (P2-03).
+        // `hc ?` or the row missing is not proof it left: keep the draft and let a later tick resolve it.
         if (!hc || state.herdr === '?') {
           return say({ ...state, resumeInput: val }, `send — ${address ? `waiting for hc to list ${address} again` : 'that hc row is gone'}; the text is kept`, now)
         }
@@ -1209,12 +1209,12 @@ function hcHints(state: TuiState, hc: HcAgent, now: number): string[] {
   const why = own ? '' : '  \x1b[2mother hc terminal — t/i/x act on your own rows only\x1b[0m'
   if (state.expanded) {
     if (state.mode === 'edit' && !state.viewer) {
-      // An armed or forbidden row's reason comes first: the two-press warning must survive 80 columns (P2-04).
+      // An armed or forbidden row's reason comes first: the two-press warning must survive 80 columns.
       const lead = btn(xLong, dLong)
       const btns = btn(sendHint, intHint, lead)
       return [`${btns}  ${attach} · Esc mirror · ↑↓ 捲動${tail}${why}`, `${lead || btns}${tail}`, `${lead || btn(sendHint, intHint, xShort, dShort)}`]
     }
-    // Preview and viewer cannot run x (it needs 編輯): offer only what acts there (R2-02).
+    // Preview and viewer cannot run x (it needs 編輯): offer only what acts there.
     return dLong
       ? [`${dLong}  hc · ${attach} · Esc mirror · ↑↓ 捲動${tail}${why}`, `${dLong}  ${attach}${tail}`, `${dLong}${why}`]
       : [`hc · ${attach} · Esc mirror · ↑↓ 捲動${why}`, attach, '']
@@ -1231,17 +1231,16 @@ function hcHints(state: TuiState, hc: HcAgent, now: number): string[] {
       : [`${head}e 編輯 · ↑↓ 捲動 · Enter detail`, 'Enter detail', '']
   }
   // Edit: the long form, then the same keys with the armed/forbidden warning kept ahead of the t/i shortcuts.
-  // The armed line carries its consequence text at every width it can fit (P2-04); only a non-armed row falls
+  // The armed line carries its consequence text at every width it can fit; only a non-armed row falls
   // back to the one-key form.
   const long = btn(sendHint, intHint, xLong, dLong)
   const medium = btn(xLong, dLong, sendHint, intHint)
   const oneKey = btn(xLong, dShort, sendHint, intHint)
-  // Armed: the warning and its consequence own the line; t/i wait for the arm to clear (Phase 1 kept that line at 80 cols).
+  // Armed: the warning and its consequence own the line; t/i wait for the arm to clear.
   const armedLine = `${btn(xLong, dLong)}${tail}`
   return [
     `${long}  ↑↓ 捲動 · Enter detail${tail}${why}`,
     `${medium}${tail}${why}`,
-    `${(stopArmed || delArmed) && tail ? armedLine : oneKey}${why}`,
     `${(stopArmed || delArmed) && tail ? armedLine : oneKey}${why}`,
   ]
 }
@@ -1526,7 +1525,6 @@ function rowLine(state: TuiState, index: number, selected: number): string {
   return `${digitPrefix}${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}${sanitizeAnsi(rowLabel(r, index === selected))}`
 }
 
-/** One hc row, the tmux row's grammar: `N: ` glyph `› name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age. */
 /** `text` cut to `max` cells by the same rule as `cellWidth` (`TMUX_AGENT_AMBIGUOUS_WIDTH`), `…` marking the cut; no `…` when it does not fit. */
 function fitByCells(text: string, max: number): string {
   if (cellWidth(text) <= max) return text
@@ -1545,6 +1543,7 @@ function fitByCells(text: string, max: number): string {
   return max >= dots ? `${cut(text, max - dots)}…` : cut(text, max)
 }
 
+/** One hc row, the tmux row's grammar: `N: ` glyph `› name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age. */
 function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, width: number, now: number): string {
   const info = state.hcInfo?.[a.address]
   const look = hcLook(a)
@@ -1631,9 +1630,9 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
       const all = lay.detail ?? ['loading…']
       const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyRows))
       const end = Math.min(all.length, top + bodyRows)
-      // hc Detail: the forbidden reason leads when this row is another terminal's (P2-04), then the nav.
+      // hc Detail: the forbidden reason leads when this row is another terminal's, then the nav.
       const why = hc && !(isOwnHc(hc, state.hcParent) || hcFinished(hc)) ? 'other hc terminal · ' : ''
-      // The reason costs cells at 80 columns: give up `b/f scroll` (the keys still work) before cutting a word (R2-02).
+      // The reason costs cells at 80 columns: give up `b/f scroll` (the keys still work) before cutting a word.
       const nav = hc ? (state.viewer ? 'Enter attach (watch-only) · Esc mirror' : 'Enter attach · Esc mirror') : 'Enter mirror'
       const full = `${why}detail ${all.length ? top + 1 : 0}–${end} of ${all.length} · b/f scroll · ${nav}`
       const short = `${why}detail ${all.length ? top + 1 : 0}–${end} of ${all.length} · ${nav}`
@@ -2099,7 +2098,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     try {
       const [agents, self] = await Promise.all([readHc(host), host.envHcTerminal()])
       if (!agents) return undefined
-      // SELF hides this terminal's own row; OWNER (--hc-parent or env) decides which finished rows are ours (P2-02).
+      // SELF hides this terminal's own row; OWNER (--hc-parent or env) decides which finished rows are ours.
       const owner = state.hcParent
       return agents.filter(a => (!self || a.address !== self) && (!hcFinished(a) || (!!owner && a.parent === owner)))
     } catch {
@@ -2432,7 +2431,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     }
     if (action.type === 'hcSend') {
       const out = await sendHc(host, action.address, action.text, state.hcParent)
-      // Refused before any write: the prompt stays open with its draft, and Enter retries (P2-03).
+      // Refused before any write: the prompt stays open with its draft, and Enter retries.
       if (!out.ok && out.refusedBeforeWrite) {
         state = { ...state, adding: true, inputKind: 'hcSend', inputFor: hcId(action.address), resumeInput: action.text }
         say(`send ${action.address} — FAILED: ${out.text.slice(0, 120)}`)

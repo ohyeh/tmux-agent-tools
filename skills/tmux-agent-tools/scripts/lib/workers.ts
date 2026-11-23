@@ -647,7 +647,7 @@ export async function mirrorHc(host: Host, address: string, rows: number, color 
  * address and say `state: live` outright — a missing or unknown state is not proof of life — and the write
  * always goes to the address asked for, never to one the answer names.
  */
-export async function hcActionable(host: Host, address: string, owner: string | undefined): Promise<{ agent: HcAgent } | { no: string }> {
+export async function hcActionable(host: Host, address: string, owner: string | undefined): Promise<{ agent: HcAgent; bin: string } | { no: string }> {
   if (!owner) return { no: 'no hc terminal for this session (--hc-parent or $HC_TERMINAL_ID)' }
   const bin = await hcBin(host)
   if (!bin) return { no: 'hc is not on PATH' }
@@ -669,51 +669,47 @@ export async function hcActionable(host: Host, address: string, owner: string | 
   if (doc.state !== 'live') return { no: `${address} is not live (state ${typeof doc.state === 'string' ? doc.state : 'unknown'})` }
   const agent = parseHcTerminal(doc)
   if (!isOwnHc(agent, owner)) return { no: `${address} is not this session's hc row (parent ${agent.parent ? `@${agent.parent}` : 'none'})` }
-  return { agent }
+  return { agent, bin }
 }
 
 /** May this session act on this hc row? Only rows its own hc terminal started (`parent`), and never that terminal. */
 export const isOwnHc = (a: Pick<HcAgent, 'address' | 'parent'>, parent: string | undefined): boolean =>
   !!parent && a.parent === parent && a.address !== parent
 
-/** Type into an hc terminal: `hc send <address> <text>`, after one live re-read of the target. Never retried: hc may have typed it. */
-export async function sendHc(host: Host, address: string, text: string, owner: string | undefined): Promise<Outcome> {
-  // After the PATH and socket probes, hc itself is asked whether the row is still live and still this session's.
+/**
+ * One hc write (`send` or `interrupt`) on an own live row, after one live re-read of the target. Never retried:
+ * hc may have acted. Returns the refusal or failure as an Outcome, or the write's stdout on success.
+ */
+async function hcAct(host: Host, verb: 'send' | 'interrupt', address: string, args: string[], owner: string | undefined, ms: number): Promise<{ fail: Outcome } | { stdout: string }> {
   const target = await hcActionable(host, address, owner)
-  // Nothing was written: the caller may keep the draft and let the person press Enter again (P2-03).
-  if ('no' in target) return { ok: false, text: `hc send ${address} stopped: ${target.no}`, refusedBeforeWrite: true }
-  const bin = await hcBin(host)
-  if (!bin) return { ok: false, text: 'hc is not on PATH', refusedBeforeWrite: true }
+  // Nothing was written: the caller may keep the draft and let the person press Enter again.
+  if ('no' in target) return { fail: { ok: false, text: `hc ${verb} ${address} stopped: ${target.no}`, refusedBeforeWrite: true } }
   // The target is the requested address: the response only proved it is still that row.
-  const done = await hcWrite(host, [bin, 'send', address, text], HC_SEND_MS)
+  const done = await hcWrite(host, [target.bin, verb, address, ...args], ms)
   try {
     const w = writeClass(done)
-    // No completion result (a cut, a signal) may still have typed the text: say so, and never resend.
-    if (w.class === 'unknown') return { ok: false, text: `hc send ${address} — delivery unknown (${w.text})` }
-    if (w.class === 'probe') return { ok: false, text: `hc send ${address} failed (${w.text})` }
-    return { ok: true, text: `sent to hc ${address}` }
+    // No completion result (a cut, a signal) may still have acted: say so, and never resend.
+    if (w.class === 'unknown') return { fail: { ok: false, text: `hc ${verb} ${address} — delivery unknown (${w.text})` } }
+    if (w.class === 'probe') return { fail: { ok: false, text: `hc ${verb} ${address} failed (${w.text})` } }
+    const out = (done as { r: RunResult }).r.stdout
+    return { stdout: typeof out === 'string' ? out : '' }
   } catch {
-    return { ok: false, text: `hc send ${address} — delivery unknown (unreadable result)` }
+    return { fail: { ok: false, text: `hc ${verb} ${address} — delivery unknown (unreadable result)` } }
   }
 }
 
-/** Stop the current turn: `hc interrupt <address>`, after one live re-read. hc presses the program's own stop key; it never kills. */
+/** Type into an hc terminal: `hc send <address> <text>`. */
+export async function sendHc(host: Host, address: string, text: string, owner: string | undefined): Promise<Outcome> {
+  const r = await hcAct(host, 'send', address, [text], owner, HC_SEND_MS)
+  return 'fail' in r ? r.fail : { ok: true, text: `sent to hc ${address}` }
+}
+
+/** Stop the current turn: `hc interrupt <address>`. hc presses the program's own stop key; it never kills. */
 export async function interruptHc(host: Host, address: string, owner: string | undefined): Promise<Outcome> {
-  const target = await hcActionable(host, address, owner)
-  if ('no' in target) return { ok: false, text: `hc interrupt ${address} stopped: ${target.no}`, refusedBeforeWrite: true }
-  const bin = await hcBin(host)
-  if (!bin) return { ok: false, text: 'hc is not on PATH', refusedBeforeWrite: true }
-  const done = await hcWrite(host, [bin, 'interrupt', address], HC_INTERRUPT_MS)
-  try {
-    const w = writeClass(done)
-    if (w.class === 'unknown') return { ok: false, text: `hc interrupt ${address} — delivery unknown (${w.text})` }
-    if (w.class === 'probe') return { ok: false, text: `hc interrupt ${address} failed (${w.text})` }
-    const out = (done as { r: RunResult }).r.stdout
-    const said = typeof out === 'string' ? (out.trim().split('\n')[0] ?? '').slice(0, 120) : ''
-    return { ok: true, text: `interrupted hc ${address}${said ? `: ${said}` : ''}` }
-  } catch {
-    return { ok: false, text: `hc interrupt ${address} — delivery unknown (unreadable result)` }
-  }
+  const r = await hcAct(host, 'interrupt', address, [], owner, HC_INTERRUPT_MS)
+  if ('fail' in r) return r.fail
+  const said = (r.stdout.trim().split('\n')[0] ?? '').slice(0, 120)
+  return { ok: true, text: `interrupted hc ${address}${said ? `: ${said}` : ''}` }
 }
 
 /**
@@ -3431,7 +3427,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
     }
     // It ended with no result at all: it may have arrived. `uncertain` + `sent` — watched, never re-sent (§8).
     // No class is named: the engine throws one error type for a timeout, an abort and a spawn failure alike,
-    // so the raw text is carried through rather than guessed at (commander ruling, fix round 3).
+    // so the raw text is carried through rather than guessed at.
     if (cut) await mark(host, epDir, 'uncertain')
     await mark(host, epDir, 'sent')
     const moved = d.owner && me && d.owner !== me ? `; it is now this session's teammate (was ${d.owner.slice(0, 8)})` : ''

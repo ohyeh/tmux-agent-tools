@@ -137,8 +137,8 @@ const MOD_VERSION = '0.55.0'
  * The engine's `$.process.run` rejects when the child cannot start, is aborted, or is still running at the
  * ceiling. Read out of the 2.1.330 engine (`M3a`): all three throw one `HooksError` built by
  * `DVe(name, method, command)` — `failed to start: …`, `aborted`, or `aborted: still running after <N>ms` —
- * so no structured timeout signal exists to read. Nothing here classifies that text (commander ruling,
- * fix round 3): a rejection travels on untouched, and a write that ends without an exit code is the
+ * so no structured timeout signal exists to read. Nothing here classifies that text: a
+ * rejection travels on untouched, and a write that ends without an exit code is the
  * caller's to report as delivery unknown.
  */
 async function wholeRun(argv: readonly string[], ran: Promise<{ exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }>) {

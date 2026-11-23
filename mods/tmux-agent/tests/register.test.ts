@@ -3450,7 +3450,7 @@ describe('teammates', () => {
       expect(drawn).toContain('hc-band-line-2')
       expect(drawn).toContain('See it whole: hc attach t20')
       expect(keysOf(tree)).toContain('stop:hc:t20')
-      // Phase 2 fix 1 (P2-05): a selected own-parent live hc row has the same tell Input and interrupt button as a tmux row.
+      // A selected own-parent live hc row has the same tell Input and interrupt button as a tmux row.
       expect(keysOf(tree)).toContain('tell:hc:t20')
       expect(keysOf(tree)).toContain('interrupt:hc:t20')
       const reads = hcRuns(panel.argv).filter(a => a[1] === 'read')
@@ -3473,7 +3473,6 @@ describe('teammates', () => {
       const panel = mockPanel(on, probe)
       type TypeInto = (t: { plugin: string; key: string; text: string; requestId: string; surface: 'terminal' }) => Promise<unknown>
       const typeInto = ($.ui as unknown as { input: TypeInto }).input
-      const calls = () => hcRuns(panel.argv).filter(a => a[1] === 'send' || a[1] === 'interrupt' || a[1] === 'kill' || a[1] === 'rm')
 
       await $.session.start(session())
       await $.command.run(run('workers'))
@@ -3515,7 +3514,7 @@ describe('teammates', () => {
       expect(hcRuns(panel.argv).filter(a => a[1] === 'send' || a[1] === 'interrupt')).toEqual([])
     })
 
-    test('a refused hc send toasts the error once and runs exactly one argv (P2-05 failure branch)', WITH_DRIVER, async ($, on) => {
+    test('a refused hc send toasts the error once and runs exactly one argv', WITH_DRIVER, async ($, on) => {
       mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
       mockStore(on)
       const clock = mockClock(on)
@@ -5536,7 +5535,7 @@ describe('cursor review of 34e2a1e', () => {
     expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI 已開在 %9，在 %5 旁'])
   })
 
-  test('[ ⧉ ] the split carries --hc-parent so the TUI knows which hc rows are this session\'s (Phase 2)', WITH_DRIVER, async ($, on) => {
+  test('[ ⧉ ] the split carries --hc-parent so the TUI knows which hc rows are this session\'s', WITH_DRIVER, async ($, on) => {
     const files: Files = { ...worker('w1', 0) }
     const { p } = band(on, { TMUX_PANE: '%5', HC_TERMINAL_ID: 't21' }, files)
     await $.session.start(session())
