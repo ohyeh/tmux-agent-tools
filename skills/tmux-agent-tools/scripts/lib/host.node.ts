@@ -86,7 +86,17 @@ export function nodeHost(opts: NodeHostOptions = {}): Host {
       return new Promise(resolve => {
         execFile(cmd[0]!, cmd.slice(1), { cwd, timeout: timeoutMs, encoding: 'utf8', ...(env ? { env } : {}) }, (error, stdout, stderr) => {
           const code = error ? (typeof error.code === 'number' ? error.code : -1) : 0
-          resolve({ exitCode: code, stdout, stderr: stderr || (error && typeof error.code !== 'number' ? String(error) : '') })
+          // execFile's own flag for a child it killed at the ceiling: the only timeout evidence a caller gets.
+          const timedOut = !!error && (error as { killed?: boolean }).killed === true
+          // A signal ended the child: there is no exit code, so the result cannot prove the command finished.
+          const signal = error ? (error as { signal?: string | null }).signal : undefined
+          resolve({
+            exitCode: code,
+            stdout,
+            stderr: stderr || (error && typeof error.code !== 'number' ? String(error) : ''),
+            ...(timedOut ? { timedOut: true } : {}),
+            ...(signal ? { signal } : {}),
+          })
         })
       })
     },

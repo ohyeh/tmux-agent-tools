@@ -79,6 +79,9 @@ import {
   hcFinished,
   mirrorHc,
   stopHc,
+  sendHc,
+  interruptHc,
+  isOwnHc,
   type HcAgent,
   claimTui,
   releaseTui,
@@ -123,12 +126,20 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.54.0'
+const MOD_VERSION = '0.55.0'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
  * the caller sees a rejection, as for a failed run, so a partial `tmux ls` never replaces the
  * fleet (Sol r9). The mod's captures are one screen, so this only fires on a broken child.
+ */
+/**
+ * The engine's `$.process.run` rejects when the child cannot start, is aborted, or is still running at the
+ * ceiling. Read out of the 2.1.330 engine (`M3a`): all three throw one `HooksError` built by
+ * `DVe(name, method, command)` — `failed to start: …`, `aborted`, or `aborted: still running after <N>ms` —
+ * so no structured timeout signal exists to read. Nothing here classifies that text (commander ruling,
+ * fix round 3): a rejection travels on untouched, and a write that ends without an exit code is the
+ * caller's to report as delivery unknown.
  */
 async function wholeRun(argv: readonly string[], ran: Promise<{ exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }>) {
   const r = await ran
@@ -898,6 +909,9 @@ export const register: Register = on => {
         break
     }
     const token = claim.claim.token
+    // The TUI does not inherit this commander's HC_TERMINAL_ID (a split-window inherits the tmux server's env;
+    // a new app tab its own), so pass it: the band's env is the one that knows which hc rows are this session's.
+    const hcParent = await host.envHcTerminal()
     const dir = await host.envTmuxAgentDir()
     const launchFile = launchDir ? tuiLaunchPath(launchDir, session, token) : undefined
     const release = () =>
@@ -909,7 +923,7 @@ export const register: Register = on => {
       const opened = await openInTerminal(
         host,
         {
-          argv: [entry, '--session', session, '--cwd', cwd, '--claim', token],
+          argv: [entry, '--session', session, '--cwd', cwd, '--claim', token, ...(hcParent ? ['--hc-parent', hcParent] : [])],
           cwd,
           env: dir ? { TMUX_AGENT_DIR: dir } : {},
           session,
@@ -1019,6 +1033,17 @@ export const register: Register = on => {
     const me = world?.owner()
     // hc agents this session's hc terminal started: counted (live only), listed, selectable, mirrorable, and stoppable.
     const herdrRows = Array.isArray(panel.herdr) ? panel.herdr : []
+    // OWNER for the hc row actions: readHerdrBand lists only rows of this session's own hc terminal, so its env id is the owner.
+    let panelHcOwner: string | undefined = typeof panel.hcOwner === 'string' ? panel.hcOwner : undefined
+    if (panelHcOwner === undefined && world) {
+      // Once per render, cached on the panel: resolving it is one env read on the host.
+      void world.envHcTerminal().then(id => {
+        if (id && panel.hcOwner !== id) {
+          panel.hcOwner = id
+          $.ui.invalidate('ui.render')
+        }
+      })
+    }
     const herdrCount = panel.herdr === undefined ? '' : ` · hc ${panel.herdr === '?' ? '?' : panel.herdr.filter(a => !hcFinished(a)).length}`
     const tally = `tmux ${tmuxRunning} · 內部 ${panel.internal}${herdrCount}`
     const counts = `${me ? `@${me.slice(0, 8)} · ` : ''}${tally}`
@@ -1207,7 +1232,7 @@ export const register: Register = on => {
                   onPress: () =>
                     pressTwice(CLEAR_ID, () =>
                       void act('clear', async host => {
-                        const out = await stopAll(host, gate)
+                        const out = await stopAll(host, gate, undefined, await host.envHcTerminal())
                         void panel.refresh?.()
                         return out
                       }),
@@ -1405,8 +1430,10 @@ export const register: Register = on => {
       }
     }
 
-    // Selectable hc rows (same digit hotkeys, mirror, arm-then-confirm stop, and clear on finished as worker rows;
-    // send/tell/interrupt stay off). The title keeps the live count; a cut list ends on `+N more`.
+    // Selectable hc rows: the same digit hotkeys, mirror, arm-then-confirm stop and clear on finished as worker rows,
+    // and the same selected-row actions a tmux row has — the tell Input (`hc send`) and the interrupt button
+    // (`hc interrupt`) — on a live row whose parent is this session's hc terminal. The title keeps the live count;
+    // a cut list ends on `+N more`.
     for (const [idx, a] of shownHerdr.entries()) {
       const hcTarget = hcId(a.address)
       const isSel = drawnSelHc?.address === a.address
@@ -1429,10 +1456,35 @@ export const register: Register = on => {
       const hcArm = hcFinished(a) ? `${hcTarget}#rm` : hcTarget
       const armed = panel.armedStop?.id === hcArm && now < panel.armedStop.until
       const hcEndHint = hcFinished(a) ? 'removes this finished hc terminal' : 'ends its hc terminal'
+      const hcOwn = isOwnHc(a, panelHcOwner)
+      // The same two actions a tmux row's selected line has, on an own live row: type (hc send), then interrupt.
+      const hcActions =
+        Input && hcOwn && !hcFinished(a)
+          ? [
+              Input({
+                key: `tell:${hcTarget}`,
+                placeholder: 'message — Enter sends',
+                submitLabel: 'send',
+                onSubmit: (value: string) => {
+                  const text = value.trim()
+                  if (!text) return
+                  void act(`send ${a.address}`, host => sendHc(host, a.address, text, panelHcOwner))
+                },
+              }),
+              Text({ children: '  ' }),
+              Button({
+                key: `interrupt:${hcTarget}`,
+                label: '↯ interrupt',
+                hotkey: 'i',
+                onPress: () => void act(`interrupt ${a.address}`, host => interruptHc(host, a.address, panelHcOwner)),
+              }),
+            ]
+          : []
       children.push(
         Box({
           flexDirection: 'row',
           children: [
+            ...hcActions,
             Text({ children: '  ' }),
             Button({
               key: `stop:${hcTarget}`,
@@ -1991,7 +2043,7 @@ export const register: Register = on => {
     const input = e as unknown as StopInput
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
-    if (input.all === true) return { result: `${(await stopAll(host, gate)).text}.` }
+    if (input.all === true) return { result: `${(await stopAll(host, gate, undefined, await host.envHcTerminal())).text}.` }
     if (!NAME_RE.test(input.name ?? '')) return { deny: 'tmux-agent: name must match [A-Za-z0-9_.-], max 64 chars, or pass all: true' }
     const d = await dispatchNamed(host, input.name!)
     if (!d && projectNamed(input.name!)) return READONLY_PROJECT

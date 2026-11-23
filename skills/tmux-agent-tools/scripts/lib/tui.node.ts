@@ -49,6 +49,9 @@ import {
   hcFinished,
   mirrorHc,
   stopHc,
+  sendHc,
+  interruptHc,
+  isOwnHc,
   captureError,
   type HcAgent,
   panelRows,
@@ -305,7 +308,7 @@ export function wrapCells(text: string, width: number): string[] {
 }
 
 /** What the input line is for. Unset `inputKind` = resume. */
-export type InputKind = 'resume' | 'tell' | 'assign'
+export type InputKind = 'resume' | 'tell' | 'assign' | 'hcSend'
 
 export interface TuiState {
   rows: PanelRow[]
@@ -339,6 +342,10 @@ export interface TuiState {
   version?: string
   /** No --session and no TMUX_AGENT_SESSION: every row, read-only (D-viewer). */
   viewer?: boolean
+  /** OWNER: this session's hc terminal (`--hc-parent`, else `$HC_TERMINAL_ID`); every hc mutation and the finished filter use it. */
+  hcParent?: string
+  /** SELF: this process's own `$HC_TERMINAL_ID`, used only to hide this terminal's own row (never for the finished filter). */
+  hcSelf?: string
   /** 預覽 is the default. Mutating keys act only in 編輯 (I3). */
   mode?: 'preview' | 'edit' | 'picker'
   /** SessionPicker highlight (T2a). */
@@ -366,6 +373,8 @@ export type TuiAction =
   | { type: 'stop'; row: PanelRow }
   | { type: 'stopAll' }
   | { type: 'interrupt'; row: PanelRow }
+  | { type: 'hcSend'; address: string; text: string }
+  | { type: 'interruptHc'; address: string }
   | { type: 'resume'; value: string }
   | { type: 'tell'; row: PanelRow; text: string }
   | { type: 'assign'; value: string }
@@ -864,6 +873,18 @@ export function nextKeyState(
         if (!row) return say(closed, 'tell — that row is gone', now)
         return { state: closed, action: { type: 'tell', row, text: val } }
       }
+      if (state.inputKind === 'hcSend') {
+        // The prompt is for the address it opened on, not whatever is selected now (P2-01).
+        const address = state.inputFor?.startsWith('hc:') ? state.inputFor.slice(3) : undefined
+        const hc = address ? hcAgents(state).find(a => a.address === address) : undefined
+        // `hc ?` or the row missing is not proof it left: keep the draft and let a later tick resolve it (P2-03).
+        if (!hc || state.herdr === '?') {
+          return say({ ...state, resumeInput: val }, `send — ${address ? `waiting for hc to list ${address} again` : 'that hc row is gone'}; the text is kept`, now)
+        }
+        if (hcFinished(hc)) return say({ ...state, resumeInput: val }, `send — ${address} has ended; the text is kept, Esc drops it`, now)
+        if (!isOwnHc(hc, state.hcParent)) return say({ ...state, resumeInput: val }, `send — ${address} is another hc terminal's row; the text is kept, Esc drops it`, now)
+        return { state: closed, action: { type: 'hcSend', address: hc.address, text: val } }
+      }
       if (state.inputKind === 'assign') return { state: closed, action: { type: 'assign', value: val } }
       return { state: closed, action: { type: 'resume', value: val } }
     }
@@ -899,8 +920,10 @@ export function nextKeyState(
   const row = state.selected ? state.rows.find(x => x.id === state.selected) : undefined
   const hc = row ? undefined : selectedHc(state)
 
-  // Worker-row-only keys do nothing on an hc row (no send, keys, tell, cancel, unlock, interrupt).
-  if (hc && ROW_WORKER_KEYS.has(key)) return { state }
+  // Worker-row keys on an hc row: - and U do nothing (no episode, no lock). t/T/i/I fall through: the mode
+  // gates just below speak outside edit (唯讀 / 預覽), and in edit the handler names why a row is not
+  // actionable (another hc terminal, ended) or runs the hc send / interrupt.
+  if (hc && ROW_WORKER_KEYS.has(key) && !['t', 'T', 'i', 'I'].includes(key)) return { state }
 
   // The one read-only gate: no key a viewer presses reaches an action (D-viewer).
   if (state.viewer && MUTATING_KEYS.has(key)) return say(state, READ_ONLY, now)
@@ -935,6 +958,11 @@ export function nextKeyState(
   }
 
   if (key === 't' || key === 'T') {
+    if (hc) {
+      if (hcFinished(hc)) return say(state, `send — ${hc.address} has ended; send reaches a live hc row only`, now)
+      if (!isOwnHc(hc, state.hcParent)) return say(state, `send — ${hc.address} is another hc terminal's row; send works on your own rows only`, now)
+      return { state: { ...state, adding: true, resumeInput: '', inputKind: 'hcSend', inputFor: hcId(hc.address) } }
+    }
     if (!row || row.project) return { state }
     return { state: { ...state, adding: true, resumeInput: '', inputKind: 'tell', inputFor: row.id } }
   }
@@ -955,7 +983,12 @@ export function nextKeyState(
 
   if (key === 'x' || key === 'X') {
     // The verb is in the arm id: a live row that finishes inside the window re-arms instead of turning kill into rm.
-    if (hc) return pressTwice(state, hcFinished(hc) ? `delete:${hcId(hc.address)}` : hcId(hc.address), now, { type: 'stopHc', hc })
+    // Own parent only (brief default): digits reach every hc row, so a kill must not. A finished row in the
+    // list is this session's own (the tick lists only own finished rows), so rm needs no parent check.
+    if (hc) {
+      if (!hcFinished(hc) && !isOwnHc(hc, state.hcParent)) return say(state, `stop — ${hc.address} is another hc terminal's row; stop works on your own rows only`, now)
+      return pressTwice(state, hcFinished(hc) ? `delete:${hcId(hc.address)}` : hcId(hc.address), now, { type: 'stopHc', hc })
+    }
     if (!row || row.project) return { state }
     return pressTwice(state, row.id, now, { type: 'stop', row })
   }
@@ -985,6 +1018,12 @@ export function nextKeyState(
   }
 
   if (key === 'i' || key === 'I') {
+    if (hc) {
+      if (hcFinished(hc)) return say(state, `interrupt — ${hc.address} has ended; nothing to interrupt`, now)
+      if (!isOwnHc(hc, state.hcParent)) return say(state, `interrupt — ${hc.address} is another hc terminal's row; interrupt works on your own rows only`, now)
+      // hc interrupt presses the program's own stop key; it never kills the terminal.
+      return { state, action: { type: 'interruptHc', address: hc.address } }
+    }
     if (row && !row.project && (row.state === 'running' || row.state === 'stalled')) {
       return { state, action: { type: 'interrupt', row } }
     }
@@ -1149,39 +1188,62 @@ function hcHints(state: TuiState, hc: HcAgent, now: number): string[] {
   const id = hcId(hc.address)
   const label = hc.name ?? hc.address
   const finished = hcFinished(hc)
+  // A finished row in the list was listed because its parent is OWNER (the tick's filter), so it is own by construction.
+  const own = isOwnHc(hc, state.hcParent) || finished
   const delArmed = state.armedStop?.id === `delete:${id}` && now < state.armedStop.until
-  // x on a finished row arms the same delete:hc id as d (the verb lives in the id), so x shows it too.
-  const stopArmed = ((state.armedStop?.id === id && now < state.armedStop.until) || (finished && delArmed))
-  const delHint = finished ? hint('d', delArmed ? `delete ${label}? press again` : 'delete', true) : undefined
-  const stopHint = hint('x', stopButtonLabel(label, stopArmed), true)
+  // x on an own finished row arms the same delete:hc id as d (the verb lives in the id), so x shows it too.
+  const stopArmed = (state.armedStop?.id === id && now < state.armedStop.until) || (own && finished && delArmed)
+  const sendHint = own && !finished ? hint('t', 'send', true) : undefined
+  const intHint = own && !finished ? hint('i', 'interrupt', true) : undefined
+  const xLong = own ? hint('x', stopButtonLabel(label, stopArmed), true) : undefined
+  const dLong = own && finished ? hint('d', delArmed ? `delete ${label}? press again` : 'delete', true) : undefined
+  const xShort = own ? hint('x', 'stop', false) : undefined
+  const dShort = own && finished ? hint('d', 'delete', false) : undefined
   const tail = stopArmed
     ? `  \x1b[31m${finished ? 'removes finished hc terminal' : 'ends its hc terminal'} · ${Math.ceil((state.armedStop!.until - now) / 1000)}s\x1b[0m`
     : delArmed
       ? `  \x1b[31mremoves finished hc terminal · ${Math.ceil((state.armedStop!.until - now) / 1000)}s\x1b[0m`
       : ''
   const attach = state.viewer ? 'Enter attach (watch-only)' : 'Enter attach'
+  const btn = (...xs: (string | undefined)[]) => xs.filter((x): x is string => !!x).join(' ')
+  const why = own ? '' : '  \x1b[2mother hc terminal — t/i/x act on your own rows only\x1b[0m'
   if (state.expanded) {
     if (state.mode === 'edit' && !state.viewer) {
-      const btns = delHint ? `${stopHint} ${delHint}` : stopHint
-      return [`${btns}  ${attach} · Esc mirror · ↑↓ 捲動${tail}`, `${btns}  ${attach}${tail}`, attach]
+      // An armed or forbidden row's reason comes first: the two-press warning must survive 80 columns (P2-04).
+      const lead = btn(xLong, dLong)
+      const btns = btn(sendHint, intHint, lead)
+      return [`${btns}  ${attach} · Esc mirror · ↑↓ 捲動${tail}${why}`, `${lead || btns}${tail}`, `${lead || btn(sendHint, intHint, xShort, dShort)}`]
     }
-    return delHint
-      ? [`${delHint}  hc · ${attach} · Esc mirror · ↑↓ 捲動${tail}`, `${delHint}  ${attach}${tail}`, attach]
-      : [`hc · ${attach} · Esc mirror · ↑↓ 捲動`, attach]
+    // Preview and viewer cannot run x (it needs 編輯): offer only what acts there (R2-02).
+    return dLong
+      ? [`${dLong}  hc · ${attach} · Esc mirror · ↑↓ 捲動${tail}${why}`, `${dLong}  ${attach}${tail}`, `${dLong}${why}`]
+      : [`hc · ${attach} · Esc mirror · ↑↓ 捲動${why}`, attach, '']
   }
   if (state.viewer) {
-    return delHint
-      ? [`${delHint}  ${READ_ONLY} · Enter detail${tail}`, `${delHint}  唯讀${tail}`, delHint]
-      : [`hc · ${READ_ONLY} · Enter detail`, 'Enter detail']
+    return dLong
+      ? [`${dLong}  ${READ_ONLY} · Enter detail${tail}`, `${dLong}  唯讀${tail}`, dLong]
+      : [`hc · ${READ_ONLY} · Enter detail`, 'Enter detail', '']
   }
   if (state.mode !== 'edit') {
-    return delHint
-      ? [`${delHint}  e 編輯 · ↑↓ 捲動 · Enter detail${tail}`, `${delHint}  e 編輯${tail}`, delHint]
-      : ['hc · e 編輯 · ↑↓ 捲動 · Enter detail', 'Enter detail']
+    const head = own ? '' : 'hc · other hc terminal · '
+    return dLong
+      ? [`${dLong}  e 編輯 · ↑↓ 捲動 · Enter detail${tail}`, `${dLong}  e 編輯${tail}`, dLong]
+      : [`${head}e 編輯 · ↑↓ 捲動 · Enter detail`, 'Enter detail', '']
   }
-  const btns = delHint ? `${stopHint} ${delHint}` : stopHint
-  const shortBtns = delHint ? `${hint('x', 'stop', false)} ${hint('d', 'delete', false)}` : hint('x', 'stop', false)
-  return [`${btns}  ↑↓ 捲動 · Enter detail${tail}`, `${btns}${tail}`, shortBtns]
+  // Edit: the long form, then the same keys with the armed/forbidden warning kept ahead of the t/i shortcuts.
+  // The armed line carries its consequence text at every width it can fit (P2-04); only a non-armed row falls
+  // back to the one-key form.
+  const long = btn(sendHint, intHint, xLong, dLong)
+  const medium = btn(xLong, dLong, sendHint, intHint)
+  const oneKey = btn(xLong, dShort, sendHint, intHint)
+  // Armed: the warning and its consequence own the line; t/i wait for the arm to clear (Phase 1 kept that line at 80 cols).
+  const armedLine = `${btn(xLong, dLong)}${tail}`
+  return [
+    `${long}  ↑↓ 捲動 · Enter detail${tail}${why}`,
+    `${medium}${tail}${why}`,
+    `${(stopArmed || delArmed) && tail ? armedLine : oneKey}${why}`,
+    `${(stopArmed || delArmed) && tail ? armedLine : oneKey}${why}`,
+  ]
 }
 
 function fitFirst(options: string[], width: number): string {
@@ -1396,6 +1458,8 @@ function sectionsOf(state: TuiState, width: number, now: number, gate?: Gate, he
     const label =
       state.inputKind === 'tell'
         ? `t tell ${state.rows.find(r => r.id === state.inputFor)?.d.name ?? '?'}`
+        : state.inputKind === 'hcSend'
+          ? `t send ${state.inputFor?.startsWith('hc:') ? state.inputFor.slice(3) : '?'}`
         : state.inputKind === 'assign'
           ? '+ assign <profile> <name> <brief-file>'
           : 'n resume [profile] <session-id> [name]'
@@ -1567,8 +1631,13 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
       const all = lay.detail ?? ['loading…']
       const top = Math.max(0, Math.min(state.scroll ?? 0, all.length - bodyRows))
       const end = Math.min(all.length, top + bodyRows)
-      const actionHint = hc ? (state.viewer ? 'Enter attach (watch-only) · Esc mirror' : 'Enter attach · Esc mirror') : 'Enter mirror'
-      tail = `\x1b[2mdetail ${all.length ? top + 1 : 0}–${end} of ${all.length} · b/f scroll · ${actionHint}\x1b[0m`
+      // hc Detail: the forbidden reason leads when this row is another terminal's (P2-04), then the nav.
+      const why = hc && !(isOwnHc(hc, state.hcParent) || hcFinished(hc)) ? 'other hc terminal · ' : ''
+      // The reason costs cells at 80 columns: give up `b/f scroll` (the keys still work) before cutting a word (R2-02).
+      const nav = hc ? (state.viewer ? 'Enter attach (watch-only) · Esc mirror' : 'Enter attach · Esc mirror') : 'Enter mirror'
+      const full = `${why}detail ${all.length ? top + 1 : 0}–${end} of ${all.length} · b/f scroll · ${nav}`
+      const short = `${why}detail ${all.length ? top + 1 : 0}–${end} of ${all.length} · ${nav}`
+      tail = `\x1b[2m${cellWidth(full) <= width ? full : short}\x1b[0m`
     } else {
       const targetId = r ? r.id : hcId(hc!.address)
       const m = state.mirror?.id === targetId ? state.mirror : undefined
@@ -1688,6 +1757,8 @@ export interface TuiOptions {
   rowsMs?: number
   /** Adopt this pending token (`--claim`). Any other current record is stale. */
   claim?: string
+  /** This session's hc terminal (`--hc-parent`): the parent of the hc rows `t`/`i`/`x` act on. Default `$HC_TERMINAL_ID`. */
+  hcParent?: string
   /** Delete `workers-tui-<sessionKey>-<token>.yaml` here once the claim is ready. */
   launchDir?: string
   /** Interactive attach runner (defaults to spawnSync with inherited stdio). */
@@ -1957,6 +2028,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
     owner: host.owner(),
     version: coreVersion(),
     viewer: !session,
+    hcParent: options.hcParent,
     mode: 'preview',
   }
 
@@ -2025,9 +2097,11 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   let hcRunning = 0
   const herdrNow = async (): Promise<HcAgent[] | '?' | undefined> => {
     try {
-      const [agents, me] = await Promise.all([readHc(host), host.envHcTerminal()])
+      const [agents, self] = await Promise.all([readHc(host), host.envHcTerminal()])
       if (!agents) return undefined
-      return agents.filter(a => (!me || a.address !== me) && (!hcFinished(a) || (!!me && a.parent === me)))
+      // SELF hides this terminal's own row; OWNER (--hc-parent or env) decides which finished rows are ours (P2-02).
+      const owner = state.hcParent
+      return agents.filter(a => (!self || a.address !== self) && (!hcFinished(a) || (!!owner && a.parent === owner)))
     } catch {
       return '?'
     }
@@ -2356,11 +2430,31 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
       render()
       return
     }
+    if (action.type === 'hcSend') {
+      const out = await sendHc(host, action.address, action.text, state.hcParent)
+      // Refused before any write: the prompt stays open with its draft, and Enter retries (P2-03).
+      if (!out.ok && out.refusedBeforeWrite) {
+        state = { ...state, adding: true, inputKind: 'hcSend', inputFor: hcId(action.address), resumeInput: action.text }
+        say(`send ${action.address} — FAILED: ${out.text.slice(0, 120)}`)
+      } else {
+        say(`send ${action.address} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 120)}`)
+      }
+      await refreshRows()
+      render()
+      return
+    }
+    if (action.type === 'interruptHc') {
+      const out = await interruptHc(host, action.address, state.hcParent)
+      say(`interrupt ${action.address} — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 120)}`)
+      await refreshRows()
+      render()
+      return
+    }
     if (action.type === 'stopAll') {
       const out = await stopAll(host, gate, name => {
         const row = state.all.find(r => r.d.name === name) ?? state.rows.find(r => r.d.name === name)
         return auditOf(row?.holder)
-      })
+      }, state.hcParent)
       say(`clear — ${out.ok ? 'ok' : 'FAILED'}: ${out.text.slice(0, 100)}`)
       await refreshRows()
       render()
@@ -2519,6 +2613,13 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
   process.on('SIGTERM', stop)
   process.on('SIGHUP', stop)
 
+  // Read after the listeners are attached: it must not delay a key (an early `q` is kept, H6).
+  // SELF is this process's own terminal (hide its row); OWNER is the session's (the band's --hc-parent wins over env).
+  {
+    const me = await host.envHcTerminal().catch(() => undefined)
+    if (me) state = { ...state, hcSelf: me, hcParent: state.hcParent ?? me }
+  }
+
   try {
     if (session && root) {
       const claimed = await claimLaunch(host, root, session, { claim: options.claim, launchDir: options.launchDir })
@@ -2586,16 +2687,16 @@ async function main(): Promise<void> {
     process.stderr.write(`tui: TMUX_AGENT_AMBIGUOUS_WIDTH must be 1 or 2, not ${JSON.stringify(amb)}\n`)
     process.exit(2)
   }
-  let values: { session?: string; cwd?: string; claim?: string }
+  let values: { session?: string; cwd?: string; claim?: string; 'hc-parent'?: string }
   try {
-    ;({ values } = parseArgs({ options: { session: { type: 'string' }, cwd: { type: 'string' }, claim: { type: 'string' } } }))
+    ;({ values } = parseArgs({ options: { session: { type: 'string' }, cwd: { type: 'string' }, claim: { type: 'string' }, 'hc-parent': { type: 'string' } } }))
   } catch (error) {
     process.stderr.write(`tui: ${(error as Error).message}\n`)
     process.exit(2)
   }
   // Outside tmux, Warp's own launch file is removed at ready.
   const launchDir = await tuiLaunchDir(nodeHost())
-  const code = await runTui({ session: values.session, cwd: values.cwd, claim: values.claim, launchDir })
+  const code = await runTui({ session: values.session, cwd: values.cwd, claim: values.claim, launchDir, hcParent: values['hc-parent'] })
   // Terminal already restored. A signal can arrive while an action's child still
   // runs; exit now instead of waiting for it (the old SIGINT/SIGTERM handler did too).
   process.exit(code)

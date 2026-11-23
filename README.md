@@ -227,7 +227,7 @@ workers-tui                                      # viewer: every worker, labeled
   delivery. The list is drawn from `hc ls` at once; the age (`m:ss`, `2h38m` from an hour) and the
   program name come from one `hc get` when an address first appears (never one per tick), and a row
   that ends gets one more for its finish time, after which its age stays fixed and reads `ran 14:10` (the run time). The selected row shows its `status.msg` as a summary line when it has
-  one. The title adds `hc N live · M ended` (`hc ?` when the read fails). `j`/`k` and `1`–`9`
+  one. In 編輯, `t` on a live own-parent hc row sends with `hc send <address> <text>` and `i` runs `hc interrupt <address>` (never a kill); another hc terminal's row or an ended one runs nothing and says why, and a send refused before any write (row ended, gone, `hc ?`, or an answer for another address) keeps the draft for the next Enter, while a write that ends with no exit code (a timeout, a signal, a rejection) says `delivery unknown` and is never resent. The preflight `hc get` must answer for that exact address and say `state: live`. The owner terminal is `--hc-parent` (the band passes the session's `$HC_TERMINAL_ID`), else `$HC_TERMINAL_ID`. The title adds `hc N live · M ended` (`hc ?` when the read fails). The band's `/workers` panel gives a selected live own-parent hc row the same `hc send` Input and `hc interrupt` button as a tmux row. `j`/`k` and `1`–`9`
   reach every hc row. The viewer stays read-only. Homebrew `herdr` (`herdr agent list`) is not shown.
 
 - Owner vs viewer: with `--session` (or `$TMUX_AGENT_SESSION`) the TUI holds

@@ -248,6 +248,10 @@ export const MIRROR_MS = 2_000
 export const MIRROR_PROBE_MS = 1_500
 /** `tmux ls` for the whole fleet is one process; it must never hold a tick. */
 export const LIVE_PROBE_MS = 5_000
+/** `hc send` waits for a person's unfinished draft; give it room, then report the cut. */
+export const HC_SEND_MS = 8_000
+/** `hc interrupt` watches the turn for up to 10 s of its own. */
+export const HC_INTERRUPT_MS = 12_000
 /**
  * The wrapper names a worker's session `<prefix>-<name>` (agent-tmux:943), and the
  * prefix is the profile's to choose (`prefix=`, tenant suffix). The name is the
@@ -386,7 +390,7 @@ export type Host = {
     argv: readonly string[],
     cwd: string,
     timeoutMs: number,
-  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+  ) => Promise<{ exitCode: number; stdout: string; stderr: string; timedOut?: boolean; signal?: string }>
   /** `$.agent.list()`: subagents and in-process teammates. The panel counts `running`; the collector matches a waiter by `id`. */
   agentList: () => Promise<readonly { id: string; status: string }[]>
 }
@@ -533,34 +537,38 @@ export function parseHc(stdout: string): HcAgent[] {
   const doc = JSON.parse(stdout) as { error?: { kind?: unknown; message?: unknown }; terminals?: unknown }
   if (doc.error) throw new Error(`hc: ${String(doc.error.kind)}: ${String(doc.error.message)}`)
   if (!Array.isArray(doc.terminals)) throw new Error('hc: no terminals in its answer')
-  const s = (v: unknown) => (typeof v === 'string' && v ? v : '?')
-  const opt = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
-  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
   return (doc.terminals as Record<string, unknown>[])
     .filter(t => t && typeof t === 'object' && (opt(t.status) || (opt(t.state) ?? 'live') !== 'live' || !HC_SHELLS.has(String(t.agent))))
-    .map(t => {
-      const name = opt(t.name)
-      const parent = opt(t.parent)
-      const state = opt(t.state)
-      const reason = opt(t.reason)
-      const turn = num(t.turn)
-      const exitCode = num(t.exit_code)
-      const signal = num(t.signal)
-      return {
-        address: s(t.address),
-        agent: s(t.agent),
-        status: opt(t.status) ?? '',
-        cwd: s(t.cwd),
-        where: s(t.where),
-        ...(state ? { state } : {}),
-        ...(name ? { name } : {}),
-        ...(parent ? { parent } : {}),
-        ...(turn !== undefined ? { turn } : {}),
-        ...(exitCode !== undefined ? { exitCode } : {}),
-        ...(reason ? { reason } : {}),
-        ...(signal !== undefined ? { signal } : {}),
-      }
-    })
+    .map(parseHcTerminal)
+}
+
+const opt = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+
+/** One `hc get`/`hc ls` terminal record as an `HcAgent`; the mapper `parseHc` uses, so a preflight reads the same fields. */
+export function parseHcTerminal(t: Record<string, unknown>): HcAgent {
+  const s = (v: unknown) => (typeof v === 'string' && v ? v : '?')
+  const name = opt(t.name)
+  const parent = opt(t.parent)
+  const state = opt(t.state)
+  const reason = opt(t.reason)
+  const turn = num(t.turn)
+  const exitCode = num(t.exit_code)
+  const signal = num(t.signal)
+  return {
+    address: s(t.address),
+    agent: s(t.agent),
+    status: opt(t.status) ?? '',
+    cwd: s(t.cwd),
+    where: s(t.where),
+    ...(state ? { state } : {}),
+    ...(name ? { name } : {}),
+    ...(parent ? { parent } : {}),
+    ...(turn !== undefined ? { turn } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(reason ? { reason } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+  }
 }
 
 /**
@@ -631,6 +639,96 @@ export async function mirrorHc(host: Host, address: string, rows: number, color 
   const error = captureError(probe)
   if (error) return { lines: [], error }
   return { lines: paneTail((probe as RunResult).stdout, rows, color) }
+}
+
+/**
+ * The hc row a `t`/`i` action was aimed at, re-read live right before the call: hc's own answer is the only
+ * proof the target is still there, still live, and still this session's. The answer must name this exact
+ * address and say `state: live` outright — a missing or unknown state is not proof of life — and the write
+ * always goes to the address asked for, never to one the answer names.
+ */
+export async function hcActionable(host: Host, address: string, owner: string | undefined): Promise<{ agent: HcAgent } | { no: string }> {
+  if (!owner) return { no: 'no hc terminal for this session (--hc-parent or $HC_TERMINAL_ID)' }
+  const bin = await hcBin(host)
+  if (!bin) return { no: 'hc is not on PATH' }
+  if (!(await hcSocketLive(host))) return { no: 'hc core is not running' }
+  const probe = await host
+    .run([bin, 'get', address, '--json'], host.cwd() ?? '/', MIRROR_PROBE_MS)
+    .catch((err: unknown) => err)
+  const error = captureError(probe)
+  if (error) return { no: `hc get ${address} failed (${error})` }
+  let doc: Record<string, unknown> | undefined
+  try {
+    const parsed: unknown = JSON.parse((probe as RunResult).stdout)
+    doc = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined
+  } catch (err) {
+    return { no: `hc get ${address} gave no terminal (${err instanceof Error ? err.message : String(err)})` }
+  }
+  if (!doc) return { no: `hc get ${address} gave no terminal` }
+  if (doc.address !== address) return { no: `hc get ${address} answered for ${typeof doc.address === 'string' ? doc.address : 'no address'}` }
+  if (doc.state !== 'live') return { no: `${address} is not live (state ${typeof doc.state === 'string' ? doc.state : 'unknown'})` }
+  const agent = parseHcTerminal(doc)
+  if (!isOwnHc(agent, owner)) return { no: `${address} is not this session's hc row (parent ${agent.parent ? `@${agent.parent}` : 'none'})` }
+  return { agent }
+}
+
+/** May this session act on this hc row? Only rows its own hc terminal started (`parent`), and never that terminal. */
+export const isOwnHc = (a: Pick<HcAgent, 'address' | 'parent'>, parent: string | undefined): boolean =>
+  !!parent && a.parent === parent && a.address !== parent
+
+/** Type into an hc terminal: `hc send <address> <text>`, after one live re-read of the target. Never retried: hc may have typed it. */
+export async function sendHc(host: Host, address: string, text: string, owner: string | undefined): Promise<Outcome> {
+  // After the PATH and socket probes, hc itself is asked whether the row is still live and still this session's.
+  const target = await hcActionable(host, address, owner)
+  // Nothing was written: the caller may keep the draft and let the person press Enter again (P2-03).
+  if ('no' in target) return { ok: false, text: `hc send ${address} stopped: ${target.no}`, refusedBeforeWrite: true }
+  const bin = await hcBin(host)
+  if (!bin) return { ok: false, text: 'hc is not on PATH', refusedBeforeWrite: true }
+  // The target is the requested address: the response only proved it is still that row.
+  const done = await hcWrite(host, [bin, 'send', address, text], HC_SEND_MS)
+  try {
+    const w = writeClass(done)
+    // No completion result (a cut, a signal) may still have typed the text: say so, and never resend.
+    if (w.class === 'unknown') return { ok: false, text: `hc send ${address} — delivery unknown (${w.text})` }
+    if (w.class === 'probe') return { ok: false, text: `hc send ${address} failed (${w.text})` }
+    return { ok: true, text: `sent to hc ${address}` }
+  } catch {
+    return { ok: false, text: `hc send ${address} — delivery unknown (unreadable result)` }
+  }
+}
+
+/** Stop the current turn: `hc interrupt <address>`, after one live re-read. hc presses the program's own stop key; it never kills. */
+export async function interruptHc(host: Host, address: string, owner: string | undefined): Promise<Outcome> {
+  const target = await hcActionable(host, address, owner)
+  if ('no' in target) return { ok: false, text: `hc interrupt ${address} stopped: ${target.no}`, refusedBeforeWrite: true }
+  const bin = await hcBin(host)
+  if (!bin) return { ok: false, text: 'hc is not on PATH', refusedBeforeWrite: true }
+  const done = await hcWrite(host, [bin, 'interrupt', address], HC_INTERRUPT_MS)
+  try {
+    const w = writeClass(done)
+    if (w.class === 'unknown') return { ok: false, text: `hc interrupt ${address} — delivery unknown (${w.text})` }
+    if (w.class === 'probe') return { ok: false, text: `hc interrupt ${address} failed (${w.text})` }
+    const out = (done as { r: RunResult }).r.stdout
+    const said = typeof out === 'string' ? (out.trim().split('\n')[0] ?? '').slice(0, 120) : ''
+    return { ok: true, text: `interrupted hc ${address}${said ? `: ${said}` : ''}` }
+  } catch {
+    return { ok: false, text: `hc interrupt ${address} — delivery unknown (unreadable result)` }
+  }
+}
+
+/**
+ * Run one hc write and keep whatever happened: a resolved value as { r }, a synchronous throw or any rejection as
+ * { e }. The call itself never throws past this. Invariant for the callers: after hcWrite, each Host-supplied field
+ * is read once, inside the caller's guard, and every decision uses those locals. A run that never settles is the Host's deadline (it reports timedOut), not this function's:
+ * a late exit 0 still reads sent (R2-03).
+ */
+async function hcWrite(host: Host, argv: string[], ms: number): Promise<{ r: unknown } | { e: unknown }> {
+  const cwd = host.cwd() ?? '/'
+  try {
+    return { r: await host.run(argv, cwd, ms) }
+  } catch (e) {
+    return { e }
+  }
 }
 
 /** Close an hc terminal: `hc kill <address>` when live, `hc rm <address>` when finished. */
@@ -884,6 +982,8 @@ export type Panel = {
   shownHerdrFirst?: number
   /** Failed `hc ls` reads in a row; the second one logs, once per session (`herdrMissLogged`). */
   herdrMisses?: number
+  /** The band's own hc terminal (`$HC_TERMINAL_ID`), resolved once: the owner of the hc rows it lists and acts on. */
+  hcOwner?: string
   herdrMissLogged?: boolean
   mirror?: { id: string } & MirrorCapture
   timer?: { cancel: () => void }
@@ -2588,14 +2688,52 @@ export interface MirrorCapture {
 
 type RunResult = Awaited<ReturnType<Host['run']>>
 
-/** Why a capture or hc run failed, one line; undefined when it succeeded. */
+/**
+ * Why a capture or hc run failed, one line; undefined when it succeeded. A timeout is the host's own
+ * `timedOut` verdict (an `ETIMEDOUT` Error also names it), never a duration: a slow success is a
+ * success, and an ordinary refusal keeps its exit code and its own stderr.
+ */
 export function captureError(probe: unknown): string | undefined {
-  if (probe instanceof Error) return probe.message.split('\n')[0]!
+  if (probe instanceof Error) {
+    const code = (probe as { code?: unknown }).code
+    if (code === 'ETIMEDOUT') return 'timed out'
+    const first = probe.message.split('\n')[0]!.trim()
+    if (/timed out|Command failed.*ETIMEDOUT/i.test(first)) return 'timed out'
+    return first
+  }
   const r = probe as RunResult | undefined
   if (!r) return 'no result'
+  if (r.timedOut === true) return 'timed out'
   if (r.exitCode === 0) return undefined
   const why = r.stderr.split('\n').find(l => l.trim())?.trim().replace(CTRL_ALL_RE, ' ')
   return `exit ${r.exitCode}${why ? `: ${why}` : ''}`
+}
+
+/**
+ * The class of a finished write: `sent`, `refused` (an exit the command chose, so the text was not
+ * typed), `unknown` (no completion result — timeout, a signal, no exit code — so it may have run),
+ * or `probe` with the failure line for a read. Both hosts report these as fields; nothing is parsed.
+ */
+function writeClass(done: { r: unknown } | { e: unknown }): { class: 'sent' | 'unknown' | 'probe'; text?: string } {
+  // Allowlist (P2-03): only a resolved result with a whole exit code >= 0, no signal and no timeout is a finished
+  // write. Any rejection — of any type, even one shaped like a result — and anything else may have typed: unknown.
+  if ('e' in done) {
+    const e = done.e
+    const msg = e instanceof Error ? e.message : e
+    const first = typeof msg === 'string' ? msg.split('\n')[0]!.trim() : ''
+    return { class: 'unknown', text: first || 'rejected without a result' }
+  }
+  const r = done.r as Partial<RunResult> | null | undefined
+  if (!r || typeof r !== 'object') return { class: 'unknown', text: 'no result' }
+  // Read each field once: the check, the class and the text must all see the same value (r6).
+  const { timedOut, signal, exitCode, stderr } = r
+  if (timedOut === true) return { class: 'unknown', text: 'timed out' }
+  if (signal) return { class: 'unknown', text: `killed by ${signal}` }
+  // -1 is the node host's code for "never exited"; a missing or non-integer code is no exit status either.
+  if (typeof exitCode !== 'number' || !Number.isInteger(exitCode) || exitCode < 0) return { class: 'unknown', text: 'no completion result' }
+  if (exitCode === 0) return { class: 'sent' }
+  const why = typeof stderr === 'string' ? stderr.split('\n').find(l => l.trim())?.trim().replace(CTRL_ALL_RE, ' ') : undefined
+  return { class: 'probe', text: `exit ${exitCode}${why ? `: ${why}` : ''}` }
 }
 
 /**
@@ -3112,7 +3250,7 @@ export async function autoStop(host: Host, gate: Gate, v3: string, quiet: readon
   }
 }
 
-export type Outcome = { ok: true; text: string } | { ok: false; text: string }
+export type Outcome = { ok: true; text: string } | { ok: false; text: string; refusedBeforeWrite?: true }
 
 /**
  * A follow-up to a worker: the same worker, a NEW episode.
@@ -3291,7 +3429,9 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
           `Peek at "${d.name}" before telling it again; a stopped worker needs a fresh assign.`,
       }
     }
-    // Cut off: it may have arrived. `uncertain` + `sent` — watched, never re-sent (§8).
+    // It ended with no result at all: it may have arrived. `uncertain` + `sent` — watched, never re-sent (§8).
+    // No class is named: the engine throws one error type for a timeout, an abort and a spawn failure alike,
+    // so the raw text is carried through rather than guessed at (commander ruling, fix round 3).
     if (cut) await mark(host, epDir, 'uncertain')
     await mark(host, epDir, 'sent')
     const moved = d.owner && me && d.owner !== me ? `; it is now this session's teammate (was ${d.owner.slice(0, 8)})` : ''
@@ -3299,9 +3439,7 @@ export async function tellWorker(host: Host, d: TmuxDispatch, text: string): Pro
       return {
         ok: false,
         seq: ep.seq,
-        text:
-          `send to "${d.name}" did not finish within ${TELL_SEND_MS / 1000}s and was stopped (${cut.slice(-200)}); ` +
-          `the message may have arrived. Peek at "${d.name}" before telling it again${moved}`,
+        text: `send to "${d.name}" stopped without a result (${cut.slice(-200)}); delivery unknown. Peek at "${d.name}" before telling it again${moved}`,
       }
     }
     return { ok: true, seq: ep.seq, text: `sent to "${d.name}" on ${d.profile} as episode ${ep.seq}; its result goes to ${ep.resultPath}${moved}${stopped ? `; ${stopped.text}` : ''}` }
@@ -3351,7 +3489,8 @@ export async function writeTuiAudit(
   if (run.exitCode !== 0) host.log(`tmux-agent: tui audit ${event} for ${fields.name} failed: ${(run.stderr || run.stdout).trim().slice(0, 200)}`)
 }
 
-export async function stopAll(host: Host, gate: Gate, auditFor?: (name: string) => TuiAudit): Promise<Outcome> {
+/** `owner` is the session's hc terminal (the TUI's `--hc-parent`, the band's env): never this process's own env. */
+export async function stopAll(host: Host, gate: Gate, auditFor?: (name: string) => TuiAudit, owner?: string): Promise<Outcome> {
   const { dispatches } = await scan(host, { claim: false })
   // One per worker: its latest episode (a worker has many).
   const latest = [...new Map(dispatches.map(d => [d.name, d])).values()]
@@ -3359,10 +3498,9 @@ export async function stopAll(host: Host, gate: Gate, auditFor?: (name: string) 
   const live = latest.filter(d => hasSession(alive, d))
   const outs = [] as Outcome[]
   for (const d of live) outs.push(await stopWorker(host, gate, d, undefined, auditFor?.(d.name)))
-  const me = await host.envHcTerminal()
-  if (me) {
+  if (owner) {
     try {
-      const finishedHc = ((await readHc(host)) ?? []).filter(a => a.parent === me && a.address !== me && hcFinished(a))
+      const finishedHc = ((await readHc(host)) ?? []).filter(a => a.parent === owner && a.address !== owner && hcFinished(a))
       for (const a of finishedHc) outs.push(await stopHc(host, a))
     } catch (error) {
       outs.push({ ok: false, text: `hc ls failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}` })

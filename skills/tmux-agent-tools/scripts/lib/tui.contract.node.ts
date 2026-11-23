@@ -40,8 +40,11 @@ import {
   hcFinished,
   elapsed,
   parseHc,
+  readHc,
   herdrLabel,
   scan,
+  sendHc,
+  interruptHc,
   type Health,
 } from './workers.ts'
 import { sessionKey } from './ledger.ts'
@@ -3917,17 +3920,31 @@ test('hc key-state: worker-only keys do nothing; d/c work on finished hc; ticks 
     { address: 't1', agent: 'agy', cwd: '/a', status: 'idle', where: 'a / 1', name: 'one', parent: 't11' },
     { address: 't2', agent: 'codex', cwd: '/b', status: 'working', where: 'b / 1' },
   ]
-  const base: TuiState = { ...ownerState(), selected: hcId('t1'), herdr: agents }
+  // t11 is this session's hc terminal: t1 is an own row (x acts on it), t2 is another's.
+  const base: TuiState = { ...ownerState(), hcParent: 't11', selected: hcId('t1'), herdr: agents }
   // Row worker-only keys do nothing in edit, preview, and viewer modes; d does nothing on live hc; x stays off in preview/viewer.
+  // Phase 2: base is edit with an OWN live row, so t opens the send prompt and i interrupts there. Every other
+  // case (preview, viewer) never acts: the mode gate names 唯讀 / 預覽 first.
+  const editAdds = new Set(['t', 'T'])
   for (const modeState of [base, { ...base, mode: 'preview' as const }, { ...base, mode: 'preview' as const, viewer: true, owner: undefined }]) {
     for (const key of ['t', 'T', 'i', 'I', '-', 'U', 'd']) {
       const next = nextKeyState(modeState, key, 1000)
-      assert.equal(next.action, undefined, `${modeState.viewer ? 'viewer' : modeState.mode} ${key} no action`)
       assert.equal(next.state.armedStop, undefined, `${key} no armedStop`)
+      if (modeState === base && editAdds.has(key)) {
+        assert.equal(next.state.adding, true, `${key} opens the send prompt on an own live row`)
+        continue
+      }
+      if (modeState === base && ['i', 'I'].includes(key)) {
+        assert.deepEqual(next.action, { type: 'interruptHc', address: 't1' }, `${key} interrupts the own live row`)
+        continue
+      }
+      assert.equal(next.action, undefined, `${modeState.viewer ? 'viewer' : modeState.mode} ${key} no action`)
       assert.equal(next.state.adding, false, `${key} no adding`)
-      assert.equal(next.state.statusMessage, undefined, `${key} no statusMessage`)
+      if (!['t', 'T', 'i', 'I'].includes(key)) assert.equal(next.state.statusMessage, undefined, `${key} no statusMessage`)
     }
   }
+  assert.equal(nextKeyState({ ...base, mode: 'preview' }, 't', 1000).state.statusMessage, PREVIEW_ONLY, 'preview t names 預覽')
+  assert.equal(nextKeyState({ ...base, mode: 'preview', viewer: true, owner: undefined }, 'x', 1000).state.statusMessage, READ_ONLY)
   // c does nothing in edit mode when there are no workers and no finished hc rows.
   for (const key of ['c', 'C']) {
     const noClearable: TuiState = { ...base, rows: [], all: [] }
@@ -4361,14 +4378,11 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     await until(() => plain().includes('hc 2 live · 1 ended') && plain().includes('done-one t2'), 5_000, 'initial hc 2 live, 1 ended render')
     assert.ok(!stripAnsi(stdout.written).includes('other-done'), 'other parent finished row is excluded')
 
+    // Select live t1, then arm + confirm x x -> hc kill t1 (stays listed as finished; hc count drops to 1).
+    // (Phase 2's t/i prompt has its own e2e test; the hint line is longer now and this frame is kept small.)
     stdin.emit('data', 'e')
-    // Select live t1, ensure t does not call hc, then arm + confirm x x -> hc kill t1 (stays listed as finished; hc count drops to 1).
     stdin.emit('data', 'j')
     await until(() => plain().includes('› live-one t1') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
-    stdin.emit('data', 't')
-    await new Promise(r => setTimeout(r, 30))
-    assert.deepEqual(hcCalls.filter(a => a[1] !== 'ls' && a[1] !== 'read' && a[1] !== 'get'), [])
-
     stdin.emit('data', 'x')
     await until(() => stdout.written.includes('stop live-one? press again'), 5_000, 't1 armed')
     assert.deepEqual(hcCalls.filter(a => a[1] === 'kill' || a[1] === 'rm'), [])
@@ -4481,7 +4495,7 @@ test('hc own terminal: excludes $HC_TERMINAL_ID from tui rows so it cannot be se
 test('hc x x: a live row that finishes inside the arm window re-arms instead of turning kill into rm', () => {
   const live: HcAgent = { address: 't1', agent: 'agy', cwd: '/a', status: 'working', where: 'a / 1', name: 'one', parent: 't11' }
   const done: HcAgent = { ...live, state: 'finished', status: 'idle' }
-  const x1 = nextKeyState({ ...ownerState(), selected: hcId('t1'), herdr: [live] }, 'x', 1000)
+  const x1 = nextKeyState({ ...ownerState(), hcParent: 't11', selected: hcId('t1'), herdr: [live] }, 'x', 1000)
   assert.equal(x1.action, undefined)
   const ticked = applyHerdrTick(x1.state, [done])
   const x2 = nextKeyState(ticked, 'x', 1500)
@@ -4813,7 +4827,7 @@ function hcLab(prefix: string) {
   const lab = {
     root, host, list: [] as Record<string, unknown>[], calls: [] as string[],
     /** Answers for `get <address>`: the next waiting resolver, or a function giving the JSON at once. */
-    gets: [] as { address: string; answer: (json: object) => void }[],
+    gets: [] as { address: string; answer: (json: object) => void; fail?: () => void }[],
     hold: false,
     lsFail: false,
     inFlight: 0,
@@ -4828,7 +4842,11 @@ function hcLab(prefix: string) {
       const address = argv[2]!
       if (!lab.hold) return { exitCode: 0, stdout: JSON.stringify(lab.getJson(address)), stderr: '' }
       lab.maxInFlight = Math.max(lab.maxInFlight, ++lab.inFlight)
-      return new Promise(resolve => lab.gets.push({ address, answer: json => { lab.inFlight--; resolve({ exitCode: 0, stdout: JSON.stringify(json), stderr: '' }) } }))
+      return new Promise(resolve => lab.gets.push({
+        address,
+        answer: json => { lab.inFlight--; resolve({ exitCode: 0, stdout: JSON.stringify(json), stderr: '' }) },
+        fail: () => { lab.inFlight--; resolve({ exitCode: 1, stdout: '', stderr: 'boom' }) },
+      }))
     }
     throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
   }
@@ -5043,4 +5061,831 @@ test('hc gets: at most four in flight across ticks, a queued row that left is ne
     await run
     rmSync(lab.root, { recursive: true, force: true })
   }
+})
+
+// -----------------------------------------------------------------------------
+// Phase 2 fix round 1: review-sol-p2 findings P2-01..P2-04
+// -----------------------------------------------------------------------------
+
+test('hc submit: the target is the address the prompt opened on, and a row that ends while it is open keeps the draft (P2-01, P2-03)', () => {
+  const live = hcAg('t1', { parent: 't11', name: 'mine', status: 'working' })
+  const base: TuiState = { ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId('t1'), herdr: [live] }
+  const opened = nextKeyState(base, 't', 1000).state
+  assert.equal(opened.inputFor, hcId('t1'), 'the prompt records its address')
+  const typed = { ...opened, resumeInput: 'stale' }
+  // The row turns finished while the prompt is open: no argv, the draft is kept, the reason names the end.
+  const ended = { ...typed, herdr: [{ ...live, state: 'finished', status: '' }] }
+  const r = nextKeyState(ended, '\r', 1100)
+  assert.equal(r.action, undefined, 'no send to a row that ended while the prompt was open')
+  assert.equal(r.state.adding, true, 'the prompt stays open')
+  assert.equal(r.state.resumeInput, 'stale', 'the draft is kept')
+  assert.match(r.state.statusMessage ?? '', /has ended/)
+  // Another parent now: also nothing, draft kept.
+  const other = { ...typed, herdr: [{ ...live, parent: 't99' }] }
+  const o = nextKeyState(other, '\r', 1100)
+  assert.equal(o.action, undefined)
+  assert.equal(o.state.resumeInput, 'stale')
+  // `hc ?`: still no argv, the draft is kept (P2-03).
+  const unknown = { ...typed, herdr: '?' as const }
+  const u = nextKeyState(unknown, '\r', 1100)
+  assert.equal(u.action, undefined, 'hc ? is not proof the row left')
+  assert.equal(u.state.resumeInput, 'stale', 'the draft survives hc ?')
+  assert.match(u.state.statusMessage ?? '', /kept/)
+  // The row returns live and own: the same Enter now sends it.
+  const back = { ...u.state, herdr: [live] }
+  assert.deepEqual(nextKeyState(back, '\r', 1200).action, { type: 'hcSend', address: 't1', text: 'stale' })
+  // A different row selected at Enter does NOT retarget the prompt.
+  const moved = { ...typed, selected: hcId('t9'), herdr: [live, hcAg('t9', { parent: 't11' })] }
+  assert.deepEqual(nextKeyState(moved, '\r', 1100).action, { type: 'hcSend', address: 't1', text: 'stale' }, 'inputFor wins over the selection')
+})
+
+test('hc preflight refuses a response for another address, a missing live state, or an empty body — and writes nothing (P2-01/P2-03)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-shape-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const row = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  let answer: unknown = row
+  const calls: string[][] = []
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(answer), stderr: '' }
+    if (argv[1] === 'send' || argv[1] === 'interrupt') return { exitCode: 0, stdout: '', stderr: '' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const writes = () => calls.filter(a => a[1] === 'send' || a[1] === 'interrupt')
+  try {
+    // The response names another terminal (same parent): the write must go nowhere.
+    answer = { ...row, address: 't7' }
+    const other = await sendHc(host, 't1', 'wrong target', 't11')
+    assert.equal(other.ok, false)
+    assert.match(other.text, /answered for t7/)
+    assert.deepEqual(writes(), [], 'a response for another address writes nothing')
+    // A live-looking row with no top-level lifecycle state is not proof of life.
+    const { state: _drop, ...noState } = row
+    answer = noState
+    const unknown = await sendHc(host, 't1', 'payload', 't11')
+    assert.equal(unknown.ok, false)
+    assert.match(unknown.text, /is not live \(state unknown\)/)
+    assert.deepEqual(writes(), [], 'a missing state writes nothing')
+    // An empty body is not a terminal.
+    answer = {}
+    const empty = await interruptHc(host, 't1', 't11')
+    assert.equal(empty.ok, false)
+    assert.match(empty.text, /gave no terminal|answered for no address/)
+    assert.deepEqual(writes(), [], 'an empty body writes nothing')
+    // A refused preflight says so before any write, so a caller may keep the draft (P2-03).
+    assert.equal(empty.refusedBeforeWrite, true)
+    // Restored: the same call now goes out exactly once, to the address asked for.
+    answer = row
+    const good = await sendHc(host, 't1', 'payload', 't11')
+    assert.equal(good.ok, true)
+    assert.deepEqual(writes(), [[bin, 'send', 't1', 'payload']], 'writes the requested address only')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc send: a delayed preflight re-read that ends the row runs no hc send (P2-01)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-pre-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const calls: string[][] = []
+  let getAnswer: object = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  let holdGet: (() => void) | undefined
+  // Only the preflight get (the one after Enter) is held; the tick's own backfill get answers at once.
+  let holdNext = false
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [JSON.parse(JSON.stringify(getAnswer))] }), stderr: '' }
+    if (argv[1] === 'get') {
+      // Hold the preflight open a moment, so the test can end the row underneath it.
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(r => (holdGet = r))
+      }
+      return { exitCode: 0, stdout: JSON.stringify(getAnswer), stderr: '' }
+    }
+    if (argv[1] === 'send') return { exitCode: 0, stdout: '', stderr: '' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const sends = () => calls.filter(a => a[1] === 'send')
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000, hcParent: 't11' })
+  try {
+    await until(() => plain().includes('mine t1'), 5_000, 'rows')
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'j')
+    await until(() => plain().includes('› mine t1') && plain().includes('[ t send ]'), 5_000, 'selected in edit')
+    stdin.emit('data', 't')
+    await until(() => plain().includes('t send t1:'), 5_000, 'prompt')
+    stdin.emit('data', 'late')
+    await until(() => plain().includes('t send t1: late'), 5_000, 'typed')
+    holdNext = true
+    stdin.emit('data', '\r')
+    // The preflight get is in flight; the row ends before it answers.
+    await until(() => holdGet !== undefined, 5_000, 'preflight get in flight')
+    getAnswer = { ...getAnswer, state: 'finished', status: undefined, reason: 'exited', exit_code: 0 }
+    holdGet!()
+    await until(() => plain().includes('send t1 — FAILED') && plain().includes('is not live (state finished)'), 5_000, 'ended at preflight')
+    await settle()
+    assert.deepEqual(sends(), [], 'the re-read ended the row: no hc send argv')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc owner vs self: --hc-parent t21 with env t99 shows and removes t21 finished rows, never t99 (P2-02)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-owner-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't99'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const calls: string[][] = []
+  let terminals = [
+    { address: 't1', name: 'own-live', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't21' },
+    { address: 't3', name: 'own-done', agent: 'env', state: 'finished', status: null, exit_code: 0, reason: 'exited', cwd: '/w', where: 'w / 2', parent: 't21' },
+    { address: 't4', name: 'ambient-done', agent: 'env', state: 'finished', status: null, exit_code: 0, reason: 'exited', cwd: '/w', where: 'w / 3', parent: 't99' },
+    { address: 't99', name: 'this-terminal', agent: 'claude', state: 'live', status: 'working', cwd: '/w', where: 'w / 4' },
+  ]
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals }), stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(terminals.find(t => t.address === argv[2]) ?? {}), stderr: '' }
+    if (argv[1] === 'rm') {
+      terminals = terminals.filter(t => t.address !== argv[2])
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 150))
+  const rms = () => calls.filter(a => a[1] === 'rm').map(a => a[2])
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000, hcParent: 't21' })
+  try {
+    await until(() => plain().includes('own-done t3'), 5_000, "t21's finished row is listed")
+    assert.ok(!plain().includes('ambient-done t4'), "t99's finished row is not listed")
+    assert.ok(!plain().includes('this-terminal t99'), 'the process own terminal row is hidden (SELF)')
+    // Select the ambient finished row by digit is impossible (not listed); select own finished and delete it.
+    // Digits: row 1 is own-live t1, row 2 is own-done t3 (the ambient finished row is not listed).
+    stdin.emit('data', 'e')
+    stdin.emit('data', '2')
+    await until(() => plain().includes('› own-done t3'), 5_000, 'own finished selected')
+    stdin.emit('data', 'd')
+    await until(() => plain().includes('delete own-done? press again'), 5_000, 'armed')
+    await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 40))
+    stdin.emit('data', 'd')
+    await until(() => rms().includes('t3'), 5_000, 'own finished removed')
+    await settle()
+    assert.deepEqual(rms(), ['t3'], 'only the own finished row is removed, never t4')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc a blocked question is still actionable: t and i on an own live row send (P2-06 decision)', () => {
+  const q = hcAg('t1', { parent: 't11', name: 'q', status: 'blocked' })
+  const st: TuiState = { ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId('t1'), herdr: [q] }
+  // Parity with tmux tell: no blocked/question refusal; a manual send is an explicit owner act.
+  const opened = nextKeyState(st, 't', 1000).state
+  assert.equal(opened.inputKind, 'hcSend', 'a blocked row still opens the send prompt')
+  assert.deepEqual(nextKeyState({ ...opened, resumeInput: 'yes' }, '\r', 1000).action, { type: 'hcSend', address: 't1', text: 'yes' })
+  assert.deepEqual(nextKeyState(st, 'i', 1000).action, { type: 'interruptHc', address: 't1' }, 'interrupt is available too')
+})
+
+test('hc armed x at 80 columns keeps its confirmation and consequence ahead of the t/i shortcuts (P2-04)', () => {
+  const own = (over: Partial<HcAgent> = {}) => hcAg('t1', { parent: 't11', name: 'owner', status: 'working', ...over })
+  const line = (st: TuiState, amb = '2') => {
+    const old = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = amb
+    try {
+      return renderTuiLines(st, 80, 30, 1001).map(stripAnsi).filter(l => l.trim())
+    } finally {
+      if (old === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+      else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = old
+    }
+  }
+  const edit: TuiState = { ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId('t1'), herdr: [own()] }
+  const armed = nextKeyState(edit, 'x', 1000).state
+  const drawn = line(armed).join('\n')
+  assert.match(drawn, /\[ x stop owner\? press again \]/, 'the armed confirmation survives 80 cols')
+  assert.match(drawn, /ends its hc terminal · \d+s/, 'the consequence text survives 80 cols')
+  // The other-parent Detail footer carries the reason when it fits.
+  // Detail footer: the reason must be in the candidate list, not the one-key fallback only.
+  const other: TuiState = { ...edit, herdr: [own({ parent: 't99' })], expanded: true, detail: { id: hcId('t1'), lines: ['address: t1'] } }
+  const detail = line(other).join('\n')
+  assert.match(detail, /other hc terminal/, 'the forbidden reason reaches the Detail footer')
+})
+
+test('hc timeout comes from the host result: a cut reads delivery unknown with its own text, a late exit 0 sends, an ordinary exit 1 keeps its text (R2-03)', async () => {
+  // The host's fields decide. A rejection or a signal has no exit code, so it is "delivery unknown" with
+  // whatever text came with it — nothing is word-matched (commander ruling, fix round 3).
+  const root0 = mkdtempSync(join(tmpdir(), 'tui-hc-timeout-unit-'))
+  const h0 = quietHost('S', root0, root0)
+  const bin0 = join(root0, 'bin', 'hc')
+  const sock0 = join(root0, '.local/state/herdr-core/default/default.sock')
+  const exist0 = h0.exists
+  h0.envPath = async () => join(root0, 'bin')
+  h0.envHome = async () => root0
+  h0.exists = async path => (path === bin0 || path === sock0 ? true : exist0(path))
+  const row0 = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  h0.run = async argv => {
+    if (argv[0] !== bin0) return { exitCode: 0, stdout: '', stderr: '' }
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row0] }), stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row0), stderr: '' }
+    if (argv[1] === 'send') throw Object.assign(new Error('Command failed: hc send t1 hi'), { code: 'ETIMEDOUT' })
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  try {
+    assert.equal((await sendHc(h0, 't1', 'hi', 't11')).text, 'hc send t1 — delivery unknown (Command failed: hc send t1 hi)')
+    // The host's own verdict: a killed child is reported with `timedOut: true`, never guessed from text.
+    h0.run = async argv => {
+      if (argv[0] !== bin0) return { exitCode: 0, stdout: '', stderr: '' }
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row0] }), stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row0), stderr: '' }
+      return { exitCode: -1, stdout: '', stderr: 'Error: Command failed: hc send t1 hi', timedOut: true }
+    }
+    const real = await sendHc(h0, 't1', 'hi', 't11')
+    assert.equal(real.ok, false)
+    assert.equal(real.text, 'hc send t1 — delivery unknown (timed out)', 'the structured flag is the one class named')
+    // R2-03: a slow SUCCESS is a success, whatever the duration; only the host's flag names a cut.
+    h0.run = async argv => {
+      if (argv[0] !== bin0) return { exitCode: 0, stdout: '', stderr: '' }
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row0] }), stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row0), stderr: '' }
+      return { exitCode: 0, stdout: '', stderr: '', timedOut: false }
+    }
+    await new Promise(r => setTimeout(r, 60))
+    assert.equal((await sendHc(h0, 't1', 'hi', 't11')).text, 'sent to hc t1', 'a late exit 0 sent it')
+    // An ordinary refusal whose text happens to carry `Command failed` keeps its exit code.
+    h0.run = async argv => {
+      if (argv[0] !== bin0) return { exitCode: 0, stdout: '', stderr: '' }
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row0] }), stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row0), stderr: '' }
+      return { exitCode: 1, stdout: '', stderr: 'Error: Command failed: bad request' }
+    }
+    assert.equal((await sendHc(h0, 't1', 'hi', 't11')).text, 'hc send t1 failed (exit 1: Error: Command failed: bad request)')
+    // A plain refusal still names its exit and its own stderr.
+    h0.run = async argv => {
+      if (argv[0] !== bin0) return { exitCode: 0, stdout: '', stderr: '' }
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row0] }), stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row0), stderr: '' }
+      return { exitCode: 1, stdout: '', stderr: 'fake refusal' }
+    }
+    assert.equal((await sendHc(h0, 't1', 'hi', 't11')).text, 'hc send t1 failed (exit 1: fake refusal)')
+  } finally {
+    rmSync(root0, { recursive: true, force: true })
+  }
+})
+
+test('hc send killed by a signal after the write reports delivery unknown, runs one argv, and is never resent (P2-03 r3)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-signal-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const row = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  const calls: string[][] = []
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row), stderr: '' }
+    // The fake hc recorded the argv, then died by SIGTERM: no exit code, so the write cannot be proven done.
+    if (argv[1] === 'send') return { exitCode: -1, stdout: '', stderr: '', signal: 'SIGTERM' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  try {
+    const out = await sendHc(host, 't1', 'hello', 't11')
+    assert.equal(out.ok, false)
+    assert.equal(out.text, 'hc send t1 — delivery unknown (killed by SIGTERM)')
+    assert.deepEqual(calls.filter(a => a[1] === 'send'), [[bin, 'send', 't1', 'hello']], 'exactly one send argv, no resend')
+    // An explicit exit 1 refusal keeps its own text: the command ran and chose to refuse.
+    host.run = async argv => {
+      if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+      calls.push([...argv])
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row), stderr: '' }
+      if (argv[1] === 'send') return { exitCode: 1, stdout: '', stderr: 'refused' }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    assert.equal((await sendHc(host, 't1', 'hello', 't11')).text, 'hc send t1 failed (exit 1: refused)')
+    // A cut write says so, and a -1 with no signal is still "no completion result".
+    host.run = async argv => {
+      if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+      if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+      if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row), stderr: '' }
+      if (argv[1] === 'send' || argv[1] === 'interrupt') return { exitCode: -1, stdout: '', stderr: '' }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    assert.equal((await sendHc(host, 't1', 'hello', 't11')).text, 'hc send t1 — delivery unknown (no completion result)')
+    assert.equal((await interruptHc(host, 't1', 't11')).text, 'hc interrupt t1 — delivery unknown (no completion result)')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc write classifier is an allowlist: any write outcome without a whole exit code >= 0 is delivery unknown, one argv, no throw (P2-03 r4)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-allow-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const row = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  // [label, resolve or reject, value, expected text in parentheses]
+  const cases: [string, 'resolve' | 'reject', unknown, string][] = [
+    ['undefined', 'resolve', undefined, 'no result'],
+    ['null', 'resolve', null, 'no result'],
+    ['string', 'resolve', 'ok', 'no result'],
+    ['number', 'resolve', 0, 'no result'],
+    ['empty object', 'resolve', {}, 'no completion result'],
+    ['string exit code', 'resolve', { exitCode: '1', stdout: '', stderr: '' }, 'no completion result'],
+    ['NaN exit code', 'resolve', { exitCode: NaN, stdout: '', stderr: '' }, 'no completion result'],
+    ['fractional exit code', 'resolve', { exitCode: 0.5, stdout: '', stderr: '' }, 'no completion result'],
+    ['string rejection', 'reject', 'transport lost', 'transport lost'],
+    ['rejected result exit 0', 'reject', { exitCode: 0, stdout: '', stderr: '' }, 'rejected without a result'],
+    ['undefined rejection', 'reject', undefined, 'rejected without a result'],
+  ]
+  try {
+    for (const verb of ['send', 'interrupt'] as const) {
+      for (const [label, how, value, why] of cases) {
+        const calls: string[][] = []
+        host.run = async argv => {
+          if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+          calls.push([...argv])
+          if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+          if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row), stderr: '' }
+          if (how === 'reject') throw value
+          return value as never
+        }
+        const out = verb === 'send' ? await sendHc(host, 't1', 'hello', 't11') : await interruptHc(host, 't1', 't11')
+        assert.equal(out.ok, false, `${verb} ${label}: not ok`)
+        assert.equal(out.text, `hc ${verb} t1 — delivery unknown (${why})`, `${verb} ${label}`)
+        assert.equal(calls.filter(a => a[1] === verb).length, 1, `${verb} ${label}: exactly one write argv`)
+      }
+      // A command that exited 1 without stderr is still an ordinary refusal with its code.
+      host.run = async argv => {
+        if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+        if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+        if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row), stderr: '' }
+        return { exitCode: 1, stdout: '' } as never
+      }
+      const refused = verb === 'send' ? await sendHc(host, 't1', 'hello', 't11') : await interruptHc(host, 't1', 't11')
+      assert.equal(refused.text, `hc ${verb} t1 failed (exit 1)`, `${verb} exit 1 without stderr`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc write path is total: whatever host.run throws, rejects or resolves with, send/interrupt resolve after one write; sent only for a clean 0, failed only for an integer > 0 (P2-03 r5)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-total-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const row = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  const nullMessage = new Error('x')
+  Object.defineProperty(nullMessage, 'message', { value: null })
+  const badMessage = new Error('x')
+  Object.defineProperty(badMessage, 'message', { get() { throw new Error('getter') } })
+  const trap = new Proxy({}, { get() { throw new Error('proxy') }, has() { throw new Error('proxy') } })
+  // [label, what the write call does, expected class]
+  const cases: [string, () => unknown, 'sent' | 'failed' | 'unknown'][] = [
+    ['synchronous throw', () => { throw new Error('transport disconnected') }, 'unknown'],
+    ['synchronous throw of a string', () => { throw 'gone' }, 'unknown'],
+    ['Error rejection with message null', () => Promise.reject(nullMessage), 'unknown'],
+    ['Error rejection with a throwing message getter', () => Promise.reject(badMessage), 'unknown'],
+    ['rejection with a Proxy', () => Promise.reject(trap), 'unknown'],
+    ['resolves to a Proxy', () => Promise.resolve(trap), 'unknown'],
+    ['throwing exitCode getter', () => Promise.resolve({ get exitCode(): number { throw new Error('getter') } }), 'unknown'],
+    ['Symbol signal', () => Promise.resolve({ exitCode: 0, stdout: '', stderr: '', signal: Symbol('SIGTERM') }), 'unknown'],
+    ['bad thenable', () => ({ then() { throw new Error('then') } }), 'unknown'],
+    ['clean exit 0', () => Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }), 'sent'],
+    ['exit 2', () => Promise.resolve({ exitCode: 2, stdout: '', stderr: 'no' }), 'failed'],
+    // A field read twice could pass the check and then classify on another value (r6): each field is read once.
+    ['exitCode 2 then undefined', () => { const v = [2]; return Promise.resolve({ get exitCode() { return v.shift() } }) }, 'failed'],
+    ['exitCode 2 then 0', () => { const v = [2, 0, 0]; return Promise.resolve({ get exitCode() { return v.shift() } }) }, 'failed'],
+  ]
+  try {
+    for (const verb of ['send', 'interrupt'] as const) {
+      for (const [label, write, want] of cases) {
+        const calls: string[][] = []
+        host.run = ((argv: string[]) => {
+          if (argv[0] !== bin) return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+          calls.push([...argv])
+          if (argv[1] === 'ls') return Promise.resolve({ exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' })
+          if (argv[1] === 'get') return Promise.resolve({ exitCode: 0, stdout: JSON.stringify(row), stderr: '' })
+          return write()
+        }) as never
+        const out = await (verb === 'send' ? sendHc(host, 't1', 'hello', 't11') : interruptHc(host, 't1', 't11')).catch(
+          (e: unknown) => assert.fail(`${verb} ${label}: rejected ${String(e)}`),
+        )
+        const got = out.ok ? 'sent' : /^hc \w+ t1 failed \(exit [1-9]\d*/.test(out.text) ? 'failed' : out.text.includes('— delivery unknown (') ? 'unknown' : out.text
+        assert.equal(got, want, `${verb} ${label}: ${out.text}`)
+        assert.equal(calls.filter(a => a[1] === verb).length, 1, `${verb} ${label}: exactly one write argv`)
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc timeout: a cut send ends as delivery unknown and the toast carries the raw rejection, never a second send', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-timeout-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const row = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(row), stderr: '' }
+    if (argv[1] === 'send') throw Object.assign(new Error('Command failed: hc send t1 hi'), { code: 'ETIMEDOUT' })
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000, hcParent: 't11' })
+  try {
+    await until(() => plain().includes('mine t1'), 5_000, 'rows')
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'j')
+    await until(() => plain().includes('[ t send ]'), 5_000, 'edit')
+    stdin.emit('data', 't')
+    await until(() => plain().includes('t send t1:'), 5_000, 'prompt')
+    stdin.emit('data', 'hi\r')
+    await until(() => plain().includes('send t1 — FAILED') && plain().includes('delivery unknown'), 5_000, 'cut named as unknown')
+    // The engine rejection reached the prompt as a value: no exit code, so the status says so and stops.
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// -----------------------------------------------------------------------------
+// Phase 2: hc send / interrupt on own-parent rows; mutation gaps X1, X5
+// -----------------------------------------------------------------------------
+
+
+test('hc get failed is never retried, even when its row then ends: exactly one get (X5)', async () => {
+  // X5 mutation: drop `final: true` on a failed get (tui.node.ts:2048). Without it, a row that fails its
+  // first get and then turns finished is queried again (the finish-get path), so the count rises to two.
+  const lab = hcLab('tui-hc-x5-')
+  lab.hold = true
+  lab.list = [termOf('t1')]
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const lss = () => lab.calls.filter(c => c.startsWith('ls')).length
+  const gets = () => lab.calls.filter(c => c === 'get t1 --json').length
+  const run = runTui({ stdin, stdout, host: lab.host, session: 'S', cwd: lab.root, root: lab.root, mirrorMs: 60_000, rowsMs: 60_000 })
+  try {
+    await until(() => lab.gets.length === 1, 5_000, 'the get is in flight')
+    // Answer it with a failure: hc exit 1. The row is drawn with no age and is not retried.
+    lab.gets[0]!.fail!()
+    await until(() => plain().includes('n-t1 t1'), 5_000, 'the row still draws after a failed get')
+    await settle()
+    assert.equal(gets(), 1, 'one failed get')
+    // The same address turns finished: the finish-get path must not retry a get that already failed.
+    lab.list = [termOf('t1', { status: null, state: 'finished', exit_code: 0, reason: 'exited' })]
+    const n = lss()
+    stdin.emit('data', 'r')
+    await until(() => lss() === n + 1, 5_000, 'the tick that ends the row')
+    await settle()
+    // Two more ticks: still nothing.
+    for (let i = 0; i < 2; i++) {
+      const k = lss()
+      stdin.emit('data', 'r')
+      await until(() => lss() === k + 1, 5_000, 'later tick')
+    }
+    await settle()
+    assert.equal(gets(), 1, 'exactly one get t1 --json in total, the failed one')
+    assert.ok(plain().includes('exited 0'), 'the ended row still draws (no age)')
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(lab.root, { recursive: true, force: true })
+  }
+})
+
+// -----------------------------------------------------------------------------
+// Phase 2: hc send / interrupt on own-parent rows; mutation gaps X1, X5
+// -----------------------------------------------------------------------------
+
+test('hc order: readHc puts a live row before a finished row whatever the hc ls order (X1)', async () => {
+  // X1 mutation: drop the live-before-finished sort in readHc (workers.ts:577).
+  const lab = hcLab('tui-hc-order-')
+  lab.list = [
+    termOf('t9', { state: 'finished', status: 'idle', reason: 'exited', exit_code: 0 }),
+    termOf('t1'),
+  ]
+  const rows = (await readHc(lab.host))!
+  assert.deepEqual(rows.map(a => a.address), ['t1', 't9'], 'a finished row returned first is drawn after the live one')
+  assert.ok(!hcFinished(rows[0]!), 'the first drawn row is the live one')
+  rmSync(lab.root, { recursive: true, force: true })
+})
+
+
+test('hc t/i: on an own live row in edit, t opens the send prompt and i runs hc interrupt (exact argv)', () => {
+  const own = { ...ownerState(), hcParent: 't11', selected: hcId('t1'), rows: [], all: [], herdr: [hcAg('t1', { parent: 't11', name: 'mine', status: 'working' })] }
+  const t1 = nextKeyState(own, 't', 1000)
+  assert.equal(t1.state.adding, true)
+  assert.equal(t1.state.inputKind, 'hcSend')
+  assert.equal(t1.state.inputFor, hcId('t1'))
+  const typed = nextKeyState({ ...t1.state, resumeInput: ' go on ' }, '\r', 1000)
+  assert.deepEqual(typed.action, { type: 'hcSend', address: 't1', text: 'go on' })
+  assert.equal(typed.state.adding, false)
+  const prompt = renderTuiLines(t1.state, 120, 20, 1).map(stripAnsi).join('\n')
+  assert.match(prompt, /t send t1: █/)
+  const i1 = nextKeyState(own, 'i', 1000)
+  assert.deepEqual(i1.action, { type: 'interruptHc', address: 't1' }, 'i runs an interrupt action, not a kill')
+  assert.ok(!/kill/i.test(i1.state.statusMessage ?? ''), 'interrupt never becomes a kill')
+})
+
+test('hc t/i: viewer, other-parent, preview and finished rows run nothing and say why', () => {
+  const other = hcAg('t2', { parent: 't99', name: 'theirs' })
+  const done = hcAg('t3', { parent: 't11', state: 'finished', status: 'idle', name: 'done' })
+  const sel = (hc: HcAgent, over: Partial<TuiState> = {}) => ({ ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId(hc.address), herdr: [hc], ...over })
+  // Viewer: the read-only gate fires before any hc branch; nothing runs.
+  for (const key of ['t', 'i', 'x']) {
+    const v = nextKeyState(sel(hcAg('t1', { parent: 't11' }), { viewer: true, owner: undefined }), key, 1000)
+    assert.equal(v.action, undefined, `viewer ${key}`)
+    assert.equal(v.state.adding, false, `viewer ${key} no prompt`)
+    assert.equal(v.state.armedStop, undefined, `viewer ${key} no arm`)
+  }
+  // Preview: 預覽 names the reason, no action.
+  for (const key of ['t', 'i']) {
+    const p = nextKeyState(sel(hcAg('t1', { parent: 't11' }), { mode: 'preview' }), key, 1000)
+    assert.equal(p.action, undefined, `preview ${key}`)
+    assert.equal(p.state.statusMessage, PREVIEW_ONLY)
+  }
+  // Another parent's live row: nothing runs, and the hint says why.
+  const ok = hcAg('t1', { parent: 'nope' })
+  for (const key of ['t', 'i', 'x']) {
+    const r = nextKeyState(sel(ok), key, 1000)
+    assert.equal(r.action, undefined, `other parent ${key}`)
+    assert.equal(r.state.armedStop, undefined)
+    assert.match(r.state.statusMessage ?? '', /another hc terminal's row|own rows only/, `${key} names the reason`)
+  }
+  // Own finished row: nothing to send or interrupt.
+  for (const key of ['t', 'i']) {
+    const r = nextKeyState(sel(done), key, 1000)
+    assert.equal(r.action, undefined, `finished ${key}`)
+    assert.match(r.state.statusMessage ?? '', /has ended/, `${key} says it ended`)
+  }
+  // x on an own finished row still arms (delete), but on another parent's it does not.
+  const xOther = nextKeyState(sel(ok), 'x', 1000)
+  assert.equal(xOther.state.armedStop, undefined, 'x on another parent arms nothing')
+  const xOwnDone = nextKeyState(sel(done), 'x', 1000)
+  assert.equal(xOwnDone.state.armedStop?.id, `delete:${hcId('t3')}`, 'x on an own finished row still arms rm')
+})
+
+test('hc t/i hints: shown only where they act, and another parent names the reason at 80 cols and ambiguous width 2', () => {
+  const own = { ...ownerState(), hcParent: 't11', rows: [], all: [], selected: hcId('t1'), herdr: [hcAg('t1', { parent: 't11', name: 'mine', status: 'working' })] }
+  const ownLine = renderTuiLines(own, 160, 24, 1).map(stripAnsi).find(l => l.includes('[ t send ]'))!
+  assert.ok(ownLine && ownLine.includes('[ i interrupt ]') && ownLine.includes('[ x stop ]'), ownLine)
+  // Another parent: no send/interrupt; the hint says why.
+  const other = { ...own, herdr: [hcAg('t2', { parent: 't99', name: 'theirs' })], selected: hcId('t2') }
+  const otherScreen = renderTuiLines(other, 160, 24, 1).map(stripAnsi).join('\n')
+  assert.ok(!otherScreen.includes('[ t send ]') && !otherScreen.includes('[ i interrupt ]'), otherScreen)
+  assert.match(otherScreen, /other hc terminal — t\/i\/x act on your own rows only/, otherScreen)
+  // Finished own: no send/interrupt either.
+  const done = { ...own, herdr: [hcAg('t3', { parent: 't11', state: 'finished', status: 'idle', name: 'done' })], selected: hcId('t3') }
+  const doneScreen = renderTuiLines(done, 160, 24, 1).map(stripAnsi).join('\n')
+  assert.ok(!doneScreen.includes('[ t send ]') && !doneScreen.includes('[ i interrupt ]'), doneScreen)
+  // 80 columns, ambiguous width 2: every drawn hint line fits.
+  const old = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+  process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = '2'
+  try {
+    for (const st of [own, other, done]) {
+      for (const l of renderTuiLines(st, 80, 30, 1)) assert.ok(cellWidth(stripAnsi(l)) <= 80, `${JSON.stringify(stripAnsi(l))} fits 80`)
+    }
+  } finally {
+    if (old === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = old
+  }
+})
+
+test('hc send e2e: a preflight get that answers {} keeps the prompt and its draft, and the same Enter sends once after it recovers (P2-03)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-draft-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const row = { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w', where: 'w / 1', parent: 't11' }
+  const calls: string[][] = []
+  let getBody: string = JSON.stringify(row)
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals: [row] }), stderr: '' }
+    if (argv[1] === 'get') return { exitCode: 0, stdout: getBody, stderr: '' }
+    if (argv[1] === 'send') return { exitCode: 0, stdout: '', stderr: '' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const sends = () => calls.filter(a => a[1] === 'send')
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000, hcParent: 't11' })
+  try {
+    await until(() => plain().includes('mine t1'), 5_000, 'rows')
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'j')
+    await until(() => plain().includes('› mine t1') && plain().includes('[ t send ]'), 5_000, 'own t1 selected in edit')
+    stdin.emit('data', 't')
+    await until(() => plain().includes('t send t1:'), 5_000, 'prompt open')
+    stdin.emit('data', 'keep this draft')
+    await until(() => plain().includes('t send t1: keep this draft'), 5_000, 'typed')
+    // ls still lists the row live; the preflight's own get answers an empty body: not proof it left.
+    getBody = '{}'
+    stdin.emit('data', '\r')
+    await until(() => plain().includes('send t1 — FAILED') && plain().includes('answered for no address'), 5_000, 'refusal names the reason')
+    assert.deepEqual(sends(), [], 'a refused preflight writes nothing')
+    // The prompt is still open with its draft on screen.
+    assert.match(plain(), /t send t1: keep this draft/, 'the draft stays on screen for a retry')
+    // Recovery: the same Enter goes out once.
+    getBody = JSON.stringify(row)
+    stdin.emit('data', '\r')
+    await until(() => sends().length === 1 && plain().includes('send t1 — ok'), 5_000, 'same Enter sends after recovery')
+    assert.deepEqual(sends()[0], [bin, 'send', 't1', 'keep this draft'])
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc hints offer x only in edit: preview and viewer keep their Phase 1 line, and another parent\'s Detail keeps a whole "Esc mirror" at 80 cols (R2-02)', () => {
+  const old = process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+  process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = '2'
+  try {
+    const row = hcAg('t1', { parent: 't11', name: 'owner', status: 'working' })
+    const done = hcAg('t3', { parent: 't11', name: 'done', state: 'finished', status: 'idle' })
+    const other = hcAg('t2', { parent: 't99', name: 'theirs' })
+    const draw = (st: TuiState, w = 80) => renderTuiLines(st, w, 30, 1001).map(stripAnsi)
+    // Preview: a finished row still offers d, never x.
+    const preview = draw({ ...ownerState(), hcParent: 't11', rows: [], all: [], mode: 'preview', selected: hcId('t3'), herdr: [done], expanded: true })
+    const pLine = preview.find(l => l.includes('[ d delete ]'))
+    assert.ok(pLine, preview.join('\n'))
+    assert.ok(!pLine.includes('[ x stop ]'), `preview offers no x: ${pLine}`)
+    // Viewer: neither x nor a mutation key; the read-only line stays.
+    const viewer = draw({ ...ownerState(), hcParent: 't11', rows: [], all: [], mode: 'edit', viewer: true, selected: hcId('t1'), herdr: [row], expanded: true })
+    const vLine = viewer.find(l => l.includes('Enter attach'))
+    assert.ok(vLine, viewer.join('\n'))
+    assert.ok(!vLine.includes('[ x stop ]'), `viewer offers no x: ${vLine}`)
+    // Another parent's Detail at 80 cols: the reason leads and "Esc mirror" is not cut.
+    const otherDetail = draw({ ...ownerState(), hcParent: 't11', rows: [], all: [], mode: 'edit', selected: hcId('t2'), herdr: [other], expanded: true })
+    const footer = otherDetail.find(l => l.includes('detail'))
+    assert.ok(footer && footer.includes('other hc terminal'), otherDetail.join('\n'))
+    assert.ok(footer.includes('Esc mirror'), `needs a whole "Esc mirror": ${footer}`)
+    for (const l of otherDetail) assert.ok(cellWidth(l) <= 80, `fits 80: ${JSON.stringify(l)}`)
+  } finally {
+    if (old === undefined) delete process.env.TMUX_AGENT_AMBIGUOUS_WIDTH
+    else process.env.TMUX_AGENT_AMBIGUOUS_WIDTH = old
+  }
+})
+
+test('hc t/i e2e: hc send and hc interrupt run the exact argv; a failed hc send shows in the status line, no retry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-hc-send-'))
+  const host = quietHost('S', root, root)
+  const bin = join(root, 'bin', 'hc')
+  const socket = join(root, '.local/state/herdr-core/default/default.sock')
+  const exists = host.exists
+  host.envPath = async () => join(root, 'bin')
+  host.envHome = async () => root
+  host.envHcTerminal = async () => 't11'
+  host.exists = async path => (path === bin || path === socket ? true : exists(path))
+  const calls: string[][] = []
+  let sendFails = false
+  const terminals = [
+    { address: 't1', name: 'mine', agent: 'env', state: 'live', status: 'working', cwd: '/w/proj', where: 'w / 1', parent: 't11' },
+    { address: 't2', name: 'theirs', agent: 'env', state: 'live', status: 'working', cwd: '/w/proj', where: 'w / 2', parent: 't99' },
+  ]
+  host.run = async argv => {
+    if (argv[0] !== bin) return { exitCode: 0, stdout: '', stderr: '' }
+    calls.push([...argv])
+    if (argv[1] === 'ls') return { exitCode: 0, stdout: JSON.stringify({ terminals }), stderr: '' }
+    // The preflight re-reads the target: answer with the live own-parent row it is meant to be.
+    if (argv[1] === 'get') return { exitCode: 0, stdout: JSON.stringify(terminals.find(t => t.address === argv[2]) ?? { address: argv[2] }), stderr: '' }
+    if (argv[1] === 'send') return sendFails ? { exitCode: 1, stdout: '', stderr: 'send refused' } : { exitCode: 0, stdout: '', stderr: '' }
+    if (argv[1] === 'interrupt') return { exitCode: 0, stdout: 'stopped\n', stderr: '' }
+    throw new Error(`unexpected hc argv: ${argv.join(' ')}`)
+  }
+  const { stdin, stdout } = mockTty()
+  stdout.columns = 160
+  const plain = () => stripAnsi(stdout.written)
+  const settle = () => new Promise(r => setTimeout(r, 120))
+  const runs = (sub: string) => calls.filter(a => a[1] === sub)
+  const run = runTui({ stdin, stdout, host, session: 'S', cwd: root, root, mirrorMs: 60_000, rowsMs: 60_000, hcParent: 't11' })
+  try {
+    await until(() => plain().includes('mine t1'), 5_000, 'rows')
+    stdin.emit('data', 'e')
+    stdin.emit('data', 'j')
+    await until(() => plain().includes('› mine t1') && plain().includes('[ t send ]'), 5_000, 'own t1 selected in edit')
+    // t opens the prompt; Enter types the line into the hc terminal.
+    stdin.emit('data', 't')
+    await until(() => plain().includes('t send t1:'), 5_000, 'send prompt open')
+    stdin.emit('data', 'hello hc')
+    await until(() => plain().includes('t send t1: hello hc'), 5_000, 'typed')
+    stdin.emit('data', '\r')
+    await until(() => runs('send').length === 1 && plain().includes('send t1 — ok'), 5_000, 'hc send ran')
+    assert.deepEqual(runs('send')[0], [bin, 'send', 't1', 'hello hc'], 'exact argv: hc send <addr> <text>')
+    // i runs hc interrupt (never kill).
+    stdin.emit('data', 'i')
+    await until(() => runs('interrupt').length === 1 && plain().includes('interrupt t1 — ok'), 5_000, 'hc interrupt ran')
+    assert.deepEqual(runs('interrupt')[0], [bin, 'interrupt', 't1'], 'exact argv: hc interrupt <addr>')
+    assert.equal(runs('kill').length + runs('rm').length, 0, 'no kill, no rm')
+    // A failed hc send reaches the status line and is not retried.
+    sendFails = true
+    stdin.emit('data', 't')
+    await until(() => plain().includes('t send t1:'), 5_000, 'second prompt')
+    stdin.emit('data', 'nope')
+    await until(() => plain().includes('t send t1: nope'), 5_000, 'typed again')
+    stdin.emit('data', '\r')
+    await until(() => plain().includes('send t1 — FAILED') && plain().includes('send refused'), 5_000, 'failure in the status line')
+    assert.equal(runs('send').length, 2, 'exactly two sends, no retry storm')
+    // Another parent's live row: t does nothing there.
+    stdin.emit('data', 'j')
+    await until(() => plain().includes('› theirs t2'), 5_000, 'other t2 selected')
+    const before = runs('send').length
+    stdin.emit('data', 't')
+    await settle()
+    assert.equal(runs('send').length, before, 't on another parent sends nothing')
+    assert.match(plain(), /another hc terminal's row/)
+  } finally {
+    stdin.emit('data', '\x03')
+    await run
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('hc x/d: kill and rm run only on own-parent rows, never another parent', () => {
+  const own = hcAg('t1', { parent: 't11', status: 'working' })
+  const theirs = hcAg('t2', { parent: 't99', status: 'working' })
+  const base = { ...ownerState(), hcParent: 't11', rows: [], all: [] }
+  // Own live: x x runs stopHc.
+  const live = { ...base, selected: hcId('t1'), herdr: [own] }
+  const a1 = nextKeyState(live, 'x', 1000)
+  assert.equal(a1.state.armedStop?.id, hcId('t1'))
+  assert.deepEqual(nextKeyState(a1.state, 'x', 1000 + STOP_REPEAT_MS * 2).action, { type: 'stopHc', hc: own })
+  // Another parent: nothing, and the reason is shown.
+  const theirsState = { ...base, selected: hcId('t2'), herdr: [theirs] }
+  const b1 = nextKeyState(theirsState, 'x', 1000)
+  assert.equal(b1.state.armedStop, undefined)
+  assert.equal(b1.action, undefined)
+  assert.match(b1.state.statusMessage ?? '', /own rows only/)
 })

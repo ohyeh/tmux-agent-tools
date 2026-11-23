@@ -2199,6 +2199,24 @@ function mockPanel(
         const c = (probe.hcClose ?? {}) as { exitCode?: number; stdout?: string; stderr?: string }
         return { value: { exitCode: c.exitCode ?? 0, stdout: c.stdout ?? '', stderr: c.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
+      // `hc get <address> --json`: the tell/interrupt preflight re-reads the row live, so answer
+      // from the terminal `hc ls` already listed, as hc would. `probe.hcGet` overrides it.
+      if (e.argv[1] === 'get') {
+        const g = (probe.hcGet ?? {}) as { exitCode?: number; stdout?: string; stderr?: string }
+        if (g.exitCode !== undefined || g.stdout !== undefined) {
+          return { value: { exitCode: g.exitCode ?? 0, stdout: g.stdout ?? '', stderr: g.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        const listed = JSON.parse(((probe.herdr ?? {}) as { stdout?: string }).stdout ?? '{"terminals":[]}') as { terminals?: Record<string, unknown>[] }
+        const found = (listed.terminals ?? []).find(t => t.address === e.argv[2])
+        return found
+          ? { value: { exitCode: 0, stdout: JSON.stringify(found), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+          : { value: { exitCode: 1, stdout: '', stderr: `hc: no terminal ${e.argv[2]}`, isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      // `probe.hcSend`: refuses the write (`{ exitCode, stderr }`), so the band's FAILED branch is exercised.
+      if (e.argv[1] === 'send' || e.argv[1] === 'interrupt') {
+        const s = (probe.hcSend ?? {}) as { exitCode?: number; stdout?: string; stderr?: string }
+        return { value: { exitCode: s.exitCode ?? 0, stdout: s.stdout ?? '', stderr: s.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
       const h = (probe.herdr ?? {}) as { exitCode?: number; stdout?: string }
       return { value: { exitCode: h.exitCode ?? 0, stdout: h.stdout ?? '', stderr: h.exitCode ? 'hc: core not running' : '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -2426,6 +2444,16 @@ const bandRender = (maxRows = 40, bodyRows = maxRows - 1, columns = 80, surface:
     view: {},
   },
 })
+
+/**
+ * The band as the terminal surface's own type wants it: `plugin validate` checks these calls against
+ * `RenderInputOf<'AbovePrompt'>`, which asks for `isCollapsed` too. The shading keys (`isCollapsed
+ * ? 10 : 11`) go to 18/19 without it, and each of its 183 sites already passes it.
+ */
+const bandRenderTerm = (maxRows = 40, bodyRows = maxRows - 1, columns = 80) => ({
+  ...bandRender(maxRows, bodyRows, columns, 'terminal'),
+  props: { ...bandRender(maxRows, bodyRows, columns, 'terminal').props, isCollapsed: false },
+} as const)
 
 /** Same cell widths the panel uses: CJK/fullwidth and `·` count 2. */
 function termCells(text: string): number {
@@ -3422,10 +3450,100 @@ describe('teammates', () => {
       expect(drawn).toContain('hc-band-line-2')
       expect(drawn).toContain('See it whole: hc attach t20')
       expect(keysOf(tree)).toContain('stop:hc:t20')
-      expect(keysOf(tree).filter(k => /^(tell|interrupt):/.test(k))).toEqual([])
+      // Phase 2 fix 1 (P2-05): a selected own-parent live hc row has the same tell Input and interrupt button as a tmux row.
+      expect(keysOf(tree)).toContain('tell:hc:t20')
+      expect(keysOf(tree)).toContain('interrupt:hc:t20')
       const reads = hcRuns(panel.argv).filter(a => a[1] === 'read')
       expect(reads.length).toBeGreaterThan(0)
       expect(reads[0]!.slice(0, 4)).toEqual(['/hb/hc', 'read', 't20', '--lines'])
+    })
+
+    test('hc send and interrupt run hc send / hc interrupt on an own live row, and nothing on another parent or a finished row', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = {
+        running: true,
+        herdr: hcList(
+          hcAgent('t20', 't11', { name: 'mine', state: 'live' }),
+          hcAgent('t22', 't11', { name: 'done', state: 'finished', status: 'idle' }),
+        ),
+      }
+      const panel = mockPanel(on, probe)
+      type TypeInto = (t: { plugin: string; key: string; text: string; requestId: string; surface: 'terminal' }) => Promise<unknown>
+      const typeInto = ($.ui as unknown as { input: TypeInto }).input
+      const calls = () => hcRuns(panel.argv).filter(a => a[1] === 'send' || a[1] === 'interrupt' || a[1] === 'kill' || a[1] === 'rm')
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRenderTerm(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t20', requestId: 'above-prompt' })
+      await clock.advance(2_000)
+      const tree = await $.ui.render(bandRenderTerm(40, 39, 120))
+      expect(keysOf(tree)).toContain('tell:hc:t20')
+      // send: type into the Input, Enter.
+      await typeInto({ plugin: 'tmux-agent', key: 'tell:hc:t20', text: 'hello band', requestId: 'above-prompt', surface: 'terminal' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'send')).toEqual([['/hb/hc', 'send', 't20', 'hello band']])
+      // interrupt: the button.
+      await $.ui.press({ plugin: 'tmux-agent', key: 'interrupt:hc:t20', requestId: 'above-prompt' })
+      await settle()
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'interrupt')).toEqual([['/hb/hc', 'interrupt', 't20']])
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm'), 'neither action kills').toEqual([])
+      // A finished row has no send or interrupt.
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t22', requestId: 'above-prompt' })
+      await $.ui.render(bandRenderTerm(40, 39, 120))
+      const doneTree = await $.ui.render(bandRenderTerm(40, 39, 120))
+      expect(keysOf(doneTree)).toContain('stop:hc:t22')
+      expect(keysOf(doneTree).filter(k => /^(tell|interrupt):/.test(k))).toEqual([])
+    })
+
+    test('the band hc actions never touch another parent row (its rows are own-parent filtered)', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      // hc ls only ever lists this session's own rows, so another parent's terminal must not be listed or acted on.
+      const probe: Record<string, unknown> = { running: true, herdr: hcList(hcAgent('t20', 't11', { name: 'mine' }), hcAgent('t30', 't99', { name: 'theirs' })) }
+      const panel = mockPanel(on, probe)
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      const tree = await $.ui.render(bandRenderTerm(40, 39, 120))
+      expect(textOf(tree)).not.toContain('theirs')
+      expect(keysOf(tree).filter(k => k === 'tell:hc:t30' || k === 'interrupt:hc:t30')).toEqual([])
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'send' || a[1] === 'interrupt')).toEqual([])
+    })
+
+    test('a refused hc send toasts the error once and runs exactly one argv (P2-05 failure branch)', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const probe: Record<string, unknown> = {
+        running: true,
+        herdr: hcList(hcAgent('t20', 't11', { name: 'mine', state: 'live' })),
+        hcSend: { exitCode: 1, stderr: 'review fake refusal' },
+      }
+      const panel = mockPanel(on, probe)
+      type TypeInto = (t: { plugin: string; key: string; text: string; requestId: string; surface: 'terminal' }) => Promise<unknown>
+      const typeInto = ($.ui as unknown as { input: TypeInto }).input
+
+      await $.session.start(session())
+      await $.command.run(run('workers'))
+      await $.ui.render(bandRenderTerm(40, 39, 120))
+      await $.ui.press({ plugin: 'tmux-agent', key: 'hc:t20', requestId: 'above-prompt' })
+      await clock.advance(2_000)
+      // The Input is drawn one render after the selection: render before addressing it.
+      await $.ui.render(bandRenderTerm(40, 39, 120))
+      await typeInto({ plugin: 'tmux-agent', key: 'tell:hc:t20', text: 'hello band', requestId: 'above-prompt', surface: 'terminal' })
+      await settle()
+      // The toast names the failure; the call ran once and was never retried.
+      expect(panel.toasts.filter(t => /send t20 — FAILED: hc send t20 failed \(exit 1: review fake refusal\)/.test(t))).toHaveLength(1)
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'send')).toEqual([['/hb/hc', 'send', 't20', 'hello band']])
+      // A refusal is not a drama: the preflight ran once too, and nothing else was written.
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'get')).toHaveLength(1)
+      expect(hcRuns(panel.argv).filter(a => a[1] === 'kill' || a[1] === 'rm')).toEqual([])
     })
 
     test('x x closes a live hc row with hc kill and a finished hc row with hc rm after arm-then-confirm', WITH_DRIVER, async ($, on) => {
@@ -4456,6 +4574,30 @@ test('re-review: a commit whose ancestry did not fit stays outstanding',WITH_DRI
   expect(store.acked()).toEqual(['w0#1']);
   expect(wake.join('\n')).not.toContain('NOT verified');
 });
+test('a rejection is never classified: an ENOENT and the engine timeout both read "delivery unknown" with the raw text (R2-03 r3)', WITH_DRIVER, async ($, on) => {
+  mock.env(on, { HOME }); mockStore(on, ['w1@0']); mockClock(on)
+  const files: Files = { ...worker('w1', 0), [`${V3}/w1/result.json`]: finished() }
+  mockFs(on, files); mockWake(on); mockSessionStart(on); on('ui.status', () => ({ value: undefined }))
+  let rejection: Error = new Error('spawn /tmp/timeout-worker ENOENT')
+  onRun(on, ($, e) => {
+    if (e.argv[2] === 'send') throw rejection
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start(session())
+  // A path that merely holds "timeout" is not a timeout: the raw text is carried, no class is named.
+  const spawn = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'one' }))
+  expect(spawn).toContain('delivery unknown')
+  // The engine answers `process.run` itself, so the call carries its own refusal text — never the fake's.
+  expect(spawn).toContain('no implementation for process.run')
+  expect(spawn).not.toContain('did not finish within')
+  expect(spawn).not.toContain('timed out')
+  // The engine's own timeout text is handled the same way: unknown, never resent, no word matching.
+  rejection = new Error('$.process.run (tmux-agent): agent-tmux send — aborted: still running after 45000ms')
+  const cut = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'two' }))
+  expect(cut).toContain('delivery unknown')
+  expect(cut).not.toContain('did not finish within')
+  expect(cut).not.toContain('timed out')
+});
 test('re-review: tell records the refreshed base before sending',WITH_DRIVER,async ($,on)=>{
   mock.env(on,{HOME});mockStore(on,['w1@0']);mockClock(on);
   const fresh='c'.repeat(40);
@@ -4481,7 +4623,7 @@ test('bug 8: a tell whose send outlasts its time still answers and records the e
   })
   await $.session.start(session())
   const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__tell' as const, name: 'w1', text: 'next' }))
-  expect(out, 'the caller is told to peek, not that nothing answered').toContain('may have arrived')
+  expect(out, 'the caller is told to peek, not that nothing answered').toContain('delivery unknown')
   expect(sendMs, 'the send gets more than the 22.6 s a folded paste took live').toBeGreaterThan(30_000)
   expect(JSON.parse(files[`${V3}/w1/episodes/2/dispatch.json`]!).since, 'the new episode is recorded').not.toEqual(0)
   expect(Object.keys(files), 'it may have arrived: uncertain + sent, watched and never re-sent (§8)').toEqual(
@@ -5414,7 +5556,19 @@ describe('cursor review of 34e2a1e', () => {
     const rec = JSON.parse(files[OWNER] ?? '{}') as { state?: string; token?: string }
     expect(rec.state, 'the claim is written before the window opens').toEqual('pending')
     expect(s.slice(s.indexOf(TUI_ENTRY))).toEqual([TUI_ENTRY, '--session', 'sess-test', '--cwd', '/work', '--claim', rec.token ?? ''])
+    expect(s, 'no --hc-parent when HC_TERMINAL_ID is unset').not.toContain('--hc-parent')
     expect(p.toasts, 'one toast, one prefix').toEqual(['tmux-agent: tui — ok: TUI 已開在 %9，在 %5 旁'])
+  })
+
+  test('[ ⧉ ] the split carries --hc-parent so the TUI knows which hc rows are this session\'s (Phase 2)', WITH_DRIVER, async ($, on) => {
+    const files: Files = { ...worker('w1', 0) }
+    const { p } = band(on, { TMUX_PANE: '%5', HC_TERMINAL_ID: 't21' }, files)
+    await $.session.start(session())
+    await pressTui($)
+    const s = opens(p.argv)[0] ?? []
+    const rec = JSON.parse(files[OWNER] ?? '{}') as { token?: string }
+    // The TUI does not inherit this commander's env (a split inherits the tmux server's), so the band passes it.
+    expect(s.slice(s.indexOf(TUI_ENTRY))).toEqual([TUI_ENTRY, '--session', 'sess-test', '--cwd', '/work', '--claim', rec.token ?? '', '--hc-parent', 't21'])
   })
 
   test('[ ⧉ ] outside tmux in Warp opens through openInTerminal and never reports a cut command as success (B2)', WITH_DRIVER, async ($, on) => {

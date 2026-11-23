@@ -1374,9 +1374,17 @@ test('T2: overlapping claims yield one won and one occupied-pending', async () =
   let entered = 0
   let releaseSecond!: () => void
   const secondArrived = new Promise<void>(r => { releaseSecond = r })
+  // The second claimant is this process with a made-up pid and lstart. `holderProvablyAlive` asks `ps`:
+  // answer for that pid with its own synthetic lstart, so the row is provably the live holder whatever order
+  // the two claims publish in. Before, real `ps` said "gone" when it published first and the row was reclaimed.
+  let syntheticPid = 0
+  let syntheticStart = ''
   const host: Host = {
     ...base,
     run: async (argv, cwd, ms) => {
+      if (argv[0] === '/bin/sh' && String(argv[2] ?? '').includes('ps -o lstart=') && String(argv[4] ?? '') === String(syntheticPid)) {
+        return { exitCode: 0, stdout: `${syntheticStart}\n`, stderr: '' }
+      }
       // The lock is published by rename(2). Hold the winner until the other claim has also reached it.
       if (argv[0] === 'perl' && argv.some(a => String(a).endsWith('/tui.owner.lock'))) {
         const result = await base.run(argv, cwd, ms)
@@ -1402,6 +1410,8 @@ test('T2: overlapping claims yield one won and one occupied-pending', async () =
   }
   const me = await processId(host)
   const other = { ...me, pid: me.pid + 3, pidStart: 'overlap-other' }
+  syntheticPid = other.pid
+  syntheticStart = other.pidStart
   try {
     const [a, b] = await Promise.all([
       core.claimTui(host, d.root, d.session, me, { state: 'pending' }),
