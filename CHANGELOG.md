@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.55.1 - 2026-11-23
+
+- Tests: nine hc tests that only fed imagined Host results or repeated another test are removed; the node host's `timedOut` case now sits in the SIGTERM test.
+- `sendHc` and `interruptHc` share one write path, and the hc preflight hands back the `hc` binary it already found. Review-round tags are gone from comments, test titles and these notes.
 - `workers-tui` hc writes: the write-result check is back to what the two real hosts can return. `host.run` is an async function in both hosts (`host.node.ts` resolves `{ exitCode: number, stdout, stderr, timedOut?, signal? }`; the mod's `wholeRun` returns the engine's typed result or rejects with an `Error`), so the guards for a synchronous throw, a non-`Error` rejection, a non-object result, a non-integer exit code, a non-string stderr and a re-read getter are gone, and `captureError` no longer names a timeout from an `ETIMEDOUT` code or from words in the error text (the node host reports `timedOut`; the engine's text is passed through). Real outcomes read as before: exit 0 sent, exit N failed, `timedOut` / a signal / exit -1 / a rejection delivery unknown.
 
 ## v0.55.0 - 2026-11-23
