@@ -814,6 +814,32 @@ export const register: Register = on => {
       await idNow(() => $.session.id())
       if (!gate.paused || (gate.session !== undefined && gate.session !== host.owner())) await heartbeat(host, gate)
     })
+    // A killed own hc worker is closed: `hc rm` its record too, so finished rows do not pile up in /workers
+    // and workers-tui. A row that ended by itself stays (its screen can be the only copy of its result), and
+    // so do the rows already killed at the first sweep: clearing those is `[ clear ]`, the person's call.
+    let hcKept: Set<string> | undefined
+    $.clock.every(POLL_MS, async () => {
+      try {
+        const me = await host.envHcTerminal()
+        if (!me) return
+        const killed = ((await readHc(host)) ?? []).filter(a => a.parent === me && a.address !== me && hcFinished(a) && a.reason === 'killed')
+        if (!hcKept) {
+          hcKept = new Set(killed.map(a => a.address))
+          return
+        }
+        for (const a of killed) {
+          if (hcKept.has(a.address)) continue
+          const out = await stopHc(host, a)
+          // A failed rm is tried once: the row stays for `[ clear ]` and the log says why.
+          if (!out.ok) {
+            hcKept.add(a.address)
+            host.log(`tmux-agent: ${out.text}`)
+          }
+        }
+      } catch (error) {
+        host.log(`tmux-agent: killed hc sweep failed: ${String(error)}`)
+      }
+    })
 
     // Catch up on whatever finished while no collector was alive, through the same
     // gate the tick uses: a slow startup scan is joined, never duplicated.

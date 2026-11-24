@@ -262,7 +262,7 @@ yourself.
   `hc read <t>`, `hc send <t> "<text>"` and `hc keys <t> enter`. For initial
   task status, use `hc get <t>`. Startup idle does not show that the task ran.
   `hc attach [--observe] <t>` attaches (watch-only in `workers-tui` viewer mode; `ctrl+\` detaches). Close it
-  live with `hc kill <t>` or `x x` in the band or `workers-tui` (編輯) (leaving the finished record listed until cleared); remove own finished rows with `d d` (`workers-tui`), `c c` / `[ clear ]`, `x x`, `/workers stop <hc address>`, or `hc rm <t>`.
+  live with `hc kill <t>` or `x x` in the band or `workers-tui` (編輯) (with the mod, its 10-second clock then removes a killed own record with `hc rm`; a row that ended by itself stays until cleared); remove own finished rows with `d d` (`workers-tui`), `c c` / `[ clear ]`, `x x`, `/workers stop <hc address>`, or `hc rm <t>`.
 - In Claude Code with the mod, `mcp__tmux-agent__assign` tries hc when `first` resolves to hc
   (`TMUX_AGENT_FIRST` overrides `/config`) or `agent-tmux` is missing. hc requires an hc parent,
   a live core, and an eligible `claude`, `codex`, `grok`, or `agy` program on PATH whose launch
