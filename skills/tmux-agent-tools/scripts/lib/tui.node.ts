@@ -391,7 +391,39 @@ export type TuiAction =
 
 export { hcId, mirrorHc }
 
-/** The hc rows of the list: they follow the tmux rows, live before finished (`readHc` sorts them). */
+/** The machine of a remote hc row (`mini/t3` → `mini`); undefined for a row on this machine. */
+export const hcMachine = (a: Pick<HcAgent, 'address'>): string | undefined => {
+  const cut = a.address.indexOf('/')
+  return cut > 0 ? a.address.slice(0, cut) : undefined
+}
+
+/**
+ * The drawn hc order. Live rows first (finished ones must not push a live row past the drawn-line cap),
+ * each part this machine first, then each remote machine by name. Live: every parent, then its
+ * children (a parent not in the part counts as absent). Finished: newest first. Ties keep the `hc ls` order.
+ */
+export function hcOrder(agents: HcAgent[]): HcAgent[] {
+  const group = (part: HcAgent[]) => {
+    const machines = [...new Set(part.map(a => hcMachine(a) ?? ''))].sort()
+    return machines.map(m => part.filter(a => (hcMachine(a) ?? '') === m))
+  }
+  const tree = (part: HcAgent[]): HcAgent[] => {
+    const here = new Set(part.map(a => a.address))
+    const out: HcAgent[] = []
+    const walk = (a: HcAgent) => {
+      out.push(a)
+      for (const c of part) if (c.parent === a.address && c !== a) walk(c)
+    }
+    for (const a of part) if (!a.parent || !here.has(a.parent)) walk(a)
+    // A parent cycle has no root: keep its rows rather than drop them.
+    return out.length === part.length ? out : [...out, ...part.filter(a => !out.includes(a))]
+  }
+  const live = agents.filter(a => !hcFinished(a))
+  const ended = agents.filter(hcFinished).reverse()
+  return [...group(live).flatMap(tree), ...group(ended).flat()]
+}
+
+/** The hc rows of the list: they follow the tmux rows, in `hcOrder`. */
 export function hcAgents(state: TuiState): HcAgent[] {
   return Array.isArray(state.herdr) ? state.herdr : []
 }
@@ -1550,10 +1582,13 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
   const color = ANSI_COLOR_MAP[STATE_COLOR[look.state]] ?? ''
   const prefix = index < 9 ? `${index + 1}: ` : '   '
   const plain = (t: string) => stripAnsi(sanitizeAnsi(t))
-  const name = plain(a.name ?? a.address)
+  const machine = hcMachine(a)
+  const short = machine ? a.address.slice(machine.length + 1) : a.address
+  const name = plain(a.name ?? short)
   // The address only on a wide row and when the name is not already the address.
-  const addr = a.name && width >= 120 ? plain(a.address) : ''
-  const marker = `${selected ? '›' : ' '} `
+  const addr = a.name && width >= 120 ? plain(short) : ''
+  // A remote row carries its machine in front of the name; a row on this machine carries nothing.
+  const marker = `${selected ? '›' : ' '} ${machine ? `\x1b[36m${plain(machine)}:\x1b[0m` : ''}`
   const lead = (n: string, withAddr: boolean) => `${marker}${n}${withAddr ? ` ${ANSI_DIM}${addr}${ANSI_RESET}` : ''}`
   const parent = a.parent ? `  @${plain(a.parent.split('/').pop()!)}` : ''
   const mark = `  ${plain(hcMark(a, info?.program))}`
@@ -2100,7 +2135,7 @@ export async function runTui(options: TuiOptions = {}): Promise<number> {
       if (!agents) return undefined
       // SELF hides this terminal's own row; OWNER (--hc-parent or env) decides which finished rows are ours.
       const owner = state.hcParent
-      return agents.filter(a => (!self || a.address !== self) && (!hcFinished(a) || (!!owner && a.parent === owner)))
+      return hcOrder(agents.filter(a => (!self || a.address !== self) && (!hcFinished(a) || (!!owner && a.parent === owner))))
     } catch {
       return '?'
     }

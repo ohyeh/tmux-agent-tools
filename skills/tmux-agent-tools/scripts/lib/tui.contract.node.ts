@@ -3861,7 +3861,7 @@ test('hc agents: rows after the tmux rows with @parent when there is one; counte
   const drawn = renderTuiLines(state, 160, 24, 1).map(stripAnsi)
   assert.match(drawn[0]!, /tmux 1 · hc 2/)
   assert.ok(drawn.includes('2: ●   agy-crash t1  @t11  idle · agy  a'), drawn.join('\n'))
-  assert.ok(drawn.includes('3: ●   codex-mbpr/t10  working · codex  b'), drawn.join('\n'))
+  assert.ok(drawn.includes('3: ●   codex-mbpr:t10  working · codex  b'), drawn.join('\n'))
   assert.ok(!drawn.join('\n').includes('read-only · @') && !drawn.join('\n').includes('未記錄'), 'no per-row hc · / read-only / 未記錄 text')
   // j/k move from worker rows onto drawn hc rows and back.
   const j1 = nextKeyState(state, 'j', 1).state
@@ -4392,9 +4392,9 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     await until(() => hcCalls.some(a => a[1] === 'kill' && a[2] === 't1') && plain().includes('hc 1 live · 2 ended') && /live-one t1 .*ended/.test(plain()), 5_000, 'hc kill t1 leaves finished row')
     assert.deepEqual(hcCalls.filter(a => a[1] === 'kill'), [[bin, 'kill', 't1']])
 
-    // Leave edit mode (preview), select finished t2, arm + confirm d d -> hc rm t2.
+    // Leave edit mode (preview), select finished t2 (newest finished first: t2 is drawn above t1), arm + confirm d d -> hc rm t2.
     stdin.emit('data', 'e')
-    stdin.emit('data', 'j')
+    stdin.emit('data', 'k')
     await until(() => plain().includes('› done-one t2') && stdout.written.includes('[ d delete ]'), 5_000, 't2 selected in preview')
     stdin.emit('data', 'd')
     await until(() => stdout.written.includes('delete done-one? press again'), 5_000, 't2 d armed')
