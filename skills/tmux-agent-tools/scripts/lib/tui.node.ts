@@ -423,6 +423,32 @@ export function hcOrder(agents: HcAgent[]): HcAgent[] {
   return [...group(live).flatMap(tree), ...group(ended).flat()]
 }
 
+/** The title drawn above hc row k: each group but this machine's live rows (they follow the tmux rows) gets one. */
+export function hcTitle(hcs: HcAgent[], k: number): string | undefined {
+  const a = hcs[k]!
+  const key = (x: HcAgent) => `${hcFinished(x)}|${hcMachine(x) ?? ''}`
+  if (k > 0 ? key(a) === key(hcs[k - 1]!) : !hcFinished(a) && !hcMachine(a)) return undefined
+  const m = hcMachine(a)
+  return hcFinished(a) ? (m ? `已結束 · ${m}` : '已結束') : m
+}
+
+/** One drawn list line: a tmux row, an hc row, or an hc group title (not selectable; digits and j/k skip it). */
+type ListItem = { row: number } | { hc: number } | { title: string }
+
+function listItems(state: TuiState): ListItem[] {
+  const hcs = hcAgents(state)
+  const out: ListItem[] = state.rows.map((_, row) => ({ row }))
+  hcs.forEach((_, hc) => {
+    const title = hcTitle(hcs, hc)
+    if (title) out.push({ title })
+    out.push({ hc })
+  })
+  return out
+}
+
+/** The item's place among the rows (tmux rows, then hc rows); -1 for a title. */
+const itemIndex = (state: TuiState, it: ListItem): number => ('row' in it ? it.row : 'hc' in it ? state.rows.length + it.hc : -1)
+
 /** The hc rows of the list: they follow the tmux rows, in `hcOrder`. */
 export function hcAgents(state: TuiState): HcAgent[] {
   return Array.isArray(state.herdr) ? state.herdr : []
@@ -1544,7 +1570,10 @@ function chromeLines(s: Sections): number {
 export function tuiLayout(state: TuiState, width: number, height: number, now: number, gate?: Gate): TuiLayout {
   const sections = sectionsOf(state, width, now, gate, height)
   const hasPreview = sections.sel >= 0 || sections.hcSel !== undefined
-  const frame = frameOf(width, height, state.rows.length + hcAgents(state).length, sections.selIndex, chromeLines(sections), state.narrowView ?? 'list', sections.footer.length, hasPreview)
+  // The frame counts drawn lines: the hc group titles are lines too, so the selection is placed by its line.
+  const items = listItems(state)
+  const selLine = sections.selIndex < 0 ? -1 : items.findIndex(it => itemIndex(state, it) === sections.selIndex)
+  const frame = frameOf(width, height, items.length, selLine, chromeLines(sections), state.narrowView ?? 'list', sections.footer.length, hasPreview)
   const wrapW = frame.preview.cols > 0 ? frame.preview.cols : width
   const open = state.expanded && state.detail && state.detail.id === state.selected
   return { frame, sections, ...(open ? { detail: wrapCells(state.detail!.lines.join('\n'), wrapW) } : {}) }
@@ -1587,8 +1616,8 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
   const name = plain(a.name ?? short)
   // The address only on a wide row and when the name is not already the address.
   const addr = a.name && width >= 120 ? plain(short) : ''
-  // A remote row carries its machine in front of the name; a row on this machine carries nothing.
-  const marker = `${selected ? '›' : ' '} ${machine ? `\x1b[36m${plain(machine)}:\x1b[0m` : ''}`
+  // The group title above names the machine, so the row shows the address without it.
+  const marker = `${selected ? '›' : ' '} `
   const lead = (n: string, withAddr: boolean) => `${marker}${n}${withAddr ? ` ${ANSI_DIM}${addr}${ANSI_RESET}` : ''}`
   const parent = a.parent ? `  @${plain(a.parent.split('/').pop()!)}` : ''
   const mark = `  ${plain(hcMark(a, info?.program))}`
@@ -1645,11 +1674,16 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
   if (s.sel >= 0 || s.hcSel) lines.push(...s.selExtra.map(fit))
 
   const hcs = hcAgents(state)
-  const shown = Math.max(0, state.rows.length + hcs.length - frame.hidden)
-  for (let i = frame.list.first; i < frame.list.first + shown; i++) {
-    lines.push(fit(i < state.rows.length ? rowLine(state, i, s.sel) : hcLine(state, hcs[i - state.rows.length]!, i, i === s.selIndex, width, now)))
+  const items = listItems(state)
+  const drawn = items.slice(frame.list.first, frame.list.first + Math.max(0, items.length - frame.hidden))
+  for (const it of drawn) {
+    if ('title' in it) lines.push(fit(`   \x1b[2m── ${sanitizeAnsi(it.title)} ${'─'.repeat(Math.max(2, 40 - cellWidth(it.title)))}\x1b[0m`))
+    else if ('row' in it) lines.push(fit(rowLine(state, it.row, s.sel)))
+    else lines.push(fit(hcLine(state, hcs[it.hc]!, state.rows.length + it.hc, state.rows.length + it.hc === s.selIndex, width, now)))
   }
-  if (frame.more) lines.push(fit(`\x1b[2m  +${frame.hidden} more — j/k moves the selection\x1b[0m`))
+  // `+N more` counts rows, not the titles cut with them.
+  const hiddenRows = state.rows.length + hcs.length - drawn.filter(it => !('title' in it)).length
+  if (frame.more) lines.push(fit(`\x1b[2m  +${hiddenRows} more — j/k moves the selection\x1b[0m`))
 
   // Full-width chrome precedes the list and preview in every frame mode.
   const r = s.sel >= 0 ? state.rows[s.sel] : undefined

@@ -3861,7 +3861,8 @@ test('hc agents: rows after the tmux rows with @parent when there is one; counte
   const drawn = renderTuiLines(state, 160, 24, 1).map(stripAnsi)
   assert.match(drawn[0]!, /tmux 1 · hc 2/)
   assert.ok(drawn.includes('2: ●   agy-crash t1  @t11  idle · agy  a'), drawn.join('\n'))
-  assert.ok(drawn.includes('3: ●   codex-mbpr:t10  working · codex  b'), drawn.join('\n'))
+  assert.ok(drawn.some(l => l.startsWith('   ── codex-mbpr ─')), drawn.join('\n'))
+  assert.ok(drawn.includes('3: ●   t10  working · codex  b'), drawn.join('\n'))
   assert.ok(!drawn.join('\n').includes('read-only · @') && !drawn.join('\n').includes('未記錄'), 'no per-row hc · / read-only / 未記錄 text')
   // j/k move from worker rows onto drawn hc rows and back.
   const j1 = nextKeyState(state, 'j', 1).state
@@ -4559,7 +4560,8 @@ test('hc row grammar: one case per mapping row, whole-string compare, no null/un
   const first = lines.findIndex(l => l.startsWith('1: '))
   assert.ok(first >= 0, lines.join('\n'))
   const want = cases.map(([, , color, glyph, label], i) => `${i < 9 ? `${i + 1}: ` : '   '}${ESC}[${color}m${ESC}[1m${glyph}${ESC}[0m${label}`)
-  assert.deepEqual(lines.slice(first, first + cases.length), want)
+  // The group titles (`── 已結束 ──`) sit between rows; this test is about the rows.
+  assert.deepEqual(lines.slice(first).filter(l => !stripAnsi(l).startsWith('   ── ')).slice(0, cases.length), want)
   assert.ok(!/null|undefined|NaN/.test(lines.join('\n')), 'no null/undefined/NaN on any row')
 })
 
