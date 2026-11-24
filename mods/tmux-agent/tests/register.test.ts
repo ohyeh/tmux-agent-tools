@@ -2115,6 +2115,10 @@ describe('stall detection', () => {
   })
 })
 
+/** An `$.agent.list()` entry: the mod reads `status`; the rest fills what 2.1.331 made required. */
+const agent = (id: string, description: string, type: string, status: AgentInfo["taskStatus"] & AgentInfo["status"]): AgentInfo =>
+  ({ id, description, type, status, kind: "local_agent", taskStatus: status, label: description, startTime: 0, cwd: "/", tokenCount: 0, tokenSamples: [], hasRow: true })
+
 /** Floors for the panel: open/close/invalidate answered, every argv recorded. */
 function mockPanel(
   on: On,
@@ -2437,6 +2441,7 @@ const bandRender = (maxRows = 40, bodyRows = maxRows - 1, columns = 80, surface:
   viewport: { columns: Math.max(100, columns), rows: maxRows + 10 },
   props: {
     hasSurvey: false,
+    isCollapsed: false,
     isWorking: false,
     maxRows,
     bodyColumns: columns,
@@ -3349,9 +3354,9 @@ describe('teammates', () => {
       [`${V3}/w2/result.json`]: finished('done'),
     })
     mockPanel(on, { running: true, sessions: ['codex-cli-w2'] }, 'hello\nworld', false, undefined, false, [
-      { id: 'a', description: 'a', type: 'general-purpose', status: 'running' },
-      { id: 'b', description: 'b', type: 'teammate', status: 'running' },
-      { id: 'c', description: 'c', type: 'Explore', status: 'completed' },
+      agent('a', 'a', 'general-purpose', 'running'),
+      agent('b', 'b', 'teammate', 'running'),
+      agent('c', 'c', 'Explore', 'completed'),
     ])
 
     await $.session.start(session())
@@ -6513,7 +6518,7 @@ describe('native mirror', () => {
     const woken = mockWake(on)
     mockSessionStart(on)
     on('agent.list', () => ({
-      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'running' }],
+      value: [agent('agt-1', 'w1', 'tmux-agent:tmux-waiter', 'running')],
     }))
 
     await $.session.start(session())
@@ -6534,7 +6539,7 @@ describe('native mirror', () => {
     const woken = mockWake(on)
     mockSessionStart(on)
     on('agent.list', () => ({
-      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'completed' }],
+      value: [agent('agt-1', 'w1', 'tmux-agent:tmux-waiter', 'completed')],
     }))
 
     await $.session.start(session())
@@ -6554,7 +6559,7 @@ describe('native mirror', () => {
     const woken = mockWake(on)
     mockSessionStart(on)
     on('agent.list', () => ({
-      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'completed' }],
+      value: [agent('agt-1', 'w1', 'tmux-agent:tmux-waiter', 'completed')],
     }))
 
     await $.session.start(session())
@@ -6581,7 +6586,7 @@ describe('native mirror', () => {
     // `exited`, which the waiter's poll (result.json / a failed launch.exit) never sees.
     mockStatus(on, { exists: false, running: false })
     on('agent.list', () => ({
-      value: [{ id: 'agt-1', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'running' }],
+      value: [agent('agt-1', 'w1', 'tmux-agent:tmux-waiter', 'running')],
     }))
 
     await $.session.start(session())
@@ -6603,7 +6608,7 @@ describe('native mirror', () => {
     const woken = mockWake(on)
     mockSessionStart(on)
     on('agent.list', () => ({
-      value: [{ id: 'agt-killed', description: 'w1', type: 'tmux-agent:tmux-waiter', status: 'killed' }],
+      value: [agent('agt-killed', 'w1', 'tmux-agent:tmux-waiter', 'killed')],
     }))
 
     await $.session.start(session())
