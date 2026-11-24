@@ -859,7 +859,7 @@ export async function assignHc(host: Host, input: AssignInput, space = HC_SPACE)
       `launched "${name}" as hc ${address} (${prog}), backend hc: no result.json, no collector. ${pane}` +
       `hc types its report into this session as <hc from="${address} ${name}">, and a note when it blocks, errors or exits; end the turn. ` +
       `If no report comes, ${bin} get ${address}: the task is over when turn is 1 or more and status is not working (do not use hc wait right after a launch: it returns at startup idle). ` +
-      `Follow up: ${bin} send ${address} "<text>". Screen: ${bin} read ${address}. Close: ${bin} kill ${address}, or its hc row in /workers. ` +
+      `Follow up: ${bin} send ${address} "<text>". Screen: ${bin} read ${address}. Close once its result is accepted: ${bin} kill ${address}, then ${bin} rm ${address} (kill alone leaves a finished row in /workers). ` +
       'The tell, await, peek and stop tools do not know this worker.',
   }
 }
