@@ -17,6 +17,7 @@
     "jsxFragmentFactory": "Fragment"
   },
   "include": [
+    "typings",
     "types",
     "hooks",
     "tests"

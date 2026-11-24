@@ -140,6 +140,9 @@ assert "usage_init carries launch_id" \
 
 echo "case: same-name restart appends a second init with a distinct launch_id"
 # A live name is never replaced (plan R8.5): stop the first launch, then reuse it.
+# Let the oneshot stamp its own process-exit first, or stop races it and the
+# launch counts as stopped (stats below expect stopped=3: lsr, lsc, lsn).
+poll_result linit || true
 "$AGENT" claude --profile "$prof_ok" stop linit >/dev/null 2>&1 || true
 "$AGENT" claude --profile "$prof_ok" start --exact linit "$WORK" 'task two' >/dev/null 2>&1 || true
 assert "two usage_init events" "$(grep -c usage_init "$TMUX_AGENT_DIR/linit/usage.jsonl")" "2"
@@ -212,7 +215,7 @@ assert "still exactly one launch_end" \
 
 echo "case: stats --json launches block is self-consistent"
 sjson="$("$AGENT" claude stats --json)"
-# total = every usage_init carrying a launch_id: linit(2)+lsr(1)+lsn(1)+lexit(1)
+# total = every usage_init carrying a launch_id: linit(2)+lsr(1)+lsc(1)+lsn(1)+lexit(1)
 assert "launches.total counts inits" "$(printf '%s' "$sjson" | jq -r .launches.total)" "6"
 assert "by_terminal_reason.stopped=3" \
   "$(printf '%s' "$sjson" | jq -r '.launches.by_terminal_reason.stopped')" "3"

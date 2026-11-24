@@ -52,7 +52,9 @@ trap 'rm -f "$actual"' EXIT
 # Capture first: under pipefail a failing validate or a grep with no match
 # would abort here, before the diagnostic below.
 vout="$("$CLAUDE" plugin validate "$MOD" </dev/null 2>&1 || true)"
-printf '%s\n' "$vout" | grep '❯' | sed 's/^[[:space:]]*❯ //' > "$actual" || true
+# Since 2.1.331 validate also prints its own tsc errors as ❯ lines; they are not
+# surface, and the mod's tsconfig is type-checked below.
+printf '%s\n' "$vout" | grep '❯' | sed 's/^[[:space:]]*❯ //' | grep -v ': error TS[0-9]*: ' > "$actual" || true
 if [[ ! -s "$actual" ]]; then
   bad "plugin validate printed no surface lines"
   printf '%s\n' "$vout" >&2

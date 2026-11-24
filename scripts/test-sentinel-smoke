@@ -305,9 +305,10 @@ rpos() {
 }
 # One launch: the path exists locally but not on the "remote" (hide), a special-character
 # directory, a CLI that exits 3, and an allowed hook just under the tmux size limit.
+# The filler leaves ~100 bytes of slack: the payload around it grows with agent-tmux.
 sd="$W/odd dir it's \$HOME;\\x"; mkdir -p "$sd"
 s="$sd/w.exit"; echo local-only > "$s"; print -r -- "$s" > "$W/hide-path"
-near="$(head -c 9000 /dev/zero | tr '\0' x)"
+near="$(head -c 8900 /dev/zero | tr '\0' x)"
 rpos "R-pos" rp-one hide.code3.host "$s" --on-exit "$HOOK; : $near" --on-exit-allow '^printf '
 check_success "R-pos" "$s" 3 rp-one "$W/rcwd"
 assert "R-pos CLI cwd" "$(head -n1 "$W/cli.hide.code3.host" 2>/dev/null)" "ran cwd=$W/rcwd"
