@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.56.0 - 2026-11-24
+
+- `workers-tui` hc rows: live rows first, then finished. Each part lists this machine, then each remote machine (`<machine>/tN` addresses from `hc ls`) by name. Live rows put each parent before its children; finished rows go newest first. A dim title line (`── <machine>`, `── 已結束`, `── 已結束 · <machine>`) sits above each group but this machine's live rows; titles are not selectable, digits and `j`/`k` skip them, and `+N more` counts rows only. A remote row drops the machine prefix, which its title names. Verified on the live hc core (one local, two remote machines).
+- Mod: the hc `assign` receipt now closes with `hc kill <address>`, then `hc rm <address>`; it said only `kill`, so every closed hc worker stayed as a finished row.
+- Mod: the collector clock (10 s) runs `hc rm` on this session's own killed hc rows. A row that ended by itself stays (its screen can be the only copy of a result), and so do rows already killed at the first sweep, for `[ clear ]`. Verified live: an hc worker under this session's terminal, killed, left `hc ls --all` within one tick; another parent's finished rows stayed.
+
 ## v0.55.1 - 2026-11-23
 
 - Tests: nine hc tests that only fed imagined Host results or repeated another test are removed; the node host's `timedOut` case now sits in the SIGTERM test.
