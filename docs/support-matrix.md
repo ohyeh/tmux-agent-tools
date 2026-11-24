@@ -79,7 +79,7 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| Mod | write + read | PASS | 2026-10-02, desktop-hosted session (`entrypoint: claude-desktop`, 2.1.286, mod 0.44.0): `/workers` printed `workers panel opened above the prompt`; an assign ran to success and its row showed in the band (user screenshot); `/workers` again closed it. Earlier notes: `mods/tmux-agent/types/claude-code.d.ts` (2.1.287) lists a `desktop` surface whose table has `Input`, and says `AbovePrompt` is "Raised on the terminal and desktop surfaces only". `mods/tmux-agent/tests/register.test.ts` ("desktop draws the band like the terminal") draws the band on `desktop`. Not B1: on 2026-10-02 the desktop app viewed a CLI-hosted session (`entrypoint: cli`, 2.1.287, probe on) during an assign; `surfaces.jsonl` got 0 `desktop` lines (only `render surface: terminal`), as the Remote Control docs predict. To close: Part B1 of `$R/runbook-B.md`, in a session started from the desktop Code tab. |
+| Mod | write + read | PASS | 2026-10-02, desktop-hosted session (`entrypoint: claude-desktop`, 2.1.286, mod 0.44.0): `/workers` printed `workers panel opened above the prompt`; an assign ran to success and its row showed in the band (user screenshot); `/workers` again closed it. Earlier notes: `claude-code.d.ts` (2.1.287; since 2.1.331 at `mods/tmux-agent/typings/`) lists a `desktop` surface whose table has `Input`, and says `AbovePrompt` is "Raised on the terminal and desktop surfaces only". `mods/tmux-agent/tests/register.test.ts` ("desktop draws the band like the terminal") draws the band on `desktop`. Not B1: on 2026-10-02 the desktop app viewed a CLI-hosted session (`entrypoint: cli`, 2.1.287, probe on) during an assign; `surfaces.jsonl` got 0 `desktop` lines (only `render surface: terminal`), as the Remote Control docs predict. To close: Part B1 of `$R/runbook-B.md`, in a session started from the desktop Code tab. |
 | MCP | write + read | UNCONFIRMED | No run exists. To close: same as the terminal MCP action, in the desktop host. |
 | Paste | read + write | not applicable | Paste needs a tmux pane that runs a known CLI. With no such pane the collector pastes nothing (`skills/tmux-agent-tools/scripts/lib/collector.node.ts:135`, `no known CLI ... nothing pasted`). Use the MCP path. |
 
@@ -87,7 +87,7 @@ Cursor rows were re-run on the release SHA `ff31398` (report: `$R/agent-live-ff3
 
 | Path | Op | Status | Evidence, or blocker and action |
 |---|---|---|---|
-| Mod | render + press | UNCONFIRMED | `mods/tmux-agent/types/claude-code.d.ts` (2.1.287): `RenderSurface` has `mobile`; its element table has no `Input` or `Select`; `AbovePrompt` is raised on terminal and desktop only. The 2.1.287 docs say Remote Control draws only in the local terminal. To close: Part B2 of `$R/runbook-B.md`. |
+| Mod | render + press | UNCONFIRMED | `claude-code.d.ts` (2.1.287; since 2.1.331 at `mods/tmux-agent/typings/`): `RenderSurface` has `mobile`; its element table has no `Input` or `Select`; `AbovePrompt` is raised on terminal and desktop only. The 2.1.287 docs say Remote Control draws only in the local terminal. To close: Part B2 of `$R/runbook-B.md`. |
 
 ## Operating systems
 
