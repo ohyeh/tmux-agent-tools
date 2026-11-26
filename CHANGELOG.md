@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.56.2 - 2026-11-26
+
+- Router skill: the product-file watch no longer depends on the brief naming products. Every brief names its products (its `WORKER_ARTIFACT`, plus any run dir or log), and the commander adds one before dispatch if it has none. Before, a brief with no product path left a quiet worker with no watch, the same gap as before 0.56.1.
+- Not verified: no live commander session has run with the new text.
+
 ## v0.56.1 - 2026-11-26
 
 - Commander supervision now matches the agent-scripts kernel (4.54.0), which wants a monitor that wakes on new products, errors, idleness and stalls.
