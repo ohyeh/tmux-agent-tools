@@ -65,8 +65,9 @@ and uses "commander is not Claude Code" below.
      finishes, the launch fails, the pane ends with no result, a hook-trust
      dialog appears, or a quota/login blocker holds. It does NOT wake you on a
      quiet pane, on another dialog (a toast and a `/workers` row only), or on
-     the files the worker writes. So when the brief names products (run dir,
-     log, report), arm a `Monitor` on those files that wakes on a new or changed
+     the files the worker writes. So every brief names its products (its
+     `WORKER_ARTIFACT`, plus any run dir or log; add one before dispatch if it
+     has none), and you arm a `Monitor` on those files that wakes on a new or changed
      file, an error line, or no change for the brief's stall time (else 10m);
      then **end the turn.** Do not start a proxy, a harvest task, a Bash
      `status` or `capture`, a `peek` loop, or a `result` wait on that worker —
