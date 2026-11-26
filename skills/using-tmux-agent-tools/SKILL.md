@@ -59,11 +59,19 @@ and uses "commander is not Claude Code" below.
    `profile`, `name`, `dir`, and a `brief` carrying GOAL / MODEL / ACCEPTANCE / REPORT.
 2. Read the receipt. One of these phrases in it is the branch condition, not
    the tool's mere presence:
-   - `collector: active in this session` → **end the turn.** The
-     collector reconciles `result.json` on its own clock and submits a prompt
-     when the worker finishes or the launch fails. Do not start a proxy, a
-     harvest task, `status`, `capture`, or a `result` wait on that worker —
-     that is a second supervisor. Ending the turn hands control back to wait
+   - `collector: active in this session` → call `mcp__tmux-agent__peek` once
+     to check that the worker took the brief. The collector reconciles
+     `result.json` on its own clock and submits a prompt when the worker
+     finishes, the launch fails, the pane ends with no result, a hook-trust
+     dialog appears, or a quota/login blocker holds. It does NOT wake you on a
+     quiet pane, on another dialog (a toast and a `/workers` row only), or on
+     the files the worker writes. So when the brief names products (run dir,
+     log, report), arm a `Monitor` on those files that wakes on a new or changed
+     file, an error line, or no change for the brief's stall time (else 10m);
+     then **end the turn.** Do not start a proxy, a harvest task, a Bash
+     `status` or `capture`, a `peek` loop, or a `result` wait on that worker —
+     that is a second supervisor; a watch on product files is not. On each wake,
+     compare the product with the plan. Ending the turn hands control back to wait
      for the asynchronous notification; it is NOT a claim that the task is done.
    - `collector: NONE — …` (the collector paused itself: three delivery
      refusals, or the acknowledged set over budget) → nobody will wake you.
@@ -125,7 +133,8 @@ and uses "commander is not Claude Code" below.
 5. The worker is a teammate (a tmux worker; for an hc worker see step 2). Next task or a correction → `mcp__tmux-agent__tell`
    with the dispatched name and the text: it resets the worker's result, sends
    the message with the result path, and the collector wakes you again on the
-   answer. Done with it → `mcp__tmux-agent__stop`. Never run the `agent-tmux`
+   answer. After a correction, `peek` once to check its next action; stop it if
+   it did not follow. Done with it → `mcp__tmux-agent__stop`. Never run the `agent-tmux`
    subcommands `send`, `send-wait`, `status`, `capture`, `result` or `stop`
    from Bash while the mod is loaded —
    its Bash gate denies them and names the tool to use instead (`--help` passes).
@@ -158,7 +167,7 @@ hc terminal (see the routing list below).
 
 Without the Claude Code mod, start a tmux commander session and dispatch from
 inside its pane. Commander assign starts the shell collector from the tmux
-server when needed. End the turn if the receipt says the collector is active.
+server when needed. If the receipt says the collector is active, check the worker once (its screen or first product), then end the turn.
 Results arrive as a prompt. Do not start a second collector, and do not
 background `collect` yourself — the CLI's shell tool reaps that child when the
 call returns.
@@ -181,7 +190,7 @@ worker — that is a second supervisor.
 
 On the shell wrapper path, dispatch one external CLI worker with one blocking `agent-tmux <cli> assign
 <name> <directory> <prompt-file>` call. `assign` owns start, result init,
-verified send, processing confirmation, and terminal supervision. Do not add a
+verified send, processing confirmation (this is the dispatch check), and terminal supervision. Do not add a
 native supervision proxy: while `assign` runs, no second supervisor may
 concurrently call `status`, `capture`, `probe`, `result`, or another wait.
 Hosting that one `assign` call inside a sub-agent is not a proxy — see below.

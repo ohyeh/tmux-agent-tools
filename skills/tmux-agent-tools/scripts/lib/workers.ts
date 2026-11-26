@@ -857,7 +857,7 @@ export async function assignHc(host: Host, input: AssignInput, space = HC_SPACE)
   return {
     receipt:
       `launched "${name}" as hc ${address} (${prog}), backend hc: no result.json, no collector. ${pane}` +
-      `hc types its report into this session as <hc from="${address} ${name}">, and a note when it blocks, errors or exits; end the turn. ` +
+      `hc types its report into this session as <hc from="${address} ${name}">, and a note when it blocks, errors or exits. Read its screen once (${bin} read ${address}) to check it took the task, then end the turn. ` +
       `If no report comes, ${bin} get ${address}: the task is over when turn is 1 or more and status is not working (do not use hc wait right after a launch: it returns at startup idle). ` +
       `Follow up: ${bin} send ${address} "<text>". Screen: ${bin} read ${address}. Close once its result is accepted: ${bin} kill ${address}, then ${bin} rm ${address} (kill alone leaves a finished row in /workers). ` +
       'The tell, await, peek and stop tools do not know this worker.',
@@ -5075,7 +5075,7 @@ export async function assignWorker(
   const down = extra?.down?.()
   const collector = down
     ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read ${stateDir}/result.json with the Read tool`
-    : 'collector: active in this session — end the turn; a prompt arrives when the worker finishes or the launch fails'
+    : 'collector: active in this session — peek once to check it took the brief, watch its product files, then end the turn; a prompt arrives when the worker finishes, the launch fails, or a quota/login blocker holds (not on a quiet pane)'
   return {
     receipt:
       `launch requested for "${name}" on ${input.profile} (launch log: ${logPath}). ` +
