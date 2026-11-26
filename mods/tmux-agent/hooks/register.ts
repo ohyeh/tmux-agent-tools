@@ -126,7 +126,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.56.0'
+const MOD_VERSION = '0.56.1'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -729,7 +729,7 @@ export const register: Register = on => {
         'Wait for one episode of a worker and return its result in THIS loop — for a workflow agent or subagent, ' +
         'whose result the collector would otherwise deliver only to the owner session. Blocks up to max_seconds, ' +
         `then returns the terminal result, or pending with a progress snapshot (call again). A read: it acks nothing, ` +
-        'so the owner session still gets one notice. In the main loop, end the turn instead; the collector wakes you.',
+        'so the owner session still gets one notice. In the main loop, peek once and watch its product files, then end the turn; the collector wakes you on its result.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2059,7 +2059,7 @@ export const register: Register = on => {
         `${told.text}. ` +
         (down
           ? `collector: NONE — ${down}. Nothing will wake you: check it with ${PEEK_TOOL}, and once it is idle read the result file named above with the Read tool`
-          : 'collector: active — end the turn; a prompt arrives when it answers') +
+          : 'collector: active — peek once to check its next action, then end the turn; a prompt arrives when it answers') +
         '.',
     }
   }).catch(($, e, next) => toolFailed(TELL_TOOL, next.error))

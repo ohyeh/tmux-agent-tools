@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.56.1 - 2026-11-26
+
+- Commander supervision now matches the agent-scripts kernel (4.54.0), which wants a monitor that wakes on new products, errors, idleness and stalls.
+  - After `assign`, `peek` once to check that the worker took the brief, arm a `Monitor` on the product files the brief names (wake on a new or changed file, an error line, or no change for the stall time), then end the turn. After a `tell` correction, `peek` once to check the next action. An hc launch: read the screen once.
+  - The skill now lists what the collector really wakes on: a result, a launch failure, a pane gone with no result, a hook-trust dialog, a quota/login blocker. A quiet pane and other dialogs never wake the session (workers.ts: "Quiet with no blocker: an observation for the log, never a wake-up"); the product-file watch covers that gap.
+  - A `peek` loop, a Bash `status`/`capture`, a proxy or a `result` wait is still a second supervisor; a watch on product files is not. The `assign`, `tell` and hc receipts, the `await` description and the router skill say this.
+- Not verified: no live commander session has run with the new text.
+
 ## v0.56.0 - 2026-11-24
 
 - `workers-tui` hc rows: live rows first, then finished. Each part lists this machine, then each remote machine (`<machine>/tN` addresses from `hc ls`) by name. Live rows put each parent before its children; finished rows go newest first. A dim title line (`── <machine>`, `── 已結束`, `── 已結束 · <machine>`) sits above each group but this machine's live rows; titles are not selectable, digits and `j`/`k` skip them, and `+N more` counts rows only. A remote row drops the machine prefix, which its title names. Verified on the live hc core (one local, two remote machines).
