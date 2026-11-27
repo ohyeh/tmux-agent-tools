@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.56.3 - 2026-11-27
+
+- Mod: the killed-hc sweep on the collector clock now logs a failure at most once per session, as the band's `hc ls` read already did. With a remote hc machine on a slow relayed link, `hc ls --all --json` took 2.4–2.5 s in 3 of 5 runs, past the 2 s run cap, and every 10 s tick printed `tmux-agent: killed hc sweep failed: … still running after 2000ms` again. A failed sweep still skips that tick; the next tick tries again.
+- Not verified: the live session after reload (the log line appearing at most once) is checked by the commander after this release, not by the suite.
+
 ## v0.56.2 - 2026-11-26
 
 - Router skill: the product-file watch no longer depends on the brief naming products. Every brief names its products (its `WORKER_ARTIFACT`, plus any run dir or log), and the commander adds one before dispatch if it has none. Before, a brief with no product path left a quiet worker with no watch, the same gap as before 0.56.1.
