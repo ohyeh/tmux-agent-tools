@@ -3766,6 +3766,18 @@ describe('teammates', () => {
       expect(panel.logs.filter(line => line.includes('hc ls failed')).length).toBe(1)
     })
 
+    test('a killed-hc sweep that keeps failing logs once per session', WITH_DRIVER, async ($, on) => {
+      mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
+      mockStore(on)
+      const clock = mockClock(on)
+      mockFs(on, { '/hb/hc': '', [SOCK]: '' })
+      const panel = mockPanel(on, { running: true, herdr: { exitCode: 1, stdout: '{"error":{"kind":"x","message":"y"}}' } })
+
+      await $.session.start(session())
+      for (let i = 0; i < 3; i++) await clock.advance(10_000)
+      expect(panel.logs.filter(line => line.includes('killed hc sweep failed')).length).toBe(1)
+    })
+
     test('a flapping hc ls (miss, miss, hit, miss, miss) logs once per session', WITH_DRIVER, async ($, on) => {
       mock.env(on, { HOME, PATH: '/hb', HC_TERMINAL_ID: 't11' })
       mockStore(on)

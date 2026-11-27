@@ -126,7 +126,7 @@ import type { TmuxDispatch, TmuxStalled } from '../types'
  * which code had drawn it. `test-version-sync-smoke` holds this to
  * `.claude-plugin/plugin.json`.
  */
-const MOD_VERSION = '0.56.2'
+const MOD_VERSION = '0.56.3'
 
 /**
  * A cut stdout (over the engine's 4 MiB limit, 2.1.287 `isStdoutTruncated`) is not an answer:
@@ -818,6 +818,7 @@ export const register: Register = on => {
     // and workers-tui. A row that ended by itself stays (its screen can be the only copy of its result), and
     // so do the rows already killed at the first sweep: clearing those is `[ clear ]`, the person's call.
     let hcKept: Set<string> | undefined
+    let sweepMissLogged = false
     $.clock.every(POLL_MS, async () => {
       try {
         const me = await host.envHcTerminal()
@@ -837,7 +838,11 @@ export const register: Register = on => {
           }
         }
       } catch (error) {
-        host.log(`tmux-agent: killed hc sweep failed: ${String(error)}`)
+        // Once per session, as the band's hc ls read: a slow remote hc machine timed out every tick and logged every tick.
+        if (!sweepMissLogged) {
+          sweepMissLogged = true
+          host.log(`tmux-agent: killed hc sweep failed: ${String(error)}`)
+        }
       }
     })
 
