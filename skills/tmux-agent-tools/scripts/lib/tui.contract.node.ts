@@ -4589,6 +4589,24 @@ test('hc row grammar: selected row marker, narrow truncation order (repo, @paren
   assert.ok(!row(119).includes('a1  @p'), 'and not before')
 })
 
+test('rows below 45 columns: the number, the marker blanks and then the glyph go before the backend label and the name or state', () => {
+  const now = 10_000_000
+  const a = hcAg('a1', { name: 'work', agent: 'claude-code', status: 'working', turn: 3 })
+  const hcRow = (width: number) => renderTuiLines(hcState([a], { a1: { createdMs: now - 125_000 } }), width, 30, now).map(stripAnsi).find(l => l.includes('hc · '))
+  const tmuxRow = (width: number, selected?: string) => renderTuiLines({ ...ownerState(), selected }, width, 30, 1).map(stripAnsi).find(l => l.includes('tmux · '))
+  // 44: room enough, the whole lead stays. 12 and 14: the number and the marker blanks go first, so
+  // 5 cells of name or state stay. 8: then the glyph. The selected row keeps its `›` after the glyph.
+  assert.deepEqual([hcRow(44), hcRow(12), hcRow(8), tmuxRow(44), tmuxRow(14), tmuxRow(14, 'w1'), tmuxRow(8)], [
+    '1: ●   hc · …  working · claude-code · turn…',
+    '● hc · work…',
+    'hc · wo…',
+    '1: ●   tmux · w1  running  1:00  r',
+    '● tmux · w1  r',
+    '›tmux · w1  ru',
+    'tmux · w',
+  ])
+})
+
 test('hc rows: header counts live and ended; the footer carries no hc line; the band label shares the mark text', () => {
   const live = hcAg('a1', { name: 'one', turn: 1 })
   const ended = hcAg('a2', { name: 'two', status: '', state: 'finished', exitCode: 0, reason: 'exited' })

@@ -2013,9 +2013,11 @@ export const register: Register = on => {
     const space = rows.find(row => row.key === 'tmux-agent.space')?.value
     const first = hcFirst((await $.env.get('TMUX_AGENT_FIRST'))?.trim() || (typeof option === 'string' ? option : undefined))
     let fellBack = ''
-    // A plugin's call (byo-provider's cli=tmux/<profile>) reads the tmux receipt and polls await, which knows only tmux workers.
-    const byModel = next.origin.plugin === 'engine'
-    if (byModel && (first || (await agentTmuxBin(host)).missing)) {
+    // tmux only, where the caller needs result.json: a plugin's call (byo-provider's cli=tmux/<profile>) reads the
+    // tmux receipt and polls await, and a brief that kept its `runtime: tmux/<profile>` line (the spawn hook's retry
+    // path when no waiter is registered) asks for the collector. Neither exists for an hc worker.
+    const hcAllowed = next.origin.plugin === 'engine' && !RUNTIME_LINE.test(input.brief ?? '')
+    if (hcAllowed && (first || (await agentTmuxBin(host)).missing)) {
       // An option never set reads as '' (seen live), so empty means the default name; `off` asks for no tab.
       const named = typeof space === 'string' ? space.trim() : ''
       const hc = await assignHc(host, input, named === 'off' ? '' : named || undefined)
@@ -2208,7 +2210,7 @@ export const register: Register = on => {
     const profile = m[1] ?? ''
     if (!waiterReady) {
       return {
-        deny: `tmux-agent: this brief names runtime tmux/${profile}; call ${TOOL} with profile "${profile}" instead of the Agent tool.`,
+        deny: `tmux-agent: this brief names runtime tmux/${profile}; call ${TOOL} with profile "${profile}" instead of the Agent tool, and keep the runtime line in the brief: it keeps the worker on tmux, and the collector delivers its result.json.`,
       }
     }
     if (e.name) {

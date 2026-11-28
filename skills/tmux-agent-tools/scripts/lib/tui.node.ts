@@ -1579,11 +1579,29 @@ export function tuiLayout(state: TuiState, width: number, height: number, now: n
   return { frame, sections, ...(open ? { detail: wrapCells(state.detail!.lines.join('\n'), wrapW) } : {}) }
 }
 
-function rowLine(state: TuiState, index: number, selected: number): string {
+/** Cells a narrow row keeps after its backend label for the name or state. */
+const NARROW_BODY = 5
+
+/**
+ * The leading fields of a list row. A narrow row gives them up before the backend label and the
+ * name: first the row number, then the marker's blanks (`›` stays on the selected row), then the glyph.
+ */
+function rowLead(width: number, index: number, glyph: string, selected: boolean, backend: string): { prefix: string; glyph: string; marker: string } {
+  const lead = { prefix: index < 9 ? `${index + 1}: ` : '   ', glyph, marker: `${selected ? '›' : ' '} ` }
+  const fits = () => width - cellWidth(lead.prefix + lead.glyph + lead.marker + backend) >= NARROW_BODY
+  if (!fits()) lead.prefix = ''
+  if (!fits()) lead.marker = selected ? '›' : ''
+  if (!fits()) lead.glyph = ''
+  return lead
+}
+
+function rowLine(state: TuiState, index: number, selected: number, width: number): string {
   const r = state.rows[index]!
-  const digitPrefix = index < 9 ? `${index + 1}: ` : '   '
   const color = r.project ? ANSI_COLOR_MAP['blue'] : (ANSI_COLOR_MAP[STATE_COLOR[r.state]] ?? '')
-  return `${digitPrefix}${color}${ANSI_BOLD}${rowGlyph(r)}${ANSI_RESET}${sanitizeAnsi(rowLabel(r, index === selected))}`
+  // rowLabel starts with the 2-cell marker, then `tmux · `.
+  const label = sanitizeAnsi(rowLabel(r, index === selected))
+  const lead = rowLead(width, index, rowGlyph(r), index === selected, 'tmux · ')
+  return `${lead.prefix}${lead.glyph ? `${color}${ANSI_BOLD}${lead.glyph}${ANSI_RESET}` : ''}${lead.marker}${label.slice(2)}`
 }
 
 /** `text` cut to `max` cells by the same rule as `cellWidth` (`TMUX_AGENT_AMBIGUOUS_WIDTH`), `…` marking the cut; no `…` when it does not fit. */
@@ -1604,12 +1622,12 @@ function fitByCells(text: string, max: number): string {
   return max >= dots ? `${cut(text, max - dots)}…` : cut(text, max)
 }
 
-/** One hc row, the tmux row's grammar: `N: ` glyph `› hc · name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age. */
+/** One hc row, the tmux row's grammar: `N: ` glyph `› hc · name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age; a very narrow row also gives up its lead (rowLead). */
 function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, width: number, now: number): string {
   const info = state.hcInfo?.[a.address]
   const look = hcLook(a)
   const color = ANSI_COLOR_MAP[STATE_COLOR[look.state]] ?? ''
-  const prefix = index < 9 ? `${index + 1}: ` : '   '
+  const { prefix, glyph, marker: sel } = rowLead(width, index, look.glyph, selected, 'hc · ')
   const plain = (t: string) => stripAnsi(sanitizeAnsi(t))
   const machine = hcMachine(a)
   const short = machine ? a.address.slice(machine.length + 1) : a.address
@@ -1617,7 +1635,7 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
   // The address only on a wide row and when the name is not already the address.
   const addr = a.name && width >= 120 ? plain(short) : ''
   // The group title above names the machine, so the row shows the address without it.
-  const marker = `${selected ? '›' : ' '} hc · `
+  const marker = `${sel}hc · `
   const lead = (n: string, withAddr: boolean) => `${marker}${n}${withAddr ? ` ${ANSI_DIM}${addr}${ANSI_RESET}` : ''}`
   const parent = a.parent ? `  @${plain(a.parent.split('/').pop()!)}` : ''
   const mark = `  ${plain(hcMark(a, info?.program))}`
@@ -1625,7 +1643,7 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
   const end = hcFinished(a) ? info?.finishedMs : now
   const age = info?.createdMs !== undefined && end !== undefined ? `  ${hcFinished(a) ? 'ran ' : ''}${elapsed(end - info.createdMs)}` : ''
   const repo = `  ${plain(rowRepo(a.cwd))}`
-  const room = Math.max(0, width - cellWidth(prefix) - cellWidth(look.glyph))
+  const room = Math.max(0, width - cellWidth(prefix) - cellWidth(glyph))
   // Room goes to the mark first. Out of room: the address, the repo, @parent, the age; then the name takes the cut (`…`), never the mark.
   const tails = [parent + mark + age + repo, parent + mark + age, mark + age, mark]
   const fits = [...(addr ? [lead(name, true) + tails[0]!] : []), ...tails.map(t => lead(name, false) + t)].find(l => cellWidth(l) <= room)
@@ -1637,7 +1655,7 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
     return markRoom >= cellWidth(`  ${mark.trim().split(' · ')[0]}`) ? `${marker}${nameCut}${fitByCells(mark, markRoom)}` : `${marker}${fitByCells(mark.trimStart(), Math.max(0, room - cellWidth(marker)))}`
   }
   const label = fits ?? (nameRoom >= 1 ? `${marker}${fitByCells(name, nameRoom)}${mark}` : cutMark())
-  return `${prefix}${color}${ANSI_BOLD}${look.glyph}${ANSI_RESET}${label}`
+  return `${prefix}${glyph ? `${color}${ANSI_BOLD}${glyph}${ANSI_RESET}` : ''}${label}`
 }
 
 /** Detail slice or mirror slice for one preview. The standard painter keeps its own tail line. */
@@ -1678,7 +1696,7 @@ function linesFromLayout(state: TuiState, width: number, height: number, lay: Tu
   const drawn = items.slice(frame.list.first, frame.list.first + Math.max(0, items.length - frame.hidden))
   for (const it of drawn) {
     if ('title' in it) lines.push(fit(`   \x1b[2m── ${sanitizeAnsi(it.title)} ${'─'.repeat(Math.max(2, 40 - cellWidth(it.title)))}\x1b[0m`))
-    else if ('row' in it) lines.push(fit(rowLine(state, it.row, s.sel)))
+    else if ('row' in it) lines.push(fit(rowLine(state, it.row, s.sel, width)))
     else lines.push(fit(hcLine(state, hcs[it.hc]!, state.rows.length + it.hc, state.rows.length + it.hc === s.selIndex, width, now)))
   }
   // `+N more` counts rows, not the titles cut with them.

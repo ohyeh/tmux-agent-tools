@@ -300,10 +300,12 @@ yourself.
 - In Claude Code with the mod, `mcp__tmux-agent__assign` tries hc first by default.
   It falls back to tmux when hc cannot take the brief before launch.
   hc needs an hc parent, a live core, and a `claude`, `codex`, `grok`, or `agy` program on PATH.
-  The launch flags must leave the task flag free. `TMUX_AGENT_FIRST` overrides `/config`.
+  The launch flags must leave the task flag free. A non-empty `TMUX_AGENT_FIRST` overrides
+  `/config`; a blank one counts as unset.
   With `first=tmux`, assign tries tmux first and can use hc if it cannot find `agent-tmux`.
   The `runtime: tmux/<profile>` Agent hook always uses tmux for the result waiter, and so
-  does an assign that another plugin calls (byo-provider `cli=tmux/<profile>`).
+  does an assign that another plugin calls (byo-provider `cli=tmux/<profile>`) or whose brief
+  keeps a `runtime: tmux/<profile>` line.
   Do not put a backend in the brief: call `assign` and follow the receipt (COLLECTOR step 2).
   The option `space` names the Herdr space if `herdr-app` is on PATH and its window responds.
   Unset or blank means `workers`. Set it to `off` for no Herdr tab.

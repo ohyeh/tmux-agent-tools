@@ -6349,6 +6349,35 @@ describe('native mirror', () => {
     expect(logs.filter(l => l.includes('tmux-waiter register failed'))).toHaveLength(1)
   })
 
+  test('no waiter, hc usable, default first: the deny says keep the runtime line, and assign with it starts tmux, never hc run', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME, PATH: '/b', HC_TERMINAL_ID: 't3' })
+    mock.store(on)
+    mockClock(on)
+    mockFs(on, { '/b/agent-tmux': '', '/b/hc': '', '/b/codex': '', [`${HOME}/.local/state/herdr-core/default/default.sock`]: '' })
+    on('tool.register', ($, e) => ({ value: { tool: e.name } }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('agent.register', () => {
+      throw new Error('schema refused')
+    })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('ui.log', () => ({ value: undefined }))
+    const argvs: string[][] = []
+    onRun(on, ($, e) => {
+      argvs.push([...e.argv])
+      return { value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${'a'.repeat(40)}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    const hcRuns = () => argvs.filter(a => a[0] === '/b/hc' && a[1] === 'run').length
+    await $.session.start(session())
+    const prompt = BRIEF.replace('tmux/cursor', 'tmux/codex')
+    expect(JSON.stringify(await $.agent.spawn(spawnOf({ prompt })))).toContain('keep the runtime line in the brief')
+    const out = JSON.stringify(await $.tool.call({ tool: 'mcp__tmux-agent__assign', profile: 'codex', name: 'w1', dir: '/work', brief: prompt }))
+    expect(out).toContain('launch requested for')
+    expect(hcRuns(), 'a brief with its runtime line never starts hc').toBe(0)
+    // Positive control: the same brief without the runtime line starts hc on this host.
+    await $.tool.call({ tool: 'mcp__tmux-agent__assign', profile: 'codex', name: 'w2', dir: '/work', brief: prompt.replace(/^runtime:.*\n/m, '') })
+    expect(hcRuns()).toBe(1)
+  })
+
   test('a runtime spawn that sets name is denied and dispatches nothing', WITH_DRIVER, async ($, on) => {
     mock.env(on, { HOME })
     mock.store(on)
@@ -7222,6 +7251,16 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     const out = JSON.stringify(await $.tool.call(assign()))
     expect(out).toContain('launch requested')
     expect(out).not.toContain('fell back')
+  })
+
+  test('a blank TMUX_AGENT_FIRST counts as unset: the plugin option first=tmux still decides, with hc usable', WITH_DRIVER, async ($, on) => {
+    on('config.list', () => ({ value: [{ ...FIRST_HC, value: 'tmux' }] }))
+    const sock = `${HOME}/.local/state/herdr-core/default/default.sock`
+    const t = setup(on, undefined, { HOME, PATH: '/b', HC_TERMINAL_ID: 't3', TMUX_AGENT_FIRST: '  ' }, { '/b/agent-tmux': '', '/b/hc': '', '/b/codex': '', [sock]: '' })
+    const out = JSON.stringify(await $.tool.call(assign()))
+    expect(out).toContain('launch requested')
+    expect(out).not.toContain('fell back')
+    expect(t.argvs.some(a => a[0] === '/b/hc' && a[1] === 'run'), 'no hc run').toBe(false)
   })
 
   test('TMUX_AGENT_FIRST=hc with hc usable: hc run gets the absolute program, and a failed hc run never falls back to tmux', WITH_DRIVER, async ($, on) => {
