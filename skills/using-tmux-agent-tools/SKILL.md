@@ -70,9 +70,10 @@ and uses "commander is not Claude Code" below.
 1. Dispatch with the tool, not the shell. For ordinary local work, call
    `mcp__tmux-agent__assign` with `profile`, `name`, `dir`, and a `brief`
    that has GOAL / MODEL / ACCEPTANCE / REPORT. It tries hc first and falls
-   back to tmux before launch. Do not put a backend in the brief.
-   For work that needs `result.json`, use the Agent tool with a
-   `runtime: tmux/<profile>` line in the brief and no `name`: it always starts tmux.
+   back to tmux before launch. Do not put a backend in the brief, except
+   for work that needs `result.json`, `await`, or `tell`: then keep a
+   `runtime: tmux/<profile>` line in the assign brief, and assign always starts tmux.
+   The Agent tool with that line and no `name` also starts tmux, through the result waiter.
    For a remote start, use `agent-tmux <cli> start-ssh`. For fanout, dialogue,
    dag, monitor, or commander, use the matching script in SELECT or the commander section.
 2. Read the receipt. One of these phrases in it is the branch condition, not

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.57.2 - 2026-11-28
+
+- Skills: `using-tmux-agent-tools` COLLECTOR step 1 now carries the same exception as SELECT: work that needs `result.json`, `await`, or `tell` keeps a `runtime: tmux/<profile>` line in the assign brief, and assign then always starts tmux. Before, step 1 said "Do not put a backend in the brief" and sent that work only to the Agent tool, against SELECT. The Agent tool with that line and no `name` still starts tmux through the result waiter. L2 post-hoc review A-06, round 2.
+- Not verified: a live consensus-gate run that keeps the runtime line and awaits a tmux worker with the mod on.
+
 ## v0.57.1 - 2026-11-28
 
 - Skills: `using-tmux-agent-tools` names the one case that keeps a backend in the brief: a `runtime: tmux/<profile>` line when the caller needs result.json, `await` or `tell` (a recipe that waits on the worker). L2 post-hoc review A-06.
