@@ -2,10 +2,13 @@
 
 ## Unreleased
 
+## v0.57.0 - 2026-11-28
+
 - Skills: `using-tmux-agent-tools` routes in this order: a built-in dispatch tool that this runtime loaded (the mod's `assign`, which picks hc or tmux itself), else an hc terminal started by hand when hc is usable, else tmux. Work that needs the `result.json` collector, a remote start, or fanout, dialogue, dag, monitor or commander stays on tmux until hc has them. A `runtime: tmux/<profile>` Agent call is the way to get `result.json` from Claude Code.
 - Mod: the plugin option `first` now defaults to `hc`: `mcp__tmux-agent__assign` tries herdr-core first and falls back to tmux before launch (no hc terminal, core down, program without a proven task flag). An unset or blank option means `hc`; set `first=tmux` to try tmux first. A non-empty `TMUX_AGENT_FIRST` overrides the option; a blank one counts as unset, so the option decides.
 - Fix (mod): an `assign` called by another plugin through `$.tool.call` always starts a tmux worker. byo-provider's `cli=tmux/<profile>` route reads the tmux receipt and polls `mcp__tmux-agent__await` for `result.json`; under `first=hc` it got an hc receipt, failed with `assign gave no worker name`, and left the hc worker running. An `assign` whose brief keeps a `runtime: tmux/<profile>` line also starts tmux, and the spawn hook's deny when no waiter is registered now says to keep that line, so the retry keeps `result.json` and the collector instead of starting an hc worker. A `runtime: tmux/<profile>` Agent call already stayed on tmux (it calls the tmux path directly); a test now pins both.
 - Mod band and `workers-tui`: every row names its backend after the selection marker, `tmux · ` on worker and project rows and `hc · ` on hc rows (the band's hc rows already had it), so tmux and hc workers can be told apart at a glance. The header counts are unchanged. A `workers-tui` row too narrow for the label and 5 cells of name or state gives up its number, then its marker blanks, then its glyph; last, the selected row's `›` gives way to reverse video, which takes no cell.
+- Not verified: a real `assign` through the reloaded mod opening an hc worker; byo-provider routing through a live tmux profile; reverse video on a narrow selected row in a real terminal.
 
 ## v0.56.3 - 2026-11-27
 
