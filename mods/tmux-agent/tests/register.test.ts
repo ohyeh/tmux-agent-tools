@@ -3121,8 +3121,11 @@ describe('honest states', () => {
     const targets = captures(panel.argv).map(a => a[a.length - 1])
     expect(targets, 'the mirror follows the selection, never both at once').toEqual(['w1', 'w2'])
     const drawn = textOf(await $.ui.render(bandRender()))
-    expect(drawn).toContain('› w2')
-    expect(drawn, 'the old selection is not still marked').not.toContain('› w1')
+    // Every tmux row names its backend after the selection marker; the header counts are unchanged.
+    expect(drawn).toContain('› tmux · w2  running')
+    expect(drawn).toContain('  tmux · w1  running')
+    expect(drawn, 'the old selection is not still marked').not.toContain('› tmux · w1')
+    expect(drawn).toContain('· tmux 2 · 內部 0')
   })
 
   test('a worker whose launch never took reads as launch failed, not running', WITH_DRIVER, async ($, on) => {
@@ -3451,6 +3454,10 @@ describe('teammates', () => {
       const tree = await $.ui.render(bandRender(40, 39, 120))
       const drawn = textOf(tree)
       expect(drawn).toContain('› hc · t20 mine · idle · agy')
+      // One band, both backends: each row starts with its backend; the header counts are unchanged.
+      expect(drawn).toContain('  tmux · w1  running')
+      expect(drawn).toContain('  hc · t21 other')
+      expect(drawn).toContain('· tmux 1 · 內部 0 · hc 2')
       expect(drawn).toContain('hc-band-line-1')
       expect(drawn).toContain('hc-band-line-2')
       expect(drawn).toContain('See it whole: hc attach t20')

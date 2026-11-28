@@ -3300,16 +3300,17 @@ export function rowGlyph(r: PanelRow): string {
   return r.state === 'needs-input' ? '? ' : r.state === 'delivered' ? '✓ ' : '● '
 }
 
-/** Formatted text for a row (excluding glyph), shared by mod band and TUI */
+/** Formatted text for a row (excluding glyph), shared by mod band and TUI. `tmux · ` names the backend, as `hc · ` does on hc rows. */
 export function rowLabel(r: PanelRow, selected: boolean): string {
+  const lead = `${selected ? '›' : ' '} tmux · `
   if (r.project) {
     const mark = r.shell ? `shell · ${r.shell}` : '專案'
-    return `${selected ? '›' : ' '} ${r.d.name}  ${mark}  ${elapsed(r.ageMs)}`
+    return `${lead}${r.d.name}  ${mark}  ${elapsed(r.ageMs)}`
   }
   const mark = rowMark(r)
   const tag = r.holder ? `  @${r.holder}` : ''
   const repo = rowRepo(r.d.dir)
-  return `${selected ? '›' : ' '} ${r.d.name}${tag}  ${mark}  ${elapsed(r.ageMs)}  ${repo}`
+  return `${lead}${r.d.name}${tag}  ${mark}  ${elapsed(r.ageMs)}  ${repo}`
 }
 
 export function clearButtonLabel(armed: boolean): string {

@@ -168,7 +168,7 @@ echo "case: resize re-lays out"
 w=80 h=24
 T resize-window -t "$P" -x "$w" -y "$h"
 keys "$P" j
-check "${w}x${h}: a selected row is drawn" wait_for "$P" '› w[ab]\.' 25
+check "${w}x${h}: a selected row is drawn" wait_for "$P" '› tmux · w[ab]\.' 25
 # SIGWINCH reaches the TUI asynchronously: poll for the re-laid-out frame.
 fits=no
 for _ in {1..100}; do left; (( $(widest "$P" 9999) <= w )) && { fits=yes; break; }; /bin/sleep 0.05; done
@@ -184,7 +184,7 @@ keys "$P" r
 check "r clears the selection" sh -c "for i in \$(seq 1 100); do tmux capture-pane -p -t '$P' | grep -q '›' || exit 0; sleep 0.05; done; exit 1"
 # Select A by its row digit: j presses can outrun a slow redraw and stop on B.
 keys "$P" "$(screen "$P" | sed -nE "s/^([1-9]): .*${A}.*/\\1/p" | head -1)"
-check "A is selected" wait_for "$P" "› $A" 25
+check "A is selected" wait_for "$P" "› tmux · $A" 25
 keys "$P" x
 check "x arms the stop" wait_for "$P" "stop $A\\? press again" 25
 /bin/sleep 0.5 # the confirm debounce (STOP_REPEAT_MS = 400) is a rule, not a race
@@ -260,7 +260,7 @@ check "picker lists the live session" wait_for "$PK" '\[live\]' 25
 keys "$PK" 1
 check "pick entered 編輯" wait_for "$PK" '\[ n resume \]' 25
 keys "$PK" "$(screen "$PK" | sed -nE "s/^([1-9]): .*${B}.*/\\1/p" | head -1)"
-check "B is selected" wait_for "$PK" "› $B" 25
+check "B is selected" wait_for "$PK" "› tmux · $B" 25
 keys "$PK" x
 check "x arms the stop on B" wait_for "$PK" "stop $B\\? press again" 25
 /bin/sleep 0.5

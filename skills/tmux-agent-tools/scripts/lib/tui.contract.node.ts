@@ -2635,12 +2635,12 @@ test('narrow: a gone selected row returns the list', async () => {
   try {
     await until(() => last().includes('drop.abcde') && last().includes('keep.abcde'), 5_000, 'both rows')
     const arm = async () => {
-      if (/› drop\.abcde/.test(last())) return
+      if (/› tmux · drop\.abcde/.test(last())) return
       stdin.emit('data', 'j')
       await new Promise(r => setTimeout(r, 80))
     }
-    for (let i = 0; i < 8 && !/› drop\.abcde/.test(last()); i++) await arm()
-    await until(() => /› drop\.abcde/.test(last()), 5_000, 'drop selected')
+    for (let i = 0; i < 8 && !/› tmux · drop\.abcde/.test(last()); i++) await arm()
+    await until(() => /› tmux · drop\.abcde/.test(last()), 5_000, 'drop selected')
     stdin.emit('data', '\r')
     await until(() => /capturing the pane|the pane is empty|See it whole/.test(last()), 5_000, 'the preview')
     rmSync(join(root, '.v3', 'drop.abcde'), { recursive: true, force: true })
@@ -3263,7 +3263,7 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
     check(sel, cols, rows, what)
     const plain = stripAnsi(sel)
     if (rows > 2) {
-      assert.match(plain, /3: \S*\s*› c\.abcde/, `${what}: the last row is selected\n${plain}`)
+      assert.match(plain, /3: \S*\s*› tmux · c\.abcde/, `${what}: the last row is selected\n${plain}`)
       assert.match(plain, /完成第3項/, `${what}: its CJK summary is shown`)
     } else {
       assert.match(plain, /3 worker\(s\) · 收件：無收件者 · window too small \(2 rows\)/, plain)
@@ -3272,7 +3272,7 @@ print('OUT=' + base64.b64encode(bytes(out)).decode())
       const after = frames(bytes.subarray(mark))
       assert.ok(after.length > 0, `${what}: no frame after the resize`)
       check(after.at(-1)!, cols2, rows2, `${what} after resize`)
-      assert.match(stripAnsi(after.at(-1)!), /› [abc]\.abcde/, `${what}: still a selected row`)
+      assert.match(stripAnsi(after.at(-1)!), /› tmux · [abc]\.abcde/, `${what}: still a selected row`)
     }
   }
 })
@@ -3665,7 +3665,7 @@ test('R8.5: a stale delivery reservation shows "unknown: 可能已送達" and - 
     assert.match(shown(), /codex-12345678\.[0-9a-z]{5}\s+exited — no result/, 'the resumed worker with a dead pane')
     const rows = shown().split('\n').map(l => l.trim())
     // Select the assigned worker's row (the list order is not the point of this test).
-    for (let i = 0; i < 4 && !shown().includes(`› ${r.name}`); i++) {
+    for (let i = 0; i < 4 && !shown().includes(`› tmux · ${r.name}`); i++) {
       stdin.emit('data', 'j')
       await pause(150)
     }
@@ -3860,10 +3860,12 @@ test('hc agents: rows after the tmux rows with @parent when there is one; counte
   const state: TuiState = { ...ownerState(), selected: undefined, herdr: agents }
   const drawn = renderTuiLines(state, 160, 24, 1).map(stripAnsi)
   assert.match(drawn[0]!, /tmux 1 · hc 2/)
-  assert.ok(drawn.includes('2: ●   agy-crash t1  @t11  idle · agy  a'), drawn.join('\n'))
+  // One list, both backends: every row starts with its backend after the selection marker.
+  assert.ok(drawn.some(l => /^1: \S+ +tmux · w1  running/.test(l)), drawn.join('\n'))
+  assert.ok(drawn.includes('2: ●   hc · agy-crash t1  @t11  idle · agy  a'), drawn.join('\n'))
   assert.ok(drawn.some(l => l.startsWith('   ── codex-mbpr ─')), drawn.join('\n'))
-  assert.ok(drawn.includes('3: ●   t10  working · codex  b'), drawn.join('\n'))
-  assert.ok(!drawn.join('\n').includes('read-only · @') && !drawn.join('\n').includes('未記錄'), 'no per-row hc · / read-only / 未記錄 text')
+  assert.ok(drawn.includes('3: ●   hc · t10  working · codex  b'), drawn.join('\n'))
+  assert.ok(!drawn.join('\n').includes('read-only · @') && !drawn.join('\n').includes('未記錄'), 'no per-row read-only / 未記錄 text')
   // j/k move from worker rows onto drawn hc rows and back.
   const j1 = nextKeyState(state, 'j', 1).state
   assert.equal(j1.selected, 'w1')
@@ -3913,7 +3915,7 @@ test('hc agents: rows after the tmux rows with @parent when there is one; counte
   assert.equal(nextKeyState(nextKeyState(state, '2', 1).state, '2', 1).state.selected, undefined)
   const nine = { ...noWorkers, herdr: Array.from({ length: 12 }, (_, i) => ({ ...agents[1]!, address: `n${i}` })) }
   assert.equal(nextKeyState(nine, '9', 1).state.selected, hcId('n8'))
-  assert.ok(renderTuiLines(nine, 160, 30, 1).map(stripAnsi).some(l => l.startsWith('   ●   n9 ')), 'rows after the 9th have no digit')
+  assert.ok(renderTuiLines(nine, 160, 30, 1).map(stripAnsi).some(l => l.startsWith('   ●   hc · n9 ')), 'rows after the 9th have no digit')
 })
 
 test('hc key-state: worker-only keys do nothing; d/c work on finished hc; ticks preserve or drop hc selection; Enter walks list -> preview -> Detail -> attach', () => {
@@ -4122,7 +4124,7 @@ test('hc preview, Detail and attach: reads only selected row, restores tty befor
 
     // First j selects w1.abcde; second j selects hc:t1.
     stdin.emit('data', 'j')
-    await until(() => stdout.written.includes('› w1.abcde'), 5_000, 'worker selected')
+    await until(() => stdout.written.includes('› tmux · w1.abcde'), 5_000, 'worker selected')
     stdin.emit('data', 'j')
     await until(() => stdout.written.includes('hc-screen-beta'), 5_000, 'hc preview rendered')
     const reads = hcCalls.filter(a => a[1] === 'read')
@@ -4383,7 +4385,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     // (The t/i prompt has its own e2e test; the hint line is longer now and this frame is kept small.)
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› live-one t1') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
+    await until(() => plain().includes('› hc · live-one t1') && stdout.written.includes('[ x stop ]'), 5_000, 't1 selected in edit mode')
     stdin.emit('data', 'x')
     await until(() => stdout.written.includes('stop live-one? press again'), 5_000, 't1 armed')
     assert.deepEqual(hcCalls.filter(a => a[1] === 'kill' || a[1] === 'rm'), [])
@@ -4396,7 +4398,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
     // Leave edit mode (preview), select finished t2 (newest finished first: t2 is drawn above t1), arm + confirm d d -> hc rm t2.
     stdin.emit('data', 'e')
     stdin.emit('data', 'k')
-    await until(() => plain().includes('› done-one t2') && stdout.written.includes('[ d delete ]'), 5_000, 't2 selected in preview')
+    await until(() => plain().includes('› hc · done-one t2') && stdout.written.includes('[ d delete ]'), 5_000, 't2 selected in preview')
     stdin.emit('data', 'd')
     await until(() => stdout.written.includes('delete done-one? press again'), 5_000, 't2 d armed')
     await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 30))
@@ -4420,7 +4422,7 @@ test('hc close, delete and clear: x x kills live -> finished, d/c remove own fin
 
     // When socket probe fails before confirming x x on t3, no hc command is run.
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› live-two t3'), 5_000, 't3 selected')
+    await until(() => plain().includes('› hc · live-two t3'), 5_000, 't3 selected')
     stdin.emit('data', 'x')
     await until(() => stdout.written.includes('stop live-two? press again'), 5_000, 't3 armed')
     const countBeforeDrop = hcCalls.length
@@ -4481,10 +4483,10 @@ test('hc own terminal: excludes $HC_TERMINAL_ID from tui rows so it cannot be se
     assert.ok(!screen.includes('self-term'), 'own hc terminal name is excluded')
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› child-term t1'), 5_000, 'only child t1 is selectable')
+    await until(() => plain().includes('› hc · child-term t1'), 5_000, 'only child t1 is selectable')
     stdin.emit('data', 'j')
     await new Promise(r => setTimeout(r, 30))
-    assert.ok(!stripAnsi(stdout.written).includes('› t11'), 'second j never selects own terminal')
+    assert.ok(!stripAnsi(stdout.written).includes('› hc · t11'), 'second j never selects own terminal')
     assert.equal(hcCalls.filter(a => a[1] === 'kill' || a[1] === 'rm').length, 0)
   } finally {
     stdin.emit('data', '\x03')
@@ -4540,20 +4542,20 @@ test('hc row grammar: one case per mapping row, whole-string compare, no null/un
   const par = { parent: '25006931paul/t1m' }
   // [agent, info, glyph colour (SGR), glyph, label]. Width 200: the address shows after the name; the age is `elapsed()` like a tmux row.
   const cases: [HcAgent, HcInfo | undefined, string, string, string][] = [
-    [hcAg('a1', { name: 'nm', agent: 'claude-code', status: 'working', turn: 3, ...par }), { createdMs: made }, '32', '● ', `  nm ${D('a1')}  @t1m  working · claude-code · turn 3  2:05  proj`],
-    [hcAg('a2', { name: 'nm', agent: 'codex', status: 'blocked', turn: 5 }), { createdMs: made }, '35', '? ', `  nm ${D('a2')}  blocked · codex  2:05  proj`],
-    [hcAg('a3', { name: 'nm', status: 'idle', turn: 2 }), { createdMs: made }, '33', '● ', `  nm ${D('a3')}  idle · agy · turn 2  2:05  proj`],
-    [hcAg('a4', { name: 'nm', agent: 'claude-code', status: 'done', turn: 9 }), { createdMs: made }, '36', '✓ ', `  nm ${D('a4')}  done · claude-code · turn 9  2:05  proj`],
-    [hcAg('a5', { name: 'nm', agent: 'env', status: '' }), { createdMs: made, program: 'claude' }, '33', '● ', `  nm ${D('a5')}  starting · claude  2:05  proj`],
-    [hcAg('a6', { name: 'nm', status: 'paused' }), { createdMs: made }, '33', '● ', `  nm ${D('a6')}  paused · agy  2:05  proj`],
-    [hcAg('a7', { name: 'nm', agent: 'env', status: 'working', turn: 1 }), { createdMs: made, program: 'codex' }, '32', '● ', `  nm ${D('a7')}  working · codex · turn 1  2:05  proj`],
-    [hcAg('a8', { name: 'nm', agent: 'env', status: '', state: 'finished', exitCode: 0, reason: 'exited', turn: 4 }), { createdMs: made, finishedMs: made + 61_000 }, '36', '✓ ', `  nm ${D('a8')}  exited 0 · turn 4  ran 1:01  proj`],
-    [hcAg('a9', { name: 'nm', status: '', state: 'finished', exitCode: 0, reason: 'killed', signal: 9 }), { createdMs: made, finishedMs: made + 5_000 }, '31', '● ', `  nm ${D('a9')}  killed · signal 9  ran 0:05  proj`],
-    [hcAg('a10', { name: 'nm', status: '', state: 'finished', exitCode: 3 }), { createdMs: made, finishedMs: made + 5_000 }, '31', '● ', `  nm ${D('a10')}  exited 3  ran 0:05  proj`],
-    [hcAg('a11', { name: 'nm', status: '', state: 'finished', reason: 'lost' }), undefined, '36', '✓ ', `  nm ${D('a11')}  ended  proj`],
-    [hcAg('a12', { name: 'nm', status: 'working' }), {}, '32', '● ', `  nm ${D('a12')}  working · agy  proj`],
-    [hcAg('a13', { status: 'working' }), undefined, '32', '● ', '  a13  working · agy  proj'],
-    [hcAg('a14', { name: 'nm', status: '', state: 'finished', exitCode: 2 }), { createdMs: made }, '31', '● ', `  nm ${D('a14')}  exited 2  proj`],
+    [hcAg('a1', { name: 'nm', agent: 'claude-code', status: 'working', turn: 3, ...par }), { createdMs: made }, '32', '● ', `  hc · nm ${D('a1')}  @t1m  working · claude-code · turn 3  2:05  proj`],
+    [hcAg('a2', { name: 'nm', agent: 'codex', status: 'blocked', turn: 5 }), { createdMs: made }, '35', '? ', `  hc · nm ${D('a2')}  blocked · codex  2:05  proj`],
+    [hcAg('a3', { name: 'nm', status: 'idle', turn: 2 }), { createdMs: made }, '33', '● ', `  hc · nm ${D('a3')}  idle · agy · turn 2  2:05  proj`],
+    [hcAg('a4', { name: 'nm', agent: 'claude-code', status: 'done', turn: 9 }), { createdMs: made }, '36', '✓ ', `  hc · nm ${D('a4')}  done · claude-code · turn 9  2:05  proj`],
+    [hcAg('a5', { name: 'nm', agent: 'env', status: '' }), { createdMs: made, program: 'claude' }, '33', '● ', `  hc · nm ${D('a5')}  starting · claude  2:05  proj`],
+    [hcAg('a6', { name: 'nm', status: 'paused' }), { createdMs: made }, '33', '● ', `  hc · nm ${D('a6')}  paused · agy  2:05  proj`],
+    [hcAg('a7', { name: 'nm', agent: 'env', status: 'working', turn: 1 }), { createdMs: made, program: 'codex' }, '32', '● ', `  hc · nm ${D('a7')}  working · codex · turn 1  2:05  proj`],
+    [hcAg('a8', { name: 'nm', agent: 'env', status: '', state: 'finished', exitCode: 0, reason: 'exited', turn: 4 }), { createdMs: made, finishedMs: made + 61_000 }, '36', '✓ ', `  hc · nm ${D('a8')}  exited 0 · turn 4  ran 1:01  proj`],
+    [hcAg('a9', { name: 'nm', status: '', state: 'finished', exitCode: 0, reason: 'killed', signal: 9 }), { createdMs: made, finishedMs: made + 5_000 }, '31', '● ', `  hc · nm ${D('a9')}  killed · signal 9  ran 0:05  proj`],
+    [hcAg('a10', { name: 'nm', status: '', state: 'finished', exitCode: 3 }), { createdMs: made, finishedMs: made + 5_000 }, '31', '● ', `  hc · nm ${D('a10')}  exited 3  ran 0:05  proj`],
+    [hcAg('a11', { name: 'nm', status: '', state: 'finished', reason: 'lost' }), undefined, '36', '✓ ', `  hc · nm ${D('a11')}  ended  proj`],
+    [hcAg('a12', { name: 'nm', status: 'working' }), {}, '32', '● ', `  hc · nm ${D('a12')}  working · agy  proj`],
+    [hcAg('a13', { status: 'working' }), undefined, '32', '● ', '  hc · a13  working · agy  proj'],
+    [hcAg('a14', { name: 'nm', status: '', state: 'finished', exitCode: 2 }), { createdMs: made }, '31', '● ', `  hc · nm ${D('a14')}  exited 2  proj`],
   ]
   const state = hcState(cases.map(c => c[0]), Object.fromEntries(cases.filter(c => c[1]).map(c => [c[0].address, c[1]!])))
   const lines = renderTuiLines(state, 200, 40, now)
@@ -4572,17 +4574,18 @@ test('hc row grammar: selected row marker, narrow truncation order (repo, @paren
     const lines = renderTuiLines(hcState([a], { a1: { createdMs: now - 125_000 } }, selected ? { selected: hcId('a1') } : {}), width, 30, now).map(stripAnsi)
     return lines.find(l => l.startsWith('1: '))!
   }
-  const full = '1: ●   nm  @p  working · claude-code · turn 3  2:05  proj'
-  assert.equal(row(57), full)
-  assert.equal(row(56), '1: ●   nm  @p  working · claude-code · turn 3  2:05', 'repo goes first')
-  assert.equal(row(51), '1: ●   nm  @p  working · claude-code · turn 3  2:05')
-  assert.equal(row(50), '1: ●   nm  working · claude-code · turn 3  2:05', 'then @parent')
-  assert.equal(row(47), '1: ●   nm  working · claude-code · turn 3  2:05')
-  assert.equal(row(46), '1: ●   nm  working · claude-code · turn 3', 'then the age')
-  assert.equal(row(41), '1: ●   nm  working · claude-code · turn 3')
-  assert.equal(row(40), '1: ●   …  working · claude-code · turn 3', 'the mark keeps its room; the name takes the cut')
-  assert.equal(row(57, true), '1: ● › nm  @p  working · claude-code · turn 3  2:05  proj')
-  assert.equal(row(120), '1: ●   nm a1  @p  working · claude-code · turn 3  2:05  proj', 'the address shows from 120 columns, after the name')
+  // `hc · ` names the backend and is never cut.
+  const full = '1: ●   hc · nm  @p  working · claude-code · turn 3  2:05  proj'
+  assert.equal(row(62), full)
+  assert.equal(row(61), '1: ●   hc · nm  @p  working · claude-code · turn 3  2:05', 'repo goes first')
+  assert.equal(row(56), '1: ●   hc · nm  @p  working · claude-code · turn 3  2:05')
+  assert.equal(row(55), '1: ●   hc · nm  working · claude-code · turn 3  2:05', 'then @parent')
+  assert.equal(row(52), '1: ●   hc · nm  working · claude-code · turn 3  2:05')
+  assert.equal(row(51), '1: ●   hc · nm  working · claude-code · turn 3', 'then the age')
+  assert.equal(row(46), '1: ●   hc · nm  working · claude-code · turn 3')
+  assert.equal(row(45), '1: ●   hc · …  working · claude-code · turn 3', 'the mark keeps its room; the name takes the cut')
+  assert.equal(row(62, true), '1: ● › hc · nm  @p  working · claude-code · turn 3  2:05  proj')
+  assert.equal(row(120), '1: ●   hc · nm a1  @p  working · claude-code · turn 3  2:05  proj', 'the address shows from 120 columns, after the name')
   assert.ok(!row(119).includes('a1  @p'), 'and not before')
 })
 
@@ -4592,7 +4595,9 @@ test('hc rows: header counts live and ended; the footer carries no hc line; the 
   assert.match(renderTuiLines(hcState([live, ended]), 160, 24, 1)[0]!, /hc 1 live · 1 ended/)
   assert.match(renderTuiLines(hcState([live]), 160, 24, 1)[0]!, /hc 1 live(?! ·)/, 'nothing ended: no ` · 0 ended`')
   const drawn = renderTuiLines(hcState([live, ended]), 160, 24, 1).map(stripAnsi)
-  assert.ok(!drawn.some(l => l.includes('read-only · ') || l.includes('hc · ')), 'no per-row hc · or read-only text')
+  assert.ok(!drawn.some(l => l.includes('read-only · ')), 'no per-row read-only text')
+  // Each hc row starts with its backend after the selection marker, as the band row does.
+  assert.ok(drawn.some(l => l.startsWith('1: ●   hc · one')) && drawn.some(l => /^2: \S+ +hc · two/.test(l)), drawn.join('\n'))
   assert.equal(herdrLabel(hcAg('t20', { name: 'mine', status: 'idle', turn: 1 })), 'hc · t20 mine · idle · agy · turn 1 · proj')
   assert.equal(herdrLabel(hcAg('t21', { status: '', state: 'finished', reason: 'killed' })), 'hc · t21 · killed · proj')
 })
@@ -4612,8 +4617,8 @@ test('parseHc: a live row with no status is kept unless its agent is a shell; fi
   assert.equal(out[0]!.status, '')
   assert.deepEqual(out[2], { address: 'k1', agent: 'zsh', status: '', cwd: '?', where: '?', state: 'finished', turn: 3, exitCode: 1, reason: 'killed', signal: 9 })
   const shown = renderTuiLines(hcState(out.slice(0, 2)), 160, 24, 1).map(stripAnsi)
-  assert.ok(shown.includes('1: ●   assigned e1  @t11  starting · env  w'), shown.join('\n'))
-  assert.ok(shown.some(l => l.startsWith('2: ●   e2  starting · env')), shown.join('\n'))
+  assert.ok(shown.includes('1: ●   hc · assigned e1  @t11  starting · env  w'), shown.join('\n'))
+  assert.ok(shown.some(l => l.startsWith('2: ●   hc · e2  starting · env')), shown.join('\n'))
 })
 
 test('parseHcGet reads the status object (state, msg, kind, app) and the program, created and finished times', () => {
@@ -4659,7 +4664,7 @@ test('hc selection survives a tick by address, whatever the order', () => {
   const sel = hcState([a, b, c], undefined, { selected: hcId('b') })
   const reordered = applyHerdrTick(sel, [c, b, a])
   assert.equal(reordered.selected, hcId('b'))
-  assert.ok(renderTuiLines(reordered, 160, 24, 1).map(stripAnsi).some(l => l.startsWith('2: ●') && l.includes('● › bee')), 'the marker follows the address to its new place')
+  assert.ok(renderTuiLines(reordered, 160, 24, 1).map(stripAnsi).some(l => l.startsWith('2: ●') && l.includes('● › hc · bee')), 'the marker follows the address to its new place')
   assert.equal(applyHerdrTick(reordered, [a, b]).selected, hcId('b'), 'a row gone before it keeps it')
   assert.equal(applyHerdrTick(reordered, [a, c]).selected, undefined, 'only a gone address clears it')
   const finished = { ...b, state: 'finished' }
@@ -4954,7 +4959,7 @@ test('hc rows: one cell rule for the budget and the name cut (TMUX_AGENT_AMBIGUO
     assert.ok(long.l.includes('nm') || long.l.includes('…'), long.l)
   }
   const first = line(undefined, blocked({ name: 'nm', agent: 'a'.repeat(100) }))
-  assert.ok(first.l.startsWith('1: ?   …  blocked · aaa'), first.l)
+  assert.ok(first.l.startsWith('1: ?   hc · …  blocked · aaa'), first.l)
 })
 
 test('hc gets: a failed ls keeps the membership, so a get that lands during it is kept and the finish get still runs', async () => {
@@ -5118,7 +5123,7 @@ test('hc send: a delayed preflight re-read that ends the row runs no hc send', a
     await until(() => plain().includes('mine t1'), 5_000, 'rows')
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› mine t1') && plain().includes('[ t send ]'), 5_000, 'selected in edit')
+    await until(() => plain().includes('› hc · mine t1') && plain().includes('[ t send ]'), 5_000, 'selected in edit')
     stdin.emit('data', 't')
     await until(() => plain().includes('t send t1:'), 5_000, 'prompt')
     stdin.emit('data', 'late')
@@ -5181,7 +5186,7 @@ test('hc owner vs self: --hc-parent t21 with env t99 shows and removes t21 finis
     // Digits: row 1 is own-live t1, row 2 is own-done t3 (the ambient finished row is not listed).
     stdin.emit('data', 'e')
     stdin.emit('data', '2')
-    await until(() => plain().includes('› own-done t3'), 5_000, 'own finished selected')
+    await until(() => plain().includes('› hc · own-done t3'), 5_000, 'own finished selected')
     stdin.emit('data', 'd')
     await until(() => plain().includes('delete own-done? press again'), 5_000, 'armed')
     await new Promise(r => setTimeout(r, STOP_REPEAT_MS + 40))
@@ -5484,7 +5489,7 @@ test('hc send e2e: a preflight get that answers {} keeps the prompt and its draf
     await until(() => plain().includes('mine t1'), 5_000, 'rows')
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› mine t1') && plain().includes('[ t send ]'), 5_000, 'own t1 selected in edit')
+    await until(() => plain().includes('› hc · mine t1') && plain().includes('[ t send ]'), 5_000, 'own t1 selected in edit')
     stdin.emit('data', 't')
     await until(() => plain().includes('t send t1:'), 5_000, 'prompt open')
     stdin.emit('data', 'keep this draft')
@@ -5574,7 +5579,7 @@ test('hc t/i e2e: hc send and hc interrupt run the exact argv; a failed hc send 
     await until(() => plain().includes('mine t1'), 5_000, 'rows')
     stdin.emit('data', 'e')
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› mine t1') && plain().includes('[ t send ]'), 5_000, 'own t1 selected in edit')
+    await until(() => plain().includes('› hc · mine t1') && plain().includes('[ t send ]'), 5_000, 'own t1 selected in edit')
     // t opens the prompt; Enter types the line into the hc terminal.
     stdin.emit('data', 't')
     await until(() => plain().includes('t send t1:'), 5_000, 'send prompt open')
@@ -5599,7 +5604,7 @@ test('hc t/i e2e: hc send and hc interrupt run the exact argv; a failed hc send 
     assert.equal(runs('send').length, 2, 'exactly two sends, no retry storm')
     // Another parent's live row: t does nothing there.
     stdin.emit('data', 'j')
-    await until(() => plain().includes('› theirs t2'), 5_000, 'other t2 selected')
+    await until(() => plain().includes('› hc · theirs t2'), 5_000, 'other t2 selected')
     const before = runs('send').length
     stdin.emit('data', 't')
     await settle()

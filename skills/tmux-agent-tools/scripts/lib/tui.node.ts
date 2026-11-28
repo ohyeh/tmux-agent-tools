@@ -1604,7 +1604,7 @@ function fitByCells(text: string, max: number): string {
   return max >= dots ? `${cut(text, max - dots)}…` : cut(text, max)
 }
 
-/** One hc row, the tmux row's grammar: `N: ` glyph `› name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age. */
+/** One hc row, the tmux row's grammar: `N: ` glyph `› hc · name  @parent  mark  age  repo`. Narrow drops the repo, then @parent, then age. */
 function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, width: number, now: number): string {
   const info = state.hcInfo?.[a.address]
   const look = hcLook(a)
@@ -1617,7 +1617,7 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
   // The address only on a wide row and when the name is not already the address.
   const addr = a.name && width >= 120 ? plain(short) : ''
   // The group title above names the machine, so the row shows the address without it.
-  const marker = `${selected ? '›' : ' '} `
+  const marker = `${selected ? '›' : ' '} hc · `
   const lead = (n: string, withAddr: boolean) => `${marker}${n}${withAddr ? ` ${ANSI_DIM}${addr}${ANSI_RESET}` : ''}`
   const parent = a.parent ? `  @${plain(a.parent.split('/').pop()!)}` : ''
   const mark = `  ${plain(hcMark(a, info?.program))}`

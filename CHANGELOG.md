@@ -5,6 +5,7 @@
 - Skills: `using-tmux-agent-tools` routes in this order: a built-in dispatch tool that this runtime loaded (the mod's `assign`, which picks hc or tmux itself), else an hc terminal started by hand when hc is usable, else tmux. Work that needs the `result.json` collector, a remote start, or fanout, dialogue, dag, monitor or commander stays on tmux until hc has them. A `runtime: tmux/<profile>` Agent call is the way to get `result.json` from Claude Code.
 - Mod: the plugin option `first` now defaults to `hc`: `mcp__tmux-agent__assign` tries herdr-core first and falls back to tmux before launch (no hc terminal, core down, program without a proven task flag). An unset or blank option or `TMUX_AGENT_FIRST` means `hc`; set `first=tmux` to try tmux first.
 - Fix (mod): an `assign` called by another plugin through `$.tool.call` always starts a tmux worker. byo-provider's `cli=tmux/<profile>` route reads the tmux receipt and polls `mcp__tmux-agent__await` for `result.json`; under `first=hc` it got an hc receipt, failed with `assign gave no worker name`, and left the hc worker running. A `runtime: tmux/<profile>` Agent call already stayed on tmux (it calls the tmux path directly); a test now pins both.
+- Mod band and `workers-tui`: every row names its backend after the selection marker, `tmux · ` on worker and project rows and `hc · ` on hc rows (the band's hc rows already had it), so tmux and hc workers can be told apart at a glance. The header counts are unchanged.
 
 ## v0.56.3 - 2026-11-27
 

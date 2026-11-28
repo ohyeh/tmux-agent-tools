@@ -221,7 +221,7 @@ workers-tui                                      # viewer: every worker, labeled
   runs, its agent terminals (all machines) are rows of the one list, after the worker rows
   and live before finished. A row reads like a worker row: `N: ` digit, a coloured glyph
   (`●` working or idle or starting, `?` blocked, `✓` done or exited 0, red `●` killed or
-  non-zero exit), then `name  @parent  mark  age  repo`. The mark is `working · <agent> · turn N`,
+  non-zero exit), then `hc · name  @parent  mark  age  repo` (a worker row starts with `tmux · `). The mark is `working · <agent> · turn N`,
   `blocked · <agent>`, `idle · <agent> · turn N`, `done · <agent> · turn N`, `starting · <program>`,
   `exited 0 · turn N`, `killed`, `exited <code>` or `ended`; `done` is a finished turn, not a
   delivery. The list is drawn from `hc ls` at once; the age (`m:ss`, `2h38m` from an hour) and the
