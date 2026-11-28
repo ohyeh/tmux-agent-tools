@@ -1582,18 +1582,25 @@ export function tuiLayout(state: TuiState, width: number, height: number, now: n
 /** Cells a narrow row keeps after its backend label for the name or state. */
 const NARROW_BODY = 5
 
+const ANSI_REVERSE = '\x1b[7m'
+
 /**
  * The leading fields of a list row. A narrow row gives them up before the backend label and the
- * name: first the row number, then the marker's blanks (`›` stays on the selected row), then the glyph.
+ * name: first the row number, then the marker's blanks, then the glyph, last the selected row's
+ * `›`, whose place a zero-width reverse style takes (`reverse`).
  */
-function rowLead(width: number, index: number, glyph: string, selected: boolean, backend: string): { prefix: string; glyph: string; marker: string } {
-  const lead = { prefix: index < 9 ? `${index + 1}: ` : '   ', glyph, marker: `${selected ? '›' : ' '} ` }
+function rowLead(width: number, index: number, glyph: string, selected: boolean, backend: string): { prefix: string; glyph: string; marker: string; reverse: boolean } {
+  const lead = { prefix: index < 9 ? `${index + 1}: ` : '   ', glyph, marker: `${selected ? '›' : ' '} `, reverse: false }
   const fits = () => width - cellWidth(lead.prefix + lead.glyph + lead.marker + backend) >= NARROW_BODY
   if (!fits()) lead.prefix = ''
   if (!fits()) lead.marker = selected ? '›' : ''
   if (!fits()) lead.glyph = ''
+  if (!fits() && selected) Object.assign(lead, { marker: '', reverse: true })
   return lead
 }
+
+/** `body` in reverse video, cut to `room` cells here so the reset is never cut off. */
+const reversed = (body: string, room: number) => `${ANSI_REVERSE}${truncateAnsi(body, room)}${ANSI_RESET}`
 
 function rowLine(state: TuiState, index: number, selected: number, width: number): string {
   const r = state.rows[index]!
@@ -1601,7 +1608,9 @@ function rowLine(state: TuiState, index: number, selected: number, width: number
   // rowLabel starts with the 2-cell marker, then `tmux · `.
   const label = sanitizeAnsi(rowLabel(r, index === selected))
   const lead = rowLead(width, index, rowGlyph(r), index === selected, 'tmux · ')
-  return `${lead.prefix}${lead.glyph ? `${color}${ANSI_BOLD}${lead.glyph}${ANSI_RESET}` : ''}${lead.marker}${label.slice(2)}`
+  const glyph = lead.glyph ? `${color}${ANSI_BOLD}${lead.glyph}${ANSI_RESET}` : ''
+  const body = lead.reverse ? reversed(label.slice(2), width - cellWidth(lead.prefix + lead.glyph)) : `${lead.marker}${label.slice(2)}`
+  return `${lead.prefix}${glyph}${body}`
 }
 
 /** `text` cut to `max` cells by the same rule as `cellWidth` (`TMUX_AGENT_AMBIGUOUS_WIDTH`), `…` marking the cut; no `…` when it does not fit. */
@@ -1627,7 +1636,7 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
   const info = state.hcInfo?.[a.address]
   const look = hcLook(a)
   const color = ANSI_COLOR_MAP[STATE_COLOR[look.state]] ?? ''
-  const { prefix, glyph, marker: sel } = rowLead(width, index, look.glyph, selected, 'hc · ')
+  const { prefix, glyph, marker: sel, reverse } = rowLead(width, index, look.glyph, selected, 'hc · ')
   const plain = (t: string) => stripAnsi(sanitizeAnsi(t))
   const machine = hcMachine(a)
   const short = machine ? a.address.slice(machine.length + 1) : a.address
@@ -1655,7 +1664,7 @@ function hcLine(state: TuiState, a: HcAgent, index: number, selected: boolean, w
     return markRoom >= cellWidth(`  ${mark.trim().split(' · ')[0]}`) ? `${marker}${nameCut}${fitByCells(mark, markRoom)}` : `${marker}${fitByCells(mark.trimStart(), Math.max(0, room - cellWidth(marker)))}`
   }
   const label = fits ?? (nameRoom >= 1 ? `${marker}${fitByCells(name, nameRoom)}${mark}` : cutMark())
-  return `${prefix}${glyph ? `${color}${ANSI_BOLD}${glyph}${ANSI_RESET}` : ''}${label}`
+  return `${prefix}${glyph ? `${color}${ANSI_BOLD}${glyph}${ANSI_RESET}` : ''}${reverse ? reversed(label, room) : label}`
 }
 
 /** Detail slice or mirror slice for one preview. The standard painter keeps its own tail line. */

@@ -4605,6 +4605,13 @@ test('rows below 45 columns: the number, the marker blanks and then the glyph go
     '›tmux · w1  ru',
     'tmux · w',
   ])
+  // 8 columns, selected: `›` gives way to a zero-width reverse style, so the whole label and a name or state cell stay.
+  const reversedRows = (lines: string[]) => lines.filter(l => l.includes('\x1b[7m'))
+  const tmuxSel8 = reversedRows(renderTuiLines({ ...ownerState(), selected: 'w1' }, 8, 30, 1))
+  const hcSel8 = reversedRows(renderTuiLines(hcState([a], { a1: { createdMs: now - 125_000 } }, { selected: hcId('a1') }), 8, 30, now))
+  assert.deepEqual([tmuxSel8.map(stripAnsi), hcSel8.map(stripAnsi)], [['tmux · w'], ['hc · wo…']])
+  assert.ok([...tmuxSel8, ...hcSel8].every(l => l.endsWith('\x1b[0m')),'the reverse style is reset on its own line')
+  assert.deepEqual(reversedRows(renderTuiLines({ ...ownerState(), selected: 'w1' }, 14, 30, 1)), [], 'with room for `›`, no reverse style')
 })
 
 test('hc rows: header counts live and ended; the footer carries no hc line; the band label shares the mark text', () => {
