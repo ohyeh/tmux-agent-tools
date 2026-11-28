@@ -35,8 +35,20 @@ No exception fired → inline, receipt `no-delegate-trigger`.
 
 ## QUESTIONS — if delegating, one-shot or teammate? State which, and why.
 
-When the mod's assign tool is available, use COLLECTOR for both task shapes.
-The wrapper instructions below apply to shell dispatch.
+Pick the dispatch path in this order, for both task shapes:
+
+1. A built-in path that this runtime loaded. Check the session's tools first:
+   mods differ per runtime and host. In Claude Code with the tmux-agent mod,
+   that is `mcp__tmux-agent__assign` (COLLECTOR); it picks hc or tmux itself.
+2. No such tool: start an hc (herdr-core) terminal by hand (SELECT, hc bullet)
+   when `hc` is on PATH, its core answers `hc ls`, and this session runs in an
+   hc terminal (`$HC_TERMINAL_ID` is set).
+3. Otherwise tmux: the commander section, or the shell wrapper below.
+
+Work that needs the `result.json` collector, a remote start, or fanout,
+dialogue, dag, monitor, or commander stays on tmux: hc has none of these
+until herdr-first phase 3.
+The wrapper instructions below apply to tmux shell dispatch.
 
 - **One-shot** (one bounded answer, no follow-up of any kind) →
   interactive `start --task-shape bounded` (headed; the pane is the debug
@@ -55,8 +67,14 @@ Applies ONLY when the tool `mcp__tmux-agent__assign` is present in this session
 (Codex, agy, Cursor, a Claude session without the mod) skips this section
 and uses "commander is not Claude Code" below.
 
-1. Dispatch with the tool, not the shell: `mcp__tmux-agent__assign` with
-   `profile`, `name`, `dir`, and a `brief` carrying GOAL / MODEL / ACCEPTANCE / REPORT.
+1. Dispatch with the tool, not the shell. For ordinary local work, call
+   `mcp__tmux-agent__assign` with `profile`, `name`, `dir`, and a `brief`
+   that has GOAL / MODEL / ACCEPTANCE / REPORT. It tries hc first and falls
+   back to tmux before launch. Do not put a backend in the brief.
+   For work that needs `result.json`, use the Agent tool with a
+   `runtime: tmux/<profile>` line in the brief and no `name`: it always starts tmux.
+   For a remote start, use `agent-tmux <cli> start-ssh`. For fanout, dialogue,
+   dag, monitor, or commander, use the matching script in SELECT or the commander section.
 2. Read the receipt. One of these phrases in it is the branch condition, not
    the tool's mere presence:
    - `collector: active in this session` → call `mcp__tmux-agent__peek` once
@@ -160,13 +178,14 @@ and uses "commander is not Claude Code" below.
 ## commander is not Claude Code
 
 The plugin options `first` and `space` belong to the Claude Code mod. A
-runtime without the mod (Codex, agy, Cursor, a Claude session without it)
-always dispatches to tmux with the commands in this section. Do not use
-`hc run` in place of `assign`: a terminal started by hand has no brief gate,
-no result.json and no collector. Use `hc run` only when the user asks for an
-hc terminal (see the routing list below).
+runtime without a built-in dispatch tool (Codex, agy, Cursor, a Claude session
+without the mod) follows the dispatch order in QUESTIONS: an hc terminal by
+hand when hc is usable (SELECT, hc bullet), else tmux with the commands in
+this section. A terminal started by hand has no brief gate, no result.json and
+no collector, so work that needs them uses tmux. When the mod's `assign` is
+loaded, do not use `hc run` in place of it.
 
-Without the Claude Code mod, start a tmux commander session and dispatch from
+For tmux, start a commander session and dispatch from
 inside its pane. Commander assign starts the shell collector from the tmux
 server when needed. If the receipt says the collector is active, check the worker once (its screen or first product), then end the turn.
 Results arrive as a prompt. Do not start a second collector, and do not
@@ -257,13 +276,18 @@ yourself.
 - Loop-shaped chain (audit / plan→build / consensus / triage) → the
   `using-decision-tree` loops branch (`references/loops.md`), not this router.
 - ONE coding CLI as a supervised worker (most common) → COLLECTOR if the mod
-  is loaded. Otherwise use the commander section or the shell wrapper path
+  is loaded. Otherwise follow the dispatch order in QUESTIONS: an hc terminal
+  by hand (next bullet), else the commander section or the shell wrapper path
   above (`agent-tmux <cli>`: claude / codex / agy built in; gemini, cursor,
   custom via profile).
-- Only when the user asks for it: an interactive agent in a Herdr.app
-  (`herdr-core`, `hc`) terminal instead of tmux, started by hand, so that it
-  shows in Herdr.app and this session's `/workers` band and can be attached
-  live. For briefed work, follow the mod or no-mod dispatch path above. Start
+- Without a built-in dispatch tool (dispatch order step 2), or when the user
+  asks for it: an interactive agent in a Herdr.app (`herdr-core`, `hc`)
+  terminal, started by hand, so that it shows in Herdr.app and the `/workers`
+  band and can be attached live. When the mod's `assign` is loaded, use it
+  instead. End a brief with `When done or stuck, report to the parent with:
+  hc send <parent> "<result or blocker>"`, `<parent>` being this terminal's
+  `$HC_TERMINAL_ID`, as the mod's `assign` does; hc also notifies this
+  terminal when the worker blocks, errors or exits. Start
   it with
   `hc run --bg --name <n> -- /usr/bin/env "PATH=$PATH" "/absolute/path/to/program" <args>`.
   Include `--no-daemon` in `<args>` for Codex. Omit `--no-parent`, so that
@@ -273,14 +297,16 @@ yourself.
   task status, use `hc get <t>`. Startup idle does not show that the task ran.
   `hc attach [--observe] <t>` attaches (watch-only in `workers-tui` viewer mode; `ctrl+\` detaches). Close it
   live with `hc kill <t>` or `x x` in the band or `workers-tui` (編輯) (with the mod, its 10-second clock then removes a killed own record with `hc rm`; a row that ended by itself stays until cleared); remove own finished rows with `d d` (`workers-tui`), `c c` / `[ clear ]`, `x x`, `/workers stop <hc address>`, or `hc rm <t>`.
-- In Claude Code with the mod, `mcp__tmux-agent__assign` tries hc when `first` resolves to hc
-  (`TMUX_AGENT_FIRST` overrides `/config`) or `agent-tmux` is missing. hc requires an hc parent,
-  a live core, and an eligible `claude`, `codex`, `grok`, or `agy` program on PATH whose launch
-  flags do not already include its task flag. The `runtime: tmux/<profile>` Agent hook calls the
-  tmux path directly when it dispatches. Do not choose the backend yourself and do not pass it in
-  the brief: call `assign` as usual and follow the receipt (COLLECTOR step 2). The option `space`
-  names the Herdr space when `herdr-app` is on PATH and its window can be queried. Unset or blank
-  means `workers`. Set it to `off` for no Herdr tab.
+- In Claude Code with the mod, `mcp__tmux-agent__assign` tries hc first by default.
+  It falls back to tmux when hc cannot take the brief before launch.
+  hc needs an hc parent, a live core, and a `claude`, `codex`, `grok`, or `agy` program on PATH.
+  The launch flags must leave the task flag free. `TMUX_AGENT_FIRST` overrides `/config`.
+  With `first=tmux`, assign tries tmux first and can use hc if it cannot find `agent-tmux`.
+  The `runtime: tmux/<profile>` Agent hook always uses tmux for the result waiter, and so
+  does an assign that another plugin calls (byo-provider `cli=tmux/<profile>`).
+  Do not put a backend in the brief: call `assign` and follow the receipt (COLLECTOR step 2).
+  The option `space` names the Herdr space if `herdr-app` is on PATH and its window responds.
+  Unset or blank means `workers`. Set it to `off` for no Herdr tab.
 - Same prompt across MANY workers → `tmux-agent-fanout`; bounded TWO-party
   exchange → `tmux-agent-dialogue`. BOTH require the user's explicit
   authorization for count, tool, model, and effort — never assume it.

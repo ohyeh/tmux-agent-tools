@@ -724,8 +724,8 @@ export async function stopHc(host: Host, agent: Pick<HcAgent, 'address' | 'name'
 /** The Herdr space hc workers open in when the plugin option `space` is not set. */
 export const HC_SPACE = 'workers'
 
-/** `TMUX_AGENT_FIRST`: `hc` or `herdr` makes assign try hc before tmux; anything else is tmux first. */
-export const hcFirst = (v: string | undefined): boolean => /^(hc|herdr)$/i.test((v ?? '').trim())
+/** `first` / `TMUX_AGENT_FIRST`: unset or blank means hc (the default), `hc` or `herdr` too; any other value tries tmux first. */
+export const hcFirst = (v: string | undefined): boolean => /^(hc|herdr)$/i.test((v ?? '').trim() || 'hc')
 
 type HcCommand = { bin: string; flags: string[] }
 /** agent-tmux's built-in presets, for when no profile file is readable. */

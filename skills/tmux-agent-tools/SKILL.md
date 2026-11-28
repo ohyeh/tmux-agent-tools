@@ -63,7 +63,7 @@ Before the first worker command:
 | Local working directory | `start` |
 | Repo on another host, tmux stays local | `start-ssh` |
 | Pin a model for one run | `start --model <m> <name> <dir> '<prompt>'` |
-| An agent in a Herdr.app (herdr-core, `hc`) terminal, not tmux, started by hand (only when the user asks. For briefed work, follow the router's mod or no-mod dispatch path.) | `hc run --bg --name <n> -- /usr/bin/env "PATH=$PATH" "/absolute/path/to/program" <args>` (include `--no-daemon` in `<args>` for Codex) from this session's hc terminal; selectable in the band and TUI (mirror + close; attach in TUI) |
+| An agent in a Herdr.app (herdr-core, `hc`) terminal, not tmux, started by hand (when no built-in dispatch tool such as the mod's `assign` is loaded, or the user asks; the router's dispatch order decides) | `hc run --bg --name <n> -- /usr/bin/env "PATH=$PATH" "/absolute/path/to/program" <args>` (include `--no-daemon` in `<args>` for Codex) from this session's hc terminal; selectable in the band and TUI (mirror + close; attach in TUI) |
 | Continue an existing CLI session UUID | `resume` (opt-in, off by default) |
 | Don't know which wrapper owns a session | `tmux-agent-sessions resolve --name <n> --json` first |
 | Two-party exchange / one-to-many work | `tmux-agent-dialogue` / `tmux-agent-fanout` |

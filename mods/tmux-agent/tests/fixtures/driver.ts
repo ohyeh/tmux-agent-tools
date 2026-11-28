@@ -13,6 +13,7 @@ export const driver: Plugin = {
       await $.command.register({ name: 'outstanding', description: 'list outstanding workers' })
       await $.command.register({ name: 'stalled', description: 'list stalled workers' })
       await $.command.register({ name: 'trust-as-plugin', description: 'exercise command provenance' })
+      await $.command.register({ name: 'assign-as-plugin', description: 'exercise a plugin caller of assign' })
       return next(e)
     })
 
@@ -43,6 +44,10 @@ export const driver: Plugin = {
       if (e.args) pendingTrust = e.args
       return { text: trustAnswer }
     })
+    // A plugin's own assign, as byo-provider's cli=tmux/<profile> route makes it; args is the tool input as JSON.
+    on('command.run', { command: 'assign-as-plugin' }, async ($, e) => ({
+      text: JSON.stringify(await $.tool.call({ ...JSON.parse(e.args), tool: 'mcp__tmux-agent__assign' })),
+    }))
   },
 }
 

@@ -1569,7 +1569,7 @@ test('assignHc: TMUX_AGENT_FIRST parsing, skips before any launch, absolute prog
   // Quotes group and are removed, as the shell on the tmux path does.
   assert.deepEqual(shellWords(`--yolo --model 'deepseek-v4.1-flash[1m]' -c "a b"=c x\\ y  `), ['--yolo', '--model', 'deepseek-v4.1-flash[1m]', '-c', 'a b=c', 'x y'])
   assert.deepEqual(shellWords(''), [])
-  assert.deepEqual(['hc', ' Herdr ', 'tmux', '', undefined].map(hcFirst), [true, true, false, false, false])
+  assert.deepEqual(['hc', ' Herdr ', 'tmux', ' TMUX ', '', '  ', undefined].map(hcFirst), [true, true, false, false, true, true, true])
   const root = '/fake-hc-home'
   const hc = `${root}/bin/hc`
   const sock = `${root}/.local/state/herdr-core/default/default.sock`

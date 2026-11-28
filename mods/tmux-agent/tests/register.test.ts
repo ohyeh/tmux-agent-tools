@@ -6448,19 +6448,24 @@ describe('native mirror', () => {
     expect(logs.some(l => l.startsWith('agent.spawn hook failed (throw: ')), 'the hook did fail').toBe(true)
   })
 
-  test('a runtime spawn dispatches the brief without the runtime line and starts the waiter', WITH_DRIVER, async ($, on) => {
-    mock.env(on, { HOME })
+  test('runtime: tmux/codex launches tmux and binds the result waiter even with first=hc', WITH_DRIVER, async ($, on) => {
+    mock.env(on, { HOME, PATH: '/b', HC_TERMINAL_ID: 't3', TMUX_AGENT_FIRST: 'hc' })
     mock.store(on)
     mockClock(on)
-    const files: Files = {}
+    const files: Files = { '/b/agent-tmux': '', '/b/hc': '', '/b/codex': '', [`${HOME}/.local/state/herdr-core/default/default.sock`]: '' }
     mockFs(on, files)
     mockSessionStart(on)
     on('ui.status', () => ({ value: undefined }))
     on('ui.log', () => ({ value: undefined }))
     const head = 'a'.repeat(40)
-    onRun(on, ($, e) => ({
-      value: { exitCode: 0, stdout: e.argv[0] === 'git' ? `${head}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
-    }))
+    const launches: string[] = []
+    onRun(on, ($, e) => {
+      if (e.argv[0] === 'sh' && e.argv[4]?.includes("'--result-path'")) launches.push(e.argv[4])
+      const hcRun = e.argv[0] === '/b/hc' && e.argv[1] === 'run'
+      if (hcRun) launches.push('hc run')
+      const stdout = e.argv[0] === 'git' ? `${head}\n` : hcRun ? '{"address":"t4"}' : ''
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
     let seen: { subagentType?: string; model?: string; background?: boolean; description?: string; prompt?: string } | undefined
     on('agent.spawn', ($, e) => {
       seen = e
@@ -6468,7 +6473,7 @@ describe('native mirror', () => {
     })
 
     await $.session.start(session())
-    const out = await $.agent.spawn(spawnOf({ cwd: '/work', description: 'Fix the bug!' }))
+    const out = await $.agent.spawn(spawnOf({ prompt: BRIEF.replace('tmux/cursor', 'tmux/codex'), cwd: '/work', description: 'Fix the bug!' }))
 
     expect(out).toMatchObject({ model: 'sonnet', agentId: 'waiter-9' })
     const fresh = Object.keys(files).filter(p => /\/worker\.json$/.test(p))
@@ -6478,7 +6483,9 @@ describe('native mirror', () => {
     expect(brief).toContain('GOAL: ship it')
     expect(brief).toContain('ACCEPTANCE: tests pass')
     expect(brief).not.toMatch(/runtime:\s*tmux/)
-    expect(record).toMatchObject({ profile: 'cursor', dir: '/work' })
+    expect(record).toMatchObject({ profile: 'codex', dir: '/work' })
+    expect(launches).toHaveLength(1)
+    expect(launches[0]).toContain(`'codex' 'assign' '--detach' '--result-path' '${V3}/${record.name}/result.json'`)
     expect(JSON.parse(files[`${V3}/${record.name}/episodes/1/dispatch.json`]!)).toMatchObject({ seq: 1, base: head })
     expect(JSON.parse(files[`${V3}/${record.name}/episodes/1/waiter`]!), 'the waiter binds E1 only (§2)').toEqual({ agentId: 'waiter-9' })
     expect(record.name).toMatch(/^Fixthebug\.[0-9a-z]{5}$/)
@@ -6495,6 +6502,10 @@ describe('native mirror', () => {
     expect(seen?.prompt, 'a bare file test would stop on the placeholder').not.toMatch(/\[ -f [^\]]*result\.json'? \] && break/)
     expect(seen?.prompt).toContain('600000')
     expect(seen?.prompt).toContain('60 minutes')
+    // Positive control: the same profile and host can launch hc through the ordinary assign tool.
+    const control = await $.tool.call({ tool: 'mcp__tmux-agent__assign', profile: 'codex', name: 'control', dir: '/work', brief })
+    expect(JSON.stringify(control)).toContain('backend hc: no result.json, no collector')
+    expect(launches[1]).toEqual('hc run')
   })
 
   test('a spawn without the runtime line is passed through untouched', WITH_DRIVER, async ($, on) => {
@@ -7175,6 +7186,12 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
   })
 
   const FIRST_HC = { key: 'tmux-agent.first', label: 'Assign backend tried first', kind: 'choice' as const, value: 'hc', options: ['tmux', 'hc'], provider: { plugin: 'tmux-agent', tier: 'user' as const }, isLocked: false }
+  test('unset first defaults to hc and falls back to tmux before launch', WITH_DRIVER, async ($, on) => {
+    on('config.list', () => ({ value: [{ ...FIRST_HC, value: '' }] }))
+    setup(on, undefined, { HOME })
+    expect(JSON.stringify(await $.tool.call(assign()))).toContain('hc first fell back to tmux: this session is not in an hc terminal')
+  })
+
   test('plugin option first=hc, no env: hc is tried first', WITH_DRIVER, async ($, on) => {
     on('config.list', () => ({ value: [FIRST_HC] }))
     setup(on, undefined, { HOME })
@@ -7210,6 +7227,21 @@ describe('dispatch gate (TMUX_AGENT_DISPATCH_GATE)', () => {
     // The fake hc prints nothing, so the launch has no address: a deny, and no tmux worker.
     expect(out).toContain('hc run gave no address')
     expect(t.assigned(), 'no tmux launch after an hc attempt').toBe(false)
+  })
+
+  test('first=hc: a plugin caller (byo-provider cli=tmux/<profile>) gets a tmux worker it can await; the model call gets hc', WITH_DRIVER, async ($, on) => {
+    const sock = `${HOME}/.local/state/herdr-core/default/default.sock`
+    const t = setup(on, undefined, { HOME, PATH: '/b', HC_TERMINAL_ID: 't3', TMUX_AGENT_FIRST: 'hc' }, { '/b/agent-tmux': '', '/b/hc': '', '/b/codex': '', [sock]: '' })
+    const hcRuns = () => t.argvs.filter(a => a[0] === '/b/hc' && a[1] === 'run').length
+    const out = String(JSON.parse((await $.command.run(run('assign-as-plugin', JSON.stringify(assign())))).text ?? '{}').result)
+    // byo reads the worker name and state dir from these receipt phrases, then polls the await tool.
+    expect(out).toMatch(/launch requested for "[^"]+"/)
+    expect(out).toMatch(/\(launch log: .+\/mod-assign\.log\)/)
+    expect(hcRuns(), 'no hc run for a plugin caller').toBe(0)
+    expect(t.assigned()).toBe(true)
+    // Positive control: the same host and profile start hc for the model's own call.
+    await $.tool.call({ ...assign(), name: 'w2' })
+    expect(hcRuns()).toBe(1)
   })
 
   test('another exit code denies: a broken gate does not pass', WITH_DRIVER, async ($, on) => {

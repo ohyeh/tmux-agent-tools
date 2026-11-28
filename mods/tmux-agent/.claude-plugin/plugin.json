@@ -16,9 +16,9 @@
     "first": {
       "type": "string",
       "title": "Assign backend tried first",
-      "description": "Which backend mcp__tmux-agent__assign tries first: tmux (agent-tmux worker) or hc (herdr-core terminal, with a pane in the Herdr window). The other one takes over only before a launch. The TMUX_AGENT_FIRST env of the claude process overrides this.",
+      "description": "mcp__tmux-agent__assign tries hc (herdr-core terminal with a Herdr tab) first by default. Choose tmux to try agent-tmux first. Fallback happens only before launch. TMUX_AGENT_FIRST overrides this option.",
       "options": ["tmux", "hc"],
-      "default": "tmux"
+      "default": "hc"
     },
     "space": {
       "type": "string",

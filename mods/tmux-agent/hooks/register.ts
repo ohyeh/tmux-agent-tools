@@ -670,7 +670,7 @@ export const register: Register = on => {
         '(e.g. a second claude started with its own --settings file through a provider gateway). Returns at once; ' +
         'the collector session reconciles result.json and submits a prompt when the worker finishes. ' +
         'Follow up with mcp__tmux-agent__tell, dismiss with mcp__tmux-agent__stop. ' +
-        'With the plugin option first=hc (or TMUX_AGENT_FIRST=hc) a brief whose profile runs claude, codex, grok or agy may start as an hc agent instead: the receipt says so and names the hc commands to use. ' +
+        'The default first=hc tries herdr-core for claude, codex, grok or agy profiles and falls back to tmux before launch if hc is unavailable or ineligible. An hc receipt names the hc commands to use. Set first=tmux or TMUX_AGENT_FIRST=tmux to try tmux first. ' +
         'brief must contain GOAL, ACCEPTANCE, REPORT and a non-empty MODEL section. MODEL: current-system Mermaid with transitions/invariants, a system-model.json path, or none — reason for read-only/search work.',
       inputSchema: {
         type: 'object',
@@ -1998,7 +1998,7 @@ export const register: Register = on => {
     }
   })
 
-  on('tool.call', { tool: TOOL }, async ($, e) => {
+  on('tool.call', { tool: TOOL }, async ($, e, next) => {
     const host = world
     if (!host) return { deny: 'tmux-agent: the mod did not bind' }
     const input = e as unknown as AssignInput
@@ -2007,13 +2007,15 @@ export const register: Register = on => {
     if ('deny' in gated) return gated
     const note = gated.note ? { context: [gated.note] } : {}
     // The plugin option `first` (/config) picks the backend tried first, and the TMUX_AGENT_FIRST env overrides it;
-    // the other backend takes over only before any launch.
+    // the other backend takes over only before any launch. A blank value means unset.
     const rows = await $.config.list().catch(() => [])
     const option = rows.find(row => row.key === 'tmux-agent.first')?.value
     const space = rows.find(row => row.key === 'tmux-agent.space')?.value
-    const first = hcFirst((await $.env.get('TMUX_AGENT_FIRST')) ?? (typeof option === 'string' ? option : undefined))
+    const first = hcFirst((await $.env.get('TMUX_AGENT_FIRST'))?.trim() || (typeof option === 'string' ? option : undefined))
     let fellBack = ''
-    if (first || (await agentTmuxBin(host)).missing) {
+    // A plugin's call (byo-provider's cli=tmux/<profile>) reads the tmux receipt and polls await, which knows only tmux workers.
+    const byModel = next.origin.plugin === 'engine'
+    if (byModel && (first || (await agentTmuxBin(host)).missing)) {
       // An option never set reads as '' (seen live), so empty means the default name; `off` asks for no tab.
       const named = typeof space === 'string' ? space.trim() : ''
       const hc = await assignHc(host, input, named === 'off' ? '' : named || undefined)
