@@ -20,7 +20,7 @@ tmux-agent-tools/
 ├── scripts/
 │   ├── test-*-smoke                   # smoke runners (one per integration boundary)
 │   ├── ci-shellcheck                  # syntax + shellcheck across all scripts
-│   └── lint-no-path-tied-locals       # zsh tied-pair locals lint (smoke: test-smoke-lib-smoke)
+│   └── lint-no-path-tied-locals       # zsh tied-pair locals lint
 ├── schemas/                           # JSON schemas for stable surfaces
 ├── docs/                              # design docs (one per issue / batch)
 └── CHANGELOG.md                       # release-by-release narrative
@@ -38,13 +38,10 @@ tmux-agent-tools/
 
 1. **Open an issue** describing the user-visible outcome and acceptance criteria. Acceptance criteria should be checkable from the merged diff.
 2. **Branch** off `main`, conventional name: `feat/<scope>-<short>-<issue#>` or `fix/<scope>-<short>-<issue#>`.
-3. **Add a regression case** under the [smoke test conventions](#smoke-test-conventions).
+3. **Plan the real check**: the command that shows the change working on the real system (see [Verification](#verification)).
 4. **Implement** in the smallest surface that meets acceptance. Match existing patterns.
 5. **Run locally**:
    ```bash
-   scripts/run-all-smokes test-<name>-smoke
-   scripts/run-all-smokes test-fanout-run-smoke   # if you touched L5 fanout/dag
-   scripts/run-all-smokes test-sentinel-smoke test-secret-uri-smoke  # if you touched L6
    scripts/ci-shellcheck
    scripts/lint-no-path-tied-locals
    ```
@@ -53,14 +50,13 @@ tmux-agent-tools/
 8. **Merge** via squash. Conventional commit message in the squash subject.
 9. **CHANGELOG.md** — add an entry under `## Unreleased`. The release PR consolidates these into a versioned section.
 
-## Smoke test conventions
+## Verification
 
-The general test policy (which test owns a case, fixed waits, cut duplicates before adding) is the "Test cost" rule in `ohyeh/agent-scripts` `.agents/rules/operator-defaults.md`. The repo facts:
+Owner, 2026-11-28: 「我們追求的真實的 e2e 可以用便宜模型測啊」. The unit, contract and smoke suites are gone.
 
-- **Budget**: `PARALLEL_JOBS=4 zsh scripts/run-all-smokes` must finish within 180 seconds, from preflight through cleanup, on the owner's development host. Quote its `suite wall` line, with the host and revision, in the change report.
-- **Runner**: run smokes through `scripts/run-all-smokes` (every `test-*-smoke`; `test-mcp-bundle-smoke` also runs the mcp-adapter source tests) or `scripts/run-all-smokes test-<name>-smoke` (one). The runner gives each job its own HOME and tmux directory.
-- **Home guard**: line 2 of every smoke sources `scripts/lib/smoke-home-guard.sh`, which refuses to run with the real HOME (2026-10-09 home-deletion incident). A smoke started directly exits 3.
-- **Isolation**: next, source `scripts/lib/smoke-tmux.sh`, before the smoke creates files or starts tmux. It puts `TMPDIR` and the tmux sockets inside the job directory and kills those tmux servers on exit, error, and signal. Register an extra socket with `smoke_socket <name>`.
+- Prove a change on the real system: a real `mcp__tmux-agent__assign` through the reloaded mod, a real `agent-tmux <cli> start`, a real hc terminal. Start the workers on a cheap model (`agy-flash`, haiku) and stop them after the check. Quote the command and its output.
+- Do not write a fake CLI, fake tmux, fake socket or fake HOME to stand in for the real one.
+- `scripts/run-all-smokes test-version-sync-smoke` stays: it reads the real version files and rebuilds the real MCP bundle.
 
 ## Partner review pattern
 
@@ -89,7 +85,7 @@ Every shipped change bumps the version, even without a release: the plugin cache
 No GitHub Actions: the release is local, after the local checks pass.
 
 1. Move `## Unreleased` entries under `## v0.X.Y - YYYY-MM-DD` and add a `- Not verified: …` line (what this release did not check; `release-notes` refuses a section without it), bump every version line (`scripts/test-version-sync-smoke` lists them), rebuild the MCP bundle (`npm --prefix mcp-adapter run build`), commit `chore(release): 0.X.Y`.
-2. Run `scripts/ci-shellcheck`, the plugin tests in `mods/tmux-agent`, and `PARALLEL_JOBS=4 zsh scripts/run-all-smokes`. The smoke suite includes the type checks and core contracts; run those lanes once. Quote each result and the smoke wall time. Run an extra targeted check only for a changed boundary that these commands did not check.
+2. Run `scripts/ci-shellcheck` and `scripts/run-all-smokes test-version-sync-smoke`, then a real `assign` through the reloaded mod on a cheap model. Quote each result.
 3. Push `main`, then tag and publish from the same commit:
    ```sh
    git tag -a v0.X.Y -m v0.X.Y

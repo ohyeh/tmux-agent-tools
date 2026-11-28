@@ -2,6 +2,8 @@
 
 What works on which host, by which delivery path. Each cell has an evidence
 path, or a blocker and the action that closes it. Nothing here is inferred.
+The unit, contract and smoke suites were removed on 2026-11-28 (owner: real e2e on a cheap model
+instead); rows that cite them record what those tests showed at the time.
 
 `$R` = `.workflow/202610011947-tui-closure`. All paths are relative to the repo root.
 

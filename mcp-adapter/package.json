@@ -6,12 +6,8 @@
   "bin": {
     "codex-tmux-agent-adapter": "src/server.js"
   },
-  "directories": {
-    "test": "test"
-  },
   "scripts": {
-    "build": "node build.mjs",
-    "test": "node test/adapter-smoke.js"
+    "build": "node build.mjs"
   },
   "keywords": [],
   "author": "",

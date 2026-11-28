@@ -25,7 +25,7 @@ npm ci
 node build.mjs            # or: node build.mjs --out <dir>
 ```
 
-`scripts/test-version-sync-smoke` rebuilds to a temp dir and fails when the bytes differ; `scripts/test-mcp-bundle-smoke` runs the bundle from a copy of only the skill dir.
+`scripts/test-version-sync-smoke` rebuilds to a temp dir and fails when the bytes differ.
 
 ## Development
 

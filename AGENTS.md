@@ -1,5 +1,14 @@
 # AGENTS.md — tmux-agent-tools
 
+## Verification: the real system, on a cheap model
+
+Owner, 2026-11-28: 「smoke 只是 fixture， 為啥不刪 浪費人力」「我們追求的真實的 e2e 可以用便宜模型測啊」.
+
+- Prove a change on the real system it touches, with workers on a cheap model (`agy-flash`, haiku),
+  and quote the command and output.
+- Do not write fake binaries, fake sockets, fake HOME layouts or unit fixtures to stand in for it.
+- Keep a fix the smallest that works.
+
 ## GitHub Actions: banned
 
 Owner ruling 2026-10-02, re-stated 2026-10-03 after a violation. Applies to every repo of the

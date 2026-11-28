@@ -1,2 +1,0 @@
-#!/usr/bin/env zsh
-exec node "${0:A:h}/agent-tmux.cjs" "$@"

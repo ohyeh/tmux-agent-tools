@@ -3,7 +3,6 @@ set -u
 
 script_dir="${0:A:h}"
 repo_root="${script_dir:h}"
-node "$script_dir/check-tmux-socket-isolation" || exit 1
 lint_out="$(zsh "$script_dir/lint-no-path-tied-locals" 2>&1)" || { print -r -- "$lint_out" >&2; exit 1; }
 
 unset TMUX TMUX_PANE
@@ -67,7 +66,7 @@ if (( $# > 0 )); then
   done
 else
   # Longest first, so the slow ones do not land in the tail of the pool.
-  typeset -a slow=("$script_dir"/{test-core-contract-smoke,test-tui-e2e-smoke,test-mcp-bundle-smoke,test-dispatch-delivery-smoke,test-audit-smoke})
+  typeset -a slow=()
   typeset -a rest=("$script_dir"/test-*-smoke(N))
   test_files=($slow ${rest:|slow})
   # A fresh clone has no adapter deps: mcp-bundle, mod-permissions and version-sync would fail
@@ -79,7 +78,7 @@ else
 fi
 # Load-sensitive: FAIL under PARALLEL_JOBS=4 on remote-44 and PASS alone (B10). They run one at a
 # time after the pool, so the default job count needs no manual serial rerun.
-typeset -a serial_names=(test-dispatch-delivery-smoke test-assign-dialog-smoke test-session-meta-smoke)
+typeset -a serial_names=()
 
 if (( ${#test_files[@]} == 0 )); then
   echo "run-all-smokes: no smoke tests found" >&2
