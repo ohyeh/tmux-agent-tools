@@ -306,7 +306,9 @@ yourself.
   The `runtime: tmux/<profile>` Agent hook always uses tmux for the result waiter, and so
   does an assign that another plugin calls (byo-provider `cli=tmux/<profile>`) or whose brief
   keeps a `runtime: tmux/<profile>` line.
-  Do not put a backend in the brief: call `assign` and follow the receipt (COLLECTOR step 2).
+  Otherwise do not put a backend in the brief: call `assign` and follow the receipt (COLLECTOR
+  step 2). Keep the `runtime: tmux/<profile>` line only when the caller needs result.json,
+  `await` or `tell` (a recipe that waits on the worker, such as consensus-gate).
   The option `space` names the Herdr space if `herdr-app` is on PATH and its window responds.
   Unset or blank means `workers`. Set it to `off` for no Herdr tab.
 - Same prompt across MANY workers → `tmux-agent-fanout`; bounded TWO-party

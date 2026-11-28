@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.57.1 - 2026-11-28
+
+- Skills: `using-tmux-agent-tools` names the one case that keeps a backend in the brief: a `runtime: tmux/<profile>` line when the caller needs result.json, `await` or `tell` (a recipe that waits on the worker). L2 post-hoc review A-06.
+- Not verified: a live consensus-gate run that keeps the runtime line and awaits a tmux worker with the mod on.
+
 ## v0.57.0 - 2026-11-28
 
 - Skills: `using-tmux-agent-tools` routes in this order: a built-in dispatch tool that this runtime loaded (the mod's `assign`, which picks hc or tmux itself), else an hc terminal started by hand when hc is usable, else tmux. Work that needs the `result.json` collector, a remote start, or fanout, dialogue, dag, monitor or commander stays on tmux until hc has them. A `runtime: tmux/<profile>` Agent call is the way to get `result.json` from Claude Code.
